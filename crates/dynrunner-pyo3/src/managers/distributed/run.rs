@@ -3,7 +3,6 @@
 //! transports. Also exposes the `completed` / `failed` / `stranded`
 //! getters Python `run_distributed` reads after `run()` returns.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
@@ -12,7 +11,7 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
-use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
+use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
@@ -50,9 +49,8 @@ impl PyDistributedManager {
         // (their workers are spawned in their own pgids and survive
         // their parent's exit).
         let panik_watcher_paths = self.panik_watcher_paths.clone();
-        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
-            self.panik_watcher_poll_interval_secs,
-        );
+        let panik_watcher_poll_interval =
+            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
         // Compose the per-secondary memprofile output dir once on
         // the GIL thread so the per-secondary spawn closures below
         // receive identical `Option<PathBuf>` values without each
@@ -72,11 +70,10 @@ impl PyDistributedManager {
         // `{self.output_dir}/memuse.log`; `None` only if
         // `self.output_dir` is itself unset (it isn't — the field
         // is always populated by the constructor).
-        let memuse_log_path =
-            dynrunner_manager_local::memuse::derive_memuse_log_path(
-                Some(self.output_dir.as_path()),
-                None,
-            );
+        let memuse_log_path = dynrunner_manager_local::memuse::derive_memuse_log_path(
+            Some(self.output_dir.as_path()),
+            None,
+        );
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -90,8 +87,7 @@ impl PyDistributedManager {
         // `output_dir` is `/app/out-network`. Single-host callers
         // that did not supply a separate log dir get `log_path ==
         // output_dir` from the fallback in `LoadedTaskDefinition`.
-        let mut sec_log_dirs: Vec<(String, PathBuf)> =
-            Vec::with_capacity(num_secondaries as usize);
+        let mut sec_log_dirs: Vec<(String, PathBuf)> = Vec::with_capacity(num_secondaries as usize);
         for i in 0..num_secondaries {
             let sid = format!("sec-{i}");
             let dir = log_paths.resolve_log_dir(py, &log_path, &sid)?;
@@ -105,8 +101,7 @@ impl PyDistributedManager {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
-        let dist_keepalive_miss_threshold =
-            self.distributed_config.keepalive_miss_threshold();
+        let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
@@ -157,28 +152,22 @@ impl PyDistributedManager {
         // methods. Built before `py.detach` so the closures can capture
         // ref-bumped `Py<PyAny>` clones.
         let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-            crate::managers::lifecycle::make_on_phase_start(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
         );
         let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
         );
 
         // Clone the task_definition once per secondary so the in-process
-        // setup-promote path can fire `on_phase_end` through the
-        // promoted-secondary's pool-drain transitions on the SAME
-        // Python `TaskDefinition` instance the primary's callback
-        // already targets. Pre-fix the promoted secondary's
-        // `note_primary_item_completed` walked the cascade silently
-        // (see `manager-distributed/src/secondary/primary/lifecycle.rs`),
-        // so a multi-phase Python task hosting `on_phase_end` in
-        // single-process mode never observed the phase boundary on the
-        // post-promotion path. Each per-secondary closure pair is
-        // pushed in the order the secondaries are spawned below; the
-        // spawn loop pops one pair off this vec per iteration so each
+        // composition can fire `on_phase_end` through a promoted
+        // secondary's co-located primary on the SAME Python
+        // `TaskDefinition` instance the live primary's callback already
+        // targets. Each spawned in-process secondary registers these
+        // callbacks and, under composition, transfers them to its
+        // co-located parked primary (which owns the phase machine and
+        // fires the cascade once activated). Each per-secondary closure
+        // pair is pushed in the order the secondaries are spawned below;
+        // the spawn loop pops one pair off this vec per iteration so each
         // closure captures its own `Py<PyAny>` ref-bump.
         let mut sec_phase_lifecycle_callbacks: Vec<(
             crate::managers::lifecycle::OnPhaseStart,
@@ -186,14 +175,10 @@ impl PyDistributedManager {
         )> = Vec::with_capacity(num_secondaries as usize);
         for _ in 0..num_secondaries {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-                crate::managers::lifecycle::make_on_phase_start(
-                    self.task_definition.clone_ref(py),
-                ),
+                crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
             );
             let on_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-                crate::managers::lifecycle::make_on_phase_end(
-                    self.task_definition.clone_ref(py),
-                ),
+                crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
             );
             sec_phase_lifecycle_callbacks.push((on_start, on_end));
         }
@@ -206,18 +191,18 @@ impl PyDistributedManager {
         // PyO3-agnostic. The in-process secondaries do NOT receive
         // the listener (see the field doc on
         // `peer_lifecycle_listener`).
-        let peer_lifecycle_listener =
-            self.peer_lifecycle_listener
-                .take()
-                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+        let peer_lifecycle_listener = self
+            .peer_lifecycle_listener
+            .take()
+            .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Same shape for the task-completion listener: independent
         // dispatcher pair on the in-process primary; same
         // pre-`run()` registration contract.
-        let task_completed_listener =
-            self.task_completed_listener
-                .take()
-                .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
+        let task_completed_listener = self
+            .task_completed_listener
+            .take()
+            .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
@@ -247,6 +232,13 @@ impl PyDistributedManager {
         // iff the in-process primary's `run` returned
         // `RunError::SetupDeadlineExpired`.
         let mut setup_deadline_expired: Option<RunError> = None;
+        // Pre-phase duplicate-task-id carried out of the detached tokio
+        // runtime — same shape as `PyPrimaryCoordinator::run`. `Some`
+        // iff the in-process primary's `run` aborted on a #3a duplicate
+        // (`RunError::DuplicateTaskIdPrePhase`); the GIL-side tail
+        // raises a `PyRuntimeError` so the wrapper does not return
+        // exit 0.
+        let mut duplicate_task_id_pre_phase: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -258,23 +250,25 @@ impl PyDistributedManager {
             rt.block_on(local.run_until(async {
                 use tokio::sync::mpsc as tokio_mpsc;
 
-                let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-                let mut outgoing = HashMap::new();
                 let mut sec_handles = Vec::new();
                 let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
-                // Step 5b: build the primary's peer-mesh view first
-                // so the per-secondary forwarder below can tap inbound
-                // messages into the peer queue. The
-                // `shared_outgoing` handle receives the same sender
-                // clones we put into the legacy `outgoing` HashMap,
-                // so role-addressed sends through `peer_transport`
-                // reach the same wire as legacy `transport.send_to`.
-                // See `dynrunner_transport_tunnel` crate docs.
-                let (peer_transport, shared_outgoing, inbound_tap) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<
-                        RunnerIdentifier,
-                    >::new("primary".into());
+                // Build the primary's single `Tr: TunneledPeerTransport`.
+                // Post-collapse this is the ONE transport the coordinator
+                // holds. `shared_outgoing` is the writer table the
+                // in-process path registers each per-secondary writer
+                // into directly (no accept loops here, so the
+                // registration sink goes unused); `inbound` is the sink
+                // the per-secondary forwarder feeds — it is the
+                // transport's real, single inbound stream (no fan-out
+                // tap, no separate legacy `ChannelSecondaryTransportEnd`
+                // consumer). Role-addressed / `Address::Peer` sends and
+                // the unified `recv_peer()` both run over this one
+                // transport.
+                let (peer_transport, shared_outgoing, inbound, _registration) =
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
+                        "primary".into(),
+                    );
 
                 for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
                     sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
@@ -284,52 +278,27 @@ impl PyDistributedManager {
                     // secondary→primary channel
                     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
 
-                    // Register the per-secondary writer in BOTH the
-                    // legacy `outgoing` HashMap (drives
-                    // `transport.send_to(sec_id, ..)`) AND the
-                    // tunneled peer view's shared writer table
-                    // (drives `peer_transport.send_to_peer(sec_id, ..)`
-                    // and `Address::Role(_)` dispatch after the
-                    // role-cache resolves). Pre-Step-5b the legacy
-                    // path was the only consumer; Step 5b makes the
-                    // primary a real mesh member by adding the
-                    // second registration.
+                    // Register the per-secondary writer directly into the
+                    // transport's shared writer table so
+                    // `transport.send_to_peer(sec_id, ..)` /
+                    // `Address::Peer(sec_id)` / role-resolved dispatch
+                    // reach this secondary. (The QUIC path registers via
+                    // the accept-loop registration sink instead; in-
+                    // process there are no accept loops, so the direct
+                    // insert is the registration.)
                     shared_outgoing
                         .borrow_mut()
-                        .insert(secondary_id.clone(), pri_to_sec_tx.clone());
-                    outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+                        .insert(secondary_id.clone(), pri_to_sec_tx);
 
-                    // Forward secondary→primary messages
-                    let fwd_tx = incoming_tx.clone();
-                    let fwd_tap = inbound_tap.clone();
+                    // Forward secondary→primary messages straight into
+                    // the transport's single inbound stream — the
+                    // in-process analogue of a QUIC/WSS accept loop's
+                    // reader task feeding the inbound sink. No fan-out
+                    // tap: `recv_peer()` drains this same stream.
+                    let fwd_tx = inbound.clone();
                     tokio::task::spawn_local(async move {
-                        // Explicit type annotation: with the tap
-                        // fan-out and the legacy forwarder both
-                        // calling `send(msg)`-shaped methods the
-                        // inferrer can no longer disambiguate the
-                        // single-channel path it used pre-tap.
-                        // Both sides receive `DistributedMessage<RunnerIdentifier>`
-                        // (the wire shape the primary speaks).
-                        let mut rx: tokio_mpsc::UnboundedReceiver<
-                            dynrunner_protocol_primary_secondary::DistributedMessage<
-                                RunnerIdentifier,
-                            >,
-                        > = sec_to_pri_rx;
+                        let mut rx = sec_to_pri_rx;
                         while let Some(msg) = rx.recv().await {
-                            // Fan-out tap: clone each inbound
-                            // message into the peer view's queue so
-                            // `peer_transport.recv_peer()` can
-                            // observe it. The legacy `fwd_tx` send
-                            // below is the canonical inbound
-                            // consumer; the peer queue is currently
-                            // drainless (Step 5b doesn't add the
-                            // demoted-primary read arm — Step 6
-                            // does). On send failure of the tap
-                            // we continue silently: a dropped tap
-                            // means the peer view was torn down
-                            // first, but the legacy inbound path
-                            // must keep flowing.
-                            let _ = fwd_tap.send(msg.clone());
                             if fwd_tx.send(msg).is_err() {
                                 break;
                             }
@@ -387,24 +356,22 @@ impl PyDistributedManager {
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                             retry_max_passes: dist_retry_max_passes,
                             oom_retry_max_passes: dist_oom_retry_max_passes,
-                            primary_link_failure_threshold:
-                                dist_primary_link_failure_threshold,
-                            primary_link_failure_window:
-                                dist_primary_link_failure_window,
+                            primary_link_failure_threshold: dist_primary_link_failure_threshold,
+                            primary_link_failure_window: dist_primary_link_failure_window,
                             setup_deadline: dist_setup_deadline,
                             is_observer: false,
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
-                            // In-process distributed manager: see
-                            // `secondary/primary/reinject_task.rs` for the
-                            // budget-reset-at-promotion semantics. The
-                            // in-process primary holds the same cap on
-                            // the shared `control_plane`; the spawned
-                            // in-process secondaries inherit the same
-                            // configured value so an externally-issued
-                            // `reinject_task` post-promotion honours the
-                            // operator's knob symmetrically.
+                            // In-process distributed manager: the
+                            // `ReinjectTask` per-task budget cap, mirrored
+                            // from the in-process primary's
+                            // `PrimaryConfig` so an externally-issued
+                            // `reinject_task` honours the operator's knob
+                            // symmetrically regardless of which authority
+                            // (live or co-located) services it. Inert on
+                            // a secondary until it holds the primary role
+                            // via its co-located primary.
                             unfulfillable_reinject_max_per_task,
                             // In-process distributed manager runs primary
                             // and secondaries in the same process, so
@@ -449,10 +416,21 @@ impl PyDistributedManager {
                             child_processes: Vec::new(),
                         };
 
-                        let mut secondary = SecondaryCoordinator::new(
-                            config,
+                        // Compose the opaque secondary transport: the
+                        // co-located channel end is the uplink to the
+                        // in-process primary, `NoPeerTransport` is the
+                        // (absent) mesh. `Address::Role(Role::Primary)`
+                        // resolves to the loopback channel while the role
+                        // cache is cold — exactly the in-process
+                        // primary. See `UnifiedSecondaryTransport`.
+                        let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                            config.secondary_id.clone(),
                             transport,
                             dynrunner_transport_quic::NoPeerTransport,
+                        );
+                        let mut secondary = SecondaryCoordinator::new(
+                            config,
+                            unified,
                             sec_scheduler_config.build_memory_scheduler(),
                             estimator,
                         );
@@ -512,24 +490,23 @@ impl PyDistributedManager {
                         }
 
                         // Install the per-secondary phase-lifecycle
-                        // callbacks BEFORE `run()` enters — the
-                        // coordinator's `register_phase_lifecycle_callbacks`
-                        // contract requires pre-run registration, same
-                        // shape as `register_lifecycle_listener` /
-                        // `register_panik_signal_rx`. The callbacks fire
-                        // ONLY when this secondary is promoted into the
-                        // primary role and observes a phase-drain
-                        // transition through `note_primary_item_completed`
-                        // / `note_primary_item_failed` (see
-                        // `manager-distributed/src/secondary/primary/lifecycle.rs`).
-                        // Non-promoted secondaries hold the registration
-                        // dormant and never invoke either closure; the
-                        // closures themselves are GIL-reacquiring and
-                        // call into the SAME Python `TaskDefinition`
-                        // instance the primary's `on_phase_*` callbacks
-                        // target — there's one `task_definition` in the
-                        // process and a multi-phase task hosts its hook
-                        // logic on that single instance.
+                        // callbacks BEFORE `run()` enters — same pre-run
+                        // registration contract as
+                        // `register_lifecycle_listener` /
+                        // `register_panik_signal_rx`. In the IN-PROCESS
+                        // distributed manager the authority is the
+                        // in-process `PrimaryCoordinator` (built below),
+                        // which fires `on_phase_*` directly; these
+                        // in-process secondaries use a `NoPeerTransport`
+                        // mesh and therefore compose NO co-located parked
+                        // primary, so their registered callbacks stay
+                        // dormant (no transfer, no promotion in-process)
+                        // and never call into Python. They are registered
+                        // for shape-parity with the SLURM secondary path
+                        // (which DOES transfer them to a co-located parked
+                        // primary); the closures target the SAME single
+                        // process-wide Python `TaskDefinition` instance
+                        // the in-process primary's callbacks already use.
                         secondary.register_phase_lifecycle_callbacks(
                             sec_on_phase_start,
                             sec_on_phase_end,
@@ -549,9 +526,14 @@ impl PyDistributedManager {
 
                     sec_handles.push(handle);
                 }
-                drop(incoming_tx); // Only forwarding tasks hold senders now
+                // Drop the original inbound sink so only the per-secondary
+                // forwarding tasks hold senders — once every secondary
+                // exits and its forwarder ends, the transport's
+                // `recv_peer()` observes `None` (the inbound-closed
+                // signal the operational loop's `transport_closed` gate
+                // keys off).
+                drop(inbound);
 
-                let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
                 let config = PrimaryConfig {
                     node_id: "primary".into(),
                     num_secondaries,
@@ -607,7 +589,6 @@ impl PyDistributedManager {
 
                 let mut primary = PrimaryCoordinator::new(
                     config,
-                    transport,
                     peer_transport,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
@@ -641,24 +622,25 @@ impl PyDistributedManager {
                 // process polls independently and fires its own
                 // teardown when its file appears. Handle held in
                 // scope for `Drop::abort()` at loop exit.
-                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
-                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
-                        paths: panik_watcher_paths,
-                        poll_interval: panik_watcher_poll_interval,
-                        // PRIMARY-role spawner: SIGTERM listening
-                        // OFF. The host-driven SIGTERM cascade is
-                        // a secondary-side concern (SLURM
-                        // time-limit applies to allocations
-                        // running secondary jobs; the primary
-                        // typically runs on the operator host,
-                        // not in a SLURM-allocated container).
-                        // Primary shutdown is driven by the
-                        // sentinel-file path, by orchestrator
-                        // teardown, or by panik broadcast from a
-                        // secondary that hit SIGTERM.
-                        listen_for_sigterm: false,
-                    },
-                );
+                let mut panik_watcher =
+                    dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                        dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                            paths: panik_watcher_paths,
+                            poll_interval: panik_watcher_poll_interval,
+                            // PRIMARY-role spawner: SIGTERM listening
+                            // OFF. The host-driven SIGTERM cascade is
+                            // a secondary-side concern (SLURM
+                            // time-limit applies to allocations
+                            // running secondary jobs; the primary
+                            // typically runs on the operator host,
+                            // not in a SLURM-allocated container).
+                            // Primary shutdown is driven by the
+                            // sentinel-file path, by orchestrator
+                            // teardown, or by panik broadcast from a
+                            // secondary that hit SIGTERM.
+                            listen_for_sigterm: false,
+                        },
+                    );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     primary.register_panik_signal_rx(rx);
                 }
@@ -704,6 +686,9 @@ impl PyDistributedManager {
                     }
                     Err(e @ RunError::SetupDeadlineExpired { .. }) => {
                         setup_deadline_expired = Some(e);
+                    }
+                    Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
+                        duplicate_task_id_pre_phase = Some(e);
                     }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow for non-structured
@@ -761,6 +746,14 @@ impl PyDistributedManager {
             // (strictly stronger) and before cluster-collapsed
             // (deadline expiry means zero tasks dispatched, so
             // stranded accounting carries no useful operator pointer).
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = duplicate_task_id_pre_phase {
+            // Surface the pre-phase duplicate-task-id abort (#3a) — same
+            // shape as `PyPrimaryCoordinator::run`. The in-process
+            // primary already broadcast `RunAborted`; raise here so the
+            // Python wrapper sees a non-zero exit instead of exit 0.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

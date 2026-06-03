@@ -277,9 +277,7 @@ mod tests {
     fn validate_silent_when_id_in_known_set() {
         let mut v = PreferredSecondariesValidator::new();
         let tasks = [task_with_prefs("a", &["secondary-known"])];
-        let known: HashSet<String> = [String::from("secondary-known")]
-            .into_iter()
-            .collect();
+        let known: HashSet<String> = [String::from("secondary-known")].into_iter().collect();
         v.validate(tasks.iter(), &known);
         assert!(v.warned_snapshot().is_empty());
     }
@@ -288,17 +286,9 @@ mod tests {
     /// tests so the priority-class ordering assertions read against
     /// the same mental model — phase / type / affinity / size /
     /// preferred_secondaries.
-    fn t(
-        phase: &str,
-        ty: &str,
-        affinity: &str,
-        size: u64,
-        prefs: &[&str],
-    ) -> TaskInfo<()> {
+    fn t(phase: &str, ty: &str, affinity: &str, size: u64, prefs: &[&str]) -> TaskInfo<()> {
         TaskInfo {
-            path: std::path::PathBuf::from(format!(
-                "/tmp/{phase}_{ty}_{affinity}_{size}"
-            )),
+            path: std::path::PathBuf::from(format!("/tmp/{phase}_{ty}_{affinity}_{size}")),
             size,
             identifier: (),
             phase_id: PhaseId::from(phase),
@@ -330,11 +320,8 @@ mod tests {
     #[test]
     fn preferred_secondaries_predicate_promotes_preferred_within_class() {
         let phases = vec![PhaseId::from("P")];
-        let mut pool = PendingPool::<()>::new(
-            phases,
-            std::collections::HashMap::new(),
-        )
-        .expect("valid graph");
+        let mut pool =
+            PendingPool::<()>::new(phases, std::collections::HashMap::new()).expect("valid graph");
         pool.extend([
             // alpha bucket — will become worker 1's pin after the first pop.
             //
@@ -386,11 +373,8 @@ mod tests {
     #[test]
     fn preferred_secondaries_predicate_empty_list_is_noop() {
         let phases = vec![PhaseId::from("P")];
-        let mut pool = PendingPool::<()>::new(
-            phases,
-            std::collections::HashMap::new(),
-        )
-        .expect("valid graph");
+        let mut pool =
+            PendingPool::<()>::new(phases, std::collections::HashMap::new()).expect("valid graph");
         pool.extend([
             t("P", "T", "alpha", 1, &[]),
             t("P", "T", "alpha", 2, &[]),

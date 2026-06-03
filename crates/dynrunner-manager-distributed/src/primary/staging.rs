@@ -10,11 +10,11 @@
 use std::path::{Path, PathBuf};
 
 use dynrunner_core::{Identifier, TaskInfo, TypeId};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::wire::{compute_task_hash, timestamp_now};
 use super::PrimaryCoordinator;
+use super::wire::{compute_task_hash, timestamp_now};
 use crate::zip_extract::compute_file_hash;
 
 /// Errors raised by the primary's initial-staging walk.
@@ -47,7 +47,11 @@ pub enum StagingError {
 impl std::fmt::Display for StagingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StagingError::SourceUnreadable { path, resolved, type_id } => write!(
+            StagingError::SourceUnreadable {
+                path,
+                resolved,
+                type_id,
+            } => write!(
                 f,
                 "queue_initial_staging: cannot read {} (resolved={}, type_id={}). \
                  Typical causes: --source points at the wrong tree; the file is \
@@ -157,10 +161,9 @@ pub fn compute_initial_staging_entries<I: Identifier>(
     Ok(entries)
 }
 
-impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
+impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
 where
-    T: SecondaryTransport<I>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
@@ -192,11 +195,7 @@ where
         secondary_ids: &[String],
         source_root: &Path,
     ) -> Result<(), StagingError> {
-        let entries = compute_initial_staging_entries(
-            binaries,
-            secondary_ids,
-            source_root,
-        )?;
+        let entries = compute_initial_staging_entries(binaries, secondary_ids, source_root)?;
         self.pending_stage_files.extend(entries);
         Ok(())
     }
@@ -233,15 +232,11 @@ where
             return Ok(());
         }
         if !self.config.uses_file_based_items {
-            tracing::debug!(
-                "auto-stage skipped: uses_file_based_items=false (opaque local_path)"
-            );
+            tracing::debug!("auto-stage skipped: uses_file_based_items=false (opaque local_path)");
             return Ok(());
         }
         if self.config.source_pre_staged_root.is_some() {
-            tracing::debug!(
-                "auto-stage skipped: pre-staged-source mode (bind-mount)"
-            );
+            tracing::debug!("auto-stage skipped: pre-staged-source mode (bind-mount)");
             return Ok(());
         }
         let Some(source_dir) = self.config.source_dir.clone() else {
@@ -298,7 +293,8 @@ where
             src_path,
             dest_path,
         };
-        self.transport.send_to(secondary_id, msg).await
+        self.transport
+            .send(Address::Peer(secondary_id.to_string()), msg)
+            .await
     }
-
 }

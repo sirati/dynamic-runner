@@ -455,10 +455,9 @@ impl OomWatcher {
         }
 
         let delta = |cur: u64, prev: u64| -> u64 { cur.saturating_sub(prev) };
-        let any_grew_by_1gib =
-            delta(cur_host_ram_used, prev.host_ram_used) >= DELTA_TRIGGER_BYTES
-                || delta(cur_cgroup_cur, prev.container_memory_current) >= DELTA_TRIGGER_BYTES
-                || delta(cur_rss_sum, prev.tracked_workers_rss_sum) >= DELTA_TRIGGER_BYTES;
+        let any_grew_by_1gib = delta(cur_host_ram_used, prev.host_ram_used) >= DELTA_TRIGGER_BYTES
+            || delta(cur_cgroup_cur, prev.container_memory_current) >= DELTA_TRIGGER_BYTES
+            || delta(cur_rss_sum, prev.tracked_workers_rss_sum) >= DELTA_TRIGGER_BYTES;
 
         if any_grew_by_1gib {
             Some(LogTrigger::DeltaUnderPressure)

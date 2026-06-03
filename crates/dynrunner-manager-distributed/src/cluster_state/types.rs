@@ -24,10 +24,7 @@ use serde::{Deserialize, Serialize};
 /// need for a parallel completed-task-id ledger; the alternative would
 /// reintroduce duplicated state across `cluster_state` and a side cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub enum TaskState<I> {
     Pending {
         task: TaskInfo<I>,
@@ -81,31 +78,48 @@ pub enum TaskState<I> {
         task: TaskInfo<I>,
         on: String,
     },
-    /// Operator-initiated emergency cancellation. The
-    /// `ClusterMutation::PanikRequested` apply rule transitions every
-    /// non-terminal entry (`Pending` / `InFlight` / `Blocked`) to this
-    /// variant in one sweep, latching the `panik_active` ClusterState
-    /// flag at the same time. `reason` mirrors the originator's
-    /// broadcast payload (e.g. the path of the panik file that
-    /// triggered the broadcast).
+    /// The task hit `ErrorType::InvalidTask` — it is structurally
+    /// invalid (e.g. a `task_depends_on` reference to a literally-
+    /// absent id, or a duplicate `(phase_id, task_id)`), so it can
+    /// never legitimately execute. Discrete variant (rather than
+    /// `Failed { kind: InvalidTask, .. }`) for the same reason as
+    /// `Unfulfillable`: downstream matcher / state-filter logic can
+    /// dispatch on the discriminant. `reason` mirrors the
+    /// `BoundedString<2048>` body from the wire mutation (stored
+    /// here as `String`; the cap is the wire-codec's concern).
     ///
-    /// Discrete variant rather than `Failed { kind: NonRecoverable,
-    /// last_error: "panik" }` for the same reason `Unfulfillable` is
-    /// discrete: downstream matcher / state-filter / metrics logic
-    /// can dispatch on the discriminant without parsing a free-form
-    /// `last_error` string. `OutcomeSummary.cancelled` partitions on
-    /// this variant; a real `Failed { NonRecoverable, .. }` (worker-
-    /// surfaced terminal failure) is counted under `fail_final`
-    /// independently.
-    ///
-    /// Late-arriving `TaskCompleted` for a hash in this state still
-    /// transitions to `Completed` (success is the strongest terminal
-    /// across all non-`Completed` predecessors, including
-    /// `Cancelled`). Late `TaskFailed` against `Cancelled` is a NoOp.
-    Cancelled {
+    /// **Terminal and NON-reinjectable** — this is the load-bearing
+    /// divergence from `Unfulfillable`. An unfulfillable task awaits
+    /// a cluster resource that may later appear, so `ReinjectTask`
+    /// transitions it back to `Pending`; an invalid task is wrong by
+    /// construction and no external action can make it valid, so the
+    /// `ReinjectTask` gate rejects it and the terminal-lockout NoOp
+    /// guards (the strongest-terminal arms in `TaskCompleted` /
+    /// `TaskFailed` / `TaskBlocked`) refuse to overwrite it. Folded
+    /// into `fail_final` by `outcome_counts` for operator-readable
+    /// buckets, sibling to `Unfulfillable`.
+    InvalidTask {
         task: TaskInfo<I>,
         reason: String,
     },
+}
+
+impl<I> TaskState<I> {
+    /// Mutable borrow of the carried `TaskInfo`, regardless of variant.
+    /// One canonical accessor so callers that need to mutate the task
+    /// payload (e.g. the snapshot migration shim filling phase-less
+    /// deps) do not each re-spell the all-variants match.
+    pub(crate) fn task_mut(&mut self) -> &mut TaskInfo<I> {
+        match self {
+            TaskState::Pending { task }
+            | TaskState::InFlight { task, .. }
+            | TaskState::Completed { task }
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::InvalidTask { task, .. }
+            | TaskState::Blocked { task, .. } => task,
+        }
+    }
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge
@@ -130,10 +144,9 @@ pub struct StateCounts {
     /// of an unfulfillable prerequisite, dormant until the prereq
     /// completes via the reinject + re-run path.
     pub blocked: usize,
-    /// Tasks in `TaskState::Cancelled { .. }` — operator-initiated
-    /// emergency-stop transitions originated by a
-    /// `ClusterMutation::PanikRequested` broadcast.
-    pub cancelled: usize,
+    /// Tasks in `TaskState::InvalidTask { .. }` — terminal, non-
+    /// reinjectable structural failures (missing dep / duplicate id).
+    pub invalid_task: usize,
 }
 
 /// Per-class outcome breakdown the primary emits on every
@@ -173,26 +186,16 @@ pub struct OutcomeSummary {
     pub fail_retry: usize,
     pub fail_oom: usize,
     pub fail_final: usize,
-    /// Operator-initiated panik-shutdown transitions
-    /// (`TaskState::Cancelled`). Independent of every `fail_*` bucket:
-    /// a cancelled task is neither a real success nor a real failure
-    /// — it's an "operator stopped the run" terminal. Surfaces in
-    /// operator logs so an emergency-stopped run's terminal report
-    /// reads `succeeded=A fail_retry=B fail_oom=C fail_final=D
-    /// cancelled=E` rather than burying the panik count inside
-    /// `fail_final`.
-    pub cancelled: usize,
 }
 
 impl OutcomeSummary {
     /// Sum across all buckets — the total tasks that reached a
-    /// terminal state (success, any failure, or cancellation).
-    /// Distinct from `total_tasks` on the coordinator, which counts
-    /// the input batch; `total_terminal()` reaches `total_tasks`
-    /// exactly when the run is fully accounted for (including
-    /// panik-cancelled tasks).
+    /// terminal state (success or any failure). Distinct from
+    /// `total_tasks` on the coordinator, which counts the input
+    /// batch; `total_terminal()` reaches `total_tasks` exactly when
+    /// the run is fully accounted for.
     pub fn total_terminal(&self) -> usize {
-        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final + self.cancelled
+        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
     }
 }
 

@@ -21,7 +21,7 @@ use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleChangeHookRegistrar,
 };
 
-use super::{NoPeerTransport, PeerNetwork};
+use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 
 /// Runtime-selected peer transport.
 ///
@@ -35,6 +35,23 @@ pub enum EitherPeerTransport<I: Identifier> {
     // pessimise the disabled arm (clippy::large_enum_variant).
     Real(Box<PeerNetwork<I>>),
     Disabled(NoPeerTransport),
+}
+
+impl<I: Identifier> EitherPeerTransport<I> {
+    /// Mint a cloneable [`MeshSendHandle`] for a co-located parked
+    /// primary's send-proxy, when a real mesh exists.
+    ///
+    /// `Some` for `Real` (a live `PeerNetwork` whose `recv_peer` drains
+    /// the proxy); `None` for `Disabled` — a firewalled / single-
+    /// secondary deployment has no mesh and therefore no remote
+    /// secondaries for a co-located primary to reach. The composition
+    /// only wires a co-located primary when this returns `Some`.
+    pub fn mesh_send_handle(&self) -> Option<MeshSendHandle<I>> {
+        match self {
+            Self::Real(p) => Some(p.mesh_send_handle()),
+            Self::Disabled(_) => None,
+        }
+    }
 }
 
 impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
@@ -82,7 +99,9 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         match self {
-            Self::Real(p) => <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(&mut **p, peers).await,
+            Self::Real(p) => {
+                <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(&mut **p, peers).await
+            }
             Self::Disabled(p) => PeerTransport::<I>::connect_to_peers(p, peers).await,
         }
     }

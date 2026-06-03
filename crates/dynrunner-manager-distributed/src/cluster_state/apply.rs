@@ -6,8 +6,8 @@
 //! `apply_peer`; the `TasksSpawned` batch arm delegates to
 //! `apply_tasks`; the simpler per-hash transitions (`TaskAdded`,
 //! `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `PrimaryChanged`,
-//! `PhaseDepsSet`, `RunComplete`, `TaskReinjected`, `TaskBlocked`,
-//! `TaskPreferredSecondariesUpdated`) live inline here.
+//! `PhaseDepsSet`, `RunComplete`, `TaskReinjected`, `TaskRequeued`,
+//! `TaskBlocked`, `TaskPreferredSecondariesUpdated`) live inline here.
 //!
 //! Two entry points: the receiver-side `apply` convenience wrapper
 //! that discards the auto-resumed list AND the freshly-Pending
@@ -43,11 +43,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn apply(&mut self, m: ClusterMutation<I>) -> ApplyOutcome {
         let mut _resumed_scratch: Vec<TaskInfo<I>> = Vec::new();
         let mut _newly_pending_scratch: Vec<TaskInfo<I>> = Vec::new();
-        self.apply_with_resumed_blocked(
-            m,
-            &mut _resumed_scratch,
-            &mut _newly_pending_scratch,
-        )
+        self.apply_with_resumed_blocked(m, &mut _resumed_scratch, &mut _newly_pending_scratch)
     }
 
     /// Apply a single `ClusterMutation<I>` and, in addition to the
@@ -82,9 +78,7 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.tasks.entry(hash)
-                {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
                     e.insert(TaskState::Pending { task });
                     ApplyOutcome::Applied
                 } else {
@@ -119,6 +113,15 @@ impl<I: Identifier> ClusterState<I> {
                     // same hash arrives twice via peer-forwarding
                     // redundancy or snapshot replay).
                     TaskState::Completed { .. } => return ApplyOutcome::NoOp,
+                    // `InvalidTask` is a terminal, non-reinjectable
+                    // lockout: a structurally-invalid task is never
+                    // dispatched, so a `TaskCompleted` for its hash is
+                    // spurious and must NOT regress the terminal. This
+                    // diverges from the `Unfulfillable`/`Blocked` arm
+                    // below, which IS superseded by a genuine success
+                    // (those tasks can legitimately run once the
+                    // resource appears).
+                    TaskState::InvalidTask { .. } => return ApplyOutcome::NoOp,
                     // Retry-success supersedes a prior Recoverable
                     // failure: the retry pass re-injects the binary,
                     // a worker picks it up, and the next TaskCompleted
@@ -154,8 +157,7 @@ impl<I: Identifier> ClusterState<I> {
                     // band), success is still the strongest terminal.
                     TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
-                    | TaskState::Blocked { task, .. }
-                    | TaskState::Cancelled { task, .. } => task.clone(),
+                    | TaskState::Blocked { task, .. } => task.clone(),
                     TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
                 };
                 // Snapshot the `task_id` for the dispatcher event
@@ -196,6 +198,7 @@ impl<I: Identifier> ClusterState<I> {
                     task_hash: hash,
                     success: true,
                     error_kind: None,
+                    last_error: None,
                 });
                 ApplyOutcome::Applied
             }
@@ -203,64 +206,66 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                // Capture task_id + wire-stable error_kind for the
-                // dispatcher event. The id snapshot lives outside the
-                // arms below so the emit at the bottom of the match
-                // sees a uniform binding regardless of which arm
-                // applied. The arms that NoOp return early and never
-                // reach the emit; the two "Applied" arms set this to
-                // `Some(...)` before exiting via the bottom emit.
+                // Capture task_id + wire-stable error_kind + the error
+                // message for the dispatcher event. The snapshot lives
+                // outside the arms below so the emit at the bottom of
+                // the match sees a uniform binding regardless of which
+                // arm applied. The arms that NoOp return early and
+                // never reach the emit; the two "Applied" arms set this
+                // to `Some(...)` BEFORE `error` is moved into the
+                // ledger entry, so the carried message is the same body
+                // that lands on the entry's `last_error`.
                 // `task.task_id` is non-optional per the framework's
                 // boundary contract; the captured payload is `String`.
-                let mut emit_payload: Option<(String, String)> = None;
+                let mut emit_payload: Option<(String, String, String)> = None;
                 let outcome = match state {
                     // Strongest terminals lock out incoming TaskFailed.
                     // `Completed` never regresses; `Unfulfillable` is a
                     // stable reinjectable terminal — a late generic
-                    // worker-originated TaskFailed must not regress it.
+                    // worker-originated TaskFailed must not regress it;
+                    // `InvalidTask` is a stable non-reinjectable
+                    // terminal — once a task is structurally invalid a
+                    // later generic TaskFailed must not overwrite the
+                    // discrete reason (the lockout keeps the invalid-
+                    // task reason accurate).
                     TaskState::Completed { .. }
                     | TaskState::Unfulfillable { .. }
-                    // `Cancelled` is an operator-initiated emergency
-                    // terminal; a late worker-surfaced `TaskFailed`
-                    // must not regress it (operator's "stop the run"
-                    // intent supersedes a residual worker failure
-                    // message that raced the panik signal). Late
-                    // `TaskCompleted` against `Cancelled` is allowed
-                    // (handled in the `TaskCompleted` arm) — success
-                    // is the strongest terminal, so genuine work
-                    // completion still lands.
-                    | TaskState::Cancelled { .. } => ApplyOutcome::NoOp,
+                    | TaskState::InvalidTask { .. } => ApplyOutcome::NoOp,
                     TaskState::Failed {
                         task,
                         kind: k,
                         last_error,
                         attempts,
                     } => {
-                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
+                        emit_payload =
+                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
                         *attempts += 1;
                         *k = kind;
                         *last_error = error;
                         ApplyOutcome::Applied
                     }
                     // Non-terminal states transition based on the
-                    // error class: `Unfulfillable` routes to the
-                    // discrete state so downstream matcher / reinject
-                    // logic can dispatch on the discriminant; every
-                    // other `ErrorType` lands in the generic `Failed`
-                    // bucket preserving the legacy attempts/last_error
-                    // shape.
+                    // error class: `Unfulfillable` and `InvalidTask`
+                    // each route to their discrete state so downstream
+                    // matcher / reinject logic can dispatch on the
+                    // discriminant; every other `ErrorType` lands in
+                    // the generic `Failed` bucket preserving the legacy
+                    // attempts/last_error shape.
                     TaskState::Pending { task }
                     | TaskState::InFlight { task, .. }
                     | TaskState::Blocked { task, .. } => {
                         let task = task.clone();
-                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
+                        emit_payload =
+                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
                         *state = match kind {
-                            ErrorType::Unfulfillable { reason } => {
-                                TaskState::Unfulfillable {
-                                    task,
-                                    reason: reason.to_string(),
-                                }
-                            }
+                            ErrorType::Unfulfillable { reason } => TaskState::Unfulfillable {
+                                task,
+                                reason: reason.to_string(),
+                            },
+                            ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
+                                task,
+                                reason: reason.to_string(),
+                            },
                             other => TaskState::Failed {
                                 task,
                                 kind: other,
@@ -277,12 +282,13 @@ impl<I: Identifier> ClusterState<I> {
                 // `emit_payload = None`). See
                 // [`Self::emit_task_completed_event`] for the CCD-9
                 // contract.
-                if let Some((task_id, error_kind)) = emit_payload {
+                if let Some((task_id, error_kind, last_error)) = emit_payload {
                     self.emit_task_completed_event(TaskCompletedEvent {
                         task_id,
                         task_hash: hash,
                         success: false,
                         error_kind: Some(error_kind),
+                        last_error: Some(last_error),
                     });
                 }
                 outcome
@@ -330,6 +336,18 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_complete = true;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::RunAborted { reason } => {
+                // Sticky monotonic: the first abort reason wins. A
+                // re-applied / duplicate `RunAborted` (at-least-once
+                // delivery, or a snapshot re-broadcast) is a NoOp so the
+                // reason and the latched flag never churn. Mirror of
+                // the `RunComplete` arm above — the failure twin.
+                if self.run_aborted.is_some() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.run_aborted = Some(reason);
+                ApplyOutcome::Applied
+            }
             ClusterMutation::TaskReinjected { hash } => {
                 // External-control reinjection moves a
                 // `Unfulfillable { .. }` entry back to `Pending`. Any
@@ -347,6 +365,32 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 let task = match state {
                     TaskState::Unfulfillable { task, .. } => task.clone(),
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::Pending { task };
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::TaskRequeued { hash } => {
+                // Dead-secondary recovery moves an `InFlight { .. }`
+                // entry back to `Pending` so the live primary re-
+                // dispatches it (and a post-failover hydrate routes it
+                // into the pool rather than the in-flight ledger). Any
+                // other state is a NoOp:
+                //   * a terminal (`Completed` / `Failed` /
+                //     `Unfulfillable` / `InvalidTask`) that arrived
+                //     first wins — a worker outcome that raced the
+                //     death observation must not be resurrected;
+                //   * `Pending` is idempotent under at-least-once
+                //     delivery;
+                //   * `Blocked` is a cascade-pause, not a dispatched
+                //     task — there is nothing in flight to requeue.
+                // The preserved `TaskInfo` is moved into the new
+                // `Pending` so re-dispatch carries the same binary.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let task = match state {
+                    TaskState::InFlight { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
                 *state = TaskState::Pending { task };
@@ -371,14 +415,11 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Completed { .. }
                     | TaskState::Failed { .. }
                     | TaskState::Unfulfillable { .. }
-                    // `Cancelled` is an operator-initiated emergency
-                    // terminal — cascade-block decisions land before
-                    // it (the panik wipes Pending/Blocked alike) and
-                    // a stale `TaskBlocked` arriving after panik must
-                    // not regress the cancellation.
-                    | TaskState::Cancelled { .. }
+                    | TaskState::InvalidTask { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
-                    TaskState::Blocked { on: existing_on, .. } => {
+                    TaskState::Blocked {
+                        on: existing_on, ..
+                    } => {
                         if existing_on == &on {
                             ApplyOutcome::NoOp
                         } else {
@@ -405,8 +446,8 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Completed { task }
                     | TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
-                    | TaskState::Blocked { task, .. }
-                    | TaskState::Cancelled { task, .. } => task,
+                    | TaskState::InvalidTask { task, .. }
+                    | TaskState::Blocked { task, .. } => task,
                 };
                 task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
                 ApplyOutcome::Applied
@@ -415,56 +456,19 @@ impl<I: Identifier> ClusterState<I> {
                 peer_id,
                 is_observer,
             } => self.apply_peer_joined(peer_id, is_observer),
-            ClusterMutation::PeerRemoved { id, cause } => {
-                self.apply_peer_removed(id, cause)
-            }
+            ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,
                 holdings,
                 epoch,
             } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
+            ClusterMutation::SecondaryCapacity {
+                secondary,
+                worker_count,
+                resources,
+            } => self.apply_secondary_capacity(secondary, worker_count, resources),
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
-            }
-            ClusterMutation::PanikRequested {
-                source_peer,
-                reason,
-            } => {
-                // Sticky-first-wins: once `panik_active` is set, the
-                // first-applying broadcast's `source_peer`/`reason`
-                // are canonical and re-application is silent. This
-                // means two distinct nodes detecting the panik file
-                // independently and broadcasting in parallel converge
-                // to identical state across the cluster — the second
-                // applying broadcast finds `panik_active = true` and
-                // exits before touching the task map.
-                if self.panik_active {
-                    return ApplyOutcome::NoOp;
-                }
-                self.panik_active = true;
-                self.panik_source = Some(source_peer);
-                self.panik_reason = Some(reason.clone());
-                // Sweep non-terminal entries to `Cancelled`. Terminal
-                // states (`Completed`, `Failed`, `Unfulfillable`, and
-                // re-applied `Cancelled` itself) are preserved —
-                // work that already finished isn't retroactively
-                // un-finished.
-                for state in self.tasks.values_mut() {
-                    let task = match state {
-                        TaskState::Pending { task }
-                        | TaskState::InFlight { task, .. }
-                        | TaskState::Blocked { task, .. } => task.clone(),
-                        TaskState::Completed { .. }
-                        | TaskState::Failed { .. }
-                        | TaskState::Unfulfillable { .. }
-                        | TaskState::Cancelled { .. } => continue,
-                    };
-                    *state = TaskState::Cancelled {
-                        task,
-                        reason: reason.clone(),
-                    };
-                }
-                ApplyOutcome::Applied
             }
         }
     }

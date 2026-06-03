@@ -7,15 +7,11 @@ use dynrunner_core::{ErrorType, TaskInfo};
 use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler::ResourceStealingScheduler;
 
-use crate::fulfillability_matcher::{
-    FulfillabilityMatcher, MatcherBatch, MatcherTriggerEvent,
-};
-use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, NoPeers, TestId,
-};
+use crate::fulfillability_matcher::{FulfillabilityMatcher, MatcherBatch, MatcherTriggerEvent};
+use crate::primary::test_helpers::{FixedEstimator, TestId, make_binary, setup_test};
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryCommand, PrimaryConfig, PrimaryCoordinator};
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 
 /// Capturing matcher: records every `(hash, reason)` pair it is
 /// asked about so the tests can assert which tasks the pipeline
@@ -70,8 +66,7 @@ impl FulfillabilityMatcher<TestId> for PanickyOnHashMatcher {
 /// Same shape as command_channel::tests::make_coordinator — built
 /// in this file to avoid leaking the helper across modules.
 fn make_coordinator() -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -101,7 +96,6 @@ fn make_coordinator() -> PrimaryCoordinator<
     PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -113,8 +107,7 @@ fn make_coordinator() -> PrimaryCoordinator<
 /// production CRDT does.
 fn seed_tasks(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -125,41 +118,39 @@ fn seed_tasks(
     for (name, state) in entries {
         let binary = make_binary(name, 100);
         let hash = compute_task_hash(&binary);
-        coordinator
-            .cluster_state
-            .apply(ClusterMutation::TaskAdded {
-                hash: hash.clone(),
-                task: binary.clone(),
-            });
+        coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: hash.clone(),
+            task: binary.clone(),
+        });
         match *state {
             "Pending" => {}
             "Unfulfillable" => {
-                coordinator.cluster_state.apply(
-                    ClusterMutation::TaskFailed {
+                coordinator
+                    .cluster_state
+                    .apply(ClusterMutation::TaskFailed {
                         hash: hash.clone(),
                         kind: ErrorType::Unfulfillable {
-                            reason: format!(
-                                "missing-resource-for-{name}"
-                            )
-                            .into(),
+                            reason: format!("missing-resource-for-{name}").into(),
                         },
                         error: format!("unfulfillable {name}"),
-                    },
-                );
+                    });
             }
             "Failed_NonRecoverable" => {
-                coordinator.cluster_state.apply(
-                    ClusterMutation::TaskFailed {
+                coordinator
+                    .cluster_state
+                    .apply(ClusterMutation::TaskFailed {
                         hash: hash.clone(),
                         kind: ErrorType::NonRecoverable,
                         error: format!("nonrecoverable {name}"),
-                    },
-                );
+                    });
             }
             "Completed" => {
-                coordinator.cluster_state.apply(
-                    ClusterMutation::TaskCompleted { hash: hash.clone(), result_data: None },
-                );
+                coordinator
+                    .cluster_state
+                    .apply(ClusterMutation::TaskCompleted {
+                        hash: hash.clone(),
+                        result_data: None,
+                    });
             }
             other => panic!("unsupported seed state: {other}"),
         }
@@ -172,8 +163,7 @@ fn seed_tasks(
 /// registered when an auto-fire lands.
 fn init_pool(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -182,8 +172,7 @@ fn init_pool(
     let mut phase_set = std::collections::HashSet::new();
     phase_set.insert(dynrunner_core::PhaseId::from("default"));
     coordinator.pending = Some(
-        dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
-            .expect("pool init"),
+        dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new()).expect("pool init"),
     );
 }
 
@@ -191,8 +180,7 @@ fn init_pool(
 /// `(hash, _reply)` pairs of every `ReinjectTask` command seen.
 fn drain_reinject_commands(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -364,9 +352,7 @@ async fn matcher_batched_per_holdings_update_burst() {
         .run_until(async {
             // Exercise the drain helper standalone: 50 sends in
             // quick succession collapse into one batch.
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<
-                MatcherTriggerEvent,
-            >();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<MatcherTriggerEvent>();
             for i in 0..50u32 {
                 let mut h = HashMap::new();
                 h.insert(
@@ -384,9 +370,11 @@ async fn matcher_batched_per_holdings_update_burst() {
             .await
             .expect("burst should yield a batch");
             // Snapshot is the LATEST event in the burst.
-            assert!(batch.holdings.contains_key("peer-1")
-                || batch.holdings.contains_key("peer-2")
-                || batch.holdings.contains_key("peer-0"));
+            assert!(
+                batch.holdings.contains_key("peer-1")
+                    || batch.holdings.contains_key("peer-2")
+                    || batch.holdings.contains_key("peer-0")
+            );
 
             // Now invoke the matcher walk with this batch and
             // confirm it fires exactly once per Unfulfillable
@@ -396,10 +384,7 @@ async fn matcher_batched_per_holdings_update_burst() {
             init_pool(&mut coordinator);
             let _hashes = seed_tasks(
                 &mut coordinator,
-                &[
-                    ("u-a", "Unfulfillable"),
-                    ("u-b", "Unfulfillable"),
-                ],
+                &[("u-a", "Unfulfillable"), ("u-b", "Unfulfillable")],
             );
             let calls = Arc::new(AtomicUsize::new(0));
             let matcher = CapturingMatcher {
@@ -408,9 +393,7 @@ async fn matcher_batched_per_holdings_update_burst() {
                 calls: calls.clone(),
             };
             coordinator.set_fulfillability_matcher(Box::new(matcher));
-            coordinator
-                .invoke_fulfillability_matcher_batch(batch)
-                .await;
+            coordinator.invoke_fulfillability_matcher_batch(batch).await;
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 2,

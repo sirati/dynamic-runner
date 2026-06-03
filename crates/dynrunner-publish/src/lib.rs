@@ -103,11 +103,7 @@ pub enum PublishError {
 /// Always-overwrite: if `dst` exists, it is replaced. Callers gate
 /// "should I publish at all?" upstream (handler-level skip-existing
 /// logic); reaching this function means publish is intended.
-pub fn publish_one(
-    src: &Path,
-    dst: &Path,
-    src_root: &Path,
-) -> Result<(), PublishError> {
+pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), PublishError> {
     // Resolve symlinks on both sides so a worker can't escape
     // `src_root` by symlinking out of the staging mount.
     let canon_src = fs::canonicalize(src).map_err(|e| PublishError::SourceMissing {
@@ -136,9 +132,7 @@ pub fn publish_one(
             if e.kind() == std::io::ErrorKind::AlreadyExists
                 && let Some(culprit) = first_existing_file_ancestor(parent)
             {
-                return PublishError::DestinationParentIsFile {
-                    path: culprit,
-                };
+                return PublishError::DestinationParentIsFile { path: culprit };
             }
             PublishError::DestinationParentCreate {
                 path: parent.to_path_buf(),
@@ -313,9 +307,7 @@ mod tests {
             PublishError::DestinationParentIsFile { path } => {
                 assert_eq!(path, collision);
             }
-            other => panic!(
-                "expected DestinationParentIsFile, got {other:?}"
-            ),
+            other => panic!("expected DestinationParentIsFile, got {other:?}"),
         }
     }
 
@@ -351,11 +343,7 @@ mod tests {
         let leftover = fs::read_dir(dst_root.join("out"))
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("publish-tmp")
-            });
+            .any(|e| e.file_name().to_string_lossy().contains("publish-tmp"));
         assert!(!leftover, "tmp sibling left behind");
     }
 
@@ -465,11 +453,7 @@ mod tests {
             let leftover = fs::read_dir(dst.parent().unwrap())
                 .unwrap()
                 .filter_map(|e| e.ok())
-                .any(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .contains("publish-tmp")
-                });
+                .any(|e| e.file_name().to_string_lossy().contains("publish-tmp"));
             assert!(!leftover, "cross-FS tmp sibling not cleaned up");
         }
     }

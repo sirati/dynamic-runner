@@ -75,7 +75,8 @@ impl<G: Gateway> SlurmJobManager<G> {
         // which binding launched the job.
         let script_path = format!("{}/job_{job_name}.sh", self.config.root_folder);
         let escaped = wrapper_script.replace('\'', "'\\''");
-        let write_cmd = format!("printf '%s' '{escaped}' > {script_path} && chmod +x {script_path}");
+        let write_cmd =
+            format!("printf '%s' '{escaped}' > {script_path} && chmod +x {script_path}");
         let result = self.gateway.execute_command(&write_cmd, None).await?;
         if !result.success() {
             return Err(SlurmError::Command(format!(
@@ -158,9 +159,7 @@ impl<G: Gateway> SlurmJobManager<G> {
 
         let job_id = result.stdout.trim().to_string();
         if job_id.is_empty() {
-            return Err(SlurmError::Command(
-                "sbatch returned empty job ID".into(),
-            ));
+            return Err(SlurmError::Command("sbatch returned empty job ID".into()));
         }
 
         tracing::info!(job_id = %job_id, job_name, "SLURM job submitted");
@@ -241,4 +240,3 @@ impl<G: Gateway> SlurmJobManager<G> {
         })
     }
 }
-

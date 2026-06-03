@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver};
 
+use crate::DistributedMessage;
 use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
 use crate::messages::timestamp_now;
-use crate::DistributedMessage;
 
 /// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
 ///
@@ -88,9 +88,7 @@ impl std::error::Error for JoinError {}
 /// `MessageSender`/`MessageReceiver` shape; the trait keeps it as a
 /// protocol-level addition without leaking the transport-level
 /// `connections: HashMap` into call sites.
-pub trait SecondaryTransport<I: Identifier>:
-    MessageReceiver<DistributedMessage<I>>
-{
+pub trait SecondaryTransport<I: Identifier>: MessageReceiver<DistributedMessage<I>> {
     /// Send a message to a specific secondary.
     fn send_to(
         &mut self,
@@ -190,8 +188,9 @@ pub trait PeerTransport<I: Identifier> {
         async move {
             match addr {
                 Address::Peer(id) => self.send_to_peer(&id, msg).await,
-                Address::Broadcast(Scope::Mesh)
-                | Address::Broadcast(Scope::AllSecondaries) => self.broadcast(msg).await,
+                Address::Broadcast(Scope::Mesh) | Address::Broadcast(Scope::AllSecondaries) => {
+                    self.broadcast(msg).await
+                }
                 Address::Role(role) => {
                     // Resolve via the write-through cache (Step 2).
                     // Cache-cold is a hard error here: Step 4 lands
@@ -304,7 +303,9 @@ pub trait PeerTransport<I: Identifier> {
     ///    abort vs. retry-with-a-different-seed.
     /// 3. Construct a [`DistributedMessage::RequestClusterSnapshot`]
     ///    envelope tagged with [`Self::local_id`] as the responder's
-    ///    return address.
+    ///    return address and `is_observer` declaring the joiner's own
+    ///    role (so the responder's `PeerJoined` broadcast carries the
+    ///    truth instead of assuming observer).
     /// 4. Send it via [`Self::send`] with `Address::Peer(<first
     ///    reachable seed id>)`. The receiver-side handler in
     ///    `secondary/dispatch.rs` accepts the request from any peer
@@ -356,6 +357,7 @@ pub trait PeerTransport<I: Identifier> {
         &mut self,
         seed: &[crate::PeerConnectionInfo],
         timeout: Duration,
+        is_observer: bool,
     ) -> impl std::future::Future<Output = Result<String, JoinError>>
     where
         I: 'static,
@@ -417,6 +419,10 @@ pub trait PeerTransport<I: Identifier> {
                 let request = DistributedMessage::RequestClusterSnapshot {
                     sender_id: local_id.clone(),
                     timestamp: timestamp_now(),
+                    // The joiner declares its own role so the responder
+                    // broadcasts a truthful `PeerJoined` rather than
+                    // assuming observer.
+                    is_observer,
                 };
                 match self
                     .send(Address::Peer(peer.secondary_id.clone()), request)

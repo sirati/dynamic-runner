@@ -35,7 +35,10 @@ fn roundtrip_secondary_welcome() {
         sender_id: "sec-2".into(),
         timestamp: 9999.0,
         secondary_id: "sec-2".into(),
-        resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 8 * 1024 * 1024 * 1024 }],
+        resources: vec![ResourceAmount {
+            kind: ResourceKind::memory(),
+            amount: 8 * 1024 * 1024 * 1024,
+        }],
         worker_count: 4,
         hostname: "node-01".into(),
         is_observer: false,
@@ -130,7 +133,10 @@ fn roundtrip_task_failed() {
             error_message,
             ..
         } => {
-            assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
+            assert_eq!(
+                error_type,
+                ErrorType::ResourceExhausted(ResourceKind::memory())
+            );
             assert_eq!(error_message, "out of memory");
         }
         _ => panic!("expected TaskFailed"),
@@ -180,8 +186,8 @@ fn roundtrip_peer_info() {
 /// the codec verbatim.
 #[test]
 fn roundtrip_task_assignment_predecessor_outputs_populated() {
-    use std::collections::BTreeMap;
     use dynrunner_core::{ResultValue, TaskOutputs};
+    use std::collections::BTreeMap;
 
     let mut producer_map: BTreeMap<String, ResultValue> = BTreeMap::new();
     producer_map.insert("nonce".into(), ResultValue::Inline("xyz".into()));
@@ -219,7 +225,10 @@ fn roundtrip_task_assignment_predecessor_outputs_populated() {
     let bytes = serialize_message(&msg).unwrap();
     let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
     match decoded {
-        DistributedMessage::TaskAssignment { predecessor_outputs, .. } => {
+        DistributedMessage::TaskAssignment {
+            predecessor_outputs,
+            ..
+        } => {
             assert_eq!(predecessor_outputs, preds);
         }
         _ => panic!("expected TaskAssignment"),
@@ -250,7 +259,8 @@ fn legacy_task_assignment_without_predecessor_outputs_decodes_empty() {
                 "compiler": "gcc",
                 "version": "12.0",
                 "opt_level": "O2"
-            }
+            },
+            "task_id": "legacy-task"
         },
         "local_path": "x",
         "file_hash": "h"
@@ -258,7 +268,10 @@ fn legacy_task_assignment_without_predecessor_outputs_decodes_empty() {
     let json = serde_json::to_vec(&legacy).unwrap();
     let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
     match decoded {
-        DistributedMessage::TaskAssignment { predecessor_outputs, .. } => {
+        DistributedMessage::TaskAssignment {
+            predecessor_outputs,
+            ..
+        } => {
             assert!(predecessor_outputs.is_empty());
         }
         _ => panic!("expected TaskAssignment"),

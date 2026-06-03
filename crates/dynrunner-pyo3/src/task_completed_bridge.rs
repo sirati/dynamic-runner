@@ -32,9 +32,7 @@
 
 use pyo3::prelude::*;
 
-use dynrunner_manager_distributed::task_completed::{
-    TaskCompletedEvent, TaskCompletedListener,
-};
+use dynrunner_manager_distributed::task_completed::{TaskCompletedEvent, TaskCompletedListener};
 
 /// Adapter that holds an unbound Python listener and dispatches each
 /// event to the matching Python call. `Send + Sync` is satisfied by
@@ -147,10 +145,7 @@ mod tests {
     /// `task_id` is always a Python `str` (the framework's boundary
     /// contract guarantees a non-empty id on every event);
     /// `error_kind` remains `str | None` (success → `None`).
-    fn captured_call(
-        globals: &Py<PyAny>,
-        idx: usize,
-    ) -> (String, bool, Option<String>) {
+    fn captured_call(globals: &Py<PyAny>, idx: usize) -> (String, bool, Option<String>) {
         Python::attach(|py| {
             let g = globals.bind(py);
             let calls = g
@@ -184,6 +179,7 @@ mod tests {
             task_hash: "h-alpha".into(),
             success: true,
             error_kind: None,
+            last_error: None,
         });
         let (task_id, success, error_kind) = captured_call(&globals, 0);
         assert_eq!(task_id, "alpha");
@@ -203,6 +199,7 @@ mod tests {
             task_hash: "h-beta".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
+            last_error: Some("worker reported failure".into()),
         });
         let (task_id, success, error_kind) = captured_call(&globals, 0);
         assert_eq!(task_id, "beta");
@@ -244,6 +241,7 @@ mod tests {
             task_hash: "h-oops".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
+            last_error: Some("listener exploded".into()),
         });
     }
 
@@ -279,6 +277,7 @@ mod tests {
             task_hash: "h".into(),
             success: false,
             error_kind: Some("recoverable".into()),
+            last_error: Some("transient".into()),
         });
     }
 }

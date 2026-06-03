@@ -12,11 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
-use dynrunner_protocol_primary_secondary::RoleTable;
+use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::worker_signal::WorkerMgmtSignal;
 
 use super::types::{PeerEntry, RoleChangeHook, TaskState};
 
@@ -52,6 +53,15 @@ pub struct ClusterState<I> {
     /// exit. Read by the secondary's operational loop to break out
     /// even when peers haven't disconnected.
     pub(super) run_complete: bool,
+    /// Set by `ClusterMutation::RunAborted { reason }`. The failure
+    /// twin of `run_complete`: sticky monotonic — once `Some`, the run
+    /// has been aborted cluster-wide and every node should exit
+    /// non-zero. `None` until the first abort lands. The secondary's
+    /// `process_tasks` loop checks this BEFORE the `run_complete` break
+    /// and returns `RunOutcome::Aborted`; the `mesh_watchdog` disarms
+    /// on it too (failover has nothing left to guard once the run is
+    /// aborting). Carries the abort reason for the PyO3-boundary log.
+    pub(super) run_aborted: Option<String>,
     /// Replicated role bookkeeping. Updated in lockstep with
     /// `current_primary` on every `PrimaryChanged` apply so the
     /// transport-layer cache (registered via `role_change_hooks`)
@@ -107,6 +117,14 @@ pub struct ClusterState<I> {
     /// inside the operational `select!` loop. Skipped from Clone /
     /// snapshot / restore for the same reason as `lifecycle_tx`.
     pub(super) matcher_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>>,
+    /// Sender end of the worker-management signal bus mpsc. Installed
+    /// via [`Self::install_worker_mgmt_sender`] when worker management
+    /// wires its operational loop; `None` while nothing has attached.
+    /// Receiver is consumed by
+    /// [`crate::worker_signal::drain_worker_signal_batch`] from inside
+    /// worker management's operational `select!` loop. Skipped from
+    /// Clone / snapshot / restore for the same reason as `lifecycle_tx`.
+    pub(super) worker_mgmt_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkerMgmtSignal>>,
     /// Sender end of the task-completion dispatcher mpsc. Installed
     /// via [`Self::install_task_completed_sender`] when the
     /// coordinator wires its dispatcher task; `None` while no
@@ -130,30 +148,6 @@ pub struct ClusterState<I> {
     /// Opaque to the CRDT: the framework does not interpret the
     /// strings; the fulfillability-matcher hook attaches meaning.
     pub(super) peer_holdings: HashMap<String, HashSet<String>>,
-    /// Sticky panik latch. Set to `true` by the first applying
-    /// `ClusterMutation::PanikRequested` broadcast; never clears for
-    /// the lifetime of this state. Read by the coordinator's
-    /// operational loop to short-circuit further dispatch (no new
-    /// `Cancelled` entries get re-promoted to `Pending`, the
-    /// retry-pass machinery refuses to seed against a panik'd ledger)
-    /// and by the watcher integration to recognise "panik already
-    /// applied — don't re-broadcast".
-    ///
-    /// Replicated via `ClusterStateSnapshot::panik_active` so a
-    /// late-joining observer sees the latched state immediately on
-    /// snapshot-restore, in addition to the live `PanikRequested`
-    /// apply path.
-    pub(super) panik_active: bool,
-    /// First-applying reason payload from the originating
-    /// `PanikRequested`. `Some(_)` iff `panik_active`. Operator-
-    /// readable: surfaces in the terminal log line so the run report
-    /// shows which signal triggered the cancellation.
-    pub(super) panik_reason: Option<String>,
-    /// Peer that originated the first-applying `PanikRequested`.
-    /// `Some(_)` iff `panik_active`. Useful for forensic logs
-    /// ("primary saw the file first" vs "secondary-3 propagated to
-    /// us") but does NOT affect any apply rule's behaviour.
-    pub(super) panik_source: Option<String>,
     /// Replicated keyed-output cache. One entry per task that has
     /// reached `Completed` and committed a non-empty `TaskOutputs`
     /// via its `TaskCompleted` mutation's `result_data` payload.
@@ -182,6 +176,23 @@ pub struct ClusterState<I> {
     /// view rather than racing the cache between "populated" and
     /// "absent".
     pub(super) task_outputs: HashMap<String, TaskOutputs>,
+    /// Per-secondary static capacity (worker-slot count + advertised
+    /// resource amounts). Set once per secondary by the
+    /// `SecondaryCapacity` apply rule (originated by the primary at the
+    /// `SecondaryWelcome` accept in `primary/connect.rs`) and never
+    /// overwritten — capacity is static for a secondary's lifetime in
+    /// the run.
+    ///
+    /// Replicated CRDT data — clone preserves it (matches `tasks`,
+    /// `peer_holdings`, and `task_outputs` semantics). Included in
+    /// `snapshot` / `restore` so a freshly-promoted primary and late-
+    /// joining observers hold the FULL per-secondary roster the moment
+    /// they restore a snapshot, before any live `SecondaryCapacity`
+    /// broadcast reaches them. This is the failover-correctness fix for
+    /// the worker roster being 100% primary-local: a promoted primary
+    /// reconstructs `alive_worker_count()` / `self.workers` from this
+    /// replicated source rather than starting empty.
+    pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -197,6 +208,7 @@ where
             primary_epoch_mirror: Arc::clone(&self.primary_epoch_mirror),
             phase_deps: self.phase_deps.clone(),
             run_complete: self.run_complete,
+            run_aborted: self.run_aborted.clone(),
             role_table: self.role_table.clone(),
             // Deliberately not cloned — see field doc.
             role_change_hooks: Vec::new(),
@@ -207,15 +219,15 @@ where
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             matcher_trigger_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            worker_mgmt_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_completed_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: self.peer_holdings.clone(),
-            // Replicated sticky panik state — clone preserves it.
-            panik_active: self.panik_active,
-            panik_reason: self.panik_reason.clone(),
-            panik_source: self.panik_source.clone(),
             // Replicated CRDT data — clone preserves it.
             task_outputs: self.task_outputs.clone(),
+            // Replicated CRDT data — clone preserves it.
+            secondary_capacities: self.secondary_capacities.clone(),
         }
     }
 }
@@ -231,17 +243,17 @@ where
             .field("primary_epoch", &self.primary_epoch)
             .field("phase_deps", &self.phase_deps)
             .field("run_complete", &self.run_complete)
+            .field("run_aborted", &self.run_aborted)
             .field("role_table", &self.role_table)
             .field("role_change_hooks", &self.role_change_hooks.len())
             .field("peer_state", &self.peer_state)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
+            .field("worker_mgmt_tx", &self.worker_mgmt_tx.is_some())
             .field("task_completed_tx", &self.task_completed_tx.is_some())
             .field("peer_holdings", &self.peer_holdings)
-            .field("panik_active", &self.panik_active)
-            .field("panik_reason", &self.panik_reason)
-            .field("panik_source", &self.panik_source)
             .field("task_outputs", &self.task_outputs.len())
+            .field("secondary_capacities", &self.secondary_capacities)
             .finish()
     }
 }
@@ -255,17 +267,17 @@ impl<I> Default for ClusterState<I> {
             primary_epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             phase_deps: HashMap::new(),
             run_complete: false,
+            run_aborted: None,
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),
             lifecycle_tx: None,
             matcher_trigger_tx: None,
+            worker_mgmt_tx: None,
             task_completed_tx: None,
             peer_holdings: HashMap::new(),
-            panik_active: false,
-            panik_reason: None,
-            panik_source: None,
             task_outputs: HashMap::new(),
+            secondary_capacities: HashMap::new(),
         }
     }
 }
@@ -278,5 +290,4 @@ impl<I: Identifier> ClusterState<I> {
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
-
 }

@@ -1,21 +1,17 @@
-
-use dynrunner_core::Identifier;
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    ClusterMutation, DistributedMessage, PeerTransport, RemovalCause,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::apply_locally_for_broadcast;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::{compute_task_hash, timestamp_now};
+use crate::worker_signal::WorkerMgmtSignal;
 
-
-
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Apply each mutation locally and broadcast the same batch so every
     /// secondary mirrors the change. Per-secondary delivery failures are
     /// logged at warn — the CRDT is idempotent, so a missed mutation is
@@ -40,10 +36,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // state transition regardless of how many peer-forward
         // paths converge on us. The apply+filter primitive lives in
         // `cluster_state::apply_locally_for_broadcast` so this
-        // originator path and the promoted-secondary's mirror
-        // (`secondary::primary::apply_and_broadcast_mutations`) share
-        // one canonical filter; the broadcast step stays at each call
-        // site because the two transports have different error shapes.
+        // originator path and the secondary-side originator
+        // (`secondary::origination::apply_and_broadcast_mutations`, used
+        // by `ingest_setup_discovery` + panik self-departure) share one
+        // canonical filter; the broadcast step stays at each call site
+        // because the two transports have different error shapes.
         //
         // `apply_locally_for_broadcast` also surfaces any `TaskInfo`s
         // the apply pass auto-resumed from `Blocked → Pending` (a
@@ -61,6 +58,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             applied,
             resumed_for_dispatch,
         } = batch;
+        let resumed_any = !resumed_for_dispatch.is_empty();
         for binary in resumed_for_dispatch {
             tracing::debug!(
                 phase = %binary.phase_id,
@@ -68,6 +66,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "pool: re-inject auto-resumed Blocked dependent"
             );
             self.pool_mut().reinject(binary);
+        }
+        // Auto-resumed Blocked dependents are a pool-entry edge: their
+        // prereq just completed and they became dispatchable, but the
+        // free worker that would run them won't re-poll on its own. EMIT
+        // a `TasksAdded` so the worker-management recheck dispatches
+        // them (decoupled emit, never a direct dispatch call — the
+        // dispatch-decoupling law).
+        if resumed_any {
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
         if applied.is_empty() {
             return;
@@ -77,15 +85,61 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "ClusterMutation broadcast delivery failed"
-                );
-            }
+        // The single mesh transport collapses per-secondary delivery
+        // failures into one `String` (the per-secondary signal is the
+        // heartbeat monitor, not this log line). The CRDT is
+        // idempotent, so a missed mutation is recoverable from the next
+        // snapshot RPC; we never block dispatch on universal delivery.
+        if let Err(error) = self.transport.broadcast(msg).await {
+            tracing::warn!(
+                error = %error,
+                "ClusterMutation broadcast delivery failed"
+            );
         }
+    }
+
+    /// Originate the CRDT `Pending → InFlight` transition for a task
+    /// that was just committed locally (`commit_assignment`) AND
+    /// successfully sent to its secondary.
+    ///
+    /// THE single origination point for `ClusterMutation::TaskAssigned`
+    /// on the live path: every dispatch site (initial assignment, the
+    /// `TaskRequest` reply, the per-tick dispatch fan-out) calls this
+    /// helper AFTER its send succeeds, so the in-flight assignment is
+    /// replicated into every replica's CRDT mirror and the per-task
+    /// `in_flight` ledger becomes a derived cache of `TaskState::InFlight`.
+    /// Routed through the canonical
+    /// `apply_and_broadcast_cluster_mutations` path so it inherits the
+    /// same local-apply + wire-fan-out + apply-filter semantics as every
+    /// other primary-originated mutation.
+    ///
+    /// Ordering (audit R-1): originate AFTER the successful `send_to`.
+    /// A send-failure path (`rollback_assignment`) runs BEFORE this
+    /// helper is reached, so a failed send leaves NO CRDT `InFlight` to
+    /// compensate — the rollback only has to undo the local
+    /// commit triple, never a replicated transition. `commit_assignment`
+    /// still writes the local ledger/slot BEFORE the send (so a
+    /// completion racing back is attributed by hash); the CRDT
+    /// origination is the post-send half.
+    ///
+    /// Repairs failover hydration: a promoted primary / observer now
+    /// sees the task as `InFlight` and does NOT re-dispatch it (the
+    /// hydrate in-flight arm, previously dead on the live path, is now
+    /// fed live). The terminal `TaskCompleted` / `TaskFailed` transitions
+    /// out of `InFlight` already exist; a dead-secondary recovery
+    /// transitions back via `ClusterMutation::TaskRequeued`.
+    pub(crate) async fn originate_task_assigned(
+        &mut self,
+        task_hash: String,
+        secondary: String,
+        worker: u32,
+    ) {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskAssigned {
+            hash: task_hash,
+            secondary,
+            worker,
+        }])
+        .await;
     }
 
     /// Phase-S/B: seed the replicated cluster ledger with the run's
@@ -106,9 +160,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// `perform_initial_assignment` runs (so the originator's mirror
     /// is non-empty when the first dispatch happens).
     pub(crate) async fn seed_cluster_state(&mut self) {
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(
-            self.all_binaries.len() + 1,
-        );
+        let mut mutations: Vec<ClusterMutation<I>> =
+            Vec::with_capacity(self.all_binaries.len() + 1);
         mutations.push(ClusterMutation::PhaseDepsSet {
             deps: self.phase_deps.clone(),
         });
@@ -141,27 +194,27 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
     /// React to a panik-watcher signal on the primary.
     ///
-    /// Single concern: turn the watcher's "the operator wants the
-    /// cluster to stop now" event into a `ClusterMutation::PanikRequested`
-    /// broadcast (applied locally + fanned out to every secondary)
-    /// and return the (matched_path, reason) pair for the caller to
-    /// surface as `RunError::PanikShutdown`.
+    /// Single concern: a node observing its OWN panik signal announces
+    /// its departure from the mesh and exits locally. It broadcasts a
+    /// self-authored `ClusterMutation::PeerRemoved { id: <self_id>,
+    /// cause: SelfDeparture(reason) }` so peers LOG the departure and
+    /// mark this peer Dead — observability only. The departure does
+    /// NOT cancel cluster work or terminate the run on peers; phase /
+    /// task management stays decoupled from membership.
     ///
-    /// Unlike the secondary's `handle_panik_signal`, the primary owns
-    /// no local worker pool — workers run on secondaries via the
-    /// `RemoteWorkerState` ledger. The broadcast is the load-bearing
-    /// step: secondaries that have not yet observed their own panik
-    /// file learn about the cluster-wide stop through this mutation
-    /// and run their own teardown (`pool.kill_all_workers_with_grace`
-    /// then exit) on their side. The primary's exit(137) is owned
+    /// Returns the (matched_path, reason) pair for the caller to
+    /// surface as `RunError::PanikShutdown` (the primary's local
+    /// self-exit). Unlike a worker-bearing node, the primary owns no
+    /// local worker pool — workers run on secondaries via the
+    /// `RemoteWorkerState` ledger — so there is nothing to tear down
+    /// here beyond the announcement; the primary's exit(137) is owned
     /// by the PyO3 wrapper once it sees `RunError::PanikShutdown`.
     ///
     /// Apply errors / broadcast failures are best-effort: logged at
     /// warn, never propagated. The panik-react path must always
     /// finish — operators rely on the SLURM container reaping via
     /// exit(137), and a degraded broadcast is no worse than the
-    /// pre-panik baseline (each secondary will eventually observe
-    /// its own panik file at the next 10s poll).
+    /// pre-panik baseline.
     pub(crate) async fn handle_panik_signal(
         &mut self,
         matched_path: std::path::PathBuf,
@@ -170,11 +223,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         tracing::warn!(
             node_id = %self.config.node_id,
             matched_path = %matched_path.display(),
-            "panik signal observed on primary; broadcasting PanikRequested"
+            "panik signal observed on primary; announcing self-departure and exiting locally"
         );
-        let mutation = ClusterMutation::PanikRequested {
-            source_peer: self.config.node_id.clone(),
-            reason: reason.clone(),
+        // Self-authored departure announcement. `BoundedString::from`
+        // truncates at the 1 KiB cap `SelfDeparture` carries.
+        let mutation = ClusterMutation::PeerRemoved {
+            id: self.config.node_id.clone(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
         };
         self.apply_and_broadcast_cluster_mutations(vec![mutation])
             .await;
@@ -188,21 +243,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             total_files: 0,
             total_bytes: 0,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "TransferComplete delivery failed"
-                );
-            }
-            return Err(format!(
-                "TransferComplete broadcast failed for {} secondaries",
-                failures.len()
-            ));
+        if let Err(error) = self.transport.broadcast(msg).await {
+            tracing::warn!(
+                error = %error,
+                "TransferComplete delivery failed"
+            );
+            return Err(format!("TransferComplete broadcast failed: {error}"));
         }
         tracing::info!("transfer complete sent to all secondaries");
         Ok(())
     }
-
 }

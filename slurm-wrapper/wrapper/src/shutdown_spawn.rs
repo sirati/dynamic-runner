@@ -193,7 +193,9 @@ fn try_systemd_run(
             eprintln!(
                 "WARNING: systemd-run --user --unit failed (exit={}); falling \
                  back to setsid -- cgroup escape DISABLED",
-                s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                s.code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
             );
             None
         }
@@ -209,12 +211,7 @@ fn try_systemd_run(
 
 /// `setsid -f <bin> <manager_args>` with stdin from /dev/null and stdout+stderr
 /// appended to the log; then poll the manager's pid-file (50 * 100ms).
-fn run_setsid(
-    layout: &Layout,
-    bin: &Path,
-    manager: &[String],
-    log_path: &Path,
-) -> ShutdownMode {
+fn run_setsid(layout: &Layout, bin: &Path, manager: &[String], log_path: &Path) -> ShutdownMode {
     eprintln!(
         "WARNING: shutdown manager running under setsid -- cgroup escape \
          DISABLED; SLURM TIMEOUT will reap the manager before cleanup."

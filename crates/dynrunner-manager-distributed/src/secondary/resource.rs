@@ -1,11 +1,9 @@
-use dynrunner_core::{
-    ErrorType, Identifier, MessageReceiver, MessageSender, ResourceKind, WorkerId,
-};
-use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_core::{ErrorType, Identifier, ResourceKind, WorkerId};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
-use dynrunner_manager_local::WorkerFactory;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 /// Wire marker used when a secondary's worker is killed by a no-fault
@@ -17,22 +15,118 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 /// respawning"` markers. The string is the public contract between
 /// secondary and primary; do not change it without updating the
 /// primary's `is_backpressure` predicate in the same commit.
-pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str =
-    "worker no-fault preempt; resource stealing";
-
+pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resource stealing";
 
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// Send an operational frame to whoever currently holds the
+    /// primary role, feeding the failover-health probe on a no-route
+    /// result.
+    ///
+    /// This is the single chokepoint for every primary-bound
+    /// operational send (TaskRequest, terminal TaskComplete/TaskFailed,
+    /// Keepalive, MeshReady). Routing is fully opaque: the unified
+    /// transport resolves `Address::Role(Role::Primary)` to loopback /
+    /// uplink / a promoted peer; the manager never inspects which.
+    ///
+    /// # Failover-health probe (the fast path)
+    ///
+    /// A clean `Err` from `send` means "no route to the primary":
+    /// the bootstrap uplink has closed AND no peer holds `Role::Primary`
+    /// (cache cold). That is the fast-failover signal — it arms the
+    /// count-axis of `PrimaryLink` immediately, well before the
+    /// keepalive time-axis would. The probe is transport-AGNOSTIC: the
+    /// manager reacts only to a send RESULT, never to `peer_count()` or
+    /// a recv-None branch or any locality inspection. A successful send
+    /// (loopback, healthy uplink, or a reachable promoted peer) resets
+    /// the health window via the normal `record_primary_message`
+    /// path when the primary's reply / keepalive arrives.
+    ///
+    /// On a breach the same arming the deleted recv-None branch used is
+    /// applied: backdate `primary_last_seen` so the next
+    /// `run_election_tick` enters Suspecting.
+    ///
+    /// Note the deliberate name: this carries NO locality logic (unlike
+    /// the removed `send_to_current_primary` router, which branched
+    /// loopback-vs-wire on the old `PrimaryLink.current_primary`). It
+    /// just sends to the primary role opaquely and notes a
+    /// failover-health breach if the role is unreachable.
+    pub(in crate::secondary) async fn send_to_primary(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        let result = self.transport.send(Address::Role(Role::Primary), msg).await;
+        if let Err(ref e) = result {
+            // No route to the primary — feed the failover-health
+            // probe. `record_recv_failure` anchors the failure window
+            // on the first breach and returns true once the count- or
+            // time-axis threshold is crossed.
+            let armed = self.primary_link.record_recv_failure();
+            if armed {
+                tracing::warn!(
+                    error = %e,
+                    "no route to primary (uplink closed, no promoted peer); \
+                     failover-health threshold breached — arming election"
+                );
+                let backdate = self
+                    .config
+                    .keepalive_interval
+                    .saturating_mul(self.config.keepalive_miss_threshold + 1);
+                self.primary_last_seen = Some(
+                    std::time::Instant::now()
+                        .checked_sub(backdate)
+                        .unwrap_or_else(std::time::Instant::now),
+                );
+            } else {
+                tracing::debug!(
+                    error = %e,
+                    "no route to primary; recording failover-health probe \
+                     (threshold not yet breached)"
+                );
+            }
+        }
+        result
+    }
+
+    /// Report a respawn-HOLD-deferred task whose worker died before it
+    /// could run (the worker disconnected between `RespawnInProgress`
+    /// and the expected `Ready`, or `assign_task` failed at the
+    /// post-Ready dispatch). The task NEVER ran, so it must be requeued
+    /// at the authority — not counted as a failure. A backpressure-
+    /// shaped `TaskFailed` (`Recoverable` + the `"worker pipe broken;
+    /// respawning"` marker the authority's `is_backpressure` predicate
+    /// recognises) is the wire contract that drives the requeue +
+    /// re-dispatch.
+    ///
+    /// CLASS-1 own-worker report: the secondary is never the authority,
+    /// so this is the SOLE recovery for a lost deferred task — there is
+    /// no local pool to requeue into.
+    pub(in crate::secondary) async fn report_deferred_task_lost(
+        &mut self,
+        worker_id: WorkerId,
+        file_hash: &str,
+    ) -> Result<(), String> {
+        let msg = DistributedMessage::TaskFailed {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            worker_id,
+            task_hash: file_hash.to_string(),
+            error_type: ErrorType::Recoverable,
+            error_message: "worker pipe broken; respawning".into(),
+        };
+        self.send_to_primary(msg).await
+    }
+
     /// Route the resource-pressure decision tick through the OOM
     /// watcher (mirrors `LocalManager::check_resource_pressure_via_watcher`).
     /// The watcher invokes `WorkerPool::check_resource_pressure`
@@ -78,9 +172,7 @@ where
     ) {
         match result {
             ResourcePressureResult::Killed {
-                worker_id,
-                reason,
-                ..
+                worker_id, reason, ..
             } => {
                 // Find and report the task as failed
                 let file_hash = self
@@ -110,8 +202,14 @@ where
                         error_type,
                         error_message,
                     };
-                    let _ = self.send_to_current_primary(msg.clone()).await;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only. The AUTHORITY
+                    // originates the terminal CRDT mutation and
+                    // broadcasts it to the mesh, so every peer/observer
+                    // mirror converges — the reporting secondary must
+                    // NOT broadcast itself (a second CRDT originator
+                    // would break the authority's apply-before-dispatch
+                    // ordering).
+                    let _ = self.send_to_primary(msg).await;
                 }
 
                 // Restart the worker and request a new task
@@ -119,46 +217,40 @@ where
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
                     return;
                 }
-                let _ = self.request_task_for_worker(worker_id, factory).await;
+                let _ = self.request_task_for_worker(worker_id).await;
             }
             ResourcePressureResult::NoAction => {}
         }
     }
 
-    /// Handle a worker event (completion, disconnection, etc.)
+    /// Send a `TaskRequest` for one idle worker to the current primary
+    /// role.
     ///
-    /// Returns `Some(worker_id)` if the worker needs to be restarted (e.g.
-    /// after disconnect). The caller is responsible for calling
+    /// A pure capacity hint: rate-limited per worker by `primary_link.
+    /// should_request_now`, then dispatched as a single
+    /// `Address::Role(Role::Primary)` send through the opaque transport
+    /// (the request routes to the uplink, a promoted peer, or loopback
+    /// depending on the role cache — the manager never branches on
+    /// locality). Since the P2 transport collapse this no longer needs a
+    /// `WorkerFactory`: the request never spawns or restarts a worker, it
+    /// only advertises the worker's available capacity to the authority.
     pub(super) async fn request_task_for_worker(
         &mut self,
         worker_id: WorkerId,
-        factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
-        // When primary, handle task requests locally
-        if self.is_primary && !self.primary_pending_is_empty() {
-            let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-                self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
-            } else {
-                self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
-            };
-            return self
-                .handle_primary_task_request(
-                    self.config.secondary_id.clone(),
-                    worker_id,
-                    available_memory,
-                    factory,
-                )
-                .await;
-        }
-
         if !self.primary_link.should_request_now(worker_id) {
             return Ok(());
         }
 
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-            self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
+            self.pool.workers[worker_id as usize]
+                .reserved_budgets
+                .get(&dynrunner_core::ResourceKind::memory())
         } else {
-            self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
+            self.config
+                .max_resources
+                .get(&dynrunner_core::ResourceKind::memory())
+                / self.config.num_workers as u64
         };
 
         let msg = DistributedMessage::TaskRequest {
@@ -173,70 +265,7 @@ where
         };
         self.primary_link.note_request_sent(worker_id);
 
-        self.send_to_current_primary(msg).await
-    }
-
-    /// Send `msg` to the node currently holding primary authority,
-    /// whichever it is.
-    ///
-    /// One concern: hide the routing decision behind a single boundary
-    /// so every "send to primary" call site (TaskComplete, TaskFailed,
-    /// Keepalive, TaskRequest, OOM report) follows the same rule. The
-    /// rule is dynamic: at run start the local node is primary and we
-    /// route via `primary_transport`; after `PromotePrimary` (and
-    /// after election) `primary_link.current_primary()` names the current
-    /// primary and we route via `peer_transport.send_to_peer` instead.
-    ///
-    /// Pre-extraction this routing logic existed inline in exactly one
-    /// place (`request_task_for_worker`); every other operational
-    /// "send to primary" went directly to `primary_transport.send`,
-    /// which after promotion points at a peer that is no longer the
-    /// authoritative primary. That mismatch is the
-    /// `primary_connection-points-at-local` class of bug — completion
-    /// reports, failure reports, and keepalives all routed to the
-    /// wrong endpoint after promotion. Centralising the decision
-    /// makes the right routing automatic at every call site.
-    ///
-    /// Setup-phase messages (welcome, cert exchange) deliberately
-    /// keep using `primary_transport` directly: at that point there
-    /// IS no other primary candidate, and the original transport is
-    /// the only path that exists. Once setup completes and a
-    /// secondary may be promoted, all operational messages route
-    /// through here.
-    pub(super) async fn send_to_current_primary(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
-        if let Some(current_primary) = self.primary_link.current_primary() {
-            if current_primary != self.config.secondary_id.as_str() {
-                let peer = current_primary.to_string();
-                return self.peer_transport.send_to_peer(&peer, msg).await;
-            }
-            // Self-addressed (we ARE the primary). Keep the loopback
-            // through `primary_transport` so the demoted observer can
-            // still tick its completion counter and run the
-            // run-done-termination check (see lifecycle.rs's
-            // observer-mode contract: forwarded outcomes still drive
-            // the local primary's terminal counters, only re-injection
-            // is suppressed).
-            //
-            // Tolerate transport errors on this loopback. Post-
-            // promotion the demoted primary process is allowed to
-            // exit cleanly — when it does, its transport-writer task
-            // closes and subsequent sends fail (QUIC: "transport
-            // writer task exited"; channel test fixture: "channel
-            // closed"). That failure is benign here: every
-            // operational call site has already done the local
-            // bookkeeping directly before invoking this helper, and
-            // we ARE the authoritative primary. Without the swallow,
-            // lone-promoted-primary runs (no peer to relay through,
-            // local primary exited) propagated the error fatally
-            // through `?` operators at processing.rs / dispatch.rs
-            // and crashed the secondary.
-            let _ = self.primary_transport.send(msg).await;
-            return Ok(());
-        }
-        self.primary_transport.send(msg).await
+        self.send_to_primary(msg).await
     }
 
     /// Periodic safety-net wakeup: walk every idle worker and call
@@ -253,14 +282,11 @@ where
     /// completions and the primary's kickstart targeted only one of
     /// them). Regular live-primary runs see most polls suppressed by
     /// the backoff because the kickstart already covers the path.
-    pub(super) async fn repoll_idle_workers(
-        &mut self,
-        factory: &mut impl WorkerFactory<M>,
-    ) {
+    pub(super) async fn repoll_idle_workers(&mut self) {
         let n = self.pool.workers.len();
         for wid in 0..n {
             if self.pool.workers[wid].is_idle_state() {
-                let _ = self.request_task_for_worker(wid as WorkerId, factory).await;
+                let _ = self.request_task_for_worker(wid as WorkerId).await;
             }
         }
     }

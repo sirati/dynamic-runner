@@ -148,8 +148,11 @@ impl SshMaster {
 
         let invalidated = Arc::new(AtomicBool::new(false));
         let watcher_cancel = Arc::new(AtomicBool::new(false));
-        let watcher_thread =
-            spawn_master_watcher(daemon_pid, Arc::clone(&watcher_cancel), Arc::clone(&invalidated));
+        let watcher_thread = spawn_master_watcher(
+            daemon_pid,
+            Arc::clone(&watcher_cancel),
+            Arc::clone(&invalidated),
+        );
 
         tracing::info!(
             ?launcher_pid,
@@ -234,18 +237,14 @@ impl SshMaster {
         // sockets in the integration tests. The timeout converts
         // that hang into a typed `MasterAdoptFailed`.
         let cp_str = path.to_string_lossy().into_owned();
-        let probed_pid = probe_master_pid_with_timeout(
-            &cp_str,
-            target.as_str(),
-            &[],
-            Duration::from_secs(3),
-        )
-        .map_err(|e| {
-            SshMasterError::adopt_failed(
-                path.clone(),
-                format!("ssh -O check rejected adoption: {e}"),
-            )
-        })?;
+        let probed_pid =
+            probe_master_pid_with_timeout(&cp_str, target.as_str(), &[], Duration::from_secs(3))
+                .map_err(|e| {
+                    SshMasterError::adopt_failed(
+                        path.clone(),
+                        format!("ssh -O check rejected adoption: {e}"),
+                    )
+                })?;
 
         tracing::info!(
             target = %target,
@@ -280,5 +279,4 @@ impl SshMaster {
             test_kill_hook: None,
         })
     }
-
 }

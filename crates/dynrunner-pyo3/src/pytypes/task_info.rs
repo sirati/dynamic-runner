@@ -20,7 +20,7 @@ use dynrunner_core::{
     AffinityId, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId,
 };
 
-use super::identifier::{split_identifier, PyBinaryIdentifier};
+use super::identifier::{PyBinaryIdentifier, split_identifier};
 
 /// Python-visible wrapper for TaskInfo.
 #[pyclass(name = "TaskInfo", from_py_object)]
@@ -147,22 +147,26 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             path: PathBuf::from(&py.path),
             size: py.size,
             identifier: RunnerIdentifier::from(&py.identifier),
-            phase_id,
+            phase_id: phase_id.clone(),
             type_id,
             affinity_id,
             payload,
             // PyTaskInfo's invariant (validated at `__new__`) is that
             // `task_id` is non-empty; the conversion is a verbatim move.
             task_id: py.task_id.clone(),
-            // Python contract is bare task_ids. Reconstitute the Rust-side
-            // `Vec<TaskDep>` with `inherit_outputs = false` per the legacy-
-            // default (matches the untagged `Bare` deserializer arm in
-            // `dynrunner_core::types::task`).
+            // `PyTaskInfo`'s Python contract is bare task_ids — they name
+            // no phase, so each resolves to the ENCLOSING task's phase
+            // (the intra-phase case this bare-list shape expresses). A
+            // dep's full identity is `(phase_id, task_id)`; the
+            // attribute-rich boundary (`extract.rs`) handles explicit
+            // cross-phase deps. `inherit_outputs = false` is the
+            // legacy-default for this bare-list shape.
             task_depends_on: py
                 .task_depends_on
                 .iter()
                 .map(|task_id| TaskDep {
                     task_id: task_id.clone(),
+                    phase_id: phase_id.clone(),
                     inherit_outputs: false,
                 })
                 .collect(),

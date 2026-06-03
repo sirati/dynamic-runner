@@ -168,9 +168,7 @@ where
             // `scancel` it on coordinator drop. The error is still
             // surfaced to the budget so a flapping tunnel doesn't
             // silently re-submit.
-            let tunnel_outcome = tunnel_establisher
-                .establish_one_tunnel(&secondary_id)
-                .await;
+            let tunnel_outcome = tunnel_establisher.establish_one_tunnel(&secondary_id).await;
             match tunnel_outcome {
                 Ok(()) => {
                     tracing::info!(
@@ -200,4 +198,3 @@ where
         }
     }
 }
-

@@ -93,8 +93,11 @@ impl<I: Identifier> NetworkClient<I> {
         timeout: Duration,
     ) -> Result<Self, String> {
         // Try QUIC first
-        match tokio::time::timeout(timeout, crate::transport::connect(addr, server_name, peer_cert))
-            .await
+        match tokio::time::timeout(
+            timeout,
+            crate::transport::connect(addr, server_name, peer_cert),
+        )
+        .await
         {
             Ok(Ok(conn)) => {
                 tracing::info!(%addr, "connected via QUIC (UDP)");
@@ -114,7 +117,9 @@ impl<I: Identifier> NetworkClient<I> {
                 tracing::info!(%addr, "connected via WSS (TCP)");
                 Ok(NetworkClient::Wss(spawn_wss_bridge(conn)))
             }
-            Ok(Err(e)) => Err(format!("both QUIC and WSS failed for {addr}: WSS error: {e}")),
+            Ok(Err(e)) => Err(format!(
+                "both QUIC and WSS failed for {addr}: WSS error: {e}"
+            )),
             Err(_) => Err(format!("both QUIC and WSS timed out for {addr}")),
         }
     }

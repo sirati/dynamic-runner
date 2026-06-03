@@ -131,13 +131,14 @@ pub(super) async fn dial_peer(
     let peer_cert_der = parse_cert_pem(&peer_info.cert);
 
     if let Some(cert_der) = peer_cert_der.as_ref() {
-        if let Some((addr, conn)) =
-            race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await
-        {
+        if let Some((addr, conn)) = race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await {
             tracing::info!(peer = peer_id, %addr, "connected to peer via QUIC");
             return Some(PeerConnection::Quic(conn));
         }
-        tracing::warn!(peer = peer_id, "QUIC race to peer failed across all addresses, trying WSS");
+        tracing::warn!(
+            peer = peer_id,
+            "QUIC race to peer failed across all addresses, trying WSS"
+        );
     } else {
         tracing::warn!(peer = peer_id, "no valid cert for peer, trying WSS");
     }
@@ -147,7 +148,10 @@ pub(super) async fn dial_peer(
         return Some(PeerConnection::Wss(Box::new(conn)));
     }
 
-    tracing::error!(peer = peer_id, "WSS race to peer failed across all addresses");
+    tracing::error!(
+        peer = peer_id,
+        "WSS race to peer failed across all addresses"
+    );
     None
 }
 

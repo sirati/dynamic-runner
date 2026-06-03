@@ -36,6 +36,7 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 use super::*;
 use crate::primary::retry_bucket::BucketKind;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Estimator that returns `task.size` bytes as the memory cost. The
 /// OOM bucket sorts retries by estimator-memory DESC, so the size
@@ -77,8 +78,7 @@ fn phased_task(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
 /// [`RemoteWorkerState`] entries the dispatch pipeline iterates.
 fn register_secondary_with_workers(
     primary: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         SizeEqualsMemoryEstimator,
         TestId,
@@ -103,22 +103,17 @@ fn register_secondary_with_workers(
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
-    primary
-        .secondaries
-        .insert(secondary_id.into(), SecondaryConnectionState::Operational(conn));
+    primary.secondaries.insert(
+        secondary_id.into(),
+        SecondaryConnectionState::Operational(conn),
+    );
     let next_global = primary.workers.len() as u32;
     for local in 0..num_workers {
-        primary.workers.push(crate::primary::RemoteWorkerState {
-            worker_id: next_global + local,
-            secondary_id: secondary_id.into(),
-            resource_budgets: ResourceMap::from([(
-                ResourceKind::memory(),
-                memory_bytes,
-            )]),
-            current_task: None,
-            estimated_resources: ResourceMap::new(),
-            is_idle: true,
-        });
+        primary.register_idle_worker_for_test(
+            secondary_id.into(),
+            next_global + local,
+            ResourceMap::from([(ResourceKind::memory(), memory_bytes)]),
+        );
     }
 }
 
@@ -154,29 +149,24 @@ fn oom_bucket_test_config(oom_retry_max_passes: u32) -> PrimaryConfig {
 /// state); the OOM-bucket reinject is what populates it for each
 /// of these tests.
 fn make_primed_primary(
-    transport: ChannelSecondaryTransportEnd<TestId>,
+    transport: ChannelPeerTransport<TestId>,
     oom_retry_max_passes: u32,
     tasks: Vec<TaskInfo<TestId>>,
 ) -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     SizeEqualsMemoryEstimator,
     TestId,
 > {
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         oom_bucket_test_config(oom_retry_max_passes),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         SizeEqualsMemoryEstimator,
     );
     let phase = PhaseId::from("default");
-    let pool = PendingPool::<TestId>::new(
-        [phase.clone()],
-        std::collections::HashMap::new(),
-    )
-    .expect("default-phase pool");
+    let pool = PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
+        .expect("default-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -189,8 +179,7 @@ fn make_primed_primary(
 /// — the failure class the OOM bucket pulls from.
 fn mark_all_failed_oom(
     primary: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         SizeEqualsMemoryEstimator,
         TestId,
@@ -232,9 +221,8 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
             // incoming receiver from observing a close — this test
             // never sends inbound traffic, but the operational shape
             // expects the channel to stay open across the bucket call.
-            let (_incoming_tx_keepalive, incoming_rx) = tokio_mpsc::unbounded_channel::<
-                DistributedMessage<TestId>,
-            >();
+            let (_incoming_tx_keepalive, incoming_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let mut outgoing: HashMap<
                 String,
                 tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
@@ -248,10 +236,8 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 outgoing.insert(sec_id.into(), tx);
                 sec_receivers.insert(sec_id.into(), rx);
             }
-            let transport = ChannelSecondaryTransportEnd {
-                outgoing,
-                incoming_rx,
-            };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
             let tasks = vec![
                 phased_task("t_small", "default", 40),
@@ -271,6 +257,18 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
             register_secondary_with_workers(&mut primary, "sec-400", 400, 2);
 
             mark_all_failed_oom(&mut primary);
+
+            // Install the worker-management bus so the OOM bucket's
+            // post-reinject `TasksAdded` emit lands on a receiver we can
+            // drain. Dispatch is now DEFERRED to the worker-management
+            // recheck (the dispatch-decoupling law) rather than fired
+            // synchronously inside `try_run_phase_retry_bucket`; this
+            // test drives the recheck explicitly below so it observes
+            // the same wire shape via the deferred path.
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
 
             // Pre-flight: `secondaries_sorted_by_memory_desc` returns
             // the canonical ordering the bucket uses to pair tasks.
@@ -300,6 +298,25 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 primary.single_worker_mode(),
                 "single_worker_mode must be true while the OOM bucket is active"
             );
+
+            // Deferred-recheck contract: the bucket emitted a
+            // `TasksAdded` rather than dispatching inline. Drain the
+            // coalesced batch and run the worker-management reaction
+            // synchronously — this is exactly what the operational
+            // loop's worker-management `select!` arm does, minus the
+            // 50ms idle window (driven here directly for determinism).
+            let batch = crate::worker_signal::drain_worker_signal_batch(
+                &mut wm_rx,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("OOM-bucket reinject must emit a TasksAdded batch");
+            assert!(
+                batch.signals.contains(&WorkerMgmtSignal::TasksAdded),
+                "the bucket's emit must carry a TasksAdded; got {:?}",
+                batch.signals
+            );
+            primary.react_to_worker_signal_batch(batch).await;
 
             // Drain each secondary's outgoing channel: every
             // `TaskAssignment` carries the worker id + task id, which
@@ -357,7 +374,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 let local = primary.local_worker_id_in_secondary(worker_idx);
                 let expect_skip = local != 0;
                 assert_eq!(
-                    primary.should_skip_worker_for_dispatch(worker_idx),
+                    primary.should_skip_worker_for_dispatch(worker_idx, false),
                     expect_skip,
                     "worker idx {worker_idx} masking mismatch (expect_skip={expect_skip})"
                 );
@@ -396,10 +413,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
             // `pool_mut()` mutable borrow doesn't overlap with the
             // immutable read of `all_binaries`.
             let seeded = primary.all_binaries.clone();
-            primary
-                .pool_mut()
-                .extend(seeded)
-                .expect("valid extend");
+            primary.pool_mut().extend(seeded).expect("valid extend");
 
             // Coordinator never entered OOM-bucket mode: flag is
             // off, mask is off everywhere, view contains every task
@@ -410,7 +424,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
             );
             for worker_idx in 0..primary.workers.len() {
                 assert!(
-                    !primary.should_skip_worker_for_dispatch(worker_idx),
+                    !primary.should_skip_worker_for_dispatch(worker_idx, false),
                     "worker idx {worker_idx} must be dispatch-eligible \
                      outside the OOM bucket"
                 );

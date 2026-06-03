@@ -44,14 +44,16 @@ impl<I: Identifier> ClusterState<I> {
     /// so the returned `Vec<TaskInfo<I>>` is independent of further
     /// CRDT mutations — callers may hold the clones across additional
     /// apply calls.
-    /// Cache a completing task's `TaskOutputs` under its `task_id`.
+    /// Cache a completing task's `TaskOutputs` under its content hash.
     ///
     /// Invoked from the `TaskCompleted` apply arm with the completing
     /// task's hash and the wire mutation's `result_data` payload. The
-    /// hash → task_id resolution reads `self.tasks` (already mutated to
-    /// `Completed` by the caller; the `task_id` is stable across that
-    /// transition because every `TaskState` variant carries the same
-    /// inner `TaskInfo`).
+    /// cache is keyed by the wire-canonical content hash — which folds
+    /// in `phase_id`, so the same `task_id` in two different phases
+    /// keys to two distinct cache entries (no cross-phase output
+    /// collision). The dispatch-time predecessor assembler resolves a
+    /// dep's full `(phase_id, task_id)` identity to its hash, then
+    /// reads this cache by that hash.
     ///
     /// Three branches, in priority order:
     ///
@@ -62,12 +64,12 @@ impl<I: Identifier> ClusterState<I> {
     ///    `None` arm is a true "did not publish" signal.
     /// 2. `result_data` decodes as [`DonePayload`] — extract the
     ///    inner `outputs` (a [`TaskOutputs`]) and insert it under the
-    ///    completing task's `task_id`. The wrapper's counter fields
+    ///    completing task's content hash. The wrapper's counter fields
     ///    (`warnings`/`filtered`) are not consumed cluster-side; serde
     ///    drops them silently because the struct does NOT use
-    ///    `deny_unknown_fields`. Anonymous tasks (no `task_id`) cannot
-    ///    be referenced by dependents and are silently skipped (no key
-    ///    to insert under).
+    ///    `deny_unknown_fields`. A hash with no ledger entry (late-
+    ///    arriving mutation for a task this replica never saw) is
+    ///    silently skipped (no entry to anchor the cache against).
     /// 3. `result_data` is malformed JSON — emit a `tracing::warn!`
     ///    and insert an empty `TaskOutputs`. Storing the empty entry
     ///    rather than skipping keeps dependents that hard-require a
@@ -79,56 +81,32 @@ impl<I: Identifier> ClusterState<I> {
     /// arm before this helper fires, so the insert is effectively
     /// first-write-wins under the apply rule. No explicit `.entry().
     /// or_insert(_)` guard is needed at this layer.
-    pub(super) fn record_task_outputs(
-        &mut self,
-        hash: &str,
-        result_data: Option<Vec<u8>>,
-    ) {
+    pub(super) fn record_task_outputs(&mut self, hash: &str, result_data: Option<Vec<u8>>) {
         let Some(bytes) = result_data else {
             return;
         };
-        let Some(task_id) = self.task_id_for_hash(hash) else {
+        if !self.tasks.contains_key(hash) {
             // Hash with no entry in the task ledger: late-arriving
             // mutation against a task this replica never saw. Nothing
             // to key the cache against.
             return;
-        };
+        }
         match serde_json::from_slice::<DonePayload>(&bytes) {
             Ok(body) => {
-                self.task_outputs.insert(task_id, body.outputs);
+                self.task_outputs.insert(hash.to_string(), body.outputs);
             }
             Err(e) => {
                 tracing::warn!(
                     target: "dynrunner_cluster_state",
                     error = %e,
                     hash = %hash,
-                    task_id = %task_id,
                     "TaskCompleted result_data failed to decode as DonePayload; \
                      storing empty entry"
                 );
-                self.task_outputs.insert(task_id, TaskOutputs::default());
+                self.task_outputs
+                    .insert(hash.to_string(), TaskOutputs::default());
             }
         }
-    }
-
-    /// Private helper for `record_task_outputs`: extract a clone of
-    /// the `task_id` for the entry at `hash`, regardless of which
-    /// `TaskState` variant it currently occupies. Returns `None`
-    /// when the hash is unknown to this replica's ledger (every
-    /// known task carries a `task_id` by the framework's boundary
-    /// contract; the variant is the missing-state case).
-    fn task_id_for_hash(&self, hash: &str) -> Option<String> {
-        let state = self.tasks.get(hash)?;
-        let task = match state {
-            TaskState::Pending { task }
-            | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task }
-            | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::Blocked { task, .. }
-            | TaskState::Cancelled { task, .. } => task,
-        };
-        Some(task.task_id.clone())
     }
 
     pub(super) fn resume_blocked_on(&mut self, prereq_hash: &str) -> Vec<TaskInfo<I>> {
@@ -150,12 +128,6 @@ impl<I: Identifier> ClusterState<I> {
         resumed
     }
 
-
-
-
-
-
-
     /// Apply a `ClusterMutation::TasksSpawned` batch.
     ///
     /// For each `TaskInfo<I>` in `tasks` (iteration order = caller's
@@ -167,8 +139,9 @@ impl<I: Identifier> ClusterState<I> {
     ///    spawned task is silent; the originator's pre-validation
     ///    surfaces the duplicate as a per-index `SpawnError` so
     ///    callers see it even when the wire apply is silent).
-    /// 3. Otherwise resolve each `task_depends_on` task_id to a hash
-    ///    via [`Self::task_hash_for_task_id`] and decide the initial
+    /// 3. Otherwise resolve each `task_depends_on` dep's full
+    ///    `(phase_id, task_id)` identity to a hash via
+    ///    [`Self::task_hash_for_dep`] and decide the initial
     ///    state per the cascade rules:
     ///      * Any dep in `Failed { kind: NonRecoverable, .. }` →
     ///        insert as `Failed { kind: NonRecoverable, task,
@@ -246,7 +219,10 @@ impl<I: Identifier> ClusterState<I> {
             let mut blocked_on_pending: Option<String> = None;
             for dep in &task.task_depends_on {
                 let dep_id = dep.task_id.as_str();
-                let dep_hash = match self.task_hash_for_task_id(dep_id) {
+                // Resolve against the dep's FULL `(phase_id, task_id)`
+                // identity — the same `task_id` in two phases is a
+                // distinct prerequisite with a distinct hash.
+                let dep_hash = match self.task_hash_for_dep(&dep.phase_id, dep_id) {
                     Some(h) => h.to_string(),
                     None => {
                         // Originator-side pre-validation should have
@@ -267,6 +243,18 @@ impl<I: Identifier> ClusterState<I> {
                         kind: ErrorType::NonRecoverable,
                         ..
                     }) => {
+                        cascade_fail = true;
+                        break;
+                    }
+                    // A dep that is itself structurally invalid is a
+                    // non-recoverable upstream terminal: the dependent
+                    // can never run, so it cascade-fails through the
+                    // same `Failed { NonRecoverable }` shape (the
+                    // "upstream-invalid" case). Keeping it out of the
+                    // `invalid_task` reason space — only literally-
+                    // absent deps mint a fresh `InvalidTask`; an
+                    // existing-but-invalid dep cascades.
+                    Some(TaskState::InvalidTask { .. }) => {
                         cascade_fail = true;
                         break;
                     }
@@ -297,23 +285,6 @@ impl<I: Identifier> ClusterState<I> {
                         if blocked_on_pending.is_none() {
                             blocked_on_pending = Some(dep_hash);
                         }
-                    }
-                    Some(TaskState::Cancelled { .. }) => {
-                        // Dependent of a panik-cancelled prereq.
-                        // The prereq won't reach Completed, so the
-                        // dependent can't ever succeed; treat as
-                        // cascade-fail (parallel to a NonRecoverable
-                        // prereq above). The new spawn lands in
-                        // `Failed { NonRecoverable, "upstream-failed" }`
-                        // — distinct from a fresh `Cancelled`
-                        // discriminant because the panik latch is the
-                        // single source of "this run was operator-
-                        // stopped"; per-task `Cancelled` is reserved
-                        // for the sweep originated by the panik
-                        // broadcast, not for new derived tasks
-                        // spawned afterwards.
-                        cascade_fail = true;
-                        break;
                     }
                     None => {
                         tracing::warn!(

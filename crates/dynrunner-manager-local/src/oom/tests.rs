@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 
 use tracing::Subscriber;
 use tracing::subscriber::with_default;
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
 
 use super::probe::{HostMemoryReading, SystemProbe};
 use super::{
-    LogTrigger, OomWatcher, OomWatcherConfig, OomWatcherSnapshot, DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_HEARTBEAT_INTERVAL, LogTrigger, OomWatcher, OomWatcherConfig, OomWatcherSnapshot,
 };
 
 /// Deterministic probe: returns the configured reading on every read.
@@ -120,8 +120,7 @@ fn capture<F: FnOnce(&mut OomWatcher)>(
 ) -> LogCapture {
     config.log_enabled = true;
     let capture = LogCapture::default();
-    let subscriber =
-        tracing_subscriber::registry().with(capture.clone());
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
     let mut watcher = OomWatcher::with_probe(config, probe);
     with_default(subscriber, || {
         f(&mut watcher);
@@ -162,7 +161,10 @@ fn snapshot_reads_proc_meminfo() {
         "/proc/meminfo MemTotal should be readable on Linux"
     );
     if let (Some(used), Some(total)) = (r.host_ram_used_bytes, r.host_ram_total_bytes) {
-        assert!(used <= total, "used ({used}) > total ({total}) is impossible");
+        assert!(
+            used <= total,
+            "used ({used}) > total ({total}) is impossible"
+        );
     }
 }
 
@@ -208,30 +210,26 @@ fn cgroup_unavailable_yields_none_or_zero() {
 fn heartbeat_log_fires_on_first_emission_then_every_10s() {
     let reading = reading_with_pressure(GIB, 16 * GIB); // 6.25% pressure
     let (probe, _cell) = MockProbe::new(reading);
-    let cap = capture(
-        Box::new(probe),
-        OomWatcherConfig::default(),
-        |watcher| {
-            let t0 = Instant::now();
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: reading,
-                tracked_workers_rss_sum: 0,
-                tracked_workers_count: 0,
-                captured_at: Some(t0),
-            });
-            // First emission: last_log_at = None → heartbeat fires.
-            let fired = watcher.evaluate_and_emit_for_test(t0);
-            assert_eq!(fired, Some(LogTrigger::Heartbeat));
-            // 9.9s later: still under the 10s heartbeat window.
-            let t1 = t0 + Duration::from_millis(9_900);
-            let fired = watcher.evaluate_and_emit_for_test(t1);
-            assert_eq!(fired, None, "9.9s after last log should not heartbeat");
-            // 10.1s later (relative to t0): heartbeat fires again.
-            let t2 = t0 + DEFAULT_HEARTBEAT_INTERVAL + Duration::from_millis(100);
-            let fired = watcher.evaluate_and_emit_for_test(t2);
-            assert_eq!(fired, Some(LogTrigger::Heartbeat));
-        },
-    );
+    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+        let t0 = Instant::now();
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: reading,
+            tracked_workers_rss_sum: 0,
+            tracked_workers_count: 0,
+            captured_at: Some(t0),
+        });
+        // First emission: last_log_at = None → heartbeat fires.
+        let fired = watcher.evaluate_and_emit_for_test(t0);
+        assert_eq!(fired, Some(LogTrigger::Heartbeat));
+        // 9.9s later: still under the 10s heartbeat window.
+        let t1 = t0 + Duration::from_millis(9_900);
+        let fired = watcher.evaluate_and_emit_for_test(t1);
+        assert_eq!(fired, None, "9.9s after last log should not heartbeat");
+        // 10.1s later (relative to t0): heartbeat fires again.
+        let t2 = t0 + DEFAULT_HEARTBEAT_INTERVAL + Duration::from_millis(100);
+        let fired = watcher.evaluate_and_emit_for_test(t2);
+        assert_eq!(fired, Some(LogTrigger::Heartbeat));
+    });
     assert_eq!(cap.count(), 2, "expected exactly 2 heartbeat lines");
     for line in cap.lines() {
         assert!(line.contains("\"trigger\":\"heartbeat\""), "{line}");
@@ -245,33 +243,28 @@ fn delta_log_under_pressure_fires_on_1gb_jump() {
     // host pressure stays > 80%. Exactly one delta line should fire.
     let initial = reading_with_pressure(13 * GIB, 16 * GIB);
     let (probe, cell) = MockProbe::new(initial);
-    let cap = capture(
-        Box::new(probe),
-        OomWatcherConfig::default(),
-        |watcher| {
-            let t0 = Instant::now();
-            // Seed the heartbeat gate by emitting once at t0.
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: initial,
-                tracked_workers_rss_sum: 4 * GIB,
-                tracked_workers_count: 2,
-                captured_at: Some(t0),
-            });
-            let first = watcher.evaluate_and_emit_for_test(t0);
-            assert_eq!(first, Some(LogTrigger::Heartbeat));
-            // 100ms later (well inside heartbeat window): jump RSS.
-            *cell.lock().unwrap() = initial;
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: initial,
-                tracked_workers_rss_sum: 4 * GIB + (3 * GIB / 2),
-                tracked_workers_count: 2,
-                captured_at: Some(t0 + Duration::from_millis(100)),
-            });
-            let fired =
-                watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
-            assert_eq!(fired, Some(LogTrigger::DeltaUnderPressure));
-        },
-    );
+    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+        let t0 = Instant::now();
+        // Seed the heartbeat gate by emitting once at t0.
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: 4 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(t0),
+        });
+        let first = watcher.evaluate_and_emit_for_test(t0);
+        assert_eq!(first, Some(LogTrigger::Heartbeat));
+        // 100ms later (well inside heartbeat window): jump RSS.
+        *cell.lock().unwrap() = initial;
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: 4 * GIB + (3 * GIB / 2),
+            tracked_workers_count: 2,
+            captured_at: Some(t0 + Duration::from_millis(100)),
+        });
+        let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
+        assert_eq!(fired, Some(LogTrigger::DeltaUnderPressure));
+    });
     let kill_or_delta = cap
         .lines()
         .iter()
@@ -287,30 +280,25 @@ fn delta_log_below_pressure_does_not_fire() {
     // log — the pressure guard suppresses it.
     let initial = reading_with_pressure(8 * GIB, 16 * GIB);
     let (probe, _cell) = MockProbe::new(initial);
-    let cap = capture(
-        Box::new(probe),
-        OomWatcherConfig::default(),
-        |watcher| {
-            let t0 = Instant::now();
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: initial,
-                tracked_workers_rss_sum: 2 * GIB,
-                tracked_workers_count: 2,
-                captured_at: Some(t0),
-            });
-            let first = watcher.evaluate_and_emit_for_test(t0);
-            assert_eq!(first, Some(LogTrigger::Heartbeat));
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: initial,
-                tracked_workers_rss_sum: 4 * GIB,
-                tracked_workers_count: 2,
-                captured_at: Some(t0 + Duration::from_millis(100)),
-            });
-            let fired =
-                watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
-            assert_eq!(fired, None, "below-pressure 2GiB jump must not fire");
-        },
-    );
+    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+        let t0 = Instant::now();
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: 2 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(t0),
+        });
+        let first = watcher.evaluate_and_emit_for_test(t0);
+        assert_eq!(first, Some(LogTrigger::Heartbeat));
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: initial,
+            tracked_workers_rss_sum: 4 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(t0 + Duration::from_millis(100)),
+        });
+        let fired = watcher.evaluate_and_emit_for_test(t0 + Duration::from_millis(100));
+        assert_eq!(fired, None, "below-pressure 2GiB jump must not fire");
+    });
     // Exactly the seed heartbeat, nothing else.
     assert_eq!(cap.count(), 1);
 }
@@ -323,19 +311,15 @@ fn kill_event_emits_trigger_kill_log() {
     // a thin pass-through verified by the manager-level tests.
     let reading = reading_with_pressure(14 * GIB, 16 * GIB);
     let (probe, _cell) = MockProbe::new(reading);
-    let cap = capture(
-        Box::new(probe),
-        OomWatcherConfig::default(),
-        |watcher| {
-            watcher.set_snapshot_for_test(OomWatcherSnapshot {
-                host: reading,
-                tracked_workers_rss_sum: 6 * GIB,
-                tracked_workers_count: 2,
-                captured_at: Some(Instant::now()),
-            });
-            watcher.note_kill();
-        },
-    );
+    let cap = capture(Box::new(probe), OomWatcherConfig::default(), |watcher| {
+        watcher.set_snapshot_for_test(OomWatcherSnapshot {
+            host: reading,
+            tracked_workers_rss_sum: 6 * GIB,
+            tracked_workers_count: 2,
+            captured_at: Some(Instant::now()),
+        });
+        watcher.note_kill();
+    });
     let all_lines = cap.lines();
     let kill_lines: Vec<&String> = all_lines
         .iter()

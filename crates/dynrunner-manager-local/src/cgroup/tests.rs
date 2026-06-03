@@ -93,8 +93,10 @@ fn write_workers_subgroup_parent_unlimited_skips_memory_max() {
     let leaf = make_fake_leaf(root.path(), "memory\n", "max\n");
 
     let workers_path = super::writer::write_workers_subgroup(&leaf, 500 * 1024 * 1024).unwrap();
-    assert!(!workers_path.join("memory.max").exists(),
-        "workers/memory.max should not be written when parent is unlimited");
+    assert!(
+        !workers_path.join("memory.max").exists(),
+        "workers/memory.max should not be written when parent is unlimited"
+    );
     // But swap.max is still forced (cgroup-v2 children default to 0).
     let swap = std::fs::read_to_string(workers_path.join("memory.swap.max")).unwrap();
     assert_eq!(swap.trim(), "max");
@@ -159,7 +161,9 @@ fn workers_path_accessor_returns_materialised_dir() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory\n", "max\n");
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
-    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let handle = NestedCgroupHandle {
+        workers_path: workers_path.clone(),
+    };
     assert_eq!(handle.workers_path(), workers_path);
 }
 
@@ -183,7 +187,10 @@ fn write_workers_subgroup_enables_subtree_control_on_workers() {
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
 
     let subtree_path = workers_path.join("cgroup.subtree_control");
-    assert!(subtree_path.exists(), "workers/cgroup.subtree_control should be created");
+    assert!(
+        subtree_path.exists(),
+        "workers/cgroup.subtree_control should be created"
+    );
     let subtree = std::fs::read_to_string(&subtree_path).unwrap();
     assert!(
         !subtree.is_empty(),
@@ -323,7 +330,9 @@ fn prepare_worker_subgroup_creates_leaf_with_swap_max() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
-    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let handle = NestedCgroupHandle {
+        workers_path: workers_path.clone(),
+    };
 
     let sub = super::prepare_worker_subgroup(&handle, 3).unwrap();
 
@@ -365,7 +374,9 @@ fn subcgroup_attach_pid_writes_decimal_to_leaf_procs() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
-    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let handle = NestedCgroupHandle {
+        workers_path: workers_path.clone(),
+    };
     let sub = super::prepare_worker_subgroup(&handle, 42).unwrap();
     let leaf_dir = sub.cgroup_dir().to_path_buf();
 
@@ -383,7 +394,9 @@ fn subcgroup_handle_drop_rmdirs_empty_leaf() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
-    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let handle = NestedCgroupHandle {
+        workers_path: workers_path.clone(),
+    };
     let sub = super::prepare_worker_subgroup(&handle, 5).unwrap();
     let leaf_dir = sub.cgroup_dir().to_path_buf();
     assert!(leaf_dir.is_dir());

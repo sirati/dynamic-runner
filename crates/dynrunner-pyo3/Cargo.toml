@@ -57,6 +57,10 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` exposes `tokio::time::pause`/`advance` +
+# `#[tokio::test(start_paused = true)]` so the observer reporter's
+# cadence/idle tests are deterministic with no wall-clock race.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

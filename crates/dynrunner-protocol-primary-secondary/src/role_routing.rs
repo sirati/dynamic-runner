@@ -41,8 +41,8 @@
 
 use dynrunner_core::Identifier;
 
-use crate::address::{read_role_cache, Role, RoleCache};
-use crate::messages::{timestamp_now, DistributedMessage};
+use crate::address::{Role, RoleCache, read_role_cache};
+use crate::messages::{DistributedMessage, timestamp_now};
 
 /// Maximum number of times a `RoleAddressed` envelope may be relayed
 /// before the receiver drops it. With each Case-B relay the
@@ -92,9 +92,7 @@ pub enum RoleAddressedAction<I> {
     /// and Case D (`attempts` exceeded the safety bound). The
     /// `reason` is a static string so log lines stay grep-able
     /// without per-call allocation.
-    Drop {
-        reason: &'static str,
-    },
+    Drop { reason: &'static str },
 }
 
 /// Decide what the receiver should do with one `RoleAddressed`
@@ -382,9 +380,15 @@ mod tests {
     fn apply_hint_writes_to_cache() {
         let cache = new_role_cache();
         apply_role_misaddress_hint(&cache, Role::Primary, "C".to_string());
-        assert_eq!(read_role_cache(&cache, &Role::Primary), Some("C".to_string()));
+        assert_eq!(
+            read_role_cache(&cache, &Role::Primary),
+            Some("C".to_string())
+        );
         // Idempotent overwrite.
         apply_role_misaddress_hint(&cache, Role::Primary, "D".to_string());
-        assert_eq!(read_role_cache(&cache, &Role::Primary), Some("D".to_string()));
+        assert_eq!(
+            read_role_cache(&cache, &Role::Primary),
+            Some("D".to_string())
+        );
     }
 }

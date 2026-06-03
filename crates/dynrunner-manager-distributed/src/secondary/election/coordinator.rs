@@ -7,19 +7,18 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
-use super::{next_round, primary_node_id, ElectionState, ElectionTickActions};
+use super::super::wire::timestamp_now;
+use super::{ElectionState, ElectionTickActions, next_round, primary_node_id};
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -29,25 +28,13 @@ where
     /// abandon any in-flight failover election. Called from the dispatch
     /// path before any other handling.
     ///
-    /// The current primary identity is NOT cleared here — once set
-    /// (either by an explicit `PromotePrimary` from the live primary
-    /// or by the failover-election outcome) it names the current
-    /// cluster primary and survives subsequent keepalives from the
-    /// now-demoted local primary. Pre-fix this method cleared it on
-    /// every primary keepalive, so non-primary secondaries that
-    /// learned the new primary's id from `PromotePrimary` lost the
-    /// routing target the moment the next local-primary keepalive
-    /// arrived; their `send_to_current_primary` then routed via
-    /// `primary_transport` back to the demoted local primary instead
-    /// of directly to the SLURM-primary peer. The local primary's
-    /// `handle_task_request` relayed TaskRequests onward, papering
-    /// over the bug as long as the local primary's transport stayed
-    /// alive — but when that transport closed (laptop suspend, SSH
-    /// tunnel idle close) the relay vanished and the entire fleet
-    /// stalled. Surfaced in dataset's K=2 hello run after 95b9f32:
-    /// the synchronous PromotePrimary state-sync was correct, but the
-    /// very next primary keepalive clobbered the routing target
-    /// back to None.
+    /// Who holds the primary role is NOT tracked here — it lives solely
+    /// in the replicated `cluster_state` (mirrored into the transport's
+    /// `RoleCache` by the `PrimaryChanged` apply hook, which is the
+    /// single source of "who is primary now" and the only re-route).
+    /// This method records liveness and cancels a false-alarm election;
+    /// it writes no routing target, because there is no transitional
+    /// routing target anymore (P2).
     pub(in crate::secondary) fn record_primary_message(&mut self) {
         self.primary_last_seen = Some(Instant::now());
         // Reset the primary-link health sub-state. A real message
@@ -61,20 +48,12 @@ where
         self.primary_link.record_recv_success();
         // Cancel a failover election in progress: a primary message
         // proves the original primary is still reachable so the
-        // election was a false alarm. The transitional routing target
-        // we set inside the election (pointing at the in-flight
-        // candidate) is also stale — clear it so routing goes back to
-        // the live primary via `primary_transport`.
-        //
-        // For Normal/Promoted states we MUST NOT touch the routing
-        // target:
-        //   - Normal-with-Some(primary) means an explicit handoff is
-        //     in effect (PromotePrimary, or a completed
-        //     Voting → Normal election outcome). Demoted local-primary
-        //     keepalives still arrive in this state but no longer name
-        //     the routing target.
-        //   - Promoted means we ARE the primary; no override applies
-        //     to ourselves.
+        // election was a false alarm. Revert to Normal. There is no
+        // transitional routing target to clear — routing always
+        // resolves `Role::Primary` through the RoleCache, which still
+        // names the original primary (no `PromotePrimary` committed
+        // during the aborted election, per the drop-the-transitional-
+        // hint design).
         if matches!(
             self.election,
             ElectionState::Suspecting { .. }
@@ -95,7 +74,6 @@ where
                 "election recovered: primary message resumed, reverting to Normal"
             );
             self.election = ElectionState::Normal;
-            self.primary_link.set_current_primary(None);
         }
     }
 
@@ -103,6 +81,18 @@ where
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {
         let mut actions = ElectionTickActions::default();
+        // Strict-observer suppression: an observer is a passive bystander
+        // with ZERO authority/responsibility. It never participates in
+        // failover — it doesn't suspect a silent primary, doesn't
+        // broadcast TimeoutQuery / PromotionVote, and can never become a
+        // candidate. Its only cue is the replicated `run_complete()`.
+        // This is the failover concern's own role-gate (the election
+        // module OWNS failover), matching `send_keepalive`'s and
+        // `report_mesh_ready_if_needed`'s self-gates — not a scattered
+        // cross-concern branch.
+        if self.config.is_observer {
+            return actions;
+        }
         if matches!(self.election, ElectionState::Promoted) {
             return actions;
         }
@@ -111,44 +101,36 @@ where
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
+        // `primary_silent` is the SOLE liveness predicate for whoever
+        // currently holds the primary role — co-located OR a promoted
+        // peer. `primary_last_seen` is refreshed by
+        // `record_primary_message`, and post-A-M0a the recognition path
+        // in `handle_inbound`'s Keepalive arm routes EVERY keepalive
+        // whose originator IS the current primary (resolved via
+        // `cluster_state.current_primary()`, the single source of "who
+        // is primary now") through `record_primary_message`. So a
+        // promoted peer's keepalives refresh `primary_last_seen` exactly
+        // like the co-located primary's dispatch traffic once did, and a
+        // genuinely-dead promoted primary trips `primary_silent` once its
+        // keepalives stop — there is no longer a separate
+        // promoted-peer-primary liveness axis to track.
+        //
+        // This subsumes the former cascade trigger (`primary_peer_silent`,
+        // which read the promoted primary's `peer_keepalives` entry):
+        // that branch is both REDUNDANT (the recognition path now keeps
+        // `primary_last_seen` fresh for a promoted peer) and BROKEN (post-
+        // A-M0a the current primary's keepalives no longer populate
+        // `peer_keepalives`, so its `unwrap_or(true)` fired against a
+        // HEALTHY just-promoted primary and stormed `TimeoutQuery`,
+        // risking double-promotion). The cascade (promoted-peer-died)
+        // case Dataset's K=2 run hit is now covered by `primary_silent`
+        // via the A-M0a recognition path.
         let primary_silent = self
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
-        // Cascade election trigger: if a primary peer was promoted
-        // (current_primary names a peer, not ourselves) and that
-        // peer's keepalives have gone stale, we need to run a fresh
-        // election regardless of whether the local-machine primary
-        // is still alive. Pre-fix, the election only fired on
-        // local-primary silence — so when a promoted peer like
-        // sec-0 died but the local primary was still streaming
-        // keepalives to other secondaries, those secondaries
-        // observed the disconnect, dropped sec-0 from
-        // peer_keepalives, and then sat idle forever because
-        // primary_silent stayed false. Dataset's K=2 run hit
-        // exactly this: 4 surviving secondaries with no primary,
-        // no election attempt, no logged "primary assigned" lines
-        // on any of them.
-        //
-        // A peer is considered the silent primary when:
-        //   - current_primary is set (a promotion happened)
-        //   - the id is NOT ourselves (we'd be Promoted, handled above)
-        //   - its peer_keepalives entry is missing OR its
-        //     timestamp is older than `deadline`
-        let primary_peer_silent = self
-            .primary_link
-            .current_primary()
-            .filter(|id| *id != self.config.secondary_id.as_str())
-            .map(|id| {
-                self.peer_keepalives
-                    .get(id)
-                    .map(|t| (timestamp_now() - t) > deadline.as_secs_f64())
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false);
-
-        let need_election = primary_silent || primary_peer_silent;
+        let need_election = primary_silent;
 
         match &self.election {
             ElectionState::Normal if need_election => {
@@ -164,19 +146,23 @@ where
                 // node to coordinate with, so the cluster is
                 // already unsalvageable. Bail with a clear reason
                 // instead of pretending the election succeeded.
+                // Diagnostic only: who the silent primary was (co-located
+                // or a promoted peer). Read inline from the single source
+                // of "who is primary now"; it drives no decision — the
+                // decision is `primary_silent` alone.
+                let current_primary_id = self.cluster_state.current_primary();
                 if self.peer_mesh_degraded {
                     let reason = format!(
                         "peer mesh required for failover but not \
-                         available: primary went silent (primary_silent={}, \
-                         primary_peer_silent={}) and no peers connected to \
-                         elect a new primary; exiting",
-                        primary_silent, primary_peer_silent,
+                         available: primary went silent (primary_silent={}) \
+                         and no peers connected to elect a new primary; \
+                         exiting",
+                        primary_silent,
                     );
                     tracing::error!(
                         secondary = %self.config.secondary_id,
                         primary_silent,
-                        primary_peer_silent,
-                        primary_peer = ?self.primary_link.current_primary(),
+                        primary = ?current_primary_id,
                         "{reason}"
                     );
                     self.fatal_exit = Some(reason);
@@ -186,10 +172,8 @@ where
                     secondary = %self.config.secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
                     primary_silent,
-                    primary_peer_silent,
-                    primary_peer = ?self.primary_link.current_primary(),
-                    "primary or primary peer missed keepalives; \
-                     entering Suspecting"
+                    primary = ?current_primary_id,
+                    "primary missed keepalives; entering Suspecting"
                 );
                 self.election = ElectionState::Suspecting {
                     since: Instant::now(),
@@ -219,11 +203,7 @@ where
                     + 1; // include us
                 let quorum = peer_count.div_ceil(2) + 1;
                 if agreeing < quorum {
-                    tracing::info!(
-                        agreeing,
-                        quorum,
-                        "no quorum on primary death; waiting"
-                    );
+                    tracing::info!(agreeing, quorum, "no quorum on primary death; waiting");
                     return actions;
                 }
                 // Task #36 / Step 7: filter observer peers from
@@ -284,11 +264,7 @@ where
                 // peer_mesh_degraded guard above catches the
                 // pathological "alone and primary's dead" case.
                 if self.config.is_observer && we_lead {
-                    let next_lowest = self
-                        .peer_keepalives
-                        .keys()
-                        .min()
-                        .cloned();
+                    let next_lowest = self.peer_keepalives.keys().min().cloned();
                     tracing::info!(
                         observer = %self.config.secondary_id,
                         ?next_lowest,
@@ -299,7 +275,12 @@ where
                          self-promote on their own ticks)"
                     );
                     if let Some(candidate) = next_lowest {
-                        self.primary_link.set_current_primary(Some(candidate.clone()));
+                        // No transitional routing target: `Role::Primary`
+                        // is re-pointed only by the winner's
+                        // authoritative `PrimaryChanged` (applied on the
+                        // `PromotePrimary` it broadcasts after winning),
+                        // never by an in-flight Voting transition. See
+                        // the P2 drop-the-transitional-hint design.
                         self.election = ElectionState::Voting { round, candidate };
                     }
                     // No next_lowest = we're the only one alive AND
@@ -313,8 +294,15 @@ where
                         confirms: HashSet::from([self.config.secondary_id.clone()]),
                         started: Instant::now(),
                     };
-                    self.primary_link
-                        .set_current_primary(Some(self.config.secondary_id.clone()));
+                    // No transitional self-as-primary routing target —
+                    // authority is committed only once this candidate
+                    // wins quorum (`record_promotion_confirm` reaches
+                    // `Promoted`). The failover re-point — broadcasting
+                    // `PromotePrimary { new = self }` so surviving
+                    // secondaries' role cache moves off the dead uplink
+                    // onto this winner's mesh peer — is the composed
+                    // runtime's terminal action on that transition, not a
+                    // transitional Voting-time hint.
                     actions.broadcast.push(DistributedMessage::PromotionVote {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -323,7 +311,7 @@ where
                     });
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
-                    self.primary_link.set_current_primary(Some(candidate.clone()));
+                    // No transitional routing target (see above).
                     self.election = ElectionState::Voting { round, candidate };
                 }
             }
@@ -396,7 +384,9 @@ where
             return None;
         }
         // Adopt this candidate as our voting target; transition out of
-        // Suspecting/Candidate so we don't double-vote.
+        // Suspecting/Candidate so we don't double-vote. No transitional
+        // routing target is written — `Role::Primary` re-points only on
+        // the winner's authoritative `PrimaryChanged` (P2).
         let already_voting_for_this_round = matches!(
             &self.election,
             ElectionState::Voting { round: r, candidate: c }
@@ -407,7 +397,6 @@ where
                 round,
                 candidate: candidate.clone(),
             };
-            self.primary_link.set_current_primary(Some(candidate.clone()));
         }
         Some(DistributedMessage::PromotionConfirm {
             sender_id: self.config.secondary_id.clone(),
@@ -433,9 +422,7 @@ where
         let quorum = peer_count.div_ceil(2) + 1;
         let promoted = match &mut self.election {
             ElectionState::Candidate {
-                round: r,
-                confirms,
-                ..
+                round: r, confirms, ..
             } if *r == round => {
                 confirms.insert(peer);
                 confirms.len() >= quorum
@@ -444,26 +431,123 @@ where
         };
         if promoted {
             tracing::info!(round, "won election — taking over as primary");
+            // The election state machine only records the terminal
+            // `Promoted` state transition. Activating the co-located
+            // primary — `PrimaryCoordinator::activate_local_primary`,
+            // which on this seeded-resume path hydrates the pool from the
+            // replicated CRDT and enters the operational loop — is the
+            // terminal action the composed runtime drives off this
+            // transition; the secondary carries no self-promotion mirror
+            // to flip on here.
             self.election = ElectionState::Promoted;
-            self.is_primary = true;
-            // Stamp the promotion instant so the alive-demoted
-            // natural-quiesce branch in `process_tasks` can enforce
-            // its minimum-elapsed-time gate. See the `promoted_at`
-            // field doc on `SecondaryCoordinator` for the rationale.
-            // Mirror the dispatch-path stamp site
-            // (`router.rs::dispatch_message` PromotePrimary arm) so
-            // both promotion paths produce the same gate semantics.
-            self.promoted_at = Some(Instant::now());
-            // Hydrate `primary_pending` from the continuously-replicated
-            // `cluster_state`. Pre-Phase-B promotion drained a cached
-            // `FullTaskList` snapshot — a consume-once data path with
-            // its own race conditions (no broadcast observed yet ⇒
-            // empty new primary). Post-Phase-B every node has been
-            // mirroring the ledger from run start, so the new primary
-            // simply reads its own already-current state.
-            self.populate_primary_from_cluster_state();
         }
         promoted
+    }
+
+    /// Fire the promotion-activation gate for the co-located parked
+    /// primary (fire-once). Wakes `PrimaryCoordinator::run_parked` into
+    /// its seeded resume (`activate_local_primary` → hydrate-from-CRDT →
+    /// operational loop).
+    ///
+    /// `take()` makes this idempotent across the TWO paths that reach
+    /// the terminal `Promoted` state: winning this node's OWN election
+    /// (`record_promotion_confirm` → true, via `fire_local_promotion`)
+    /// and being NAMED primary by a `PromotePrimary` broadcast (the
+    /// `dispatch/router` arm). Only the first consumes the sender; the
+    /// second is a no-op on the gate. No-op entirely when no co-located
+    /// primary was composed (`promote_activation_tx` is `None`).
+    pub(in crate::secondary) fn activate_co_located_primary(&mut self) {
+        if let Some(tx) = self.promote_activation_tx.take() {
+            // Hand the parked primary a SNAPSHOT of this secondary's
+            // continuously-mirrored cluster_state — the seed it
+            // `restore`s before `hydrate_from_cluster_state`. The parked
+            // primary's own cluster_state is empty (the role-aware tap
+            // does not feed it CRDT mirror frames), so this snapshot IS
+            // the ledger it resumes from.
+            let snapshot = self.cluster_state.snapshot();
+            if tx.send(snapshot).is_err() {
+                tracing::warn!(
+                    secondary = %self.config.secondary_id,
+                    "promotion-activation gate receiver dropped before firing \
+                     — the parked co-located primary is gone"
+                );
+            } else {
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "fired promotion-activation gate with cluster_state snapshot; \
+                     co-located primary will restore + hydrate and take authority"
+                );
+            }
+        }
+    }
+
+    /// Terminal action for THIS node reaching the `Promoted` state: wake
+    /// the co-located parked primary into its seeded resume and re-point
+    /// every surviving secondary's `Role::Primary` onto this winner.
+    ///
+    /// Two side effects, both idempotent on a second call:
+    ///   1. Fire the promotion-activation gate (`promote_activation_tx`,
+    ///      registered by the composed runtime). The parked
+    ///      `PrimaryCoordinator::run_parked` is waiting on the matching
+    ///      oneshot; firing it triggers `activate_local_primary`
+    ///      (hydrate-from-CRDT seeded resume) + the operational loop.
+    ///      `take()` makes this fire-once: the own-election-win path
+    ///      (`record_promotion_confirm` → true) and the peer-named path
+    ///      (the `PromotePrimary { new = self }` router arm) both call
+    ///      here, but only the first consumes the sender.
+    ///   2. Broadcast `PromotePrimary { new = self, epoch =
+    ///      primary_epoch + 1 }` onto the mesh. Surviving secondaries
+    ///      apply it as `ClusterMutation::PrimaryChanged`, whose
+    ///      write-through role-change hook re-points their transport's
+    ///      `Role::Primary` cache off the dead original-primary uplink
+    ///      onto this winner's mesh peer-id — the entire failover
+    ///      re-route, owned by the transport layer. `epoch + 1` strictly
+    ///      supersedes the prior identity (last-writer-wins on epoch),
+    ///      so a delayed lower-epoch broadcast cannot un-elect this
+    ///      winner.
+    ///
+    /// The OLD primary, observing this `PrimaryChanged`, becomes a pure
+    /// observer (it no longer holds `Role::Primary`) — R3's observe path.
+    ///
+    /// No-op on the gate when no co-located primary was composed
+    /// (Rust-only tests / legacy callers): `promote_activation_tx` is
+    /// `None`; the broadcast still fires so the mesh learns the new
+    /// authority.
+    pub(in crate::secondary) async fn fire_local_promotion(&mut self) {
+        // (1) Wake the parked co-located primary (fire-once).
+        self.activate_co_located_primary();
+
+        // (2) Broadcast the failover re-point. epoch+1 strictly
+        // supersedes the prior primary identity.
+        let epoch = self.cluster_state.primary_epoch() + 1;
+        let msg = DistributedMessage::PromotePrimary {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            new_primary_id: self.config.secondary_id.clone(),
+            epoch,
+            // Failover after primary loss: the ledger is CRDT-merged
+            // from the in-flight broadcasts, NOT a fresh setup-defer
+            // discovery. `required_setup = false`.
+            required_setup: false,
+        };
+        if let Err(e) = self
+            .transport
+            .send(
+                dynrunner_protocol_primary_secondary::Address::Broadcast(
+                    dynrunner_protocol_primary_secondary::Scope::Mesh,
+                ),
+                msg,
+            )
+            .await
+        {
+            tracing::warn!(
+                secondary = %self.config.secondary_id,
+                error = %e,
+                "PromotePrimary(new=self) failover broadcast failed; \
+                 surviving secondaries will re-point on the next election \
+                 round or via CRDT snapshot reconciliation"
+            );
+        }
     }
 
     /// Whether the secondary has been elected primary in this run.

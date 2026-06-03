@@ -270,9 +270,7 @@ async fn production_announcer_sender_wraps_body_in_cluster_mutation() {
                     );
                     assert_eq!(*epoch, 9);
                 }
-                other => panic!(
-                    "expected PeerResourceHoldingsUpdated, got {other:?}"
-                ),
+                other => panic!("expected PeerResourceHoldingsUpdated, got {other:?}"),
             }
         }
         other => panic!("expected DistributedMessage::ClusterMutation, got {other:?}"),
@@ -294,10 +292,8 @@ async fn production_announcer_sender_propagates_drain_error() {
 
     let (outbox_tx, mut outbox_rx) =
         tokio::sync::mpsc::channel::<AnnouncerOutboxItem<RunnerIdentifier>>(8);
-    let mut sender = PeerMeshAnnouncerSender::<RunnerIdentifier>::new(
-        "observer-prop".into(),
-        outbox_tx,
-    );
+    let mut sender =
+        PeerMeshAnnouncerSender::<RunnerIdentifier>::new("observer-prop".into(), outbox_tx);
 
     let body = PeerResourceHoldingsUpdatedPayload {
         peer_id: "observer-prop".into(),

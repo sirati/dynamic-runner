@@ -1,22 +1,24 @@
 //! Worker-event handler: convert one inbound `WorkerEvent` (task
-//! completed, task failed, worker exited unexpectedly, etc.) into the
-//! appropriate cluster-mutation broadcast, per-pool bookkeeping, and
-//! primary-side ledger update.
+//! completed, task failed, worker exited unexpectedly, etc.) into local
+//! per-pool bookkeeping plus a CLASS-1 terminal report to the primary
+//! role.
 //!
-//! Single concern: the secondary's worker→cluster bridge. Drives the
-//! cluster-mutation apply-and-broadcast path for every authoritative
-//! task-outcome the local worker emits.
+//! Single concern: the secondary's OWN-worker → primary bridge. The
+//! secondary holds NO authority — it originates no CRDT mutation and
+//! drives no phase machine. Each terminal worker outcome is reported to
+//! whoever currently holds the primary role via `send_to_primary`
+//! (`Address::Role(Role::Primary)`); the authoritative
+//! `PrimaryCoordinator` owns the `ClusterMutation` origination and the
+//! mesh broadcast.
 
 use std::time::Duration;
 
-use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
-use dynrunner_manager_local::oom::{classify_disconnect, OomWatcher};
-use dynrunner_manager_local::WorkerFactory;
+use dynrunner_core::{ErrorType, Identifier, WorkerId};
+use dynrunner_manager_local::oom::{OomWatcher, classify_disconnect};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Same window as the LocalManager path — 500ms covers ~10 samples
 /// worth of correlation tolerance at the production 50ms sample
@@ -24,29 +26,28 @@ use tokio::sync::mpsc as tokio_mpsc;
 /// worker pipe-EOF observation.
 const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
 
-use crate::primary::PrimaryCommand;
-
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// `command_rx` threads the operational-loop's command-channel
-    /// receiver into the cascade so a callback-issued `spawn_tasks`
-    /// applies inline before the next `drain_empty_active_phases`
-    /// poll. Off-loop callers pass `&mut None`.
+    /// Single concern: the secondary's OWN-worker → cluster bridge.
+    /// One inbound `WorkerEvent` from this node's worker pool becomes
+    /// (1) local pool bookkeeping (slot clear, sampler flush, respawn
+    /// queueing) and (2) a CLASS-1 terminal report to the primary role
+    /// (`send_to_primary`). The secondary is never the authority: it
+    /// originates NO CRDT mutation and drives NO phase machine — the
+    /// co-located `PrimaryCoordinator` owns authoritative accounting,
+    /// reached via the `send_to_primary` loopback.
     pub(in crate::secondary) async fn handle_worker_event(
         &mut self,
         event: WorkerEvent<I>,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-        factory: &mut impl WorkerFactory<M>,
         oom_watcher: &OomWatcher,
     ) -> Result<Option<WorkerId>, String> {
         match event {
@@ -70,10 +71,10 @@ where
                 // the snapshots feed the shared memuse writer so
                 // every secondary's `memuse.log` row carries the
                 // same shape as the LocalManager's.
-                let estimated_for_memuse =
-                    self.pool.workers[worker_id as usize].estimated_resources.clone();
-                let actual_for_memuse =
-                    self.pool.workers[worker_id as usize].actual_usage.clone();
+                let estimated_for_memuse = self.pool.workers[worker_id as usize]
+                    .estimated_resources
+                    .clone();
+                let actual_for_memuse = self.pool.workers[worker_id as usize].actual_usage.clone();
                 if let Some(log_path) = self.config.memuse_log_path.as_deref() {
                     dynrunner_manager_local::memuse::log_resource_usage(
                         log_path,
@@ -84,7 +85,9 @@ where
                     );
                 }
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 // Flush the per-task memprofile writer (if any).
@@ -109,69 +112,24 @@ where
 
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
-                    // `completed_tasks` is the "saw it terminate" set;
-                    // the primary's dispatch path uses it to
-                    // avoid redispatching tasks the cluster has
-                    // already finished. For Recoverable failures we
-                    // intend to retry, so the hash must NOT land here
-                    // — otherwise `handle_primary_task_request` would
-                    // filter the re-injected binary out via its
-                    // `completed_tasks` retain, and retry silently
-                    // becomes a no-op. Mirrors the pre-existing
-                    // dispatch.rs::TaskFailed forward and peer.rs::
-                    // TaskFailed wire paths, both of which already
-                    // skip `completed_tasks` insertion for
-                    // Recoverable. The terminal-failure / success
-                    // branches still insert below.
-                    let recoverable_failure = !result.success
-                        && result
-                            .error_type
-                            .as_ref()
-                            .is_some_and(|e| matches!(
-                                e,
-                                dynrunner_core::ErrorType::Recoverable
-                            ));
-                    if !recoverable_failure {
-                        self.completed_tasks.insert(hash.clone());
-                    }
+                    // No per-node terminal set: the authority owns the
+                    // CRDT terminal mutation and every replica's
+                    // `cluster_state` mirror converges to it. The
+                    // secondary just clears its OWN `active_tasks` slot
+                    // (above) and reports its own worker's outcome to
+                    // the primary role (below).
 
                     if result.success {
-                        // Promoted-secondary apply→dispatch race
-                        // (keyed-outputs): when this node is the
-                        // primary, `note_primary_item_completed`
-                        // releases dependents in `primary_pending`
-                        // and the same-frame
-                        // `request_task_for_worker` below routes
-                        // straight into `handle_primary_task_request`,
-                        // which reads `predecessor_outputs` from
-                        // `self.cluster_state`. The canonical
-                        // `ClusterMutation::TaskCompleted`
-                        // originator on the live-primary path is
-                        // the demoted-local primary's
-                        // `handle_task_complete`, reached via the
-                        // `send_to_current_primary` loopback below —
-                        // that runs strictly later (its inbound is
-                        // an mpsc enqueue, processed in another
-                        // await frame). Without this synchronous
-                        // local apply the dispatch sees empty
-                        // `task_outputs` for the just-completed
-                        // prerequisite and ships the dependent with
-                        // `predecessor_outputs: {}`. Idempotent /
-                        // no-broadcast — see
-                        // [`Self::apply_task_completed_locally_if_primary`]
-                        // for the invariants this preserves.
-                        self.apply_task_completed_locally_if_primary(
-                            hash.clone(),
-                            result_data.clone(),
-                        );
-                        // Drive the primary's phase machine if
-                        // this node is acting as one and dispatched
-                        // the task — a no-op otherwise. Mid-run
-                        // firing is what unblocks chained phases in
-                        // the primary pool.
-                        self.note_primary_item_completed(&hash, command_rx).await;
                         // Report completion to the current primary
                         // (whichever node currently holds authority).
+                        // CLASS-1 own-worker report: the authority
+                        // (`PrimaryCoordinator`, reached via the
+                        // `send_to_primary` loopback) owns the
+                        // `ClusterMutation::TaskCompleted` origination,
+                        // the keyed-outputs apply, and the phase-machine
+                        // advance. The secondary never holds authority,
+                        // so it neither applies the completion locally
+                        // nor drives a phase machine.
                         let msg = DistributedMessage::TaskComplete {
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
@@ -180,8 +138,16 @@ where
                             task_hash: hash.clone(),
                             result_data,
                         };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
+                        // Report to the primary role only. The AUTHORITY
+                        // originates the terminal CRDT mutation
+                        // (`apply_and_broadcast_cluster_mutations`) and
+                        // broadcasts it to the mesh, so every peer /
+                        // observer mirror converges and run-complete
+                        // cues stay intact — the reporting secondary
+                        // must NOT broadcast itself (a second CRDT
+                        // originator would break the authority's
+                        // apply-before-dispatch ordering).
+                        self.send_to_primary(msg).await?;
                     } else {
                         // Reuse the upstream classification from the
                         // worker protocol; default to NonRecoverable
@@ -194,23 +160,16 @@ where
                             .error_type
                             .clone()
                             .unwrap_or(ErrorType::NonRecoverable);
-                        // Failure-aware variant: Recoverable failures
-                        // land in `primary_failed` for the
-                        // retry pass. Phase-machine in-flight
-                        // bookkeeping is identical to the success
-                        // case (decrement + cascade).
-                        self.note_primary_item_failed(&hash, &error_type, command_rx).await;
-                        // Synchronous kickstart (see peer.rs for
-                        // rationale): the per-phase retry-bucket
-                        // cascade fired inside
-                        // `note_primary_item_failed` may have just
-                        // reinjected this task into the pool. Re-
-                        // poll our own idle workers so a freshly
-                        // reinjected item reaches a worker on this
-                        // tick rather than waiting up to one
-                        // keepalive interval.
-                        self.repoll_idle_workers(factory).await;
-                        // Report error to the current primary.
+                        // Re-poll our OWN idle workers (own worker
+                        // management — not authority). A retry the
+                        // authority reinjects and re-dispatches to this
+                        // node reaches an idle worker on the next tick
+                        // rather than waiting a full keepalive interval.
+                        self.repoll_idle_workers().await;
+                        // Report error to the current primary. CLASS-1
+                        // own-worker report: the authority owns the
+                        // failure accounting, the retry-bucket cascade,
+                        // and the terminal CRDT mutation.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
@@ -222,12 +181,14 @@ where
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),
                         };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
+                        // Report to the primary role only; the authority
+                        // originates + broadcasts the terminal CRDT
+                        // mutation (see the TaskComplete arm above).
+                        self.send_to_primary(msg).await?;
                     }
 
                     // Request next task for this worker
-                    self.request_task_for_worker(worker_id, factory).await?;
+                    self.request_task_for_worker(worker_id).await?;
                 }
 
                 // Operator-facing INFO: did the worker finish a
@@ -271,7 +232,9 @@ where
                 let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
 
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 tracing::warn!(
@@ -283,23 +246,23 @@ where
 
                 // Recover any pending first-bind binary first: the
                 // worker died between `RespawnInProgress` and the
-                // expected `Ready`, so the binary stashed in
-                // `pending_first_bind` is orphaned. Route it back
-                // to the right ledger per its `BindSource`
-                // discriminator before the standard disconnect
-                // path proceeds. Two-step here (take + recover)
-                // because `recover_pending_first_bind` takes
-                // `&mut self` and the `pending` value extracted
-                // from the map would otherwise conflict.
+                // expected `Ready`, so the task held in
+                // `pending_first_bind` (deferred per the respawn-HOLD
+                // contract) never ran. Report it back to the authority
+                // as a backpressure-shaped TaskFailed so the authority
+                // requeues + re-dispatches it. The secondary is never
+                // the authority, so there is exactly ONE recovery: the
+                // own-worker CLASS-1 report.
                 if let Some(pending) = self.pending_first_bind.remove(&worker_id) {
                     let pending_hash = pending.file_hash.clone();
-                    let source = pending.source.clone();
                     tracing::warn!(
                         worker_id,
                         task_hash = %pending_hash,
-                        "pending first-bind worker disconnected before Ready; recovering binary"
+                        "pending first-bind worker disconnected before Ready; \
+                         reporting deferred task back to the authority"
                     );
-                    self.recover_pending_first_bind(worker_id, &pending_hash, &source).await?;
+                    self.report_deferred_task_lost(worker_id, &pending_hash)
+                        .await?;
                 }
 
                 // Find and report the task as failed
@@ -364,15 +327,11 @@ where
                     let kernel_oom_recent =
                         oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
                     let error_type = classify_disconnect(
-                        result
-                            .error_type
-                            .clone()
-                            .unwrap_or(ErrorType::Recoverable),
+                        result.error_type.clone().unwrap_or(ErrorType::Recoverable),
                         exit_status.as_ref(),
                         kernel_oom_recent,
                     );
-                    let is_comm_failure =
-                        matches!(error_type, ErrorType::Recoverable);
+                    let is_comm_failure = matches!(error_type, ErrorType::Recoverable);
 
                     let (wire_error_type, wire_error_message) = if is_comm_failure {
                         (
@@ -397,8 +356,9 @@ where
                         error_type: wire_error_type,
                         error_message: wire_error_message,
                     };
-                    let _ = self.send_to_current_primary(msg.clone()).await;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only; the authority
+                    // originates + broadcasts the terminal CRDT mutation.
+                    let _ = self.send_to_primary(msg).await;
                 }
 
                 let _ = binary; // binary info already reported
@@ -454,7 +414,9 @@ where
                 // go through `poll_ready` directly without a
                 // background task, so they hit this arm with
                 // `poll_task = None` and pass through cleanly.
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 // Drop the per-worker `TaskRequest` backoff window.
                 // The slot just transitioned out of the
                 // type-shift Transitioning state — any backoff
@@ -490,7 +452,6 @@ where
                         binary,
                         file_hash,
                         estimated,
-                        source,
                         predecessor_outputs,
                     } = pending;
                     let log_task_hash = file_hash.clone();
@@ -528,26 +489,22 @@ where
                             // actual signal/code rather than the
                             // pipe-level error string. Recovery
                             // shape mirrors the same-arm
-                            // [Disconnected] path: the binary
-                            // path takes the source-discriminated
-                            // recovery branch so the in-flight
-                            // ledger ends up consistent.
-                            let exit_status =
-                                self.pool.workers[worker_id as usize].try_reap_exit();
+                            // [Disconnected] path: the deferred task
+                            // never ran, so report it back to the
+                            // authority as backpressure so it requeues
+                            // + re-dispatches.
+                            let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id,
                                 error = %e,
                                 exit_status = exit_status.as_ref().map(|s| s.to_string()),
                                 task_hash = %log_task_hash,
-                                "pending first-bind assign_task failed; recovering binary"
+                                "pending first-bind assign_task failed; reporting \
+                                 deferred task back to the authority"
                             );
                             self.pending_worker_restarts.insert(worker_id);
-                            self.recover_pending_first_bind(
-                                worker_id,
-                                &log_task_hash,
-                                &source,
-                            )
-                            .await?;
+                            self.report_deferred_task_lost(worker_id, &log_task_hash)
+                                .await?;
                         }
                     }
                     return Ok(None);
@@ -561,7 +518,7 @@ where
                 // Errors are propagated through `?` since a
                 // send-to-primary failure here is the same wire
                 // error class as elsewhere in this handler.
-                self.request_task_for_worker(worker_id, factory).await?;
+                self.request_task_for_worker(worker_id).await?;
                 tracing::debug!(worker_id, "worker ready (post-respawn reclaim)");
                 Ok(None)
             }

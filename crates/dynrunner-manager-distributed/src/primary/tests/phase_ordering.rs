@@ -94,10 +94,7 @@ async fn on_phase_end_fires_after_last_in_flight_completes() {
             run_phase_ordering_scenario(
                 binaries,
                 phase_deps,
-                vec![(
-                    "/tmp/slow_slow".to_string(),
-                    Duration::from_millis(500),
-                )],
+                vec![("/tmp/slow_slow".to_string(), Duration::from_millis(500))],
                 /* lazy_spawn_next: */ None,
                 /* expected_total_completed: */ 3,
             )
@@ -137,10 +134,7 @@ async fn on_phase_end_fires_after_every_in_flight_item_terminates() {
             run_phase_ordering_scenario(
                 binaries,
                 phase_deps,
-                vec![(
-                    "/tmp/fast_3".to_string(),
-                    Duration::from_millis(200),
-                )],
+                vec![("/tmp/fast_3".to_string(), Duration::from_millis(200))],
                 /* lazy_spawn_next: */ None,
                 /* expected_total_completed: */ 6,
             )
@@ -172,16 +166,12 @@ async fn on_phase_end_fires_after_last_in_flight_completes_with_lazy_spawn() {
                 phased_binary("slow_fast", "slow", 100),
                 phased_binary("slow_slow", "slow", 50),
             ];
-            let next_phase_items =
-                vec![phased_binary("next_one", "next", 50)];
+            let next_phase_items = vec![phased_binary("next_one", "next", 50)];
 
             run_phase_ordering_scenario(
                 binaries,
                 phase_deps,
-                vec![(
-                    "/tmp/slow_slow".to_string(),
-                    Duration::from_millis(500),
-                )],
+                vec![("/tmp/slow_slow".to_string(), Duration::from_millis(500))],
                 Some(("slow".into(), next_phase_items)),
                 /* expected_total_completed: */ 3,
             )
@@ -214,12 +204,7 @@ async fn run_phase_ordering_scenario(
     // re-introducing the PhaseId/&str dance.
     let deps_lookup: HashMap<String, Vec<String>> = phase_deps
         .iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                v.iter().map(|p| p.to_string()).collect(),
-            )
-        })
+        .map(|(k, v)| (k.to_string(), v.iter().map(|p| p.to_string()).collect()))
         .collect();
     // Compute per-phase totals BEFORE moving `binaries`. Used to
     // assert that every on_phase_end firing observes the full
@@ -244,12 +229,8 @@ async fn run_phase_ordering_scenario(
 
     for i in 0..2u32 {
         let sec_id = format!("sec-{i}");
-        let (pri_to_sec_tx, sec_to_pri_rx, handle) = spawn_real_secondary_slow(
-            sec_id.clone(),
-            1,
-            max_res.clone(),
-            slow_markers.clone(),
-        );
+        let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+            spawn_real_secondary_slow(sec_id.clone(), 1, max_res.clone(), slow_markers.clone());
         outgoing.insert(sec_id, pri_to_sec_tx);
         sec_handles.push(handle);
 
@@ -265,10 +246,8 @@ async fn run_phase_ordering_scenario(
     }
     drop(incoming_tx);
 
-    let transport = ChannelSecondaryTransportEnd {
-        outgoing,
-        incoming_rx,
-    };
+    let transport =
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         node_id: "primary".into(),
         num_secondaries: 2,
@@ -293,7 +272,6 @@ async fn run_phase_ordering_scenario(
     let mut primary = PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -414,12 +392,12 @@ async fn run_phase_ordering_scenario(
                 continue;
             };
             for dep_phase in deps {
-                let start_idx = log.iter().position(|e| {
-                    matches!(e, PhaseEvent::Start(p) if p == starting_phase)
-                });
-                let dep_end_idx = log.iter().position(|e| {
-                    matches!(e, PhaseEvent::End { phase, .. } if phase == dep_phase)
-                });
+                let start_idx = log
+                    .iter()
+                    .position(|e| matches!(e, PhaseEvent::Start(p) if p == starting_phase));
+                let dep_end_idx = log
+                    .iter()
+                    .position(|e| matches!(e, PhaseEvent::End { phase, .. } if phase == dep_phase));
                 assert!(
                     dep_end_idx.is_some(),
                     "on_phase_end({dep_phase}) must fire before \

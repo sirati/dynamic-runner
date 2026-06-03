@@ -31,8 +31,10 @@ impl Layout {
     /// Pure derivation from config — no filesystem side effects.
     pub fn derive(cfg: &WrapperConfig) -> Self {
         let rndtmp = PathBuf::from(format!("/tmp/{}-{}", cfg.name_prefix, cfg.rand_suffix));
-        let container_name =
-            format!("{}-{}-{}", cfg.name_prefix, cfg.rand_suffix, cfg.secondary_id);
+        let container_name = format!(
+            "{}-{}-{}",
+            cfg.name_prefix, cfg.rand_suffix, cfg.secondary_id
+        );
 
         let src_tmp = rndtmp.join("src");
         let out_tmp = rndtmp.join("out");
@@ -130,7 +132,10 @@ mod tests {
         assert_eq!(l.podman_storage, PathBuf::from("/tmp/asm-2f1d4e89/storage"));
         assert_eq!(l.podman_run, PathBuf::from("/tmp/asm-2f1d4e89/run"));
         assert_eq!(l.socket_dir, PathBuf::from("/tmp/asm-2f1d4e89/sockets"));
-        assert_eq!(l.cmd_socket, PathBuf::from("/tmp/asm-2f1d4e89/sockets/cmd.sock"));
+        assert_eq!(
+            l.cmd_socket,
+            PathBuf::from("/tmp/asm-2f1d4e89/sockets/cmd.sock")
+        );
         assert_eq!(l.shutdown_unit_name, "dynrunner-shutdown-2f1d4e89");
         assert_eq!(
             l.shutdown_log_path,

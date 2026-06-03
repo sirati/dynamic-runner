@@ -151,8 +151,7 @@ fn assign_initial_marks_opportunistic_when_exceeding_max() {
     let worker = make_worker(0, 500, true, false);
     let binaries = vec![make_binary("medium", 100)];
 
-    let decision =
-        s.assign_initial(&worker, &binaries, &mem(900), &mem(1000), &LinearEstimator);
+    let decision = s.assign_initial(&worker, &binaries, &mem(900), &mem(1000), &LinearEstimator);
     match decision {
         AssignmentDecision::Assign { opportunistic, .. } => {
             assert!(opportunistic);
@@ -167,8 +166,7 @@ fn assign_initial_no_fit() {
     let worker = make_worker(0, 100, true, false);
     let binaries = vec![make_binary("huge", 1000)];
 
-    let decision =
-        s.assign_initial(&worker, &binaries, &mem(0), &mem(10000), &LinearEstimator);
+    let decision = s.assign_initial(&worker, &binaries, &mem(0), &mem(10000), &LinearEstimator);
     assert!(matches!(decision, AssignmentDecision::NoFit));
 }
 
@@ -187,8 +185,7 @@ fn assign_initial_skips_already_assigned() {
     worker.has_initial_assignment = true;
     let binaries = vec![make_binary("a", 10)];
 
-    let decision =
-        s.assign_initial(&worker, &binaries, &mem(0), &mem(1000), &FixedEstimator(10));
+    let decision = s.assign_initial(&worker, &binaries, &mem(0), &mem(1000), &FixedEstimator(10));
     assert!(matches!(decision, AssignmentDecision::NoFit));
 }
 
@@ -200,8 +197,14 @@ fn assign_normal_picks_fitting_task() {
     let workers = vec![make_worker(0, 500, true, false)];
     let binaries = vec![make_binary("a", 100)];
 
-    let decision =
-        s.assign_normal(&workers[0], &workers, &binaries, &mem(10000), &LinearEstimator, false);
+    let decision = s.assign_normal(
+        &workers[0],
+        &workers,
+        &binaries,
+        &mem(10000),
+        &LinearEstimator,
+        false,
+    );
     match decision {
         AssignmentDecision::Assign {
             binary_index,
@@ -222,8 +225,14 @@ fn assign_normal_opportunistic_caps_to_available() {
     let workers = vec![w];
     let binaries = vec![make_binary("a", 100)];
 
-    let decision =
-        s.assign_normal(&workers[0], &workers, &binaries, &mem(300), &LinearEstimator, false);
+    let decision = s.assign_normal(
+        &workers[0],
+        &workers,
+        &binaries,
+        &mem(300),
+        &LinearEstimator,
+        false,
+    );
     assert!(matches!(decision, AssignmentDecision::Assign { .. }));
 }
 
@@ -234,8 +243,14 @@ fn assign_normal_opportunistic_rejects_too_large() {
     let workers = vec![w];
     let binaries = vec![make_binary("a", 200)];
 
-    let decision =
-        s.assign_normal(&workers[0], &workers, &binaries, &mem(300), &LinearEstimator, false);
+    let decision = s.assign_normal(
+        &workers[0],
+        &workers,
+        &binaries,
+        &mem(300),
+        &LinearEstimator,
+        false,
+    );
     assert!(matches!(decision, AssignmentDecision::NoFit));
 }
 
@@ -284,8 +299,7 @@ fn check_pressure_no_action_below_threshold() {
         current_task: Some(make_binary("a", 10)),
         estimated_usage: mem(100),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(10000), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(10000), true);
     assert!(matches!(decision, ResourcePressureDecision::NoAction));
 }
 
@@ -320,8 +334,7 @@ fn check_pressure_kills_opportunistic_first() {
             estimated_usage: mem(400),
         },
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill"),
@@ -359,8 +372,7 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
             estimated_usage: mem(300),
         },
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill"),
@@ -386,8 +398,7 @@ fn check_pressure_kills_during_pressure_phase() {
         current_task: Some(make_binary("a", 10)),
         estimated_usage: mem(99999),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     assert!(matches!(decision, ResourcePressureDecision::Kill { .. }));
 }
 
@@ -413,8 +424,7 @@ fn check_pressure_no_action_outside_pressure_phase_even_when_over_budget() {
         current_task: Some(make_binary("a", 10)),
         estimated_usage: mem(99999),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
     assert!(
         matches!(decision, ResourcePressureDecision::NoAction),
         "expected NoAction with in_pressure_phase=false regardless of usage, got {decision:?}"
@@ -438,8 +448,7 @@ fn check_pressure_no_action_outside_pressure_phase_with_opportunistic_overshoot(
         worker_active(0, 500, 400, false),
         worker_active(1, 500, 400, true),
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), false);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), false);
     assert!(
         matches!(decision, ResourcePressureDecision::NoAction),
         "expected NoAction with in_pressure_phase=false regardless of opportunistic-victim selection, got {decision:?}"
@@ -449,8 +458,7 @@ fn check_pressure_no_action_outside_pressure_phase_with_opportunistic_overshoot(
 #[test]
 fn check_pressure_no_action_empty_workers() {
     let s = sched();
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &[], &mem(10000), false);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &[], &mem(10000), false);
     assert!(matches!(decision, ResourcePressureDecision::NoAction));
 }
 
@@ -498,8 +506,7 @@ fn pressure_kill_fires_before_cgroup_oom() {
         },
     ];
     // Sum of actual_usage = 92.
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill of opportunistic worker, got {decision:?}"),
@@ -530,8 +537,7 @@ fn active_kill_fires_at_margin_not_at_cgroup_cap() {
         current_task: Some(make_binary("a", 10)),
         estimated_usage: mem(95),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 7),
         _ => panic!("expected Kill of smallest active worker, got {decision:?}"),
@@ -564,8 +570,7 @@ fn safety_margin_zero_restores_pre_fix_behavior() {
         current_task: Some(make_binary("a", 10)),
         estimated_usage: mem(95),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     assert!(
         matches!(decision, ResourcePressureDecision::NoAction),
         "expected NoAction with margin=0 and usage<cap, got {decision:?}"
@@ -624,8 +629,7 @@ fn kill_reason_no_fault_memory_stealing_when_opportunistic_picked() {
         // Opportunistic victim — median of one is itself.
         worker_active(1, 500, 400, true),
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -661,8 +665,7 @@ fn kill_reason_no_fault_under_budget_when_smallest_active_is_below_reserved() {
             estimated_usage: mem(100),
         },
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -703,8 +706,7 @@ fn kill_reason_oom_over_budget_when_smallest_active_is_over_reserved() {
             estimated_usage: mem(300),
         },
     ];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -732,8 +734,7 @@ fn kill_reason_oom_last_resort_when_single_active_over_budget() {
         current_task: Some(make_binary("solo", 10)),
         estimated_usage: mem(200),
     }];
-    let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
+    let decision = Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 7);
@@ -753,15 +754,33 @@ fn assign_normal_temp_factor_ordering() {
     ];
     let binaries = vec![make_binary("a", 50)];
 
-    let d0 =
-        s.assign_normal(&workers[0], &workers, &binaries, &mem(600), &LinearEstimator, false);
+    let d0 = s.assign_normal(
+        &workers[0],
+        &workers,
+        &binaries,
+        &mem(600),
+        &LinearEstimator,
+        false,
+    );
     assert!(matches!(d0, AssignmentDecision::Assign { .. }));
 
-    let d1 =
-        s.assign_normal(&workers[1], &workers, &binaries, &mem(600), &LinearEstimator, false);
+    let d1 = s.assign_normal(
+        &workers[1],
+        &workers,
+        &binaries,
+        &mem(600),
+        &LinearEstimator,
+        false,
+    );
     assert!(matches!(d1, AssignmentDecision::Assign { .. }));
 
-    let d2 =
-        s.assign_normal(&workers[2], &workers, &binaries, &mem(600), &LinearEstimator, false);
+    let d2 = s.assign_normal(
+        &workers[2],
+        &workers,
+        &binaries,
+        &mem(600),
+        &LinearEstimator,
+        false,
+    );
     assert!(matches!(d2, AssignmentDecision::Assign { .. }));
 }

@@ -127,11 +127,7 @@ mod tests {
 
     #[test]
     fn sigkill_with_kernel_oom_upgrades_to_resource_exhausted() {
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&killed_with(9)),
-            true,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&killed_with(9)), true);
         assert_eq!(result, ErrorType::ResourceExhausted(ResourceKind::memory()));
     }
 
@@ -140,31 +136,19 @@ mod tests {
         // External SIGKILL with no cgroup-OOM correlate (operator
         // kill, host signal): retrying is safe — the worker may
         // have been the victim of a transient external event.
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&killed_with(9)),
-            false,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&killed_with(9)), false);
         assert_eq!(result, ErrorType::Recoverable);
     }
 
     #[test]
     fn sigsegv_routes_to_nonrecoverable() {
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&killed_with(11)),
-            false,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&killed_with(11)), false);
         assert_eq!(result, ErrorType::NonRecoverable);
     }
 
     #[test]
     fn sigabrt_routes_to_nonrecoverable() {
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&killed_with(6)),
-            false,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&killed_with(6)), false);
         assert_eq!(result, ErrorType::NonRecoverable);
     }
 
@@ -174,11 +158,7 @@ mod tests {
         // a different worker triggered oom_kill, the SIGKILL→OOM
         // arm requires `signal == SIGKILL`. SIGSEGV must still
         // route to NonRecoverable.
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&killed_with(11)),
-            true,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&killed_with(11)), true);
         assert_eq!(result, ErrorType::NonRecoverable);
     }
 
@@ -188,11 +168,7 @@ mod tests {
         // observed pipe-EOF first (rare; usually the worker would
         // have sent Response::Error). Without a signal there's
         // nothing to upgrade — stays Recoverable.
-        let result = classify_disconnect(
-            ErrorType::Recoverable,
-            Some(&exited_with(1)),
-            false,
-        );
+        let result = classify_disconnect(ErrorType::Recoverable, Some(&exited_with(1)), false);
         assert_eq!(result, ErrorType::Recoverable);
     }
 
@@ -209,11 +185,7 @@ mod tests {
         // Worker explicitly reported NonRecoverable on the wire;
         // even with a kernel-OOM correlate, the classifier must
         // preserve the upstream verdict.
-        let result = classify_disconnect(
-            ErrorType::NonRecoverable,
-            Some(&killed_with(9)),
-            true,
-        );
+        let result = classify_disconnect(ErrorType::NonRecoverable, Some(&killed_with(9)), true);
         assert_eq!(result, ErrorType::NonRecoverable);
     }
 }

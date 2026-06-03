@@ -66,10 +66,10 @@ pub(crate) fn make_on_phase_end(
 ) -> impl FnMut(&PhaseId, u32, u32) + Send + 'static {
     move |phase_id: &PhaseId, completed: u32, failed: u32| {
         Python::attach(|py| {
-            if let Err(e) = task_definition.bind(py).call_method1(
-                "on_phase_end",
-                (phase_id.as_str(), completed, failed),
-            ) {
+            if let Err(e) = task_definition
+                .bind(py)
+                .call_method1("on_phase_end", (phase_id.as_str(), completed, failed))
+            {
                 tracing::warn!(
                     error = %e,
                     phase = %phase_id,
@@ -224,14 +224,8 @@ mod tests {
             // Use a Python int as the opaque handle sentinel.
             let sentinel: Py<PyAny> = 42i64.into_pyobject(py).unwrap().into_any().unbind();
             let args = py.None();
-            fire_on_run_start(
-                task,
-                "/src",
-                "/out",
-                args.bind(py),
-                Some(sentinel),
-            )
-            .expect("modern signature accepts primary_handle kwarg");
+            fire_on_run_start(task, "/src", "/out", args.bind(py), Some(sentinel))
+                .expect("modern signature accepts primary_handle kwarg");
             let g = globals.bind(py);
             let calls = g
                 .cast::<PyDict>()
@@ -263,14 +257,8 @@ mod tests {
             let task = task_obj.bind(py);
             let sentinel: Py<PyAny> = 7i64.into_pyobject(py).unwrap().into_any().unbind();
             let args = py.None();
-            fire_on_run_start(
-                task,
-                "/src",
-                "/out",
-                args.bind(py),
-                Some(sentinel),
-            )
-            .expect("legacy signature falls back without surfacing the TypeError");
+            fire_on_run_start(task, "/src", "/out", args.bind(py), Some(sentinel))
+                .expect("legacy signature falls back without surfacing the TypeError");
             let g = globals.bind(py);
             let calls = g
                 .cast::<PyDict>()
@@ -302,14 +290,8 @@ mod tests {
             let task = task_obj.bind(py);
             let sentinel: Py<PyAny> = 1i64.into_pyobject(py).unwrap().into_any().unbind();
             let args = py.None();
-            let err = fire_on_run_start(
-                task,
-                "/src",
-                "/out",
-                args.bind(py),
-                Some(sentinel),
-            )
-            .expect_err("unrelated TypeError must propagate");
+            let err = fire_on_run_start(task, "/src", "/out", args.bind(py), Some(sentinel))
+                .expect_err("unrelated TypeError must propagate");
             assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
             assert!(err.value(py).to_string().contains("something else broke"));
         });

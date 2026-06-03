@@ -187,7 +187,10 @@ mod tests {
     fn choose_only_cgroup() {
         let (cap, source) = choose(None, Some(42));
         assert_eq!(cap, Some(42));
-        assert_eq!(source, "wrapper cgroup memory.max (host-MemTotal probe failed)");
+        assert_eq!(
+            source,
+            "wrapper cgroup memory.max (host-MemTotal probe failed)"
+        );
     }
 
     #[test]

@@ -1,21 +1,17 @@
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_core::{Identifier, TaskInfo};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
+use crate::worker_signal::WorkerMgmtSignal;
 
-
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
     /// applies inline before the next `drain_empty_active_phases`
@@ -57,8 +53,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // earlier landing).
             let dedup_is_backpressure = error_message == "No idle worker available"
                 || error_message == "worker pipe broken; respawning"
-                || error_message
-                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
+                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if !dedup_is_backpressure
                 && (self.completed_tasks.contains(task_hash)
                     || self.failed_tasks.contains_key(task_hash))
@@ -70,21 +65,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let task_hash = task_hash.clone();
             let error_type = error_type.clone();
             let error_message = error_message.clone();
-            // Find the specific worker and recover the binary if it's a
-            // recoverable error so it can be re-assigned to another worker.
-            let mut recovered_binary: Option<TaskInfo<I>> = None;
-            let mut local_idx: u32 = 0;
-            for w in &mut self.workers {
-                if w.secondary_id == secondary_id {
-                    if local_idx == worker_id {
-                        recovered_binary = w.current_task.take();
-                        w.estimated_resources = ResourceMap::new();
-                        w.is_idle = true;
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
+            // Resolve the held binary BY HASH and free its holding slot
+            // through the single terminal-free helper.
+            // `free_slot_on_terminal` frees the slot back to `Idle`,
+            // releases the per-type concurrency slot, and removes the
+            // `in_flight` ledger entry ONLY if the addressed slot's held
+            // hash equals this `task_hash`; it returns the freed entry
+            // (or the inherited pre-owned entry) so both the
+            // backpressure-requeue and terminal-failure arms below can
+            // recover the binary. A stale TaskFailed for a slot already
+            // reassigned to a later task returns `None` — a safe no-op.
+            // All three terminal-shaped paths in this function
+            // (backpressure-requeue, terminal TaskFailed) share this
+            // one resolution; the stuck-worker watchdog in
+            // `operational_loop` routes through the same helper.
+            let recovered_binary: Option<TaskInfo<I>> = self
+                .free_slot_on_terminal(&secondary_id, worker_id, &task_hash)
+                .map(|entry| entry.task);
 
             // Backpressure detection: secondary's dispatch.rs sends
             // this exact error_message when its `is_idle_state()`
@@ -139,8 +136,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // the other two markers.
             let is_backpressure = error_message == "No idle worker available"
                 || error_message == "worker pipe broken; respawning"
-                || error_message
-                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
+                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if is_backpressure {
                 let backoff_ms = 500;
                 self.backpressured_secondaries.insert(
@@ -153,9 +149,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     backoff_ms,
                     "secondary returned backpressure; re-queuing task and applying backoff"
                 );
+                // The slot + ledger + type-slot were already freed by
+                // `free_slot_on_terminal` above; backpressure means the
+                // task never ran, so requeue it into the pool (which
+                // decrements the phase's in-flight counter and re-adds
+                // the binary at the front of its bucket). No
+                // `release_type_slot` here — the helper already did it.
                 if let Some(binary) = recovered_binary {
-                    self.release_type_slot(&binary.type_id);
                     self.pool_mut().requeue(binary);
+                    // The requeued binary is a pool-entry edge AND the
+                    // backpressured worker's slot just freed. EMIT a
+                    // `TasksAdded` so the worker-management recheck picks
+                    // it up (the recheck bypasses the per-secondary
+                    // backoff: the slot is genuinely free now — that's
+                    // what the terminal freed — so the freed worker, on
+                    // this OR any other secondary, is a valid target).
+                    // Decoupled emit, never a direct dispatch call.
+                    self.cluster_state
+                        .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
                 }
                 return;
             }
@@ -181,13 +192,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // post-failure state. The wire `error_type` is now the
             // typed `ErrorType` enum (Phase D), so the CRDT mutation
             // takes it verbatim — no string-token mapping.
-            self.apply_and_broadcast_cluster_mutations(vec![
-                ClusterMutation::TaskFailed {
-                    hash: task_hash.clone(),
-                    kind: error_type.clone(),
-                    error: error_message.clone(),
-                },
-            ])
+            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskFailed {
+                hash: task_hash.clone(),
+                kind: error_type.clone(),
+                error: error_message.clone(),
+            }])
             .await;
 
             // Operator-facing WARN: per-class for retry/policy
@@ -214,17 +223,29 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "task failed: identity"
             );
 
+            // Terminal failure: the slot + ledger + type-slot were
+            // already freed by `free_slot_on_terminal` above. Run only
+            // the per-phase cascade so the phase machine drains the
+            // in-flight counter (N+1 → N) and any dependent phase that
+            // just became unblocked cascades. Covers both
+            // locally-dispatched and inherited (pre-owned) entries
+            // uniformly — the latter simply had no slot/type-slot to
+            // free, matching the deleted pre-owned fallback's contract.
             if let Some(binary) = recovered_binary {
-                self.release_type_slot(&binary.type_id);
-                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
+                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx)
+                    .await;
             }
 
-            // Same kickstart rationale as `handle_task_complete`:
-            // `note_item_failed` may have just cascaded a phase
-            // through Drained → Done and activated a dependent
-            // phase; idle workers across other secondaries won't
-            // re-poll on their own. Idempotent.
-            self.dispatch_to_idle_workers().await.ok();
+            // Same rationale as `handle_task_complete`: this terminal
+            // freed a worker AND `note_item_failed` may have cascaded a
+            // phase Drained → Done and activated a dependent phase; free
+            // workers across other secondaries won't re-poll on their
+            // own. EMIT a `TasksAdded` onto the decoupled bus rather
+            // than calling dispatch directly (the dispatch-decoupling
+            // law); the worker-management arm coalesces it into one
+            // batched recheck.
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
 
             // Forward task-terminal outcomes to peer secondaries so
             // their `failed_tasks` / `completed_tasks` caches stay
@@ -239,5 +260,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 .await;
         }
     }
-
 }

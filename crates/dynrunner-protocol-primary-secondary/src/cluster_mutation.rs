@@ -5,21 +5,42 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, PhaseId, WorkerId, TaskInfo};
+use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, TaskInfo, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::removal_cause::RemovalCause;
+
+/// The static, per-secondary capacity a secondary advertises once at
+/// connect time: how many worker slots it can run concurrently and the
+/// opaque resource amounts it brought to the cluster.
+///
+/// This is the value half of the replicated capacity map (see
+/// `dynrunner_manager_distributed::cluster_state`) and the payload the
+/// [`ClusterMutation::SecondaryCapacity`] variant carries. It is static
+/// for a secondary's lifetime in the run — the framework records it once
+/// and never overwrites it (set-once apply semantics), so a freshly-
+/// promoted primary and late-joining observers reconstruct the full
+/// roster from the replicated map alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryCapacityRecord {
+    /// Concurrent worker slots the secondary can run.
+    pub worker_count: u32,
+    /// Opaque resource amounts advertised at connect. The framework
+    /// does not interpret these; downstream scheduler / matcher policy
+    /// attaches meaning (same opacity contract as `peer_holdings`).
+    pub resources: Vec<ResourceAmount>,
+}
 
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub enum ClusterMutation<I> {
-    TaskAdded { hash: String, task: TaskInfo<I> },
+    TaskAdded {
+        hash: String,
+        task: TaskInfo<I>,
+    },
     TaskAssigned {
         hash: String,
         secondary: String,
@@ -35,7 +56,10 @@ pub enum ClusterMutation<I> {
         kind: ErrorType,
         error: String,
     },
-    PrimaryChanged { new: String, epoch: u64 },
+    PrimaryChanged {
+        new: String,
+        epoch: u64,
+    },
     /// Per-run static phase dependency graph. Emitted once by the
     /// primary at run start (alongside the bulk `TaskAdded` batch);
     /// receivers store it on their `ClusterState` so the post-promotion
@@ -61,6 +85,31 @@ pub enum ClusterMutation<I> {
     /// drained` so the post-promotion residual peers all exit
     /// shortly after the primary returns.
     RunComplete,
+    /// "The run was ABORTED — every secondary and observer should exit
+    /// non-zero." The failure twin of [`Self::RunComplete`].
+    ///
+    /// Emitted exactly once by the primary when an unrecoverable
+    /// cluster-wide fault is detected BEFORE any phase has started —
+    /// today the only originator is the pre-phase duplicate-task-id
+    /// case (#3a): a `(phase_id, task_id)` collision in the INITIAL
+    /// batch is a producer-side bug that would silently mask one of the
+    /// colliding tasks, so the whole run is torn down rather than
+    /// proceeding on an ambiguous task set. (A duplicate detected AFTER
+    /// a phase started — #3b — does NOT abort: it invalidates the
+    /// not-yet-terminal tasks run-wide and the cluster CONTINUES.)
+    ///
+    /// Receivers set a sticky `run_aborted: Option<String>` ledger
+    /// field (mirroring `run_complete`). The secondary's
+    /// `process_tasks` loop checks `run_aborted()` BEFORE the
+    /// `run_complete()` break and returns `RunOutcome::Aborted`, which
+    /// the secondary / observer PyO3 wrappers translate to
+    /// `std::process::exit(1)`. The primary itself surfaces a structured
+    /// `RunError` at its own PyO3 boundary. Broadcast over the SAME
+    /// `apply_and_broadcast_cluster_mutations` path as `RunComplete`, so
+    /// it inherits the identical delivery / settle semantics.
+    RunAborted {
+        reason: String,
+    },
     /// External-control reinjection: the primary's
     /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
     /// state is the discrete `TaskState::Unfulfillable { .. }` variant
@@ -76,7 +125,41 @@ pub enum ClusterMutation<I> {
     /// `Unfulfillable`. Carries no reason payload: the entry's
     /// previous `reason` belongs to the pre-reinject Unfulfillable
     /// state and is reset on transition to Pending.
-    TaskReinjected { hash: String },
+    TaskReinjected {
+        hash: String,
+    },
+    /// Dead-secondary recovery requeue: the secondary that held
+    /// `hash` in `TaskState::InFlight { secondary, .. }` died, so the
+    /// authoritative primary takes the task back for re-dispatch and
+    /// transitions the CRDT entry `InFlight → Pending`.
+    ///
+    /// Originated by the primary's `recover_inflight_for_dead_secondary`
+    /// (one per requeued in-flight task) and broadcast through the
+    /// canonical `apply_and_broadcast_cluster_mutations` path, so every
+    /// replica's CRDT mirror moves the entry off `InFlight` in lockstep
+    /// with the primary's local pool requeue. Without it the local pool
+    /// requeue would have no CRDT counterpart: a stale `InFlight` would
+    /// survive in the ledger, and on failover `hydrate_from_cluster_state`
+    /// (which routes `InFlight` to the in-flight ledger, NOT the pool)
+    /// would neither re-dispatch the task nor keep it dispatchable — a
+    /// lost task.
+    ///
+    /// Distinct from [`Self::TaskReinjected`] (`Unfulfillable → Pending`,
+    /// external-control resolution of a missing-resource failure): this
+    /// is internal failover recovery transitioning OUT of `InFlight`, a
+    /// different source state and a different concern.
+    ///
+    /// Re-application is a NoOp when the local state isn't `InFlight`:
+    /// a terminal that arrived first wins (a `TaskCompleted` /
+    /// `TaskFailed` that raced the death observation must not be
+    /// resurrected to `Pending`), and an already-`Pending` entry is
+    /// idempotent under at-least-once delivery. Carries no payload
+    /// beyond `hash`: the `TaskInfo` preserved on the `InFlight` entry
+    /// is moved into the new `Pending` state verbatim so the requeued
+    /// task re-dispatches the same binary.
+    TaskRequeued {
+        hash: String,
+    },
     /// A cascade-paused dependent: `hash`'s prerequisite (identified
     /// by `on`, the prereq's task hash) just transitioned to
     /// `TaskState::Unfulfillable` and the dependent cannot make
@@ -192,6 +275,31 @@ pub enum ClusterMutation<I> {
         holdings: Vec<String>,
         epoch: u64,
     },
+    /// A secondary's static, advertised capacity — the worker-slot
+    /// count and resource amounts it brought to the cluster.
+    ///
+    /// Originated by the primary at the same point it originates
+    /// `PeerJoined` (the `SecondaryWelcome` accept in `primary/connect.rs`),
+    /// carrying the `worker_count` + `resources` the welcome announced.
+    /// Replicated into the snapshotted `secondary_capacities` map on
+    /// `ClusterState` so a freshly-promoted primary AND late-joining
+    /// observers hold the full per-secondary roster the moment they
+    /// restore a snapshot — without it a promoted primary starts with
+    /// `alive_worker_count() == 0` and cannot dispatch (the roster was
+    /// 100% primary-local and `PeerJoined` dropped the `worker_count`).
+    ///
+    /// Set-once apply semantics (see `ClusterState::apply`): the first
+    /// apply for a given `secondary` records the record; every
+    /// subsequent apply for the same id is a NoOp. Capacity is static
+    /// for the secondary's lifetime in the run, so re-application
+    /// (snapshot replay, redundant peer-forwarding, the idempotent
+    /// PeerJoined re-emit from `send_peer_lists`) never clobbers the
+    /// first-recorded value.
+    SecondaryCapacity {
+        secondary: String,
+        worker_count: u32,
+        resources: Vec<ResourceAmount>,
+    },
     /// Runtime task injection: introduce a batch of brand-new
     /// `TaskInfo<I>` entries into the replicated ledger so the live
     /// primary can dispatch them and every replica's CRDT mirror
@@ -231,36 +339,7 @@ pub enum ClusterMutation<I> {
     /// hash matches — newly-injected Blocked entries participate in
     /// the same auto-resume mechanism as cascade-paused dependents
     /// from `apply_fail_permanent`.
-    TasksSpawned { tasks: Vec<TaskInfo<I>> },
-    /// Operator-initiated emergency stop. Broadcast when ANY node
-    /// observes the panik filesystem signal (e.g. a per-host or
-    /// shared-network sentinel path); the apply rule latches a sticky
-    /// `panik_active` flag on local `ClusterState` and transitions
-    /// every non-terminal task entry (`Pending` / `InFlight` /
-    /// `Blocked`) to the discrete `TaskState::Cancelled { task,
-    /// reason }` variant so the run terminates with a defined outcome
-    /// instead of stranding.
-    ///
-    /// Sticky-first-wins: once `panik_active` is set, subsequent
-    /// `PanikRequested` broadcasts (e.g. a slow secondary detecting
-    /// the same file 10s later) are silent NoOps — the first
-    /// applying broadcast wins on `source_peer` / `reason`.
-    ///
-    /// Terminal preservation: `Completed` / `Failed` / `Unfulfillable`
-    /// entries are left intact — work that already finished isn't
-    /// retroactively cancelled. A `TaskCompleted` that races a
-    /// `PanikRequested` and lands after the apply still legitimately
-    /// transitions `Cancelled → Completed` (the `TaskCompleted` arm
-    /// preserves success as the strongest terminal across all non-
-    /// `Completed` predecessors).
-    ///
-    /// `reason` is the caller-supplied panik justification (e.g.
-    /// `"file: /tmp/asm-tokenizer.panik"` or `"file: /shared/dataset.panik"`).
-    /// Stored on each transitioned `Cancelled { reason }` entry so
-    /// the OutcomeSummary's `cancelled` bucket has operator-visible
-    /// per-task provenance.
-    PanikRequested {
-        source_peer: String,
-        reason: String,
+    TasksSpawned {
+        tasks: Vec<TaskInfo<I>>,
     },
 }

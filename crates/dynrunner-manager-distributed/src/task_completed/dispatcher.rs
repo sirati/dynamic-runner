@@ -127,8 +127,7 @@ mod tests {
     #[tokio::test]
     async fn task_completed_dispatcher_drains_events_to_rust_listener() {
         let (tx, rx) = unbounded_channel();
-        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let listeners: Vec<Box<dyn TaskCompletedListener>> = vec![Box::new(CapturingListener {
             captured: Arc::clone(&captured),
         })];
@@ -140,6 +139,7 @@ mod tests {
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
+            last_error: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
@@ -147,6 +147,7 @@ mod tests {
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
+            last_error: Some("worker exited with code 2".into()),
         })
         .unwrap();
 
@@ -160,6 +161,10 @@ mod tests {
         assert_eq!(observed[1].task_hash, "h2");
         assert!(!observed[1].success);
         assert_eq!(observed[1].error_kind.as_deref(), Some("non_recoverable"));
+        assert_eq!(
+            observed[1].last_error.as_deref(),
+            Some("worker exited with code 2")
+        );
     }
 
     /// Pins the panic-isolation contract: a panicking listener must
@@ -169,8 +174,7 @@ mod tests {
     #[tokio::test]
     async fn task_completed_dispatcher_isolates_python_panic() {
         let (tx, rx) = unbounded_channel();
-        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let listeners: Vec<Box<dyn TaskCompletedListener>> = vec![
             Box::new(PanickingListener),
             Box::new(CapturingListener {
@@ -185,6 +189,7 @@ mod tests {
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
+            last_error: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
@@ -192,6 +197,7 @@ mod tests {
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("oom".into()),
+            last_error: Some("oom-killed".into()),
         })
         .unwrap();
 

@@ -35,14 +35,17 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
-use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
+use dynrunner_core::{
+    ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo,
+};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Which retry channel a `failed_tasks` entry belongs to.
 ///
@@ -76,22 +79,6 @@ impl BucketKind {
 
     /// Per-bucket budget from the live-primary's config.
     pub(crate) fn max_passes(self, config: &PrimaryConfig) -> u32 {
-        match self {
-            BucketKind::Recoverable => config.retry_max_passes,
-            BucketKind::Oom => config.oom_retry_max_passes,
-        }
-    }
-
-    /// Per-bucket budget from the promoted-secondary's config.
-    /// Mirrors `max_passes` exactly — the secondary surfaces the
-    /// same two knobs (`retry_max_passes` /
-    /// `oom_retry_max_passes`) so the cap-resolution semantics
-    /// don't drift across the live-primary / promoted-secondary
-    /// boundary.
-    pub(crate) fn max_passes_secondary(
-        self,
-        config: &crate::secondary::SecondaryConfig,
-    ) -> u32 {
         match self {
             BucketKind::Recoverable => config.retry_max_passes,
             BucketKind::Oom => config.oom_retry_max_passes,
@@ -188,7 +175,16 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     // does not burn a second pass on the same set of failures.
     retry_passes_used.insert(key, used + 1);
 
+    // Phase-transition important event: the start of a retry pass.
+    // ONE emit site shared by both retry channels — `bucket = ?kind`
+    // discriminates error-retry (`Recoverable`) from OOM-retry (`Oom`),
+    // never a per-kind branch. Emitted at the importance target so the
+    // dual-sink surfaces it on stdio under `--important-stdio-only`;
+    // only the budget-available reinject path (this point) is the
+    // "start of a retry" — the empty / budget-exhausted returns above
+    // are not.
     tracing::info!(
+        target: crate::primary::important_events::IMPORTANT_TARGET,
         phase = %phase,
         bucket = ?kind,
         pass = used + 1,
@@ -200,10 +196,9 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     true
 }
 
-impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
+impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
 where
-    T: SecondaryTransport<I>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
@@ -245,10 +240,11 @@ where
         kind: BucketKind,
         _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<bool, String> {
-        // OOM-bucket dispatch shape (live-primary only — the secondary
-        // wrapper at `secondary/primary/lifecycle.rs` does NOT touch
-        // single_worker_mode because the field lives on
-        // PrimaryCoordinator). Entry-side: flip the coordinator into
+        // OOM-bucket dispatch shape. `single_worker_mode` lives on
+        // `PrimaryCoordinator`, so this is the only machine that drives
+        // it — there is no parallel secondary-side retry mirror in the
+        // unified model (a promoted node runs its co-located primary,
+        // which is THIS machine). Entry-side: flip the coordinator into
         // single-worker mode for the duration of the bucket so the
         // dispatch pipeline masks workers != local-id-0 and promotes
         // `preferred_secondaries` to a strict filter. Exit-side: every
@@ -263,20 +259,19 @@ where
 
         // Build candidates from `all_binaries` (the run-start snapshot)
         // cross-referenced against `failed_tasks` (the hash-keyed
-        // ErrorType ledger). The secondary's mirror at
-        // `secondary/primary/lifecycle.rs` stores the binary inside
-        // its FailedTaskEntry instead, so the two sides have different
-        // candidate-build code paths but share the core via
-        // `try_phase_retry_bucket_core`.
+        // ErrorType ledger). On a parked primary that activated via the
+        // seeded resume, `all_binaries` is empty (the pool was hydrated
+        // from the CRDT, not a run-start binary list); `failed_tasks` is
+        // seeded from the restored ledger, and the candidate set is
+        // built from the hydrated pool's view. Both paths share the core
+        // via `try_phase_retry_bucket_core`.
         let candidates: Vec<TaskInfo<I>> = self
             .all_binaries
             .iter()
             .filter(|b| b.phase_id == *phase)
             .filter(|b| {
                 let h = compute_task_hash(*b);
-                self.failed_tasks
-                    .get(&h)
-                    .is_some_and(|et| kind.matches(et))
+                self.failed_tasks.get(&h).is_some_and(|et| kind.matches(et))
             })
             .cloned()
             .collect();
@@ -308,13 +303,18 @@ where
             )
         };
         if reinjected {
-            // Kickstart dispatch: the workers won't request a new task
-            // on their own (they already sent their last `TaskRequest`
-            // which got `nothing-to-do` because the failure hadn't been
-            // reinjected yet). Same rationale as the legacy
-            // `run_retry_passes` body — without the kickstart,
-            // reinjected binaries sit in the pool forever.
-            self.dispatch_to_idle_workers().await?;
+            // Reinjection is a pool-entry edge: the workers won't
+            // request a new task on their own (they already sent their
+            // last `TaskRequest` which got `nothing-to-do` because the
+            // failure hadn't been reinjected yet). EMIT a `TasksAdded`
+            // onto the decoupled worker-management bus rather than
+            // calling dispatch directly (the dispatch-decoupling law);
+            // the operational loop's worker-management arm coalesces it
+            // into one batched recheck. Without this emit the reinjected
+            // binaries sit in the pool forever (the negative control
+            // test pins it load-bearing).
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         } else if matches!(kind, BucketKind::Oom) {
             // No reinjection happened — either empty candidates or
             // budget exhausted. Lift the single-worker dispatch-shape
@@ -370,5 +370,128 @@ where
             task.preferred_secondaries = SoftPreferredSecondaries::new(vec![target]);
         }
         tasks
+    }
+}
+
+#[cfg(test)]
+mod important_event_tests {
+    //! Pins the phase-transition "start of retry" important event on
+    //! the shared retry-bucket emit site: it fires exactly once on the
+    //! budget-available reinject, never on the empty-candidate or
+    //! budget-exhausted paths, and the SINGLE site discriminates
+    //! error-retry (`Recoverable`) from OOM-retry (`Oom`) purely via
+    //! the `bucket` field — no per-kind branch.
+
+    use std::collections::HashMap;
+
+    use dynrunner_core::{PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId};
+    use dynrunner_scheduler_api::PendingPool;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{Layer, Registry};
+
+    use super::{BucketKind, RetryPassesUsed, try_phase_retry_bucket_core};
+    use crate::test_capture::{ImportantCapture, important_only};
+
+    fn task(name: &str, phase: &PhaseId) -> TaskInfo<RunnerIdentifier> {
+        TaskInfo {
+            path: std::path::PathBuf::from(format!("/tmp/{name}")),
+            size: 1,
+            identifier: RunnerIdentifier::from(name),
+            phase_id: phase.clone(),
+            type_id: TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: name.into(),
+            task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
+            resolved_path: None,
+        }
+    }
+
+    fn pool(phase: &PhaseId) -> PendingPool<RunnerIdentifier> {
+        PendingPool::new([phase.clone()], HashMap::new()).expect("single-phase pool")
+    }
+
+    /// Drive the core with the given bucket over a capture and return
+    /// (reinjected?, captured events). The phase has budget for one pass.
+    fn run_with_capture(
+        kind: BucketKind,
+        candidates: Vec<TaskInfo<RunnerIdentifier>>,
+        max_passes: u32,
+        used_seed: u32,
+    ) -> (bool, Vec<crate::test_capture::CapturedEvent>) {
+        let phase = PhaseId::from("phase-a");
+        let mut pool = pool(&phase);
+        let mut used: RetryPassesUsed = HashMap::new();
+        if used_seed > 0 {
+            used.insert((phase.clone(), kind), used_seed);
+        }
+        let capture = ImportantCapture::default();
+        let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
+        let reinjected = with_default(subscriber, || {
+            try_phase_retry_bucket_core(
+                &phase,
+                kind,
+                candidates,
+                &mut pool,
+                &mut used,
+                max_passes,
+                |_h| {},
+            )
+        });
+        (reinjected, capture.events())
+    }
+
+    #[test]
+    fn error_retry_emits_one_event_tagged_recoverable() {
+        let phase = PhaseId::from("phase-a");
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Recoverable, vec![task("t0", &phase)], 1, 0);
+        assert!(reinjected);
+        assert_eq!(events.len(), 1, "exactly one important event: {events:?}");
+        assert!(events[0].message.contains("re-injecting failed tasks"));
+        assert_eq!(
+            events[0].fields.get("bucket").map(String::as_str),
+            Some("Recoverable"),
+            "error-retry must be tagged Recoverable: {events:?}"
+        );
+    }
+
+    #[test]
+    fn oom_retry_emits_one_event_tagged_oom() {
+        let phase = PhaseId::from("phase-a");
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Oom, vec![task("t0", &phase)], 1, 0);
+        assert!(reinjected);
+        assert_eq!(events.len(), 1, "exactly one important event: {events:?}");
+        assert_eq!(
+            events[0].fields.get("bucket").map(String::as_str),
+            Some("Oom"),
+            "OOM-retry must be tagged Oom: {events:?}"
+        );
+    }
+
+    #[test]
+    fn empty_candidates_emit_no_event() {
+        let (reinjected, events) = run_with_capture(BucketKind::Recoverable, vec![], 1, 0);
+        assert!(!reinjected);
+        assert!(
+            events.is_empty(),
+            "no important event on empty bucket: {events:?}"
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_emits_no_event() {
+        let phase = PhaseId::from("phase-a");
+        // Seed the counter at the cap so this pass is over budget.
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Recoverable, vec![task("t0", &phase)], 1, 1);
+        assert!(!reinjected);
+        assert!(
+            events.is_empty(),
+            "no important event when the budget is exhausted: {events:?}"
+        );
     }
 }

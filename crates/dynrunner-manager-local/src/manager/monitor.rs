@@ -1,20 +1,18 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use dynrunner_core::{
-    ErrorType, FailedTask, Identifier, ResourceKind, TaskResult, WorkerId,
-};
+use dynrunner_core::{ErrorType, FailedTask, Identifier, ResourceKind, TaskResult, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{
-    KillReason, ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{KillReason, ResourceEstimator, Scheduler};
 
 use crate::oom::OomWatcher;
 use crate::pool::ResourcePressureResult;
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     pub(super) async fn check_timeouts(
         &mut self,
         _active_workers: &mut HashSet<WorkerId>,
@@ -53,7 +51,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             // Record as recoverable error
             let binary = self.pool.workers[worker_id as usize].current_binary.clone();
             let actual_usage = self.pool.workers[worker_id as usize].actual_usage.clone();
-            let estimated = self.pool.workers[worker_id as usize].estimated_resources.clone();
+            let estimated = self.pool.workers[worker_id as usize]
+                .estimated_resources
+                .clone();
 
             self.log_resource_usage(binary.as_ref(), &estimated, &actual_usage, true);
 
@@ -158,10 +158,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     ///     phase; drop in pressure phase (matches Python's skip of
     ///     `_handle_oom_killed_task` for non-last-resort kills during
     ///     OOM phase, which would otherwise loop forever).
-    pub(super) fn handle_resource_pressure_result(
-        &mut self,
-        result: ResourcePressureResult<I>,
-    ) {
+    pub(super) fn handle_resource_pressure_result(&mut self, result: ResourcePressureResult<I>) {
         match result {
             ResourcePressureResult::Killed {
                 worker_id: _,
@@ -216,7 +213,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 for line in contents.lines() {
                     if let Some(rest) = line.strip_prefix("MemAvailable:") {
                         let rest = rest.trim();
-                        if let Some(kb_str) = rest.strip_suffix("kB").or_else(|| rest.strip_suffix(" kB"))
+                        if let Some(kb_str) =
+                            rest.strip_suffix("kB").or_else(|| rest.strip_suffix(" kB"))
                             && let Ok(kb) = kb_str.trim().parse::<u64>()
                         {
                             return kb * 1024;

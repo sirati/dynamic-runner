@@ -140,8 +140,16 @@ mod tests {
             ipv4: Some("10.0.0.5".to_owned()),
             ipv6: Some("fe80::1".to_owned()),
         };
-        write_connection_info(dir.path(), "sec-1", "node01.cluster", 40001, 50001, &ips, false)
-            .unwrap();
+        write_connection_info(
+            dir.path(),
+            "sec-1",
+            "node01.cluster",
+            40001,
+            50001,
+            &ips,
+            false,
+        )
+        .unwrap();
         let got = fs::read_to_string(dir.path().join("sec-1.info")).unwrap();
         let expected = "tcp://node01.cluster:40001\n\
             version=2\n\
@@ -160,8 +168,16 @@ mod tests {
             ipv4: Some("10.0.0.5".to_owned()),
             ipv6: None,
         };
-        write_connection_info(dir.path(), "sec-2", "node02.cluster", 40002, 50002, &ips, true)
-            .unwrap();
+        write_connection_info(
+            dir.path(),
+            "sec-2",
+            "node02.cluster",
+            40002,
+            50002,
+            &ips,
+            true,
+        )
+        .unwrap();
         let got = fs::read_to_string(dir.path().join("sec-2.info")).unwrap();
         let expected = "tcp://node02.cluster:40002\n\
             version=2\n\
@@ -179,8 +195,16 @@ mod tests {
             ipv4: None,
             ipv6: None,
         };
-        write_connection_info(dir.path(), "sec-3", "node03.cluster", 40003, 50003, &ips, false)
-            .unwrap();
+        write_connection_info(
+            dir.path(),
+            "sec-3",
+            "node03.cluster",
+            40003,
+            50003,
+            &ips,
+            false,
+        )
+        .unwrap();
         let got = fs::read_to_string(dir.path().join("sec-3.info")).unwrap();
         let expected = "tcp://node03.cluster:40003\n\
             version=2\n\

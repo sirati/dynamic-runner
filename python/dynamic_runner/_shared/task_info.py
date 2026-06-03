@@ -33,26 +33,40 @@ class TaskDep:
     Mirrors the Rust-side ``TaskDep`` in
     ``crates/dynrunner-core/src/types/task.rs``. Consumer code uses
     this dataclass on the declarer side (``TaskInfo.task_depends_on``)
-    to opt into the framework's transitive-ancestry output read.
+    to name a prerequisite and to opt into the framework's
+    transitive-ancestry output read.
+
+    A dependency's full identity is ``(phase_id, task_id)``. ``phase_id``
+    defaults to the empty string, which the PyO3 bridge resolves to the
+    ENCLOSING task's phase — the common INTRA-PHASE case. Set
+    ``phase_id`` explicitly only to name a CROSS-PHASE prerequisite (a
+    task declared in a different phase). The same ``task_id`` in two
+    different phases is a distinct prerequisite.
 
     Wire-equivalent shapes accepted by the PyO3 bridge:
 
-    * Bare ``str`` — legacy / default. The extractor lifts it into
-      ``TaskDep(task_id=<str>, inherit_outputs=False)``; semantically
-      identical to the ``Vec<String>`` Python contract pre-feature.
+    * Bare ``str`` — names a prerequisite by id in the SAME phase as the
+      declaring task. The extractor lifts it into
+      ``TaskDep(task_id=<str>, phase_id=<enclosing>, inherit_outputs=False)``.
     * ``TaskDep(task_id, inherit_outputs=True)`` — opts the dependent
       task into receiving its predecessor's transitive ancestors'
       published outputs in addition to the direct predecessor's.
+    * ``TaskDep(task_id, phase_id="other-phase")`` — a cross-phase
+      prerequisite.
 
     The Rust→Python read direction (``TaskInfo.task_depends_on``
     surfaced from a round-trip through the runtime) keeps the legacy
-    ``tuple[str, ...]`` projection — the ``inherit_outputs`` flag is a
-    declarer-side concern and the runtime stops carrying it past the
-    primary's dispatcher.
+    ``tuple[str, ...]`` projection — the ``inherit_outputs`` /
+    ``phase_id`` fields are declarer-side concerns and the runtime stops
+    carrying them past the primary's dispatcher.
     """
 
     task_id: str
     inherit_outputs: bool = False
+    # Phase of the prerequisite. Empty == "same phase as the declaring
+    # task" (resolved at the PyO3 boundary). Set explicitly only for a
+    # cross-phase dependency.
+    phase_id: str = ""
 
 
 @dataclass
@@ -159,7 +173,11 @@ def _dep_to_jsonable(dep: "TaskDep | str") -> "str | dict":
     legal-shape set but not the same wire encoder.
     """
     if isinstance(dep, TaskDep):
-        return {"task_id": dep.task_id, "inherit_outputs": dep.inherit_outputs}
+        return {
+            "task_id": dep.task_id,
+            "phase_id": dep.phase_id,
+            "inherit_outputs": dep.inherit_outputs,
+        }
     return dep
 
 

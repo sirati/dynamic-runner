@@ -114,7 +114,10 @@ mod tests {
 
     /// A `Layout` rooted in `root`, with a dummy source tar written and its
     /// bytes returned so callers can assert the copy is faithful.
-    fn fixture(root: &std::path::Path, load_command: &str) -> (WrapperConfig, Layout, ResolvedBins, Vec<u8>) {
+    fn fixture(
+        root: &std::path::Path,
+        load_command: &str,
+    ) -> (WrapperConfig, Layout, ResolvedBins, Vec<u8>) {
         let rndtmp = root.join("rndtmp");
         std::fs::create_dir_all(&rndtmp).unwrap();
         let src = root.join("source.tar");
@@ -160,8 +163,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let (cfg, layout, bins, _) = fixture(dir.path(), "false");
 
-        let err = copy_and_load(&cfg, &layout, &bins)
-            .expect_err("non-zero load command must fail");
+        let err = copy_and_load(&cfg, &layout, &bins).expect_err("non-zero load command must fail");
         assert_eq!(err, LOAD_FAILED_STDOUT);
         // The copy still happened before the load attempt.
         assert!(layout.local_image.exists());

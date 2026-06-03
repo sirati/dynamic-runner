@@ -94,10 +94,7 @@ pub enum PendingPoolError {
     /// A task's `task_depends_on` references an id that does not match
     /// any existing, queued, blocked, completed, or failed task.
     #[error("task `{referenced_by}` depends on unknown task `{task}`")]
-    UnknownTaskDep {
-        task: String,
-        referenced_by: String,
-    },
+    UnknownTaskDep { task: String, referenced_by: String },
     /// A `task_depends_on` graph cycle was detected on extend. The
     /// `Vec` is a deterministic walk of the offending cycle (smallest
     /// task_id first, then DFS).

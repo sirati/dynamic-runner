@@ -25,10 +25,14 @@
 //! runs strictly off-apply, so a slow / panicking / Python-GIL-blocked
 //! listener cannot stall `ClusterState::apply`.
 
+pub mod collector;
 pub mod dispatcher;
 pub mod event;
 pub mod listener;
 
+pub use collector::{
+    CollectedFailure, CollectorDriver, CollectorPolicy, run_collector, windowed_failure_collector,
+};
 pub use dispatcher::run_task_completed_dispatcher;
 pub use event::TaskCompletedEvent;
 pub use listener::TaskCompletedListener;

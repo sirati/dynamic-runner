@@ -99,13 +99,8 @@ fn multi_process_spawner_invokes_python_callback_with_kwargs() {
              return None\n",
         "cb",
     );
-    let module_handle = Python::attach(|py| {
-        callable
-            .bind(py)
-            .getattr("__globals__")
-            .unwrap()
-            .unbind()
-    });
+    let module_handle =
+        Python::attach(|py| callable.bind(py).getattr("__globals__").unwrap().unbind());
 
     let spawner = PyMultiProcessSpawner::new(callable);
 
@@ -122,7 +117,11 @@ fn multi_process_spawner_invokes_python_callback_with_kwargs() {
         let globals = module_handle.bind(py);
         let calls = globals.get_item("calls").unwrap();
         let calls_list = calls.cast::<PyList>().unwrap();
-        assert_eq!(calls_list.len(), 1, "callback should be invoked exactly once");
+        assert_eq!(
+            calls_list.len(),
+            1,
+            "callback should be invoked exactly once"
+        );
         let entry = calls_list.get_item(0).unwrap();
         let entry_tuple = entry.cast::<PyTuple>().unwrap();
         let args = entry_tuple.get_item(0).unwrap();
@@ -165,8 +164,7 @@ fn multi_process_spawner_translates_pyerr_to_spawn_error() {
     );
     let spawner = PyMultiProcessSpawner::new(callable);
 
-    let outcome =
-        run_local(async { spawner.as_arc().spawn(spec("sec-replacement-1")).await });
+    let outcome = run_local(async { spawner.as_arc().spawn(spec("sec-replacement-1")).await });
 
     let err = outcome.expect_err("callback raised, adapter must report SpawnError");
     match err {
@@ -194,13 +192,8 @@ fn multi_process_spawner_respects_spec_secondary_id() {
              return None\n",
         "cb",
     );
-    let module_handle = Python::attach(|py| {
-        callable
-            .bind(py)
-            .getattr("__globals__")
-            .unwrap()
-            .unbind()
-    });
+    let module_handle =
+        Python::attach(|py| callable.bind(py).getattr("__globals__").unwrap().unbind());
 
     let spawner = PyMultiProcessSpawner::new(callable);
 
@@ -241,9 +234,8 @@ fn primary_pubkey_pem_reaches_spawner_spec() {
              return None\n",
         "cb",
     );
-    let module_handle = Python::attach(|py| {
-        callable.bind(py).getattr("__globals__").unwrap().unbind()
-    });
+    let module_handle =
+        Python::attach(|py| callable.bind(py).getattr("__globals__").unwrap().unbind());
 
     let spawner = PyMultiProcessSpawner::new(callable);
 
@@ -444,9 +436,7 @@ fn spawn_pyerr_surfaces_as_spawn_error_and_leaves_registry_empty() {
     let spawner = PyMultiProcessSpawner::new(callable);
     let inner = Arc::clone(&spawner.inner);
 
-    let outcome = run_local(async {
-        spawner.as_arc().spawn(spec("sec-pyerr-1")).await
-    });
+    let outcome = run_local(async { spawner.as_arc().spawn(spec("sec-pyerr-1")).await });
 
     match outcome {
         Err(SpawnError::Other(msg)) => assert!(
@@ -482,9 +472,7 @@ fn spawn_command_failure_surfaces_as_spawn_error() {
     let spawner = PyMultiProcessSpawner::new(callable);
     let inner = Arc::clone(&spawner.inner);
 
-    let outcome = run_local(async {
-        spawner.as_arc().spawn(spec("sec-badbin-1")).await
-    });
+    let outcome = run_local(async { spawner.as_arc().spawn(spec("sec-badbin-1")).await });
 
     match outcome {
         Err(SpawnError::Other(msg)) => {

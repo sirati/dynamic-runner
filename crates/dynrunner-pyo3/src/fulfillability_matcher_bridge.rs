@@ -65,9 +65,7 @@ impl PyFulfillabilityMatcher {
     /// Self" doesn't fit a constructor whose whole purpose is to
     /// hand callers an erased trait object.
     #[allow(clippy::new_ret_no_self)]
-    pub(crate) fn new(
-        matcher: Py<PyAny>,
-    ) -> Box<dyn FulfillabilityMatcher<RunnerIdentifier>> {
+    pub(crate) fn new(matcher: Py<PyAny>) -> Box<dyn FulfillabilityMatcher<RunnerIdentifier>> {
         Box::new(Self { matcher })
     }
 }
@@ -101,10 +99,7 @@ impl FulfillabilityMatcher<RunnerIdentifier> for PyFulfillabilityMatcher {
                 }
                 holdings_dict.set_item(peer_id, set)?;
             }
-            let result = self
-                .matcher
-                .bind(py)
-                .call1((view_obj, holdings_dict))?;
+            let result = self.matcher.bind(py).call1((view_obj, holdings_dict))?;
             // Accept any truthy Python return — explicit `bool`
             // extraction would refuse a numeric / list return that
             // the matcher implementation might use as a shorthand

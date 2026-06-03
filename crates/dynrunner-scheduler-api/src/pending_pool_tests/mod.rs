@@ -11,8 +11,10 @@ pub(super) use super::{PendingPool, PendingPoolError, PhaseState};
 pub(super) use dynrunner_core::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 
 mod bucket_dispatch;
+mod partition;
 mod phase_graph;
 mod phase_lifecycle;
+mod ready_count;
 mod take_first_match;
 mod task_deps;
 mod worker_view;
@@ -57,10 +59,7 @@ pub(super) fn pool_with(phases: &[&str], deps: &[(&str, &[&str])]) -> PendingPoo
     let phases: Vec<PhaseId> = phases.iter().map(|p| phase(p)).collect();
     let mut deps_map: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
     for (child, parents) in deps {
-        deps_map.insert(
-            phase(child),
-            parents.iter().map(|p| phase(p)).collect(),
-        );
+        deps_map.insert(phase(child), parents.iter().map(|p| phase(p)).collect());
     }
     PendingPool::new(phases, deps_map).expect("valid graph")
 }

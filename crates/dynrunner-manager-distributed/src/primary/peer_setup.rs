@@ -1,19 +1,18 @@
-
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerConnectionInfo, PeerTransport, PrimarySetupBootstrap,
-    SecondaryTransport, SetupBootstrapBroadcast, SetupBootstrapMessage,
+    ClusterMutation, PeerConnectionInfo, PeerTransport, PrimaryPeerSetupBootstrap,
+    SetupBootstrapBroadcast, SetupBootstrapMessage,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::state::SecondaryConnectionState;
 
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
         tracing::info!("sending peer lists");
 
@@ -105,7 +104,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // re-implementing the walk. The `?` here propagates the
         // summary string the adapter folds up — same exit semantics
         // as the pre-refactor `return Err(format!(…))`.
-        let mut bootstrap = PrimarySetupBootstrap::new(&mut self.transport);
+        let mut bootstrap = PrimaryPeerSetupBootstrap::new(&mut self.transport);
         SetupBootstrapBroadcast::<I>::broadcast(&mut bootstrap, msg).await?;
 
         // Broadcast the observer-join CRDT batch immediately after
@@ -114,7 +113,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // for `PeerJoined { is_observer: true }` is set-semantics
         // idempotent — a re-application against an already-populated
         // role table is a silent NoOp.
-        self.apply_and_broadcast_cluster_mutations(observer_mutations).await;
+        self.apply_and_broadcast_cluster_mutations(observer_mutations)
+            .await;
 
         // Transition all from CertExchanging -> PeerDiscovery
         for secondary_id in &secondary_ids {
@@ -156,5 +156,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     // ── Phase 5: Initial Assignment ──
-
 }

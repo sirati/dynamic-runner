@@ -95,6 +95,13 @@ impl PyErrorType {
             // properly; for the wire-protocol commit it stays out of
             // the legacy bridge.
             CoreErrorType::Unfulfillable { .. } => None,
+            // `InvalidTask` has no representation in the legacy
+            // 3-variant Python enum either — same conservative `None`
+            // collapse as `Unfulfillable` above. The structural-failure
+            // identity is carried to Python via the wire-stable
+            // `error_kind` tag on `TaskCompletedEvent`, not this legacy
+            // enum bridge.
+            CoreErrorType::InvalidTask { .. } => None,
         }
     }
 }

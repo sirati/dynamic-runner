@@ -25,12 +25,15 @@
 
 mod assignment;
 mod command_channel;
+mod config;
 mod connect;
 mod coordinator;
-mod config;
 mod error;
 mod fulfillability_matcher;
 mod heartbeat;
+mod hydrate;
+mod important_events;
+mod ingest;
 mod lifecycle;
 mod peer_setup;
 pub mod preferred_secondaries;
@@ -47,7 +50,7 @@ mod test_helpers;
 mod tests;
 
 pub use command_channel::{
-    validate_spawn_tasks, PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
 pub use config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 pub use coordinator::PrimaryCoordinator;
@@ -58,4 +61,4 @@ pub use error::RunError;
 // these directly without going through the wire-message path; the
 // `pub(super) struct` declaration on the coordinator side keeps the
 // fields scoped to siblings within `primary/`.
-pub(crate) use coordinator::{PendingMassDeath, RemoteWorkerState};
+pub(crate) use coordinator::{PendingMassDeath, RemoteWorkerState, SlotState};

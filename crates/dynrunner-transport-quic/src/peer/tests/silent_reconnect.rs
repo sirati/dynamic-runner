@@ -10,13 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::super::PeerNetwork;
-use super::log_capture::{pump_b_until, CaptureLayer, CapturedEvent};
 use super::TestId;
+use super::log_capture::{CaptureLayer, CapturedEvent, pump_b_until};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport, MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED,
+    DistributedMessage, MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED, PeerConnectionInfo, PeerTransport,
 };
-use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Registry;
+use tracing_subscriber::layer::SubscriberExt;
 
 /// Silent-reconnect: a partitioned A↔B link self-heals when the
 /// Router emits a redial signal, and the operator-visible log
@@ -59,12 +59,9 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
     local
         .run_until(async {
             // Establish a 3-peer mesh.
-            let mut peer_a: PeerNetwork<TestId> =
-                PeerNetwork::start("peer-a").await.unwrap();
-            let mut peer_b: PeerNetwork<TestId> =
-                PeerNetwork::start("peer-b").await.unwrap();
-            let mut peer_c: PeerNetwork<TestId> =
-                PeerNetwork::start("peer-c").await.unwrap();
+            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b").await.unwrap();
+            let mut peer_c: PeerNetwork<TestId> = PeerNetwork::start("peer-c").await.unwrap();
 
             let peers = vec![
                 PeerConnectionInfo {
@@ -217,20 +214,14 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // peer-c is also drained here (rather than relying
             // on the forwarder task's recv loop) so the
             // "did peer-c forward msg1?" signal is unambiguous.
-            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(
-                &mut peer_a,
-            )
-            .is_some()
+            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(&mut peer_a)
+                .is_some()
             {}
-            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(
-                &mut peer_b,
-            )
-            .is_some()
+            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(&mut peer_b)
+                .is_some()
             {}
-            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(
-                &mut peer_c,
-            )
-            .is_some()
+            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(&mut peer_c)
+                .is_some()
             {}
 
             // Pre-partition direct send so A's `route_state` for
@@ -256,10 +247,8 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // warmup actually arrives at peer-b.
             tokio::time::sleep(Duration::from_millis(50)).await;
             peer_b.drain_new_connections();
-            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(
-                &mut peer_b,
-            )
-            .is_some()
+            while <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(&mut peer_b)
+                .is_some()
             {}
 
             // Partition A↔B by removing both sides' channel
@@ -319,12 +308,8 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     panic!(
                         "relayed message should reach peer-b within 5s; \
                          peer_a.peer_count={} peer_b.peer_count={} captured={:#?}",
-                        <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(
-                            &peer_a
-                        ),
-                        <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(
-                            &peer_b
-                        ),
+                        <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(&peer_a),
+                        <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(&peer_b),
                         trace
                     )
                 });
@@ -338,9 +323,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             let mut healed = false;
             for _ in 0..100 {
                 peer_a.drain_new_connections();
-                if <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(&peer_a)
-                    == 2
-                {
+                if <PeerNetwork<TestId> as PeerTransport<TestId>>::peer_count(&peer_a) == 2 {
                     healed = true;
                     break;
                 }
@@ -430,7 +413,10 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                 relay_events[1]
             );
 
-            for ev in captured.iter().filter(|e| e.target.starts_with("dynrunner")) {
+            for ev in captured
+                .iter()
+                .filter(|e| e.target.starts_with("dynrunner"))
+            {
                 let lower = ev.message.to_lowercase();
                 assert!(
                     !lower.contains("redial"),

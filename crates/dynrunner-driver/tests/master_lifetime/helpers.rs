@@ -67,10 +67,13 @@ impl AuthorizedKey {
         let private_path = key_dir.path().join("id_ed25519");
         let out = StdCommand::new("ssh-keygen")
             .args([
-                "-t", "ed25519",
-                "-N", "",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
                 "-q",
-                "-C", "dynrunner-driver-test",
+                "-C",
+                "dynrunner-driver-test",
                 "-f",
             ])
             .arg(&private_path)

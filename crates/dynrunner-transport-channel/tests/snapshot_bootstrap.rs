@@ -38,10 +38,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dynrunner_protocol_primary_secondary::{
-    timestamp_now, DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
-    DEFAULT_JOIN_TIMEOUT,
+    DEFAULT_JOIN_TIMEOUT, DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
+    timestamp_now,
 };
-use dynrunner_transport_channel::{peer_mesh, ChannelPeerTransport};
+use dynrunner_transport_channel::{ChannelPeerTransport, peer_mesh};
 use serde::{Deserialize, Serialize};
 
 /// In-test identifier — same shape as `mesh_partition.rs`'s `TestId`.
@@ -186,7 +186,9 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
     // two peers don't respond — first-success-wins on the joiner side
     // (it iterates seed in order; the first peer to accept the
     // unicast send is the chosen responder).
-    let join_fut = joiner.join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT);
+    // `is_observer = true`: this scenario is the fresh observer
+    // late-joiner described in the module doc.
+    let join_fut = joiner.join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true);
     tokio::pin!(join_fut);
 
     // The join future immediately sends out a RequestClusterSnapshot
@@ -223,8 +225,13 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
 
     // Task ledger survives the RPC.
     assert_eq!(
-        parsed.tasks.keys().collect::<std::collections::HashSet<_>>(),
-        ["task-1".to_string(), "task-2".to_string()].iter().collect()
+        parsed
+            .tasks
+            .keys()
+            .collect::<std::collections::HashSet<_>>(),
+        ["task-1".to_string(), "task-2".to_string()]
+            .iter()
+            .collect()
     );
 
     // Step 7 + 8 contract: observers survive the snapshot roundtrip.
@@ -267,7 +274,9 @@ async fn join_running_cluster_empty_seed_errors_fast() {
     // SendFailed. Either error is acceptable — the contract is "fail
     // fast, don't burn the full bootstrap budget".
     let timeout = Duration::from_millis(500);
-    let result = joiner.join_running_cluster(&seed, timeout).await;
+    // `is_observer = false`: a joining worker (the common case); the
+    // role is irrelevant here since no request is ever sent.
+    let result = joiner.join_running_cluster(&seed, timeout, false).await;
     match result {
         Err(JoinError::SendFailed(_)) | Err(JoinError::NoReachablePeer) => {}
         other => panic!("expected SendFailed or NoReachablePeer, got {other:?}"),

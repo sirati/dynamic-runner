@@ -153,6 +153,10 @@ fn encode_cause<'py>(py: Python<'py>, cause: &RemovalCause) -> PyResult<Bound<'p
             dict.set_item("kind", "fatal_error")?;
             dict.set_item("reason", bs.as_str())?;
         }
+        RemovalCause::SelfDeparture(bs) => {
+            dict.set_item("kind", "self_departure")?;
+            dict.set_item("reason", bs.as_str())?;
+        }
     }
     Ok(dict)
 }
@@ -178,8 +182,7 @@ mod tests {
     /// names through `sys.modules`, so without this the parallel
     /// `cargo test` harness would have two threads mutating the same
     /// module-level `removed_calls` list.
-    static MODULE_COUNTER: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static MODULE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Compile a tiny recording listener module + return both the
     /// instance (as a `Py<PyAny>` ready for `PyPeerLifecycleListener::new`)
@@ -318,7 +321,12 @@ mod tests {
                 std::ffi::CString::new(module_name).unwrap().as_c_str(),
             )
             .unwrap();
-            module.getattr("Listener").unwrap().call0().unwrap().unbind()
+            module
+                .getattr("Listener")
+                .unwrap()
+                .call0()
+                .unwrap()
+                .unbind()
         });
         let bridge = PyPeerLifecycleListener::new(listener_obj);
         // Must not panic / propagate; the bridge swallows the missing

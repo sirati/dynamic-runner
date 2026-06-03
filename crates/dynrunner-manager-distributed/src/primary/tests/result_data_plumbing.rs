@@ -15,8 +15,7 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
     local
         .run_until(async {
             let (transport, secondary_ends) = setup_test(1);
-            let (sec_id, mut to_sec_rx, _incoming_tx) =
-                secondary_ends.into_iter().next().unwrap();
+            let (sec_id, mut to_sec_rx, _incoming_tx) = secondary_ends.into_iter().next().unwrap();
 
             let config = crate::primary::PrimaryConfig {
                 node_id: "primary".into(),
@@ -39,11 +38,10 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 unfulfillable_reinject_max_per_task: None,
                 setup_promote_deadline: Duration::from_secs(600),
             };
-            let mut primary: crate::primary::PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: crate::primary::PrimaryCoordinator<_, _, _, TestId> =
                 crate::primary::PrimaryCoordinator::new(
                     config,
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -86,16 +84,13 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                     let completed = mutations
                         .iter()
                         .find_map(|m| match m {
-                            ClusterMutation::TaskCompleted { hash: h, result_data }
-                                if h == &hash =>
-                            {
-                                Some(result_data.clone())
-                            }
+                            ClusterMutation::TaskCompleted {
+                                hash: h,
+                                result_data,
+                            } if h == &hash => Some(result_data.clone()),
                             _ => None,
                         })
-                        .expect(
-                            "ClusterMutation batch must include a TaskCompleted for this hash",
-                        );
+                        .expect("ClusterMutation batch must include a TaskCompleted for this hash");
                     assert_eq!(
                         completed,
                         Some(payload),

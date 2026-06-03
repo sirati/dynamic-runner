@@ -16,14 +16,10 @@ fn prune_evicts_stale_outgoing_relays() {
     let _ = router
         .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(t0, 1.0))
         .unwrap();
-    assert!(router
-        .outgoing_relays
-        .contains_key(&("a".to_string(), 0)));
+    assert!(router.outgoing_relays.contains_key(&("a".to_string(), 0)));
     // Past TTL.
     router.prune(t0 + RELAY_STATE_TTL + Duration::from_secs(1));
-    assert!(!router
-        .outgoing_relays
-        .contains_key(&("a".to_string(), 0)));
+    assert!(!router.outgoing_relays.contains_key(&("a".to_string(), 0)));
 }
 
 #[test]
@@ -43,12 +39,16 @@ fn prune_evicts_stale_blacklist() {
         relay_id: 0,
     };
     let _ = router.process_inbound(backoff, &mut conns, clocks_at(t0, 2.0));
-    assert!(router
-        .failed_forwarders
-        .contains_key(&("d".to_string(), "b".to_string())));
+    assert!(
+        router
+            .failed_forwarders
+            .contains_key(&("d".to_string(), "b".to_string()))
+    );
     // Past blacklist TTL.
     router.prune(t0 + BLACKLIST_TTL + Duration::from_secs(1));
-    assert!(!router
-        .failed_forwarders
-        .contains_key(&("d".to_string(), "b".to_string())));
+    assert!(
+        !router
+            .failed_forwarders
+            .contains_key(&("d".to_string(), "b".to_string()))
+    );
 }

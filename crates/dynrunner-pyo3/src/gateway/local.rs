@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use tokio::task::LocalSet;
 
-use dynrunner_gateway::traits::Gateway;
 use dynrunner_gateway::LocalGateway;
+use dynrunner_gateway::traits::Gateway;
 
 use super::gateway_error_to_py;
 
@@ -149,11 +149,7 @@ impl PyLocalGateway {
     /// No-op for the local gateway; included for Protocol parity.
     /// Forwarded to [`LocalGateway::setup_port_forwarding`] which
     /// returns `Ok(())` without touching state.
-    fn setup_port_forwarding(
-        &mut self,
-        local_port: u16,
-        remote_port: u16,
-    ) -> PyResult<()> {
+    fn setup_port_forwarding(&mut self, local_port: u16, remote_port: u16) -> PyResult<()> {
         self.inner
             .setup_port_forwarding(local_port, remote_port)
             .map_err(gateway_error_to_py)

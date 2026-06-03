@@ -13,7 +13,8 @@ fn retain_drops_unmatched_items_across_buckets() {
         t("P", "T1", "alpha", 20),
         t("P", "T2", "beta", 30),
         t("P", "T2", "", 40),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     assert_eq!(p.len(), 4);
     p.retain(|item| item.size >= 25);
     // BTreeMap key order: (P, T2, "") sorts before (P, T2, "beta") because
@@ -30,7 +31,8 @@ fn take_first_match_removes_and_returns_first_hit() {
         t("P", "T", "alpha", 10),
         t("P", "T", "alpha", 20),
         t("P", "T", "beta", 30),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     let taken = p.take_first_match(|i| i.size >= 15).expect("hit");
     assert_eq!(taken.size, 20);
     let rest: Vec<u64> = p.iter().map(|i| i.size).collect();
@@ -48,10 +50,8 @@ fn take_first_match_returns_none_when_no_match() {
 #[test]
 fn take_first_match_empties_bucket_clears_pin_state() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([
-        t("P", "T", "alpha", 10),
-        t("P", "T", "beta", 30),
-    ]).expect("valid extend");
+    p.extend([t("P", "T", "alpha", 10), t("P", "T", "beta", 30)])
+        .expect("valid extend");
     // Worker 1 claims alpha bucket via normal dispatch.
     let _ = p.pop_for_worker(1).unwrap();
     // alpha is now drained-by-dispatch; take a beta item via predicate.

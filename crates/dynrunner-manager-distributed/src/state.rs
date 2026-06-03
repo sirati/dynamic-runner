@@ -357,7 +357,10 @@ mod tests {
 
         let conn = conn.receive_welcome(
             4,
-            vec![ResourceAmount { kind: dynrunner_core::ResourceKind::memory(), amount: 16 * 1024 * 1024 * 1024 }],
+            vec![ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 16 * 1024 * 1024 * 1024,
+            }],
             "node1".into(),
             5000,
             None,
@@ -404,14 +407,7 @@ mod tests {
         // alongside `ipv4()` so a future drift between the two
         // accessors becomes a test failure.
         let conn = SecondaryConnection::new("sec-2".into());
-        let conn = conn.receive_welcome(
-            1,
-            vec![],
-            "h".into(),
-            5000,
-            None,
-            false,
-        );
+        let conn = conn.receive_welcome(1, vec![], "h".into(), 5000, None, false);
         let conn = conn.receive_cert_exchange(
             "CERT".into(),
             Some("10.0.0.2".into()),

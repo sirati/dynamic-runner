@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerTransport, RouteVia, Router, SendOutcome,
-    REDIAL_COOLDOWN,
+    Clocks, DistributedMessage, InboundOutcome, PeerTransport, REDIAL_COOLDOWN, RouteVia, Router,
+    SendOutcome,
 };
 use tokio::sync::mpsc;
 
 use crate::helpers::{
-    build_mesh, keepalive, pump_until, pump_until_received, pump_until_with_deadline, TestId,
+    TestId, build_mesh, keepalive, pump_until, pump_until_received, pump_until_with_deadline,
 };
 
 // ── Scenario 7 ──
@@ -42,7 +42,12 @@ async fn redial_signal_fires_on_first_send_then_silent_within_cooldown() {
     let t0 = Instant::now();
     // First send → first observation → cooldown gate trips.
     let out1 = router
-        .send_to_peer("d", keepalive("a"), &mut conns, Clocks { now: t0, wire: 1.0 })
+        .send_to_peer(
+            "d",
+            keepalive("a"),
+            &mut conns,
+            Clocks { now: t0, wire: 1.0 },
+        )
         .expect("send ok");
     match out1 {
         SendOutcome::Relayed {
@@ -140,10 +145,7 @@ async fn receiver_side_relay_observation_triggers_redial() {
     };
     let outcome = router.process_inbound(inbound, &mut conns, Clocks { now, wire: 1.0 });
     match outcome {
-        InboundOutcome::Deliver {
-            msg,
-            redial_target,
-        } => {
+        InboundOutcome::Deliver { msg, redial_target } => {
             assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
             assert_eq!(
                 redial_target.as_deref(),
@@ -202,10 +204,7 @@ async fn receiver_side_relay_observation_triggers_redial() {
 /// directly without another backoff round-trip.
 #[tokio::test]
 async fn blacklist_persists_across_sends() {
-    let mut mesh = build_mesh(
-        &["a", "b", "c", "d"],
-        &[("a", "b"), ("a", "c"), ("c", "d")],
-    );
+    let mut mesh = build_mesh(&["a", "b", "c", "d"], &[("a", "b"), ("a", "c"), ("c", "d")]);
     // First send: A picks B; B backs off; A retries via C; C delivers.
     mesh.get_mut("a")
         .unwrap()
@@ -214,7 +213,10 @@ async fn blacklist_persists_across_sends() {
         .expect("send ok");
     let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
     let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
-    assert!(ok, "d did not receive 1st within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive 1st within deadline; delivered={delivered:?}"
+    );
     match &mesh.get("a").unwrap().last_outcome {
         Some(SendOutcome::Relayed { forwarder, .. }) => {
             assert_eq!(forwarder, "b", "first pick is lex-lowest B");
@@ -254,5 +256,8 @@ async fn blacklist_persists_across_sends() {
         d.get("d").map(|v| v.len() >= 2).unwrap_or(false)
     })
     .await;
-    assert!(ok, "d did not receive 2nd within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive 2nd within deadline; delivered={delivered:?}"
+    );
 }

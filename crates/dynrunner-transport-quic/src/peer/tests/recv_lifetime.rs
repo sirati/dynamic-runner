@@ -42,8 +42,7 @@ async fn recv_peer_tick_survives_outer_drop() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer: PeerNetwork<TestId> =
-                PeerNetwork::start("peer-a").await.unwrap();
+            let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
 
             // Pre-arm a fake peer entry so `process_reconnect_tick`
             // has work to do. The fake peer id sorts higher than
@@ -101,13 +100,11 @@ async fn recv_peer_tick_survives_outer_drop() {
             //     would let the send succeed but produce the
             //     same silent-disable. Step 3 below catches that
             //     variant.
-            peer.reconnect_tick_tx_for_test
-                .send(())
-                .expect(
-                    "tick channel must survive recv_peer drop; \
+            peer.reconnect_tick_tx_for_test.send(()).expect(
+                "tick channel must survive recv_peer drop; \
                      pre-fix this fails because the receiver was \
                      moved into the dropped future",
-                );
+            );
 
             // Step 3: race a second recv_peer against a longer
             // timeout. Post-fix: the tick arm picks up the

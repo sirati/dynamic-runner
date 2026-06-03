@@ -5,7 +5,7 @@
 //! their assertion shape. Both delegate to the canonical parser in
 //! [`crate::peer_info`].
 
-use crate::peer_info::{parse as parse_peer_info, PeerInfoRecord};
+use crate::peer_info::{PeerInfoRecord, parse as parse_peer_info};
 
 use super::options::{InfoFileReader, PrepError};
 

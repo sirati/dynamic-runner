@@ -75,12 +75,7 @@ fn peer_resource_holdings_updated_stale_epoch_is_noop() {
         }),
         ApplyOutcome::Applied
     );
-    assert!(
-        s.peer_holdings()
-            .get("peer-a")
-            .unwrap()
-            .contains("fresh")
-    );
+    assert!(s.peer_holdings().get("peer-a").unwrap().contains("fresh"));
 
     // epoch > primary_epoch → Applied (an announce from a peer
     // that already learned of a newer primary is still
@@ -93,12 +88,7 @@ fn peer_resource_holdings_updated_stale_epoch_is_noop() {
         }),
         ApplyOutcome::Applied
     );
-    assert!(
-        s.peer_holdings()
-            .get("peer-b")
-            .unwrap()
-            .contains("future")
-    );
+    assert!(s.peer_holdings().get("peer-b").unwrap().contains("future"));
 }
 
 /// Re-application of a `PeerResourceHoldingsUpdated` whose

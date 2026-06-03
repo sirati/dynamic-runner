@@ -10,13 +10,12 @@
 //! file is the entry-point catch-all.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
-use dynrunner_manager_local::pool::WorkerPool;
+use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
+use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::primary_link::PrimaryLink;
@@ -24,40 +23,22 @@ use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub fn new(
-        config: SecondaryConfig,
-        primary_transport: PT,
-        peer_transport: P,
-        scheduler: S,
-        estimator: E,
-    ) -> Self {
+    pub fn new(config: SecondaryConfig, transport: Tr, scheduler: S, estimator: E) -> Self {
         let tmp_dir = config.src_tmp.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
         let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
         let primary_link = PrimaryLink::with_failover_threshold(
-            config.secondary_id.clone(),
             config.primary_link_failure_threshold,
             config.primary_link_failure_window,
-        );
-        // RetryBudget consumes `config.retry_max_passes` as the
-        // attempt-count cap and reads `$SLURM_JOB_END_TIME` ONCE
-        // here (startup) for the wallclock deadline. The
-        // env-var is documented as Unix-epoch seconds; absence is
-        // the legacy non-SLURM path (silent), parse failure logs WARN.
-        // See `retry_budget.rs` for the dual-axis design.
-        let primary_retry_budget = super::retry_budget::RetryBudget::from_env_and_legacy(
-            config.retry_max_passes,
-            super::retry_budget::DEFAULT_SAFETY_MARGIN,
         );
         // Peer-lifecycle dispatcher channel. Built at construction so
         // the `cluster_state` apply path has an installed sender
@@ -69,8 +50,7 @@ where
         let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
         // Task-completion dispatcher channel; same construction-time
         // installation rationale as `lifecycle_tx`.
-        let (task_completed_tx, task_completed_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (task_completed_tx, task_completed_rx) = tokio::sync::mpsc::unbounded_channel();
         // Command channel for the PyO3 `PrimaryHandle` surface.
         // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
         // sized so a noisy caller can't OOM the secondary, but with
@@ -82,44 +62,32 @@ where
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
-            primary_transport,
-            peer_transport,
+            transport,
             scheduler,
             estimator,
             peer_cert_info: None,
             pool: WorkerPool::new(),
             active_tasks: HashMap::new(),
-            completed_tasks: HashSet::new(),
             #[cfg(test)]
             local_tasks_run: 0,
             transfer_complete: false,
-            is_primary: false,
-            promoted_at: None,
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
-            primary_disconnected: false,
             election: super::election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
             primary_link,
             peer_mesh_check_at: None,
             peer_dial_count: 0,
             mesh_ready_sent: false,
-            primary_pending: None,
-            primary_completed: HashSet::new(),
-            primary_in_flight: HashMap::new(),
-            primary_failed: HashMap::new(),
-            primary_retry_passes_used: HashMap::new(),
-            primary_retry_budget,
-            backpressured_secondaries: HashMap::new(),
             pre_staged_mode: false,
+            setup_discovery_done: false,
             uses_file_based_items: true,
             fatal_exit: None,
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
             pending_first_bind: HashMap::new(),
-            setup_pending: false,
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
@@ -130,14 +98,13 @@ where
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
+            fatal_exit_signal_rx: None,
+            on_cluster_state_refresh: None,
+            promote_activation_tx: None,
             on_phase_end: None,
             on_phase_start: None,
-            primary_phase_completed: HashMap::new(),
-            primary_phase_failed: HashMap::new(),
-            primary_phase_started_emitted: HashSet::new(),
             command_rx: Some(command_rx),
             command_tx,
-            unfulfillable_reinject_remaining: HashMap::new(),
             // Lazily constructed in `run_until_setup_or_done_inner`
             // post-`initialize_workers` — see the doc on the
             // `sampler` field for the runtime-context rationale.
@@ -160,12 +127,13 @@ where
             .install_task_completed_sender(task_completed_tx);
         // Attach the transport's write-through role cache to our
         // authoritative `cluster_state.role_table`. The hook fires
-        // on every applied `PrimaryChanged` mutation; the cache
-        // serves Step 3's `Address::Role(_)` dispatch on the send
-        // hot path. Transports that don't override
-        // `register_with_cluster_state` (e.g. `NoPeerTransport`,
-        // test stubs) get the default no-op — safe by construction.
-        this.peer_transport
+        // on every applied `PrimaryChanged` mutation; the cache is
+        // THE single source of "who is primary now" and serves the
+        // unified transport's `Address::Role(Role::Primary)` routing
+        // (including the promotion re-route — the role-change hook IS
+        // the re-route). Transports that don't override
+        // `register_with_cluster_state` get the default no-op.
+        this.transport
             .register_with_cluster_state(&mut this.cluster_state);
         this
     }
@@ -208,8 +176,10 @@ where
     /// into the loop's local state on first entry).
     ///
     /// Single concern: the coordinator owns the panik-react logic
-    /// (broadcast `ClusterMutation::PanikRequested`, kill all worker
-    /// process trees, return `RunOutcome::PanikShutdown`). The PyO3
+    /// (announce a self-authored `ClusterMutation::PeerRemoved
+    /// { SelfDeparture }` on the file-source path — observability only,
+    /// no cluster-wide cancellation — kill all worker process trees,
+    /// return `RunOutcome::PanikShutdown`). The PyO3
     /// wrapper owns spawning [`crate::panik_watcher::spawn_panik_watcher`]
     /// and threading its `take_signal_rx()` here; that separation is
     /// what lets each Rust-only caller (tests, the existing `run`
@@ -222,6 +192,105 @@ where
         self.panik_signal_rx = Some(rx);
     }
 
+    /// Register an externally-armed fatal-exit signal receiver. The
+    /// matching sender is handed to a run-loop-external policy (the
+    /// observer's invalid_task monitor) that cannot reach `self.fatal_exit`
+    /// directly because it runs on the task-completed dispatcher task. On
+    /// the first message, the `process_tasks` select! arm latches
+    /// `self.fatal_exit` with the carried reason and the run exits
+    /// non-zero. Pre-`run_until_setup_or_done` contract, same single-shot
+    /// shape as [`Self::register_panik_signal_rx`]; absent registration
+    /// leaves the arm parked on `pending()`.
+    pub fn register_fatal_exit_signal_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        self.fatal_exit_signal_rx = Some(rx);
+    }
+
+    /// Register a callback invoked on a modest periodic tick from the
+    /// `process_tasks` loop with a read-only borrow of the live,
+    /// post-apply `cluster_state`. The matching consumer (the PyO3
+    /// observer's live-snapshot feed) cannot borrow the CRDT directly —
+    /// the run loop owns the `&mut cluster_state` for its whole lifetime
+    /// — so the loop calls IN to the consumer's closure at the one
+    /// in-loop moment it legitimately holds `&self.cluster_state`.
+    ///
+    /// Pre-`run_until_setup_or_done` contract, same single-shot
+    /// registration shape as [`Self::register_fatal_exit_signal_rx`]:
+    /// the slot is `Option::take`-n into the loop's local state on first
+    /// entry, so a registration after the loop started has no effect on
+    /// the active loop. Absent registration leaves the slot `None` — the
+    /// periodic tick still fires but invokes nothing.
+    ///
+    /// Single concern: own the registration surface. This crate never
+    /// learns what the consumer does with the borrow (it projects + the
+    /// `StatsSnapshot` / `SharedSnapshotSource` shapes live entirely in
+    /// the PyO3 layer); the callback is the clean boundary. The tick is
+    /// periodic — NOT per-`ClusterMutation` — so the projection cost is
+    /// `O(ledger)` per tick rather than `O(ledger × mutations)`.
+    pub fn register_cluster_state_refresh(&mut self, callback: super::ClusterStateRefreshFn<I>) {
+        self.on_cluster_state_refresh = Some(callback);
+    }
+
+    /// Register the promotion-activation gate sender for the co-located
+    /// parked [`crate::primary::PrimaryCoordinator`].
+    ///
+    /// The composed runtime builds both coordinators on one `LocalSet`,
+    /// parks the primary behind `PrimaryCoordinator::run_parked`'s
+    /// oneshot gate, and hands the matching sender here. When this
+    /// node's election reaches its terminal `Promoted` transition,
+    /// [`Self::fire_local_promotion`] fires the gate to wake the parked
+    /// primary into its seeded resume. Pre-`run_until_setup_or_done`
+    /// contract, same single-shot shape as the other `register_*`
+    /// setters. Absent registration (Rust-only tests / legacy single-
+    /// `run()` callers) leaves the gate `None`; the terminal action then
+    /// only broadcasts `PromotePrimary { new = self }`. The gate carries
+    /// a [`crate::cluster_state::ClusterStateSnapshot`] — the seed for
+    /// the parked primary's `restore` + `hydrate_from_cluster_state`.
+    pub fn register_promote_activation(
+        &mut self,
+        tx: tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
+    ) {
+        self.promote_activation_tx = Some(tx);
+    }
+
+    /// Extract the composed-primary wiring — the lifecycle/command
+    /// channels the PyO3 wrapper minted on this `SecondaryCoordinator`
+    /// so its `PrimaryHandle` clone stays a stable type — for transfer
+    /// onto the co-located [`crate::primary::PrimaryCoordinator`], the
+    /// real consumer.
+    ///
+    /// Returns `(command_tx, command_rx, on_phase_start, on_phase_end)`,
+    /// taking each out of `self`. The composed runtime hands the command
+    /// pair to the primary via `replace_command_channel` and the phase
+    /// callbacks via `register_lifecycle_*`/`register_phase_*` — the
+    /// authority owns the phase machine and the externally-issued
+    /// `PrimaryCommand` ingress, NOT the follower secondary. This is the
+    /// site that makes these fields live (consumed in-crate), so the
+    /// fields carry no `#[allow(dead_code)]`.
+    ///
+    /// One-shot: a second call yields `(_, None, None, None)` because
+    /// the receiver/closures were already taken. The `command_tx` clone
+    /// is `Clone`, so the secondary retains its own copy for any handle
+    /// minted off it; only the receiver is uniquely transferred.
+    #[allow(clippy::type_complexity)]
+    pub fn take_composed_primary_wiring(
+        &mut self,
+    ) -> (
+        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
+        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
+        Option<crate::primary::OnPhaseStart>,
+        Option<crate::primary::OnPhaseEnd>,
+    ) {
+        (
+            self.command_tx.clone(),
+            self.command_rx.take(),
+            self.on_phase_start.take(),
+            self.on_phase_end.take(),
+        )
+    }
+
     /// Register a [`crate::task_completed::TaskCompletedListener`].
     /// Same single-shot, pre-`run_until_setup_or_done`-only contract
     /// as [`Self::register_lifecycle_listener`].
@@ -232,22 +301,26 @@ where
         self.task_completed_listeners.push(listener);
     }
 
-    /// Install per-phase lifecycle hooks fired on this secondary when
-    /// it owns the primary pool (post-promotion). Mirrors the same
-    /// shape `PrimaryCoordinator::run_pipeline` accepts:
+    /// Accept the per-phase lifecycle hooks for the post-promotion path.
+    /// Mirrors the shape `PrimaryCoordinator::run` accepts:
     /// `on_phase_start(&PhaseId)` fires when a phase flips Blocked →
     /// Active; `on_phase_end(&PhaseId, completed, failed)` fires when
     /// the phase reaches `Drained`.
     ///
     /// Must be called before `run_until_setup_or_done` enters.
-    /// Secondaries that never get promoted never invoke either hook,
-    /// so the absence of a registration is the no-op case (the
-    /// fire-sites guard on the `Option`).
     ///
-    /// Single concern: ownership transfer of the boxed closures from
-    /// the PyO3 wrapper (which constructs the GIL-reacquiring
-    /// closures) onto the coordinator that will fire them. The
-    /// invocation semantics live in `secondary/primary/lifecycle.rs`.
+    /// The secondary holds NO phase machine and never fires these
+    /// itself. It is a registration ANCHOR: under the unified
+    /// composition the runtime moves the closures onto the co-located
+    /// parked `PrimaryCoordinator` (the authority that owns the phase
+    /// machine) via [`Self::take_composed_primary_wiring`]; that primary
+    /// fires them once activated. On a node that composes no co-located
+    /// primary (in-process distributed secondaries on a `NoPeerTransport`
+    /// mesh) the closures stay dormant and are never invoked.
+    ///
+    /// Single concern: accept ownership of the boxed GIL-reacquiring
+    /// closures from the PyO3 wrapper and hold them until the
+    /// composition transfers them to the authority.
     pub fn register_phase_lifecycle_callbacks(
         &mut self,
         on_phase_start: crate::primary::OnPhaseStart,
@@ -324,27 +397,44 @@ where
         // to the announcer task (which would deadlock against the
         // drain arm if both ran on the same LocalSet).
         const ANNOUNCER_OUTBOX_CAPACITY: usize = 32;
-        let (outbox_tx, outbox_rx) =
-            tokio::sync::mpsc::channel::<crate::observer::announcer::AnnouncerOutboxItem<I>>(
-                ANNOUNCER_OUTBOX_CAPACITY,
-            );
+        let (outbox_tx, outbox_rx) = tokio::sync::mpsc::channel::<
+            crate::observer::announcer::AnnouncerOutboxItem<I>,
+        >(ANNOUNCER_OUTBOX_CAPACITY);
         self.announcer_outbox_rx = Some(outbox_rx);
         self.announcer_outbox_tx = Some(outbox_tx.clone());
-        let sender = crate::observer::announcer::PeerMeshAnnouncerSender::new(
-            peer_id, outbox_tx,
-        );
+        let sender = crate::observer::announcer::PeerMeshAnnouncerSender::new(peer_id, outbox_tx);
         (handle, sender)
     }
 
-    /// Whether the run is in pre-staged-source mode (set from the
-    /// primary's `InitialAssignment`). Exposed within the secondary
-    /// module so dispatch / setup can pick the right resolution path.
-    pub(in crate::secondary) fn pre_staged_mode(&self) -> bool {
-        self.pre_staged_mode
-    }
-
+    /// Set pre-staged-source mode from the primary's
+    /// `InitialAssignment`. The flag is read directly at the resolution
+    /// site (`expected_content_hash` selection); no getter is needed.
     pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
         self.pre_staged_mode = on;
+    }
+
+    /// Single source of truth for the setup-discovery `SetupPending`
+    /// yield discriminator.
+    ///
+    /// `true` iff (a) the authority deferred discovery
+    /// (`pre_staged_mode`, set from the empty `InitialAssignment` the
+    /// submitter sends when it has no local corpus view), (b) the
+    /// replicated ledger is still empty (`cluster_state.task_count()
+    /// == 0` — no node has seeded it yet), and (c) this node hasn't
+    /// already run its own discovery pass ([`Self::setup_discovery_done`]).
+    ///
+    /// `process_tasks` consults this once per tick and yields
+    /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
+    /// Python's `task.discover_items` against the locally bind-mounted
+    /// corpus and feed the result back via
+    /// [`Self::ingest_setup_discovery`]. The predicate is self-clearing
+    /// on every axis: a non-empty ledger (this node's own ingest or a
+    /// peer's broadcast) flips (b) false, and `ingest_setup_discovery`
+    /// flips (c) true — so the yield FIRES AT MOST ONCE per node and an
+    /// empty discovery never re-yields. Legacy / failover runs leave
+    /// `pre_staged_mode` false, so the predicate is always false there.
+    pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
+        self.pre_staged_mode && !self.setup_discovery_done && self.cluster_state.task_count() == 0
     }
 
     /// Whether dispatched task items back to real files (default true).
@@ -405,17 +495,6 @@ where
             .resolve_binary(zip_ref, local_path, file_hash, expected_content_hash)
     }
 
-    /// True iff `secondary_id` is currently in the primary's
-    /// backpressure backoff window (recently returned "No idle worker
-    /// available"). Used by `handle_primary_task_request` to skip
-    /// re-dispatching to an unresponsive peer. Mirrors
-    /// `PrimaryCoordinator::is_backpressured`.
-    pub(in crate::secondary) fn is_primary_peer_backpressured(&self, secondary_id: &str) -> bool {
-        self.backpressured_secondaries
-            .get(secondary_id)
-            .is_some_and(|t| Instant::now() < *t)
-    }
-
     /// Set certificate info for peer connections. Must be called before `run()`
     /// if peer-to-peer QUIC is enabled.
     pub fn set_peer_cert_info(&mut self, info: PeerCertInfo) {
@@ -430,9 +509,7 @@ where
     /// The sender itself is `Clone` and `Send` so the returned handle
     /// is freely passable across threads / async runtimes. Mirrors
     /// `PrimaryCoordinator::command_sender` exactly.
-    pub fn command_sender(
-        &self,
-    ) -> tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>> {
+    pub fn command_sender(&self) -> tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>> {
         self.command_tx.clone()
     }
 
@@ -509,41 +586,44 @@ where
         self.setup_phase_completed = true;
     }
 
-    pub fn completed_count(&self) -> usize {
-        self.completed_tasks.len()
-    }
-
-    /// Test-only inspector for the primary retry-pass budget
-    /// usage. Returns the SUM of consumed passes across all
-    /// `(phase, bucket)` keys in `primary_retry_passes_used`.
-    /// Lets tests assert that the per-phase retry-bucket cascade
-    /// actually drove re-injection (vs. e.g. the success arriving
-    /// without re-injection because the test fixture fixed the
-    /// worker behaviour before the bucket fired).
+    /// Cluster-wide count of successfully-completed tasks, read off the
+    /// replicated CRDT (`cluster_state.outcome_counts().succeeded`).
     ///
-    /// Post-refactor (2026-05-17): the counter shape moved from a
-    /// single `RetryBudget::attempts_used` (run-wide) to a per-
-    /// (phase, bucket) HashMap mirroring
-    /// `PrimaryCoordinator::retry_passes_used`. The aggregate
-    /// surfaced through this helper matches the legacy run-wide
-    /// shape so existing test assertions (`passes_used == 1`)
-    /// keep their meaning on single-phase fixtures.
-    #[cfg(test)]
-    pub fn primary_retry_passes_used_for_test(&self) -> u32 {
-        self.primary_retry_passes_used.values().sum()
+    /// A pure observer (and every non-authority secondary) keeps NO
+    /// per-node completed/failed/total counter: terminal state is read
+    /// ONLY from the CRDT, which every replica converges to. This is
+    /// what the late-joiner observer's `completed` getter surfaces — it
+    /// reflects every completion visible in the restored snapshot plus
+    /// any the observer ingested live, regardless of which node ran the
+    /// task.
+    pub fn completed_count(&self) -> usize {
+        self.cluster_state.outcome_counts().succeeded
     }
 
-    /// Test-only inspector for the primary's residual
-    /// failed-task ledger after the retry budget is exhausted. Used
-    /// by the multi-pass-exhaustion regression test to assert that a
-    /// task which fails Recoverably across all permitted passes ends
-    /// up permanently in `primary_failed`. Counts only
-    /// primary-dispatched failures (tasks that went through
-    /// `handle_primary_task_request`); initial-assignment failures
-    /// observed by the local worker bypass this ledger by design.
-    #[cfg(test)]
-    pub fn primary_failed_count_for_test(&self) -> usize {
-        self.primary_failed.len()
+    /// Read-only borrow of the replicated cluster ledger.
+    ///
+    /// # Single concern
+    ///
+    /// A shared, non-mutating view of the CRDT for callers that
+    /// PROJECT it (e.g. the observer's CRDT-derived periodic stats
+    /// reporter, which reads the ledger through
+    /// `StatsSnapshot::from_cluster_state`). It exposes exactly the
+    /// `&ClusterState<I>` the public projection accessors
+    /// (`tasks_iter`/`counts`/`outcome_counts`/`phase_deps`) already
+    /// hang off — no authority, no mutation, no pool.
+    ///
+    /// # Why a borrow and not an owned/shared handle
+    ///
+    /// The coordinator owns its `cluster_state` field by value; the
+    /// CRDT is deliberately NOT `Arc`-shared (that would ripple into
+    /// every apply site). A `&self` borrow keeps that ownership intact
+    /// and is the correct shape for a synchronous, in-loop projection
+    /// at a point where the caller already holds `&SecondaryCoordinator`
+    /// (the late-joiner observer publishes its projection right after
+    /// `restore_from_snapshot_and_skip_setup` and on each run-loop
+    /// return — both `&self`-reachable moments).
+    pub fn cluster_state(&self) -> &ClusterState<I> {
+        &self.cluster_state
     }
 
     /// Test-only inspector for the replicated cluster ledger this
@@ -647,6 +727,13 @@ where
                 "secondary panik shutdown: {reason} (matched_path={})",
                 matched_path.display()
             )),
+            // Surface RunAborted as a String error on the legacy
+            // `run()` path, same disposition as PanikShutdown: the PyO3
+            // wrapper takes the structured `RunOutcome::Aborted`
+            // directly and calls `std::process::exit(1)`; the legacy
+            // wrapper has no such side-effect channel, so the abort
+            // surfaces as a normal error return carrying the reason.
+            RunOutcome::Aborted { reason } => Err(format!("run aborted by primary: {reason}")),
         }
     }
 
@@ -794,9 +881,7 @@ where
             {
                 self.sampler = Some(
                     dynrunner_manager_local::memprofile::MemProfileSampler::spawn(
-                        dynrunner_manager_local::memprofile::MemProfileConfig::new(
-                            dir.clone(),
-                        ),
+                        dynrunner_manager_local::memprofile::MemProfileConfig::new(dir.clone()),
                     ),
                 );
             }
@@ -829,7 +914,7 @@ where
                     return Err(e);
                 }
                 Err(_elapsed) => {
-                    let peers = self.peer_transport.peer_count();
+                    let peers = self.transport.peer_count();
                     self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
                     if peers == 0 {
@@ -893,7 +978,7 @@ where
                 self.stop_all_workers().await;
                 tracing::info!(
                     secondary = %self.config.secondary_id,
-                    completed = self.completed_tasks.len(),
+                    completed = self.completed_count(),
                     "secondary finished"
                 );
             }
@@ -922,6 +1007,21 @@ where
                     matched_path = %matched_path.display(),
                     reason = %reason,
                     "secondary panik shutdown"
+                );
+            }
+            RunOutcome::Aborted { reason } => {
+                // Run aborted cluster-wide. The run is over, so tear
+                // down workers the same way as `Done` (drain the
+                // sampler before `stop_all_workers`); the PyO3 wrapper
+                // will call `std::process::exit(1)` once it sees this
+                // variant. Logged at error level — an abort is a
+                // failure outcome, not a clean finish.
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    reason = %reason,
+                    "secondary exiting: run aborted by primary"
                 );
             }
         }

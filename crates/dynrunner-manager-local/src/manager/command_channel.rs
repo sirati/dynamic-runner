@@ -29,8 +29,8 @@
 //! | `UpdatePreferredSecondaries` | `pool.update_first_match_in_place` to mirror onto the matching pool entry's `TaskInfo.preferred_secondaries`; `tracing::debug!` and Ok on no-match (the task may be in-flight or terminal — the preference is still meaningful for any future re-injection, so we don't fail). |
 
 use dynrunner_core::{
-    compute_task_hash, validate_spawn_tasks, FailedTask, Identifier, PrimaryCommand,
-    SoftPreferredSecondaries,
+    FailedTask, Identifier, PrimaryCommand, SoftPreferredSecondaries, compute_task_hash,
+    validate_spawn_tasks,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -96,9 +96,7 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             let task = match mgr.task_by_hash.get(&hash) {
                 Some(t) => t.clone(),
                 None => {
-                    let _ = reply.send(Err(format!(
-                        "fail_permanent: unknown task hash {hash}"
-                    )));
+                    let _ = reply.send(Err(format!("fail_permanent: unknown task hash {hash}")));
                     return;
                 }
             };
@@ -129,9 +127,7 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
                 mgr.failed_tasks.push(FailedTask {
                     binary: cascaded_task,
                     error_type: error.clone(),
-                    error_message: format!(
-                        "cascade-fail from {hash} (root: {reason})"
-                    ),
+                    error_message: format!("cascade-fail from {hash} (root: {reason})"),
                     retry_count: 0,
                 });
             }

@@ -9,9 +9,6 @@
 
 use super::*;
 
-
-
-
 #[test]
 fn task_preferred_secondaries_updated_apply_writes_to_task() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
@@ -29,7 +26,10 @@ fn task_preferred_secondaries_updated_apply_writes_to_task() {
     let Some(TaskState::Pending { task }) = s.task_state("h") else {
         panic!("expected Pending");
     };
-    assert_eq!(task.preferred_secondaries.as_slice(), &["secondary-2", "secondary-5"]);
+    assert_eq!(
+        task.preferred_secondaries.as_slice(),
+        &["secondary-2", "secondary-5"]
+    );
 }
 
 #[test]
@@ -123,7 +123,10 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
     });
     assert!(matches!(
         s.task_state("h"),
-        Some(TaskState::Failed { kind: ErrorType::NonRecoverable, .. })
+        Some(TaskState::Failed {
+            kind: ErrorType::NonRecoverable,
+            ..
+        })
     ));
     // And Recoverable also stays in Failed (sanity check the
     // dispatcher routes ONLY Unfulfillable to the new variant).
@@ -139,7 +142,10 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
     });
     assert!(matches!(
         s2.task_state("h2"),
-        Some(TaskState::Failed { kind: ErrorType::Recoverable, .. })
+        Some(TaskState::Failed {
+            kind: ErrorType::Recoverable,
+            ..
+        })
     ));
 }
 
@@ -191,6 +197,65 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
     );
 }
 
+/// A fresh `TasksSpawned` whose dep is an EXISTING `InvalidTask`
+/// cascade-fails as `Failed { NonRecoverable, last_error:
+/// "upstream-failed" }` — NOT as a fresh `invalid_task`. This keeps the
+/// `invalid_task` reason space accurate: only a literally-absent dep
+/// mints a fresh `InvalidTask`; an existing-but-invalid dep cascades
+/// through the same `Failed { NonRecoverable }` shape as any other
+/// upstream terminal. (The dep classifier in `apply_tasks_spawned`.)
+#[test]
+fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // Prereq `x` exists in the ledger and is InvalidTask.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "x_hash".into(),
+        task: mk_task("x"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "x_hash".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "missing dep".to_string().into(),
+        },
+        error: "missing dependency".into(),
+    });
+    assert_eq!(s.counts().invalid_task, 1);
+
+    // Spawn a dependent V naming (p0, x) — the classifier resolves the
+    // dep to x's ledger hash, sees InvalidTask, cascade-fails V.
+    let mut v = mk_task("v");
+    v.task_depends_on = vec![dynrunner_core::TaskDep {
+        task_id: "x".into(),
+        phase_id: PhaseId::from("p0"),
+        inherit_outputs: false,
+    }];
+    let v_hash = crate::primary::wire::compute_task_hash(&v);
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![v] });
+
+    match s.task_state(&v_hash) {
+        Some(TaskState::Failed {
+            kind, last_error, ..
+        }) => {
+            assert_eq!(
+                *kind,
+                ErrorType::NonRecoverable,
+                "cascades as NonRecoverable"
+            );
+            assert_eq!(
+                last_error, "upstream-failed",
+                "upstream-invalid cascade shape"
+            );
+        }
+        other => panic!("expected Failed{{NonRecoverable}} cascade, got {other:?}"),
+    }
+    // The dependent did NOT become a fresh invalid_task — the count is
+    // still just the original prereq.
+    assert_eq!(
+        s.counts().invalid_task,
+        1,
+        "the dependent cascaded as NonRecoverable, NOT a fresh invalid_task"
+    );
+}
 
 /// `TaskCompleted` apply arm auto-resumes every Blocked dependent
 /// whose `on` matches the completing hash back to `Pending`.
@@ -212,7 +277,9 @@ fn task_completed_auto_resumes_blocked_dependents() {
         },
         error: "missing".into(),
     });
-    s.apply(ClusterMutation::TaskReinjected { hash: "prereq".into() });
+    s.apply(ClusterMutation::TaskReinjected {
+        hash: "prereq".into(),
+    });
     // Two dependents Blocked-on-prereq.
     for h in ["d1", "d2"] {
         s.apply(ClusterMutation::TaskAdded {
@@ -235,7 +302,10 @@ fn task_completed_auto_resumes_blocked_dependents() {
     });
     // Prereq completes — every Blocked-on-prereq entry resumes.
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "prereq".into(), result_data: None }),
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "prereq".into(),
+            result_data: None
+        }),
         ApplyOutcome::Applied
     );
     assert!(matches!(
@@ -277,10 +347,7 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         s.apply(ClusterMutation::TaskReinjected { hash: "u".into() }),
         ApplyOutcome::Applied
     );
-    assert!(matches!(
-        s.task_state("u"),
-        Some(TaskState::Pending { .. })
-    ));
+    assert!(matches!(s.task_state("u"), Some(TaskState::Pending { .. })));
 
     // Failed{NonRecoverable} → reinject: NoOp (pre-variant
     // matcher accepted this; the tightened rule rejects).
@@ -297,8 +364,217 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         s.apply(ClusterMutation::TaskReinjected { hash: "f".into() }),
         ApplyOutcome::NoOp
     );
+    assert!(matches!(s.task_state("f"), Some(TaskState::Failed { .. })));
+}
+
+// ── Dead-secondary requeue (`TaskRequeued`, InFlight → Pending) ──
+
+/// `ClusterMutation::TaskRequeued { hash }` transitions an `InFlight`
+/// entry back to `Pending`, preserving the `TaskInfo` so the requeued
+/// task re-dispatches the same binary. This is the CRDT half of
+/// dead-secondary recovery: the local pool requeue and this transition
+/// move in lockstep so no stale `InFlight` survives.
+#[test]
+fn task_requeued_transitions_in_flight_back_to_pending() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "h".into(),
+        secondary: "dead-sec".into(),
+        worker: 0,
+    });
     assert!(matches!(
-        s.task_state("f"),
-        Some(TaskState::Failed { .. })
+        s.task_state("h"),
+        Some(TaskState::InFlight { .. })
     ));
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "h".into() }),
+        ApplyOutcome::Applied
+    );
+    let Some(TaskState::Pending { task }) = s.task_state("h") else {
+        panic!("InFlight must requeue to Pending");
+    };
+    assert_eq!(
+        task.task_id, "h",
+        "the preserved TaskInfo re-dispatches the same task"
+    );
+}
+
+/// `TaskRequeued` is a NoOp against every non-`InFlight` state:
+///   * `Pending` — idempotent under at-least-once delivery;
+///   * `Blocked` — a cascade-pause, not a dispatched task;
+///   * terminals (`Completed` / `Failed` / `Unfulfillable` /
+///     `InvalidTask`) — a terminal that raced the death observation
+///     wins; the requeue must NOT resurrect it to `Pending`.
+#[test]
+fn task_requeued_is_noop_against_non_in_flight_states() {
+    // Unknown hash.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued {
+            hash: "nope".into()
+        }),
+        ApplyOutcome::NoOp
+    );
+    // Pending (idempotent).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "p".into(),
+        task: mk_task("p"),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "p".into() }),
+        ApplyOutcome::NoOp
+    );
+    assert!(matches!(s.task_state("p"), Some(TaskState::Pending { .. })));
+    // Completed terminal wins (the Complete-before-Requeue reorder).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "c".into(),
+        task: mk_task("c"),
+    });
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "c".into(),
+        secondary: "dead-sec".into(),
+        worker: 0,
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "c".into(),
+        result_data: None,
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "c".into() }),
+        ApplyOutcome::NoOp,
+        "a completion that raced the death observation must win"
+    );
+    assert!(matches!(
+        s.task_state("c"),
+        Some(TaskState::Completed { .. })
+    ));
+    // InvalidTask terminal also wins.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "i".into(),
+        task: mk_task("i"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "i".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "dup".to_string().into(),
+        },
+        error: "invalid_task:dup".into(),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "i".into() }),
+        ApplyOutcome::NoOp
+    );
+    assert!(matches!(
+        s.task_state("i"),
+        Some(TaskState::InvalidTask { .. })
+    ));
+}
+
+// ── Discrete InvalidTask state pins ──
+
+/// `TaskFailed { kind: ErrorType::InvalidTask, .. }` lands in the
+/// discrete `TaskState::InvalidTask { reason, task }` variant, NOT in
+/// `TaskState::Failed { kind: InvalidTask, .. }`. Mirrors the
+/// `Unfulfillable` routing pin; the `reason` carries the inner
+/// `BoundedString` body verbatim.
+#[test]
+fn task_failed_with_invalid_task_lands_in_invalid_task_variant() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::InvalidTask {
+                reason: "missing dep nope".to_string().into(),
+            },
+            error: "invalid_task:missing dep nope".into(),
+        }),
+        ApplyOutcome::Applied
+    );
+    match s.task_state("h") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "missing dep nope");
+        }
+        other => panic!("expected InvalidTask, got {other:?}"),
+    }
+}
+
+/// `InvalidTask` is a TERMINAL, NON-reinjectable lockout. Unlike
+/// `Unfulfillable` (which `TaskReinjected` lifts back to `Pending`),
+/// a `TaskReinjected` against an `InvalidTask` entry is a NoOp and the
+/// state stays `InvalidTask` — there is no external action that makes
+/// a structurally-invalid task valid.
+#[test]
+fn reinject_against_invalid_task_is_noop_non_reinjectable() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "h".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "dup id".to_string().into(),
+        },
+        error: "invalid_task:dup id".into(),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskReinjected { hash: "h".into() }),
+        ApplyOutcome::NoOp,
+        "InvalidTask is non-reinjectable; ReinjectTask must NoOp"
+    );
+    assert!(
+        matches!(s.task_state("h"), Some(TaskState::InvalidTask { .. })),
+        "state must stay InvalidTask after a rejected reinject"
+    );
+}
+
+/// Terminal lockout: a late generic `TaskFailed` and a spurious
+/// `TaskCompleted` must NOT overwrite a terminal `InvalidTask` entry.
+/// The discrete reason stays accurate across out-of-order delivery.
+#[test]
+fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "h".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "missing dep".to_string().into(),
+        },
+        error: "invalid_task:missing dep".into(),
+    });
+    // A late generic worker-originated TaskFailed must NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "panic".into(),
+        }),
+        ApplyOutcome::NoOp
+    );
+    // A spurious TaskCompleted must NoOp (an invalid task is never
+    // dispatched, so success is impossible by construction).
+    assert_eq!(
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h".into(),
+            result_data: None,
+        }),
+        ApplyOutcome::NoOp
+    );
+    match s.task_state("h") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "missing dep");
+        }
+        other => panic!("expected InvalidTask preserved, got {other:?}"),
+    }
 }

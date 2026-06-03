@@ -111,10 +111,7 @@ pub(super) fn run_preparation<'py>(
     mem_manager_reserved_bytes: Option<u64>,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<(PreparationOutcome, Option<Py<PyAny>>)> {
-    let base_log_dir: String = slurm_config
-        .call_method0("get_log_dir")?
-        .str()?
-        .extract()?;
+    let base_log_dir: String = slurm_config.call_method0("get_log_dir")?.str()?.extract()?;
     let run_log_dir = format!("{base_log_dir}/{run_id}");
 
     // Directory prep (gateway-side mkdir for image / srcbins / output
@@ -163,19 +160,15 @@ pub(super) fn run_preparation<'py>(
             "info",
             ("Skipping image build and transfer (--skip-image-build)",),
         )?;
-        let image_dir = job_manager
-            .call_method1(
-                "_expand_path",
-                (slurm_config.call_method0("get_image_dir")?,),
-            )?;
+        let image_dir = job_manager.call_method1(
+            "_expand_path",
+            (slurm_config.call_method0("get_image_dir")?,),
+        )?;
         let pathlib = py.import("pathlib")?;
         let image_dir_path = pathlib.getattr("Path")?.call1((image_dir,))?;
         let image_tar_basename = deployment.getattr("image_tar_basename")?;
         let image_path = image_dir_path.call_method1("__truediv__", (image_tar_basename,))?;
-        log.call_method1(
-            "info",
-            (format!("Assuming image exists at: {image_path}"),),
-        )?;
+        log.call_method1("info", (format!("Assuming image exists at: {image_path}"),))?;
         let podman_module = py.import("dynamic_runner.packaging.podman")?;
         let metadata_cls = podman_module.getattr("PodmanImageMetadata")?;
         let metadata_kwargs = PyDict::new(py);
@@ -226,13 +219,13 @@ pub(super) fn run_preparation<'py>(
     };
     log.call_method1(
         "info",
-        (format!("Using gateway hostname (as configured by user): {gateway_host}"),),
+        (format!(
+            "Using gateway hostname (as configured by user): {gateway_host}"
+        ),),
     )?;
 
     log.call_method1("info", ("Submitting SLURM jobs...",))?;
-    let job_name_prefix: String = deployment
-        .getattr("effective_job_name_prefix")?
-        .extract()?;
+    let job_name_prefix: String = deployment.getattr("effective_job_name_prefix")?.extract()?;
     for i in 0..num_secondaries {
         let secondary_id = format!("secondary-{i}");
         let job_name = format!("{job_name_prefix}-{secondary_id}");

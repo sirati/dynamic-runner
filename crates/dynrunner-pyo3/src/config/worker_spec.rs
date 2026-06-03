@@ -67,10 +67,7 @@ pub(crate) struct RenderedCommand {
 
 impl WorkerSpec {
     pub(crate) fn render(&self, vars: &WorkerVars<'_>) -> RenderedCommand {
-        let comm_fd = vars
-            .comm_fd
-            .map(|fd| fd.to_string())
-            .unwrap_or_default();
+        let comm_fd = vars.comm_fd.map(|fd| fd.to_string()).unwrap_or_default();
         let socket_path = vars
             .socket_path
             .map(|p| p.to_string_lossy().into_owned())
@@ -85,9 +82,12 @@ impl WorkerSpec {
         };
         RenderedCommand {
             argv: self.argv.iter().map(|a| subst(a)).collect(),
-            env: self.env.iter().map(|(k, v)| (k.clone(), subst(v))).collect(),
+            env: self
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), subst(v)))
+                .collect(),
             cwd: self.cwd.as_deref().map(subst),
         }
     }
 }
-

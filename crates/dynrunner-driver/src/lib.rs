@@ -45,7 +45,9 @@ pub mod ssh_target;
 
 pub use config::SshConfig;
 pub use error::{KillLadder, SshMasterError};
-pub use identity::{IdentityError, WriteSshConfigArgs, ensure_dispatcher_keypair, write_ssh_config};
+pub use identity::{
+    IdentityError, WriteSshConfigArgs, ensure_dispatcher_keypair, write_ssh_config,
+};
 pub use session::{CommandOutcome, Session};
 pub use ssh_master::SshMaster;
 pub use ssh_target::SshTarget;

@@ -1,21 +1,20 @@
 use std::collections::HashMap;
 
-use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
+use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport,
-    SecondaryTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
+    Address, DistributedMessage, PeerTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
     ZipFileAssignment,
 };
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler};
 
 use crate::state::SecondaryConnectionState;
 
-use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
+use super::{PrimaryCoordinator, RemoteWorkerState};
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
 
@@ -114,9 +113,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         worker_id: global_worker_id,
                         secondary_id: meta.id.clone(),
                         resource_budgets: budget,
-                        current_task: None,
-                        estimated_resources: ResourceMap::new(),
-                        is_idle: true,
+                        state: super::SlotState::Idle,
                     });
                     global_worker_id += 1;
                 }
@@ -169,20 +166,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             } = decision
             {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
-                self.reserve_type_slot(&binary.type_id);
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();
-                // Compute local worker index within that secondary
-                let local_worker_id = self.workers[..worker_idx + 1]
-                    .iter()
-                    .filter(|w| w.secondary_id == secondary_id)
-                    .count() as u32
-                    - 1;
+                // Secondary-local worker id (the wire `worker_id`).
+                let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
 
-                self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
-                self.workers[worker_idx].is_idle = false;
+                // Type-slot reserve + slot `Idle -> Assigned{task_hash}`
+                // + ledger insert, committed together at the moment of
+                // initial dispatch. The wire `InitialAssignment` is
+                // built+sent below in the per-secondary fan-out loop; the
+                // ledger/slot must already reflect the assignment so a
+                // completion that races back is attributed by hash.
+                let task_hash = compute_task_hash(&binary);
+                self.commit_assignment(
+                    worker_idx,
+                    binary.clone(),
+                    task_hash,
+                    estimated_usage.clone(),
+                );
 
                 assignments_per_secondary
                     .entry(secondary_id)
@@ -234,7 +236,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 .iter()
                 .map(|(worker_id, _, est_res)| WorkerReadyInfo {
                     worker_id: *worker_id,
-                    resource_budgets: est_res.iter()
+                    resource_budgets: est_res
+                        .iter()
                         .map(|(kind, amount)| dynrunner_core::ResourceAmount {
                             kind: kind.clone(),
                             amount,
@@ -256,7 +259,26 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport.send_to(secondary_id, msg).await?;
+            self.transport
+                .send(Address::Peer(secondary_id.clone()), msg)
+                .await?;
+
+            // Send succeeded: originate the CRDT `Pending → InFlight`
+            // transition for each task in this secondary's initial
+            // batch (the single origination point, shared with the live
+            // dispatch sites). After the send so a delivery failure —
+            // which `?`-aborts initial assignment — never leaves a
+            // replicated `InFlight` to compensate. Collect the
+            // (hash, worker) pairs owned BEFORE the mut-self call so the
+            // immutable borrow of `assignments_per_secondary` is dropped.
+            let assigned_inflight: Vec<(String, u32)> = assignments
+                .iter()
+                .map(|(worker_id, binary, _)| (compute_task_hash(binary), *worker_id))
+                .collect();
+            for (task_hash, worker_id) in assigned_inflight {
+                self.originate_task_assigned(task_hash, secondary_id.clone(), worker_id)
+                    .await;
+            }
         }
 
         // Transition all to Operational. At the same moment, reset
@@ -337,7 +359,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 pre_staged_mode: true,
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport.send_to(secondary_id, msg).await?;
+            self.transport
+                .send(Address::Peer(secondary_id.clone()), msg)
+                .await?;
         }
 
         // InitialAssigning → Operational + seed keepalive, identical to
@@ -362,5 +386,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     // ── Phase 6: Transfer Complete ──
-
 }

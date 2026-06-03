@@ -21,12 +21,7 @@ pub(crate) fn probe_master_pid(
     for arg in base_args {
         cmd.arg(arg);
     }
-    cmd.args([
-        "-O",
-        "check",
-        "-o",
-        &format!("ControlPath={control_path}"),
-    ]);
+    cmd.args(["-O", "check", "-o", &format!("ControlPath={control_path}")]);
     cmd.arg(target);
 
     let output = cmd
@@ -68,12 +63,7 @@ pub(super) fn probe_master_pid_with_timeout(
     for arg in base_args {
         cmd.arg(arg);
     }
-    cmd.args([
-        "-O",
-        "check",
-        "-o",
-        &format!("ControlPath={control_path}"),
-    ]);
+    cmd.args(["-O", "check", "-o", &format!("ControlPath={control_path}")]);
     cmd.arg(target);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
@@ -88,13 +78,13 @@ pub(super) fn probe_master_pid_with_timeout(
         match child.try_wait() {
             Ok(Some(status)) => {
                 // Subprocess exited. Read its output.
-                let out = child.wait_with_output().unwrap_or_else(|_| {
-                    std::process::Output {
+                let out = child
+                    .wait_with_output()
+                    .unwrap_or_else(|_| std::process::Output {
                         status,
                         stdout: Vec::new(),
                         stderr: Vec::new(),
-                    }
-                });
+                    });
                 if !out.status.success() {
                     return Err(SshMasterError::MasterPidProbeFailed);
                 }
@@ -122,11 +112,9 @@ pub(super) fn probe_master_pid_with_timeout(
 pub(super) fn parse_master_pid(s: &str) -> Option<u32> {
     let marker = "Master running (pid=";
     let rest = s.find(marker).map(|i| &s[i + marker.len()..])?;
-    let pid_str: String =
-        rest.chars().take_while(char::is_ascii_digit).collect();
+    let pid_str: String = rest.chars().take_while(char::is_ascii_digit).collect();
     if pid_str.is_empty() {
         return None;
     }
     pid_str.parse().ok()
 }
-

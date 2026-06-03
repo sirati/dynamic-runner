@@ -90,21 +90,23 @@ impl ProcSysProbe {
     /// cgroup-v1, or unmounted hierarchy) so the operator sees the
     /// degraded mode once rather than per-tick.
     pub fn new() -> Self {
-        let cgroup_memory_current = if std::path::Path::new("/sys/fs/cgroup/memory.current").exists() {
-            Some("/sys/fs/cgroup/memory.current")
-        } else {
-            None
-        };
+        let cgroup_memory_current =
+            if std::path::Path::new("/sys/fs/cgroup/memory.current").exists() {
+                Some("/sys/fs/cgroup/memory.current")
+            } else {
+                None
+            };
         let cgroup_memory_max = if std::path::Path::new("/sys/fs/cgroup/memory.max").exists() {
             Some("/sys/fs/cgroup/memory.max")
         } else {
             None
         };
-        let cgroup_swap_current = if std::path::Path::new("/sys/fs/cgroup/memory.swap.current").exists() {
-            Some("/sys/fs/cgroup/memory.swap.current")
-        } else {
-            None
-        };
+        let cgroup_swap_current =
+            if std::path::Path::new("/sys/fs/cgroup/memory.swap.current").exists() {
+                Some("/sys/fs/cgroup/memory.swap.current")
+            } else {
+                None
+            };
         let cgroup_swap_max = if std::path::Path::new("/sys/fs/cgroup/memory.swap.max").exists() {
             Some("/sys/fs/cgroup/memory.swap.max")
         } else {
@@ -241,7 +243,9 @@ fn read_meminfo() -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
 /// numeric body fails to parse.
 fn parse_meminfo_line(line: &str, prefix: &str) -> Option<u64> {
     let rest = line.strip_prefix(prefix)?.trim();
-    let kb_str = rest.strip_suffix("kB").or_else(|| rest.strip_suffix(" kB"))?;
+    let kb_str = rest
+        .strip_suffix("kB")
+        .or_else(|| rest.strip_suffix(" kB"))?;
     let kb: u64 = kb_str.trim().parse().ok()?;
     Some(kb * 1024)
 }

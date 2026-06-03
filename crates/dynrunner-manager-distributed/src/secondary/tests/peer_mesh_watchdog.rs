@@ -5,13 +5,15 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::{
+    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport, make_transport,
+};
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
-use std::time::Duration;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 // Helper: build a no-peer secondary with the watchdog already armed
@@ -28,8 +30,7 @@ fn arm_watchdog_no_peers(
     dial_count: u32,
 ) -> (
     SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        NoPeers,
+        TestTransport<NoPeers>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -41,7 +42,7 @@ fn arm_watchdog_no_peers(
     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let transport = ChannelPrimaryTransportEnd {
+    let uplink = ChannelPrimaryTransportEnd {
         tx: sec_to_pri_tx,
         rx: pri_to_sec_rx,
     };
@@ -73,16 +74,14 @@ fn arm_watchdog_no_peers(
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        NoPeers,
+        TestTransport<NoPeers>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        transport,
-        NoPeers,
+        make_transport(secondary_id, uplink, NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -154,7 +153,10 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
             DistributedMessage::SecondaryFatalError { .. } => {
                 panic!("watchdog must NOT send SecondaryFatalError in graceful-degrade mode");
             }
-            other => panic!("unexpected message on primary channel: {:?}", other.msg_type()),
+            other => panic!(
+                "unexpected message on primary channel: {:?}",
+                other.msg_type()
+            ),
         }
     }
     assert!(
@@ -289,7 +291,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let transport = ChannelPrimaryTransportEnd {
+            let uplink = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
             };
@@ -328,14 +330,13 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             let secondary_id = config.secondary_id.clone();
             let primary_handle = tokio::task::spawn_local(fake_primary(
                 binaries,
-                secondary_id,
+                secondary_id.clone(),
                 sec_to_pri_rx,
                 pri_to_sec_tx,
             ));
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                make_transport(&secondary_id, uplink, NoPeers),
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -352,7 +353,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 .expect("degraded run must complete cleanly over WSS");
 
             assert_eq!(
-                secondary.completed_count(),
+                secondary.local_tasks_run_for_test(),
                 3,
                 "WSS dispatch must keep flowing after peer-mesh degraded mode"
             );
@@ -373,8 +374,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
 /// to vote with.
 #[tokio::test(flavor = "current_thread")]
 async fn degraded_failover_fails_loud_instead_of_self_promoting() {
-    use super::super::test_helpers::{election_config, make_secondary};
     use super::super::election::ElectionState;
+    use super::super::test_helpers::{election_config, make_secondary};
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = make_secondary(election_config("sec-a"));
@@ -425,7 +426,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
     let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let transport = ChannelPrimaryTransportEnd {
+    let uplink = ChannelPrimaryTransportEnd {
         tx: sec_to_pri_tx,
         rx: pri_to_sec_rx,
     };
@@ -457,16 +458,14 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        FixedPeerCount,
+        TestTransport<FixedPeerCount>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        transport,
-        FixedPeerCount(3),
+        make_transport("sec-quo", uplink, FixedPeerCount(3)),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -500,7 +499,10 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
                 assert_eq!(peer_count, 3, "healthy mesh reports the live peer count");
                 saw_mesh_ready = true;
             }
-            other => panic!("unexpected message on primary channel: {:?}", other.msg_type()),
+            other => panic!(
+                "unexpected message on primary channel: {:?}",
+                other.msg_type()
+            ),
         }
     }
     assert!(saw_mesh_ready, "MeshReady must be sent on the healthy path");

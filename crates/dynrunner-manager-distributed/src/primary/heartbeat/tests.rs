@@ -6,11 +6,11 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, RemovalCause};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::{PrimaryConfig, PrimaryCoordinator, RemoteWorkerState};
+use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 
@@ -19,20 +19,15 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 /// production; tests that exercise post-initialisation paths
 /// (heartbeat re-queue, etc.) need this so `pool_mut()` doesn't
 /// panic.
-fn install_default_pool<T, P, S, E>(
-    primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
-) where
-    T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
-    P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
+fn install_default_pool<Tr, S, E>(primary: &mut PrimaryCoordinator<Tr, S, E, TestId>)
+where
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
     S: dynrunner_scheduler_api::Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
     let phase = PhaseId::from("default");
-    let pool = PendingPool::<TestId>::new(
-        [phase.clone()],
-        std::collections::HashMap::new(),
-    )
-    .expect("default-phase pool");
+    let pool = PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
+        .expect("default-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -58,8 +53,8 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
         keepalive_interval,
         keepalive_miss_threshold: miss_threshold,
         source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
+        uses_file_based_items: true,
+        required_setup_on_promote: false,
         max_concurrent_per_type: std::collections::HashMap::new(),
         retry_max_passes: 1,
         oom_retry_max_passes: 1,
@@ -77,7 +72,7 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
 }
 
 fn empty_transport() -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
@@ -86,10 +81,7 @@ fn empty_transport() -> (
     let mut outgoing = HashMap::new();
     outgoing.insert("dead-sec".into(), sec_tx);
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         sec_rx,
         incoming_tx,
     )
@@ -102,10 +94,9 @@ fn empty_transport() -> (
 #[tokio::test(flavor = "current_thread")]
 async fn dead_secondary_requeues_in_flight_task() {
     let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );
@@ -144,14 +135,7 @@ async fn dead_secondary_requeues_in_flight_task() {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
-    primary.workers.push(RemoteWorkerState {
-        worker_id: 0,
-        secondary_id: "dead-sec".into(),
-        resource_budgets: ResourceMap::new(),
-        current_task: Some(in_flight.clone()),
-        estimated_resources: ResourceMap::new(),
-        is_idle: false,
-    });
+    primary.stage_in_flight_for_test("dead-sec".into(), 0, in_flight.clone());
 
     // Sleep past `keepalive_interval * miss_threshold` so the deadline
     // expires, then collect the report.
@@ -185,7 +169,7 @@ async fn dead_secondary_requeues_in_flight_task() {
 // structurally by the field types and isn't reused elsewhere.
 #[allow(clippy::type_complexity)]
 fn two_secondary_transport() -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     Vec<tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>>,
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
@@ -196,10 +180,7 @@ fn two_secondary_transport() -> (
     outgoing.insert("sec-a".into(), a_tx);
     outgoing.insert("sec-b".into(), b_tx);
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         vec![a_rx, b_rx],
         incoming_tx,
     )
@@ -209,14 +190,13 @@ fn two_secondary_transport() -> (
 /// in-flight task. Mirrors the setup pattern of
 /// `dead_secondary_requeues_in_flight_task` but parametrised by id
 /// so the mass-death tests can stage two of them.
-fn register_operational_secondary<T, P, S, E>(
-    primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
+fn register_operational_secondary<Tr, S, E>(
+    primary: &mut PrimaryCoordinator<Tr, S, E, TestId>,
     secondary_id: &str,
     worker_id: u32,
     in_flight_label: &str,
 ) where
-    T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
-    P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
     S: dynrunner_scheduler_api::Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
@@ -231,11 +211,10 @@ fn register_operational_secondary<T, P, S, E>(
         SecondaryConnectionState::Operational(conn),
     );
     primary.seed_keepalive(secondary_id);
-    primary.workers.push(RemoteWorkerState {
+    primary.stage_in_flight_for_test(
+        secondary_id.into(),
         worker_id,
-        secondary_id: secondary_id.into(),
-        resource_budgets: ResourceMap::new(),
-        current_task: Some(TaskInfo {
+        TaskInfo {
             path: std::path::PathBuf::from(format!("{in_flight_label}.bin")),
             size: 100,
             identifier: TestId(in_flight_label.into()),
@@ -247,10 +226,8 @@ fn register_operational_secondary<T, P, S, E>(
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
-        }),
-        estimated_resources: ResourceMap::new(),
-        is_idle: false,
-    });
+        },
+    );
 }
 
 fn config_with_mass_death(
@@ -277,19 +254,12 @@ fn config_with_mass_death(
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_defers_requeue_when_all_secondaries_silent() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -317,19 +287,12 @@ async fn mass_death_defers_requeue_when_all_secondaries_silent() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_recovery_during_grace_undefers_secondary() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -356,19 +319,12 @@ async fn mass_death_recovery_during_grace_undefers_secondary() {
 #[tokio::test(flavor = "current_thread")]
 async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -394,19 +350,12 @@ async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_disabled_when_grace_is_zero() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::ZERO,
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::ZERO, 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -452,19 +401,12 @@ fn collect_peer_removed(
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -481,7 +423,11 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
     // sending its TimeoutDetected first.
     let removed_a = collect_peer_removed(&mut sec_rxs[0]);
     let removed_b = collect_peer_removed(&mut sec_rxs[1]);
-    let merged = if !removed_b.is_empty() { removed_b } else { removed_a };
+    let merged = if !removed_b.is_empty() {
+        removed_b
+    } else {
+        removed_a
+    };
     assert_eq!(
         merged.len(),
         1,
@@ -503,19 +449,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_millis(200),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_millis(200), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -557,8 +496,7 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
     for (_, cause) in &removed {
         assert_eq!(*cause, RemovalCause::MassDeathEscalation);
     }
-    let ids: std::collections::HashSet<&str> =
-        removed.iter().map(|(id, _)| id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = removed.iter().map(|(id, _)| id.as_str()).collect();
     assert!(ids.contains("sec-a"));
     assert!(ids.contains("sec-b"));
 }
@@ -572,14 +510,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config(Duration::from_millis(50), 2),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -633,19 +569,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -688,10 +617,9 @@ async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
 #[tokio::test(flavor = "current_thread")]
 async fn live_secondary_is_not_falsely_declared_dead() {
     let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );
@@ -738,31 +666,28 @@ fn first_task_assignment(
 
 /// Regression for the dispatch-stall after keepalive-driven recovery:
 /// when the primary requeues an in-flight task from a dead secondary,
-/// surviving idle workers do NOT auto-poll. Without an explicit
-/// `dispatch_to_idle_workers` kickstart at the end of the requeue
-/// path the recovered task sits in the pool forever — observed in the
-/// 2026-05-17 cohort run where the primary logged
+/// surviving idle workers do NOT auto-poll. Without re-dispatch at the
+/// end of the requeue path the recovered task sits in the pool forever
+/// — observed in the 2026-05-17 cohort run where the primary logged
 /// `recovered_in_flight=1` after a 300 s keepalive timeout but never
 /// re-emitted `task_request` to any idle peer, so the entire dispatch
 /// chain stalled until the SLURM time-limit killed the wrapper.
 ///
-/// Mirrors the existing kickstart pattern in
-/// `run_retry_passes` / `handle_task_complete` / `handle_task_failed`:
-/// every other path that re-injects into the pool calls
-/// `dispatch_to_idle_workers().await` before yielding to the
-/// operational loop, because secondaries only send `TaskRequest`
-/// after they finish a task.
+/// Post dispatch-decoupling the requeue path no longer calls dispatch
+/// directly: it EMITS a `WorkerMgmtSignal::TasksAdded` onto the
+/// worker-management bus, and the operational loop's worker-management
+/// `select!` arm runs the recheck that re-dispatches. This test drives
+/// that recheck synchronously (drain the batch + call the reaction) —
+/// the dispatch still happens, just via the batched recheck.
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config(Duration::from_millis(50), 2),
-            transport,
-            dynrunner_transport_quic::NoPeerTransport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
 
     // sec-a is the wedged secondary; it owns one in-flight task that
@@ -784,17 +709,22 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         SecondaryConnectionState::Operational(sec_b_conn),
     );
     primary.seed_keepalive("sec-b");
-    primary.workers.push(RemoteWorkerState {
-        worker_id: 1,
-        secondary_id: "sec-b".into(),
-        resource_budgets: ResourceMap::from([(
+    primary.register_idle_worker_for_test(
+        "sec-b".into(),
+        1,
+        ResourceMap::from([(
             dynrunner_core::ResourceKind::memory(),
             1024 * 1024 * 1024u64,
         )]),
-        current_task: None,
-        estimated_resources: ResourceMap::new(),
-        is_idle: true,
-    });
+    );
+
+    // Install the worker-management bus so the requeue path's
+    // `TasksAdded` emit lands on a receiver we drive the recheck from.
+    let (wm_tx, mut wm_rx) =
+        tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(wm_tx);
 
     // Sleep past the keepalive deadline so sec-a is dead. Refresh
     // sec-b's keepalive immediately before the tick so only sec-a
@@ -819,10 +749,27 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         "survivor must remain"
     );
 
+    // Deferred-recheck contract: the requeue path emitted a
+    // `TasksAdded` rather than dispatching inline. Drain the coalesced
+    // batch and run the worker-management reaction synchronously —
+    // exactly what the operational loop's worker-management arm does.
+    let batch =
+        crate::worker_signal::drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            .await
+            .expect("dead-secondary requeue must emit a TasksAdded batch");
+    assert!(
+        batch
+            .signals
+            .contains(&crate::worker_signal::WorkerMgmtSignal::TasksAdded),
+        "requeue path must emit TasksAdded; got {:?}",
+        batch.signals
+    );
+    primary.react_to_worker_signal_batch(batch).await;
+
     // The load-bearing assertion: sec-b's outgoing channel saw a
-    // `TaskAssignment` — i.e. the requeue path kickstarted dispatch
-    // to the surviving idle worker, the very signal the production
-    // run was missing.
+    // `TaskAssignment` — i.e. the recheck re-dispatched to the
+    // surviving idle worker, the very signal the production run was
+    // missing.
     let assignment = first_task_assignment(&mut sec_rxs[1]);
     assert!(
         assignment.is_some(),
@@ -840,12 +787,151 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     // only) is the right shape: the task moved from queued to
     // in-flight on the kickstart's dispatch call.
     assert!(
-        primary.workers.iter().any(|w| w.secondary_id == "sec-b" && !w.is_idle),
+        primary
+            .workers
+            .iter()
+            .any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
         "survivor's worker must flip to busy after the kickstart"
     );
     assert_eq!(
         primary.pool().iter().count(),
         0,
         "recovered task must leave the queued bucket via dispatch kickstart"
+    );
+}
+
+/// R-1: a dead-secondary requeue transitions the CRDT entry
+/// `InFlight → Pending` (via the `TaskRequeued` mutation
+/// `recover_inflight_for_dead_secondary` produces and
+/// `requeue_dead_secondary` broadcasts), so a snapshot taken after the
+/// recovery — restored into a freshly-promoted primary — hydrates the
+/// task into the pool and re-dispatches it EXACTLY once.
+///
+/// Without the `TaskRequeued` transition the local pool requeue would
+/// have no CRDT counterpart: a stale `InFlight` would survive the
+/// snapshot, `hydrate_from_cluster_state` would route it to the
+/// in-flight ledger (NOT the pool), and the promoted primary would
+/// never re-dispatch it — a lost task. The "exactly once" assertion
+/// pins both failure modes: zero (the lost-task regression) and twice
+/// (a stale-InFlight + pool double-count).
+#[tokio::test(flavor = "current_thread")]
+async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
+    let (transport, _sec_rx, _kept_alive) = empty_transport();
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // Register the dead-to-be secondary, operational.
+    let conn = SecondaryConnection::new("dead-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_cert_exchange(String::new(), None, None, 0)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "dead-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("dead-sec");
+
+    // The victim task: dispatched (CRDT InFlight on dead-sec/w0) AND
+    // present in the local in-flight ledger via the real
+    // `commit_assignment` lifecycle. The hash is the content hash so
+    // the CRDT key and the ledger key align (production dispatch always
+    // keys both on `compute_task_hash`).
+    let victim = TaskInfo {
+        path: std::path::PathBuf::from("victim.bin"),
+        size: 100,
+        identifier: TestId("victim".into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: "victim".into(),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let victim_hash = primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
+    // Mirror the CRDT to InFlight, the state the live `TaskAssigned`
+    // origination would have written at dispatch.
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: victim_hash.clone(),
+            task: victim.clone(),
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            hash: victim_hash.clone(),
+            secondary: "dead-sec".into(),
+            worker: 0,
+        });
+    }
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&victim_hash),
+            Some(crate::cluster_state::TaskState::InFlight { .. })
+        ),
+        "victim starts InFlight in the CRDT"
+    );
+
+    // dead-sec dies → the recovery path requeues locally AND broadcasts
+    // the `TaskRequeued` transition, applying it to the local CRDT.
+    let dead = super::DeadSecondary {
+        secondary_id: "dead-sec".into(),
+        last_keepalive: std::time::Instant::now(),
+    };
+    primary
+        .requeue_dead_secondary(dead, RemovalCause::KeepaliveMiss)
+        .await
+        .unwrap();
+
+    // The CRDT entry is now Pending (InFlight → Pending), in lockstep
+    // with the local pool requeue.
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&victim_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "dead-secondary recovery must transition the CRDT InFlight → Pending"
+    );
+
+    // Snapshot the post-recovery ledger and restore it into a freshly-
+    // promoted primary (the failover hydration path).
+    let snapshot = primary.cluster_state_for_test().snapshot();
+
+    let (transport2, _sec_rx2, _kept_alive2) = empty_transport();
+    let mut promoted: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport2,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    promoted.cluster_state_mut_for_test().restore(snapshot);
+    promoted.hydrate_from_cluster_state();
+
+    // EXACTLY ONCE: the requeued task hydrates into the pool as a
+    // dispatchable (queued) item — not stranded in the in-flight ledger
+    // (zero), not double-counted (twice).
+    let queued: Vec<_> = promoted.pool().iter().collect();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the requeued task must hydrate as exactly one dispatchable pool item"
+    );
+    assert_eq!(queued[0].task_id, "victim");
+    assert_eq!(
+        promoted.in_flight_len_for_test(),
+        0,
+        "no stale in-flight ledger entry — the task is genuinely pending"
+    );
+    assert_eq!(
+        promoted.pool().in_flight(&PhaseId::from("default")),
+        0,
+        "no phase in-flight counter held for the requeued task"
     );
 }

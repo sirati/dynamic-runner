@@ -91,7 +91,6 @@ impl MessageReceiver<Response> for NamedSocketManagerEnd {
             Err(_) => None,
         }
     }
-
 }
 
 /// Runner-side transport that connects to a named Unix domain socket.
@@ -179,71 +178,75 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn named_socket_roundtrip() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let dir = std::env::temp_dir().join(format!("db_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock_path = dir.join("test.sock");
+        local
+            .run_until(async {
+                let dir = std::env::temp_dir().join(format!("db_test_{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let sock_path = dir.join("test.sock");
 
-        let mut manager = NamedSocketManagerEnd::bind(&sock_path).unwrap();
+                let mut manager = NamedSocketManagerEnd::bind(&sock_path).unwrap();
 
-        // Spawn a runner that connects
-        let sock_path_clone = sock_path.clone();
-        let runner_handle = tokio::task::spawn_local(async move {
-            let mut runner = NamedSocketRunnerEnd::connect(&sock_path_clone).await.unwrap();
+                // Spawn a runner that connects
+                let sock_path_clone = sock_path.clone();
+                let runner_handle = tokio::task::spawn_local(async move {
+                    let mut runner = NamedSocketRunnerEnd::connect(&sock_path_clone)
+                        .await
+                        .unwrap();
 
-            // Send Ready
-            runner.send(Response::Ready).await.unwrap();
+                    // Send Ready
+                    runner.send(Response::Ready).await.unwrap();
 
-            // Receive command
-            let cmd = runner.recv().await.unwrap();
-            assert!(matches!(cmd, Command::ProcessTask { .. }));
+                    // Receive command
+                    let cmd = runner.recv().await.unwrap();
+                    assert!(matches!(cmd, Command::ProcessTask { .. }));
 
-            // Send Done with an opaque byte payload. The framework
-            // treats `result_data` as fully opaque (see codec.rs):
-            // the bytes here are arbitrary and chosen to NOT look
-            // like any plausible int-pair shape, so this test
-            // verifies opaque-bytes round-trip and not accidental
-            // legacy-int parsing.
-            runner
-                .send(Response::Done {
-                    result_data: Some(b"opaque-payload-bytes".to_vec()),
-                })
-                .await
-                .unwrap();
-        });
+                    // Send Done with an opaque byte payload. The framework
+                    // treats `result_data` as fully opaque (see codec.rs):
+                    // the bytes here are arbitrary and chosen to NOT look
+                    // like any plausible int-pair shape, so this test
+                    // verifies opaque-bytes round-trip and not accidental
+                    // legacy-int parsing.
+                    runner
+                        .send(Response::Done {
+                            result_data: Some(b"opaque-payload-bytes".to_vec()),
+                        })
+                        .await
+                        .unwrap();
+                });
 
-        // Accept connection
-        manager.accept().await.unwrap();
+                // Accept connection
+                manager.accept().await.unwrap();
 
-        // Receive Ready
-        let resp = manager.recv().await.unwrap();
-        assert!(matches!(resp, Response::Ready));
+                // Receive Ready
+                let resp = manager.recv().await.unwrap();
+                assert!(matches!(resp, Response::Ready));
 
-        // Send command
-        manager
-            .send(Command::ProcessTask {
-                relative_path: "x/y".into(),
-                payload: None,
-                resolved_path: None,
-                predecessor_outputs: std::collections::BTreeMap::new(),
+                // Send command
+                manager
+                    .send(Command::ProcessTask {
+                        relative_path: "x/y".into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs: std::collections::BTreeMap::new(),
+                    })
+                    .await
+                    .unwrap();
+
+                // Receive Done
+                let resp = manager.recv().await.unwrap();
+                match resp {
+                    Response::Done { result_data } => {
+                        assert_eq!(result_data.unwrap(), b"opaque-payload-bytes");
+                    }
+                    _ => panic!("expected Done"),
+                }
+
+                runner_handle.await.unwrap();
+
+                // Cleanup
+                let _ = std::fs::remove_dir_all(&dir);
             })
-            .await
-            .unwrap();
-
-        // Receive Done
-        let resp = manager.recv().await.unwrap();
-        match resp {
-            Response::Done { result_data } => {
-                assert_eq!(result_data.unwrap(), b"opaque-payload-bytes");
-            }
-            _ => panic!("expected Done"),
-        }
-
-        runner_handle.await.unwrap();
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(&dir);
-        }).await;
+            .await;
     }
 
     /// The runner-side `connect` must wait for the manager to bind its
@@ -256,8 +259,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let dir = std::env::temp_dir()
-                    .join(format!("db_test_late_{}", std::process::id()));
+                let dir = std::env::temp_dir().join(format!("db_test_late_{}", std::process::id()));
                 std::fs::create_dir_all(&dir).unwrap();
                 let sock_path = dir.join("late.sock");
                 // Make sure no stale file exists.
@@ -267,8 +269,7 @@ mod tests {
                 let manager_path = sock_path.clone();
                 let manager_handle = tokio::task::spawn_local(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let mut manager =
-                        NamedSocketManagerEnd::bind(&manager_path).unwrap();
+                    let mut manager = NamedSocketManagerEnd::bind(&manager_path).unwrap();
                     manager.accept().await.unwrap();
                     // Hold the connection open until the runner closes.
                     let _ = manager.recv().await;
@@ -305,10 +306,8 @@ mod tests {
     /// directly with a short timeout so the test runs quickly.
     #[tokio::test(flavor = "current_thread")]
     async fn runner_times_out_when_socket_never_appears() {
-        let sock_path = std::env::temp_dir().join(format!(
-            "db_test_missing_{}.sock",
-            std::process::id()
-        ));
+        let sock_path =
+            std::env::temp_dir().join(format!("db_test_missing_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock_path);
 
         let start = std::time::Instant::now();

@@ -4,13 +4,15 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::{
+    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, make_transport,
+};
 use super::super::*;
-use std::time::Duration;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Simulate a primary that coordinates with the secondary.
@@ -50,7 +52,7 @@ pub(super) async fn fake_primary(
     to_secondary
         .send(DistributedMessage::InitialAssignment {
             pre_staged_mode: false,
-                    uses_file_based_items: true,
+            uses_file_based_items: true,
             sender_id: "primary".into(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -93,7 +95,23 @@ pub(super) async fn fake_primary(
         }
     }
 
-    // Drop channel to signal secondary to stop
+    // Production-faithful shutdown: the primary broadcasts
+    // `ClusterMutation::RunComplete` as its last act before exiting, so
+    // every secondary's `process_tasks` exits on the
+    // `cluster_state.run_complete()` cue. The unified transport's
+    // `recv_peer()` only yields `None` when EVERY inbound source closes
+    // (uplink AND mesh); with a `NoPeers` mesh stub that never happens,
+    // so RunComplete is the real exit cue (matching production, where
+    // dropping the uplink alone is NOT the run-over signal).
+    to_secondary
+        .send(DistributedMessage::ClusterMutation {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete],
+        })
+        .unwrap();
+
+    // Then drop the channel.
     drop(to_secondary);
 }
 
@@ -166,7 +184,10 @@ async fn secondary_with_real_workers_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 1,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -202,10 +223,10 @@ async fn secondary_with_real_workers_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -213,7 +234,12 @@ async fn secondary_with_real_workers_processes_tasks() {
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
 
-            assert_eq!(secondary.completed_count(), 3);
+            // The secondary keeps no per-node completed counter; assert
+            // the OWN-worker run count (the CRDT-backed `completed_count`
+            // is 0 here because the fake primary reports terminal state
+            // back but does not broadcast `ClusterMutation::TaskCompleted`
+            // into this node's mirror — that's the authority's job).
+            assert_eq!(secondary.local_tasks_run_for_test(), 3);
 
             primary_handle.await.unwrap();
         })
@@ -237,7 +263,10 @@ async fn secondary_multi_worker_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 2,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    2 * 1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -271,10 +300,10 @@ async fn secondary_multi_worker_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -282,7 +311,7 @@ async fn secondary_multi_worker_processes_tasks() {
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
 
-            assert_eq!(secondary.completed_count(), 6);
+            assert_eq!(secondary.local_tasks_run_for_test(), 6);
 
             primary_handle.await.unwrap();
         })
@@ -348,10 +377,10 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -362,7 +391,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
             // All 15 must complete; the operational loop is responsible
             // for >= 14 of them since one worker can hold at most one
             // initial assignment.
-            assert_eq!(secondary.completed_count(), 15);
+            assert_eq!(secondary.local_tasks_run_for_test(), 15);
 
             primary_handle.await.unwrap();
         })
@@ -464,7 +493,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::InitialAssignment {
                         pre_staged_mode: false,
-                    uses_file_based_items: true,
+                        uses_file_based_items: true,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
@@ -522,8 +551,7 @@ async fn stage_file_then_assign_task_succeeds() {
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),
-                                        predecessor_outputs:
-                                            std::collections::BTreeMap::new(),
+                                        predecessor_outputs: std::collections::BTreeMap::new(),
                                     })
                                     .unwrap();
                                 sent_assignment = true;
@@ -538,13 +566,25 @@ async fn stage_file_then_assign_task_succeeds() {
                         break;
                     }
                 }
+                // Production-faithful exit cue (see `fake_primary`):
+                // broadcast RunComplete before dropping the uplink so
+                // the secondary's `process_tasks` exits on
+                // `cluster_state.run_complete()` (the unified transport's
+                // `recv_peer()` never yields None with a `NoPeers` mesh).
+                let _ = pri_to_sec_tx.send(DistributedMessage::ClusterMutation {
+                    sender_id: "primary".into(),
+                    timestamp: 0.0,
+                    mutations: vec![
+                        dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                    ],
+                });
                 drop(pri_to_sec_tx);
             });
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -553,7 +593,7 @@ async fn stage_file_then_assign_task_succeeds() {
             secondary.run(&mut factory).await.unwrap();
 
             assert_eq!(
-                secondary.completed_count(),
+                secondary.local_tasks_run_for_test(),
                 1,
                 "expected the staged-then-assigned task to complete"
             );
@@ -561,6 +601,166 @@ async fn stage_file_then_assign_task_succeeds() {
             primary_handle.await.unwrap();
 
             let _ = std::fs::remove_dir_all(&root);
+        })
+        .await;
+}
+
+/// A fake primary that completes the setup handshake then immediately
+/// broadcasts `ClusterMutation::RunAborted` — the #3a hard-shutdown cue.
+/// No tasks are ever assigned: the abort is the run-over signal.
+async fn fake_primary_abort(
+    secondary_id: String,
+    mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    // Welcome + cert exchange.
+    let (mut got_welcome, mut got_cert) = (false, false);
+    while !got_welcome || !got_cert {
+        if let Some(msg) = from_secondary.recv().await {
+            match msg.msg_type() {
+                MessageType::SecondaryWelcome => got_welcome = true,
+                MessageType::CertExchange => got_cert = true,
+                _ => {}
+            }
+        } else {
+            return;
+        }
+    }
+    to_secondary
+        .send(DistributedMessage::PeerInfo {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            peers: vec![],
+        })
+        .unwrap();
+    to_secondary
+        .send(DistributedMessage::InitialAssignment {
+            pre_staged_mode: false,
+            uses_file_based_items: true,
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            secondary_id,
+            zip_files: vec![],
+            workers_ready: vec![],
+            staged_files: vec![],
+        })
+        .unwrap();
+    to_secondary
+        .send(DistributedMessage::TransferComplete {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            total_files: 0,
+            total_bytes: 0,
+        })
+        .unwrap();
+    // The abort cue: broadcast RunAborted. Keep the uplink ALIVE
+    // afterwards (drain the secondary's outbound) so the secondary's
+    // `process_tasks` exits on the `run_aborted()` check rather than on
+    // a channel-closed recv — production-faithful (dropping the uplink
+    // alone is NOT the run-over signal; the CRDT flag is). The task
+    // returns (dropping `to_secondary`) only once the secondary has
+    // gone quiet, which happens after it returns `RunOutcome::Aborted`.
+    to_secondary
+        .send(DistributedMessage::ClusterMutation {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            mutations: vec![
+                dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
+                    reason: "duplicate task identity in the initial batch".into(),
+                },
+            ],
+        })
+        .unwrap();
+    // Drain until the secondary drops its end (it has exited on the
+    // abort), holding `to_secondary` open in the meantime.
+    while from_secondary.recv().await.is_some() {}
+}
+
+/// `RunAborted` apply → `run_aborted()` set → `process_tasks` returns
+/// `RunOutcome::Aborted` (checked BEFORE the `run_complete()` break, and
+/// without waiting for any task drain — a hard shutdown).
+#[tokio::test(flavor = "current_thread")]
+async fn run_aborted_yields_run_outcome_aborted() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-0".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
+                is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
+                output_dir: None,
+                memuse_log_path: None,
+            };
+
+            let secondary_id = config.secondary_id.clone();
+            let primary_handle = tokio::task::spawn_local(fake_primary_abort(
+                secondary_id,
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                unified,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mut factory = FakeWorkerFactory;
+            let outcome = secondary
+                .run_until_setup_or_done(&mut factory)
+                .await
+                .expect("run_until_setup_or_done returns Ok(RunOutcome::Aborted)");
+            match outcome {
+                RunOutcome::Aborted { reason } => {
+                    assert!(
+                        reason.contains("duplicate task identity"),
+                        "Aborted carries the broadcast reason: {reason}"
+                    );
+                }
+                other => panic!("expected RunOutcome::Aborted, got {other:?}"),
+            }
+            assert!(
+                secondary.cluster_state().run_aborted().is_some(),
+                "run_aborted() is latched after the RunAborted apply"
+            );
+
+            // The fake primary holds the uplink open (draining the
+            // secondary's outbound) so the secondary exits on the
+            // `run_aborted()` cue rather than a channel-closed recv; it
+            // only returns once the secondary drops its end, which won't
+            // happen while `secondary` is still owned here. Abort it now
+            // that the outcome is asserted.
+            primary_handle.abort();
         })
         .await;
 }

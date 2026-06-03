@@ -22,11 +22,7 @@ impl SshMaster {
     /// Spawn-master forwards are baked into the spawn argv; calling
     /// `add_forward` on a spawn-master would issue a duplicate
     /// registration and is rejected with [`SshMasterError::Other`].
-    pub fn add_forward(
-        &mut self,
-        local_port: u16,
-        remote_port: u16,
-    ) -> Result<(), SshMasterError> {
+    pub fn add_forward(&mut self, local_port: u16, remote_port: u16) -> Result<(), SshMasterError> {
         if self.is_spawned {
             return Err(SshMasterError::Other(
                 "add_forward is only valid on adopt-master; \
@@ -121,12 +117,7 @@ impl SshMaster {
             if self.port != 22 {
                 cmd.args(["-p", &self.port.to_string()]);
             }
-            cmd.args([
-                "-O",
-                "exit",
-                "-o",
-                &format!("ControlPath={cp_str}"),
-            ]);
+            cmd.args(["-O", "exit", "-o", &format!("ControlPath={cp_str}")]);
             cmd.arg(self.target.as_str());
             cmd.stdin(std::process::Stdio::null());
             cmd.stdout(std::process::Stdio::null());
@@ -199,9 +190,7 @@ impl SshMaster {
                     )));
                 }
                 Err(e) => {
-                    last_err = Some(SshMasterError::Other(format!(
-                        "ssh -O cancel spawn: {e}"
-                    )));
+                    last_err = Some(SshMasterError::Other(format!("ssh -O cancel spawn: {e}")));
                 }
             }
         }

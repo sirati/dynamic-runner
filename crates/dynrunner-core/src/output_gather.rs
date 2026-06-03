@@ -41,40 +41,51 @@
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
-use crate::types::{TaskDep, TaskOutputs};
+use crate::types::{PhaseId, TaskDep, TaskOutputs};
 
 /// Assemble the predecessor-output map for a task whose direct deps are
 /// `task_deps`. See module doc for the per-edge contract.
 ///
-/// The two closures decouple the helper from any specific storage:
+/// The two closures decouple the helper from any specific storage.
+/// Both key on a dependency's FULL `(phase_id, task_id)` identity — the
+/// same `task_id` in two different phases is a distinct predecessor, so
+/// resolution must carry the phase:
 ///
-/// * `outputs_for(task_id)` — returns the cached outputs for `task_id`
-///   (owned/cloned). `None` means "no outputs recorded"; the helper
-///   converts that into the present-but-empty contract entry.
-/// * `deps_of(task_id)` — returns the named ancestor's OWN
+/// * `outputs_for(phase_id, task_id)` — returns the cached outputs for
+///   that identity (owned/cloned). `None` means "no outputs recorded";
+///   the helper converts that into the present-but-empty contract entry.
+/// * `deps_of(phase_id, task_id)` — returns the named ancestor's OWN
 ///   `task_depends_on` for the transitive walk. `None` means "task
 ///   not known to this caller"; the walk skips silently (the
 ///   direct-dep loop has already emitted the present-but-empty key,
 ///   so a missing transitive entry is strictly weaker than a missing
 ///   direct dep).
 ///
-/// Returned map is owned; callers wire it directly into the wire
-/// message. Empty map if `task_deps` is empty.
+/// Returned map is keyed by the predecessor's `task_id` (the
+/// consumer-visible handle a worker indexes its predecessor outputs
+/// by). Owned; callers wire it directly into the wire message. Empty
+/// map if `task_deps` is empty.
 pub fn gather_predecessor_outputs<F1, F2>(
     task_deps: &[TaskDep],
     outputs_for: F1,
     deps_of: F2,
 ) -> BTreeMap<String, TaskOutputs>
 where
-    F1: Fn(&str) -> Option<TaskOutputs>,
-    F2: Fn(&str) -> Option<Vec<TaskDep>>,
+    F1: Fn(&PhaseId, &str) -> Option<TaskOutputs>,
+    F2: Fn(&PhaseId, &str) -> Option<Vec<TaskDep>>,
 {
     let mut result: BTreeMap<String, TaskOutputs> = BTreeMap::new();
 
     for dep in task_deps {
-        insert_outputs_for(&outputs_for, &dep.task_id, &mut result);
+        insert_outputs_for(&outputs_for, &dep.phase_id, &dep.task_id, &mut result);
         if dep.inherit_outputs {
-            walk_ancestry(&outputs_for, &deps_of, &dep.task_id, &mut result);
+            walk_ancestry(
+                &outputs_for,
+                &deps_of,
+                &dep.phase_id,
+                &dep.task_id,
+                &mut result,
+            );
         }
     }
 
@@ -92,15 +103,16 @@ where
 /// through different paths.
 fn insert_outputs_for<F1>(
     outputs_for: &F1,
+    phase_id: &PhaseId,
     task_id: &str,
     result: &mut BTreeMap<String, TaskOutputs>,
 ) where
-    F1: Fn(&str) -> Option<TaskOutputs>,
+    F1: Fn(&PhaseId, &str) -> Option<TaskOutputs>,
 {
     if result.contains_key(task_id) {
         return;
     }
-    let outputs = outputs_for(task_id).unwrap_or_default();
+    let outputs = outputs_for(phase_id, task_id).unwrap_or_default();
     result.insert(task_id.to_string(), outputs);
 }
 
@@ -117,32 +129,38 @@ fn insert_outputs_for<F1>(
 fn walk_ancestry<F1, F2>(
     outputs_for: &F1,
     deps_of: &F2,
+    root_phase: &PhaseId,
     root_id: &str,
     result: &mut BTreeMap<String, TaskOutputs>,
 ) where
-    F1: Fn(&str) -> Option<TaskOutputs>,
-    F2: Fn(&str) -> Option<Vec<TaskDep>>,
+    F1: Fn(&PhaseId, &str) -> Option<TaskOutputs>,
+    F2: Fn(&PhaseId, &str) -> Option<Vec<TaskDep>>,
 {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    visited.insert(root_id.to_string());
-    queue.push_back(root_id.to_string());
+    // The visited set is keyed by the full `(phase_id, task_id)`
+    // identity: the same `task_id` in two different phases is a
+    // distinct ancestor, so de-duping on task_id alone would drop a
+    // legitimate cross-phase ancestor.
+    let mut visited: HashSet<(PhaseId, String)> = HashSet::new();
+    let mut queue: VecDeque<(PhaseId, String)> = VecDeque::new();
+    visited.insert((root_phase.clone(), root_id.to_string()));
+    queue.push_back((root_phase.clone(), root_id.to_string()));
 
-    while let Some(current_id) = queue.pop_front() {
-        let Some(current_deps) = deps_of(&current_id) else {
-            // Unknown task_id — pre-apply spawn validation rejects
-            // unknown deps, but a snapshot containing only a subset
-            // of the run's tasks (late-joiner partial restore) can
-            // reach this branch. Skip silently: the direct-dep
-            // loop already emitted a present-but-empty key for any
-            // missing direct ancestor, and missing transitives are
-            // a strictly weaker concern than missing direct deps.
+    while let Some((current_phase, current_id)) = queue.pop_front() {
+        let Some(current_deps) = deps_of(&current_phase, &current_id) else {
+            // Unknown `(phase_id, task_id)` — pre-apply spawn
+            // validation rejects unknown deps, but a snapshot
+            // containing only a subset of the run's tasks (late-joiner
+            // partial restore) can reach this branch. Skip silently:
+            // the direct-dep loop already emitted a present-but-empty
+            // key for any missing direct ancestor, and missing
+            // transitives are a strictly weaker concern than missing
+            // direct deps.
             continue;
         };
         for dep in &current_deps {
-            if visited.insert(dep.task_id.clone()) {
-                insert_outputs_for(outputs_for, &dep.task_id, result);
-                queue.push_back(dep.task_id.clone());
+            if visited.insert((dep.phase_id.clone(), dep.task_id.clone())) {
+                insert_outputs_for(outputs_for, &dep.phase_id, &dep.task_id, result);
+                queue.push_back((dep.phase_id.clone(), dep.task_id.clone()));
             }
         }
     }
@@ -162,7 +180,7 @@ mod tests {
     //! tests use a pair of HashMaps for clarity.
 
     use super::*;
-    use crate::types::{ResultValue, TaskDep, TaskOutputs};
+    use crate::types::{PhaseId, ResultValue, TaskDep, TaskOutputs};
     use std::collections::{BTreeMap, HashMap};
 
     fn outputs_with(key: &str, value: &str) -> TaskOutputs {
@@ -171,20 +189,37 @@ mod tests {
         TaskOutputs(m)
     }
 
-    type OutputsLookup = Box<dyn Fn(&str) -> Option<TaskOutputs>>;
-    type DepsLookup = Box<dyn Fn(&str) -> Option<Vec<TaskDep>>>;
+    /// A single-phase dep for the intra-phase gather shapes. Cross-phase
+    /// resolution is exercised by the cluster-state-bound wrapper tests.
+    fn dep(task_id: &str, inherit_outputs: bool) -> TaskDep {
+        TaskDep {
+            task_id: task_id.into(),
+            phase_id: PhaseId::from("p"),
+            inherit_outputs,
+        }
+    }
 
-    /// Build the two lookups from a pair of HashMaps. The closures
-    /// returned own clones of the maps so the test bodies stay
-    /// concise.
+    type OutputsLookup = Box<dyn Fn(&PhaseId, &str) -> Option<TaskOutputs>>;
+    type DepsLookup = Box<dyn Fn(&PhaseId, &str) -> Option<Vec<TaskDep>>>;
+
+    /// Build the two lookups from a pair of HashMaps keyed by the full
+    /// `(phase_id, task_id)` identity. The closures returned own clones
+    /// of the maps so the test bodies stay concise.
     fn lookups(
-        outputs: HashMap<String, TaskOutputs>,
-        deps: HashMap<String, Vec<TaskDep>>,
+        outputs: HashMap<(PhaseId, String), TaskOutputs>,
+        deps: HashMap<(PhaseId, String), Vec<TaskDep>>,
     ) -> (OutputsLookup, DepsLookup) {
-        let outputs_for: OutputsLookup =
-            Box::new(move |task_id: &str| outputs.get(task_id).cloned());
-        let deps_of: DepsLookup = Box::new(move |task_id: &str| deps.get(task_id).cloned());
+        let outputs_for: OutputsLookup = Box::new(move |phase: &PhaseId, task_id: &str| {
+            outputs.get(&(phase.clone(), task_id.to_string())).cloned()
+        });
+        let deps_of: DepsLookup = Box::new(move |phase: &PhaseId, task_id: &str| {
+            deps.get(&(phase.clone(), task_id.to_string())).cloned()
+        });
         (outputs_for, deps_of)
+    }
+
+    fn key(task_id: &str) -> (PhaseId, String) {
+        (PhaseId::from("p"), task_id.to_string())
     }
 
     #[test]
@@ -193,14 +228,11 @@ mod tests {
         // exactly {"A": A's outputs}.
         let a_outputs = outputs_with("nonce", "xyz");
         let mut outputs = HashMap::new();
-        outputs.insert("A".to_string(), a_outputs.clone());
+        outputs.insert(key("A"), a_outputs.clone());
         let deps = HashMap::new();
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
-        let b_deps = vec![TaskDep {
-            task_id: "A".into(),
-            inherit_outputs: false,
-        }];
+        let b_deps = vec![dep("A", false)];
         let assembled = gather_predecessor_outputs(&b_deps, outputs_for, deps_of);
         assert_eq!(assembled.len(), 1);
         assert_eq!(assembled.get("A"), Some(&a_outputs));
@@ -216,10 +248,7 @@ mod tests {
         let deps = HashMap::new();
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
-        let b_deps = vec![TaskDep {
-            task_id: "A".into(),
-            inherit_outputs: false,
-        }];
+        let b_deps = vec![dep("A", false)];
         let assembled = gather_predecessor_outputs(&b_deps, outputs_for, deps_of);
         assert_eq!(assembled.len(), 1);
         assert_eq!(assembled.get("A"), Some(&TaskOutputs::default()));
@@ -233,22 +262,13 @@ mod tests {
         let a_outputs = outputs_with("x", "1");
         let b_outputs = outputs_with("y", "2");
         let mut outputs = HashMap::new();
-        outputs.insert("A".to_string(), a_outputs.clone());
-        outputs.insert("B".to_string(), b_outputs.clone());
+        outputs.insert(key("A"), a_outputs.clone());
+        outputs.insert(key("B"), b_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            "B".to_string(),
-            vec![TaskDep {
-                task_id: "A".into(),
-                inherit_outputs: false,
-            }],
-        );
+        deps.insert(key("B"), vec![dep("A", false)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
-        let c_deps = vec![TaskDep {
-            task_id: "B".into(),
-            inherit_outputs: true,
-        }];
+        let c_deps = vec![dep("B", true)];
         let assembled = gather_predecessor_outputs(&c_deps, outputs_for, deps_of);
         assert_eq!(assembled.len(), 2);
         assert_eq!(assembled.get("B"), Some(&b_outputs));
@@ -262,22 +282,13 @@ mod tests {
         // attached because the inheritance flag gates the walk.
         let b_outputs = outputs_with("y", "2");
         let mut outputs = HashMap::new();
-        outputs.insert("A".to_string(), outputs_with("x", "1"));
-        outputs.insert("B".to_string(), b_outputs.clone());
+        outputs.insert(key("A"), outputs_with("x", "1"));
+        outputs.insert(key("B"), b_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            "B".to_string(),
-            vec![TaskDep {
-                task_id: "A".into(),
-                inherit_outputs: false,
-            }],
-        );
+        deps.insert(key("B"), vec![dep("A", false)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
-        let c_deps = vec![TaskDep {
-            task_id: "B".into(),
-            inherit_outputs: false,
-        }];
+        let c_deps = vec![dep("B", false)];
         let assembled = gather_predecessor_outputs(&c_deps, outputs_for, deps_of);
         assert_eq!(assembled.len(), 1);
         assert_eq!(assembled.get("B"), Some(&b_outputs));
@@ -293,21 +304,12 @@ mod tests {
         // must terminate and emit exactly one entry for "A".
         let a_outputs = outputs_with("k", "v");
         let mut outputs = HashMap::new();
-        outputs.insert("A".to_string(), a_outputs.clone());
+        outputs.insert(key("A"), a_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            "A".to_string(),
-            vec![TaskDep {
-                task_id: "A".into(),
-                inherit_outputs: true,
-            }],
-        );
+        deps.insert(key("A"), vec![dep("A", true)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
-        let a_deps = vec![TaskDep {
-            task_id: "A".into(),
-            inherit_outputs: true,
-        }];
+        let a_deps = vec![dep("A", true)];
         let assembled = gather_predecessor_outputs(&a_deps, outputs_for, deps_of);
         assert_eq!(assembled.len(), 1);
         assert_eq!(assembled.get("A"), Some(&a_outputs));

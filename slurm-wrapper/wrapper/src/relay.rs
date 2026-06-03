@@ -125,13 +125,12 @@ async fn relay_loop(
         // each poll interval (so teardown never wedges on a writer-less FIFO).
         let read_path = cmd_socket.clone();
         let stop = Arc::clone(&shutdown);
-        let outcome = match tokio::task::spawn_blocking(move || read_command(&read_path, &stop))
-            .await
-        {
-            Ok(o) => o,
-            // JoinError (e.g. abort during shutdown): stop the loop.
-            Err(_) => return,
-        };
+        let outcome =
+            match tokio::task::spawn_blocking(move || read_command(&read_path, &stop)).await {
+                Ok(o) => o,
+                // JoinError (e.g. abort during shutdown): stop the loop.
+                Err(_) => return,
+            };
 
         if shutdown.load(Ordering::SeqCst) {
             return;
@@ -243,9 +242,7 @@ async fn dispatch_command(
     // like the bash subshell does, rather than opening the FIFO in the parent.
     // The reported pid is this bash child's pid: signalling it stops CMD
     // (CMD_PID fidelity note).
-    let wrapped = format!(
-        "exec > \"$DYNRUNNER_OUTPUT_SOCK\" 2>&1; {cmd}"
-    );
+    let wrapped = format!("exec > \"$DYNRUNNER_OUTPUT_SOCK\" 2>&1; {cmd}");
     let mut command = tokio::process::Command::new("bash");
     command
         .arg("-c")
@@ -385,11 +382,7 @@ fn is_fifo(path: &Path) -> bool {
 /// [`ReadOutcome::ShutdownRequested`] when `stop` is observed while waiting.
 fn read_command<S: Stop>(path: &Path, stop: &S) -> ReadOutcome {
     // O_RDONLY | O_NONBLOCK: returns immediately even with no writer present.
-    let raw = match open(
-        path,
-        OFlag::O_RDONLY | OFlag::O_NONBLOCK,
-        Mode::empty(),
-    ) {
+    let raw = match open(path, OFlag::O_RDONLY | OFlag::O_NONBLOCK, Mode::empty()) {
         Ok(fd) => fd,
         Err(_) => {
             // Open failed: if the node is gone, that's the corrupt-state EOF
@@ -469,8 +462,11 @@ fn read_line_from_fd(fd: &OwnedFd) -> std::io::Result<Option<String>> {
     // Dup into a File so the BufReader's drop closes only this clone, not the
     // long-lived `owned` fd.
     let dup = fd.try_clone()?;
-    nix::fcntl::fcntl(dup.as_raw_fd(), nix::fcntl::FcntlArg::F_SETFL(OFlag::empty()))
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    nix::fcntl::fcntl(
+        dup.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(OFlag::empty()),
+    )
+    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     let file = std::fs::File::from(dup);
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -548,7 +544,10 @@ mod tests {
         assert!(cmd_meta.file_type().is_fifo(), "cmd.sock is a FIFO");
         let resp = response_path(&layout.cmd_socket);
         let resp_meta = std::fs::metadata(&resp).expect("response fifo exists");
-        assert!(resp_meta.file_type().is_fifo(), "cmd.sock.response is a FIFO");
+        assert!(
+            resp_meta.file_type().is_fifo(),
+            "cmd.sock.response is a FIFO"
+        );
 
         // shutdown must return without hanging or panicking.
         tokio::time::timeout(std::time::Duration::from_secs(10), handle.shutdown())

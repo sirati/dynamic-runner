@@ -1,6 +1,6 @@
 use super::b64::{decode_b64, encode_b64};
 use super::{
-    parse, parse_v1_uri, read_dir_v2, Builder, PeerInfoError, PeerInfoVersion, ReadDirError,
+    Builder, PeerInfoError, PeerInfoVersion, ReadDirError, parse, parse_v1_uri, read_dir_v2,
 };
 
 /// v1 contents (line 1 only) parse to a `V1` record. The legacy-URI
@@ -80,7 +80,10 @@ fn parse_is_observer_invalid_value() {
 #[test]
 fn parse_empty_is_error() {
     let err = parse("").unwrap_err();
-    assert!(matches!(err, PeerInfoError::InvalidUri(_) | PeerInfoError::Empty));
+    assert!(matches!(
+        err,
+        PeerInfoError::InvalidUri(_) | PeerInfoError::Empty
+    ));
 }
 
 /// Line 1 is required and must be a parsable URI; line-1 garbage

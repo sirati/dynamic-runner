@@ -3,19 +3,23 @@
 
 use super::*;
 
-
-fn make_remote_worker(
-    worker_id: u32,
-    secondary_id: &str,
-    busy: bool,
-) -> RemoteWorkerState<TestId> {
+fn make_remote_worker(worker_id: u32, secondary_id: &str, busy: bool) -> RemoteWorkerState<TestId> {
+    let state = if busy {
+        let task = make_binary("placeholder", 0);
+        let task_hash = crate::primary::wire::compute_task_hash(&task);
+        crate::primary::SlotState::Assigned {
+            task_hash,
+            task,
+            estimated: dynrunner_core::ResourceMap::new(),
+        }
+    } else {
+        crate::primary::SlotState::Idle
+    };
     RemoteWorkerState {
         worker_id,
         secondary_id: secondary_id.into(),
         resource_budgets: dynrunner_core::ResourceMap::new(),
-        current_task: if busy { Some(make_binary("placeholder", 0)) } else { None },
-        estimated_resources: dynrunner_core::ResourceMap::new(),
-        is_idle: !busy,
+        state,
     }
 }
 
@@ -128,7 +132,6 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -159,12 +162,8 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
                 tokio::task::spawn_local(async move {
                     let mut rx = sec_inbound;
                     while let Some(msg) = rx.recv().await {
-                        if let DistributedMessage::InitialAssignment {
-                            zip_files, ..
-                        } = &msg
-                        {
-                            let n: usize =
-                                zip_files.iter().map(|zf| zf.binaries.len()).sum();
+                        if let DistributedMessage::InitialAssignment { zip_files, .. } = &msg {
+                            let n: usize = zip_files.iter().map(|zf| zf.binaries.len()).sum();
                             counts_for_secondary
                                 .lock()
                                 .unwrap()

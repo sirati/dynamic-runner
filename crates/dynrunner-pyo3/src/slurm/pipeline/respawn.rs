@@ -71,9 +71,7 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
 
     // --- Job manager Arc (must be the pyclass `_rust` handle). ---
     let job_manager_arc = match job_manager.getattr("_rust") {
-        Ok(rust_handle) => match rust_handle
-            .cast::<crate::slurm::PyRustSlurmJobManager>()
-        {
+        Ok(rust_handle) => match rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>() {
             Ok(rust_jm) => rust_jm.borrow().arc_handle(),
             Err(_) => {
                 log.call_method1(
@@ -118,11 +116,9 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
                 Err(_) => {
                     log.call_method1(
                         "warning",
-                        (
-                            "SLURM respawn pipeline NOT wired: tunnel_manager is \
+                        ("SLURM respawn pipeline NOT wired: tunnel_manager is \
                              not a RustSlurmPreparation pyclass. Cannot share the \
-                             tunnel-establisher pool with the initial cohort.",
-                        ),
+                             tunnel-establisher pool with the initial cohort.",),
                     )?;
                     return Ok(None);
                 }
@@ -155,22 +151,21 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
             return Ok(None);
         }
     };
-    let wrapper_gen =
-        crate::slurm::respawn_bridge::wrapper_script_generator_from_pyobj(
-            job_manager.clone().unbind(),
-            image_metadata,
-            outcome.gateway_host.clone(),
-            primary_quic_port,
-            cores_spec.to_owned(),
-            max_memory_spec.to_owned(),
-            forwarded_argv.to_vec(),
-            use_reverse_connection,
-            outcome.run_log_dir.clone(),
-            outcome.shutdown_manager_remote_path.clone(),
-            outcome.name_prefix.clone(),
-            outcome.wrapper_bin_remote_path.clone(),
-            mem_manager_reserved_bytes,
-        );
+    let wrapper_gen = crate::slurm::respawn_bridge::wrapper_script_generator_from_pyobj(
+        job_manager.clone().unbind(),
+        image_metadata,
+        outcome.gateway_host.clone(),
+        primary_quic_port,
+        cores_spec.to_owned(),
+        max_memory_spec.to_owned(),
+        forwarded_argv.to_vec(),
+        use_reverse_connection,
+        outcome.run_log_dir.clone(),
+        outcome.shutdown_manager_remote_path.clone(),
+        outcome.name_prefix.clone(),
+        outcome.wrapper_bin_remote_path.clone(),
+        mem_manager_reserved_bytes,
+    );
 
     // --- Build the PySlurmSpawner pyclass. ---
     let spawner = crate::slurm::respawn_bridge::PySlurmSpawner::new(

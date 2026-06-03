@@ -23,11 +23,9 @@
 
 use std::path::Path;
 
-use dynrunner_slurm_wrapper_config::{
-    ConnectionMode as WireConnectionMode, WrapperConfig,
-};
+use dynrunner_slurm_wrapper_config::{ConnectionMode as WireConnectionMode, WrapperConfig};
 
-use super::config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
+use super::config::{ConnectionMode, WRAPPER_SRC_NETWORK_CONTAINER_PATH, WrapperScriptConfig};
 use super::quote::{bash_quote, rand_hex8};
 
 /// Generate the bash wrapper script for a SLURM job.
@@ -231,11 +229,12 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // setsid path DOES inherit the wrapper's PATH (no new session
     // PATH reset), but threading the same arg keeps both branches
     // exercising the identical CLI contract.
-    let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
-        match cfg.shutdown_manager_bin_path {
-            Some(path) => {
-                let bin_q = bash_quote(&path.display().to_string());
-                (
+    let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) = match cfg
+        .shutdown_manager_bin_path
+    {
+        Some(path) => {
+            let bin_q = bash_quote(&path.display().to_string());
+            (
                     format!(
                         r##"SHUTDOWN_MODE=""
 SHUTDOWN_SCOPE=""
@@ -330,9 +329,9 @@ fi
                      fi\n"
                         .to_string(),
                 )
-            }
-            None => (String::new(), String::new()),
-        };
+        }
+        None => (String::new(), String::new()),
+    };
 
     let mut script = format!(
         r##"#!/usr/bin/env bash
@@ -611,7 +610,9 @@ echo ""
 
     // Connection-mode-specific port allocation
     match &cfg.connection {
-        ConnectionMode::Reverse { connection_info_dir } => {
+        ConnectionMode::Reverse {
+            connection_info_dir,
+        } => {
             let sid = cfg.secondary_id;
             let is_observer = if cfg.is_observer { "true" } else { "false" };
             script.push_str(&format!(
@@ -794,8 +795,7 @@ echo "  Secondary ID: {secondary_id}"
         .collect();
     let (mode_banner, secondary_url) = match &cfg.connection {
         ConnectionMode::Reverse { .. } => (
-            "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\""
-                .to_string(),
+            "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\"".to_string(),
             "tcp://localhost:$TUNNEL_PORT".to_string(),
         ),
         ConnectionMode::Standard {
@@ -895,11 +895,7 @@ exit $CONTAINER_EXIT_CODE
 /// mount-source fallbacks; the `ConnectionMode` translation). The two
 /// paths therefore share one source of truth for those inputs and
 /// cannot drift.
-fn generate_wrapper_stub(
-    cfg: &WrapperScriptConfig<'_>,
-    bin: &Path,
-    rnd_suffix: &str,
-) -> String {
+fn generate_wrapper_stub(cfg: &WrapperScriptConfig<'_>, bin: &Path, rnd_suffix: &str) -> String {
     // Mount-source fallbacks: identical to the legacy bash path
     // (generate.rs `srcbins_network`/`output_network`/`log_network`),
     // so the binary receives the same resolved absolute paths the
@@ -953,9 +949,7 @@ fn generate_wrapper_stub(
         dynrunner_network_dir: cfg.dynrunner_network_dir.map(String::from),
         connection,
         is_observer: cfg.is_observer,
-        shutdown_manager_bin_path: cfg
-            .shutdown_manager_bin_path
-            .map(|p| p.to_path_buf()),
+        shutdown_manager_bin_path: cfg.shutdown_manager_bin_path.map(|p| p.to_path_buf()),
     };
 
     let bin_q = bash_quote(&bin.display().to_string());

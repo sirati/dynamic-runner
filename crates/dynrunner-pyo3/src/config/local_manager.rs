@@ -186,10 +186,7 @@ impl PyLocalManagerConfig {
             // sampler at construction time. The Rust core (in
             // `LocalManager`) consumes this single `Option<PathBuf>`
             // and never sees the two-flag form.
-            output_dir: resolve_memprofile_dir(
-                self.memprofile_enabled,
-                self.output_dir.as_deref(),
-            ),
+            output_dir: resolve_memprofile_dir(self.memprofile_enabled, self.output_dir.as_deref()),
             // `PyLocalManagerConfig` does not currently expose the
             // per-task reinject cap as a typed kwarg — operators
             // setting the cap on the local backend use the
@@ -229,9 +226,7 @@ mod tests {
     #[test]
     fn memprofile_off_returns_none_regardless_of_output_dir() {
         assert!(resolve_memprofile_dir(false, None).is_none());
-        assert!(
-            resolve_memprofile_dir(false, Some(std::path::Path::new("/tmp/run"))).is_none()
-        );
+        assert!(resolve_memprofile_dir(false, Some(std::path::Path::new("/tmp/run"))).is_none());
     }
 
     #[test]

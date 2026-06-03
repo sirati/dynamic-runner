@@ -40,9 +40,7 @@ pub fn parse_v1_uri(line: &str) -> Result<LegacyUri, PeerInfoError> {
 /// parser can be exercised against in-memory strings in unit tests.
 pub fn parse(contents: &str) -> Result<PeerInfoRecord, PeerInfoError> {
     let mut lines = contents.split('\n');
-    let line1 = lines
-        .next()
-        .ok_or(PeerInfoError::Empty)?;
+    let line1 = lines.next().ok_or(PeerInfoError::Empty)?;
     let legacy_uri = parse_v1_uri(line1)?;
 
     // Walk remaining lines collecting key=value pairs. Lines that
@@ -71,12 +69,15 @@ pub fn parse(contents: &str) -> Result<PeerInfoRecord, PeerInfoError> {
     };
 
     let quic_port = match kvs.get("quic_port") {
-        Some(s) if !s.is_empty() => Some(s.parse::<u16>().map_err(|source| {
-            PeerInfoError::InvalidQuicPort {
-                value: s.clone(),
-                source,
-            }
-        })?),
+        Some(s) if !s.is_empty() => {
+            Some(
+                s.parse::<u16>()
+                    .map_err(|source| PeerInfoError::InvalidQuicPort {
+                        value: s.clone(),
+                        source,
+                    })?,
+            )
+        }
         _ => None,
     };
     let is_observer = match kvs.get("is_observer").map(String::as_str) {
@@ -90,18 +91,9 @@ pub fn parse(contents: &str) -> Result<PeerInfoRecord, PeerInfoError> {
         _ => None,
     };
 
-    let ipv4 = kvs
-        .get("ipv4")
-        .filter(|s| !s.is_empty())
-        .cloned();
-    let ipv6 = kvs
-        .get("ipv6")
-        .filter(|s| !s.is_empty())
-        .cloned();
-    let secondary_id = kvs
-        .get("secondary_id")
-        .filter(|s| !s.is_empty())
-        .cloned();
+    let ipv4 = kvs.get("ipv4").filter(|s| !s.is_empty()).cloned();
+    let ipv6 = kvs.get("ipv6").filter(|s| !s.is_empty()).cloned();
+    let secondary_id = kvs.get("secondary_id").filter(|s| !s.is_empty()).cloned();
 
     Ok(PeerInfoRecord {
         version,

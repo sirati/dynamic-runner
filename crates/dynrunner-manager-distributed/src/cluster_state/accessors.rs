@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
-use dynrunner_protocol_primary_secondary::RoleTable;
+use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
 use super::{ClusterState, OutcomeSummary, StateCounts, TaskState};
 
@@ -55,7 +55,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Failed { .. } => c.failed += 1,
                 TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
                 TaskState::Blocked { .. } => c.blocked += 1,
-                TaskState::Cancelled { .. } => c.cancelled += 1,
+                TaskState::InvalidTask { .. } => c.invalid_task += 1,
             }
         }
         c
@@ -89,9 +89,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Completed { .. } => o.succeeded += 1,
                 TaskState::Failed { kind, .. } => match kind {
                     ErrorType::Recoverable => o.fail_retry += 1,
-                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
-                        o.fail_oom += 1
-                    }
+                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => o.fail_oom += 1,
                     // Defensive: the apply rule for `TaskFailed` routes
                     // `Unfulfillable` straight to `TaskState::Unfulfillable`
                     // (the discrete state below), so this arm is unreachable
@@ -100,7 +98,8 @@ impl<I: Identifier> ClusterState<I> {
                     // entry the count still partitions correctly.
                     ErrorType::ResourceExhausted(_)
                     | ErrorType::NonRecoverable
-                    | ErrorType::Unfulfillable { .. } => o.fail_final += 1,
+                    | ErrorType::Unfulfillable { .. }
+                    | ErrorType::InvalidTask { .. } => o.fail_final += 1,
                 },
                 // Discrete `Unfulfillable` state: reinjectable resource-
                 // availability failure. Tallied as `fail_final` for the
@@ -109,14 +108,12 @@ impl<I: Identifier> ClusterState<I> {
                 // legacy `Failed { Unfulfillable, .. }` arm above so the
                 // total partition stays stable across the variant cutover.
                 TaskState::Unfulfillable { .. } => o.fail_final += 1,
-                // Operator-initiated panik cancellation. Partitioned
-                // separately from `fail_final` so a terminal-report
-                // log line distinguishes "operator stopped the run"
-                // from "the worker actually hit a non-recoverable
-                // failure". Mapping mirrors the rationale on
-                // `TaskState::Cancelled`: cancellation is not a
-                // failure class, it's an emergency-terminal class.
-                TaskState::Cancelled { .. } => o.cancelled += 1,
+                // Discrete `InvalidTask` state: terminal, non-
+                // reinjectable structural failure. Tallied as
+                // `fail_final` (sibling to `Unfulfillable`) until the
+                // dedicated invalid_task stat line lands in Part C; the
+                // mapping keeps the operator-readable partition stable.
+                TaskState::InvalidTask { .. } => o.fail_final += 1,
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to
@@ -144,23 +141,23 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::Blocked { task, .. }
-                | TaskState::Cancelled { task, .. } => task,
+                | TaskState::InvalidTask { task, .. }
+                | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
         })
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for terminal entries
-    /// (`Completed`, `Failed`, `Unfulfillable`). `Blocked` is non-
-    /// terminal (auto-resumes to `Pending` when its prereq completes)
-    /// and is excluded.
+    /// (`Completed`, `Failed`, `Unfulfillable`, `InvalidTask`).
+    /// `Blocked` is non-terminal (auto-resumes to `Pending` when its
+    /// prereq completes) and is excluded.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Completed { task }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
-            | TaskState::Cancelled { task, .. } => Some((h, task)),
+            | TaskState::InvalidTask { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -213,17 +210,21 @@ impl<I: Identifier> ClusterState<I> {
         &self.role_table
     }
 
-    /// Resolve a task_id to its wire-canonical hash via a linear scan
-    /// over `self.tasks`. Returns `None` if no entry in the ledger
-    /// carries that `task_id`.
+    /// Resolve a dependency's full `(phase_id, task_id)` identity to its
+    /// wire-canonical hash via a linear scan over `self.tasks`. Returns
+    /// `None` if no entry in the ledger carries that exact identity.
     ///
-    /// O(n) over the ledger; the CRDT does not maintain a task_id →
-    /// hash reverse index (the live `PendingPool` does, but it's
-    /// task_id-keyed by design and lives only on the primary;
+    /// The match is on BOTH phase and task_id: the same `task_id` in
+    /// two different phases is a distinct task with a distinct hash, so
+    /// a dep resolves only against the ledger entry whose phase AND
+    /// task_id agree with the dep.
+    ///
+    /// O(n) over the ledger; the CRDT does not maintain a reverse index
+    /// (the live `PendingPool` does, but it lives only on the primary;
     /// every replica must resolve locally to converge on dependency
     /// states). The scan keeps the dependency-tracking concern
     /// self-contained inside cluster_state.
-    pub fn task_hash_for_task_id(&self, task_id: &str) -> Option<&str> {
+    pub fn task_hash_for_dep(&self, phase_id: &PhaseId, task_id: &str) -> Option<&str> {
         self.tasks.iter().find_map(|(h, s)| {
             let task = match s {
                 TaskState::Pending { task }
@@ -231,28 +232,33 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::Blocked { task, .. }
-                | TaskState::Cancelled { task, .. } => task,
+                | TaskState::InvalidTask { task, .. }
+                | TaskState::Blocked { task, .. } => task,
             };
-            (task.task_id == task_id).then_some(h.as_str())
+            (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
         })
     }
 
-    /// Borrow a completed task's cached [`TaskOutputs`] by `task_id`.
-    /// Returns `None` if no task with that `task_id` has reached
-    /// `Completed` with a non-empty `result_data` payload yet (the
-    /// task is still in-flight, never published outputs, was anonymous,
-    /// or the payload failed to decode and dependents that need a
+    /// Borrow a completed dependency's cached [`TaskOutputs`] by its
+    /// full `(phase_id, task_id)` identity. Returns `None` if no task
+    /// with that identity has reached `Completed` with a non-empty
+    /// `result_data` payload yet (the task is still in-flight, never
+    /// published outputs, the dep names an identity the ledger does not
+    /// know, or the payload failed to decode and dependents that need a
     /// non-empty view should treat the empty `TaskOutputs` insert as
     /// their answer — see the cache-populate helper).
     ///
-    /// The dispatch-time predecessor-outputs assembler reads this
-    /// accessor to attach each dependent's predecessor outputs to its
-    /// `TaskAssignment`. The borrow is invalidated by the next
-    /// `&mut self` apply call; callers that need ownership across an
-    /// apply boundary must `.clone()` the returned reference.
-    pub fn outputs_for(&self, task_id: &str) -> Option<&TaskOutputs> {
-        self.task_outputs.get(task_id)
+    /// Resolution is phase-aware: the dep's `(phase_id, task_id)` is
+    /// resolved to the unique ledger hash (so the same `task_id` in two
+    /// phases reads two distinct output entries), then the hash-keyed
+    /// cache is read. The dispatch-time predecessor-outputs assembler
+    /// reads this accessor to attach each dependent's predecessor
+    /// outputs to its `TaskAssignment`. The borrow is invalidated by
+    /// the next `&mut self` apply call; callers that need ownership
+    /// across an apply boundary must `.clone()` the returned reference.
+    pub fn outputs_for(&self, phase_id: &PhaseId, task_id: &str) -> Option<&TaskOutputs> {
+        let hash = self.task_hash_for_dep(phase_id, task_id)?;
+        self.task_outputs.get(hash)
     }
 
     /// Whether the run has been declared finished by the primary.
@@ -263,27 +269,41 @@ impl<I: Identifier> ClusterState<I> {
         self.run_complete
     }
 
-    /// Whether a panik shutdown has been declared (any node observed
-    /// the panik filesystem signal and the broadcast
-    /// `ClusterMutation::PanikRequested` has applied locally). Sticky
-    /// monotonic flag: once set, never clears for the lifetime of
-    /// this state. Coordinators read this from the operational loop
-    /// to skip dispatch and gate shutdown.
-    pub fn panik_active(&self) -> bool {
-        self.panik_active
+    /// The abort reason if the run has been declared ABORTED by the
+    /// primary (`ClusterMutation::RunAborted`), else `None`. The
+    /// failure twin of [`Self::run_complete`]: sticky monotonic — once
+    /// `Some`, never clears. Secondaries check this BEFORE the
+    /// `run_complete` break in `process_tasks` and exit non-zero
+    /// (`RunOutcome::Aborted`); the `mesh_watchdog` disarms on it too.
+    pub fn run_aborted(&self) -> Option<&str> {
+        self.run_aborted.as_deref()
     }
 
-    /// First-applying panik reason. `Some(_)` iff `panik_active`.
-    /// Carries the originator's caller-supplied justification (e.g.
-    /// `"file: /tmp/asm-tokenizer.panik"`).
-    pub fn panik_reason(&self) -> Option<&str> {
-        self.panik_reason.as_deref()
+    /// Borrow a secondary's static capacity record (worker-slot count +
+    /// advertised resources), or `None` if no `SecondaryCapacity`
+    /// mutation for that id has been applied yet. Set once per
+    /// secondary by the `SecondaryCapacity` apply rule.
+    pub fn secondary_capacity(&self, secondary: &str) -> Option<&SecondaryCapacityRecord> {
+        self.secondary_capacities.get(secondary)
     }
 
-    /// Peer that originated the first-applying `PanikRequested`
-    /// broadcast. `Some(_)` iff `panik_active`. Forensic-only — no
-    /// apply rule consults this field.
-    pub fn panik_source(&self) -> Option<&str> {
-        self.panik_source.as_deref()
+    /// The set of secondary ids the cluster has a replicated capacity
+    /// record for — the known-secondary roster derived purely from the
+    /// CRDT. A freshly-promoted primary and observers read this to
+    /// reconstruct the worker roster on failover (the roster was
+    /// historically 100% primary-local and lost on promotion).
+    pub fn known_secondaries(&self) -> impl Iterator<Item = &str> {
+        self.secondary_capacities.keys().map(String::as_str)
+    }
+
+    /// Total advertised worker-slot count across every secondary with a
+    /// replicated capacity record. CRDT-derived occupancy DENOMINATOR
+    /// for the worker-roster stats and the failover roster
+    /// reconstruction — sum of every secondary's `worker_count`.
+    pub fn total_worker_count(&self) -> u64 {
+        self.secondary_capacities
+            .values()
+            .map(|c| u64::from(c.worker_count))
+            .sum()
     }
 }

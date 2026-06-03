@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use dynrunner_core::{
-    gather_predecessor_outputs as core_gather, Identifier, TaskInfo, TaskOutputs,
+    Identifier, PhaseId, TaskInfo, TaskOutputs, gather_predecessor_outputs as core_gather,
 };
 
 use crate::cluster_state::ClusterState;
@@ -31,26 +31,31 @@ pub(crate) fn gather_predecessor_outputs<I: Identifier>(
 ) -> BTreeMap<String, TaskOutputs> {
     core_gather(
         &task.task_depends_on,
-        // Cached outputs lookup: O(1) via the CRDT's task_id-keyed cache.
-        |task_id| state.outputs_for(task_id).cloned(),
-        // Deps-of lookup: linear scan over `state.iter_all()`. The
-        // CRDT does not maintain a `task_id → hash` reverse index by
-        // design; the ancestry walk fires only at dispatch time (not
-        // the hot path) and per-task chains are short, so the O(n)
-        // scan is acceptable. Adding a replicated reverse index
-        // would be a larger refactor (PhaseDepsSet / TaskAdded apply
-        // paths must agree).
-        |task_id| find_task_info_by_id(state, task_id).map(|t| t.task_depends_on.clone()),
+        // Cached outputs lookup, phase-aware: resolve the dep's full
+        // `(phase_id, task_id)` identity to its hash and read the
+        // hash-keyed CRDT output cache.
+        |phase_id, task_id| state.outputs_for(phase_id, task_id).cloned(),
+        // Deps-of lookup: linear scan over `state.iter_all()`, matching
+        // the full `(phase_id, task_id)` identity. The CRDT does not
+        // maintain a reverse index by design; the ancestry walk fires
+        // only at dispatch time (not the hot path) and per-task chains
+        // are short, so the O(n) scan is acceptable. Adding a
+        // replicated reverse index would be a larger refactor
+        // (PhaseDepsSet / TaskAdded apply paths must agree).
+        |phase_id, task_id| {
+            find_task_info_by_id(state, phase_id, task_id).map(|t| t.task_depends_on.clone())
+        },
     )
 }
 
 fn find_task_info_by_id<'a, I: Identifier>(
     state: &'a ClusterState<I>,
+    phase_id: &PhaseId,
     task_id: &str,
 ) -> Option<&'a TaskInfo<I>> {
-    state
-        .iter_all()
-        .find_map(|(_, task)| (task.task_id == task_id).then_some(task))
+    state.iter_all().find_map(|(_, task)| {
+        (task.task_id == task_id && &task.phase_id == phase_id).then_some(task)
+    })
 }
 
 #[cfg(test)]
@@ -96,9 +101,10 @@ mod tests {
 
     /// Build a `ClusterState` with `task` added and (if `outputs` is
     /// `Some`) the matching `TaskCompleted` applied to populate the
-    /// outputs cache. Uses the task_id as the hash for simplicity —
-    /// the cache keys by `task_id`, so the hash only needs to be
-    /// unique within the ledger.
+    /// outputs cache. Uses the task_id as the ledger hash for
+    /// simplicity — the output cache keys by that hash and
+    /// `outputs_for` resolves the dep's `(phase_id, task_id)` to it, so
+    /// the hash only needs to be unique within the ledger.
     fn seed(
         state: &mut ClusterState<RunnerIdentifier>,
         task: TaskInfo<RunnerIdentifier>,
@@ -134,6 +140,7 @@ mod tests {
             "B",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -157,6 +164,7 @@ mod tests {
             "B",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -178,6 +186,7 @@ mod tests {
             "B",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -185,6 +194,7 @@ mod tests {
             "C",
             vec![TaskDep {
                 task_id: "B".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: true,
             }],
         );
@@ -210,6 +220,7 @@ mod tests {
             "B",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -217,6 +228,7 @@ mod tests {
             "C",
             vec![TaskDep {
                 task_id: "B".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -242,6 +254,7 @@ mod tests {
             "A",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: true,
             }],
         );
@@ -253,16 +266,14 @@ mod tests {
         assert_eq!(assembled.get("A"), Some(&a_outputs));
     }
 
-    /// Cross-call-site identity: the three primary-side dispatch
-    /// invocations
-    /// (`primary/lifecycle/dispatch.rs`, `primary/task/request.rs`,
-    /// `secondary/primary/task_request.rs`) all funnel through this
-    /// wrapper with the same `(&ClusterState, &TaskInfo)` argument
-    /// shape. The plan calls for parity across those sites; once
-    /// they're all routed through this single helper, the parity
-    /// invariant collapses to "the helper is a pure function of its
-    /// inputs". This test pins that purity — repeated invocation on
-    /// the same `(state, task)` pair yields byte-identical output
+    /// Cross-call-site identity: the primary-side dispatch invocations
+    /// (`primary/lifecycle/dispatch.rs`, `primary/task/request.rs`) all
+    /// funnel through this wrapper with the same `(&ClusterState,
+    /// &TaskInfo)` argument shape. The plan calls for parity across
+    /// those sites; once they're all routed through this single helper,
+    /// the parity invariant collapses to "the helper is a pure function
+    /// of its inputs". This test pins that purity — repeated invocation
+    /// on the same `(state, task)` pair yields byte-identical output
     /// (no internal mutation, no hidden hash-iteration bleed via
     /// `iter_all` — `BTreeMap`'s ordered iteration in the assembled
     /// map already guarantees stable ordering).
@@ -285,6 +296,7 @@ mod tests {
             "B",
             vec![TaskDep {
                 task_id: "A".into(),
+                phase_id: PhaseId::from("p0"),
                 inherit_outputs: false,
             }],
         );
@@ -293,10 +305,12 @@ mod tests {
             vec![
                 TaskDep {
                     task_id: "B".into(),
+                    phase_id: PhaseId::from("p0"),
                     inherit_outputs: true,
                 },
                 TaskDep {
                     task_id: "missing".into(),
+                    phase_id: PhaseId::from("p0"),
                     inherit_outputs: false,
                 },
             ],

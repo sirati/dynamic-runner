@@ -33,13 +33,18 @@
 //! The crate exposes exactly one trait impl ([`PeerTransport`] for
 //! [`TunneledPeerTransport`]) and one builder
 //! ([`TunneledPeerTransport::new`]) that returns the transport plus
-//! two handles the caller hands to the legacy transport: a shared
-//! outgoing-writer table and an inbound-tap sender. The legacy
-//! transport's job is reduced to (a) populating the shared writer
-//! table from its accept loops and (b) cloning each inbound message
-//! into the tap so the peer view's `recv_peer()` can observe it.
+//! three handles the caller wires to the accept loops: a shared
+//! outgoing-writer table (for direct registration on the in-process /
+//! test paths), an inbound sink (the accept-loop reader tasks push
+//! every frame into it), and a registration sink (the accept loops
+//! push each handshaked secondary's [`PeerRegistration`] through it).
+//! `TunneledPeerTransport` OWNS the real inbound demux: its
+//! `recv_peer` drives the single `incoming_rx` + `new_conn_rx`
+//! `select!` that the legacy `NetworkServer::recv` used to own. The
+//! `NetworkServer` is reduced to bind + accept-loops + writer-table
+//! population — it no longer consumes inbound or fans out a tap.
 //! Beyond that, `TunneledPeerTransport` owns its mesh-level state:
-//! local-id, role-cache, inbound mpsc.
+//! local-id, role-cache, inbound + registration mpscs.
 //!
 //! # Single-threaded by construction
 //!
@@ -59,9 +64,15 @@
 //! secondary call sites keep it for as long as that disable path
 //! exists.
 
+mod secondary_link;
 mod transport;
 
 #[cfg(test)]
+mod secondary_link_tests;
+#[cfg(test)]
 mod tests;
 
-pub use transport::{InboundTap, SharedOutgoing, TunneledPeerTransport};
+pub use secondary_link::UnifiedSecondaryTransport;
+pub use transport::{
+    InboundTap, PeerRegistration, RegistrationSink, SharedOutgoing, TunneledPeerTransport,
+};

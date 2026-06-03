@@ -14,38 +14,36 @@
 //! through a method signature for no behavioural gain. Documented in
 //! `secondary/dispatch/mod.rs`.
 
-use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
+    Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::cluster_state::ClusterStateSnapshot;
-use crate::primary::PrimaryCommand;
-use super::super::election::ElectionState;
-use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
+use super::super::wire::{distributed_to_binary, timestamp_now};
+use crate::cluster_state::ClusterStateSnapshot;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// `command_rx` threads the operational-loop's command-channel
-    /// receiver into the TaskComplete / TaskFailed arms so a callback-
-    /// issued `spawn_tasks` applies inline. Off-loop callers pass
-    /// `&mut None`.
+    /// Wire-frame dispatcher for the frame types the role-aware
+    /// `handle_inbound` base does not own directly (TaskAssignment,
+    /// StageFile, PromotePrimary, RequestClusterSnapshot,
+    /// ClusterSnapshot, PeerInfo, plus the test-reachable
+    /// TaskComplete/TaskFailed arms). The secondary holds NO authority:
+    /// every arm here is either own-worker management, a CRDT mirror
+    /// apply, or a CLASS-1 report to the primary role.
     pub(in crate::secondary) async fn dispatch_message(
         &mut self,
         msg: DistributedMessage<I>,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         // Any message from the primary side resets the election state and
@@ -69,8 +67,7 @@ where
                 // site on the secondary funnels through it so the
                 // three modes stay in lockstep.
                 let zip_ref = zip_file.as_deref().filter(|z| !z.is_empty());
-                let resolved_path =
-                    self.resolve_for_dispatch(zip_ref, &local_path, &file_hash);
+                let resolved_path = self.resolve_for_dispatch(zip_ref, &local_path, &file_hash);
 
                 // Fail loudly when the worker has no plausible way to
                 // open the binary, instead of silently passing
@@ -129,7 +126,8 @@ where
                 let target_wid = if self.pool.workers[wid as usize].is_idle_state() {
                     wid
                 } else {
-                    self.pool.workers
+                    self.pool
+                        .workers
                         .iter()
                         .position(|w| w.is_idle_state())
                         .map(|i| i as u32)
@@ -137,7 +135,8 @@ where
                 };
 
                 if self.pool.workers[target_wid as usize].is_idle_state() {
-                    let estimated_mb = estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+                    let estimated_mb =
+                        estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     let log_task_hash = file_hash.clone();
                     // Per-type subprocess dispatch via the async-event
                     // flow for both first-bind (`loaded_type_id == None`)
@@ -187,26 +186,34 @@ where
                     {
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                            // Respawn-HOLD (#58): the per-type subprocess
+                            // for `target_wid` is mid-kill+spawn (the
+                            // pool kicked off a background `wait_ready`
+                            // task). DEFER this task rather than drop it
+                            // or busy-bounce it to the authority: stash
+                            // the resolved binary in `pending_first_bind`
+                            // keyed by the worker; the
+                            // `WorkerEvent::Ready` handler picks it up and
+                            // calls `assign_task` once the slot is
+                            // observably Idle with the new type bound. No
+                            // drop, no tight retry loop. The loss path
+                            // (`WorkerEvent::Disconnected` before Ready)
+                            // reports the deferred task back to the
+                            // authority as backpressure via
+                            // `report_deferred_task_lost`.
                             tracing::debug!(
                                 worker_id = target_wid,
                                 type_id = %binary.type_id,
                                 file_hash = %file_hash,
-                                "type-bind respawn issued; stashing task in pending_first_bind \
-                                 until WorkerEvent::Ready arrives on the event channel"
+                                "type-bind respawn in progress; deferring task until \
+                                 worker Ready (respawn-HOLD)"
                             );
-                            // The slot is occupied by a Transitioning
-                            // worker with the new type bound; do NOT
-                            // queue another restart through
-                            // `pending_worker_restarts` — that would
-                            // SIGKILL the just-spawned subprocess and
-                            // start a third respawn cycle.
                             self.pending_first_bind.insert(
                                 target_wid,
                                 super::super::PendingFirstBind {
                                     binary,
                                     file_hash,
                                     estimated,
-                                    source: super::super::BindSource::PeerAssigned,
                                     predecessor_outputs,
                                 },
                             );
@@ -233,12 +240,12 @@ where
                                 "No idle worker available (respawn failed): {e}"
                             ),
                         };
-                        // Mirror the "no idle worker available" arm:
-                        // unicast to the current primary, broadcast to
-                        // peers (belt-and-suspenders for primary
-                        // changeover mid-flight).
-                        self.send_to_current_primary(task_failed.clone()).await?;
-                        let _ = self.peer_transport.broadcast(task_failed).await;
+                        // Report to the primary role only; the authority
+                        // owns mesh propagation (it originates the CRDT
+                        // mutation and broadcasts it). A reporting
+                        // secondary that also broadcast would be a second
+                        // CRDT originator.
+                        self.send_to_primary(task_failed).await?;
                         return Ok(());
                     }
                     // Snapshot the assigned binary for the sampler
@@ -310,10 +317,9 @@ where
                                 worker_id: target_wid,
                                 task_hash: file_hash,
                                 error_type: ErrorType::Recoverable,
-                                error_message:
-                                    "worker pipe broken; respawning".into(),
+                                error_message: "worker pipe broken; respawning".into(),
                             };
-                            self.send_to_current_primary(msg).await?;
+                            self.send_to_primary(msg).await?;
                         }
                     }
                 } else {
@@ -330,16 +336,14 @@ where
                         error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
                     };
-                    // Route to whoever currently holds primary
-                    // authority; broadcast to peers as belt-and-
-                    // suspenders so the promoted peer's
-                    // `handle_primary_peer_rejection` always sees the
-                    // bounce even if the unicast loses to a primary
-                    // changeover mid-flight. Idempotent — the
-                    // primary's recovery path is hash-keyed and
-                    // no-ops on the second call.
-                    self.send_to_current_primary(msg.clone()).await?;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only — the authority
+                    // owns mesh propagation. Routing across a primary
+                    // changeover is opaque: `Address::Role(Role::Primary)`
+                    // resolves to whichever node currently holds the
+                    // role. The promoted peer's
+                    // `handle_primary_peer_rejection` recovery is
+                    // hash-keyed, so the single report suffices.
+                    self.send_to_primary(msg).await?;
                 }
                 Ok(())
             }
@@ -364,7 +368,12 @@ where
                 self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
-            DistributedMessage::PromotePrimary { new_primary_id, epoch, required_setup, .. } => {
+            DistributedMessage::PromotePrimary {
+                new_primary_id,
+                epoch,
+                required_setup,
+                ..
+            } => {
                 // Task #36 / Step 7 defensive guard: an observer MUST
                 // NOT be promoted. If we receive a PromotePrimary
                 // naming an observer (either us, or a peer in the
@@ -419,210 +428,94 @@ where
                     );
                     return Ok(());
                 }
-                let became_primary =
-                    new_primary_id == self.config.secondary_id && !self.is_primary;
-                self.is_primary = new_primary_id == self.config.secondary_id;
-                if became_primary {
-                    // Stamp the promotion instant so the alive-demoted
-                    // natural-quiesce branch in `process_tasks` can
-                    // enforce its minimum-elapsed-time gate. See the
-                    // `promoted_at` field doc on `SecondaryCoordinator`
-                    // for the full rationale. Stamped here BEFORE
-                    // `populate_primary_from_cluster_state` so the
-                    // grace counts from the role flip, not from the
-                    // hydration write (which is sub-millisecond after
-                    // but conceptually distinct — a future hydration
-                    // refactor should not change the grace start).
-                    self.promoted_at = Some(std::time::Instant::now());
+                // The `PrimaryChanged` apply above drove the
+                // transport's RoleCache write-through hook, which is
+                // the single source of "who is primary" — the
+                // promotion re-route happens entirely inside the
+                // transport layer. The secondary manager carries NO
+                // self-promotion machinery: there is no separate
+                // promoted-secondary-as-primary mirror to activate.
+                let _ = required_setup;
+                // Sync the FAILOVER ELECTION state with the role
+                // identity when this node is the one named primary: its
+                // election goes terminal `Promoted` so a subsequently-
+                // silent (now-demoted) local primary does NOT drive THIS
+                // node into Suspecting → Candidate and a self-re-promote
+                // cascade (the early-return in `run_election_tick` keys
+                // off `Promoted`). The peer-named case needs nothing
+                // extra: the `record_primary_message` pre-amble at the
+                // top of `dispatch_message` already reset the election
+                // to `Normal` (this node is a settled follower).
+                if new_primary_id == self.config.secondary_id {
+                    self.election = super::super::election::ElectionState::Promoted;
+                    // Wake the co-located parked primary: this node is
+                    // now the authority. Gate-only (no re-broadcast) —
+                    // this PromotePrimary IS the broadcast that named
+                    // us, so re-emitting it would loop. Fire-once via
+                    // `take()`, so the own-election-win path
+                    // (`fire_local_promotion`) and this peer-named path
+                    // converge on a single activation. Idempotent when
+                    // this is our OWN echoed broadcast (the gate is
+                    // already consumed) or when no primary was composed.
+                    self.activate_co_located_primary();
                 }
-                // `on_primary_changed` updates the routing target AND
-                // resets per-worker backoff so idle workers fire a
-                // fresh `TaskRequest` at the new primary on their next
-                // tick instead of sitting through stale windows that
-                // accrued against the old primary. This is the
-                // cancel-and-reissue primitive the trace at `feb1052`
-                // exposed as missing — pre-Phase-P only the routing
-                // target moved, leaving the new primary's local
-                // workers silent for the residual window.
-                self.primary_link.on_primary_changed(new_primary_id.clone());
-                if became_primary {
-                    if required_setup {
-                        // Setup-promote path: the submitter deferred
-                        // all run-setup work (discovery, ledger seed,
-                        // initial assignment) to us. The cluster ledger
-                        // is intentionally empty at this point —
-                        // there's nothing to hydrate from. Set the
-                        // setup_pending flag so the outer process-tasks
-                        // loop yields back to the PyO3 wrapper, which
-                        // re-acquires the GIL, runs Python's
-                        // `task.discover_items` against our locally
-                        // bind-mounted staged source, and calls
-                        // `ingest_setup_discovery` to feed the result
-                        // back into the ledger. Hydration is deferred
-                        // until that call clears the flag.
-                        //
-                        // NOTE: do NOT call
-                        // `populate_primary_from_cluster_state` here —
-                        // there is no state to populate from yet, and
-                        // a no-op pool would set `primary_pending =
-                        // None` which is indistinguishable from
-                        // "pool build failed" downstream.
-                        self.setup_pending = true;
-                        tracing::info!(
-                            epoch,
-                            "promoted with required_setup=true — yielding to wrapper for discovery"
-                        );
-                    } else {
-                        // Atomic role-flip on continuously-replicated
-                        // state: the new primary's pending pool is
-                        // hydrated from `cluster_state` directly, no
-                        // wire round-trip. Pre-Phase-B this happened
-                        // either via FullTaskList arrival (race-prone:
-                        // the trace at `feb1052` showed dispatch silence
-                        // for 1.6s because PromotePrimary preceded the
-                        // payload) or via a cached snapshot
-                        // (`populate_primary_from_cache`, which had its
-                        // own consume-once footgun).
-                        self.populate_primary_from_cluster_state();
-                    }
-                }
-                if self.is_primary {
-                    // Sync the election state machine with the role
-                    // change so `run_election_tick`'s
-                    // `if Promoted return` early-return guards this
-                    // node too. Pre-fix the pre-designated primary
-                    // had `is_primary=true` but `election=Normal`,
-                    // so the keepalive-tick path entered Suspecting
-                    // the moment local-primary keepalives went
-                    // silent (which is benign post-promotion: the
-                    // local primary has demoted itself per
-                    // `lifecycle.rs`'s observer-mode contract).
-                    // Self-suspect cascaded into self-re-promotion,
-                    // hydrated the new pool from a stale
-                    // initial-assignment-time snapshot, and dropped
-                    // every in-flight task. Surfaced in tokenizer's
-                    // v6 trace.
-                    self.election = ElectionState::Promoted;
-                    tracing::info!(epoch, "this secondary has been promoted to primary");
-                } else {
-                    tracing::info!(
-                        new_primary = %new_primary_id,
-                        epoch,
-                        "another secondary promoted to primary"
-                    );
-                }
+                tracing::info!(
+                    new_primary = %new_primary_id,
+                    epoch,
+                    "primary role changed"
+                );
+                // Clear every worker's per-request backoff: it accrued
+                // against the PRIOR primary identity, so it is stale the
+                // moment the role changes. Without this the repoll below
+                // is suppressed by `should_request_now` and idle workers
+                // sit through a stale backoff window before re-issuing
+                // at the new primary (the dispatch-silence symptom).
+                // Mirrors the pre-unification `on_primary_changed` reset
+                // — the rule is "any observable primary-identity change
+                // revives the slot's pull semantic and resets the
+                // rate-limiter". Keyed off the backoff maps (not the
+                // pool) so it fires even before `initialize_workers`.
+                self.primary_link.reset_all_backoff();
                 // Immediate repoll: every idle worker re-issues its
-                // pending TaskRequest at the freshly-identified
-                // primary instead of waiting up to a keepalive
-                // interval for the periodic `repoll_idle_workers`
-                // tick. The race this closes:
-                //
-                //   1. Process-tasks entry's for-loop sends an
-                //      initial TaskRequest for each idle worker. At
-                //      that point `primary_link.current_primary() ==
-                //      None`, so the request routes via
-                //      `primary_transport.send` to the original
-                //      submitter (the still-live demoted local
-                //      primary).
-                //   2. The demoted local's `handle_task_request`
-                //      skips the local-assign branch (`!self.demoted`
-                //      gate) and tries to relay via
-                //      `peer_transport.send(Address::Role(Primary),
-                //      msg)`. Pre-PromotePrimary the role-table cache
-                //      is empty — the relay drops with the warn line
-                //      "Address::Role(Primary) unresolvable:
-                //      role-table cache empty for this role".
-                //   3. `note_request_sent` already bumped the
-                //      requesting worker's backoff window; the
-                //      worker is now silent until the next
-                //      `repoll_idle_workers` tick — up to a full
-                //      `keepalive_interval` (5s on the production
-                //      default).
-                //   4. Meanwhile the promoted secondary's own two
-                //      workers self-assign synchronously from its
-                //      newly-hydrated `primary_pending` in the same
-                //      process-tasks for-loop and burn through small
-                //      workloads (e.g. 20 binaries × ~0.1s each)
-                //      well inside the 5s window — peer secondaries
-                //      observe zero TaskAssignments.
-                //
-                // Repolling here (after `on_primary_changed` has
-                // cleared per-worker backoff AND installed the new
-                // routing target) gives every idle worker an
-                // immediate retry against the fresh route. For the
-                // promoted secondary the repoll self-assigns from
-                // its own pool; for peers it routes via
-                // `peer_transport.send_to_peer(promoted_id, msg)`.
-                //
-                // Gated on `!self.setup_pending` because the
-                // setup-promote-promoted path is about to yield to
-                // the wrapper for discovery — the local pool is
-                // empty and there's no primary to poll yet. The
-                // wrapper-driven re-entry into `process_tasks`
-                // will run the entry for-loop (`request_task_for_worker`
-                // for every idle worker) after the pool hydrates,
-                // covering that case without needing a repoll here.
-                //
-                // 20/0/0/0-style distribution on small workloads was
-                // a pre-existing efficiency artifact masked by the
-                // larger run-completion bug in `a78c89c` — see
-                // `b1ecc53`'s commit message for the run-complete
-                // hang fix. This repoll closes the structural race
-                // independent of that fix.
-                if !self.setup_pending {
-                    self.repoll_idle_workers(factory).await;
-                }
+                // pending `TaskRequest` against the freshly-identified
+                // primary (resolved through the transport's RoleCache,
+                // now updated by the `PrimaryChanged` apply above)
+                // instead of waiting up to a keepalive interval.
+                self.repoll_idle_workers().await;
                 Ok(())
             }
-            DistributedMessage::TaskComplete {
-                task_hash,
+            DistributedMessage::TaskComplete { task_hash, .. } => {
+                // A `TaskComplete` REPORT frame is a peer's own-worker
+                // terminal report to the authority — not a CRDT
+                // mutation. A non-authority node has nothing to do with
+                // it: the authoritative terminal state arrives as a
+                // separate `ClusterMutation::TaskCompleted` broadcast
+                // that the `ClusterMutation` arm mirrors idempotently.
+                // The secondary keeps NO per-node terminal set, so this
+                // arm is a pure observation no-op.
+                //
+                // Reachable only via a direct `dispatch_message` call
+                // (tests); the operational inbound stream routes
+                // TaskComplete through the role-aware `handle_inbound`
+                // arm (own-worker reporter path).
+                tracing::trace!(task_hash, "observed TaskComplete report (no-op)");
+                Ok(())
+            }
+            DistributedMessage::TaskFailed { task_hash, .. } => {
+                // Same as the TaskComplete arm: a `TaskFailed` REPORT
+                // frame carries no authority for a non-authority node.
+                // The authoritative terminal state (and any retry
+                // cascade) is owned by the primary and mirrored to this
+                // node's `cluster_state` via a `ClusterMutation`
+                // broadcast. Pure observation no-op.
+                tracing::trace!(task_hash, "observed TaskFailed report (no-op)");
+                Ok(())
+            }
+            DistributedMessage::RequestClusterSnapshot {
+                sender_id,
+                is_observer,
                 ..
             } => {
-                // The local primary forwards observed TaskCompletes
-                // to every secondary so each one's `completed_tasks`
-                // set stays current — matters on local-death-then-
-                // failover, where the elected secondary's
-                // `populate_primary_from_cluster_state` consults
-                // `self.completed_tasks` to rebuild the primary view.
-                // (Peer broadcast covers the common case but is
-                // best-effort; this primary-side forward is the
-                // reliable backstop.) Idempotent: a forward of our
-                // own completion just re-inserts the hash that's
-                // already there.
-                self.completed_tasks.insert(task_hash.clone());
-                self.note_primary_item_completed(&task_hash, command_rx).await;
-                Ok(())
-            }
-            DistributedMessage::TaskFailed {
-                task_hash,
-                error_type,
-                ..
-            } => {
-                // Same forwarding rationale as TaskComplete; only
-                // act on terminal (non-Recoverable) failures since
-                // Recoverable retry is owned by the primary
-                // (see `note_primary_item_failed`) and a future
-                // TaskComplete or terminal TaskFailed will arrive.
-                if !matches!(error_type, ErrorType::Recoverable) {
-                    self.completed_tasks.insert(task_hash.clone());
-                    // Use the failure-aware variant for symmetry
-                    // with the other TaskFailed sites (peer.rs,
-                    // processing.rs); for non-Recoverable inputs
-                    // this is identical to `note_primary_item_completed`
-                    // (no entry added to `primary_failed`).
-                    self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
-                    // Kickstart our own idle workers so any
-                    // reinjected items the per-phase retry-bucket
-                    // cascade (inside `note_primary_item_failed`)
-                    // produced reach a worker on this tick. Same
-                    // shape and rationale as the other TaskFailed
-                    // sites — peer workers self-recover on their
-                    // own keepalive tick.
-                    self.repoll_idle_workers(factory).await;
-                }
-                Ok(())
-            }
-            DistributedMessage::RequestClusterSnapshot { sender_id, .. } => {
                 // Any peer can answer — `cluster_state` is replicated,
                 // so any responder's snapshot is a valid bootstrap
                 // payload. The merge semantics on the receiver
@@ -645,8 +538,8 @@ where
                     snapshot_json,
                 };
                 if let Err(e) = self
-                    .peer_transport
-                    .send_to_peer(&sender_id, response)
+                    .transport
+                    .send(Address::Peer(sender_id.clone()), response)
                     .await
                 {
                     tracing::warn!(
@@ -659,23 +552,28 @@ where
                 //
                 // Late-joiners enter the cluster by sending
                 // `RequestClusterSnapshot`; the responder is the first
-                // existing member to observe the joiner. By current
-                // design late-joiners are observers (`is_observer =
-                // true`), so the CRDT mutation carries that flag. Apply
-                // locally and broadcast over the same canonical path the
-                // post-promotion originator uses — receivers learn about
-                // the joiner via the widened `apply_peer_joined` rule
-                // (`peer_state` entry + observer-set projection),
-                // idempotent under duplicate broadcasts from concurrent
-                // responders. The CRDT-merge contract handles the rare
-                // race where two peers both answered the same join.
+                // existing member to observe the joiner. Apply locally
+                // and broadcast over the canonical origination path so
+                // receivers learn about the joiner via the
+                // `apply_peer_joined` rule, idempotent under duplicate
+                // broadcasts from concurrent responders.
+                //
+                // The joiner's ACTUAL role rides the request frame's
+                // `is_observer` field — the joiner declares its own role
+                // when it calls `join_running_cluster`. A worker joins
+                // with `false`, an observer with `true`. This carries
+                // the truth into `apply_peer_joined`, whose observer
+                // flag is an upward-only ratchet: a `false` for a
+                // re-bootstrapping worker is a NoOp against an existing
+                // `false` entry (no mis-upgrade), and a `true` for an
+                // observer correctly populates `RoleTable.observers`.
+                // Only `PeerRemoved` ever clears the observer flag, so
+                // the ratchet never regresses a genuine observer.
                 let _ = self
-                    .apply_and_broadcast_mutations(vec![
-                        ClusterMutation::PeerJoined {
-                            peer_id: sender_id,
-                            is_observer: true,
-                        },
-                    ])
+                    .apply_and_broadcast_mutations(vec![ClusterMutation::PeerJoined {
+                        peer_id: sender_id,
+                        is_observer,
+                    }])
                     .await;
                 Ok(())
             }
@@ -686,20 +584,28 @@ where
                 // may have already applied mutations the snapshot also
                 // contains; the merge keeps the strictly stronger of
                 // each).
+                //
+                // Per-frame FATALITY (P3 replication invariant): a
+                // ClusterSnapshot whose payload fails to deserialize is
+                // a hard error, NOT a swallow. A bootstrapping observer
+                // / late-joiner requested this snapshot precisely to
+                // populate its CRDT from a partial/empty starting state;
+                // continuing to "observe" an un-restored (partial/empty)
+                // CRDT would silently report a lie (a premature
+                // run-complete, wrong outcome counts). Latch
+                // `fatal_exit` so the operational loop aborts the run
+                // with a clear error instead of observing corruption.
                 match serde_json::from_str::<ClusterStateSnapshot<I>>(&snapshot_json) {
                     Ok(snap) => {
                         self.cluster_state.restore(snap);
-                        if self.is_primary {
-                            // The post-bootstrap primary rebuilds its
-                            // pending pool from the merged ledger.
-                            self.populate_primary_from_cluster_state();
-                        }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to deserialize ClusterSnapshot payload"
+                        let reason = format!(
+                            "ClusterSnapshot restore failed (malformed snapshot \
+                             payload); refusing to observe a partial/empty CRDT: {e}"
                         );
+                        tracing::error!(error = %e, "{reason}");
+                        self.fatal_exit = Some(reason);
                     }
                 }
                 Ok(())
@@ -724,19 +630,6 @@ where
                 // remains on the wire frame for backwards
                 // compatibility but is not consumed here.
                 Ok(())
-            }
-            DistributedMessage::TaskRequest {
-                secondary_id,
-                worker_id,
-                available_resources,
-                ..
-            } if self.is_primary => {
-                let available_memory = available_resources.iter()
-                    .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
-                    .map(|r| r.amount)
-                    .unwrap_or(0);
-                self.handle_primary_task_request(secondary_id, worker_id, available_memory, factory)
-                    .await
             }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");

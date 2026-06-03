@@ -91,11 +91,9 @@ where
                 // tunnel; the v2 envelope (cert, quic_port, …) is
                 // produced for late-joiner consumers (Step 8) and
                 // ignored here.
-                let record = parse_peer_info(trimmed).map_err(|e| {
-                    PrepError::InfoParse {
-                        secondary_id: secondary_id.to_owned(),
-                        message: e.to_string(),
-                    }
+                let record = parse_peer_info(trimmed).map_err(|e| PrepError::InfoParse {
+                    secondary_id: secondary_id.to_owned(),
+                    message: e.to_string(),
                 })?;
                 let h = record.legacy_uri.host.clone();
                 let p = record.legacy_uri.port;
@@ -120,12 +118,9 @@ where
     // `EstablishmentPolicy` doc-comment). Returns the verified Child
     // already past the 3s alive-gate; this function then moves it
     // into the shared tunnels Vec for cleanup() to reap.
-    let child = establish_tunnel(
-        secondary_id,
-        &opts.establishment,
-        establish_pool,
-        || spawner(host.clone(), tunnel_port),
-    )
+    let child = establish_tunnel(secondary_id, &opts.establishment, establish_pool, || {
+        spawner(host.clone(), tunnel_port)
+    })
     .await?;
 
     // Commit to the shared tunnel set only after verification —
@@ -204,7 +199,10 @@ where
             // drop at the end of this loop iteration. `.unwrap()` is
             // sound: the Semaphore is never closed (it lives for the
             // duration of `setup_ssh_tunnels`).
-            let _permit = establish_pool.acquire().await.expect("semaphore not closed");
+            let _permit = establish_pool
+                .acquire()
+                .await
+                .expect("semaphore not closed");
 
             let mut child = match spawner().await {
                 Ok(c) => c,

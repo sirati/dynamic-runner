@@ -40,6 +40,8 @@ pub(super) fn parse_cert_pem(pem: &str) -> Option<rustls::pki_types::Certificate
         return None;
     }
     use base64::Engine;
-    let der = base64::engine::general_purpose::STANDARD.decode(&b64).ok()?;
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(&b64)
+        .ok()?;
     Some(rustls::pki_types::CertificateDer::from(der))
 }

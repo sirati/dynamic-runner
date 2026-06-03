@@ -124,7 +124,10 @@ mod tests {
 
         // Two sends arrive faster than the idle window can elapse.
         tx.send(MatcherTriggerEvent { holdings: h1 }).unwrap();
-        tx.send(MatcherTriggerEvent { holdings: h2.clone() }).unwrap();
+        tx.send(MatcherTriggerEvent {
+            holdings: h2.clone(),
+        })
+        .unwrap();
         // Drop sender so once the burst completes the helper would
         // return None on the next recv — but the idle-window timeout
         // fires first because the two sends are already in the queue.

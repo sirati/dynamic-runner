@@ -15,9 +15,11 @@
 //!   * `secondary/setup.rs::handle_initial_assignment` — initial
 //!     dispatch the primary handed us at startup.
 //!   * `secondary/dispatch/router.rs` (`TaskAssignment` arm) — every
-//!     peer-routed in-loop assignment.
-//!   * `secondary/primary/task_request.rs::handle_primary_task_request`
-//!     — primary-self-assign while this node holds primary authority.
+//!     in-loop assignment (a `TaskAssignment` addressed to this node's
+//!     own worker arrives here whether it came over the wire from the
+//!     authority or via the co-located primary's loopback — the unified
+//!     transport made the origin opaque, subsuming the old
+//!     self-assign-vs-wire split).
 //!   * `secondary/processing/worker_event.rs` (`WorkerEvent::Ready`
 //!     arm) — post-respawn pending-first-bind dispatch.
 //!   * `secondary/processing/worker_event.rs` (`TaskCompleted` and
@@ -31,17 +33,16 @@
 //! coordinators share the sampler's public API and differ only in
 //! which `Self` exposes the hook surface.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender, TaskInfo, WorkerId};
+use dynrunner_core::{Identifier, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -58,11 +59,7 @@ where
     /// short-circuits without firing a sampler command. The sampler's
     /// `on_task_assigned` requires the cgroup leaf path; we don't
     /// fabricate one.
-    pub(super) fn notify_sampler_assigned(
-        &self,
-        worker_id: WorkerId,
-        binary: &TaskInfo<I>,
-    ) {
+    pub(super) fn notify_sampler_assigned(&self, worker_id: WorkerId, binary: &TaskInfo<I>) {
         let Some(sampler) = self.sampler.as_ref() else {
             return;
         };

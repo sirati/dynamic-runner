@@ -216,7 +216,10 @@ impl WrapperConfig {
 
         // Emitted explicitly in both states so the round-trip is unambiguous
         // (a bare presence-flag could not distinguish false from omitted).
-        push("--is-observer", if self.is_observer { "true" } else { "false" });
+        push(
+            "--is-observer",
+            if self.is_observer { "true" } else { "false" },
+        );
 
         if let Some(path) = &self.shutdown_manager_bin_path {
             push("--shutdown-manager-bin-path", &path.to_string_lossy());

@@ -143,12 +143,17 @@ async fn upload_relative_under_src() {
     let binaries = vec![make_binary("subdir/foo.bin")];
     let srcbins = mgr.config.src_bins_path();
 
-    mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
 
     let transfers = mgr.gateway().transfers();
     assert_eq!(transfers.len(), 1, "exactly one transfer expected");
     let (local, remote) = &transfers[0];
-    assert_eq!(local, &local_file, "manager must read from source_root-joined path");
+    assert_eq!(
+        local, &local_file,
+        "manager must read from source_root-joined path"
+    );
     assert_eq!(
         remote,
         &format!("{srcbins}/subdir/foo.bin"),
@@ -176,7 +181,9 @@ async fn upload_absolute_under_src() {
     // Absolute path verbatim, sitting under source_root.
     let binaries = vec![make_binary(&local_file)];
 
-    mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
 
     let transfers = mgr.gateway().transfers();
     assert_eq!(transfers.len(), 1);
@@ -204,7 +211,9 @@ async fn skip_absolute_out_of_tree() {
     let mgr = make_manager();
     let binaries = vec![make_binary(outside)];
 
-    mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
 
     let transfers = mgr.gateway().transfers();
     assert!(
@@ -238,11 +247,17 @@ async fn mixed_inputs_skip_only_out_of_tree() {
         make_binary("/elsewhere/skip.bin"),
     ];
 
-    mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
 
     let transfers = mgr.gateway().transfers();
     let remotes: Vec<String> = transfers.iter().map(|(_, r)| r.clone()).collect();
-    assert_eq!(transfers.len(), 2, "exactly the two in-tree binaries upload");
+    assert_eq!(
+        transfers.len(),
+        2,
+        "exactly the two in-tree binaries upload"
+    );
     assert!(remotes.contains(&format!("{srcbins}/a/rel.bin")));
     assert!(remotes.contains(&format!("{srcbins}/abs.bin")));
 }

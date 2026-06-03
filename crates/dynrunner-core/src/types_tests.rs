@@ -11,13 +11,77 @@ fn error_type_wire_roundtrip() {
         ErrorType::NonRecoverable,
         ErrorType::Recoverable,
         ErrorType::Unfulfillable {
-            reason: "toolchain outpath /nix/store/abc-foo missing".to_string().into(),
+            reason: "toolchain outpath /nix/store/abc-foo missing"
+                .to_string()
+                .into(),
+        },
+        ErrorType::InvalidTask {
+            reason: "dependency (phase-a, task-7) does not exist"
+                .to_string()
+                .into(),
         },
     ] {
         let wire = et.wire_value();
         let parsed = ErrorType::from_wire(&wire).unwrap();
         assert_eq!(et, parsed);
     }
+}
+
+#[test]
+fn error_type_invalid_task_wire_format() {
+    let et = ErrorType::InvalidTask {
+        reason: "duplicate task id".to_string().into(),
+    };
+    assert_eq!(et.wire_value(), "invalid_task:duplicate task id");
+}
+
+#[test]
+fn error_type_invalid_task_wire_roundtrip_reason_with_colons_and_edges() {
+    // `from_wire` strips only the `invalid_task:` prefix and keeps the
+    // remainder verbatim, so a reason containing colons (and other
+    // edge characters that are NOT newlines, which would break the
+    // line-oriented text codec's framing) round-trips losslessly.
+    for reason in [
+        "missing dep: phase-a:task-7 :: also phase-b:task-9",
+        ":leading-colon",
+        "trailing-colon:",
+        "tabs\tand spaces and unicode → ✓",
+        "", // empty reason
+    ] {
+        let et = ErrorType::InvalidTask {
+            reason: reason.to_string().into(),
+        };
+        let wire = et.wire_value();
+        assert_eq!(wire, format!("invalid_task:{reason}"));
+        let parsed = ErrorType::from_wire(&wire).unwrap();
+        assert_eq!(parsed, et);
+        match parsed {
+            ErrorType::InvalidTask { reason: r } => assert_eq!(r.as_str(), reason),
+            other => panic!("expected InvalidTask, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn error_type_invalid_task_distinct_from_unfulfillable_on_wire() {
+    // The two reason-bearing variants must not collide on the wire:
+    // `invalid_task:` and `unfulfillable:` share no prefix, so a tag
+    // for one never parses as the other.
+    let invalid = ErrorType::InvalidTask {
+        reason: "x".to_string().into(),
+    };
+    let unfulfillable = ErrorType::Unfulfillable {
+        reason: "x".to_string().into(),
+    };
+    assert_eq!(
+        ErrorType::from_wire(&invalid.wire_value()).unwrap(),
+        invalid
+    );
+    assert_eq!(
+        ErrorType::from_wire(&unfulfillable.wire_value()).unwrap(),
+        unfulfillable
+    );
+    assert_ne!(invalid.wire_value(), unfulfillable.wire_value());
 }
 
 #[test]
@@ -263,7 +327,10 @@ fn soft_preferred_secondaries_round_trips_through_serde() {
     assert_eq!(json, "[\"sec-a\",\"sec-b\"]");
     let parsed: SoftPreferredSecondaries = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, hint);
-    assert_eq!(parsed.as_slice(), &["sec-a".to_string(), "sec-b".to_string()]);
+    assert_eq!(
+        parsed.as_slice(),
+        &["sec-a".to_string(), "sec-b".to_string()]
+    );
     assert!(!parsed.is_empty());
 
     let empty = SoftPreferredSecondaries::default();
@@ -310,7 +377,9 @@ fn task_info_preferred_secondaries_default_empty() {
     let bi = TaskInfo {
         path: PathBuf::from("/tmp/x"),
         size: 8,
-        identifier: ShapeId { old: "shape".into() },
+        identifier: ShapeId {
+            old: "shape".into(),
+        },
         phase_id: PhaseId::from("default"),
         type_id: TypeId::from("default"),
         affinity_id: None,

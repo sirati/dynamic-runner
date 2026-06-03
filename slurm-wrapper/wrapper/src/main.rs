@@ -228,7 +228,9 @@ async fn resolve_network(cfg: &WrapperConfig) -> std::io::Result<Network> {
     let quic_port = network::alloc_free_port()?;
 
     let secondary_url = match &cfg.connection {
-        ConnectionMode::Reverse { connection_info_dir } => {
+        ConnectionMode::Reverse {
+            connection_info_dir,
+        } => {
             let tunnel_port = network::alloc_free_port()?;
             tracing::info!(target: LOG_TARGET, "Using tunnel port: {tunnel_port}");
             tracing::info!(target: LOG_TARGET, "Using QUIC port: {quic_port}");
@@ -453,8 +455,7 @@ fn banner_job_completed() {
 /// stderr logging via `tracing`, honouring `RUST_LOG` (default `info`).
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -473,24 +474,42 @@ mod tests {
     fn parses_config_from_flags() {
         let argv = [
             "dynrunner-slurm-wrapper",
-            "--name-prefix", "asm",
-            "--rand-suffix", "2f1d4e89",
-            "--secondary-id", "sec-0",
-            "--image-path", "/staged/img.tar",
-            "--image-tar-basename", "img.tar",
-            "--image-name", "img",
-            "--image-tag", "latest",
-            "--load-command", "true",
-            "--container-command", "cmd",
-            "--cores-spec", "-2",
-            "--max-memory-spec", "-2G",
-            "--srcbins-network", "/net/srcbins",
-            "--output-network", "/net/out",
-            "--log-network", "/net/log",
-            "--connection", "standard",
-            "--gateway-host", "gw",
-            "--gateway-port", "4433",
-            "--is-observer", "false",
+            "--name-prefix",
+            "asm",
+            "--rand-suffix",
+            "2f1d4e89",
+            "--secondary-id",
+            "sec-0",
+            "--image-path",
+            "/staged/img.tar",
+            "--image-tar-basename",
+            "img.tar",
+            "--image-name",
+            "img",
+            "--image-tag",
+            "latest",
+            "--load-command",
+            "true",
+            "--container-command",
+            "cmd",
+            "--cores-spec",
+            "-2",
+            "--max-memory-spec",
+            "-2G",
+            "--srcbins-network",
+            "/net/srcbins",
+            "--output-network",
+            "/net/out",
+            "--log-network",
+            "/net/log",
+            "--connection",
+            "standard",
+            "--gateway-host",
+            "gw",
+            "--gateway-port",
+            "4433",
+            "--is-observer",
+            "false",
         ];
         let cfg = dynrunner_slurm_wrapper_config::parse_args(argv).unwrap();
         assert_eq!(cfg.secondary_id, "sec-0");
@@ -507,18 +526,17 @@ mod tests {
     /// as `Err` so `main` can exit nonzero.
     #[test]
     fn rejects_bad_argv() {
-        assert!(dynrunner_slurm_wrapper_config::parse_args(
-            ["dynrunner-slurm-wrapper"]
-        )
+        assert!(dynrunner_slurm_wrapper_config::parse_args(["dynrunner-slurm-wrapper"]).is_err());
+        assert!(dynrunner_slurm_wrapper_config::parse_args([
+            "dynrunner-slurm-wrapper",
+            "--name-prefix",
+            "asm"
+        ])
         .is_err());
-        assert!(dynrunner_slurm_wrapper_config::parse_args(
-            ["dynrunner-slurm-wrapper", "--name-prefix", "asm"]
-        )
-        .is_err());
-        assert!(dynrunner_slurm_wrapper_config::parse_args(
-            ["dynrunner-slurm-wrapper", "--bogus"]
-        )
-        .is_err());
+        assert!(
+            dynrunner_slurm_wrapper_config::parse_args(["dynrunner-slurm-wrapper", "--bogus"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -553,7 +571,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         // Construct a signal-terminated ExitStatus (SIGKILL = 9).
         let status = std::process::ExitStatus::from_raw(9); // raw wait status: signo in low 7 bits
-        // from_raw takes the raw wait() status word; 9 => terminated by signal 9.
+                                                            // from_raw takes the raw wait() status word; 9 => terminated by signal 9.
         assert_eq!(status.signal(), Some(9));
         assert_eq!(exit_code_from_status(Ok(status)), 128 + 9);
     }
@@ -681,7 +699,10 @@ mod tests {
         let probe = tmp.path().join("xdg.txt");
         let podman = write_fake_podman(
             tmp.path(),
-            &format!("printf '%s' \"$XDG_RUNTIME_DIR\" > {}; exit 0", probe.display()),
+            &format!(
+                "printf '%s' \"$XDG_RUNTIME_DIR\" > {}; exit 0",
+                probe.display()
+            ),
         );
         let layout = test_layout(tmp.path());
         let (mut monitor, _inject) = signals::SignalMonitor::for_test();
@@ -753,16 +774,20 @@ mod tests {
         )
         .await
         .expect("run_to_completion must resolve via the injected signal path");
-        assert_eq!(code, 128 + sigterm, "signal path returns 128+signo (SIGTERM)");
+        assert_eq!(
+            code,
+            128 + sigterm,
+            "signal path returns 128+signo (SIGTERM)"
+        );
 
         // The container (sleep) must have been SIGTERM'd — it is no longer a
         // live process (reaped via the wait inside run_to_completion). Sending
         // signal 0 to its pid should now fail with ESRCH.
-        let alive = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(container_pid as i32),
-            None,
-        )
-        .is_ok();
-        assert!(!alive, "container should have been terminated by the forwarded SIGTERM");
+        let alive =
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(container_pid as i32), None).is_ok();
+        assert!(
+            !alive,
+            "container should have been terminated by the forwarded SIGTERM"
+        );
     }
 }

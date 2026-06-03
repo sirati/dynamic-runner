@@ -245,10 +245,7 @@ pub fn parse_response(line: &str) -> Option<Response> {
                 exception_type: wire.exception_type,
                 message: wire.message,
                 traceback: wire.traceback,
-                error_type: wire
-                    .error_type
-                    .as_deref()
-                    .and_then(ErrorType::from_wire),
+                error_type: wire.error_type.as_deref().and_then(ErrorType::from_wire),
             });
         }
         return Some(Response::WorkerException {
@@ -283,8 +280,6 @@ pub fn parse_response(line: &str) -> Option<Response> {
 
     None
 }
-
-
 
 #[cfg(test)]
 #[path = "codec_tests.rs"]

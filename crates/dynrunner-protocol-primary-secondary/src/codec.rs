@@ -1,5 +1,5 @@
-use dynrunner_core::Identifier;
 use crate::messages::DistributedMessage;
+use dynrunner_core::Identifier;
 
 /// Serialize a distributed message to a length-prefixed JSON frame.
 ///
@@ -16,14 +16,18 @@ pub fn serialize_message<I: Identifier>(msg: &DistributedMessage<I>) -> Result<V
 }
 
 /// Deserialize a distributed message from JSON bytes (without length prefix).
-pub fn deserialize_message<I: Identifier>(json_bytes: &[u8]) -> Result<DistributedMessage<I>, String> {
+pub fn deserialize_message<I: Identifier>(
+    json_bytes: &[u8],
+) -> Result<DistributedMessage<I>, String> {
     serde_json::from_slice(json_bytes).map_err(|e| e.to_string())
 }
 
 /// Extract one message from a buffer that may contain length-prefixed frames.
 ///
 /// Returns (message, bytes_consumed) or None if not enough data.
-pub fn decode_frame<I: Identifier>(buf: &[u8]) -> Result<Option<(DistributedMessage<I>, usize)>, String> {
+pub fn decode_frame<I: Identifier>(
+    buf: &[u8],
+) -> Result<Option<(DistributedMessage<I>, usize)>, String> {
     if buf.len() < 4 {
         return Ok(None);
     }
@@ -34,8 +38,6 @@ pub fn decode_frame<I: Identifier>(buf: &[u8]) -> Result<Option<(DistributedMess
     let msg = deserialize_message(&buf[4..4 + len])?;
     Ok(Some((msg, 4 + len)))
 }
-
-
 
 #[cfg(test)]
 #[path = "codec_tests/mod.rs"]

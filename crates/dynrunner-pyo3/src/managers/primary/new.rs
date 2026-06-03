@@ -4,7 +4,7 @@
 
 use pyo3::prelude::*;
 
-use dynrunner_manager_distributed::{compute_initial_staging_entries, StagingError};
+use dynrunner_manager_distributed::{StagingError, compute_initial_staging_entries};
 
 use crate::config::distributed::DistributedConfig;
 use crate::config::scheduler::SchedulerConfig;
@@ -147,16 +147,12 @@ impl PyPrimaryCoordinator {
         let secondary_ids: Vec<String> = (0..self.num_secondaries)
             .map(|i| format!("secondary-{i}"))
             .collect();
-        let entries = compute_initial_staging_entries(
-            &rust_binaries,
-            &secondary_ids,
-            &source_root,
-        )
-        .map_err(|e| match e {
-            StagingError::SourceUnreadable { .. } => {
-                pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string())
-            }
-        })?;
+        let entries = compute_initial_staging_entries(&rust_binaries, &secondary_ids, &source_root)
+            .map_err(|e| match e {
+                StagingError::SourceUnreadable { .. } => {
+                    pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string())
+                }
+            })?;
         self.pending_stage_files.extend(entries);
         Ok(())
     }

@@ -36,10 +36,7 @@ use super::py_gateway::PyGatewayAdapter;
 /// nested form (`{image_subfolder}/srcbins`) so that the Rust
 /// `SlurmConfig::src_bins_path()` getter returns the same path
 /// the Python `get_srcbins_dir()` method has been producing.
-fn slurm_config_from_python(
-    py: Python<'_>,
-    slurm_config: &Py<PyAny>,
-) -> PyResult<SlurmConfig> {
+fn slurm_config_from_python(py: Python<'_>, slurm_config: &Py<PyAny>) -> PyResult<SlurmConfig> {
     let bound = slurm_config.bind(py);
     let root_folder: String = bound.getattr("root_folder")?.str()?.extract()?;
     let image_subfolder: String = bound.getattr("image_subfolder")?.extract()?;
@@ -67,22 +64,31 @@ fn slurm_config_from_python(
     // Missing/None on the Python side maps to Rust `None` so
     // `submit_job` omits `--mem` (Python parity). Only an explicit
     // string value on the Python config produces `Some(...)` here.
-    let mem = bound
-        .getattr("memory_per_node")
-        .ok()
-        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
-    let email = bound
-        .getattr("notify_email")
-        .ok()
-        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
+    let mem = bound.getattr("memory_per_node").ok().and_then(|v| {
+        if v.is_none() {
+            None
+        } else {
+            v.extract::<String>().ok()
+        }
+    });
+    let email = bound.getattr("notify_email").ok().and_then(|v| {
+        if v.is_none() {
+            None
+        } else {
+            v.extract::<String>().ok()
+        }
+    });
     let nodes = bound
         .getattr("nodes")
         .ok()
         .and_then(|v| v.extract::<u32>().ok());
-    let prestaged_src_bins_path = bound
-        .getattr("prestaged_src_bins_path")
-        .ok()
-        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
+    let prestaged_src_bins_path = bound.getattr("prestaged_src_bins_path").ok().and_then(|v| {
+        if v.is_none() {
+            None
+        } else {
+            v.extract::<String>().ok()
+        }
+    });
     // Pre-SIGKILL warning window — defaults to the Rust core's default
     // when the Python config doesn't carry the attribute (matches the
     // duck-typed pattern used for the other optional-shape fields).
@@ -115,10 +121,7 @@ fn slurm_config_from_python(
 /// squeue had no record (Rust state is `None`), Python sees
 /// `state="UNKNOWN"` and empty `node`/`reason` — same as the
 /// pre-migration Python implementation.
-fn job_status_to_dict<'py>(
-    py: Python<'py>,
-    info: &JobStatusInfo,
-) -> PyResult<Bound<'py, PyDict>> {
+fn job_status_to_dict<'py>(py: Python<'py>, info: &JobStatusInfo) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("state", info.state.as_deref().unwrap_or("UNKNOWN"))?;
     dict.set_item("node", info.node.as_str())?;
@@ -314,11 +317,7 @@ impl PyRustSlurmJobManager {
     /// upload mechanics; this method is the GIL-release +
     /// tokio-runtime wrapper. Mirrors
     /// `upload_shutdown_manager_binary_from`.
-    fn upload_wrapper_binary_from(
-        &self,
-        py: Python<'_>,
-        local: String,
-    ) -> PyResult<String> {
+    fn upload_wrapper_binary_from(&self, py: Python<'_>, local: String) -> PyResult<String> {
         let inner = self.inner.clone();
         py.detach(|| {
             block_on_local(async move {
@@ -369,11 +368,7 @@ impl PyRustSlurmJobManager {
     /// Query a job's state via `squeue`. Returns a Python dict with
     /// `state` / `node` / `reason` string fields — same shape as the
     /// pre-migration Python `SlurmJobManager.get_job_status`.
-    fn get_job_status<'py>(
-        &self,
-        py: Python<'py>,
-        job_id: String,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn get_job_status<'py>(&self, py: Python<'py>, job_id: String) -> PyResult<Bound<'py, PyDict>> {
         let inner = self.inner.clone();
         let info = py.detach(|| {
             block_on_local(async move {
@@ -457,9 +452,7 @@ impl PyRustSlurmJobManager {
     fn job_ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         let inner = self.inner.clone();
         Ok(py.detach(|| {
-            block_on_local(async move {
-                lock_manager(&inner).await.job_ids().to_vec()
-            })
+            block_on_local(async move { lock_manager(&inner).await.job_ids().to_vec() })
         }))
     }
 }

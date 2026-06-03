@@ -8,10 +8,10 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{TaskInfo, PhaseId, SoftPreferredSecondaries, TypeId, WorkerId};
+use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
+use dynrunner_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,8 +39,7 @@ impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
         worker_id: WorkerId,
         _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(SocketpairManagerEnd, Option<u32>), String> {
-        let (manager_end, child_fd) =
-            create_socketpair().expect("failed to create socketpair");
+        let (manager_end, child_fd) = create_socketpair().expect("failed to create socketpair");
 
         let mut cmd = process::Command::new("python3");
         cmd.arg("-m")

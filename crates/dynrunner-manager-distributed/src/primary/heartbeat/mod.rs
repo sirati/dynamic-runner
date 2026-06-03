@@ -12,15 +12,15 @@
 
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BoundedString, Identifier, ResourceMap};
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
     Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
-    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::{PendingMassDeath, PrimaryCoordinator};
 use super::wire::timestamp_now;
+use super::{PendingMassDeath, PrimaryCoordinator};
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Outcome of a single periodic heartbeat sweep.
 pub(super) struct SecondaryHeartbeatReport {
@@ -34,8 +34,8 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<T, P, S, E, I>
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
 {
     /// Update the keepalive timestamp for a known secondary. No-op if the
     /// secondary id isn't registered (e.g. a stray message after death).
@@ -102,7 +102,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
     ///
-    /// Keepalive rides `peer_transport.send(Address::Broadcast(
+    /// Keepalive rides `self.transport.send(Address::Broadcast(
     /// Scope::AllSecondaries), msg)` since Step 6 — the Step 5b
     /// `TunneledPeerTransport` made the primary a real mesh member, so
     /// the mesh-level broadcast reaches every connected secondary
@@ -128,10 +128,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.node_id.clone(),
-            active_workers: self.workers.iter().filter(|w| !w.is_idle).count() as u32,
+            active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
         };
         if let Err(error) = self
-            .peer_transport
+            .transport
             .send(Address::Broadcast(Scope::AllSecondaries), msg)
             .await
         {
@@ -141,7 +141,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // warn would spam the log on an already-handled state
             // transition. (Pre-Step-6 the legacy
             // `transport.broadcast` returned per-secondary failure
-            // tuples; `peer_transport.send` collapses them into a
+            // tuples; `self.transport.send` collapses them into a
             // single Err — the heartbeat-monitor is the
             // per-secondary signal, not this log line.)
             tracing::debug!(
@@ -175,8 +175,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             "secondary missed keepalives; requeueing in-flight tasks"
         );
 
-        let mut requeued = 0usize;
-        let mut survivors_workers = Vec::with_capacity(self.workers.len());
         // Snapshot the dead workers' global ids first; we need them to
         // call `pool.release_worker` AFTER requeue (release_worker
         // clears the affinity record, requeue uses it for routing —
@@ -188,23 +186,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .filter(|w| w.secondary_id == secondary_id)
             .map(|w| w.worker_id)
             .collect();
-        for mut worker in std::mem::take(&mut self.workers) {
-            if worker.secondary_id == secondary_id {
-                if let Some(binary) = worker.current_task.take() {
-                    // requeue lands the item at the FRONT of its
-                    // (phase, type, affinity) bucket and decrements
-                    // the phase's in-flight count.
-                    self.pool_mut().requeue(binary);
-                    requeued += 1;
-                }
-                worker.estimated_resources = ResourceMap::new();
-                worker.is_idle = true;
-                // Drop this worker — its host is dead.
-                continue;
-            }
-            survivors_workers.push(worker);
-        }
-        self.workers = survivors_workers;
+        // Recover EVERY in-flight task targeting the dead secondary
+        // through the single hash-keyed ledger: requeue each (front of
+        // its bucket, phase in-flight counter decremented, type slot
+        // released) and drop the ledger entry. This covers both
+        // locally-dispatched tasks (a slot held them) AND inherited
+        // (pre-owned, no-slot) tasks the dead secondary owned —
+        // mirroring the reference dead-peer recovery. The held slots
+        // are then removed below; the ledger is the source of truth for
+        // the requeue so the two can't diverge.
+        let requeue_mutations = self.recover_inflight_for_dead_secondary(&secondary_id);
+        let requeued = requeue_mutations.len();
+        // Drop every worker hosted by the dead secondary — its host is
+        // gone. The slot state is discarded with the worker; the task
+        // it held (if any) was already requeued via the ledger above.
+        self.workers.retain(|w| w.secondary_id != secondary_id);
         // Now clear pool-side affinity for the dead workers so any
         // bucket they pinned is free for survivors.
         for wid in dead_global_ids {
@@ -214,18 +210,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
 
-        // Authoritative origination: the primary is the sole writer of
-        // `PeerRemoved` for a dead secondary. Goes through the canonical
-        // `apply_and_broadcast_cluster_mutations` helper so the local
-        // CRDT mirror flips in the same call as the wire fan-out and
-        // the apply+filter semantics stay consistent with every other
-        // primary-originated mutation. Secondaries do NOT broadcast
-        // `PeerRemoved`; they observe and apply ours.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerRemoved {
+        // Authoritative origination, one batch: the dead secondary's
+        // in-flight tasks transition `InFlight → Pending` in the CRDT
+        // (the `TaskRequeued` mutations the recovery just produced, in
+        // lockstep with the local pool requeue above so a stale
+        // `InFlight` can't survive and strand the task on failover) and
+        // the secondary itself is marked removed (`PeerRemoved`). Both
+        // go through the canonical `apply_and_broadcast_cluster_mutations`
+        // helper so the local CRDT mirror flips in the same call as the
+        // wire fan-out and the apply+filter semantics stay consistent
+        // with every other primary-originated mutation. The primary is
+        // the sole writer of both; secondaries observe and apply ours.
+        let mut recovery_mutations = requeue_mutations;
+        recovery_mutations.push(ClusterMutation::PeerRemoved {
             id: secondary_id.clone(),
             cause,
-        }])
-        .await;
+        });
+        self.apply_and_broadcast_cluster_mutations(recovery_mutations)
+            .await;
 
         if self
             .primary_id
@@ -259,7 +261,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         for peer_id in surviving {
             if let Err(e) = self
                 .transport
-                .send_to(&peer_id, timeout_msg.clone())
+                .send(Address::Peer(peer_id.clone()), timeout_msg.clone())
                 .await
             {
                 tracing::warn!(peer = %peer_id, error = %e, "TimeoutDetected delivery failed");
@@ -274,20 +276,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             "dead secondary cleaned up"
         );
 
-        // Kickstart dispatch to surviving idle workers. Secondaries
-        // only emit `TaskRequest` after they finish a task; the
-        // workers idle on survivors right now have nothing in flight
-        // to complete, so without an explicit nudge the just-
-        // requeued tasks would sit in the pool forever. Mirrors the
-        // identical kickstart at the end of `run_retry_passes`,
-        // `handle_task_complete`, and `handle_task_failed` — every
-        // path that puts a task back into the pool owns the
-        // re-dispatch step. Swallowed via `.ok()` like the task-
-        // outcome paths: a transient send failure to one survivor
-        // is logged + rolled back inside `dispatch_to_idle_workers`
-        // and must not abort the heartbeat-tick's outer requeue
-        // bookkeeping.
-        self.dispatch_to_idle_workers().await.ok();
+        // A dead secondary's in-flight tasks were just requeued into
+        // the pool — a pool-entry edge. Surviving free workers only
+        // emit `TaskRequest` after they finish a task; the workers free
+        // on survivors right now have nothing in flight to complete, so
+        // without a nudge the requeued tasks would sit in the pool
+        // forever. EMIT a `TasksAdded` onto the decoupled
+        // worker-management bus rather than calling dispatch directly
+        // (the dispatch-decoupling law) — mirroring the emit at every
+        // other pool-entry / worker-free edge (`handle_task_complete`,
+        // `handle_task_failed`, the retry bucket). The operational
+        // loop's worker-management arm coalesces it into one batched
+        // recheck (which, on a real `TasksAdded`, bypasses the
+        // per-secondary backoff so a survivor that was transiently
+        // backpressured is still a target).
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         Ok(())
     }
 
@@ -378,7 +382,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // singleton/dual-secondary runs from biasing toward correlated
         // inference. `alive_count` excludes already-deferred peers
         // (they're "dead from the alive set's perspective" too).
-        let alive_count = self.secondaries.len().saturating_sub(self.pending_mass_death.len());
+        let alive_count = self
+            .secondaries
+            .len()
+            .saturating_sub(self.pending_mass_death.len());
         let mass_event = self.config.mass_death_grace > Duration::ZERO
             && new_dead.len() >= self.config.mass_death_min_count as usize
             && new_dead.len() == alive_count;
@@ -461,4 +468,3 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
 #[cfg(test)]
 mod tests;
-

@@ -5,7 +5,7 @@
 //! permanent-failure cascade, and the `update_first_match_in_place`
 //! primitive (which scans both queued buckets and the blocked map).
 
-use dynrunner_core::{SoftPreferredSecondaries, TaskDep, TaskInfo};
+use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo};
 
 use super::{PendingPoolError, phase, pool_with, t};
 
@@ -26,6 +26,7 @@ fn t_with_id(
         .iter()
         .map(|d| TaskDep {
             task_id: d.to_string(),
+            phase_id: PhaseId::from(phase),
             inherit_outputs: false,
         })
         .collect();
@@ -37,7 +38,10 @@ fn task_deps_unknown_id_fails_extend() {
     let mut p = pool_with(&["P"], &[]);
     let res = p.extend([t_with_id("P", "T", "", 1, "child", &["nope"])]);
     match res {
-        Err(PendingPoolError::UnknownTaskDep { task, referenced_by }) => {
+        Err(PendingPoolError::UnknownTaskDep {
+            task,
+            referenced_by,
+        }) => {
             assert_eq!(task, "nope");
             assert_eq!(referenced_by, "child");
         }
@@ -74,10 +78,7 @@ fn task_deps_blocked_until_dep_completes() {
     ])
     .expect("valid extend");
     // Bucket iteration only sees A; B is in the blocked map.
-    let queued_ids: Vec<_> = p
-        .iter()
-        .map(|i| i.task_id.clone())
-        .collect();
+    let queued_ids: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
     assert_eq!(queued_ids, vec!["a".to_string()]);
     let first = p.pop_for_worker(1).expect("a is dispatchable");
     assert_eq!(first.task_id, "a");
@@ -140,10 +141,7 @@ fn task_deps_cascade_fail_on_permanent_prereq_failure() {
     let a = p.pop_for_worker(1).expect("a");
     assert_eq!(a.task_id, "a");
     let cascaded = p.on_item_failed_permanent(&phase("P"), "a");
-    let mut cascaded_ids: Vec<_> = cascaded
-        .iter()
-        .map(|i| i.task_id.clone())
-        .collect();
+    let mut cascaded_ids: Vec<_> = cascaded.iter().map(|i| i.task_id.clone()).collect();
     cascaded_ids.sort();
     assert_eq!(cascaded_ids, vec!["b".to_string(), "c".to_string()]);
     // No queued items remain — B and C never made it into a bucket.
@@ -165,8 +163,7 @@ fn update_first_match_in_place_mutates_queued_match() {
     let updated = p.update_first_match_in_place(
         |t| t.task_id == "b",
         |t| {
-            t.preferred_secondaries =
-                SoftPreferredSecondaries::new(vec!["sec-x".into()]);
+            t.preferred_secondaries = SoftPreferredSecondaries::new(vec!["sec-x".into()]);
         },
     );
     assert!(updated, "predicate must match `b`");
@@ -205,8 +202,7 @@ fn update_first_match_in_place_visits_blocked_items() {
     let updated = p.update_first_match_in_place(
         |t| t.task_id == "b",
         |t| {
-            t.preferred_secondaries =
-                SoftPreferredSecondaries::new(vec!["sec-y".into()]);
+            t.preferred_secondaries = SoftPreferredSecondaries::new(vec!["sec-y".into()]);
         },
     );
     assert!(updated, "predicate must match blocked `b`");
@@ -224,12 +220,12 @@ fn update_first_match_in_place_visits_blocked_items() {
 #[test]
 fn update_first_match_in_place_returns_false_on_no_match() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t_with_id("P", "T", "", 1, "a", &[])]).expect("valid");
+    p.extend([t_with_id("P", "T", "", 1, "a", &[])])
+        .expect("valid");
     let updated = p.update_first_match_in_place(
         |t| t.task_id == "nonexistent",
         |t| {
-            t.preferred_secondaries =
-                SoftPreferredSecondaries::new(vec!["never".into()]);
+            t.preferred_secondaries = SoftPreferredSecondaries::new(vec!["never".into()]);
         },
     );
     assert!(!updated, "no match → false");

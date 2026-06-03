@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
+use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
 use serde::{Deserialize, Serialize};
 
 use super::ClusterState;
@@ -53,15 +54,22 @@ use super::TaskState;
 ///   entry only when the local map has no entry for that key. This
 ///   matches the `tasks` lattice's monotonic-terminal-wins shape
 ///   projected onto the cache's single-write-per-key semantics.
+/// - `secondary_capacities`: per-secondary first-write-wins. Each
+///   entry is set exactly once by the originating `SecondaryCapacity`
+///   apply arm (set-once; capacity is static for the run), so a
+///   snapshot's entry and a live-applied entry for the same secondary
+///   carry the same value — the merge inserts a snapshot entry only
+///   when the local map has no entry for that key. Same monotonic-
+///   insertion shape as `task_outputs`. Carried so a freshly-promoted
+///   primary and late-joining observers hold the full per-secondary
+///   roster on snapshot-restore, before any live `SecondaryCapacity`
+///   broadcast reaches them.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
 /// converges to the same state regardless of order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct ClusterStateSnapshot<I> {
     pub tasks: HashMap<String, TaskState<I>>,
     pub current_primary: Option<String>,
@@ -88,40 +96,20 @@ pub struct ClusterStateSnapshot<I> {
     /// identical to the pre-variant shape).
     #[serde(default)]
     pub peer_holdings: HashMap<String, HashSet<String>>,
-    /// Replicated panik latch. Carried so a late-joining observer
-    /// learns of an in-progress emergency shutdown immediately on
-    /// snapshot-restore, before the next `PanikRequested` broadcast
-    /// reaches it. The latch is sticky monotonic: once true on any
-    /// replica it stays true forever, and `restore` honors that —
-    /// a snapshot with `panik_active = true` sets local state's
-    /// flag (and reason/source if they are still `None`); a
-    /// snapshot with `panik_active = false` is a NoOp against a
-    /// local `true`. `#[serde(default)]` keeps wire compat with
-    /// pre-feature senders (deserialize defaults to `false`).
-    #[serde(default)]
-    pub panik_active: bool,
-    /// First-applying panik reason from the originator's broadcast.
-    /// `Some(_)` iff `panik_active`. See [`Self::panik_active`].
-    /// `#[serde(default)]` for wire compat.
-    #[serde(default)]
-    pub panik_reason: Option<String>,
-    /// Peer that originated the first-applying panik. `Some(_)` iff
-    /// `panik_active`. Forensic-only; no apply rule consults it.
-    /// `#[serde(default)]` for wire compat.
-    #[serde(default)]
-    pub panik_source: Option<String>,
     /// Replicated keyed-output cache (one entry per task that has
-    /// reached `Completed` with a non-empty `result_data` payload).
-    /// Carried so a late-joiner can resolve a dependent's predecessor
-    /// outputs immediately on snapshot-restore, before the next live
-    /// `TaskCompleted` broadcast reaches it — symmetric with how
-    /// `tasks` carries terminal task states for the same reason.
+    /// reached `Completed` with a non-empty `result_data` payload),
+    /// keyed by the wire-canonical content hash (which folds in
+    /// `phase_id`, so same-`task_id`-different-phase outputs never
+    /// collide). Carried so a late-joiner can resolve a dependent's
+    /// predecessor outputs immediately on snapshot-restore, before the
+    /// next live `TaskCompleted` broadcast reaches it — symmetric with
+    /// how `tasks` carries terminal task states for the same reason.
     ///
     /// Merge rule on `restore`: per-key first-write-wins. Each entry
     /// is set exactly once (by the originating `TaskCompleted` apply
     /// arm; duplicate `TaskCompleted`s NoOp before reaching the
     /// populate helper), so a snapshot entry and a live-applied
-    /// entry for the same `task_id` carry the same value — the merge
+    /// entry for the same hash carry the same value — the merge
     /// keeps whichever landed first and ignores the duplicate. This
     /// matches the `tasks` lattice's "terminal wins; among terminals,
     /// local wins" rule projected onto the cache's monotonic
@@ -132,6 +120,42 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-cache shape).
     #[serde(default)]
     pub task_outputs: HashMap<String, TaskOutputs>,
+    /// Replicated per-secondary static capacity (worker-slot count +
+    /// advertised resources, one entry per secondary the
+    /// `SecondaryCapacity` apply arm has recorded). Carried so a
+    /// freshly-promoted primary and late-joining observers reconstruct
+    /// the full worker roster immediately on snapshot-restore — without
+    /// it a promoted primary starts `alive_worker_count() == 0` and
+    /// cannot dispatch.
+    ///
+    /// Merge rule on `restore`: per-secondary first-write-wins. Each
+    /// entry is set exactly once (the `SecondaryCapacity` apply is
+    /// set-once; capacity is static for the run), so a snapshot entry
+    /// and a live-applied entry for the same secondary carry the same
+    /// value — the merge keeps whichever landed first and ignores the
+    /// duplicate. Same monotonic-insertion shape as `task_outputs`.
+    ///
+    /// `#[serde(default)]` keeps wire compat with pre-feature senders
+    /// (missing field deserializes as an empty map, identical to the
+    /// pre-feature shape).
+    #[serde(default)]
+    pub secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+}
+
+/// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
+/// every legacy un-phased dep in the snapshot. A dep that already names
+/// its phase (every dep a current binary emits) is left untouched, so
+/// this is a no-op for non-legacy snapshots. Operates in place on the
+/// decoded snapshot before the lattice merge so the restored ledger
+/// carries fully-explicit `(phase_id, task_id)` deps.
+fn migrate_unphased_deps<I>(snap: &mut ClusterStateSnapshot<I>) {
+    for state in snap.tasks.values_mut() {
+        let task = state.task_mut();
+        let enclosing = task.phase_id.clone();
+        for dep in &mut task.task_depends_on {
+            dep.fill_phase(&enclosing);
+        }
+    }
 }
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
@@ -148,13 +172,12 @@ fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
         TaskState::InFlight { .. } => 2,
         // All terminals share the strongest rank. Convergence among
         // terminals follows the per-arm rules in `apply` (Completed
-        // never regresses; Failed/Unfulfillable lock out incoming
-        // TaskFailed for their own hash; Cancelled is preserved by
-        // `TaskFailed` and only superseded by `TaskCompleted`).
+        // never regresses; Failed/Unfulfillable/InvalidTask lock out
+        // incoming TaskFailed for their own hash).
         TaskState::Completed { .. }
         | TaskState::Failed { .. }
         | TaskState::Unfulfillable { .. }
-        | TaskState::Cancelled { .. } => 3,
+        | TaskState::InvalidTask { .. } => 3,
     }
 }
 
@@ -180,16 +203,14 @@ impl<I: Identifier> ClusterState<I> {
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
             peer_holdings: self.peer_holdings.clone(),
-            // Sticky panik latch — carried so a late-joiner sees
-            // the in-progress emergency-stop immediately, in
-            // addition to via any live `PanikRequested` broadcast.
-            panik_active: self.panik_active,
-            panik_reason: self.panik_reason.clone(),
-            panik_source: self.panik_source.clone(),
             // Replicated keyed-output cache — carried so a late-joiner
             // can resolve a dependent's predecessor outputs without
             // waiting for the prereq's `TaskCompleted` to retransmit.
             task_outputs: self.task_outputs.clone(),
+            // Per-secondary static capacity — carried so a freshly-
+            // promoted primary and late-joining observers reconstruct
+            // the full worker roster on snapshot-restore.
+            secondary_capacities: self.secondary_capacities.clone(),
         }
     }
 
@@ -206,7 +227,18 @@ impl<I: Identifier> ClusterState<I> {
     /// mutation; merging keeps the strictly stronger of (local,
     /// snapshot) per the lattice and stays correct under arbitrary
     /// interleaving of live broadcasts and snapshot delivery.
-    pub fn restore(&mut self, snap: ClusterStateSnapshot<I>) {
+    pub fn restore(&mut self, mut snap: ClusterStateSnapshot<I>) {
+        // Migration shim (snapshot-ONLY): a legacy snapshot predates the
+        // `(phase_id, task_id)` dep identity, so its deps decode with the
+        // migration sentinel (empty `PhaseId`). Inject the enclosing
+        // task's phase into every un-phased dep before merging. A new
+        // dep always names its phase, so this is a no-op for any
+        // snapshot produced by a current binary — the shim touches only
+        // legacy entries and is never a runtime default. The enclosing
+        // task's phase is the unambiguous source for a legacy dep
+        // because a legacy snapshot only ever expressed same-phase deps
+        // implicitly.
+        migrate_unphased_deps(&mut snap);
         for (hash, incoming) in snap.tasks {
             match self.tasks.get(&hash) {
                 None => {
@@ -266,29 +298,31 @@ impl<I: Identifier> ClusterState<I> {
         if self.peer_holdings.is_empty() && !snap.peer_holdings.is_empty() {
             self.peer_holdings = snap.peer_holdings;
         }
-        // Sticky panik latch: monotonic-true. Snapshot with
-        // `panik_active = true` always sets local; local `true` never
-        // regresses to `false` even if the incoming snapshot omits it
-        // (#[serde(default)] = false case). Reason / source land
-        // alongside the flag the first time the latch flips to true.
-        if snap.panik_active && !self.panik_active {
-            self.panik_active = true;
-            self.panik_reason = snap.panik_reason;
-            self.panik_source = snap.panik_source;
-        }
         // Keyed-output cache merge: per-key first-write-wins. Each
         // `TaskCompleted` apply for a given hash records exactly one
         // entry (duplicate `TaskCompleted`s NoOp before reaching the
         // populate helper), so a snapshot's entry and a live-applied
-        // entry for the same `task_id` carry the same value — keeping
+        // entry for the same hash carry the same value — keeping
         // the local entry when present and inserting the snapshot's
         // entry when missing converges every replica to the same map
         // regardless of (live-broadcast, snapshot) arrival order. The
         // `entry().or_insert(_)` shape is the CRDT-coherent choice;
         // a blanket replace would clobber legitimately-applied local
         // entries when the snapshot interleaves with live broadcasts.
-        for (task_id, outputs) in snap.task_outputs {
-            self.task_outputs.entry(task_id).or_insert(outputs);
+        for (hash, outputs) in snap.task_outputs {
+            self.task_outputs.entry(hash).or_insert(outputs);
+        }
+        // Per-secondary capacity merge: per-secondary first-write-wins,
+        // identical shape to `task_outputs`. The `SecondaryCapacity`
+        // apply is set-once, so a snapshot entry and a live-applied
+        // entry for the same secondary carry the same value — keeping
+        // the local entry when present and inserting the snapshot's
+        // entry when missing converges every replica to the same map
+        // regardless of (live-broadcast, snapshot) arrival order. A
+        // blanket replace would clobber a legitimately-applied local
+        // entry when the snapshot interleaves with live broadcasts.
+        for (secondary, record) in snap.secondary_capacities {
+            self.secondary_capacities.entry(secondary).or_insert(record);
         }
     }
 }

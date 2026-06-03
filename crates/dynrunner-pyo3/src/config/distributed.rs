@@ -185,7 +185,8 @@ impl DistributedConfig {
                 .unwrap_or(d.connect_retry_delay_secs),
             peer_timeout_secs: peer_timeout_secs.unwrap_or(d.peer_timeout_secs),
             keepalive_interval_secs: keepalive_interval_secs.unwrap_or(d.keepalive_interval_secs),
-            keepalive_miss_threshold: keepalive_miss_threshold.unwrap_or(d.keepalive_miss_threshold),
+            keepalive_miss_threshold: keepalive_miss_threshold
+                .unwrap_or(d.keepalive_miss_threshold),
             retry_max_passes: effective_retry_max_passes,
             oom_retry_max_passes: oom_retry_max_passes.unwrap_or(effective_retry_max_passes),
             mass_death_grace_secs: mass_death_grace_secs.unwrap_or(d.mass_death_grace_secs),
@@ -255,4 +256,3 @@ impl DistributedConfig {
         self.log_oom_watcher
     }
 }
-

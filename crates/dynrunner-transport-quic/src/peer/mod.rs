@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    new_role_cache, seed_self_role, DistributedMessage, PeerConnectionInfo, RoleCache, Router,
+    DistributedMessage, PeerConnectionInfo, RoleCache, Router, new_role_cache, seed_self_role,
 };
 use tokio::sync::mpsc;
 
@@ -23,6 +23,7 @@ mod accept;
 mod dial;
 mod either;
 mod handler;
+mod mesh_send;
 mod no_peer;
 mod reconnect;
 mod transport_impl;
@@ -32,7 +33,10 @@ mod util;
 mod tests;
 
 pub use either::EitherPeerTransport;
+pub use mesh_send::MeshSendHandle;
 pub use no_peer::NoPeerTransport;
+
+use mesh_send::MeshSend;
 
 /// A peer connection accepted by this node's server.
 pub(super) struct AcceptedPeer<I: Identifier> {
@@ -124,6 +128,24 @@ pub struct PeerNetwork<I: Identifier> {
     /// `PeerTransport` impl needs to read it; production callers
     /// reach the same value through `PeerTransport::peer_for_role`.
     pub(super) role_cache: RoleCache,
+
+    /// Receiver for the cloneable mesh-send proxy (see
+    /// [`MeshSendHandle`]). A co-located parked `PrimaryCoordinator`
+    /// holds a clone of the matching sender and queues its remote sends
+    /// here; `recv_peer`'s drain arm forwards each through this
+    /// network's own relay-aware `send_to_peer` / `broadcast` so the
+    /// router applies uniformly. `None`-yielding is impossible while the
+    /// network lives (the network keeps its own sender clone in
+    /// `mesh_send_tx`), so the drain arm only fires on real items.
+    proxy_rx: mpsc::UnboundedReceiver<MeshSend<I>>,
+
+    /// Network-held clone of the proxy sender. Kept so
+    /// [`Self::mesh_send_handle`] can mint additional cloneable handles
+    /// at any time AND so `proxy_rx` never observes a spurious close
+    /// while the network is alive (the handed-out handles may all be
+    /// dropped — e.g. a never-promoted parked primary — without closing
+    /// the drain).
+    mesh_send_tx: mpsc::UnboundedSender<MeshSend<I>>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -176,11 +198,8 @@ impl<I: Identifier> PeerNetwork<I> {
         {
             let tick_tx = reconnect_tick_tx;
             tokio::task::spawn_local(async move {
-                let mut interval =
-                    tokio::time::interval(reconnect::RECONNECT_TICK);
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+                let mut interval = tokio::time::interval(reconnect::RECONNECT_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the first immediate tick: `Interval::tick()`
                 // resolves immediately on first call which would
                 // ping the tracker before any peers are tracked.
@@ -203,6 +222,7 @@ impl<I: Identifier> PeerNetwork<I> {
         // `intended_role == Self_` envelopes as Case A (local
         // unwrap) rather than Case C (no cached holder → drop).
         seed_self_role(&role_cache, peer_id);
+        let (mesh_send_tx, proxy_rx) = mpsc::unbounded_channel();
         Ok(Self {
             peer_id: peer_id.to_string(),
             cert,
@@ -219,7 +239,21 @@ impl<I: Identifier> PeerNetwork<I> {
             reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),
             role_cache,
+            proxy_rx,
+            mesh_send_tx,
         })
+    }
+
+    /// Mint a cloneable [`MeshSendHandle`] over this network's mesh.
+    ///
+    /// The co-located parked `PrimaryCoordinator`'s send-proxy holds the
+    /// returned handle to reach remote secondaries over the SAME mesh
+    /// the secondary's `UnifiedSecondaryTransport` owns — without
+    /// aliasing this network's `connections` ownership. Sends queued on
+    /// the handle are drained + dispatched (relay-aware) inside
+    /// [`Self::recv_peer`]. See the [`mesh_send`] module docs.
+    pub fn mesh_send_handle(&self) -> MeshSendHandle<I> {
+        MeshSendHandle::new(self.mesh_send_tx.clone())
     }
 
     /// The port this peer network is listening on.
@@ -368,8 +402,7 @@ impl<I: Identifier> PeerNetwork<I> {
     /// so this method is safe even if a redial from a prior tick
     /// is still in flight when the next tick fires.
     fn process_reconnect_tick(&mut self) {
-        let cluster_peers: Vec<String> =
-            self.peer_dial_info.keys().cloned().collect();
+        let cluster_peers: Vec<String> = self.peer_dial_info.keys().cloned().collect();
         for peer_id in &cluster_peers {
             if self.connections.contains_key(peer_id) {
                 self.reconnect_tracker.observe_reconnect(peer_id);
@@ -395,9 +428,9 @@ impl<I: Identifier> PeerNetwork<I> {
     fn spawn_redial(&self, peer_id: &str) {
         if self.connections.contains_key(peer_id) {
             return; // already directly connected (mid-heal: prior dial
-                    // landed but the cooldown timestamp is still hot).
-                    // Skipping avoids a duplicate WSS pipe whose sender
-                    // would later be discarded by drain_new_connections.
+            // landed but the cooldown timestamp is still hot).
+            // Skipping avoids a duplicate WSS pipe whose sender
+            // would later be discarded by drain_new_connections.
         }
         let Some(peer_info) = self.peer_dial_info.get(peer_id).cloned() else {
             return; // peer no longer in the authoritative cluster list
@@ -422,11 +455,8 @@ impl<I: Identifier> PeerNetwork<I> {
             let Some(connection) = dial::dial_peer(&peer_id, &peer_info).await else {
                 return;
             };
-            let outgoing_tx = handler::spawn_outgoing_handler(
-                peer_id.clone(),
-                connection,
-                incoming_tx,
-            );
+            let outgoing_tx =
+                handler::spawn_outgoing_handler(peer_id.clone(), connection, incoming_tx);
             let _ = new_conn_tx.send(AcceptedPeer {
                 peer_id,
                 outgoing_tx,
@@ -434,4 +464,3 @@ impl<I: Identifier> PeerNetwork<I> {
         });
     }
 }
-

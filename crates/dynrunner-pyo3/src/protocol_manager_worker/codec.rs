@@ -5,10 +5,10 @@
 //! Python-facing `parse_command`/`parse_response` pyfunctions just
 //! call into the codec and route through these wrappers.
 
-use dynrunner_protocol_manager_worker::{Command as RustCommand, Response as RustResponse};
 use dynrunner_protocol_manager_worker::codec::{
     parse_command as codec_parse_command, parse_response as codec_parse_response,
 };
+use dynrunner_protocol_manager_worker::{Command as RustCommand, Response as RustResponse};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -70,11 +70,9 @@ fn response_into_py(py: Python<'_>, resp: RustResponse) -> PyResult<Py<PyAny>> {
     match resp {
         RustResponse::Ready => Ok(Py::new(py, (PyReadyResponse, PyResponse))?.into_any()),
         RustResponse::Keepalive => Ok(Py::new(py, (PyKeepaliveResponse, PyResponse))?.into_any()),
-        RustResponse::Done { result_data } => Ok(Py::new(
-            py,
-            (PyDoneResponse { result_data }, PyResponse),
-        )?
-        .into_any()),
+        RustResponse::Done { result_data } => {
+            Ok(Py::new(py, (PyDoneResponse { result_data }, PyResponse))?.into_any())
+        }
         RustResponse::Error {
             error_type,
             message,
@@ -82,8 +80,7 @@ fn response_into_py(py: Python<'_>, resp: RustResponse) -> PyResult<Py<PyAny>> {
             // `from_core` collapses unrecognised `ResourceExhausted`
             // kinds to `None`; the pre-refactor Python code defaulted
             // unknown wire tags to `Recoverable`, so preserve that.
-            let py_et =
-                PyErrorType::from_core(&error_type).unwrap_or(PyErrorType::Recoverable);
+            let py_et = PyErrorType::from_core(&error_type).unwrap_or(PyErrorType::Recoverable);
             Ok(Py::new(
                 py,
                 (
@@ -126,11 +123,9 @@ fn response_into_py(py: Python<'_>, resp: RustResponse) -> PyResult<Py<PyAny>> {
             )?
             .into_any())
         }
-        RustResponse::PhaseUpdate { phase_name } => Ok(Py::new(
-            py,
-            (PyPhaseUpdateResponse { phase_name }, PyResponse),
-        )?
-        .into_any()),
+        RustResponse::PhaseUpdate { phase_name } => {
+            Ok(Py::new(py, (PyPhaseUpdateResponse { phase_name }, PyResponse))?.into_any())
+        }
     }
 }
 
@@ -287,17 +282,13 @@ mod tests {
 
             // Parse it back into a Value and assert per-key shape so
             // the assertion doesn't depend on serde-json's whitespace.
-            let value: serde_json::Value =
-                serde_json::from_str(&json).expect("JSON parses");
+            let value: serde_json::Value = serde_json::from_str(&json).expect("JSON parses");
             let task_a = value.get("task_a").expect("task_a present");
             let nonce = task_a.get("nonce").expect("nonce present");
             assert_eq!(nonce.get("kind").and_then(|v| v.as_str()), Some("inline"));
             assert_eq!(nonce.get("value").and_then(|v| v.as_str()), Some("xyz"));
             let artifact = task_a.get("artifact").expect("artifact present");
-            assert_eq!(
-                artifact.get("kind").and_then(|v| v.as_str()),
-                Some("file"),
-            );
+            assert_eq!(artifact.get("kind").and_then(|v| v.as_str()), Some("file"),);
             assert_eq!(
                 artifact.get("value").and_then(|v| v.as_str()),
                 Some("/shared/out.bin"),

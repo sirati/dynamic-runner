@@ -31,7 +31,6 @@
 //! success). Commutativity is preserved — see `apply`'s TaskCompleted
 //! arm doc.
 
-
 mod accessors;
 mod apply;
 mod apply_peer;
@@ -57,4 +56,3 @@ pub use types::{ApplyOutcome, OutcomeSummary, RoleChangeHook, StateCounts, TaskS
 
 #[cfg(test)]
 mod tests;
-

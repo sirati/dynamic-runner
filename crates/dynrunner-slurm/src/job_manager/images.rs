@@ -23,12 +23,25 @@ impl<G: Gateway> SlurmJobManager<G> {
     where
         P: PodmanPackaging<G>,
     {
-        tracing::info!("Building and transferring container image...");
+        // Building-image important event (LLM-wake): occurrence point is
+        // the start of the container image build+transfer. Emitted at the
+        // importance target so the dual-sink surfaces it on stdio under
+        // `--important-stdio-only`.
+        tracing::info!(
+            target: crate::IMPORTANT_TARGET,
+            "Building and transferring container image...",
+        );
         let output_dir = self.config.image_path();
         let metadata = packager
             .build_images(&self.gateway, local_project_root, Path::new(&output_dir))
             .await?;
+        // Uploading-image important event: occurrence point is the
+        // image-transfer result. `uploaded` discriminates an actual
+        // upload (cache miss) from a reused remote artifact (cache hit);
+        // both are the "image is now on the gateway" milestone. Same
+        // importance target.
         tracing::info!(
+            target: crate::IMPORTANT_TARGET,
             remote_path = %metadata.remote_path.display(),
             uploaded = metadata.uploaded,
             "container image ready on gateway",
@@ -133,5 +146,4 @@ impl<G: Gateway> SlurmJobManager<G> {
         );
         Ok(())
     }
-
 }

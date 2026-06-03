@@ -36,13 +36,12 @@
 //!
 //! # Why a oneshot signal rather than a watch channel?
 //!
-//! The panik latch is sticky-monotonic-true. Once any path matches we
-//! signal once and exit; the coordinator's apply rule
-//! (`ClusterState::apply` on `ClusterMutation::PanikRequested`)
-//! latches the cluster-wide flag so subsequent same-path matches on
-//! other nodes converge silently. A watch channel would imply
-//! "re-broadcast on every poll while file exists", which violates
-//! the apply rule's sticky-first-wins idempotency contract.
+//! A panik signal fires once and the node leaves the mesh. Once any
+//! path matches we signal once and exit; the coordinator announces its
+//! own departure (self-authored `ClusterMutation::PeerRemoved
+//! { SelfDeparture }`, observability only) and exits locally. A watch
+//! channel would imply "re-signal on every poll while file exists",
+//! which is redundant — the node has already departed.
 //!
 //! # Cancellation strategy
 //!
@@ -62,7 +61,8 @@
 //! coordinator (`PrimaryCoordinator` / `SecondaryCoordinator` /
 //! observer-mode `SecondaryCoordinator`) owns:
 //!   - selecting against the signal in its operational loop,
-//!   - broadcasting `ClusterMutation::PanikRequested`,
+//!   - announcing its own departure (file source: self-authored
+//!     `ClusterMutation::PeerRemoved { SelfDeparture }`),
 //!   - killing workers + their child trees (process-group kill),
 //!   - tearing down the operational loop,
 //!   - returning a panik outcome to the PyO3 wrapper, which calls
@@ -85,8 +85,8 @@ use tokio::task::JoinHandle;
 /// triggered by SIGTERM rather than by a filesystem path. Documented
 /// as a non-path string (angle-bracketed) so it cannot collide with
 /// any real path operators pass via `--panik-file`. Downstream log
-/// readers and `ClusterMutation::PanikRequested.reason` use this to
-/// attribute the shutdown source.
+/// readers and the departure announcement's `SelfDeparture` reason use
+/// this to attribute the shutdown source.
 pub const SIGTERM_SENTINEL_PATH: &str = "<SIGTERM>";
 
 /// Construct the sentinel as a `PathBuf` for downstream comparison
@@ -129,8 +129,7 @@ pub struct PanikWatcherConfig {
     /// alongside the file polling loop and fire the panik signal on
     /// first SIGTERM. The fired
     /// [`PanikSignal::matched_path`] is [`SIGTERM_SENTINEL_PATH`] so
-    /// downstream logging /
-    /// `ClusterMutation::PanikRequested.reason` records the source.
+    /// downstream logging records the source.
     ///
     /// Default `false` preserves existing behavior for any caller
     /// that hasn't been migrated. Enabled on the secondary path so a
@@ -158,7 +157,7 @@ impl Default for PanikWatcherConfig {
 #[derive(Debug, Clone)]
 pub struct PanikSignal {
     /// The first path observed to exist (in input order). Carried in
-    /// the broadcast `ClusterMutation::PanikRequested.reason` so the
+    /// the departure announcement's `SelfDeparture` reason so the
     /// terminal log shows which sentinel triggered the shutdown.
     pub matched_path: PathBuf,
 }
@@ -324,7 +323,9 @@ mod tests {
     #[tokio::test]
     async fn empty_paths_yields_disabled_watcher() {
         let mut w = spawn_panik_watcher(PanikWatcherConfig::default());
-        let signal_rx = w.take_signal_rx().expect("first take_signal_rx must succeed");
+        let signal_rx = w
+            .take_signal_rx()
+            .expect("first take_signal_rx must succeed");
         // The receiver MUST resolve quickly (no-op task drops the
         // sender on spawn). Bounded wait to surface the no-leak
         // contract.
@@ -575,7 +576,9 @@ mod tests {
             listen_for_sigterm: false,
             ..Default::default()
         });
-        let signal_rx = w.take_signal_rx().expect("first take_signal_rx must succeed");
+        let signal_rx = w
+            .take_signal_rx()
+            .expect("first take_signal_rx must succeed");
         let result = tokio::time::timeout(Duration::from_millis(100), signal_rx).await;
         let result = result.expect("disabled watcher should resolve immediately");
         assert!(
@@ -586,9 +589,8 @@ mod tests {
     }
 
     /// Sentinel path is the documented public constant. Locks the
-    /// wire-format so downstream log parsers and
-    /// `ClusterMutation::PanikRequested.reason` consumers can rely
-    /// on the literal across revisions.
+    /// wire-format so downstream log parsers and `SelfDeparture`
+    /// reason consumers can rely on the literal across revisions.
     #[test]
     fn sigterm_sentinel_path_is_stable_literal() {
         assert_eq!(SIGTERM_SENTINEL_PATH, "<SIGTERM>");

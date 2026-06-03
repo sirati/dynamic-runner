@@ -114,8 +114,7 @@ impl Cli {
                     .ok_or("--connection standard requires --gateway-port")?;
                 if self.connection_info_dir.is_some() {
                     return Err(
-                        "--connection-info-dir is only valid with --connection reverse"
-                            .to_string(),
+                        "--connection-info-dir is only valid with --connection reverse".to_string(),
                     );
                 }
                 ConnectionMode::Standard {

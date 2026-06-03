@@ -16,12 +16,12 @@
 use std::path::Path;
 
 use dynrunner_slurm_wrapper_config::{
-    parse_args, ConnectionMode as WireConnectionMode, WrapperConfig,
+    ConnectionMode as WireConnectionMode, WrapperConfig, parse_args,
 };
 
 use super::standard_cfg;
 use crate::config::SlurmConfig;
-use crate::wrapper_script::{generate_wrapper_script, ConnectionMode};
+use crate::wrapper_script::{ConnectionMode, generate_wrapper_script};
 
 fn cfg_config() -> SlurmConfig {
     SlurmConfig {
@@ -55,8 +55,7 @@ fn legacy_bash_uses_name_prefix_not_hardcoded_asm() {
     // scan itself uses a `/tmp/*/storage` glob — neither is a
     // name_prefix-derived literal, so they are out of scope here.)
     assert!(
-        !script.contains("RNDTMP=\"/tmp/asm-")
-            && !script.contains("CONTAINER_NAME=\"asm-"),
+        !script.contains("RNDTMP=\"/tmp/asm-") && !script.contains("CONTAINER_NAME=\"asm-"),
         "no residual hardcoded `asm` literal in the RNDTMP / CONTAINER_NAME assignments",
     );
 }
@@ -72,7 +71,11 @@ fn binary_stub_shape() {
     let script = generate_wrapper_script(&cfg);
 
     let lines: Vec<&str> = script.lines().collect();
-    assert_eq!(lines.len(), 2, "stub is shebang + one exec line; got: {script}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "stub is shebang + one exec line; got: {script}"
+    );
     assert_eq!(lines[0], "#!/usr/bin/env bash");
     assert!(
         lines[1].starts_with("exec /gw/dynrunner-slurm-wrapper "),
@@ -186,7 +189,10 @@ fn binary_stub_round_trips_through_cli_parser() {
     let exec_line = script.lines().nth(1).expect("stub has an exec line");
     let mut tokens = shell_split(exec_line);
     assert_eq!(tokens.first().map(String::as_str), Some("exec"));
-    assert_eq!(tokens.get(1).map(String::as_str), Some("/gw/dynrunner-slurm-wrapper"));
+    assert_eq!(
+        tokens.get(1).map(String::as_str),
+        Some("/gw/dynrunner-slurm-wrapper")
+    );
     // Drop `exec` + the binary path; clap wants argv[0] = program name.
     let arg_tail = tokens.split_off(2);
     let mut argv = vec!["dynrunner-slurm-wrapper".to_string()];
@@ -195,7 +201,10 @@ fn binary_stub_round_trips_through_cli_parser() {
     let parsed = parse_args(argv).expect("stub args must parse back via the cli parser");
 
     let expected = expected_wire("asm", &parsed.rand_suffix);
-    assert_eq!(parsed, expected, "stub args must round-trip to the intended WrapperConfig");
+    assert_eq!(
+        parsed, expected,
+        "stub args must round-trip to the intended WrapperConfig"
+    );
 }
 
 /// Reverse-mode + populated optional fields must round-trip too: the
@@ -234,7 +243,10 @@ fn binary_stub_round_trips_reverse_with_optionals() {
             connection_info_dir: "/logs/connection_info".to_string()
         }
     );
-    assert_eq!(parsed.dynrunner_network_dir.as_deref(), Some("/net/dynrunner"));
+    assert_eq!(
+        parsed.dynrunner_network_dir.as_deref(),
+        Some("/net/dynrunner")
+    );
     assert_eq!(parsed.mem_manager_reserved_bytes, Some(524_288_000));
     assert_eq!(
         parsed.shutdown_manager_bin_path.as_deref(),

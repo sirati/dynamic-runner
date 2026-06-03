@@ -8,7 +8,7 @@
 //! over the underlying transport until the peer disconnects.
 
 use dynrunner_core::{Identifier, MessageReceiver};
-use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;

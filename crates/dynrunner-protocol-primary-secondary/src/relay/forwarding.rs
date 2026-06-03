@@ -206,11 +206,7 @@ pub fn handle_backoff<I: Identifier, V>(
     blacklist: &HashSet<String>,
 ) -> BackoffDecision<I> {
     state.tried.insert(failed_via.to_string());
-    let mut excluded: HashSet<&str> = state
-        .path_at_send
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
+    let mut excluded: HashSet<&str> = state.path_at_send.iter().map(|s| s.as_str()).collect();
     excluded.insert(state.target.as_str());
     excluded.insert(my_peer_id);
     for t in &state.tried {

@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::pool::WorkerPool;
+use crate::stats::ProcessingStats;
 use dynrunner_core::{
-    compute_task_hash, FailedTask, Identifier, PhaseId, PrimaryCommand, ResourceKind, ResourceMap,
-    TaskInfo, TaskOutputs, TypeId, WorkerId, COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, FailedTask, Identifier, PhaseId, PrimaryCommand, ResourceKind,
+    ResourceMap, TaskInfo, TaskOutputs, TypeId, WorkerId, compute_task_hash,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
-use crate::pool::WorkerPool;
-use crate::stats::ProcessingStats;
 
 /// Per-completion context handed to a `RestartPredicate`. References borrow
 /// from the manager's per-worker state and live only for the predicate call.
@@ -199,7 +199,12 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
 /// real sockets and in-process channels for testing.
 /// Generic over `I` (the identifier type) so different task definitions
 /// can use different identifier structures.
-pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier = ()> {
+pub struct LocalManager<
+    M: ManagerEndpoint,
+    S: Scheduler<I>,
+    E: ResourceEstimator<I>,
+    I: Identifier = (),
+> {
     pub(crate) config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
@@ -259,7 +264,12 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// `predecessor_outputs` directly into `TaskAssignment` and the
     /// secondary forwards it verbatim. The cache population in
     /// distributed mode is cheap-but-unused; no conditional gate.
-    pub(crate) task_outputs_cache: HashMap<String, TaskOutputs>,
+    /// Keyed by the predecessor's full `(phase_id, task_id)` identity
+    /// so the same `task_id` in two different phases caches two distinct
+    /// output entries (no cross-phase collision) — mirrors the
+    /// distributed primary's hash-keyed CRDT output cache, which folds
+    /// `phase_id` into the hash.
+    pub(crate) task_outputs_cache: HashMap<(PhaseId, String), TaskOutputs>,
     /// Per-task memory-profile sampler. `Some` iff
     /// [`LocalManagerConfig::output_dir`] was set when
     /// `process_binaries` started — sampler construction defers to
@@ -332,7 +342,9 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     pub(crate) unfulfillable_reinject_remaining: HashMap<String, u32>,
 }
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     /// Construct a manager with a freshly-minted command channel.
     /// The Rust-test surface uses this form — the test never needs to
     /// reach into the channel sender, so a self-built pair is the
@@ -434,8 +446,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // Snapshot the phase set from the binaries' `phase_id`s. Any phase
         // that appears as a dep but not in the items must still be in the
         // pool's phase set, so merge in dep-graph keys/values too.
-        let mut phase_ids: HashSet<PhaseId> =
-            binaries.iter().map(|t| t.phase_id.clone()).collect();
+        let mut phase_ids: HashSet<PhaseId> = binaries.iter().map(|t| t.phase_id.clone()).collect();
         for (child, parents) in &phase_deps {
             phase_ids.insert(child.clone());
             for parent in parents {
@@ -453,8 +464,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.on_phase_start_cb = Some(Box::new(on_phase_start));
         self.on_phase_end_cb = Some(Box::new(on_phase_end));
 
-        let pool = PendingPool::new(phase_ids, phase_deps)
-            .map_err(|e| e.to_string())?;
+        let pool = PendingPool::new(phase_ids, phase_deps).map_err(|e| e.to_string())?;
         self.pending = Some(pool);
         // Mirror the initial batch into `task_by_hash` BEFORE
         // `pool.extend`. The mirror is the command-channel handler's
@@ -473,9 +483,20 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             self.task_by_hash
                 .insert(compute_task_hash(task), task.clone());
         }
-        self.pool_mut()
-            .extend(binaries)
-            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
+        // #2 dependency-existence validation (local parity with the
+        // distributed primary). Run the pool's non-mutating
+        // `partition_ingest` keyed on `(phase_id, task_id)`: tasks whose
+        // `task_depends_on` names a literally-absent `(phase_id,
+        // task_id)` are recorded as terminal `invalid_task` failures
+        // (the manager keeps running on the rest) instead of failing the
+        // whole `extend` as a hard `UnknownTaskDep`. The valid subset is
+        // extended; `extend`'s atomic contract is preserved there (a
+        // cycle among valid tasks is still a hard error). 3a/3b
+        // duplicate-id semantics are distributed-only (no peer/cluster
+        // concept here); a within-batch / against-pool duplicate stays
+        // the hard `extend`-side `DuplicateTaskId` it always was, so the
+        // `duplicates` partition is left to `extend` to reject.
+        self.ingest_partition_local(binaries)?;
 
         // Fire on_phase_start for any phase that started life Active.
         self.fire_on_phase_start_for_newly_active();
@@ -510,15 +531,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // queue exists for non-cgroup messages (Disconnected fan-out)
         // and so the local-mode integration test can pin lifecycle
         // semantics independently of cgroup-v2 availability.
-        self.sampler = self
-            .config
-            .output_dir
-            .as_ref()
-            .map(|dir| {
-                crate::memprofile::MemProfileSampler::spawn(
-                    crate::memprofile::MemProfileConfig::new(dir.clone()),
-                )
-            });
+        self.sampler = self.config.output_dir.as_ref().map(|dir| {
+            crate::memprofile::MemProfileSampler::spawn(crate::memprofile::MemProfileConfig::new(
+                dir.clone(),
+            ))
+        });
 
         // Outer loop: every iteration runs the full 5-phase pipeline
         // and breaks when `task_by_hash` did not grow during the pass.
@@ -633,6 +650,75 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             .expect("pending pool not initialised; called outside process_binaries")
     }
 
+    /// Initial-batch ingest with #2 dependency-existence validation —
+    /// the local-manager parity of the distributed primary's
+    /// `ingest_initial_batch` (minus the distributed-only 3a/3b
+    /// duplicate-abort split).
+    ///
+    /// Runs the pool's non-mutating `partition_ingest` keyed on
+    /// `(phase_id, task_id)`:
+    ///   * **duplicates** → hard error, preserving the pre-feature
+    ///     behaviour (the local `extend` rejected a duplicate `task_id`
+    ///     with `PendingPoolError::DuplicateTaskId`). Local mode has no
+    ///     cluster to abort; a duplicate in the single ingest is a
+    ///     producer bug surfaced as a `process_binaries` error.
+    ///   * **invalid_deps** (#2 missing-dep) → recorded as terminal
+    ///     `FailedTask { error_type: InvalidTask }` (surfaced to Python
+    ///     via `manager.failed_tasks()` with the `invalid_task` kind) +
+    ///     `stats.errored` bumped; their `task_id` is pre-seeded into
+    ///     the pool's failed set so a valid dependent's `extend`
+    ///     resolves + cascade-drops (matching the runtime cascade).
+    ///   * **valid** → handed to `extend`, preserving its atomic
+    ///     contract (a cycle among valid tasks is still a hard error).
+    fn ingest_partition_local(&mut self, binaries: Vec<TaskInfo<I>>) -> Result<(), String> {
+        let partition = self.pool_ref().partition_ingest(binaries);
+
+        // Duplicates: hard error (no cluster-abort concept in local
+        // mode). Surface the first colliding identity in the message —
+        // same diagnostic shape `extend`'s `DuplicateTaskId` produced.
+        if let Some((task, reason)) = partition.duplicates.first() {
+            return Err(format!(
+                "duplicate task identity rejected at ingest: {reason} \
+                 (task_id={}, phase={})",
+                task.task_id, task.phase_id
+            ));
+        }
+
+        // Pre-seed the pool's failed set with the missing-dep ids so the
+        // valid survivors' dep-existence + extend-time cascade stay
+        // correct.
+        let invalid_ids: Vec<String> = partition
+            .invalid_deps
+            .iter()
+            .map(|(task, _)| task.task_id.clone())
+            .collect();
+        self.pool_mut().mark_tasks_failed(invalid_ids);
+
+        // Record each missing-dep task as a terminal invalid_task
+        // failure so it surfaces to Python and counts as errored.
+        for (task, reason) in &partition.invalid_deps {
+            tracing::warn!(
+                task_id = %task.task_id,
+                phase = %task.phase_id,
+                reason = %reason,
+                "task has a missing dependency; marking invalid_task"
+            );
+            self.failed_tasks.push(FailedTask {
+                binary: task.clone(),
+                error_type: dynrunner_core::ErrorType::InvalidTask {
+                    reason: dynrunner_core::BoundedString::from(reason.clone()),
+                },
+                error_message: reason.clone(),
+                retry_count: 0,
+            });
+            self.stats.errored += 1;
+        }
+
+        self.pool_mut()
+            .extend(partition.valid)
+            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))
+    }
+
     /// Test seam: install a pre-built [`PendingPool`] so unit tests
     /// of the per-event handlers can exercise the routing logic
     /// without bootstrapping a full `process_binaries` run.
@@ -706,7 +792,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         success: bool,
         task_id: Option<&str>,
     ) {
-        let entry = self.phase_completion_counts.entry(phase_id.clone()).or_insert((0, 0));
+        let entry = self
+            .phase_completion_counts
+            .entry(phase_id.clone())
+            .or_insert((0, 0));
         if success {
             entry.0 += 1;
         } else {

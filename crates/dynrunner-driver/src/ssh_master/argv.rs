@@ -20,12 +20,18 @@ use crate::error::SshMasterError;
 /// own master.
 fn master_only_options() -> &'static [&'static str] {
     &[
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=yes",
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=1080",
-        "-o", "TCPKeepAlive=yes",
-        "-o", "LogLevel=ERROR",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=yes",
+        "-o",
+        "ServerAliveInterval=60",
+        "-o",
+        "ServerAliveCountMax=1080",
+        "-o",
+        "TCPKeepAlive=yes",
+        "-o",
+        "LogLevel=ERROR",
     ]
 }
 
@@ -47,10 +53,7 @@ pub(super) fn build_auth_flags(config: &SshConfig) -> Vec<String> {
         ]);
     }
     if let Some(config_file) = &config.config_file {
-        opts.extend([
-            "-F".to_string(),
-            config_file.to_string_lossy().into_owned(),
-        ]);
+        opts.extend(["-F".to_string(), config_file.to_string_lossy().into_owned()]);
     }
     opts
 }
@@ -128,4 +131,3 @@ pub(super) fn validate_control_path_len(p: &Path) -> Result<(), SshMasterError> 
         format!("control path is {len} bytes; sockaddr_un.sun_path cap is 108"),
     ))
 }
-

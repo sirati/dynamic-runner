@@ -1,12 +1,6 @@
-
-use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport,
-    SecondaryTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
@@ -14,30 +8,36 @@ use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_n
 
 use super::dispatch_order;
 
-
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-
-    /// Iterate every idle worker and dispatch a task from the pool
-    /// if one fits. Used by `run_retry_passes` to kickstart dispatch
-    /// after re-injection (workers won't send a fresh TaskRequest on
-    /// their own — see the run_retry_passes comment). Mirrors the
-    /// per-worker logic in `handle_task_request` minus the
-    /// primary relay (which is irrelevant for the
-    /// non-promoted-primary at this stage).
-    pub(crate) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
-        // Demoted observer mode: the promoted primary is the
-        // sole authority for dispatch. Returning here covers every
-        // call site (kickstart from handle_task_complete /
-        // handle_task_failed, plus the retry-pass kickstart) without
-        // sprinkling `if !self.demoted` across the message-handling
-        // code. See `demoted` doc on `PrimaryCoordinator`.
-        if self.demoted {
-            return Ok(());
-        }
-        // Visit idle workers in load-aware order so a secondary with
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
+    /// Iterate every free worker and dispatch a task from the pool if
+    /// one fits. This is worker management's dispatch RECHECK: the
+    /// operational loop's worker-management `select!` arm calls it on a
+    /// drained [`crate::worker_signal::WorkerSignalBatch`] carrying a
+    /// `TasksAdded` (decoupled from the phase/task code that emitted
+    /// the signal — see the dispatch-decoupling law). Workers won't
+    /// send a fresh `TaskRequest` on their own after a phase boundary
+    /// or a re-injection, so the recheck re-evaluates EVERY free worker
+    /// and dispatches what now fits. Mirrors the per-worker logic in
+    /// `handle_task_request` minus the primary relay (which is
+    /// irrelevant for the non-promoted-primary at this stage).
+    ///
+    /// `bypass_backpressure` lifts the per-secondary backoff for this
+    /// recheck (NOT the OOM single-worker mask). The worker-management
+    /// arm passes `true` when reacting to a genuine `TasksAdded`:
+    /// circumstances changed, so a freed slot on a recently-
+    /// backpressured secondary is a valid target again. See
+    /// [`PrimaryCoordinator::should_skip_worker_for_dispatch`].
+    pub(crate) async fn dispatch_to_idle_workers(
+        &mut self,
+        bypass_backpressure: bool,
+    ) -> Result<(), String> {
+        // Visit free workers in load-aware order so a secondary with
         // many in-flight tasks doesn't keep winning tail-of-phase
-        // dispatches against an idler peer. `dispatch_order` filters
-        // to idle and sorts by (busy-workers-on-secondary, worker_id).
+        // dispatches against an idler peer. `dispatch_order` selects on
+        // the authoritative free predicate (`held_task().is_none()`)
+        // and sorts by the advisory busy-load count.
         let order = dispatch_order(&self.workers);
         for worker_idx in order {
             // Composed dispatch-shape gate: backpressure backoff +
@@ -49,7 +49,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // `dispatch_order`) so a backpressure window or
             // single-worker-mode flip mid-tick takes effect
             // immediately.
-            if self.should_skip_worker_for_dispatch(worker_idx) {
+            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure) {
                 continue;
             }
             // Dispatch-shape view pipeline: pool view → soft
@@ -82,14 +82,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             } = decision
             {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
-                self.reserve_type_slot(&binary.type_id);
                 let sec_id = self.workers[worker_idx].secondary_id.clone();
                 let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
-                self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
-                self.workers[worker_idx].is_idle = false;
 
                 let task_hash = compute_task_hash(&binary);
+                // Type-slot reserve + slot `Idle -> Assigned{task_hash}`
+                // + ledger insert, committed together so the three
+                // pieces of in-flight bookkeeping can never diverge. The
+                // slot is idle by construction here (`dispatch_order`
+                // filters to idle workers).
+                self.commit_assignment(
+                    worker_idx,
+                    binary.clone(),
+                    task_hash.clone(),
+                    estimated_usage.clone(),
+                );
                 // Resolve the per-edge predecessor-output map from the
                 // replicated `cluster_state.task_outputs` cache. The
                 // helper handles both the direct-dep present-but-empty
@@ -98,8 +105,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // same helper is consumed by the sibling dispatch site
                 // in `primary/task/request.rs` so the wire shape is
                 // identical regardless of which path fires.
-                let predecessor_outputs =
-                    gather_predecessor_outputs(&self.cluster_state, &binary);
+                let predecessor_outputs = gather_predecessor_outputs(&self.cluster_state, &binary);
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
@@ -133,8 +139,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // dispatch loop so other idle workers still get a
                 // chance this tick. WARN so an operator grepping
                 // for the jam symptom sees the proximate cause.
-                if let Err(send_err) =
-                    self.transport.send_to(&sec_id, assignment_msg).await
+                if let Err(send_err) = self
+                    .transport
+                    .send(Address::Peer(sec_id.clone()), assignment_msg)
+                    .await
                 {
                     tracing::warn!(
                         secondary = %sec_id,
@@ -143,14 +151,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         error = %send_err,
                         "task-assignment send failed; rolling back worker state and requeuing binary"
                     );
-                    self.workers[worker_idx].current_task = None;
-                    self.workers[worker_idx].estimated_resources =
-                        ResourceMap::new();
-                    self.workers[worker_idx].is_idle = true;
-                    self.release_type_slot(&binary.type_id);
+                    // Undo the `commit_assignment` triple (type slot +
+                    // slot state + ledger) for the task whose send never
+                    // made it real — no terminal will ever arrive for
+                    // this hash — then requeue the binary.
+                    self.rollback_assignment(worker_idx, &task_hash, &binary.type_id);
                     self.pool_mut().requeue(binary);
                     continue;
                 }
+
+                // Send succeeded: originate the CRDT `Pending → InFlight`
+                // transition (the single origination point). After the
+                // send so a failure needs no CRDT compensation (the
+                // rollback above runs before we reach here).
+                self.originate_task_assigned(task_hash.clone(), sec_id.clone(), local_worker_id)
+                    .await;
 
                 // Operator-facing INFO: which secondary/worker just
                 // took the task. Per-task identity (task_id /
@@ -174,5 +189,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
         Ok(())
     }
-
 }

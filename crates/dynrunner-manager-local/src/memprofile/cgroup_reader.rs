@@ -77,11 +77,7 @@ fn read_scalar(cgroup_dir: &Path, file_name: &str) -> Result<u64, MemProfileErro
 fn parse_scalar(path: &Path, raw: &str) -> Result<u64, MemProfileError> {
     let trimmed = raw.trim();
     trimmed.parse::<u64>().map_err(|e| {
-        MemProfileError::parse(
-            path,
-            None,
-            format!("expected u64, got {trimmed:?}: {e}"),
-        )
+        MemProfileError::parse(path, None, format!("expected u64, got {trimmed:?}: {e}"))
     })
 }
 
@@ -117,9 +113,9 @@ fn parse_stat(path: &Path, raw: &str) -> Result<BTreeMap<String, u64>, MemProfil
             continue;
         }
         let mut parts = trimmed.split_whitespace();
-        let key = parts.next().ok_or_else(|| {
-            MemProfileError::parse(path, Some(line_no), "missing key")
-        })?;
+        let key = parts
+            .next()
+            .ok_or_else(|| MemProfileError::parse(path, Some(line_no), "missing key"))?;
         let value_str = parts.next().ok_or_else(|| {
             MemProfileError::parse(
                 path,
@@ -274,12 +270,7 @@ banana 4
     fn missing_swap_current_treats_as_zero() {
         let dir = tempdir().unwrap();
         // Deliberately do NOT write memory.swap.current.
-        write_cgroup(
-            dir.path(),
-            Some("777\n"),
-            None,
-            Some("anon 1\nfile 2\n"),
-        );
+        write_cgroup(dir.path(), Some("777\n"), None, Some("anon 1\nfile 2\n"));
 
         let sample = read(dir.path()).expect("read should succeed without swap file");
 

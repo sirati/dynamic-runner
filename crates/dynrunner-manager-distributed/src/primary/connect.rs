@@ -1,12 +1,8 @@
-
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, MessageType, PeerTransport,
-    SecondaryTransport,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
@@ -14,7 +10,9 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn wait_for_connections(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -26,22 +24,26 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
         loop {
             // Check if all secondaries have completed cert exchange
-            let cert_done = self.secondaries.values()
+            let cert_done = self
+                .secondaries
+                .values()
                 .filter(|s| s.is_at_least_cert_exchanged())
                 .count();
             if cert_done >= expected {
                 break;
             }
 
-            // Cancellation safety: `transport.recv` goes through the
-            // mpsc bridge in `NetworkServer` (its inner select! is over
-            // two cancel-safe mpsc receivers). `sleep_until` is
-            // one-shot and cancel-safe. If `sleep_until` wins it's
-            // because the deadline expired and we error out anyway —
-            // even on a hypothetical not-cancel-safe transport, the
-            // connection is torn down on the error path.
+            // Cancellation safety: `transport.recv_peer` is the unified
+            // inbound demux — the relocated `NetworkServer` `select!`
+            // over the cancel-safe inbound + registration mpscs.
+            // `sleep_until` is one-shot and cancel-safe. If
+            // `sleep_until` wins it's because the deadline expired and
+            // we error out anyway. The demux applies any pending writer
+            // registration before surfacing a frame, so the welcome
+            // this loop counts arrives with its secondary already
+            // registered (FIFO welcome → registration → cert-exchange).
             tokio::select! {
-                msg = self.transport.recv() => {
+                msg = self.transport.recv_peer() => {
                     match msg {
                         // Pre-operational-loop site. Threading
                         // `command_rx` through so an `on_phase_end`
@@ -137,7 +139,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
         }
 
-        tracing::info!("all {} secondaries connected", self.secondaries.len());
+        // Whole-cluster-ready milestone (the LLM-wake "connected to
+        // gateway" event): every connected secondary has completed
+        // cert-exchange, so the mesh is formed and the run can proceed.
+        // Emitted at the importance target so the dual-sink routes it
+        // to stdio under `--important-stdio-only` while the full log
+        // keeps it too.
+        tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
+            secondaries = self.secondaries.len(),
+            "all secondaries connected",
+        );
         Ok(())
     }
 
@@ -218,7 +230,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             ..
         } = msg
         {
-            let ram_bytes = resources.iter()
+            let ram_bytes = resources
+                .iter()
                 .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
@@ -230,15 +243,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "secondary connected"
             );
 
+            // Capture the advertised capacity before `resources` is
+            // moved into the per-secondary connection state below, so
+            // the same welcome originates the static `SecondaryCapacity`
+            // record into the replicated ledger (see the broadcast
+            // batch below). `worker_count` is `Copy`; `resources` is
+            // cloned once.
+            let advertised_resources = resources.clone();
             let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn = conn.receive_welcome(
-                worker_count,
-                resources,
-                hostname,
-                0,
-                None,
-                is_observer,
-            );
+            let conn =
+                conn.receive_welcome(worker_count, resources, hostname, 0, None, is_observer);
             self.secondaries.insert(
                 secondary_id.clone(),
                 SecondaryConnectionState::Handshaking(conn),
@@ -260,10 +274,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // its observer batch idempotently (the `apply_peer_joined`
             // rule short-circuits NoOp on re-applies for an already-
             // alive id whose observer projection isn't changing).
+            // Originate the static `SecondaryCapacity` record alongside
+            // `PeerJoined`, carrying the `worker_count` + advertised
+            // resources the welcome announced (historically dropped
+            // here — the worker roster was 100% primary-local, so a
+            // promoted primary started `alive_worker_count() == 0`).
+            // Set-once apply: the idempotent re-emits this site shares
+            // with `PeerJoined` (e.g. via `send_peer_lists`) NoOp on
+            // re-application.
             self.apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::PeerJoined {
-                    peer_id: secondary_id,
+                    peer_id: secondary_id.clone(),
                     is_observer,
+                },
+                ClusterMutation::SecondaryCapacity {
+                    secondary: secondary_id,
+                    worker_count,
+                    resources: advertised_resources,
                 },
             ])
             .await;
@@ -302,5 +329,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     // ── Phase 3: Send Peer Lists ──
-
 }

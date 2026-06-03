@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    read_role_cache, Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo,
-    PeerTransport, Role, RoleAddressedAction, RoleChangeHookRegistrar, SendOutcome,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Role,
+    RoleAddressedAction, RoleChangeHookRegistrar, SendOutcome, apply_role_misaddress_hint,
+    decide_role_addressed_with_cache, install_role_change_hook, read_role_cache,
 };
 
 use super::PeerNetwork;
@@ -153,8 +153,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             // redial immediately rather than waiting for the
             // next periodic tick — the user-directed contract is
             // "reconnect immediately, then every 5 seconds".
-            let first_observation =
-                self.reconnect_tracker.observe_disconnect(peer_id);
+            let first_observation = self.reconnect_tracker.observe_disconnect(peer_id);
             if first_observation {
                 self.spawn_redial(peer_id);
             }
@@ -265,6 +264,46 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     // against `connections` so duplicate dials on
                     // a freshly-restored peer are harmless.
                     self.process_reconnect_tick();
+                    None
+                }
+                queued = self.proxy_rx.recv() => {
+                    // Mesh-send proxy drain (see `mesh_send.rs` +
+                    // `MeshSendHandle`). A co-located parked primary's
+                    // send-proxy queued a remote send here; forward it
+                    // through THIS network's own relay-aware send path
+                    // so the router's relay / blacklist / redial logic
+                    // applies uniformly. The forwarding lives entirely
+                    // in the transport — no manager-visible mesh drain.
+                    //
+                    // `recv()` never yields `None` while the network
+                    // lives: `self.mesh_send_tx` keeps a sender clone,
+                    // so the channel cannot close from under us even if
+                    // every handed-out `MeshSendHandle` is dropped.
+                    // Errors from the inner send are best-effort
+                    // (logged, not surfaced) — the same contract the
+                    // mesh's own callers get; a dead peer is the router's
+                    // concern, not the queued sender's.
+                    if let Some(item) = queued {
+                        match item {
+                            super::MeshSend::ToPeer(peer_id, msg) => {
+                                if let Err(e) = self.send_to_peer(&peer_id, msg).await {
+                                    tracing::debug!(
+                                        peer = %peer_id,
+                                        error = %e,
+                                        "mesh-send proxy: forwarded unicast had no route"
+                                    );
+                                }
+                            }
+                            super::MeshSend::Broadcast(msg) => {
+                                if let Err(e) = self.broadcast(msg).await {
+                                    tracing::debug!(
+                                        error = %e,
+                                        "mesh-send proxy: forwarded broadcast failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     None
                 }
             };

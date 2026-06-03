@@ -12,7 +12,7 @@ pub mod announcer;
 pub mod lifecycle;
 
 pub use announcer::{
-    run_observer_announcer, AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender,
-    PeerMeshAnnouncerSender, PeerResourceHoldingsUpdatedPayload,
+    AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender, PeerMeshAnnouncerSender,
+    PeerResourceHoldingsUpdatedPayload, run_observer_announcer,
 };
-pub use lifecycle::{attach_observer_announcer, AnnouncerHandle};
+pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};

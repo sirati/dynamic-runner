@@ -33,10 +33,7 @@ use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 /// be boxed), not for size containment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 #[allow(clippy::large_enum_variant)]
 pub enum DistributedMessage<I> {
     SecondaryWelcome {
@@ -258,6 +255,19 @@ pub enum DistributedMessage<I> {
     RequestClusterSnapshot {
         sender_id: String,
         timestamp: f64,
+        /// The joiner's own role. The snapshot responder is the first
+        /// existing member to observe a late-joiner; it broadcasts a
+        /// `ClusterMutation::PeerJoined { is_observer }` so every peer
+        /// learns about the new member. The joiner declares its own
+        /// role here so the responder broadcasts the TRUTH rather than
+        /// assuming observer — a hardcoded `true` mis-ratcheted a
+        /// re-bootstrapping worker up to observer via
+        /// `apply_peer_joined`'s upward-only observer ratchet.
+        /// `#[serde(default)]` keeps pre-field senders wire-compatible
+        /// (they decode as `false` — a worker, the conservative
+        /// non-ratcheting default).
+        #[serde(default)]
+        is_observer: bool,
     },
     /// Response carrying a full `ClusterStateSnapshot` the receiver
     /// merges into its local mirror via `ClusterState::restore`. The
@@ -446,4 +456,3 @@ pub enum DistributedMessage<I> {
         holder_id: String,
     },
 }
-

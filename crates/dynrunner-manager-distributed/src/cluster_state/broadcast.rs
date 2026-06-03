@@ -16,9 +16,7 @@
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, RoleChangeHookRegistrar, RoleTable,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, RoleChangeHookRegistrar, RoleTable};
 
 use super::{ApplyOutcome, ClusterState};
 
@@ -31,10 +29,7 @@ use super::{ApplyOutcome, ClusterState};
 /// Today the only registrant is the `PeerTransport` write-through
 /// cache, one per node.
 impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
-    fn register_role_change_hook(
-        &mut self,
-        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
-    ) {
+    fn register_role_change_hook(&mut self, hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>) {
         self.role_change_hooks.push(Arc::from(hook));
     }
 }
@@ -70,22 +65,21 @@ pub(crate) struct AppliedBatch<I: Identifier> {
 ///
 /// Single concern: apply-locally + filter to applied (+ surface the
 /// resumed-for-dispatch list). The broadcast step and the pool
-/// re-injection step are both transport-/state-specific (primary
-/// uses `SecondaryTransport`, promoted-secondary uses `PeerTransport`;
-/// the live primary always wants to re-inject, the promoted secondary
-/// already has Blocked items in its pool via the
-/// `populate_primary_from_cluster_state` seed) so they stay at the
-/// call sites. This free function is the canonical place to perform
-/// the apply+filter so the two originator paths can't drift on the
-/// filter semantics.
+/// re-injection step are both caller-specific (the authority primary
+/// re-injects resumed dependents into its dispatch pool; the secondary
+/// originator holds no pool and discards the resumed list — the
+/// co-located authority drives dispatch off the same mutation), so they
+/// stay at the call sites. This free function is the canonical place to
+/// perform the apply+filter so the two originator paths can't drift on
+/// the filter semantics.
 ///
 /// Callers:
 ///   - `primary::lifecycle::apply_and_broadcast_cluster_mutations`
-///     (the live primary's originator path).
-///   - `secondary::primary::apply_and_broadcast_mutations` (the
-///     promoted-secondary's originator path, used by
-///     `ingest_setup_discovery` to seed the ledger with the
-///     discovery-time `TaskAdded` batch + `PhaseDepsSet`).
+///     (the authority primary's originator path).
+///   - `secondary::origination::apply_and_broadcast_mutations` (the
+///     secondary-side originator path, used by `ingest_setup_discovery`
+///     to seed the ledger with the discovery-time `TaskAdded` batch +
+///     `PhaseDepsSet`, and by the panik self-departure announcement).
 pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     state: &mut ClusterState<I>,
     mutations: Vec<ClusterMutation<I>>,

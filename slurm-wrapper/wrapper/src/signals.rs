@@ -38,7 +38,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use nix::sys::signal::{SigSet, Signal, SigmaskHow, sigprocmask};
+use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
 use nix::sys::signalfd::SignalFd;
 use tokio::sync::mpsc;
 
@@ -91,15 +91,18 @@ impl SignalMonitor {
     /// normal operation), this returns a synthetic `<monitor-gone>`
     /// record so callers can still make forward progress on teardown.
     pub async fn recv_terminating(&mut self) -> TerminatingSignal {
-        self.term_rx.recv().await.unwrap_or_else(|| TerminatingSignal {
-            signo: 0,
-            signame: "<monitor-gone>".to_string(),
-            sender_pid: 0,
-            sender_uid: 0,
-            si_code: "<none>".to_string(),
-            comm: "<unknown>".to_string(),
-            cmdline: "<unknown>".to_string(),
-        })
+        self.term_rx
+            .recv()
+            .await
+            .unwrap_or_else(|| TerminatingSignal {
+                signo: 0,
+                signame: "<monitor-gone>".to_string(),
+                sender_pid: 0,
+                sender_uid: 0,
+                si_code: "<none>".to_string(),
+                comm: "<unknown>".to_string(),
+                cmdline: "<unknown>".to_string(),
+            })
     }
 
     /// Test-only constructor: a monitor backed by a caller-fed channel with
@@ -221,8 +224,7 @@ pub fn start_monitor() -> std::io::Result<SignalMonitor> {
 pub fn child_pre_exec() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     || {
         let empty = SigSet::empty();
-        sigprocmask(SigmaskHow::SIG_SETMASK, Some(&empty), None)
-            .map_err(std::io::Error::from)
+        sigprocmask(SigmaskHow::SIG_SETMASK, Some(&empty), None).map_err(std::io::Error::from)
     }
 }
 
@@ -258,10 +260,7 @@ fn monitor_loop(sfd: SignalFd, term_tx: mpsc::Sender<TerminatingSignal>, proc_ba
 }
 
 /// Resolve the full provenance record for one delivered siginfo.
-fn build_provenance(
-    siginfo: &nix::sys::signalfd::siginfo,
-    proc_base: &Path,
-) -> TerminatingSignal {
+fn build_provenance(siginfo: &nix::sys::signalfd::siginfo, proc_base: &Path) -> TerminatingSignal {
     let pid = siginfo.ssi_pid;
     TerminatingSignal {
         signo: siginfo.ssi_signo,

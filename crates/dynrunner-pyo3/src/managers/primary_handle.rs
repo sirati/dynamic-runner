@@ -63,7 +63,10 @@ impl ReinjectCapCell {
     /// Read the current cap. Called from `PyPrimaryCoordinator::run`
     /// once, at the moment it constructs the inner `PrimaryConfig`.
     pub(crate) fn snapshot(&self) -> Option<u32> {
-        self.inner.lock().expect("ReinjectCapCell poisoned").max_per_task
+        self.inner
+            .lock()
+            .expect("ReinjectCapCell poisoned")
+            .max_per_task
     }
 
     /// Mark `run()` as entered so the handle setter starts rejecting
@@ -151,13 +154,9 @@ impl PyPrimaryHandle {
         let sender = self.sender.clone();
         let rt = self.rt.clone();
         let outcome: Result<Result<(), String>, String> = rt.block_on(async move {
-            sender
-                .send(cmd)
-                .await
-                .map_err(|_| {
-                    "PrimaryHandle: command channel closed (coordinator dropped?)"
-                        .to_string()
-                })?;
+            sender.send(cmd).await.map_err(|_| {
+                "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
+            })?;
             reply_rx
                 .await
                 .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
@@ -303,8 +302,7 @@ impl PyPrimaryHandle {
         // entries BEFORE releasing the GIL — the conversion touches
         // Python-allocated objects (string interning, dict payloads)
         // and `getattr` calls require the GIL.
-        let typed: Vec<TaskInfo<RunnerIdentifier>> =
-            crate::pytypes::extract_binaries(tasks)?;
+        let typed: Vec<TaskInfo<RunnerIdentifier>> = crate::pytypes::extract_binaries(tasks)?;
 
         let sender = self.sender.clone();
         let rt = self.rt.clone();
@@ -334,20 +332,18 @@ impl PyPrimaryHandle {
                 match sender.try_send(command) {
                     Ok(()) => Ok(Ok(Vec::new())),
                     Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(
-                        "PrimaryHandle: command channel closed (coordinator dropped?)"
-                            .to_string(),
+                        "PrimaryHandle: command channel closed (coordinator dropped?)".to_string(),
                     ),
-                    Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(
-                        "PrimaryHandle: command channel full — coordinator \
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+                        Err("PrimaryHandle: command channel full — coordinator \
                          is not draining commands"
-                            .to_string(),
-                    ),
+                            .to_string())
+                    }
                 }
             } else {
                 rt.block_on(async move {
                     sender.send(command).await.map_err(|_| {
-                        "PrimaryHandle: command channel closed (coordinator dropped?)"
-                            .to_string()
+                        "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
                     })?;
                     reply_rx
                         .await
@@ -368,7 +364,10 @@ impl PyPrimaryHandle {
                     dict.set_item("kind", "duplicate_task_hash")?;
                     dict.set_item("task_hash", hash)?;
                 }
-                SpawnError::UnknownDependency { task_hash, dep_task_id } => {
+                SpawnError::UnknownDependency {
+                    task_hash,
+                    dep_task_id,
+                } => {
                     dict.set_item("kind", "unknown_dependency")?;
                     dict.set_item("task_hash", task_hash)?;
                     dict.set_item("dep_task_id", dep_task_id)?;
@@ -387,7 +386,11 @@ impl PyPrimaryHandle {
     /// its own copy of the cap from that moment on, so a setter call
     /// here would silently no-op without the gate.
     fn set_unfulfillable_reinject_max_per_task(&self, n: Option<u32>) -> PyResult<()> {
-        let mut g = self.reinject_cap.inner.lock().expect("ReinjectCapCell poisoned");
+        let mut g = self
+            .reinject_cap
+            .inner
+            .lock()
+            .expect("ReinjectCapCell poisoned");
         if g.run_started {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "set_unfulfillable_reinject_max_per_task: must be called \
@@ -397,6 +400,24 @@ impl PyPrimaryHandle {
         g.max_per_task = n;
         Ok(())
     }
+}
+
+/// Decode a Python `bytes` value into the wire-canonical hash string
+/// the rest of the dispatcher uses. The wire form is
+/// `format!("{:016x}", hasher.finish())` (see
+/// `dynrunner_manager_distributed::compute_task_hash`); callers pass
+/// the raw 16-byte hex-encoded ASCII representation through `bytes`.
+/// Invalid UTF-8 raises `PyValueError` so the Python side surfaces a
+/// typed exception instead of a panicking unwrap.
+fn bytes_to_hash_string(hash: &Bound<'_, PyBytes>) -> PyResult<String> {
+    let bytes = hash.as_bytes();
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_owned())
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "PrimaryHandle: hash bytes are not valid UTF-8: {e}"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -410,7 +431,6 @@ mod tests {
     //!        --features test-with-python primary_handle`
     use super::*;
     use dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY;
-    use pyo3::types::PyAnyMethods;
 
     /// Build a `PyPrimaryHandle` paired with a stub receiver task
     /// that echoes back empty per-index errors for every
@@ -419,9 +439,8 @@ mod tests {
     /// side's `block_on` (inside `spawn_tasks`) and the stub's
     /// `recv().await` don't deadlock on a single runtime.
     fn handle_with_stub_receiver() -> (PyPrimaryHandle, std::thread::JoinHandle<()>) {
-        let (tx, mut rx) = tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(
-            COMMAND_CHANNEL_CAPACITY,
-        );
+        let (tx, mut rx) =
+            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(COMMAND_CHANNEL_CAPACITY);
         let cell = crate::managers::primary_handle::ReinjectCapCell::default();
         let handle = PyPrimaryHandle::from_sender(tx, cell).expect("handle init");
         let thread = std::thread::spawn(move || {
@@ -466,22 +485,4 @@ mod tests {
         drop(handle);
         stub_thread.join().expect("stub thread joined");
     }
-}
-
-/// Decode a Python `bytes` value into the wire-canonical hash string
-/// the rest of the dispatcher uses. The wire form is
-/// `format!("{:016x}", hasher.finish())` (see
-/// `dynrunner_manager_distributed::compute_task_hash`); callers pass
-/// the raw 16-byte hex-encoded ASCII representation through `bytes`.
-/// Invalid UTF-8 raises `PyValueError` so the Python side surfaces a
-/// typed exception instead of a panicking unwrap.
-fn bytes_to_hash_string(hash: &Bound<'_, PyBytes>) -> PyResult<String> {
-    let bytes = hash.as_bytes();
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_owned())
-        .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "PrimaryHandle: hash bytes are not valid UTF-8: {e}"
-            ))
-        })
 }

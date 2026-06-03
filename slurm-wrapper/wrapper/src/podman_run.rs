@@ -239,7 +239,15 @@ mod tests {
             gateway_port: 4433,
         });
         let secondary_url = "tcp://gw.cluster:4433";
-        let argv = build_run_argv(&cfg, &layout(), &bins(), Some(8_589_934_592), &both_ips(), 7777, secondary_url);
+        let argv = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(8_589_934_592),
+            &both_ips(),
+            7777,
+            secondary_url,
+        );
 
         let expected: Vec<String> = vec![
             "--root",
@@ -320,7 +328,15 @@ mod tests {
             gateway_port: 1,
         });
         let secondary_url = "tcp://gw:1";
-        let argv = build_run_argv(&cfg, &layout(), &bins(), None, &PeerIps::default(), 5555, secondary_url);
+        let argv = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            None,
+            &PeerIps::default(),
+            5555,
+            secondary_url,
+        );
 
         let expected: Vec<String> = vec![
             "--root",
@@ -395,7 +411,15 @@ mod tests {
             connection_info_dir: "/net/conn".to_string(),
         });
         let secondary_url = "tcp://localhost:12345";
-        let argv = build_run_argv(&cfg, &layout(), &bins(), Some(4_294_967_296), &both_ips(), 9001, secondary_url);
+        let argv = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(4_294_967_296),
+            &both_ips(),
+            9001,
+            secondary_url,
+        );
 
         // Find the `--secondary` flag and assert its value token follows.
         let idx = argv

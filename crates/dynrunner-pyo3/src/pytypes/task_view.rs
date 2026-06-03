@@ -51,11 +51,7 @@ impl PyTaskInfoView {
     /// called from the operational loop where the identifier type is
     /// the coordinator's `I` parameter; the view itself erases `I`
     /// (only `path` is rendered, and that's an `I`-free string).
-    pub(crate) fn from_task<I>(
-        hash: &str,
-        task: &TaskInfo<I>,
-        reason: &str,
-    ) -> Self {
+    pub(crate) fn from_task<I>(hash: &str, task: &TaskInfo<I>, reason: &str) -> Self {
         Self {
             hash: hash.to_string(),
             path: task.path.to_string_lossy().into_owned(),

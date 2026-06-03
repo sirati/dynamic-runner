@@ -28,17 +28,18 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for ChannelSecondaryT
 }
 
 impl<I: Identifier> SecondaryTransport<I> for ChannelSecondaryTransportEnd<I> {
-    async fn send_to(&mut self, secondary_id: &str, msg: DistributedMessage<I>) -> Result<(), String> {
+    async fn send_to(
+        &mut self,
+        secondary_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
         if let Some(tx) = self.outgoing.get(secondary_id) {
             tx.send(msg).map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 
-    async fn broadcast(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), Vec<(String, String)>> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), Vec<(String, String)>> {
         let mut errors = Vec::new();
         for (secondary_id, tx) in &self.outgoing {
             if let Err(e) = tx.send(msg.clone()) {

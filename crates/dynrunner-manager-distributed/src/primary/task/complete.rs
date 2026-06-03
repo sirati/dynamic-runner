@@ -1,20 +1,17 @@
-
-use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
+use crate::worker_signal::WorkerMgmtSignal;
 
-
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
     /// applies inline before the next `drain_empty_active_phases`
@@ -71,12 +68,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // post-completion state by applying this mutation. CRDT
             // semantics make duplicate applies (e.g. on a re-broadcast
             // for a task already terminal locally) a NoOp.
-            self.apply_and_broadcast_cluster_mutations(vec![
-                ClusterMutation::TaskCompleted {
-                    hash: task_hash.clone(),
-                    result_data: result_data.clone(),
-                },
-            ])
+            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
+                hash: task_hash.clone(),
+                result_data: result_data.clone(),
+            }])
             .await;
 
             // A successful TaskComplete from this secondary proves
@@ -87,36 +82,37 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // is still active.
             self.backpressured_secondaries.remove(&secondary_id);
 
-            // Mark the specific worker idle using secondary_id + local worker_id.
-            // Capture the phase + type of the just-finished item so we
-            // can fold it into per-phase counters, release the
-            // per-type concurrency slot, and run the phase lifecycle
-            // cascade.
-            // `task_id` is non-optional per the framework's boundary
-            // contract; the snapshot tuple stores it as `String`.
-            let mut completed_meta: Option<(
-                dynrunner_core::PhaseId,
-                dynrunner_core::TypeId,
-                String,
-            )> = None;
-            let mut local_idx: u32 = 0;
-            for w in &mut self.workers {
-                if w.secondary_id == secondary_id {
-                    if local_idx == worker_id {
-                        if let Some(task) = w.current_task.take() {
-                            completed_meta = Some((
-                                task.phase_id.clone(),
-                                task.type_id.clone(),
-                                task.task_id.clone(),
-                            ));
-                        }
-                        w.estimated_resources = ResourceMap::new();
-                        w.is_idle = true;
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
+            // Resolve the just-finished item BY HASH and free its
+            // holding slot through the single terminal-free helper:
+            // `free_slot_on_terminal` frees the slot back to `Idle` AND
+            // removes the `in_flight` ledger entry ONLY if the addressed
+            // slot's held hash equals this `task_hash` (the hash IS the
+            // slot's held-task identity — not a reorder-detector). A
+            // reordered TaskRequest-then-Complete cannot misfire: the
+            // request never freed the slot, so the slot still holds
+            // this hash. A Complete for a slot already reassigned to a
+            // later task returns `None` (its ledger entry is gone /
+            // belongs to a different slot) and is a safe no-op. The
+            // entry also unifies the formerly-separate pre-owned
+            // (hydrated) in-flight tasks: a completion with no local
+            // holding slot is attributed by the ledger entry just the
+            // same.
+            //
+            // `completed_meta` (phase / type / task_id) comes from the
+            // freed ledger entry's `task`, not a worker scan. The
+            // type-slot release lives inside `free_slot_on_terminal`
+            // (paired with the reserve in `commit_assignment`), so the
+            // cascade below only runs the per-phase counter; `type_id`
+            // is carried purely for the diagnostic DEBUG line.
+            let completed_meta: Option<(dynrunner_core::PhaseId, dynrunner_core::TypeId, String)> =
+                self.free_slot_on_terminal(&secondary_id, worker_id, task_hash)
+                    .map(|entry| {
+                        (
+                            entry.phase,
+                            entry.task.type_id.clone(),
+                            entry.task.task_id.clone(),
+                        )
+                    });
 
             // Operator-facing INFO: enough to grep "did task X
             // complete and how are aggregate counts moving?". The
@@ -145,37 +141,31 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "task complete: identity"
             );
 
-            if let Some((phase, type_id, task_id)) = completed_meta {
-                self.release_type_slot(&type_id);
-                self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
+            if let Some((phase, _type_id, task_id)) = completed_meta {
+                self.note_item_completed(&phase, Some(task_id.as_str()), command_rx)
+                    .await;
             }
 
-            // Kickstart dispatch to every idle worker. After
-            // `note_item_completed` runs the phase-lifecycle cascade,
-            // a previously-Blocked phase may have just transitioned
-            // to Active. Workers that have been idle since startup
-            // (because their initial TaskRequest got "no work" when
-            // the new phase wasn't yet active) won't re-poll on their
-            // own — they sent their last TaskRequest already, got
-            // nothing, and are waiting for an unsolicited
-            // TaskAssignment. Without this kickstart, a 2-phase task
-            // graph where phase-N has 1 item and phase-(N+1) has the
-            // rest would stall after the phase-N item finishes —
-            // the originating secondary's worker DOES re-request via
-            // its `request_task_for_worker(0)` in
-            // `processing.rs:193`, but every OTHER secondary's
-            // workers don't. Same kickstart pattern as
-            // `run_retry_passes` uses after re-injection.
-            //
-            // Idempotent: if no phase advanced (the common case for
-            // mid-phase completions where the phase still has queued
-            // work), `dispatch_to_idle_workers` finds the soft-pin
-            // soft-pin order returns the originating worker first and
-            // the kickstart no-ops by definition. If multiple phases
-            // cascaded done in one tick (chain of empty phases →
-            // first populated phase), every newly-active phase's
-            // items are seen.
-            self.dispatch_to_idle_workers().await.ok();
+            // A task completed: its worker freed AND a previously-
+            // Blocked phase may have just transitioned to Active in the
+            // `note_item_completed` cascade. Either way, work may now be
+            // dispatchable to a worker that won't re-poll on its own
+            // (it sent its last TaskRequest already, got "no work", and
+            // is waiting for an unsolicited TaskAssignment). EMIT a
+            // `TasksAdded` onto the decoupled worker-management bus
+            // rather than calling dispatch directly: phase/task
+            // management states "work may be available" and knows
+            // nothing of dispatch (the dispatch-decoupling law). The
+            // operational loop's worker-management arm coalesces the
+            // signal into one batched recheck over every free worker.
+            // Without this emit, a 2-phase graph where phase-N has 1
+            // item and phase-(N+1) has the rest would stall after the
+            // phase-N item finishes (the originating secondary re-
+            // requests via `request_task_for_worker(0)`, but every
+            // OTHER secondary's workers don't). The negative control
+            // test pins this emit as load-bearing.
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
 
             // Belt-and-suspenders: forward to every other secondary
             // so each one's `completed_tasks` cache stays current.
@@ -212,7 +202,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         for secondary_id in &recipients {
             if let Err(e) = self
                 .transport
-                .send_to(secondary_id, msg.clone())
+                .send(Address::Peer(secondary_id.clone()), msg.clone())
                 .await
             {
                 tracing::debug!(
@@ -223,5 +213,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
         }
     }
-
 }

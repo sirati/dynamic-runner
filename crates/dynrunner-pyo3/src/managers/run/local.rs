@@ -54,7 +54,12 @@ pub(crate) fn run_local<'py>(
     // bypasses its single-key-memory shape via the `max_resources` and
     // `low_resource_thresholds` kwargs which the legacy class accepts and
     // prefers when present. No flattening here.
-    let max_memory = config.max_resources.inner.get("memory").copied().unwrap_or(0);
+    let max_memory = config
+        .max_resources
+        .inner
+        .get("memory")
+        .copied()
+        .unwrap_or(0);
 
     let kwargs = PyDict::new(py);
     kwargs.set_item("skip_existing", skip_existing)?;

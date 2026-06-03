@@ -35,7 +35,7 @@
 use pyo3::PyResult;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use dynrunner_manager_distributed::primary::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
+use dynrunner_manager_distributed::primary::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
 
 use crate::identifier::RunnerIdentifier;
 use crate::managers::primary_handle::{PyPrimaryHandle, ReinjectCapCell};

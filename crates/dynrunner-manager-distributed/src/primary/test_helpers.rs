@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{
-    TaskInfo, Identifier, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TypeId,
+    Identifier, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -12,9 +12,7 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerTransport,
 };
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{
-    channel_pair, ChannelManagerEnd, ChannelSecondaryTransportEnd,
-};
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPeerTransport, channel_pair};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -81,6 +79,64 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
+}
+
+/// PeerTransport that records every outbound message into a shared log
+/// instead of dropping it (the [`NoPeers`] behaviour). Lets a test
+/// assert that an emission (e.g. the primary keepalive) was actually
+/// issued over the peer transport, without standing up a real mesh.
+///
+/// Both `broadcast` and `send_to_peer` append to the same log: the
+/// keepalive emitter routes through `send(Address::Broadcast(
+/// AllSecondaries), ..)`, whose default trait impl delegates to
+/// `broadcast`, but recording both keeps the helper honest if a future
+/// emission switches to unicast. `recv_peer` parks forever so the
+/// recorder never closes the peer arm.
+///
+/// Single-threaded (`Rc`/`RefCell`); only safe inside a
+/// `tokio::task::LocalSet` / `current_thread` runtime, like every other
+/// fixture in this module.
+pub(super) struct RecordingPeer<I: Identifier> {
+    pub(super) broadcasts: std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>>,
+}
+
+impl<I: Identifier> RecordingPeer<I> {
+    pub(super) fn new() -> Self {
+        Self {
+            broadcasts: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Clone of the shared log handle. The recorder is moved into
+    /// `PrimaryCoordinator::new`, so the test grabs this before the move.
+    pub(super) fn log_handle(&self) -> std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>> {
+        self.broadcasts.clone()
+    }
+}
+
+impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        0
+    }
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
 /// PeerTransport that drops every message and never produces input.
@@ -432,15 +488,9 @@ pub(super) async fn fake_secondary_with_addrs(
                 // `worker_id=0`, which after demotion is no longer
                 // self-healed by the heartbeat-driven requeue and
                 // leaves later workers permanently mid-dispatch.
-                let entries: Vec<_> = zip_files
-                    .iter()
-                    .flat_map(|zf| zf.binaries.iter())
-                    .collect();
+                let entries: Vec<_> = zip_files.iter().flat_map(|zf| zf.binaries.iter()).collect();
                 for (idx, entry) in entries.iter().enumerate() {
-                    let worker_id = workers_ready
-                        .get(idx)
-                        .map(|w| w.worker_id)
-                        .unwrap_or(0);
+                    let worker_id = workers_ready.get(idx).map(|w| w.worker_id).unwrap_or(0);
                     pending_hashes.remove(&entry.hash);
                     outgoing_to_primary
                         .send(DistributedMessage::TaskComplete {
@@ -500,18 +550,28 @@ pub(super) async fn fake_secondary_with_addrs(
 }
 
 /// Allocate the channel-pairs for `num_secondaries` and return the
-/// primary's `ChannelSecondaryTransportEnd` plus per-secondary
+/// primary's single `ChannelPeerTransport` plus per-secondary
 /// (id, secondary→primary inbox, secondary→primary outbox) tuples
 /// that the test plumbs into `fake_secondary` (or a real
 /// SecondaryCoordinator via `spawn_real_secondary` in the
 /// `e2e_helpers` companion).
+///
+/// Post-collapse the primary holds ONE `Tr: PeerTransport`. The fake
+/// secondaries still drive raw `DistributedMessage` channels (they are
+/// hand-rolled, not real `ChannelPeerTransport`s); the primary's
+/// transport is built from those raw channels via
+/// `ChannelPeerTransport::from_raw_channels` so its `send_to_peer(id)`
+/// reaches the matching fake's inbox and its `recv_peer()` drains the
+/// aggregated inbound the fakes write to. THIS is the migration the
+/// send-collapse needs: workload now flows over the peer transport, not
+/// the deleted `ChannelSecondaryTransportEnd` handle.
 // One-off test-helper return; the tuple shape is documented by the
 // per-element doc above and isn't reused elsewhere.
 #[allow(clippy::type_complexity)]
 pub(super) fn setup_test(
     num_secondaries: u32,
 ) -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     Vec<(
         String,
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -530,10 +590,7 @@ pub(super) fn setup_test(
     }
 
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         secondary_ends,
     )
 }

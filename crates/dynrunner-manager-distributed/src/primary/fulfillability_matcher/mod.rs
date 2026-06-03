@@ -44,7 +44,7 @@
 use std::panic::AssertUnwindSafe;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
@@ -55,10 +55,9 @@ use crate::primary::command_channel::PrimaryCommand;
 #[cfg(test)]
 mod tests;
 
-impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
+impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
 where
-    T: SecondaryTransport<I>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
@@ -81,10 +80,7 @@ where
     /// forget; the caller has no acknowledgement to wait on). Safe
     /// under bursts that interleave a manual reinject and a
     /// matcher-true on the same hash.
-    pub(super) async fn invoke_fulfillability_matcher_batch(
-        &mut self,
-        batch: MatcherBatch,
-    ) {
+    pub(super) async fn invoke_fulfillability_matcher_batch(&mut self, batch: MatcherBatch) {
         // No matcher installed → nothing to do. The select! arm
         // should not be enabled in this case, but the guard is
         // defensive: `set_fulfillability_matcher` is a setter, not a
@@ -171,4 +167,3 @@ where
         }
     }
 }
-

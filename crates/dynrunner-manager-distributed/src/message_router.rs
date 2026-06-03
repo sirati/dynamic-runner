@@ -34,10 +34,7 @@ impl<I: Identifier> MessageRouter<I> {
 
     /// Register a channel for a specific message type.
     /// Returns the receiving end.
-    pub fn register(
-        &mut self,
-        msg_type: MessageType,
-    ) -> mpsc::UnboundedReceiver<RoutedMessage<I>> {
+    pub fn register(&mut self, msg_type: MessageType) -> mpsc::UnboundedReceiver<RoutedMessage<I>> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.senders.insert(msg_type, tx);
         rx
@@ -49,10 +46,7 @@ impl<I: Identifier> MessageRouter<I> {
         let msg_type = message.msg_type();
         let source_id = message.sender_id().to_string();
         if let Some(tx) = self.senders.get(&msg_type) {
-            let _ = tx.send(RoutedMessage {
-                message,
-                source_id,
-            });
+            let _ = tx.send(RoutedMessage { message, source_id });
             true
         } else {
             tracing::warn!(?msg_type, "no handler registered for message type");

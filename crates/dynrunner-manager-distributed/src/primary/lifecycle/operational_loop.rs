@@ -1,67 +1,133 @@
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{
-    PeerTransport,
-    SecondaryTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_core::{ErrorType, Identifier};
+use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::compute_task_hash;
 
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
+    /// Run-completion exit decision for one operational-loop iteration.
+    ///
+    /// Returns `true` iff the loop should break this iteration on a
+    /// "the run is done" condition. This is a FAITHFUL extraction of
+    /// the three run-completion branches that previously lived inline
+    /// at the top of `operational_loop` — the counter exit, the
+    /// pool-drain exit, and the replicated-ledger `RunComplete` exit.
+    /// Their semantics are unchanged: each is re-evaluated against
+    /// live coordinator state (`total_tasks`, the pool, `cluster_state`)
+    /// every call, so lazy `spawn_tasks` / `TasksSpawned` growth is
+    /// naturally absorbed.
+    ///
+    /// The failure/abort exits (fleet-dead timeout, both-transports-
+    /// closed, panik, setup-promote deadline, stuck-worker watchdog)
+    /// are a DIFFERENT concern (the run did not complete normally) and
+    /// stay inline in the loop — they are not run-completion decisions.
+    ///
+    /// All three exits are evaluated against live CRDT / pool / counter
+    /// state, so there is no demoted-vs-authoritative `partial_view`
+    /// special-case: a node running this loop is the authoritative
+    /// primary by construction (the demoted node is a pure observer
+    /// running the secondary observe loop, NOT this loop). The
+    /// replicated-ledger `RunComplete` arm is a uniform fallback that
+    /// is redundant on the fully-seeded path (the counter arm trips
+    /// first) and load-bearing only when an external authority's
+    /// `RunComplete` broadcast is the first complete signal this node
+    /// observes.
+    pub(crate) fn run_complete_check(&self) -> bool {
+        // Check termination: all tasks accounted for AND no
+        // worker is mid-dispatch. Both halves of the check are
+        // necessary — counting `completed + failed >= total`
+        // alone would orphan in-flight tasks if the bookkeeping
+        // ever inflates (e.g. a TaskComplete arriving for a task
+        // primary doesn't currently track as in-flight on a
+        // worker — the insert grows the set while the in-flight
+        // ledger stays as-is, so the counter check trips while a
+        // sibling worker is still mid-dispatch and primary tears
+        // down before that sibling's TaskComplete arrives).
+        // Pairing the counter check with `active_workers == 0`
+        // guarantees we only exit when every dispatched
+        // assignment has been reconciled.
+        let active_workers = self.workers.iter().filter(|w| !w.is_idle()).count();
+        // Setup-defer gate: while `setup_pending()` is true the
+        // discovery feed has not yet seeded the ledger, so `total_tasks`
+        // is 0 and every declared phase is a transiently-empty `Active`.
+        // The counter exit (`0+0 >= 0`) and the pool-drain exit would
+        // both false-fire "the run is done" before any task exists. Both
+        // are skipped together until the first `TaskAdded` lands (the
+        // CRDT-derived `setup_pending()` predicate flips false). On the
+        // legacy bootstrap path (`required_setup_on_promote = false`)
+        // the predicate is permanently false and these exits run
+        // unchanged. The replicated-ledger `RunComplete` arm below is a
+        // real terminal cue and is NOT gated — an external authority's
+        // RunComplete must still exit even in setup-defer mode.
+        let setup_pending = self.setup_pending();
+        // Counter-based exit: every task accounted for (completed or
+        // failed) and no worker mid-dispatch. Re-read every iteration
+        // so lazy `spawn_tasks` / `TasksSpawned` growth is absorbed.
+        if !setup_pending
+            && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+            && active_workers == 0
+        {
+            tracing::info!("all tasks completed or failed");
+            return true;
+        }
 
+        // Drain check: pool's `is_run_complete` returns true iff
+        // queued + in-flight is zero AND no phase is Active or
+        // Draining. The active-workers guard catches the edge
+        // where in-flight is zero but a worker hasn't reported
+        // completion yet (mostly defensive — `on_item_finished`
+        // runs synchronously off the wire message).
+        if !setup_pending && self.pool().is_run_complete() && active_workers == 0 {
+            tracing::info!("pool drained and no active workers");
+            return true;
+        }
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+        // Replicated-ledger run-complete signal. Whichever node holds
+        // authority broadcasts `ClusterMutation::RunComplete` as the
+        // last act before its own `run()` returns; `dispatch_message`
+        // applies it to this node's `cluster_state` mirror.
+        //
+        // On the fully-seeded path this is a redundant exit — the
+        // counter check above trips first (the local ledger was seeded
+        // by `seed_cluster_state` and every peer's TaskCompleted arrives
+        // before the authority itself decides RunComplete). Keeping this
+        // arm unguarded is harmless and serves as a uniform fallback for
+        // any path where an external `RunComplete` is the first complete
+        // signal observed. `cluster_state.run_complete()` is a sticky
+        // monotonic flag, so this fires at most once per run.
+        if self.cluster_state.run_complete() && active_workers == 0 {
+            tracing::info!("RunComplete signal received from cluster; exiting");
+            return true;
+        }
+
+        false
+    }
 
     pub(crate) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
 
-        let mut heartbeat_tick =
-            tokio::time::interval(self.config.keepalive_interval);
+        let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
         // Skip the immediate first tick — secondaries might not have sent
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
 
-        // Setup-promote deadline anchor. Pinned at operational-loop
-        // entry so a coordinator that re-enters the loop on a retry
-        // pass measures the deadline against THIS pass's start, not
-        // a long-elapsed earlier one. The arm below consults
-        // `setup_pending` at fire time: if the latch is already cleared
-        // (TaskAdded / TasksSpawned / RunComplete arrived in time), the
-        // arm is a no-op. The deadline only ever surfaces when
-        // discovery genuinely never started.
-        //
-        // `setup_promote_loop_start` is captured locally so the
-        // `setup_deadline_outcome` write at fire time can record the
-        // exact wall-clock elapsed for diagnostic logging.
-        let setup_promote_loop_start = Instant::now();
-        let setup_promote_deadline_at =
-            setup_promote_loop_start + self.config.setup_promote_deadline;
-        // One-shot gate so the arm fires at most once per loop entry.
-        // After firing (whether we exit on a real expiry OR re-iterate
-        // because setup_pending cleared in the same tick window) the
-        // flag flips true and the arm parks on `pending().await` for
-        // the rest of this loop entry, preventing a spurious second
-        // fire after a retry-pass legitimately re-runs the loop with
-        // `setup_pending = false`.
-        let mut setup_promote_deadline_consumed = false;
-
-        // One-shot gates on the two recv arms. Each flips true the
-        // first time its channel returns `None`. Mirrors
+        // One-shot gate on the single recv arm. Flips true the first
+        // time `transport.recv_peer()` returns `None`. Mirrors
         // `SecondaryCoordinator.primary_disconnected` (see
         // `secondary/processing.rs:75`): a closed mpsc receiver
         // resolves immediately on every subsequent poll, so leaving
-        // an arm enabled after the first None would hot-loop the
+        // the arm enabled after the first None would hot-loop the
         // select!. The timer arms still drive every subsequent loop
         // iteration so the top-of-loop exit checks (counter-based,
         // pool-drained, `cluster_state.run_complete()`) can still
-        // trip. Resets are intentionally absent — once a bridge has
-        // exited it cannot re-open mid-run.
+        // trip. Resets are intentionally absent — once the transport's
+        // inbound has closed it cannot re-open mid-run.
         let mut transport_closed = false;
-        let mut peer_transport_closed = false;
 
         // Cross-thread command-channel receiver. Owned locally for the
         // duration of the loop so the `&mut self.command_rx` borrow
@@ -85,9 +151,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // One-shot gate on the matcher arm. Flips true on
         // `rx.recv() == None` (every sender dropped); subsequent
         // poll attempts would resolve immediately and hot-loop the
-        // select. Mirrors the `transport_closed` / `peer_transport_closed`
-        // gates above.
+        // select. Mirrors the `transport_closed` gate above.
         let mut matcher_arm_closed = false;
+
+        // Worker-management signal receiver. Same shape + lifetime as
+        // `matcher_trigger_rx`: taken out for the loop's duration so the
+        // `drain_worker_signal_batch` await can borrow it without
+        // conflicting with the per-arm `&mut self` borrows, then put
+        // back at loop exit so retry-pass re-entries keep draining the
+        // same channel. `None` when a previous run already consumed it
+        // (single-shot lifecycle — same handling as `matcher_trigger_rx`).
+        let mut worker_mgmt_rx = self.worker_mgmt_rx.take();
+        // One-shot gate on the worker-management arm. Flips true on
+        // `rx.recv() == None` (every sender dropped); mirrors
+        // `matcher_arm_closed`.
+        let mut worker_mgmt_arm_closed = false;
 
         // Respawn-request receiver. Same shape + lifetime as
         // `command_rx`: taken out for the duration of the loop so the
@@ -113,136 +191,61 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // secondary's panik arm.
         let mut panik_signal_rx = self.panik_signal_rx.take();
 
+        // Setup-promote-deadline timer. In setup-defer mode
+        // (`config.required_setup_on_promote`) the ledger stays empty
+        // until the discovery feed broadcasts its first `TaskAdded`;
+        // `setup_pending()` gates the run-complete exits above so the
+        // loop does not declare the run done before any task exists. The
+        // backstop: if discovery NEVER seeds the ledger (a wedged
+        // discovery feed), the loop would otherwise idle forever. The
+        // deadline arm below fires once `config.setup_promote_deadline`
+        // elapses while `setup_pending()` is still true, records the
+        // elapsed on `setup_deadline_outcome`, and breaks — the outer
+        // `run_pipeline` surfaces `RunError::SetupDeadlineExpired`.
+        //
+        // `setup_promote_loop_start` is captured locally (not on `self`)
+        // so each loop entry — including a retry-pass re-entry — measures
+        // from its own start.
+        let setup_promote_loop_start = Instant::now();
+        let setup_promote_deadline_at =
+            setup_promote_loop_start + self.config.setup_promote_deadline;
+        // One-shot gate so the arm fires at most once per loop entry.
+        // After firing (whether on a real expiry OR because
+        // `setup_pending()` cleared in the same tick window) the flag
+        // flips true and the arm parks on `pending().await` for the rest
+        // of this loop entry, preventing a spurious second fire after a
+        // retry-pass legitimately re-runs the loop with the latch clear.
+        let mut setup_promote_deadline_consumed = false;
+
         loop {
-            // Check termination: all tasks accounted for AND no
-            // worker is mid-dispatch. Both halves of the check are
-            // necessary — counting `completed + failed >= total`
-            // alone would orphan in-flight tasks if the bookkeeping
-            // ever inflates (e.g. a TaskComplete arriving for a task
-            // primary doesn't currently track as in-flight on a
-            // worker — the insert grows the set while the in-flight
-            // ledger stays as-is, so the counter check trips while a
-            // sibling worker is still mid-dispatch and primary tears
-            // down before that sibling's TaskComplete arrives).
-            // Pairing the counter check with `active_workers == 0`
-            // guarantees we only exit when every dispatched
-            // assignment has been reconciled.
-            let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            // Counter-based exit. Gates:
-            //
-            //   (a) `!self.setup_pending` — the historical setup-defer
-            //       guard: in setup-promote mode (`required_setup_on_promote
-            //       = true`) the local enters the loop with `total_tasks
-            //       = 0` and the chosen secondary still owes its first
-            //       TaskAdded broadcast; without this gate `0+0 >= 0`
-            //       trips immediately. Cleared by the first TaskAdded
-            //       or RunComplete mirror — see
-            //       `mirror_mutation_to_accounting`.
-            //
-            //   (b) `!(self.demoted && self.config.required_setup_on_promote)`
-            //       — the LMU CIP partial-CRDT-view guard. The local
-            //       submitter is always `demoted = true` post-bootstrap
-            //       (`promote_primary` unconditionally hands off to the
-            //       first secondary, see `lifecycle.rs:981`), so the
-            //       demoted-flag alone cannot gate the counter exit
-            //       without breaking every normal run. The bug only
-            //       manifests when the demoted's view is also PARTIAL
-            //       — i.e. `required_setup_on_promote = true` so
-            //       `seed_cluster_state` never ran locally and the
-            //       local learns task counts only from out-of-order
-            //       TaskAdded broadcasts. In that regime
-            //       `total_tasks` and `completed_tasks.len()` can
-            //       transiently align (e.g. 50 TaskAddeds arrive,
-            //       then 50 TaskCompleteds arrive before the next
-            //       TaskAdded batch — `50 + 0 >= 50` trips while
-            //       185 items are still unaccounted-for upstream).
-            //       For these setup-promoted demoted primaries the
-            //       ONLY safe exit is `cluster_state.run_complete()`
-            //       (the authoritative primary's terminal broadcast).
-            //
-            //       Pre-seeded mode (`required_setup_on_promote =
-            //       false` — local does discovery + seeds
-            //       `cluster_state` BEFORE handing off to the
-            //       promoted secondary; a fully production-supported
-            //       path, not a deprecated one) is unaffected: even
-            //       when demoted, the local's view was fully seeded
-            //       by `seed_cluster_state` before the operational
-            //       loop started, so `total_tasks = binaries.len()`
-            //       is set once at run start and never drifts under
-            //       partial CRDT updates. The counter exit is the
-            //       load-bearing happy-path exit for every
-            //       pre-seeded run; gating it on `!self.demoted`
-            //       would break every distributed run.
-            //
-            // Concrete bug this guard kills (asm-tokenizer LMU CIP
-            // `--jobs 15`, 50ms+ tunnel RTT, `--source-already-staged`):
-            // the setup-promoted secondary discovers 235 items,
-            // broadcasts batched TaskAdded + interleaved
-            // TaskCompleted; the demoted local's counter check
-            // momentarily aligns and the loop exits with `total=N,
-            // succeeded=N` before the upstream run is anywhere near
-            // done. The local dispatcher then chains to Phase 2 and
-            // tears down Phase 1's tunnels — killing Phase 1.
-            let partial_view = self.demoted && self.config.required_setup_on_promote;
-            if !partial_view
-                && !self.setup_pending
-                && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
-                && active_workers == 0
-            {
-                tracing::info!("all tasks completed or failed");
+            // Run-completion exit decision. The counter exit, the
+            // pool-drain exit, and the replicated-ledger RunComplete
+            // exit are extracted into `run_complete_check` (a single-
+            // concern predicate, byte-for-byte the same conditions
+            // that previously lived inline here). The failure/abort
+            // exits below (fleet-dead, both-transports-closed, panik,
+            // setup-promote deadline, stuck-worker watchdog) are a
+            // different concern and stay in the loop.
+            if self.run_complete_check() {
                 break;
             }
 
-            // Drain check: pool's `is_run_complete` returns true iff
-            // queued + in-flight is zero AND no phase is Active or
-            // Draining. The active-workers guard catches the edge
-            // where in-flight is zero but a worker hasn't reported
-            // completion yet (mostly defensive — `on_item_finished`
-            // runs synchronously off the wire message).
-            //
-            // Same `partial_view` guard as the counter exit above:
-            // a setup-promoted demoted primary's pool is also a
-            // stale local view (the authoritative pool lives on the
-            // promoted secondary, and the local pool stays empty
-            // because TaskAdded mirrors into cluster_state, not into
-            // the local pool — only the live primary's pool ingests
-            // staged items). Legacy bootstrap's pool was seeded
-            // pre-loop and drains normally.
-            if !partial_view && !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
-                tracing::info!("pool drained and no active workers");
-                break;
-            }
-
-            // Replicated-ledger run-complete signal. The promoted
-            // primary broadcasts `ClusterMutation::RunComplete` as the
-            // last act before its own `run()` returns; `handle_cluster_mutation`
-            // applies it to our `cluster_state` mirror.
-            //
-            // For a setup-promoted demoted primary (`partial_view`
-            // = true above) this is the SOLE exit cue — the local
-            // counter / pool views are partial and unreliable until
-            // RunComplete proves the authoritative primary has
-            // accounted for every task. RunComplete is causally
-            // ordered after every TaskCompleted / TaskFailed in the
-            // run, so by the time we apply it to our mirror those
-            // mutations have already updated `completed_tasks` /
-            // `failed_tasks` — the "primary finished succeeded=X
-            // fail_retry=X ..." log line at the demoted exit reflects
-            // the true final state.
-            //
-            // Pre-seeded demoted primary (`required_setup_on_promote
-            // = false`): RunComplete is a redundant exit (the
-            // counter check above trips first, since the local was
-            // fully seeded by `seed_cluster_state` and TaskCompleteds
-            // from every peer's worker arrive on the per-peer
-            // SecondaryTransport / peer transport before the promoted
-            // primary itself decides RunComplete). Keeping this arm
-            // unguarded is harmless and serves as a uniform fallback.
-            //
-            // Sticky monotonic flag, so this fires at most once
-            // per run.
-            if self.cluster_state.run_complete() && active_workers == 0 {
-                tracing::info!("RunComplete signal received from cluster; exiting");
+            // Worker-management run-should-fail exit. The
+            // worker-management `select!` arm records a break outcome on
+            // `worker_mgmt_fail_outcome` when it drains a
+            // `RunShouldFail` (emitted by the phase layer onto the
+            // decoupled bus, OR by the phase-floor liveness check). The
+            // worker arm OWNS the clean-shutdown drive; breaking here —
+            // not from the emit path — keeps phase/task management fully
+            // decoupled from worker management (the dispatch-decoupling
+            // law). `run_pipeline` consumes the outcome after the loop
+            // returns Ok and surfaces the failure. Same write-by-arm /
+            // read-by-loop discipline as `panik_outcome`.
+            if self.worker_mgmt_fail_outcome.is_some() {
+                tracing::warn!(
+                    "primary operational loop exiting via worker-management \
+                     run-should-fail signal"
+                );
                 break;
             }
 
@@ -297,18 +300,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 self.fleet_dead_since = None;
             }
 
-            // Both inbound paths closed: no further mutations can
-            // arrive on either source, so the demoted-primary view is
-            // frozen. The pre-Step-6 behaviour (transport-closed →
-            // immediate break) is preserved structurally for the
-            // pathological "every channel died" case. The
+            // Inbound closed: no further mutations can arrive, so this
+            // node's view is frozen. The pre-collapse behaviour
+            // (transport-closed → break) is preserved for the
+            // pathological "mesh died" case. The
             // `cluster_state.run_complete()` check above is the
             // happy-path exit; this guard is only reached when the
-            // mesh itself has collapsed.
-            if transport_closed && peer_transport_closed {
-                tracing::info!(
-                    "both transport and peer_transport closed; exiting operational loop"
-                );
+            // transport's inbound itself has closed.
+            if transport_closed {
+                tracing::info!("transport inbound closed; exiting operational loop");
                 break;
             }
 
@@ -317,66 +317,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // is generous — if no message arrives in 5 minutes and there
             // are in-flight tasks, something is wrong.
             //
-            // Cancellation safety: `transport.recv` is the mpsc-bridged
-            // `NetworkServer::recv` (cancel-safe — see `MessageReceiver`
-            // doc). `peer_transport.recv_peer` is the mpsc-backed
-            // tunneled inbound queue (also cancel-safe — see
-            // `TunneledPeerTransport::recv_peer`). The two timer arms
-            // (heartbeat tick + 5-min sleep) are tokio time primitives
-            // which are themselves cancel-safe.
+            // Cancellation safety: `transport.recv_peer` is the
+            // mpsc-backed unified inbound demux (cancel-safe — see
+            // `TunneledPeerTransport::recv_peer` /
+            // `ColocatedPrimaryTransport::recv_peer`). The two timer
+            // arms (heartbeat tick + 5-min sleep) are tokio time
+            // primitives which are themselves cancel-safe.
+            //
+            // There is exactly ONE inbound arm: the unification deleted
+            // the legacy `transport.recv()` arm + its
+            // "legacy-closed-but-mesh-live" special case. The folded
+            // `NetworkServer` demux means `recv_peer` IS the real
+            // inbound (no duplicate frames, no separate uplink to keep
+            // alive), so the single arm carries every welcome / cert /
+            // request / completion / ClusterMutation through
+            // `dispatch_message` — the same dispatcher the deleted arm
+            // used, idempotent on every wire shape.
             tokio::select! {
-                msg = self.transport.recv(), if !transport_closed => {
-                    match msg {
-                        Some(m) => self.dispatch_message(m, &mut command_rx).await?,
-                        None => {
-                            // Legacy `transport.recv()` returned None —
-                            // the per-secondary SecondaryTransport bridge
-                            // exited. Two structural cases:
-                            //
-                            // 1. Pre-demotion / no mesh: the legacy
-                            //    transport is the only inbound path. The
-                            //    historical "transport close = end of
-                            //    run" semantics apply; exit cleanly.
-                            //
-                            // 2. Post-demotion (`self.demoted == true`)
-                            //    with a live peer mesh: the legacy
-                            //    transport's writer task to the promoted
-                            //    secondary has shut down per the
-                            //    PromotePrimary contract, but the demoted
-                            //    local is still a real mesh member (Step
-                            //    5b `TunneledPeerTransport`). The new
-                            //    primary's ClusterMutation /
-                            //    Keepalive / TaskCompleted broadcasts
-                            //    arrive on the peer_transport arm below;
-                            //    the loop's exit cues (counter check,
-                            //    pool-drained, RunComplete) are all
-                            //    driven by mutations the peer arm feeds
-                            //    through `dispatch_message`. Breaking
-                            //    here would re-introduce bug class #1
-                            //    (asm-tokenizer "succeeded=0 + 235 CSVs
-                            //    landed") and #79 (chain-gate reading
-                            //    stale 0/0/0).
-                            //
-                            // The architectural invariant
-                            // (`feedback_mesh_independent_of_role_and_membership`):
-                            // mesh state is transport-independent of any
-                            // single legacy channel.
-                            transport_closed = true;
-                            if self.peer_transport.peer_count() > 0 {
-                                tracing::info!(
-                                    peer_count = self.peer_transport.peer_count(),
-                                    demoted = self.demoted,
-                                    "legacy transport closed; staying in operational \
-                                     loop — peer mesh still active, mutations and \
-                                     RunComplete will arrive via peer_transport"
-                                );
-                                continue;
-                            }
-                            tracing::info!("transport closed");
-                            break;
-                        }
-                    }
-                }
                 cmd = async {
                     match command_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -456,60 +413,88 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         }
                     }
                 }
-                peer_msg = self.peer_transport.recv_peer(), if !peer_transport_closed => {
-                    match peer_msg {
+                wm_batch = async {
+                    match worker_mgmt_rx.as_mut() {
+                        Some(rx) => {
+                            crate::worker_signal::drain_worker_signal_batch(
+                                rx,
+                                crate::worker_signal::WORKER_SIGNAL_BATCH_IDLE_WINDOW,
+                            ).await
+                        }
+                        // No receiver attached — park forever so the
+                        // arm never fires. Mirrors the matcher arm's
+                        // `pending().await` for the same closed-channel
+                        // hot-loop reason.
+                        None => std::future::pending().await,
+                    }
+                }, if !worker_mgmt_arm_closed => {
+                    match wm_batch {
+                        Some(batch) => {
+                            // Worker management's PARKED RECHECK: a batch
+                            // of decoupled signals arrived. The reaction
+                            // (dispatch recheck over every free worker,
+                            // phase-floor liveness check, run-should-fail
+                            // break) lives in `lifecycle::worker_mgmt`;
+                            // this arm's only concern is "a batch
+                            // arrived; hand it off". The phase/task code
+                            // that emitted the signals never touched
+                            // worker management directly (the
+                            // dispatch-decoupling law).
+                            self.react_to_worker_signal_batch(batch).await;
+                        }
+                        None => {
+                            // Every sender dropped. Same as the matcher
+                            // channel's None arm: disable this arm and
+                            // let the timer / counter exit cues take over.
+                            worker_mgmt_arm_closed = true;
+                            tracing::debug!(
+                                "worker-management signal channel closed; disabling \
+                                 the worker-management arm for the remainder of \
+                                 the loop"
+                            );
+                        }
+                    }
+                }
+                msg = self.transport.recv_peer(), if !transport_closed => {
+                    match msg {
                         Some(m) => {
-                            // Same dispatcher the legacy arm uses. Post-
-                            // demotion the new primary's broadcasts
-                            // (`ClusterMutation::TaskCompleted`,
-                            // `ClusterMutation::RunComplete`, Keepalive,
-                            // etc.) arrive here; threading them through
-                            // `dispatch_message` keeps a single source
-                            // of truth for wire-shape handling.
+                            // THE single inbound arm. Every wire shape —
+                            // welcome / cert / TaskRequest / TaskComplete
+                            // / TaskFailed / Keepalive / ClusterMutation
+                            // (incl. a promoted peer's broadcasts post-
+                            // demotion) — arrives here and threads through
+                            // `dispatch_message`, the one source of truth
+                            // for wire-shape handling.
                             //
-                            // Idempotency: every mutation a peer might
-                            // also forward via `transport` is dedup-
-                            // gated downstream — `cluster_state.apply`
-                            // is CRDT-idempotent, the `completed_tasks`
-                            // / `failed_tasks` HashSet inserts are
+                            // Idempotency: `cluster_state.apply` is
+                            // CRDT-idempotent, the `completed_tasks` /
+                            // `failed_tasks` HashSet inserts are
                             // idempotent, and `handle_task_complete`
-                            // already short-circuits on
-                            // `completed_tasks.contains(hash)`. Safe
-                            // by construction; no extra dedup needed
-                            // at this layer.
+                            // short-circuits on
+                            // `completed_tasks.contains(hash)` — so a
+                            // mutation that reaches the primary via more
+                            // than one peer-forward path is absorbed.
                             self.dispatch_message(m, &mut command_rx).await?;
                         }
                         None => {
-                            // Peer transport closed (only when every
-                            // TunneledPeerTransport writer has gone
-                            // away, or for `NoPeerTransport` the future
-                            // never resolves so this branch is
-                            // unreachable). Gate the arm so subsequent
-                            // select! iterations don't hot-poll a
-                            // permanently-resolved future. The legacy
-                            // arm and the timer arms still drive exit
-                            // conditions; the top-of-loop checks
-                            // (`run_complete`, counter-based) can still
-                            // break.
-                            peer_transport_closed = true;
+                            // The transport's inbound closed (every
+                            // writer/connection gone). Gate the arm so
+                            // subsequent select! iterations don't
+                            // hot-poll a permanently-resolved future; the
+                            // top-of-loop `transport_closed` guard then
+                            // breaks the loop (the timer arms still drive
+                            // the run_complete / counter exit checks until
+                            // the next iteration).
+                            transport_closed = true;
                             tracing::debug!(
-                                "peer_transport.recv_peer() returned None; \
-                                 disabling the arm for the remainder of the loop"
+                                "transport.recv_peer() returned None; \
+                                 disabling the inbound arm for the remainder of the loop"
                             );
                         }
                     }
                 }
                 _ = heartbeat_tick.tick() => {
                     self.broadcast_primary_keepalive().await;
-                    // Demoted observer mode: the promoted
-                    // primary owns dead-secondary detection and the
-                    // associated requeue. If the local primary also
-                    // requeued, the same in-flight task would be
-                    // re-dispatched twice (once from each primary's
-                    // pool view) — duplicating work and racing on
-                    // ledger state. We still send keepalives so peers
-                    // know we're alive, but skip the requeue path.
-                    //
                     // `process_heartbeat_tick` runs the per-tick
                     // mass-death-aware death evaluator: resolve any
                     // already-deferred secondaries (recovery or grace
@@ -518,9 +503,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     // (requeue). See `process_heartbeat_tick` for
                     // detail and `PrimaryConfig.mass_death_grace` for
                     // the disable knob.
-                    if !self.demoted {
-                        self.process_heartbeat_tick().await?;
-                    }
+                    self.process_heartbeat_tick().await?;
                 }
                 req = async {
                     match respawn_request_rx.as_mut() {
@@ -579,15 +562,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // exactly once: with `Ok(signal)` on first-matching
                 // panik file, or with `Err(_)` if the watcher's
                 // sender was dropped (empty paths config or task
-                // abort on coordinator drop). On `Ok` we broadcast
-                // `ClusterMutation::PanikRequested` and stash the
+                // abort on coordinator drop). On `Ok` we announce a
+                // self-authored `ClusterMutation::PeerRemoved
+                // { SelfDeparture }` (observability only) and stash the
                 // (matched_path, reason) on `self.panik_outcome` so
                 // the outer `run_pipeline` can translate it into
                 // `RunError::PanikShutdown`. Breaking out of the
-                // loop here mirrors the `transport_closed` /
-                // `peer_transport_closed` exit shape: the operational
-                // loop's `Result<(), String>` signature does not need
-                // to change.
+                // loop here mirrors the `transport_closed` exit shape:
+                // the operational loop's `Result<(), String>` signature
+                // does not need to change.
                 //
                 // `Err(_)` is treated as a no-op (watcher disabled or
                 // gracefully stopped); the loop continues. Setting
@@ -616,49 +599,46 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         break;
                     }
                 }
-                // Setup-promote-deadline arm. Gated by the
-                // `if self.setup_pending && !setup_promote_deadline_consumed`
-                // arm condition (the same shape `matcher_trigger_rx`
-                // uses) so the arm is *disabled* the moment the
-                // latch clears (a long-but-eventually-successful
-                // discovery does NOT false-fire), and so a
-                // coordinator re-entering the loop on a retry pass
-                // with `setup_pending = false` doesn't observe a
-                // stale resolved sleep.
+                // Setup-promote-deadline arm. Gated by
+                // `self.setup_pending() && !setup_promote_deadline_consumed`
+                // (the same arm-condition shape `matcher_trigger_rx`
+                // uses) so the arm is DISABLED the moment the
+                // setup-defer gate clears — a long-but-eventually-
+                // successful discovery does NOT false-fire — and so a
+                // coordinator re-entering the loop on a retry pass with
+                // the gate already clear doesn't observe a stale
+                // resolved sleep.
                 //
                 // Single-concern: this arm OWNS the
                 // setup-promote-deadline timer. It reads only
-                // `setup_pending` (the latch the rest of the
-                // primary already maintains) and writes only
-                // `setup_deadline_outcome` (a new field the outer
-                // `run_pipeline` consumes). It does NOT touch
-                // dead-detection, heartbeat tracking, transport
-                // teardown, or any other concern.
+                // `setup_pending()` (the CRDT-derived gate the rest of
+                // the primary already maintains) and writes only
+                // `setup_deadline_outcome` (the field the outer
+                // `run_pipeline` consumes). It touches no dead-detection,
+                // heartbeat, or transport-teardown concern.
                 //
-                // Cancellation safety: `tokio::time::sleep_until`
-                // is one-shot cancel-safe per tokio docs (same
-                // primitive `wait_for_connections` /
-                // `wait_for_mesh_ready` use).
+                // Cancellation safety: `tokio::time::sleep_until` is
+                // one-shot cancel-safe per tokio docs (same primitive
+                // `wait_for_connections` / `wait_for_mesh_ready` use).
                 _ = tokio::time::sleep_until(setup_promote_deadline_at.into()),
-                    if self.setup_pending && !setup_promote_deadline_consumed => {
+                    if self.setup_pending() && !setup_promote_deadline_consumed => {
                     setup_promote_deadline_consumed = true;
-                    // Re-check the latch at fire time. The
-                    // `select!` doesn't guarantee the arm-condition
-                    // was true at the exact moment the inner
-                    // future resolved — a TaskAdded mutation could
-                    // land on the transport arm in the same tick
-                    // the sleep elapses. If the latch cleared,
-                    // treat the firing as a no-op and let the
-                    // next iteration's exit checks decide.
-                    if self.setup_pending {
+                    // Re-check the gate at fire time: `select!` does not
+                    // guarantee the arm-condition held at the exact
+                    // moment the sleep resolved — a TaskAdded mutation
+                    // could land on a recv arm in the same tick the
+                    // sleep elapses. If the gate cleared, treat the
+                    // firing as a no-op and let the next iteration's
+                    // exit checks decide.
+                    if self.setup_pending() {
                         let elapsed = setup_promote_loop_start.elapsed();
                         tracing::error!(
                             elapsed_s = elapsed.as_secs_f64(),
                             deadline_s = self.config.setup_promote_deadline.as_secs_f64(),
-                            "setup-promote deadline expired: promoted secondary \
-                             never broadcast TaskAdded / TasksSpawned / RunComplete. \
-                             Exiting operational loop; outer run_pipeline will \
-                             surface RunError::SetupDeadlineExpired."
+                            "setup-promote deadline expired: discovery feed never \
+                             seeded the ledger (no TaskAdded / TasksSpawned / \
+                             RunComplete). Exiting operational loop; outer \
+                             run_pipeline will surface RunError::SetupDeadlineExpired."
                         );
                         self.setup_deadline_outcome = Some(elapsed);
                         break;
@@ -679,7 +659,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     // `try_run_phase_retry_bucket` is its sole
                     // writer. Outside the OOM bucket the arm runs
                     // unchanged.
-                    let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+                    let active = self.workers.iter().filter(|w| !w.is_idle()).count();
                     if active > 0 {
                         let outcome = self.outcome_summary();
                         tracing::warn!(
@@ -695,18 +675,45 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         // are workers that didn't ack progress for the
                         // operational-loop timeout window — typically
                         // a stuck worker or wedged transport. Classify
-                        // as Recoverable so `run_retry_passes` gets a
-                        // chance to re-dispatch them; if they wedge
-                        // the same way on retry, the retry-budget
-                        // exhaustion path takes over.
-                        for worker in &mut self.workers {
-                            if let Some(binary) = worker.current_task.take() {
-                                let hash = compute_task_hash(&binary);
-                                self.failed_tasks
-                                    .insert(hash, ErrorType::Recoverable);
-                                worker.estimated_resources = ResourceMap::new();
-                                worker.is_idle = true;
+                        // as Recoverable so a later retry gets a chance
+                        // to re-dispatch them; if they wedge the same
+                        // way on retry, the retry-budget exhaustion path
+                        // takes over.
+                        //
+                        // Snapshot every held slot's
+                        // `(secondary, local_worker_id, hash)` first
+                        // (an immutable borrow), then free each through
+                        // the single `free_slot_on_terminal` helper so
+                        // the slot, the `in_flight` ledger entry, and
+                        // the per-type concurrency slot all release
+                        // together — the same terminal path TaskComplete
+                        // / TaskFailed use, keyed by the held hash. The
+                        // re-tag into `failed_tasks` preserves the
+                        // pre-existing "mark Recoverable, don't decrement
+                        // the phase counter at loop-exit" behaviour
+                        // (this arm only fires on the timeout-exit edge).
+                        let held: Vec<(String, u32, String)> = {
+                            let mut out = Vec::new();
+                            for idx in 0..self.workers.len() {
+                                let w = &self.workers[idx];
+                                if let Some(task) = w.held_task() {
+                                    out.push((
+                                        w.secondary_id.clone(),
+                                        self.local_worker_id_in_secondary(idx),
+                                        compute_task_hash(task),
+                                    ));
+                                }
                             }
+                            out
+                        };
+                        for (secondary_id, local_worker_id, hash) in held {
+                            self.failed_tasks
+                                .insert(hash.clone(), ErrorType::Recoverable);
+                            self.free_slot_on_terminal(
+                                &secondary_id,
+                                local_worker_id,
+                                &hash,
+                            );
                         }
                     }
                 }
@@ -724,6 +731,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // the same channel so holdings-update bursts during retry
         // passes still drive the matcher.
         self.matcher_trigger_rx = matcher_trigger_rx;
+        // Same rationale for the worker-management signal receiver:
+        // retry passes re-enter the operational loop and must keep
+        // draining the same bus so a `TasksAdded` emitted during a
+        // retry pass still drives the dispatch recheck.
+        self.worker_mgmt_rx = worker_mgmt_rx;
         // Same rationale for the respawn-request receiver: retry
         // passes re-enter the operational loop and a death observed
         // during a retry pass should still drive the dispatcher.
@@ -745,52 +757,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // is in flight; an empty JoinSet is a fast no-op.
         self.drain_respawn_tasks().await;
 
-        // Mirror-divergence detector. On the demoted observer the
-        // `completed_tasks` / `failed_tasks` HashSets and the CRDT-
-        // replicated `cluster_state` outcome partition are supposed
-        // to converge: every TaskCompleted / TaskFailed broadcast
-        // routes through either `handle_task_complete` (line 58 of
-        // `task/complete.rs`, direct insert) or
-        // `mirror_mutation_to_accounting` (line 168 of
-        // `task/mutation.rs`, mirror-then-apply). Both populate the
-        // HashSets BEFORE applying to `cluster_state`, so the
-        // CRDT cannot have a terminal entry the HashSet is missing.
-        //
-        // The production bug class #88 documents the opposite: the
-        // demoted primary's terminal log undercounted whenever a
-        // cross-secondary completion's mirror hop was bypassed. The
-        // accessors `completed_count()` / `failed_count()` now route
-        // through `cluster_state.outcome_counts()` to mask that
-        // divergence at the operator-facing read site (the dispatcher's
-        // `succeeded=N` stdout); this trace fires when the divergence
-        // is actually observable so a production trace can pin the
-        // wire path that produced it. Demoted-observer-only (a live
-        // primary's HashSet IS authoritative for its own dispatched
-        // tasks); behind `tracing::debug` so a clean run is silent.
-        if self.demoted {
-            let crdt = self.cluster_state.outcome_counts();
-            let crdt_failed = crdt.fail_retry + crdt.fail_oom + crdt.fail_final;
-            if self.completed_tasks.len() != crdt.succeeded
-                || self.failed_tasks.len() != crdt_failed
-            {
-                tracing::debug!(
-                    hashset_completed = self.completed_tasks.len(),
-                    hashset_failed = self.failed_tasks.len(),
-                    crdt_succeeded = crdt.succeeded,
-                    crdt_failed,
-                    "demoted-observer mirror divergence: completed_tasks / \
-                     failed_tasks HashSets disagree with cluster_state. \
-                     `mirror_mutation_to_accounting` should keep them in \
-                     lock-step on every TaskCompleted / TaskFailed CRDT \
-                     apply (see primary/task/mutation.rs). The \
-                     `completed_count()` / `failed_count()` accessors mask \
-                     the divergence by reading from `cluster_state`; this \
-                     log surfaces the underlying mirror bypass for \
-                     post-hoc diagnosis."
-                );
-            }
-        }
-
         Ok(())
     }
 
@@ -808,14 +774,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// The function body is kept as a no-op (rather than removed)
     /// so the existing call site in `run_pipeline` stays compiling
     /// without a churning structural edit; cleanup of the call
-    /// site is a follow-up. Panik / demoted short-circuits stay so
-    /// a future re-introduction of post-pipeline behaviour doesn't
-    /// silently re-arm them.
+    /// site is a follow-up. The panik short-circuit stays so a
+    /// future re-introduction of post-pipeline behaviour doesn't
+    /// silently re-arm it.
     pub(crate) async fn run_retry_passes(&mut self) -> Result<(), String> {
         if self.panik_outcome.is_some() {
-            return Ok(());
-        }
-        if self.demoted {
             return Ok(());
         }
         Ok(())
@@ -848,10 +811,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// loop knew how to handle is handled identically here — no parallel
     /// switch-statement, no special-cased subset. The drain is a
     /// post-loop continuation, not a different code path.
-    pub(crate) async fn drain_pending_messages(
-        &mut self,
-        budget: Duration,
-    ) -> Result<(), String> {
+    pub(crate) async fn drain_pending_messages(&mut self, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
         let quiet_window = Duration::from_millis(50);
         let mut drained = 0usize;
@@ -861,7 +821,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 break;
             }
             let poll_window = std::cmp::min(quiet_window, remaining);
-            match tokio::time::timeout(poll_window, self.transport.recv()).await {
+            match tokio::time::timeout(poll_window, self.transport.recv_peer()).await {
                 Ok(Some(msg)) => {
                     // Post-loop drain: no operational loop is running to
                     // service callback-queued spawn_tasks, so passing
@@ -901,5 +861,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
         Ok(())
     }
-
 }

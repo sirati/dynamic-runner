@@ -29,15 +29,17 @@ fn snapshot_round_trip_preserves_state() {
         hash: "c".into(),
         task: mk_task("c"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "c".into(),
+        result_data: None,
+    });
     s.apply(ClusterMutation::PrimaryChanged {
         new: "s1".into(),
         epoch: 3,
     });
-    let deps: HashMap<PhaseId, Vec<PhaseId>> =
-        [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
-            .into_iter()
-            .collect();
+    let deps: HashMap<PhaseId, Vec<PhaseId>> = [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
+        .into_iter()
+        .collect();
     s.apply(ClusterMutation::PhaseDepsSet { deps: deps.clone() });
 
     let snap = s.snapshot();
@@ -60,6 +62,54 @@ fn snapshot_round_trip_preserves_state() {
         joiner.task_state("c"),
         Some(TaskState::Completed { .. })
     ));
+}
+
+/// A terminal `InvalidTask` entry survives a snapshot → restore cycle
+/// onto a fresh joiner: it ranks as a strongest terminal (so a stale
+/// peer's Pending observation cannot overwrite it on merge) and its
+/// `reason` body is preserved verbatim.
+#[test]
+fn snapshot_round_trip_preserves_invalid_task() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "bad".into(),
+        task: mk_task("bad"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "bad".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "duplicate (phase,task_id)".to_string().into(),
+        },
+        error: "invalid_task:duplicate (phase,task_id)".into(),
+    });
+
+    let snap = s.snapshot();
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.restore(snap);
+
+    match joiner.task_state("bad") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "duplicate (phase,task_id)");
+        }
+        other => panic!("expected InvalidTask after restore, got {other:?}"),
+    }
+    assert_eq!(joiner.counts(), s.counts());
+
+    // Lattice rank: a stale peer's later Pending snapshot must NOT
+    // overwrite the terminal InvalidTask on the joiner.
+    let mut stale = ClusterState::<RunnerIdentifier>::new();
+    stale.apply(ClusterMutation::TaskAdded {
+        hash: "bad".into(),
+        task: mk_task("bad"),
+    });
+    joiner.restore(stale.snapshot());
+    assert!(
+        matches!(
+            joiner.task_state("bad"),
+            Some(TaskState::InvalidTask { .. })
+        ),
+        "terminal InvalidTask must win over a stale Pending snapshot"
+    );
 }
 
 /// Pins the Step 8 contract that `ClusterStateSnapshot` carries
@@ -131,7 +181,10 @@ fn restore_lattice_merge_preserves_local_terminal() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    joiner.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    joiner.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::TaskAdded {
@@ -213,7 +266,10 @@ fn restore_idempotent_under_double_apply() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    peer.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    peer.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
 
     let snap = peer.snapshot();
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
@@ -261,4 +317,67 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
         Some(TaskState::Blocked { on, .. }) => assert_eq!(on, "u"),
         other => panic!("expected Blocked, got {other:?}"),
     }
+}
+
+/// Migration shim (snapshot-only): a legacy snapshot carries deps that
+/// predate the `(phase_id, task_id)` identity, so they decode with the
+/// sentinel (empty) phase. On `restore`, the shim must inject the
+/// enclosing task's phase into every sentinel dep — and leave any dep
+/// that already names its phase (a new, explicit cross-phase dep)
+/// untouched.
+#[test]
+fn restore_migrates_unphased_deps_to_enclosing_phase() {
+    use dynrunner_core::TaskDep;
+
+    // Build a task in phase "p0" (mk_task's phase) whose dep list mixes
+    // a legacy un-phased dep (sentinel phase) and an explicit
+    // cross-phase dep.
+    let mut task = mk_task("dependent");
+    task.task_depends_on = vec![
+        // Legacy un-phased dep: sentinel phase, to be migrated.
+        TaskDep {
+            task_id: "legacy_prereq".into(),
+            phase_id: PhaseId::default(),
+            inherit_outputs: false,
+        },
+        // New explicit cross-phase dep: must NOT be rewritten.
+        TaskDep {
+            task_id: "explicit_prereq".into(),
+            phase_id: PhaseId::from("other-phase"),
+            inherit_outputs: true,
+        },
+    ];
+
+    let mut source = ClusterState::<RunnerIdentifier>::new();
+    source.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task,
+    });
+    let snap = source.snapshot();
+
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.restore(snap);
+
+    let restored = match joiner.task_state("h") {
+        Some(TaskState::Pending { task }) => task,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    let deps = &restored.task_depends_on;
+    assert_eq!(deps.len(), 2);
+    // Legacy dep took the enclosing task's phase ("p0").
+    assert_eq!(deps[0].task_id, "legacy_prereq");
+    assert_eq!(
+        deps[0].phase_id,
+        PhaseId::from("p0"),
+        "sentinel migrated to enclosing phase"
+    );
+    assert!(!deps[0].is_unphased());
+    // Explicit cross-phase dep is unaffected by the shim.
+    assert_eq!(deps[1].task_id, "explicit_prereq");
+    assert_eq!(
+        deps[1].phase_id,
+        PhaseId::from("other-phase"),
+        "explicit dep untouched"
+    );
+    assert!(deps[1].inherit_outputs);
 }

@@ -1,21 +1,18 @@
-
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, Role,
-    SecondaryTransport,
-};
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo,
-};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
+use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-
-    pub(crate) async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
+    pub(crate) async fn handle_task_request(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
             ref secondary_id,
             worker_id,
@@ -23,74 +20,47 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             ..
         } = msg
         {
-            let available_res: ResourceMap = available_resources.iter()
+            let available_res: ResourceMap = available_resources
+                .iter()
                 .map(|r| (r.kind.clone(), r.amount))
                 .collect();
-            // Find matching worker
-            let mut target_idx = None;
-            let mut local_idx: u32 = 0;
-            for (idx, w) in self.workers.iter().enumerate() {
-                if w.secondary_id == *secondary_id {
-                    if local_idx == worker_id {
-                        target_idx = Some(idx);
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
+            // Find matching worker by its stable secondary-local id.
+            let target_idx = self.worker_idx_for(secondary_id, worker_id);
 
             let mut assigned = false;
 
-            // Demoted observer mode: the promoted primary is
-            // the sole authority for assignment. Skip the local-
-            // assign branch entirely so the request always falls
-            // through to the primary relay below — that way
-            // only one primary's pool ever decides what runs where.
-            // Without this skip, the local primary would race the
-            // primary by assigning from its own (post-handoff
-            // stale) pool view. See `demoted` doc on
-            // `PrimaryCoordinator`.
+            // R1: `TaskRequest` is a pure capacity hint that NEVER
+            // frees a slot. The removed free-on-request block
+            // (`current_task = None; is_idle = true`) and the removed
+            // stale-request guard let a bare request mutate slot state;
+            // R1's `SlotState` typestate makes assignment reachable
+            // ONLY from `Idle` (via `commit_assignment`'s
+            // `assign`/`debug_assert`) and frees a slot ONLY on a
+            // terminal outcome via `free_slot_on_terminal`. The
+            // `demoted` short-circuit is gone too — there is no
+            // demoted-primary self-assign race to guard against.
+            //
+            // Capacity-hint contract: if the addressed slot is already
+            // `Assigned`, the request is a no-op on slot state (a
+            // delayed/duplicate request for a worker that's still
+            // running the task it last took) — we fall through to the
+            // primary-relay arm without touching the slot or the
+            // ledger. Only an `Idle` slot refreshes its budget and
+            // attempts one assignment.
             if let Some(idx) = target_idx
-                && !self.demoted
+                && self.workers[idx].is_idle()
             {
-                // Stale TaskRequest guard: if primary's view says this
-                // worker is already mid-dispatch (current_task =
-                // Some(_)), the kickstart in `handle_task_complete` /
-                // `handle_task_failed` has just sent a TaskAssignment
-                // to the same worker. The TaskRequest in our hand was
-                // sent by the secondary BEFORE that kickstart-
-                // assignment arrived. Honouring it would dispatch a
-                // SECOND assignment to a worker that's about to be
-                // busy with the first, secondary then bounces the
-                // second with "No idle worker available" — every such
-                // bounce becomes a Recoverable failure that consumes
-                // a retry budget. Skip silently; the worker will
-                // process the kickstart-assignment and send a fresh
-                // TaskRequest after that one terminates.
-                if self.workers[idx].current_task.is_some() {
-                    tracing::trace!(
-                        secondary = %secondary_id,
-                        worker_id,
-                        "stale TaskRequest after kickstart-dispatch; skipping"
-                    );
-                    return Ok(());
-                }
                 // Composed dispatch-shape gate: backpressure backoff
                 // + OOM-bucket single-worker masking. See
                 // `should_skip_worker_for_dispatch` for the
-                // per-reason documentation. Replaces the historical
-                // bare backpressure check so the OOM bucket's "only
-                // worker 0 of each secondary may serve a retry"
-                // shape applies here too; without that the
-                // TaskRequest path would happily hand a memory-
-                // pressed retry to worker N>0 and defeat the bucket.
-                if self.should_skip_worker_for_dispatch(idx) {
+                // per-reason documentation. `false`: a secondary's own
+                // `TaskRequest` does NOT bypass its backoff — the
+                // backoff exists precisely to stop a secondary that
+                // just said "no idle worker" from re-hammering us on
+                // its request-retry tick.
+                if self.should_skip_worker_for_dispatch(idx, false) {
                     return Ok(());
                 }
-                // Mark worker idle
-                self.workers[idx].current_task = None;
-                self.workers[idx].estimated_resources = ResourceMap::new();
-                self.workers[idx].is_idle = true;
                 if !available_res.is_empty() {
                     self.workers[idx].resource_budgets = available_res.clone();
                 }
@@ -123,13 +93,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     } = decision
                     {
                         let binary = self.pool_mut().take_from_view(view, binary_index);
-                        self.reserve_type_slot(&binary.type_id);
                         let sec_id = self.workers[idx].secondary_id.clone();
-                        self.workers[idx].current_task = Some(binary.clone());
-                        self.workers[idx].estimated_resources = estimated_usage.clone();
-                        self.workers[idx].is_idle = false;
 
                         let task_hash = compute_task_hash(&binary);
+                        // Type-slot reserve + slot `Idle ->
+                        // Assigned{task_hash}` + ledger insert, committed
+                        // together. The slot is idle here: the outer arm
+                        // gated on `is_idle()`, so assignment is reachable
+                        // only from an idle slot.
+                        self.commit_assignment(
+                            idx,
+                            binary.clone(),
+                            task_hash.clone(),
+                            estimated_usage.clone(),
+                        );
                         // Resolve the per-edge predecessor-output map from the
                         // replicated `cluster_state.task_outputs` cache. The
                         // helper handles both the direct-dep present-but-empty
@@ -154,9 +131,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
                         // Same partial-commit-leak rollback as
                         // `dispatch_to_idle_workers`: a send_to
-                        // failure here pre-fix left the worker's
-                        // current_task set + is_idle=false + pool
-                        // in_flight bumped. dispatch_order then
+                        // failure here pre-fix left the slot Assigned +
+                        // pool in_flight bumped. dispatch_order then
                         // skipped the slot forever; the leaked
                         // in_flight never decremented because no
                         // TaskComplete/TaskFailed could arrive for
@@ -164,8 +140,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         // 33-in_flight/active=0 jam at 84f669c is
                         // the operator-facing symptom of cumulative
                         // leaks from this and the sibling path.
-                        if let Err(send_err) =
-                            self.transport.send_to(&sec_id, assignment_msg).await
+                        if let Err(send_err) = self
+                            .transport
+                            .send(Address::Peer(sec_id.clone()), assignment_msg)
+                            .await
                         {
                             tracing::warn!(
                                 secondary = %sec_id,
@@ -174,11 +152,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                                 error = %send_err,
                                 "task-assignment send failed; rolling back worker state and requeuing binary"
                             );
-                            self.workers[idx].current_task = None;
-                            self.workers[idx].estimated_resources =
-                                ResourceMap::new();
-                            self.workers[idx].is_idle = true;
-                            self.release_type_slot(&binary.type_id);
+                            // Undo the `commit_assignment` triple (type
+                            // slot + slot state + ledger) for the unsent
+                            // task, then requeue the binary.
+                            self.rollback_assignment(idx, &task_hash, &binary.type_id);
                             self.pool_mut().requeue(binary);
                             // Return early without setting
                             // `assigned`: the binary is back in
@@ -191,6 +168,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                             // to handle, looping work back.
                             return Ok(());
                         }
+
+                        // Send succeeded: originate the CRDT `Pending →
+                        // InFlight` transition (the single origination
+                        // point). After the send so a failure needs no
+                        // CRDT compensation (the rollback above runs
+                        // before we reach here).
+                        self.originate_task_assigned(task_hash.clone(), sec_id.clone(), worker_id)
+                            .await;
 
                         // Operator-facing INFO: which secondary/
                         // worker just took the task. Per-task
@@ -231,7 +216,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             //
             // Step 5 collapses the guard structurally: addressing by
             // role (`Address::Role(Role::Primary)`) resolves through
-            // the `peer_transport`'s write-through `RoleTable` cache,
+            // the single `transport`'s write-through `RoleTable` cache,
             // which `cluster_state` updates on every `PrimaryChanged`
             // apply (post-promotion the cache points at the promoted
             // peer's id; pre-promotion it's cold and `send` returns
@@ -248,10 +233,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // per `feedback_mesh_independent_of_role_and_membership.md`)
             // regardless of who's authoritative.
             if !assigned
-                && let Err(e) = self
-                    .peer_transport
-                    .send(Address::Role(Role::Primary), msg)
-                    .await
+                && let Err(e) = self.transport.send(Address::Role(Role::Primary), msg).await
             {
                 tracing::debug!(
                     error = %e,
@@ -262,5 +244,4 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
         Ok(())
     }
-
 }

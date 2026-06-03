@@ -7,24 +7,22 @@
 //! `SecondaryCoordinator::peer_mesh_degraded`; this module owns only
 //! the detection + first-report side.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-
     /// One-shot watchdog: 30s after `connect_to_peers` fired with a
     /// non-empty peer list, decide whether the peer mesh formed.
     /// Self-healing if the mesh forms before the deadline
@@ -76,16 +74,22 @@ where
             Some(d) => d,
             None => return,
         };
-        if self.cluster_state.run_complete() {
-            // Run is over; the mesh fault has nothing to report.
-            // Disarm so subsequent ticks are no-ops.
+        if self.cluster_state.run_complete() || self.cluster_state.run_aborted().is_some() {
+            // Run is over — completed cleanly OR aborted cluster-wide.
+            // Either way the mesh fault has nothing to report:
+            // failover and inter-secondary keepalive paths have nothing
+            // left to guard once the run is terminating. Disarm so
+            // subsequent ticks are no-ops. (`run_aborted` is the
+            // failure twin of `run_complete`; both terminate the run,
+            // so both disarm the watchdog — single source of truth here
+            // rather than at every apply site.)
             self.peer_mesh_check_at = None;
             return;
         }
         // peer_count drains new connections internally; calling it
         // BEFORE the deadline check lets a fresh connection clear
         // the watchdog without firing the fault.
-        let connected = self.peer_transport.peer_count();
+        let connected = self.transport.peer_count();
         if connected > 0 {
             self.peer_mesh_check_at = None;
             // Mesh formed for the first time — tell the primary so
@@ -132,6 +136,15 @@ where
     /// anything to report". This keeps the modular boundary clean
     /// (peer.rs owns peer-mesh status; processing.rs just calls).
     pub(in crate::secondary) async fn report_mesh_ready_if_needed(&mut self) {
+        // Strict-observer suppression: MeshReady is a worker-secondary
+        // signal — the primary defers `PromotePrimary` until every
+        // worker secondary's mesh has settled. An observer has no
+        // workers and is never a promotion candidate, so it must
+        // originate NOTHING here (the mesh-ready concern's own role-gate,
+        // matching `send_keepalive` / `run_election_tick`).
+        if self.config.is_observer {
+            return;
+        }
         if self.mesh_ready_sent {
             return;
         }
@@ -149,11 +162,10 @@ where
         //     or it elapsed with zero peers). The fully-failed case
         //     still reports so the primary doesn't wait the full
         //     mesh-ready timeout for nothing.
-        let connected = self.peer_transport.peer_count() as u32;
+        let connected = self.transport.peer_count() as u32;
         let no_peers_expected = self.peer_dial_count == 0;
         let mesh_formed = connected > 0;
-        let watchdog_done =
-            self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
+        let watchdog_done = self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
         if !(no_peers_expected || mesh_formed || watchdog_done) {
             return;
         }
@@ -163,7 +175,7 @@ where
             secondary_id: self.config.secondary_id.clone(),
             peer_count: connected,
         };
-        if let Err(e) = self.send_to_current_primary(msg).await {
+        if let Err(e) = self.send_to_primary(msg).await {
             // Best-effort: log and flip the flag anyway so we
             // don't busy-retry on every keepalive tick. The
             // primary's wait step will time out (warning, not a
@@ -175,10 +187,7 @@ where
                  mesh-ready timeout before promoting primary"
             );
         } else {
-            tracing::debug!(
-                connected,
-                "MeshReady sent to primary"
-            );
+            tracing::debug!(connected, "MeshReady sent to primary");
         }
         self.mesh_ready_sent = true;
     }

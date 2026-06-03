@@ -72,7 +72,6 @@ pub struct SlurmJobManager<G: Gateway> {
     pub(super) wrapper_bin_remote_path: Option<String>,
 }
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum SlurmError {
     #[error("gateway error: {0}")]
@@ -103,4 +102,3 @@ pub enum SlurmError {
     #[error("wrapper source binary not found: {0}")]
     WrapperBinaryNotFound(std::path::PathBuf),
 }
-

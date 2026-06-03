@@ -24,29 +24,29 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{
-    ErrorType, Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo, WorkerId,
-};
+use dynrunner_core::{Identifier, TaskInfo, WorkerId};
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
-use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
 use self::primary_link::PrimaryLink;
 
-mod command_channel;
 mod coordinator;
 mod dispatch;
 mod election;
+// `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive
+// (the module's single `pub(crate)` item) is reachable by the
+// symmetric `crate::primary::hydrate` path. Every other item in the
+// module stays `pub(in crate::secondary)`.
+pub(crate) mod origination;
 mod peer;
-mod primary;
 mod primary_link;
 mod processing;
 pub(crate) mod resource;
-mod retry_budget;
 mod sampler_hooks;
 mod setup;
 mod staging;
@@ -61,82 +61,47 @@ mod tests;
 
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
 
-pub(super) struct PrimaryInFlightItem<I: Identifier> {
-    pub(super) phase_id: PhaseId,
-    pub(super) target_secondary_id: String,
-    pub(super) binary: TaskInfo<I>,
-}
+/// The shape of the cluster-state refresh callback registered via
+/// [`SecondaryCoordinator::register_cluster_state_refresh`]: invoked from
+/// the `process_tasks` periodic tick with a read-only borrow of the live,
+/// post-apply `cluster_state`. See the field doc on
+/// [`SecondaryCoordinator::on_cluster_state_refresh`] for why it carries
+/// no `Send` bound (invoked inline on the coordinator's own task).
+pub type ClusterStateRefreshFn<I> = Box<dyn Fn(&ClusterState<I>)>;
 
-/// Source of a task that's currently waiting on a worker's first-bind
-/// (or true type-shift) respawn to reach `Response::Ready`. Drives the
-/// `WorkerEvent::Disconnected` recovery path: which ledger the binary
-/// needs to be returned to if the worker dies before Ready arrives.
+/// A task DEFERRED on this secondary because the target worker's
+/// per-type subprocess is mid-respawn (the dispatch arm observed
+/// [`dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress`]).
 ///
-/// See [`PendingFirstBind`] and `SecondaryCoordinator.pending_first_bind`.
-#[derive(Debug, Clone)]
-pub(super) enum BindSource {
-    /// Inbound TaskAssignment from a peer (or the original primary).
-    /// Disconnect recovery: send TaskFailed-as-backpressure
-    /// (`"worker pipe broken; respawning"`) to the current primary so
-    /// the primary's `handle_primary_peer_rejection` requeues the
-    /// binary for re-dispatch.
-    PeerAssigned,
-    /// Local self-assign from `handle_primary_task_request` while this
-    /// secondary holds primary authority. Disconnect recovery:
-    /// `recover_in_flight_to_pool` (the binary is already tracked in
-    /// `primary_in_flight` because the self-assign path inserts there
-    /// BEFORE attempting the respawn).
-    PrimarySelfAssign,
-}
-
-/// One pending first-bind entry: the inbound binary the dispatch arm
-/// could not assign immediately because the target worker's
-/// `loaded_type_id` did not match the task's `type_id` (first-bind
-/// `None → Some(T)` OR true type-shift `Some(T1) → Some(T2)`). The
-/// pool's [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
-/// kicked off the kill+spawn on a background `wait_ready` task; this
-/// entry is the dispatch-arm side, keyed by the `WorkerId` so the
-/// `WorkerEvent::Ready` handler can pick it up and call `assign_task`
-/// once the slot is observably Idle with the new type bound.
+/// Respawn-HOLD (#58): instead of dropping the task or busy-re-bouncing
+/// it to the authority while the only worker for that type is
+/// respawning, the dispatch arm stashes the resolved task here keyed by
+/// `WorkerId`. The `WorkerEvent::Ready` handler picks it up and calls
+/// `assign_task` once the slot is observably Idle with the new type
+/// bound — no drop, no tight retry loop. If the worker dies before
+/// Ready (`WorkerEvent::Disconnected`), the task never ran and the
+/// secondary reports it back to the authority as a backpressure-shaped
+/// `TaskFailed` so the authority requeues + re-dispatches it.
 ///
-/// Carries everything `assign_task` + cleanup needs: the resolved
-/// `TaskInfo`, the wire-side `file_hash` (used by `active_tasks` and
-/// the disconnect-recovery wire messages), the scheduler's estimated
-/// resource usage, and the [`BindSource`] discriminator that drives
-/// the disconnect-recovery branch.
+/// Carries everything `assign_task` needs: the resolved [`TaskInfo`],
+/// the wire-side `file_hash` (the `active_tasks` key + the recovery
+/// wire message's `task_hash`), the scheduler's estimated resource
+/// usage, and the `predecessor_outputs` the dispatch arm destructured
+/// off the inbound `TaskAssignment` (forwarded verbatim so the
+/// dependent worker observes the same shape a same-type fast-path
+/// assignment would have produced).
+///
+/// Unlike the pre-demolition `PendingFirstBind`, there is no
+/// `BindSource` discriminator: the secondary is never the authority, so
+/// the loss-recovery path is unconditionally "report to the primary
+/// role". The authority-self-assign recovery leg the discriminator
+/// selected is gone with the authority mirror.
 #[derive(Debug, Clone)]
 pub(super) struct PendingFirstBind<I: Identifier> {
     pub(super) binary: TaskInfo<I>,
     pub(super) file_hash: String,
     pub(super) estimated: dynrunner_core::ResourceMap,
-    pub(super) source: BindSource,
-    /// Predecessor-output map preserved across the
-    /// stash-until-Ready bounce. The router destructured this off
-    /// the `TaskAssignment` wire message; the post-Ready first-bind
-    /// dispatch (`processing/worker_event.rs`) forwards it verbatim
-    /// to `WorkerHandle::assign_task` so the dependent worker
-    /// observes the same `predecessor_outputs` shape it would have
-    /// seen on a same-type fast-path assignment.
-    pub(super) predecessor_outputs:
-        std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
-}
-
-/// One entry in the secondary's `primary_failed` ledger. Carries
-/// both the original `TaskInfo` (so the secondary can re-inject the
-/// binary on a retry pass without re-fetching it from the cluster
-/// state) and the last-observed `ErrorType` (so the per-class
-/// outcome breakdown — fail_retry/fail_oom/fail_final — can be
-/// computed locally at log time).
-///
-/// On retry, the entry is overwritten with the new pass's
-/// `ErrorType`; the binary is unchanged.
-#[derive(Debug, Clone)]
-pub(super) struct FailedTaskEntry<I: Identifier> {
-    pub(super) binary: TaskInfo<I>,
-    // Kept for diagnostic / future routing; not currently read by the
-    // retry path which surfaces it via the FailedTask wire message.
-    #[allow(dead_code)]
-    pub(super) error_type: ErrorType,
+    pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.
@@ -146,24 +111,34 @@ pub(super) struct FailedTaskEntry<I: Identifier> {
 /// workers. It reports completions back and requests more work.
 ///
 /// Generic over:
-/// - `PT`: primary transport (e.g. WSS connection or channel)
-/// - `P`: peer transport (e.g. `PeerNetwork` or `NoPeerTransport`)
+/// - `Tr`: the unified transport (a `PeerTransport<I>`). One opaque
+///   handle: the manager addresses by [`Address`] and never branches
+///   on transport locality. Routing (local-vs-remote primary AND the
+///   promotion re-route) lives entirely inside the transport — see
+///   `dynrunner_transport_tunnel::UnifiedSecondaryTransport`.
 /// - `M`: manager endpoint for worker communication
 /// - `S`: scheduler
 /// - `E`: memory estimator
 /// - `I`: identifier type
-pub struct SecondaryCoordinator<PT, P, M, S, E, I>
+pub struct SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
 {
     config: SecondaryConfig,
-    primary_transport: PT,
-    peer_transport: P,
+
+    /// The single opaque transport handle. Every operational send is
+    /// an [`Address`]-addressed `transport.send(..)`; every inbound
+    /// frame arrives via `transport.recv_peer()` (which merges the
+    /// uplink + mesh streams internally). The manager never names a
+    /// `primary_transport`/`peer_transport`, never reads
+    /// `peer_count()` for routing, and never branches on
+    /// transport-locality — the unified transport owns all of that.
+    transport: Tr,
+
     scheduler: S,
     estimator: E,
 
@@ -173,19 +148,20 @@ where
     // Workers
     pool: WorkerPool<M, I>,
 
-    // Task tracking: file_hash -> worker_id
+    // Task tracking: file_hash -> worker_id (this node's OWN in-flight
+    // worker assignments — own-worker management, not authority).
     active_tasks: HashMap<String, WorkerId>,
-    completed_tasks: HashSet<String>,
 
     /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
     /// this secondary's OWN workers fired (i.e. tasks actually
     /// dispatched to and executed by this node's worker pool). Distinct
-    /// from `completed_tasks` (which is the cluster-wide set of all
-    /// task hashes any secondary observed terminal). Pinned by the
-    /// peer-repoll-on-primary-changed regression test to assert
-    /// post-fix distribution across secondaries: pre-fix the promoted
-    /// secondary's pool burns through small workloads before any peer
-    /// re-polls (production keepalive default = 5s), so peer
+    /// from the cluster-wide terminal set, which is read off the
+    /// replicated CRDT (`cluster_state.outcome_counts()`) — the
+    /// secondary holds NO per-node completed/failed/total counter.
+    /// Pinned by the peer-repoll-on-primary-changed regression test to
+    /// assert post-fix distribution across secondaries: pre-fix the
+    /// promoted secondary's pool burns through small workloads before
+    /// any peer re-polls (production keepalive default = 5s), so peer
     /// `local_tasks_run` stays 0; post-fix every secondary's idle
     /// workers retry against the freshly-identified primary inside
     /// the PromotePrimary dispatch tick and pick up work.
@@ -194,42 +170,6 @@ where
 
     // State
     transfer_complete: bool,
-    is_primary: bool,
-
-    /// Wall-clock instant of the most recent `is_primary: false → true`
-    /// transition. `None` while this secondary has never been promoted;
-    /// set whenever a `PromotePrimary` (dispatch path) or a failover
-    /// election (election path) flips `is_primary` to true.
-    ///
-    /// Read by the **alive-demoted natural-quiesce** branch in
-    /// `process_tasks` to enforce a minimum-elapsed-time gate
-    /// (`PROMOTED_PRIMARY_QUIESCE_GRACE`) before declaring the cluster
-    /// done. Rationale: that branch fires on a CRDT-derived predicate
-    /// (`task_count() > 0 && pending == 0 && in_flight == 0`) that is
-    /// **incomplete-mirror-prone** in the immediate post-promotion
-    /// window — a freshly promoted secondary may hold only the
-    /// fraction of `TaskAdded` broadcasts the demoted primary had
-    /// flushed at promotion time. Without a settle period the local
-    /// view "5 of 10 tasks added, all 5 already terminal" satisfies
-    /// the predicate and the branch broadcasts `RunComplete` while
-    /// the demoted primary is still publishing the other 5
-    /// (asm-dataset-nix T11: 5/10 phase_build tasks stranded).
-    ///
-    /// This is a **time-based bandage**, documented as such: the
-    /// structurally clean fix (a wire signal from the demoted primary
-    /// that it has finished publishing) does not exist in the
-    /// protocol today. The grace is small enough not to defeat the
-    /// branch's original asm-tokenizer LMU 2-of-235 deadlock-break
-    /// purpose (loopback round-trips on a healthy cluster complete
-    /// in single-digit ms; 2 s gives orders-of-magnitude headroom)
-    /// while still finite so the branch eventually fires in the
-    /// LMU scenario it was added to fix.
-    ///
-    /// Not reset on a subsequent re-hydration (the post-bootstrap
-    /// `ClusterSnapshot` arm in `dispatch_message`): later snapshot
-    /// arrivals are exactly the events the grace exists to wait for,
-    /// resetting would defeat the purpose.
-    pub(in crate::secondary) promoted_at: Option<Instant>,
 
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
@@ -240,7 +180,35 @@ where
     /// and trusts `src_network/<local_path>` directly. Off until
     /// the InitialAssignment lands, which is fine: no TaskAssignment
     /// can arrive before InitialAssignment.
+    ///
+    /// Also the FIRST half of the setup-discovery yield discriminator:
+    /// `pre_staged_mode == true` means the authority deferred task
+    /// discovery to the corpus-mounting secondaries (the submitter has
+    /// no local corpus view, so it sent an empty `InitialAssignment`
+    /// with this flag set rather than seeding the ledger). See
+    /// [`Self::setup_discovery_done`].
     pre_staged_mode: bool,
+
+    /// One-shot latch for the setup-discovery `SetupPending` yield.
+    ///
+    /// In pre-staged mode the cluster ledger starts empty (the authority
+    /// deferred discovery). The `process_tasks` loop yields
+    /// `RunOutcome::SetupPending` so the PyO3 wrapper can run Python's
+    /// `task.discover_items` against the locally bind-mounted corpus and
+    /// feed the result back via [`Self::ingest_setup_discovery`], which
+    /// broadcasts `PhaseDepsSet + TaskAdded` onto the mesh and sets this
+    /// latch.
+    ///
+    /// The latch is what makes the yield FIRE-ONCE: the natural
+    /// "ledger non-empty" self-clear (`cluster_state.task_count() > 0`)
+    /// covers the common case, but an *empty* discovery (every item
+    /// already complete under a `--skip-existing` filter) leaves the
+    /// ledger empty forever — without the latch the loop would re-yield
+    /// on every re-entry. `ingest_setup_discovery` sets the latch
+    /// unconditionally (including the empty-discovery path, which also
+    /// broadcasts `RunComplete`), so re-entry never re-yields. Always
+    /// false outside pre-staged mode (no yield is ever produced there).
+    setup_discovery_done: bool,
 
     /// Whether dispatched task items are backed by real files (the
     /// historical contract). Set from
@@ -260,20 +228,6 @@ where
     // not just `Keepalive`, so an actively-routing primary doesn't get
     // falsely declared dead.
     primary_last_seen: Option<Instant>,
-
-    /// Sticky flag for "the primary's transport returned None on
-    /// `recv()`". Used as the `if` guard on the `primary_transport.recv`
-    /// arm of `process_tasks`'s `select!` so the persistently-None
-    /// future doesn't hot-loop. Once true, we drive failover via the
-    /// election state machine and route work via
-    /// `primary_link.current_primary()` once a peer wins the election.
-    ///
-    /// Pre-fix the recv arm bare-broke the loop on `None` and the
-    /// secondary exited cleanly with `completed=0` — losing every
-    /// task the primary peer was about to dispatch. Dataset
-    /// reported this on the dev-box-primary scenario where the local
-    /// transport closed at the phase boundary.
-    primary_disconnected: bool,
 
     // Failover election state (F2). Defaults to Normal until the primary
     // misses keepalives.
@@ -317,94 +271,6 @@ where
     /// (mesh formed, watchdog elapsed, or no peers to dial).
     mesh_ready_sent: bool,
 
-    // primary state (populated on promotion).
-    // `primary_pending` is `None` until this secondary is promoted; on
-    // the became-primary transition `populate_primary_from_cluster_state`
-    // rebuilds it from the continuously-replicated `cluster_state` mirror.
-    // No wire round-trip: the cluster ledger has been kept in sync via
-    // `ClusterMutation` broadcasts since the run started.
-    primary_pending: Option<PendingPool<I>>,
-    primary_completed: HashSet<String>,
-    /// Per-item ledger for every primary dispatch that hasn't
-    /// terminated yet. Keyed by the same task hash used in
-    /// `completed_tasks` / `active_tasks`. Stores `phase_id` (drives
-    /// the pool's `on_item_finished` counter), `target_secondary_id`
-    /// (used by the backpressure path to mark the right peer), and
-    /// the full `binary` (used to `pool.requeue` on a rejection so
-    /// the task isn't silently dropped from the pool).
-    primary_in_flight: HashMap<String, PrimaryInFlightItem<I>>,
-
-    /// Per-task ledger of Recoverable failures observed on the
-    /// primary path. Mirrors the live primary's `failed_tasks` set, but
-    /// keyed to the secondary that's currently acting as primary.
-    /// Populated by `note_primary_item_failed` whenever a Recoverable
-    /// failure terminates a dispatch slot for a task this node
-    /// dispatched; drained by `primary_drain_check_and_retry`
-    /// when the main pass quiesces (pool empty + no in-flight + no
-    /// active local tasks) and re-injected into `primary_pending` via
-    /// `pool.reinject(item)` for one more attempt.
-    ///
-    /// Stores the binary alongside the hash so the re-injection step
-    /// has the full `TaskInfo` to put back into the pool — `primary_in_flight`
-    /// already kept this shape for rejection-recovery; the failed
-    /// ledger keeps the same shape for retry-injection.
-    ///
-    /// Each entry now also carries the last-observed `ErrorType` so
-    /// the post-restructure `succeeded/fail_retry/fail_oom/fail_final`
-    /// log surface can partition failures by class. Pre-restructure
-    /// the secondary lost OOM-vs-final classification at this
-    /// boundary (the binary was carried, the failure class was not).
-    ///
-    /// Closes the gap demotion introduced: post-demotion the local
-    /// primary's `run_retry_passes` is a no-op, so without this
-    /// primary-side ledger every Recoverable failure became
-    /// terminal at the cluster level.
-    primary_failed: HashMap<String, FailedTaskEntry<I>>,
-
-    /// Per-(phase, retry-bucket) pass counter for the
-    /// promoted-secondary's primary path. Mirrors
-    /// `PrimaryCoordinator::retry_passes_used` 1:1 — the same
-    /// per-phase Recoverable + OOM partition the live primary
-    /// runs at each phase drain edge also runs on this node when
-    /// it acts as primary. The shared core lives in
-    /// [`crate::primary::retry_bucket::try_phase_retry_bucket_core`];
-    /// the candidate-build is per-side (the secondary's
-    /// `primary_failed` stores the binary on the entry, the
-    /// primary's `failed_tasks` cross-references `all_binaries`).
-    ///
-    /// Initialised empty on construction; entries appear when a
-    /// bucket runs for the first time on a given (phase, kind)
-    /// pair. The map keys include `PhaseId`, so phase A's counter
-    /// is structurally independent of phase B's.
-    primary_retry_passes_used: crate::primary::retry_bucket::RetryPassesUsed,
-
-    /// Retry budget for the primary-side re-injection loop. Owns
-    /// both the attempt counter (originally `retry_max_passes`) and
-    /// the optional SLURM-wallclock deadline (read once at
-    /// construction from `$SLURM_JOB_END_TIME`). Consulted by the
-    /// two drain-down exit predicates in `processing.rs` to bound
-    /// the post-disconnect wait-for-quiesce window. Per-phase
-    /// retry-bucket admission is now driven by
-    /// `primary_retry_passes_used` + `config.retry_max_passes` /
-    /// `config.oom_retry_max_passes` (mirroring the live primary);
-    /// this field's `should_retry()` axis acts purely as a SLURM-
-    /// wallclock guard so the secondary doesn't sit on a stale
-    /// `primary_failed` ledger forever after the job hits its
-    /// wall-clock deadline. See `retry_budget.rs` for the dual-
-    /// axis design.
-    primary_retry_budget: retry_budget::RetryBudget,
-
-    /// Per-peer backpressure backoff for the primary path.
-    /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when
-    /// a peer rejects a `TaskAssignment` with the wire signal
-    /// "No idle worker available", record the peer with an expiry
-    /// timestamp; until expiry, `handle_primary_task_request` skips
-    /// re-dispatching to that peer (binary stays in the pool for
-    /// another candidate). Cleared when the peer reports an actual
-    /// `TaskComplete` (proves it's healthy) or when the backoff
-    /// window expires naturally.
-    backpressured_secondaries: HashMap<String, Instant>,
-
     /// Set by handlers that detect an unrecoverable local fault.
     /// The main `process_tasks` loop checks this once per iteration
     /// AFTER the deferred-message flush; if `Some`, the loop returns
@@ -446,23 +312,27 @@ where
     pub(super) peer_mesh_degraded: bool,
 
     /// Replicated mirror of the cluster ledger. Maintained by applying
-    /// every `DistributedMessage::ClusterMutation` the primary
-    /// broadcasts. Read-only on this node — only the originator may
-    /// produce mutations (Phase L will move the originator-side logic
-    /// onto whichever node currently holds the primary role).
+    /// every `DistributedMessage::ClusterMutation` observed on the mesh.
+    /// Read-only authority-wise on this node — the secondary never
+    /// originates a terminal mutation. The authority (the live primary,
+    /// or this node's co-located primary once promoted) owns
+    /// origination. The secondary DOES originate the two non-authority
+    /// mutations the unified model keeps on this side: the
+    /// `ingest_setup_discovery` `PhaseDepsSet + TaskAdded` batch and the
+    /// panik self-departure `PeerRemoved` (both via
+    /// `origination::apply_and_broadcast_mutations`).
     pub(super) cluster_state: ClusterState<I>,
 
     /// Worker IDs queued for respawn at the next `process_tasks`
-    /// tick. Populated by code paths that observe a worker
-    /// subprocess as dead WITHOUT a corresponding
-    /// `WorkerEvent::Disconnected` arriving on the pool's event
-    /// channel:
-    ///
-    ///   - `handle_primary_task_request`'s self-assign Err arm
-    ///     (the local worker's pipe is broken when we try to write
-    ///     the next task to it),
-    ///   - `dispatch_message`'s peer-assign Err arm (same shape on
-    ///     the peer-assigned path).
+    /// tick. Populated by the assignment-dispatch path
+    /// (`dispatch/router.rs`'s `TaskAssignment` arm) when an
+    /// `assign_task` write fails on a broken pipe — i.e. the worker
+    /// subprocess is observed dead WITHOUT a corresponding
+    /// `WorkerEvent::Disconnected` arriving on the pool's event channel.
+    /// (The pre-unification self-assign-vs-wire split — a separate
+    /// `handle_primary_task_request` Err arm — is gone: the unified
+    /// transport delivers a self-addressed assignment via the same
+    /// loopback path as any wire frame, so there is ONE dispatch site.)
     ///
     /// In both cases the worker subprocess has voluntarily exited
     /// — typically because `NonRecoverableError` in the task
@@ -481,97 +351,12 @@ where
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
 
-    /// Pending task assignments waiting on a freshly-spawned worker
-    /// to reach `Response::Ready`. Keyed by `WorkerId`; consumed by
-    /// the `WorkerEvent::Ready` arm in
-    /// [`crate::secondary::processing::worker_event`].
-    ///
-    /// # Single concern
-    ///
-    /// The select!-arm bodies in `dispatch/router.rs` (TaskAssignment
-    /// from primary) and `primary/task_request.rs`
-    /// (`handle_primary_task_request`) historically held an inline
-    /// `ensure_worker_for_type(...).await` on the FIRST-BIND path
-    /// (`loaded_type_id == None`). The await drove
-    /// [`crate::worker::WorkerHandle::poll_ready`] in a loop until
-    /// the freshly-spawned worker subprocess sent `Response::Ready`
-    /// — and BLOCKED the select! for the full duration. Production
-    /// observed 300+s of tokio-runtime silence on the asm-tokenizer
-    /// LMU dispatch when the worker took longer than the keepalive
-    /// interval to import its Python task module.
-    ///
-    /// The async-event fix routes type-bind through
-    /// [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
-    /// (returns `RespawnInProgress` immediately, drives
-    /// `wait_ready` on a background `spawn_local` task that emits
-    /// `WorkerEvent::Ready` on the pool's channel when done). The
-    /// caller stores the inbound binary HERE keyed by the worker
-    /// it dispatched to, returns from the select! arm, and the
-    /// Ready handler picks the binary back up and calls
-    /// `assign_task` once the slot is observably Idle with the
-    /// correct `loaded_type_id`.
-    ///
-    /// # Why HERE rather than bouncing as backpressure
-    ///
-    /// The first cut of this fix bounced the binary back to the
-    /// primary as a `TaskFailed` carrying the
-    /// `"worker pipe broken; respawning"` marker, mirroring the
-    /// existing type-shift respawn path. That path works
-    /// architecturally — the primary's
-    /// `handle_primary_peer_rejection` requeues and re-dispatches
-    /// — but introduces distribution bias: the promoted-primary's
-    /// own self-assigns reach the same-type fast path within
-    /// sub-millisecond after the Ready event fires (no wire
-    /// round-trip), while peer secondaries pay one full primary
-    /// round-trip per first-bind. On small workloads (e.g. the
-    /// 20-binary asm-tokenizer Tier-2 recipe) the promoted-primary
-    /// burns through every task before the peer cycle catches up,
-    /// regressing the
-    /// `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
-    /// test which pins per-secondary distribution fairness.
-    ///
-    /// Storing the binary on the secondary preserves fairness:
-    /// each worker stays bound to its initial assignment for the
-    /// duration of the respawn, no round-trip needed.
-    ///
-    /// # Loss handling
-    ///
-    /// If the worker dies before reaching Ready, the
-    /// `WorkerEvent::Disconnected` arm drains the entry and
-    /// recovers it per `source`:
-    ///
-    ///   * `BindSource::PrimarySelfAssign` →
-    ///     [`Self::recover_in_flight_to_pool`] (the binary is
-    ///     already in `primary_in_flight`; pushes it back to the
-    ///     pool front).
-    ///   * `BindSource::PeerAssigned` → send TaskFailed-as-
-    ///     backpressure to the current primary so the primary's
-    ///     `handle_primary_peer_rejection` requeues it for
-    ///     another peer (or self-assign).
+    /// Tasks DEFERRED because the target worker's per-type subprocess
+    /// is mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`; the
+    /// `WorkerEvent::Ready` handler picks the entry up and assigns it
+    /// once the slot is Idle with the new type bound. See
+    /// [`PendingFirstBind`] for the full contract.
     pub(super) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-
-    /// Set true by the `PromotePrimary { required_setup: true }` arm
-    /// in `dispatch.rs` when this secondary is promoted into the
-    /// setup-secondary role (the submitter deferred all run-setup work
-    /// to us — no `TaskAdded` batch was pre-seeded on the cluster
-    /// ledger). The outer process-tasks loop yields back to the PyO3
-    /// wrapper when this is true so Python's `task.discover_items` can
-    /// run on this node (which has the staged source filesystem
-    /// bind-mounted locally). The wrapper then calls
-    /// `ingest_setup_discovery`, which seeds the ledger with
-    /// `PhaseDepsSet` + `TaskAdded` mutations, broadcasts them to
-    /// every peer, clears this flag, and hydrates the primary pool
-    /// from the now-populated `cluster_state`.
-    ///
-    /// Never set on the pre-seeded promotion path (`required_setup:
-    /// false` from the local submitter — local did discovery and the
-    /// ledger is pre-seeded) nor on the failover-election path (the
-    /// ledger has content from the CRDT broadcasts that ran during
-    /// the live-primary phase). The wire-level `required_setup` flag
-    /// is the only discriminator; "ledger empty" is NOT a proxy
-    /// because failover-at-startup can legitimately observe an
-    /// empty ledger.
-    pub(super) setup_pending: bool,
 
     /// Re-entry guard for `run_until_setup_or_done`. The first call
     /// runs `initialize_workers`, the setup-handshake (`send_welcome`,
@@ -599,15 +384,13 @@ where
     /// handed to
     /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] inside
     /// the LocalSet running the secondary's operational loop.
-    pub(super) lifecycle_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>,
-    >,
+    pub(super) lifecycle_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
     /// Consumers of peer-lifecycle events; same single-shot
     /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
     /// `PrimaryCoordinator::peer_lifecycle_listeners` for the
     /// rationale.
-    pub(super) peer_lifecycle_listeners:
-        Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+    pub(super) peer_lifecycle_listeners: Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 
     /// Handle to the peer-lifecycle dispatcher task spawned at
     /// `run_until_setup_or_done`'s first entry. `Some` between spawn
@@ -625,16 +408,14 @@ where
     /// `task_completed_tx` installed on `cluster_state` at
     /// construction. Same single-shot / `mem::take`-at-first-entry
     /// semantics as `lifecycle_rx`.
-    pub(super) task_completed_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>,
-    >,
+    pub(super) task_completed_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>>,
 
     /// Consumers of task-completion events; same single-shot
     /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
     /// `PrimaryCoordinator::task_completed_listeners` for the
     /// rationale.
-    pub(super) task_completed_listeners:
-        Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
+    pub(super) task_completed_listeners: Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
 
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
@@ -648,7 +429,7 @@ where
     /// by the spawned announcer task. The matching receiver is
     /// drained by the operational `select!` arm in `process_tasks`,
     /// which dequeues each [`crate::observer::announcer::AnnouncerOutboxItem`]
-    /// and forwards it onto `peer_transport.send(Address::Role(Role::Primary),
+    /// and forwards it onto `transport.send(Address::Role(Role::Primary),
     /// msg)`, returning the outcome through the item's `reply`
     /// oneshot.
     ///
@@ -657,11 +438,8 @@ where
     /// attached the announcer) never construct the outbox, so the
     /// select arm parks on `pending()` instead of polling a dead
     /// channel.
-    pub(super) announcer_outbox_tx: Option<
-        tokio::sync::mpsc::Sender<
-            crate::observer::announcer::AnnouncerOutboxItem<I>,
-        >,
-    >,
+    pub(super) announcer_outbox_tx:
+        Option<tokio::sync::mpsc::Sender<crate::observer::announcer::AnnouncerOutboxItem<I>>>,
 
     /// Announcer-outbox receiver, paired with `announcer_outbox_tx`.
     /// Built in [`Self::attach_observer_announcer`] (so non-observer
@@ -671,11 +449,8 @@ where
     /// `command_rx`/`matcher_trigger_rx` on the primary. `None`
     /// outside the attached-observer window or once the loop has
     /// taken ownership.
-    pub(super) announcer_outbox_rx: Option<
-        tokio::sync::mpsc::Receiver<
-            crate::observer::announcer::AnnouncerOutboxItem<I>,
-        >,
-    >,
+    pub(super) announcer_outbox_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::observer::announcer::AnnouncerOutboxItem<I>>>,
 
     /// Panik-watcher signal receiver. Installed via
     /// [`Self::register_panik_signal_rx`] before `run_until_setup_or_done`
@@ -693,91 +468,140 @@ where
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
-    /// Lifecycle hook invoked when this secondary owns the primary
-    /// pool (post-promotion) and a phase reaches `Drained`. Mirrors
-    /// `PrimaryCoordinator::on_phase_end` exactly; the PyO3 wrapper
-    /// installs a GIL-reacquiring closure that calls Python's
-    /// `task.on_phase_end(phase_id, completed, failed)`. `None` when
-    /// the caller did not supply a hook OR when this secondary never
-    /// gets promoted — in both cases the fire-site silently no-ops, so
-    /// non-promoted secondaries are unaffected by the field's
-    /// existence.
-    pub(super) on_phase_end:
-        Option<crate::primary::OnPhaseEnd>,
-
-    /// Per-phase completion counters fed to `on_phase_end`. Incremented
-    /// inside `note_primary_item_completed` (the single chokepoint
-    /// where a primary-dispatched item terminates successfully on this
-    /// secondary's pool); mirrors the same field on
-    /// `PrimaryCoordinator`. Stays empty when this secondary is never
-    /// promoted (the increment site is also the only writer).
-    pub(super) primary_phase_completed:
-        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
-
-    /// Per-phase failure counters fed to `on_phase_end`. Sibling of
-    /// `primary_phase_completed` for the failure path.
-    pub(super) primary_phase_failed:
-        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
-
-    /// Phases that have already had `on_phase_start` fired through this
-    /// secondary's lifecycle bridge. Mirrors
-    /// `PrimaryCoordinator::phase_started_emitted` — the pool's state
-    /// machine doesn't track "did we observe this transition", so the
-    /// coordinator does the bookkeeping. Stays empty when no lifecycle
-    /// callback is installed.
-    pub(super) primary_phase_started_emitted:
-        std::collections::HashSet<dynrunner_core::PhaseId>,
-
-    /// Lifecycle hook invoked when this secondary owns the primary
-    /// pool (post-promotion) and a phase flips Blocked → Active.
-    /// Mirrors `PrimaryCoordinator::on_phase_start`. Same `None`
-    /// semantics as `on_phase_end`.
-    pub(super) on_phase_start:
-        Option<crate::primary::OnPhaseStart>,
-
-    /// Cross-thread / cross-runtime ingress for the
-    /// `PrimaryHandle` PyO3 surface (when the handle was minted from
-    /// a `PySecondaryCoordinator`). Each handler is co-located with
-    /// the coordinator's per-mutation semantics under
-    /// `secondary/primary/{fail_permanent,reinject_task,
-    /// update_preferred_secondaries,spawn_tasks}.rs`; the receiver is
-    /// read inside `process_tasks`' `select!` arm and the sender is
-    /// cloned out via `command_sender()` before
-    /// `run_until_setup_or_done` enters.
+    /// Externally-armed fatal-exit signal. Installed via
+    /// [`Self::register_fatal_exit_signal_rx`] before
+    /// `run_until_setup_or_done`. A run-loop-external policy (the
+    /// observer's invalid_task monitor — a windowed-failure-collector
+    /// action running on the task-completed dispatcher task, which holds
+    /// no `&mut self` to write `fatal_exit` directly) sends a reason
+    /// string here; the `process_tasks` select! arm receives it and
+    /// latches `self.fatal_exit`, exiting the run non-zero. Mirrors
+    /// `panik_signal_rx` exactly: `None` when no such policy was attached
+    /// (regular secondaries, Rust-only tests) and the arm parks on
+    /// `pending().await`.
     ///
-    /// Mirrors the `command_rx` / `command_tx` pair on
-    /// `PrimaryCoordinator`. Held as `Option` so the operational loop
-    /// can take the receiver out for the duration of the
-    /// select-driven phase (Rust's borrow checker won't let us hold a
-    /// `&mut Receiver` inside the same `&mut self` that the per-arm
-    /// handlers need) and put it back when the loop exits. Outside
-    /// the loop, the option is `Some` so cloned senders keep working
-    /// across `SetupPending` re-entries.
-    pub(super) command_rx:
-        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
+    /// An mpsc (not a oneshot) receiver because the sender side is a
+    /// `CollectorPolicy` action that fires best-effort `send`; the
+    /// receiver consumes the first message and the run exits, so only the
+    /// first send is ever observed. Taken out for the duration of
+    /// `process_tasks` so the arm's `await` owns it across iterations,
+    /// same discipline as `panik_signal_rx`.
+    pub(super) fatal_exit_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
+    /// Externally-registered cluster-state refresh callback. Installed
+    /// via [`Self::register_cluster_state_refresh`] before
+    /// `run_until_setup_or_done`. Invoked on a modest periodic tick from
+    /// the `process_tasks` select! loop with a read-only borrow of the
+    /// live, post-apply `cluster_state` — the single in-loop moment a
+    /// concurrently-running consumer can observe the freshening CRDT
+    /// (the loop owns the `&mut cluster_state` for its whole lifetime,
+    /// so the consumer cannot borrow it directly).
+    ///
+    /// Single concern, dependency-inverted: this crate defines the
+    /// `Fn(&ClusterState<I>)` slot and invokes it on the tick; the
+    /// consumer (the PyO3 observer's live-snapshot feed) supplies the
+    /// closure that PROJECTS the CRDT into its own shape and publishes
+    /// it. The slot mirrors `fatal_exit_signal_rx`'s registration shape
+    /// (a registered slot, `Option::take`-n into the loop's local state
+    /// on first entry), differing only in DIRECTION: fatal-exit flows a
+    /// value INTO the loop, so it is a receiver; this flows a borrow of
+    /// loop-owned state OUT to the consumer, so it is a callback the loop
+    /// calls with `&self.cluster_state`.
+    ///
+    /// `None` when no consumer registered (regular secondaries,
+    /// Rust-only tests) — the periodic tick fires but invokes nothing.
+    /// `Box<dyn Fn>` (not `FnMut`) because the consumer's closure only
+    /// reads the borrow and forwards a projection to a shared cell; it
+    /// holds no per-invocation mutable state of its own.
+    ///
+    /// No `Send` bound (unlike the `LifecycleListener` / `OnPhaseEnd`
+    /// hooks, which require it because they are `mem::take`-n INTO a
+    /// `spawn_local` dispatcher task or moved onto the co-located
+    /// primary): this callback is invoked INLINE from the `process_tasks`
+    /// select! loop on the same current-thread task that owns the
+    /// coordinator, so it never crosses a thread/task boundary. Adding
+    /// `Send` would needlessly bar a single-threaded consumer (the
+    /// observer's `LocalSet`-bound feed) from capturing `Rc`-shaped
+    /// state.
+    pub(super) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
+
+    /// Promotion-activation gate sender for the co-located parked
+    /// `PrimaryCoordinator`.
+    ///
+    /// The composed runtime (`PySecondaryCoordinator::run`) builds both
+    /// coordinators on one `LocalSet` and parks the primary behind
+    /// `PrimaryCoordinator::run_parked`'s oneshot gate; the matching
+    /// sender is registered here via
+    /// [`Self::register_promote_activation`]. When THIS node's election
+    /// reaches its terminal `Promoted` transition — either by winning
+    /// its own election ([`election::coordinator`]'s
+    /// `record_promotion_confirm` returning `true`) or by a peer's
+    /// `PromotePrimary` naming this node (the `dispatch/router`
+    /// `PromotePrimary` arm) — [`Self::fire_local_promotion`] fires this
+    /// gate (waking the parked primary into its seeded resume) and
+    /// broadcasts `PromotePrimary { new = self }` so surviving
+    /// secondaries' `PrimaryChanged` role-change hook re-points
+    /// `Role::Primary` off the dead uplink onto this winner's mesh peer.
+    ///
+    /// The gate carries a [`crate::cluster_state::ClusterStateSnapshot`]
+    /// — NOT a bare `()`. A parked co-located primary's `cluster_state`
+    /// is empty (it never ran the bootstrap pool-build and the role-aware
+    /// inbound tap deliberately does NOT feed it CRDT mirror frames —
+    /// those stay with this secondary, which mirrors the ledger for the
+    /// node). At promotion the secondary snapshots its continuously-
+    /// mirrored `cluster_state` and sends it through this gate; the
+    /// parked primary `restore`s it before `hydrate_from_cluster_state`,
+    /// so the seeded resume rebuilds its pool from the full replicated
+    /// ledger (the brief's "restore cluster_state snapshot + hydrate").
+    ///
+    /// `Option<oneshot::Sender>` makes the activation FIRE-ONCE: the
+    /// terminal action `take()`s it, so the two promotion paths reaching
+    /// `Promoted` (own-election win + peer-named) never double-activate.
+    /// `None` when no co-located primary was composed (Rust-only tests,
+    /// the legacy single-`run()` callers) — the terminal action is then
+    /// a no-op on the gate (the broadcast still fires) and the secondary
+    /// runs without a local authority to promote.
+    pub(super) promote_activation_tx:
+        Option<tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>>,
+
+    /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
+    /// closure calling Python's `task.on_phase_end(phase_id, completed,
+    /// failed)`).
+    ///
+    /// The secondary holds NO authority and runs no phase machine — the
+    /// fire site is the co-located authoritative `PrimaryCoordinator`,
+    /// which owns `on_phase_end` and the phase machine. This field is a
+    /// registration ANCHOR: the PyO3 secondary wrapper accepts the
+    /// closure (keeping the `register_phase_lifecycle_callbacks` pre-run
+    /// contract stable for callers minting a handle from a secondary),
+    /// and the composed runtime transfers it to the co-located primary
+    /// via [`SecondaryCoordinator::take_composed_primary_wiring`] before
+    /// the primary's `run_parked` enters. That extraction is the in-crate
+    /// consumer, so this field carries no `#[allow(dead_code)]`.
+    pub(super) on_phase_end: Option<crate::primary::OnPhaseEnd>,
+
+    /// Phase-start sibling of `on_phase_end`; same registration-anchor
+    /// disposition (transferred to the co-located primary via
+    /// `take_composed_primary_wiring`, fired by it, not the secondary).
+    pub(super) on_phase_start: Option<crate::primary::OnPhaseStart>,
+
+    /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
+    /// PyO3 surface (when the handle was minted from a
+    /// `PySecondaryCoordinator`).
+    ///
+    /// Externally-issued `PrimaryCommand`s are authority mutations whose
+    /// only correct owner is the co-located `PrimaryCoordinator`; the
+    /// secondary never drains this channel. The field is a registration
+    /// ANCHOR keeping the PyO3 `command_sender()` clone a stable type;
+    /// the composed runtime hands the receiver to the primary's command
+    /// loop via [`SecondaryCoordinator::take_composed_primary_wiring`].
+    pub(super) command_rx: Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
-    /// consumers via `command_sender()`. Stored on `Self` so the
-    /// lifetime is tied to the coordinator — when the coordinator is
-    /// dropped, all cloned senders return `SendError` on subsequent
-    /// `send()` calls and the PyO3 side surfaces that as a Python
-    /// exception.
-    pub(super) command_tx:
-        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
-
-    /// Per-task reinject counter, paired with
-    /// `SecondaryConfig::unfulfillable_reinject_max_per_task`. Lazily
-    /// initialised on first reinject for a hash; counts DOWN from the
-    /// configured cap (so 0 means "exhausted, refuse"). The map is
-    /// keyed by task hash, not task_id, because external-control
-    /// callers use the hash as the canonical identifier (mirroring the
-    /// rest of the wire protocol).
-    ///
-    /// Independent of the primary's same-name counter: at promotion
-    /// the freshly-promoted secondary starts with a fresh `HashMap`,
-    /// so the budget effectively resets across the demotion boundary.
-    /// Documented in `secondary/primary/reinject_task.rs`.
-    pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
+    /// consumers via `command_sender()`. Same registration-anchor
+    /// disposition as `command_rx` — a clone crosses to the co-located
+    /// primary via `take_composed_primary_wiring`.
+    pub(super) command_tx: tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
 
     /// Per-task memory-profile sampler. `Some` iff
     /// [`SecondaryConfig::output_dir`] was set when the secondary's

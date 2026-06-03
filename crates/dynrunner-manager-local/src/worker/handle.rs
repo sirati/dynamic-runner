@@ -24,7 +24,7 @@ use crate::cgroup::SubcgroupHandle;
 use crate::monitor::{ProcStatmMonitor, ResourceMonitor};
 
 use super::event::WorkerEvent;
-use super::exit_status::{try_reap_subprocess, WorkerExitStatus};
+use super::exit_status::{WorkerExitStatus, try_reap_subprocess};
 
 /// Manager-side handle for one worker.
 ///
@@ -170,7 +170,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// shutdown" lever.
     #[cfg(unix)]
     pub fn kill_subprocess(&self) {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         let Some(pid) = self.pid else {
             return;
@@ -234,7 +234,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// grace-then-SIGKILL escalation lives on `WorkerPool`).
     #[cfg(unix)]
     pub fn sigterm_process_tree(&self) {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         let Some(pid) = self.pid else {
             return;
@@ -275,7 +275,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// on absence.
     #[cfg(unix)]
     pub fn sigkill_process_tree(&self) {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         let Some(pid) = self.pid else {
             return;
@@ -441,9 +441,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// post-Ready repoll is wired through the standard
     /// `handle_worker_event` path.
     pub fn spawn_ready_watcher(&mut self) -> Result<(), String> {
-        let waiting = self.protocol.take_waiting().ok_or_else(|| {
-            "spawn_ready_watcher requires WaitingForReady state".to_string()
-        })?;
+        let waiting = self
+            .protocol
+            .take_waiting()
+            .ok_or_else(|| "spawn_ready_watcher requires WaitingForReady state".to_string())?;
         let worker_id = self.worker_id;
         let tx = self.event_tx.clone();
         let handle = tokio::task::spawn_local(async move {
@@ -603,7 +604,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     ) -> RunnerProtocolState<M> {
         loop {
             match processing.poll_status().await {
-                PollResult::Completed { result, result_data, protocol } => {
+                PollResult::Completed {
+                    result,
+                    result_data,
+                    protocol,
+                } => {
                     let _ = tx.send(WorkerEvent::TaskCompleted {
                         worker_id,
                         result,

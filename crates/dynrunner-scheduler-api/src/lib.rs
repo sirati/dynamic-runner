@@ -1,7 +1,9 @@
-use dynrunner_core::{TaskInfo, Identifier, ResourceMap, WorkerId};
+use dynrunner_core::{Identifier, ResourceMap, TaskInfo, WorkerId};
 
 pub mod pending_pool;
-pub use pending_pool::{BucketKey, PendingPool, PendingPoolError, PhaseState, WorkerView};
+pub use pending_pool::{
+    BucketKey, IngestPartition, PendingPool, PendingPoolError, PhaseState, WorkerView,
+};
 
 /// Processing phases that the manager cycles through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

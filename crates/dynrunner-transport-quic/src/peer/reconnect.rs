@@ -36,10 +36,10 @@ pub(super) const RECONNECT_TICK: Duration = Duration::from_secs(5);
 /// 1m, 5m, 10m, 20m, 40m, 60m — fixed wall-clock points the
 /// operator can predict.
 pub(super) const MILESTONES: &[Duration] = &[
-    Duration::from_secs(60),       // 1 minute
-    Duration::from_secs(5 * 60),   // 5 minutes
-    Duration::from_secs(10 * 60),  // 10 minutes
-    Duration::from_secs(20 * 60),  // 20 minutes
+    Duration::from_secs(60),      // 1 minute
+    Duration::from_secs(5 * 60),  // 5 minutes
+    Duration::from_secs(10 * 60), // 10 minutes
+    Duration::from_secs(20 * 60), // 20 minutes
 ];
 
 /// Post-`MILESTONES` recurrence interval. Aligned with the last
@@ -165,10 +165,8 @@ impl ReconnectTracker {
             // every missed recurrence in order, not just one.
             while state.next_milestone_idx >= MILESTONES.len() {
                 let last_milestone = *MILESTONES.last().expect("MILESTONES non-empty");
-                let recurrence_count =
-                    (state.next_milestone_idx - MILESTONES.len()) as u32;
-                let next_log_at =
-                    last_milestone + MILESTONE_RECURRENCE * (recurrence_count + 1);
+                let recurrence_count = (state.next_milestone_idx - MILESTONES.len()) as u32;
+                let next_log_at = last_milestone + MILESTONE_RECURRENCE * (recurrence_count + 1);
                 if elapsed >= next_log_at {
                     tracing::warn!(
                         peer = %peer_id,

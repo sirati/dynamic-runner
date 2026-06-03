@@ -100,11 +100,7 @@ impl Gateway for LocalGateway {
         }
     }
 
-    async fn transfer_file(
-        &self,
-        local: &Path,
-        remote: &str,
-    ) -> Result<(), GatewayError> {
+    async fn transfer_file(&self, local: &Path, remote: &str) -> Result<(), GatewayError> {
         if !self.connected {
             return Err(GatewayError::NotConnected);
         }
@@ -137,11 +133,7 @@ impl Gateway for LocalGateway {
         Ok(())
     }
 
-    async fn download_file(
-        &self,
-        remote: &str,
-        local: &Path,
-    ) -> Result<(), GatewayError> {
+    async fn download_file(&self, remote: &str, local: &Path) -> Result<(), GatewayError> {
         if !self.connected {
             return Err(GatewayError::NotConnected);
         }
@@ -354,10 +346,7 @@ mod tests {
             tokio::time::advance(COMMAND_TIMEOUT + Duration::from_secs(1)).await;
         };
 
-        let (result, _) = tokio::join!(
-            gw.execute_command("sleep 600", None),
-            advance,
-        );
+        let (result, _) = tokio::join!(gw.execute_command("sleep 600", None), advance,);
         let result = result.unwrap();
         assert_eq!(result.return_code, -1);
         assert_eq!(result.stdout, "");
