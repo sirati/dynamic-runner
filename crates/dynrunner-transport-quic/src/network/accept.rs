@@ -2,10 +2,10 @@
 //!
 //! A QUIC and a WSS listener each spawn an accept-loop that hands every
 //! new connection to a per-connection handler. The handler reads the
-//! first message to learn the secondary's id, registers the new
+//! first message to learn the connecting peer's id, registers the new
 //! connection with the owning `NetworkServer` via `new_conn_tx`, and
 //! then runs reader + writer tasks over the underlying transport until
-//! the secondary disconnects.
+//! the peer disconnects.
 
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use crate::wss::{WssConnection, WssListener};
 /// How long the per-connection handler waits for the peer's first
 /// frame (`SecondaryWelcome`) before dropping the connection as
 /// non-conformant. The transport can't surface the connection to
-/// the coordinator until that first frame arrives — `secondary_id`
+/// the coordinator until that first frame arrives — `peer_id`
 /// is read from `first_msg.sender_id()` — so without a deadline,
 /// a peer that completes the WSS/QUIC handshake but never speaks
 /// the runner protocol leaves the coordinator's
@@ -82,14 +82,14 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
     }
 }
 
-/// Handle a new QUIC connection: read first message to identify secondary,
+/// Handle a new QUIC connection: read first message to identify the peer,
 /// then split into separate reader/writer tasks.
 async fn handle_new_quic_connection<I: Identifier>(
     mut conn: QuicConnection,
     incoming_tx: InboundTap<I>,
     new_conn_tx: RegistrationSink<I>,
 ) {
-    // Read first message to identify the secondary. Bounded by
+    // Read first message to identify the peer. Bounded by
     // WELCOME_TIMEOUT so a non-conformant peer (handshake-completes
     // but never sends Welcome — usually because its worker_module
     // doesn't complete the runner-protocol Ready handshake and the
@@ -120,7 +120,7 @@ async fn handle_new_quic_connection<I: Identifier>(
             return;
         }
     };
-    let secondary_id = first_msg.sender_id().to_string();
+    let peer_id = first_msg.sender_id().to_string();
 
     // Forward first message
     if incoming_tx.send(first_msg).is_err() {
@@ -134,11 +134,11 @@ async fn handle_new_quic_connection<I: Identifier>(
     // transport's `recv_peer` demux (it inserts into the shared
     // writer table). Emitted immediately after the first frame
     // (`SecondaryWelcome`) and before any further frame, so the
-    // demux registers the writer before the secondary's
+    // demux registers the writer before the peer's
     // CertExchange / TaskRequest traffic needs a reply path.
     if new_conn_tx
         .send(PeerRegistration {
-            peer_id: secondary_id.clone(),
+            peer_id: peer_id.clone(),
             outgoing_tx,
         })
         .is_err()
@@ -152,7 +152,7 @@ async fn handle_new_quic_connection<I: Identifier>(
 
     // Reader task: read from QUIC recv stream, forward to incoming
     let reader_tx = incoming_tx;
-    let reader_id = secondary_id.clone();
+    let reader_id = peer_id.clone();
     let mut reader = tokio::task::spawn_local(async move {
         let mut recv_buf = existing_buf;
         let mut recv = recv_stream;
@@ -176,11 +176,11 @@ async fn handle_new_quic_connection<I: Identifier>(
                 Err(_) => break,
             }
         }
-        tracing::debug!(secondary = %reader_id, "QUIC reader done");
+        tracing::debug!(peer = %reader_id, "QUIC reader done");
     });
 
     // Writer task: drain outgoing channel, write to QUIC send stream
-    let writer_id = secondary_id;
+    let writer_id = peer_id;
     let mut writer = tokio::task::spawn_local(async move {
         let mut send = send_stream;
         while let Some(msg) = outgoing_rx.recv().await {
@@ -193,7 +193,7 @@ async fn handle_new_quic_connection<I: Identifier>(
                 Err(_) => break,
             }
         }
-        tracing::debug!(secondary = %writer_id, "QUIC writer done");
+        tracing::debug!(peer = %writer_id, "QUIC writer done");
     });
 
     // Wait for either task to finish, then abort the other
@@ -203,14 +203,14 @@ async fn handle_new_quic_connection<I: Identifier>(
     }
 }
 
-/// Handle a new WSS connection: read first message to identify secondary,
+/// Handle a new WSS connection: read first message to identify the peer,
 /// then split the WebSocket stream into reader/writer halves.
 async fn handle_new_wss_connection<I: Identifier>(
     mut conn: WssConnection,
     incoming_tx: InboundTap<I>,
     new_conn_tx: RegistrationSink<I>,
 ) {
-    // Read first message to identify the secondary. Bounded by
+    // Read first message to identify the peer. Bounded by
     // WELCOME_TIMEOUT — see `handle_new_quic_connection`'s matching
     // block for the rationale (non-conformant worker_module
     // diagnosis).
@@ -239,7 +239,7 @@ async fn handle_new_wss_connection<I: Identifier>(
             return;
         }
     };
-    let secondary_id = first_msg.sender_id().to_string();
+    let peer_id = first_msg.sender_id().to_string();
 
     // Forward first message
     if incoming_tx.send(first_msg).is_err() {
@@ -253,11 +253,11 @@ async fn handle_new_wss_connection<I: Identifier>(
     // transport's `recv_peer` demux (it inserts into the shared
     // writer table). Emitted immediately after the first frame
     // (`SecondaryWelcome`) and before any further frame, so the
-    // demux registers the writer before the secondary's
+    // demux registers the writer before the peer's
     // CertExchange / TaskRequest traffic needs a reply path.
     if new_conn_tx
         .send(PeerRegistration {
-            peer_id: secondary_id.clone(),
+            peer_id: peer_id.clone(),
             outgoing_tx,
         })
         .is_err()
@@ -270,7 +270,7 @@ async fn handle_new_wss_connection<I: Identifier>(
 
     // Reader task: read from WebSocket, decode, forward to incoming
     let reader_tx = incoming_tx;
-    let reader_id = secondary_id.clone();
+    let reader_id = peer_id.clone();
     let mut reader = tokio::task::spawn_local(async move {
         loop {
             match ws_read.next().await {
@@ -288,11 +288,11 @@ async fn handle_new_wss_connection<I: Identifier>(
                 Some(Err(_)) => break,
             }
         }
-        tracing::debug!(secondary = %reader_id, "WSS reader done");
+        tracing::debug!(peer = %reader_id, "WSS reader done");
     });
 
     // Writer task: drain outgoing channel, write to WebSocket
-    let writer_id = secondary_id;
+    let writer_id = peer_id;
     let mut writer = tokio::task::spawn_local(async move {
         while let Some(msg) = outgoing_rx.recv().await {
             match codec::serialize_message(&msg) {
@@ -304,7 +304,7 @@ async fn handle_new_wss_connection<I: Identifier>(
                 Err(_) => break,
             }
         }
-        tracing::debug!(secondary = %writer_id, "WSS writer done");
+        tracing::debug!(peer = %writer_id, "WSS writer done");
     });
 
     // Wait for either task to finish, then abort the other

@@ -278,10 +278,10 @@ impl<I: Identifier> PeerNetwork<I> {
     ///
     /// The co-located parked `PrimaryCoordinator`'s send-proxy holds the
     /// returned handle to reach remote secondaries over the SAME mesh
-    /// the secondary's `UnifiedSecondaryTransport` owns — without
-    /// aliasing this network's `connections` ownership. Sends queued on
-    /// the handle are drained + dispatched (relay-aware) inside
-    /// [`Self::recv_peer`]. See the [`mesh_send`] module docs.
+    /// this `PeerNetwork` owns (the secondary's `EitherPeerTransport::Real`
+    /// arm) — without aliasing this network's `connections` ownership.
+    /// Sends queued on the handle are drained + dispatched (relay-aware)
+    /// inside [`Self::recv_peer`]. See the [`mesh_send`] module docs.
     pub fn mesh_send_handle(&self) -> MeshSendHandle<I> {
         MeshSendHandle::new(self.mesh_send_tx.clone())
     }
