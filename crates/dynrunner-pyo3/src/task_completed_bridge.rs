@@ -4,11 +4,11 @@
 //!
 //! Single concern of this file: convert one Rust
 //! `&TaskCompletedEvent` into one Python call
-//! `listener(task_id, success, error_kind)` under the GIL, swallowing
-//! every `PyErr` path to `tracing::warn` so the dispatcher task never
-//! tears down on a buggy / raising Python listener. Nothing about
-//! WHICH manager owns the listener, HOW the manager threads the kwarg
-//! through, or WHEN `register_task_completed_listener` runs lives
+//! `listener(task_id, success, error_kind, last_error)` under the GIL,
+//! swallowing every `PyErr` path to `tracing::warn` so the dispatcher
+//! task never tears down on a buggy / raising Python listener. Nothing
+//! about WHICH manager owns the listener, HOW the manager threads the
+//! kwarg through, or WHEN `register_task_completed_listener` runs lives
 //! here — those concerns belong to the manager pyclass files and are
 //! uniformly thin (single line each).
 //!
@@ -19,8 +19,15 @@
 //!     task_id: str | None,
 //!     success: bool,
 //!     error_kind: str | None,
+//!     last_error: str | None,
 //! ) -> None: ...
 //! ```
+//!
+//! `last_error` is the trailing positional, mirroring the
+//! `TaskCompletedEvent.last_error` field: `None` on success, the
+//! operator-facing failure message on failure. It is carried
+//! ALONGSIDE `error_kind` (the wire-stable type tag) because a
+//! failure is only fully identified by type AND message.
 //!
 //! Error / exception handling:
 //!   - `PyErr` from the call surfaces a `tracing::warn` and is
@@ -68,13 +75,15 @@ impl TaskCompletedListener for PyTaskCompletedListener {
         let outcome: PyResult<()> = Python::attach(|py| {
             // `task_id` is non-optional per the framework's boundary
             // contract; it round-trips as Python `str`. `error_kind`
-            // remains optional (the success arm leaves it `None`)
-            // and goes through `Option<&str> → str | None` via
-            // PyO3's IntoPyObject for `Option<T>`.
+            // and `last_error` are both optional (the success arm
+            // leaves them `None`) and go through
+            // `Option<&str> → str | None` via PyO3's IntoPyObject for
+            // `Option<T>`.
             let args = (
                 event.task_id.as_str(),
                 event.success,
                 event.error_kind.as_deref(),
+                event.last_error.as_deref(),
             );
             self.listener.bind(py).call1(args).map(|_| ())
         });
@@ -126,8 +135,8 @@ mod tests {
                 py,
                 std::ffi::CString::new(
                     "calls = []\n\
-                     def listener(task_id, success, error_kind):\n    \
-                         calls.append((task_id, success, error_kind))\n",
+                     def listener(task_id, success, error_kind, last_error):\n    \
+                         calls.append((task_id, success, error_kind, last_error))\n",
                 )
                 .unwrap()
                 .as_c_str(),
@@ -144,8 +153,13 @@ mod tests {
     /// Pull a captured `calls` entry out of the module globals.
     /// `task_id` is always a Python `str` (the framework's boundary
     /// contract guarantees a non-empty id on every event);
-    /// `error_kind` remains `str | None` (success → `None`).
-    fn captured_call(globals: &Py<PyAny>, idx: usize) -> (String, bool, Option<String>) {
+    /// `error_kind` and `last_error` are both `str | None`
+    /// (success → `None`).
+    #[allow(clippy::type_complexity)]
+    fn captured_call(
+        globals: &Py<PyAny>,
+        idx: usize,
+    ) -> (String, bool, Option<String>, Option<String>) {
         Python::attach(|py| {
             let g = globals.bind(py);
             let calls = g
@@ -159,17 +173,22 @@ mod tests {
             let tuple = entry.cast::<pyo3::types::PyTuple>().unwrap();
             let task_id: String = tuple.get_item(0).unwrap().extract().unwrap();
             let success: bool = tuple.get_item(1).unwrap().extract().unwrap();
-            let error_kind_obj = tuple.get_item(2).unwrap();
-            let error_kind = if error_kind_obj.is_none() {
-                None
-            } else {
-                Some(error_kind_obj.extract::<String>().unwrap())
+            let opt_str = |obj: Bound<'_, PyAny>| -> Option<String> {
+                if obj.is_none() {
+                    None
+                } else {
+                    Some(obj.extract::<String>().unwrap())
+                }
             };
-            (task_id, success, error_kind)
+            let error_kind = opt_str(tuple.get_item(2).unwrap());
+            let last_error = opt_str(tuple.get_item(3).unwrap());
+            (task_id, success, error_kind, last_error)
         })
     }
 
-    /// Pins the success-path call shape: `(task_id, True, None)`.
+    /// Pins the success-path call shape:
+    /// `(task_id, True, None, None)`. The trailing `last_error` is
+    /// `None` on success — the consumer must see no message.
     #[test]
     fn task_completed_listener_fires_on_task_completed_apply() {
         let (callable, globals) = make_recording_listener();
@@ -181,15 +200,19 @@ mod tests {
             error_kind: None,
             last_error: None,
         });
-        let (task_id, success, error_kind) = captured_call(&globals, 0);
+        let (task_id, success, error_kind, last_error) = captured_call(&globals, 0);
         assert_eq!(task_id, "alpha");
         assert!(success);
         assert!(error_kind.is_none());
+        assert!(last_error.is_none());
     }
 
     /// Pins the failure-path call shape: `(task_id, False,
-    /// Some(<wire_value>))`. Mirrors the cluster_state-side test
+    /// Some(<wire_value>), Some(<message>))`. Mirrors the
+    /// cluster_state-side test
     /// `task_completed_listener_fires_on_task_failed_with_error_kind`.
+    /// Asserts the operator-facing `last_error` message reaches the
+    /// Python listener verbatim alongside the wire-stable type tag.
     #[test]
     fn task_completed_listener_fires_on_task_failed_with_error_kind() {
         let (callable, globals) = make_recording_listener();
@@ -201,10 +224,56 @@ mod tests {
             error_kind: Some("non_recoverable".into()),
             last_error: Some("worker reported failure".into()),
         });
-        let (task_id, success, error_kind) = captured_call(&globals, 0);
+        let (task_id, success, error_kind, last_error) = captured_call(&globals, 0);
         assert_eq!(task_id, "beta");
         assert!(!success);
         assert_eq!(error_kind.as_deref(), Some("non_recoverable"));
+        assert_eq!(last_error.as_deref(), Some("worker reported failure"));
+    }
+
+    /// Forwarding contract for the trailing `last_error` positional,
+    /// asserted on a single recording listener across both terminal
+    /// arms so the success/failure contrast is unmissable:
+    ///   - FAILED  → the operator-facing message rides through verbatim
+    ///     (here an `unfulfillable:<reason>` failure, to prove the
+    ///     message is carried independently of which `error_kind` tag
+    ///     accompanies it);
+    ///   - SUCCESS → `None`, never an empty string or a stale message.
+    #[test]
+    fn task_completed_listener_forwards_last_error() {
+        let (callable, globals) = make_recording_listener();
+        let bridge = PyTaskCompletedListener::new(callable);
+
+        // Failure: the message must reach the listener as the 4th arg.
+        bridge.on_event(&TaskCompletedEvent {
+            task_id: "fails".into(),
+            task_hash: "h-fails".into(),
+            success: false,
+            error_kind: Some("unfulfillable:no_capable_worker".into()),
+            last_error: Some("no worker can satisfy 64 GiB reservation".into()),
+        });
+        // Success on the SAME listener: last_error must be None.
+        bridge.on_event(&TaskCompletedEvent {
+            task_id: "succeeds".into(),
+            task_hash: "h-succeeds".into(),
+            success: true,
+            error_kind: None,
+            last_error: None,
+        });
+
+        let (failed_id, failed_ok, _failed_kind, failed_last_error) =
+            captured_call(&globals, 0);
+        assert_eq!(failed_id, "fails");
+        assert!(!failed_ok);
+        assert_eq!(
+            failed_last_error.as_deref(),
+            Some("no worker can satisfy 64 GiB reservation"),
+        );
+
+        let (ok_id, ok_ok, _ok_kind, ok_last_error) = captured_call(&globals, 1);
+        assert_eq!(ok_id, "succeeds");
+        assert!(ok_ok);
+        assert!(ok_last_error.is_none());
     }
 
     /// A panicking Python listener must surface as a Rust panic so
@@ -220,7 +289,7 @@ mod tests {
             let module = PyModule::from_code(
                 py,
                 std::ffi::CString::new(
-                    "def listener(task_id, success, error_kind):\n    \
+                    "def listener(task_id, success, error_kind, last_error):\n    \
                          raise AssertionError('listener exploded')\n",
                 )
                 .unwrap()
@@ -259,7 +328,7 @@ mod tests {
             let module = PyModule::from_code(
                 py,
                 std::ffi::CString::new(
-                    "def listener(task_id, success, error_kind):\n    \
+                    "def listener(task_id, success, error_kind, last_error):\n    \
                          raise RuntimeError('listener should not surface')\n",
                 )
                 .unwrap()
