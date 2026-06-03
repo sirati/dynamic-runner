@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 
+use dynrunner_core::IMPORTANT_TARGET;
 use dynrunner_manager_distributed::task_completed::{
     CollectedFailure, CollectorPolicy, TaskCompletedEvent,
 };
@@ -86,7 +87,7 @@ impl CollectorPolicy for InvalidTaskMonitorPolicy {
         // filter) AND carried in the fatal-exit reason.
         let detail = render_invalid_tasks(&collected);
         tracing::error!(
-            target: "dynrunner_important",
+            target: IMPORTANT_TARGET,
             "observer exiting: {} invalid task(s) observed — these can never run \
              and the cluster will not complete them:\n{detail}",
             distinct_count(&collected),

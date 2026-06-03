@@ -43,12 +43,11 @@ use crate::ClusterState;
 
 /// Tracing target marking an event as "important" (LLM-wake-worthy).
 ///
-/// Fixed cross-crate contract: equal to `dynrunner-pyo3`'s
-/// `logging::IMPORTANT_TARGET` and the Python child logger
-/// `dynamic_runner.important`. Kept as a crate-local const so the
-/// primary's several emit sites share one source of truth for the
-/// string rather than repeating the literal.
-pub(crate) const IMPORTANT_TARGET: &str = "dynrunner_important";
+/// Re-exported from the single cross-crate source of truth
+/// ([`dynrunner_core::IMPORTANT_TARGET`]) and mirrored by the Python child
+/// logger `dynamic_runner.important`. The primary's several emit sites
+/// share this one const rather than repeating the literal.
+pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
 /// Register a [`crate::RoleChangeHook`] on `cluster_state` that emits
 /// the **primary changed** important event whenever the replicated
