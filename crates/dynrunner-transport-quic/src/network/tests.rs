@@ -1,7 +1,7 @@
 use super::*;
 use crate::wss::WssListener;
 use dynrunner_core::{MessageReceiver, MessageSender};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole, PeerTransport};
 use dynrunner_transport_tunnel::TunneledPeerTransport;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -71,6 +71,7 @@ async fn server_accepts_wss_bidirectional() {
                 timestamp: 2.0,
                 secondary_id: "primary".into(),
                 active_workers: 0,
+                emitter_role: KeepaliveRole::Secondary,
             };
             transport.send_to_peer("sec-0", reply).await.unwrap();
 
@@ -117,6 +118,7 @@ async fn server_accepts_quic_bidirectional() {
                     timestamp: 2.0,
                     secondary_id: "sec-1".into(),
                     active_workers: 3,
+                    emitter_role: KeepaliveRole::Secondary,
                 };
                 MessageSender::send(&mut client, msg).await.unwrap();
 
@@ -134,6 +136,7 @@ async fn server_accepts_quic_bidirectional() {
                 timestamp: 3.0,
                 secondary_id: "primary".into(),
                 active_workers: 0,
+                emitter_role: KeepaliveRole::Secondary,
             };
             transport.send_to_peer("sec-1", reply).await.unwrap();
 
@@ -182,6 +185,7 @@ async fn client_falls_back_to_wss() {
                 timestamp: 1.0,
                 secondary_id: "fallback".into(),
                 active_workers: 0,
+                emitter_role: KeepaliveRole::Secondary,
             };
             MessageSender::send(&mut client, msg).await.unwrap();
 
@@ -266,6 +270,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                         timestamp: 3.0,
                         secondary_id: "primary".into(),
                         active_workers: 0,
+                        emitter_role: KeepaliveRole::Secondary,
                     },
                 )
                 .await
@@ -309,6 +314,7 @@ async fn recv_peer_drains_buffered_frames_accepted_before_first_poll() {
                         timestamp: i as f64,
                         secondary_id: "sec-0".into(),
                         active_workers: i,
+                        emitter_role: KeepaliveRole::Secondary,
                     };
                     MessageSender::send(&mut client, ka).await.unwrap();
                 }

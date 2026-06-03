@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole, PeerTransport};
 use dynrunner_transport_channel::{ChannelPeerTransport, peer_mesh_with_adjacency};
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
@@ -55,6 +55,7 @@ pub(crate) fn keepalive(sender: &str) -> DistributedMessage<TestId> {
         timestamp: 1.0,
         secondary_id: sender.to_string(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

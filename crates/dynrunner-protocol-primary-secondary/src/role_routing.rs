@@ -229,6 +229,7 @@ pub fn apply_role_misaddress_hint(cache: &RoleCache, role: Role, holder_id: Stri
 mod tests {
     use super::*;
     use crate::address::new_role_cache;
+    use crate::messages::KeepaliveRole;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -240,6 +241,7 @@ mod tests {
             timestamp: 1.0,
             secondary_id: sender.into(),
             active_workers: 0,
+            emitter_role: KeepaliveRole::Secondary,
         }
     }
 

@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use super::*;
-use crate::messages::DistributedMessage;
+use crate::messages::{DistributedMessage, KeepaliveRole};
 
 fn conns(ids: &[&str]) -> HashMap<String, ()> {
     ids.iter().map(|s| (s.to_string(), ())).collect()
@@ -22,6 +22,7 @@ fn keepalive(sender: &str) -> DistributedMessage<()> {
         timestamp: 1.0,
         secondary_id: sender.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

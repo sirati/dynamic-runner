@@ -162,6 +162,7 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynrunner_protocol_primary_secondary::KeepaliveRole;
     use serde::{Deserialize, Serialize};
 
     /// Minimal test identifier.
@@ -180,6 +181,7 @@ mod tests {
             timestamp: 42.0,
             secondary_id: "test".into(),
             active_workers: 2,
+            emitter_role: KeepaliveRole::Secondary,
         };
 
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();

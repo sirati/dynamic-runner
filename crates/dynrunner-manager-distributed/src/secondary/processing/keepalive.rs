@@ -11,7 +11,9 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Scope};
+use dynrunner_protocol_primary_secondary::{
+    Address, DistributedMessage, KeepaliveRole, PeerTransport, Scope,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
@@ -103,6 +105,7 @@ where
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
             active_workers: active_count,
+            emitter_role: KeepaliveRole::Secondary,
         };
         // Two DISTINCT liveness targets (not a redundant fan-out):
         //   1. the primary role — primary-link liveness, opaque routing.

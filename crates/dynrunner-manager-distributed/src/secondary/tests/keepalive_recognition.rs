@@ -11,7 +11,7 @@
 use std::time::{Duration, Instant};
 
 use super::super::test_helpers::{FakeWorkerFactory, TestId, election_config, make_secondary};
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole};
 
 /// Build a runtime `Keepalive` originated by `origin`. The wire shape
 /// sets `sender_id == secondary_id == origin` for every emitter (the
@@ -24,6 +24,7 @@ fn keepalive(origin: &str) -> DistributedMessage<TestId> {
         timestamp: 1.0,
         secondary_id: origin.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

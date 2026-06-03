@@ -3,7 +3,7 @@
 //! non-setup variants fail the `TryFrom` boundary.
 
 use super::*;
-use crate::messages::{DistributedMessage, PeerConnectionInfo};
+use crate::messages::{DistributedMessage, KeepaliveRole, PeerConnectionInfo};
 
 // Sanity that the bidirectional conversion is lossless and that
 // any non-setup variant fails the TryFrom — this is the
@@ -109,6 +109,7 @@ fn non_setup_variant_rejected() {
         timestamp: 4.0,
         secondary_id: "s0".into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     };
     let result: Result<SetupBootstrapMessage, DistributedMessage<()>> = runtime.try_into();
     assert!(

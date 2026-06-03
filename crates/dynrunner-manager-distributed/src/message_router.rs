@@ -58,6 +58,7 @@ impl<I: Identifier> MessageRouter<I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynrunner_protocol_primary_secondary::KeepaliveRole;
     use serde::{Deserialize, Serialize};
 
     /// Minimal test identifier.
@@ -74,6 +75,7 @@ mod tests {
             timestamp: 1.0,
             secondary_id: "sec-0".into(),
             active_workers: 2,
+            emitter_role: KeepaliveRole::Secondary,
         };
 
         assert!(router.route(msg));
@@ -95,6 +97,7 @@ mod tests {
             timestamp: 1.0,
             secondary_id: "sec-0".into(),
             active_workers: 2,
+            emitter_role: KeepaliveRole::Secondary,
         };
         assert!(!router.route(msg));
     }

@@ -8,7 +8,8 @@
 //! with no manager coordinator wrapped around it.
 use crate::{InboundTap, TunneledPeerTransport};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, Role, RoleChangeHookRegistrar, RoleTable, Scope,
+    Address, DistributedMessage, KeepaliveRole, PeerTransport, Role, RoleChangeHookRegistrar,
+    RoleTable, Scope,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -48,6 +49,7 @@ fn keepalive(sender: &str) -> DistributedMessage<TestId> {
         timestamp: 1.0,
         secondary_id: sender.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 
