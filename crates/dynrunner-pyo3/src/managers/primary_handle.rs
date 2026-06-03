@@ -399,6 +399,24 @@ impl PyPrimaryHandle {
     }
 }
 
+/// Decode a Python `bytes` value into the wire-canonical hash string
+/// the rest of the dispatcher uses. The wire form is
+/// `format!("{:016x}", hasher.finish())` (see
+/// `dynrunner_manager_distributed::compute_task_hash`); callers pass
+/// the raw 16-byte hex-encoded ASCII representation through `bytes`.
+/// Invalid UTF-8 raises `PyValueError` so the Python side surfaces a
+/// typed exception instead of a panicking unwrap.
+fn bytes_to_hash_string(hash: &Bound<'_, PyBytes>) -> PyResult<String> {
+    let bytes = hash.as_bytes();
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_owned())
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "PrimaryHandle: hash bytes are not valid UTF-8: {e}"
+            ))
+        })
+}
+
 #[cfg(test)]
 #[cfg(feature = "test-with-python")]
 mod tests {
@@ -410,7 +428,6 @@ mod tests {
     //!        --features test-with-python primary_handle`
     use super::*;
     use dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY;
-    use pyo3::types::PyAnyMethods;
 
     /// Build a `PyPrimaryHandle` paired with a stub receiver task
     /// that echoes back empty per-index errors for every
@@ -466,22 +483,4 @@ mod tests {
         drop(handle);
         stub_thread.join().expect("stub thread joined");
     }
-}
-
-/// Decode a Python `bytes` value into the wire-canonical hash string
-/// the rest of the dispatcher uses. The wire form is
-/// `format!("{:016x}", hasher.finish())` (see
-/// `dynrunner_manager_distributed::compute_task_hash`); callers pass
-/// the raw 16-byte hex-encoded ASCII representation through `bytes`.
-/// Invalid UTF-8 raises `PyValueError` so the Python side surfaces a
-/// typed exception instead of a panicking unwrap.
-fn bytes_to_hash_string(hash: &Bound<'_, PyBytes>) -> PyResult<String> {
-    let bytes = hash.as_bytes();
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_owned())
-        .map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "PrimaryHandle: hash bytes are not valid UTF-8: {e}"
-            ))
-        })
 }

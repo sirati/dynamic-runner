@@ -829,7 +829,7 @@ task_args = SimpleNamespace()
                 .expect("handle() must succeed before process_binaries");
             // Downcast to prove the type contract.
             let _handle: pyo3::PyRef<'_, PyPrimaryHandle> = handle_obj
-                .downcast::<PyPrimaryHandle>()
+                .cast::<PyPrimaryHandle>()
                 .expect("handle() must return a PrimaryHandle pyclass")
                 .borrow();
         });
@@ -852,10 +852,10 @@ task_args = SimpleNamespace()
                 .call_method0("handle")
                 .expect("second handle");
             let r1 = h1
-                .downcast::<PyPrimaryHandle>()
+                .cast::<PyPrimaryHandle>()
                 .unwrap();
             let r2 = h2
-                .downcast::<PyPrimaryHandle>()
+                .cast::<PyPrimaryHandle>()
                 .unwrap();
             let r1_sender = r1.borrow().sender.clone();
             let r2_sender = r2.borrow().sender.clone();
