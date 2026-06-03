@@ -1,18 +1,24 @@
 //! Tests for the directed bootstrap-primary mesh link
 //! (`PeerNetwork::register_primary_link`).
 //!
-//! The secondary registers its dialed primary connection into the mesh
+//! The secondary folds its dialed primary bootstrap wire into the mesh
 //! so the primary is a routable mesh member from its side. These tests
-//! pin the directed-only contract: `send_to_peer(primary)` /
-//! `has_peer(primary)` resolve over the registered writer, while the
-//! primary is EXCLUDED from the `broadcast` fan-out and from the
-//! `peer_count` mesh-health cardinality (so the registration does not
-//! prematurely change broadcast topology or mesh-watchdog behaviour).
+//! pin the directed-only ROUTING contract: a connection keyed by the
+//! primary's id is reachable via `send_to_peer(primary)` /
+//! `has_peer(primary)`, while the primary is EXCLUDED from the
+//! `broadcast` fan-out and from the `peer_count` mesh-health cardinality
+//! (so the registration does not prematurely change broadcast topology
+//! or mesh-watchdog behaviour).
 //!
-//! The "writer" is a plain channel sender — the registration API takes
-//! a `mpsc::UnboundedSender<DistributedMessage<I>>` (in production the
-//! fan-in handle from `NetworkClient::mesh_writer`), so no real wire is
-//! needed to exercise the routing/exclusion logic.
+//! `register_primary_link` itself now consumes the whole
+//! `NetworkClient` (owning BOTH directions of the bootstrap wire); the
+//! real-wire fan-in is covered by `network/tests.rs::
+//! mesh_writer_fans_into_the_same_wire`. Here we exercise only the
+//! directed-routing / exclusion LOGIC, which is independent of the
+//! wire — so the directed link is staged directly into the
+//! `connections` table and `primary_link_id` (exactly the state
+//! `register_primary_link` installs for the outbound side) with a plain
+//! channel sender, no real wire needed.
 
 use super::super::PeerNetwork;
 use super::TestId;
@@ -31,8 +37,8 @@ fn keepalive(sender: &str) -> DistributedMessage<TestId> {
     }
 }
 
-/// `send_to_peer(primary)` routes the frame over the registered primary
-/// writer (direct, no relay), and `has_peer(primary)` is true.
+/// `send_to_peer(primary)` routes the frame over the directed primary
+/// connection (direct, no relay), and `has_peer(primary)` is true.
 #[tokio::test(flavor = "current_thread")]
 async fn send_to_primary_routes_over_registered_link() {
     let local = tokio::task::LocalSet::new();
@@ -40,7 +46,8 @@ async fn send_to_primary_routes_over_registered_link() {
         .run_until(async {
             let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0").await.unwrap();
             let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
-            net.register_primary_link("primary".to_string(), primary_tx);
+            net.connections.insert("primary".to_string(), primary_tx);
+            net.primary_link_id = Some("primary".to_string());
 
             assert!(
                 PeerTransport::<TestId>::has_peer(&net, &PeerId::from("primary")),
@@ -75,7 +82,8 @@ async fn primary_link_excluded_from_broadcast_and_peer_count() {
             let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
             net.connections.insert("sec-1".to_string(), peer_tx);
             let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
-            net.register_primary_link("primary".to_string(), primary_tx);
+            net.connections.insert("primary".to_string(), primary_tx);
+            net.primary_link_id = Some("primary".to_string());
 
             // peer_count reports the real peer only — the primary link
             // is excluded so a firewalled fleet isn't reported as

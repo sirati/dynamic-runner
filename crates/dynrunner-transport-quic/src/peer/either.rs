@@ -20,7 +20,6 @@ use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role, RoleChangeHookRegistrar,
 };
-use tokio::sync::mpsc;
 
 use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 
@@ -54,23 +53,31 @@ impl<I: Identifier> EitherPeerTransport<I> {
         }
     }
 
-    /// Register the secondary's dialed primary connection as a
-    /// directed-routable mesh member keyed by `primary_id`.
+    /// Fold the secondary's dialed primary bootstrap wire into the mesh
+    /// as a directed-routable member keyed by `primary_id`.
     ///
     /// Forwards to [`PeerNetwork::register_primary_link`] on the `Real`
     /// arm so `send_to_peer(primary)` / `has_peer(primary)` resolve over
-    /// the existing bootstrap wire. No-op on `Disabled`: a firewalled /
-    /// single-secondary deployment has no mesh `connections` table to
-    /// register into — the bootstrap uplink remains the only path to the
-    /// primary there, exactly as before.
-    pub fn register_primary_link(
-        &mut self,
-        primary_id: String,
-        writer: mpsc::UnboundedSender<DistributedMessage<I>>,
-    ) {
+    /// the existing bootstrap wire (both directions folded into the one
+    /// mesh).
+    ///
+    /// The `Disabled` arm (firewalled inter-compute fabric / single-
+    /// secondary) has no mesh `connections` table to fold the wire into.
+    /// Routing the bootstrap wire to the primary WITHOUT a peer mesh —
+    /// i.e. a transport that owns only the bootstrap wire as its sole
+    /// member with no inter-secondary dialing — is a separate concern
+    /// from this leaf's QUIC/WSS uplink deletion (it is the firewalled-
+    /// fleet bootstrap-wire-as-mesh leaf). Left unimplemented so the
+    /// owning leaf supplies it rather than this one papering over the
+    /// gap.
+    pub fn register_primary_link(&mut self, primary_id: String, client: crate::NetworkClient<I>) {
         match self {
-            Self::Real(p) => p.register_primary_link(primary_id, writer),
-            Self::Disabled(_) => {}
+            Self::Real(p) => p.register_primary_link(primary_id, client),
+            Self::Disabled(_) => unimplemented!(
+                "register_primary_link on a Disabled peer overlay: folding the bootstrap \
+                 wire into a no-peer-mesh transport (firewalled-fleet path) is owned by a \
+                 separate leaf, not the uplink-deletion leaf"
+            ),
         }
     }
 }

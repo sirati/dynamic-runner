@@ -262,16 +262,28 @@ impl<I: Identifier> PeerNetwork<I> {
         })
     }
 
-    /// Register the secondary's dialed primary connection as a
-    /// DIRECTED-routable mesh member keyed by `primary_id`.
+    /// Fold the secondary's dialed primary connection — the bootstrap
+    /// wire — into THIS mesh as a DIRECTED-routable member keyed by
+    /// `primary_id`, in BOTH directions. After this call the bootstrap
+    /// wire is just another mesh connection: "the tunnel is just a way
+    /// of joining the mesh".
     ///
-    /// `writer` is a send handle into the existing bootstrap wire (see
-    /// [`crate::NetworkClient::mesh_writer`]) — registering it makes the
-    /// primary reachable via [`PeerTransport::send_to_peer`] /
-    /// observable via [`PeerTransport::has_peer`] over the SAME
-    /// connection the bootstrap uplink already owns, so no second wire
-    /// is opened and inbound primary frames keep arriving on the uplink
-    /// leg.
+    /// Takes the whole [`crate::NetworkClient`] by value (the mesh now
+    /// owns the wire; there is no separate `uplink` leg). Both
+    /// directions are wired onto the one uniform mesh path:
+    ///
+    /// - **Outbound:** [`crate::NetworkClient::mesh_writer`] mints a
+    ///   fan-in send handle into the wire; it is inserted into
+    ///   [`Self::connections`] so [`PeerTransport::send_to_peer`] /
+    ///   observable via [`PeerTransport::has_peer`] resolve over the
+    ///   existing connection (no second wire is opened).
+    /// - **Inbound:** a forwarder task drains the client's `recv()` into
+    ///   this network's single [`Self::incoming_tx`] fan-in — the same
+    ///   sink the accept loops + outgoing-dial handlers feed — so primary
+    ///   frames surface through [`PeerTransport::recv_peer`] like any
+    ///   other peer's. The task exits when the wire closes (`recv()` →
+    ///   `None`) or `incoming_tx` is dropped. It lives on the same
+    ///   `LocalSet` as the rest of the mesh's reader/writer tasks.
     ///
     /// The primary is registered as a DIRECTED-only member: it is
     /// recorded in [`Self::primary_link_id`] and excluded from
@@ -283,14 +295,28 @@ impl<I: Identifier> PeerNetwork<I> {
     /// the same [`Self::connections`] table every directed send + the
     /// router read from, so routing to the primary uses the one uniform
     /// path.
-    pub fn register_primary_link(
-        &mut self,
-        primary_id: String,
-        writer: mpsc::UnboundedSender<DistributedMessage<I>>,
-    ) {
-        tracing::info!(primary = %primary_id, "registered primary as directed mesh link");
-        self.connections.insert(primary_id.clone(), writer);
+    pub fn register_primary_link(&mut self, primary_id: String, client: crate::NetworkClient<I>) {
+        use dynrunner_core::MessageReceiver;
+
+        tracing::info!(primary = %primary_id, "folded primary bootstrap wire into the mesh");
+        // Outbound: fan-in send handle into the existing wire.
+        self.connections
+            .insert(primary_id.clone(), client.mesh_writer());
         self.primary_link_id = Some(primary_id);
+
+        // Inbound: drive the wire's inbound into the mesh's single
+        // fan-in, so the primary's frames arrive via `recv_peer` like
+        // every other peer's — no per-role uplink recv arm.
+        let incoming_tx = self.incoming_tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut client = client;
+            while let Some(msg) = client.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+            tracing::debug!("primary bootstrap-wire inbound forwarder done");
+        });
     }
 
     /// Mint a cloneable [`MeshSendHandle`] over this network's mesh.

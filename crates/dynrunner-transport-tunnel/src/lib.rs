@@ -64,15 +64,11 @@
 //! secondary call sites keep it for as long as that disable path
 //! exists.
 
-mod secondary_link;
 mod transport;
 
 #[cfg(test)]
-mod secondary_link_tests;
-#[cfg(test)]
 mod tests;
 
-pub use secondary_link::UnifiedSecondaryTransport;
 pub use transport::{
     InboundTap, PeerRegistration, RegistrationSink, SharedOutgoing, TunneledPeerTransport,
 };

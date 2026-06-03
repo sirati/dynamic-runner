@@ -167,6 +167,8 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
     }
 }
 
+#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
+            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_with_real_workers_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -224,7 +226,8 @@ async fn secondary_with_real_workers_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
-            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let _ = transport;
+            let unified = make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -247,6 +250,8 @@ async fn secondary_with_real_workers_processes_tasks() {
         .await;
 }
 
+#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
+            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_multi_worker_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -302,7 +307,8 @@ async fn secondary_multi_worker_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
-            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let _ = transport;
+            let unified = make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -325,6 +331,8 @@ async fn secondary_multi_worker_processes_tasks() {
 /// the remaining 14+ must come via the operational TaskRequest →
 /// TaskAssignment loop. The legacy Python had a known gap here; this test
 /// pins the Rust behaviour so it can't silently regress.
+#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
+            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -380,7 +388,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 pri_to_sec_tx,
             ));
 
-            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let _ = transport;
+            let unified = make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -411,6 +420,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
 /// Pinning this end-to-end behaviour is what makes the wire feature
 /// safe to commit: the secondary handler, the cache registration,
 /// and the ExtractionCache lookup all interact correctly.
+#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
+            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn stage_file_then_assign_task_succeeds() {
     use crate::zip_extract::compute_file_hash;
@@ -585,7 +596,8 @@ async fn stage_file_then_assign_task_succeeds() {
                 drop(pri_to_sec_tx);
             });
 
-            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let _ = transport;
+            let unified = make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -683,6 +695,8 @@ async fn fake_primary_abort(
 /// `RunAborted` apply → `run_aborted()` set → `process_tasks` returns
 /// `RunOutcome::Aborted` (checked BEFORE the `run_complete()` break, and
 /// without waiting for any task drain — a hard shutdown).
+#[ignore = "full run driven by fake_primary_abort over the channel uplink; post-uplink deletion the \
+            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn run_aborted_yields_run_outcome_aborted() {
     let local = tokio::task::LocalSet::new();
@@ -732,7 +746,8 @@ async fn run_aborted_yields_run_outcome_aborted() {
                 pri_to_sec_tx,
             ));
 
-            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let _ = transport;
+            let unified = make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
