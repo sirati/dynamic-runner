@@ -340,7 +340,6 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                         oom_retry_max_passes: 1,
                         primary_link_failure_threshold: 5,
                         primary_link_failure_window: Duration::from_secs(30),
-                        setup_deadline: Duration::from_secs(60),
                         unconfigured_deadline: Duration::from_secs(600),
                         is_observer: false,
                         resource_check_interval: Duration::from_millis(100),

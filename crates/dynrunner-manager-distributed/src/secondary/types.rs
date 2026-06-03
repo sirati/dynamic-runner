@@ -7,14 +7,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Outcome reported by `SecondaryCoordinator::run_until_setup_or_done`.
+/// Per-run control signal reported by
+/// `SecondaryCoordinator::run_until_setup_or_done`.
 ///
-/// The PyO3 wrapper drives the secondary in a loop and inspects this
-/// value to decide whether to run Python-side setup discovery before
-/// re-entering, or to break out and shut down. The Rust-only callers
-/// (tests, the existing `run` entry point) only ever observe `Done` —
-/// `SetupPending` requires pre-staged mode with an empty ledger (see
-/// below), which those contexts never enter.
+/// This is the orthogonal "what should the caller do next" axis — it is
+/// NOT the per-secondary terminal (which terminal it reached lives on the
+/// [`crate::secondary::SecondaryLifecycle`] and is read back via
+/// [`SecondaryTerminal`]). The PyO3 wrapper drives the secondary in a loop
+/// and inspects this value to decide whether to run Python-side setup
+/// discovery before re-entering, or to break out, read the lifecycle
+/// terminal, and shut down.
 ///
 /// - `SetupPending`: the secondary observed pre-staged mode with an
 ///   empty replicated ledger — the authority deferred task discovery to
@@ -29,42 +31,58 @@ use std::time::Duration;
 ///   re-entering `run_until_setup_or_done` resumes the loop, and the
 ///   fire-once latch (set by `ingest_setup_discovery`) prevents a
 ///   re-yield.
-/// - `Done`: the loop reached one of its normal terminations
-///   (RunComplete observed, drain-down after primary disconnect, or
-///   single-secondary clean exit). The worker pool has been stopped
-///   and the secondary is finished.
-/// - `Aborted`: the replicated ledger recorded
-///   `ClusterMutation::RunAborted` (the failure twin of RunComplete).
-///   `process_tasks` checks `cluster_state.run_aborted()` BEFORE the
-///   `run_complete()` break and returns this so the PyO3
-///   secondary/observer wrappers call `std::process::exit(1)`. Carries
-///   the abort `reason` for the boundary log. The cluster-wide
-///   non-zero-exit cue for a pre-phase duplicate-task-id (#3a).
-/// - `PanikShutdown`: the panik watcher observed its sentinel file (or
-///   SIGTERM). The coordinator announced its own departure (file
-///   source: a self-authored `ClusterMutation::PeerRemoved
-///   { SelfDeparture }` — observability only, peers are NOT terminated),
-///   took down every worker AND its child tree with
-///   `pool.kill_all_workers_with_grace`, and is returning so the PyO3
-///   wrapper can call `std::process::exit(137)` for the SLURM wrapper
-///   to reap. `matched_path` is the first panik file that existed
-///   (used by the PyO3 wrapper for the shutdown-cause log); `reason`
-///   is the human-readable shape `"panik file: <path>"` carried in the
-///   `SelfDeparture` payload.
-///
-/// Note: `RunOutcome` is no longer `Copy`/`Eq` — the `PanikShutdown`
-/// variant carries a `PathBuf` + `String` payload. Existing call
-/// sites that pattern-match on the variant continue to compile;
-/// no production site compared `RunOutcome` values for equality.
-#[derive(Debug, Clone)]
+/// - `Terminal`: the loop reached one of its terminal exits. The
+///   coordinator has driven the matching `SecondaryLifecycle` terminal
+///   transition; the caller reads [`SecondaryCoordinator::terminal`] to
+///   learn which one (`Done` / `Aborted` / `Panik`) and act on it. (A
+///   `fatal_exit` is the one terminal NOT reported here — it propagates as
+///   an `Err` from the run loop while recording `Failed` on the lifecycle.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     SetupPending,
+    Terminal,
+}
+
+/// The per-secondary terminal outcome, projected from the module-private
+/// [`crate::secondary::SecondaryLifecycle`] terminal to the public boundary
+/// the PyO3 wrapper reads.
+///
+/// One value of this type describes how *this secondary* ended. The
+/// lifecycle terminal is the single source of truth; this is its public
+/// projection (see `SecondaryLifecycle::terminal`). The PyO3 boundary maps:
+///
+/// - `Done`: normal completion (RunComplete observed / clean drain-down) —
+///   `exit(0)` / `Ok`.
+/// - `Aborted`: the replicated ledger recorded `ClusterMutation::RunAborted`
+///   (the failure twin of RunComplete; the cluster-wide non-zero cue for a
+///   pre-phase duplicate-task-id #3a). `process_tasks` checks
+///   `cluster_state.run_aborted()` BEFORE the `run_complete()` break.
+///   `reason` is carried for the boundary log; the PyO3 wrapper calls
+///   `std::process::exit(1)`.
+/// - `Panik`: the panik watcher observed its sentinel file (or SIGTERM).
+///   The coordinator announced its own departure (file source: a
+///   self-authored `ClusterMutation::PeerRemoved { SelfDeparture }` —
+///   observability only, peers are NOT terminated), took down every worker
+///   AND its child tree with `pool.kill_all_workers_with_grace`, and the
+///   PyO3 wrapper calls `std::process::exit(137)` for the SLURM wrapper to
+///   reap. `matched_path` is the first panik file that existed (PyO3
+///   shutdown-cause log); `reason` is the `"panik file: <path>"` shape
+///   carried in the `SelfDeparture` payload.
+/// - `Failed`: an unrecoverable local fault was latched (`fatal_exit`). The
+///   run loop returns `Err(reason)`; the lifecycle records this terminal
+///   with the same `reason`. (The run loop's `Err` is what drives the
+///   boundary here, not a `RunOutcome::Terminal`.)
+#[derive(Debug, Clone)]
+pub enum SecondaryTerminal {
     Done,
     Aborted {
         reason: String,
     },
-    PanikShutdown {
+    Panik {
         matched_path: std::path::PathBuf,
+        reason: String,
+    },
+    Failed {
         reason: String,
     },
 }
@@ -178,32 +196,6 @@ pub struct SecondaryConfig {
     /// via the `--log-oom-watcher` CLI flag and propagated to
     /// secondaries through the SLURM wrapper's `forwarded_argv`.
     pub log_oom_watcher: bool,
-
-    /// Maximum wall-clock the secondary will spend in setup phases
-    /// (send_welcome + send_cert_exchange + wait_for_setup) before
-    /// concluding the cluster is dead and exiting cold. Default 60s.
-    ///
-    /// Concern: a late-arriving secondary scheduled AFTER the run
-    /// has logically completed (primary already exited) cannot reach
-    /// the now-dead primary URL. Without this deadline the transport
-    /// layer's internal connection retries hold the boot path
-    /// indefinitely (asm-dataset-nix T7 attempt 2 observed
-    /// ~345 retries × 1s = ~6min before SLURM container teardown
-    /// reaped the secondary). 60s gives a slow primary handshake
-    /// enough headroom on healthy clusters; well under SLURM's
-    /// per-job minimum so a dead-cluster boot reaps fast.
-    ///
-    /// `R1` (mid-run primary disconnect detection) deliberately
-    /// lives in the processing loop, not the setup loop — the
-    /// setup-phase `wait_for_setup` is documented as cancellation-
-    /// unsafe under tokio::select! racing of `recv()` (see
-    /// `setup.rs:79-96`), so we apply the deadline at the
-    /// orchestration boundary instead of nested inside the recv
-    /// loop. On timeout the recv future is cancelled at the outer
-    /// boundary, no subsequent iteration touches the (possibly
-    /// partial) transport state, so the cancellation hazard the
-    /// setup-loop comment warns about does not arise.
-    pub setup_deadline: Duration,
 
     /// Maximum wall-clock a secondary will spend NOT-YET-CONFIGURED —
     /// in the pre-`Operational` lifecycle states (`AwaitingPrimary` +
@@ -361,7 +353,6 @@ impl Default for SecondaryConfig {
             is_observer: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
-            setup_deadline: Duration::from_secs(60),
             unconfigured_deadline: Duration::from_secs(600),
             promoted_primary_quiesce_grace: Duration::from_secs(2),
             unfulfillable_reinject_max_per_task: None,

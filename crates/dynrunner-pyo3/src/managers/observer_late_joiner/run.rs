@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 
 use dynrunner_manager_distributed::{
-    RunOutcome, SecondaryConfig, SecondaryCoordinator, cluster_state::ClusterStateSnapshot,
-    observer::run_observer_announcer,
+    RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
+    cluster_state::ClusterStateSnapshot, observer::run_observer_announcer,
 };
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_slurm::read_peer_info_dir_v2;
@@ -70,7 +70,6 @@ impl PyObserverLateJoiner {
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
-        let dist_setup_deadline = self.distributed_config.setup_deadline();
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
@@ -202,7 +201,6 @@ impl PyObserverLateJoiner {
                         oom_retry_max_passes: dist_oom_retry_max_passes,
                         primary_link_failure_threshold: dist_primary_link_failure_threshold,
                         primary_link_failure_window: dist_primary_link_failure_window,
-                        setup_deadline: dist_setup_deadline,
                         unconfigured_deadline: dist_unconfigured_deadline,
                         is_observer: true,
                         // Observer has zero workers — the watcher's
@@ -567,32 +565,49 @@ impl PyObserverLateJoiner {
                                 secondary.cluster_state(),
                             ));
                             match outcome {
-                                RunOutcome::Done => break,
-                                RunOutcome::PanikShutdown {
-                                    matched_path,
-                                    reason,
-                                } => {
-                                    tracing::warn!(
-                                        matched_path = %matched_path.display(),
-                                        reason = %reason,
-                                        "observer panik shutdown; propagating \
-                                         to PyO3 boundary for exit(137)"
-                                    );
-                                    return Ok(ObserverRunOutcome::Panik(matched_path));
-                                }
-                                RunOutcome::Aborted { reason } => {
-                                    // The primary broadcast `RunAborted`
-                                    // (#3a pre-phase duplicate). Propagate
-                                    // to the PyO3 boundary for exit(1) — an
-                                    // observer exits non-zero on a
-                                    // cluster-wide abort, same as the
-                                    // secondary.
-                                    tracing::error!(
-                                        reason = %reason,
-                                        "observer run aborted by primary; propagating \
-                                         to PyO3 boundary for exit(1)"
-                                    );
-                                    return Ok(ObserverRunOutcome::Aborted(reason));
+                                RunOutcome::Terminal => {
+                                    // The per-secondary terminal is the
+                                    // single source of truth on the
+                                    // lifecycle; read it back to choose the
+                                    // boundary action.
+                                    match secondary.terminal() {
+                                        Some(SecondaryTerminal::Done) | None => break,
+                                        Some(SecondaryTerminal::Panik {
+                                            matched_path,
+                                            reason,
+                                        }) => {
+                                            tracing::warn!(
+                                                matched_path = %matched_path.display(),
+                                                reason = %reason,
+                                                "observer panik shutdown; propagating \
+                                                 to PyO3 boundary for exit(137)"
+                                            );
+                                            return Ok(ObserverRunOutcome::Panik(matched_path));
+                                        }
+                                        Some(SecondaryTerminal::Aborted { reason }) => {
+                                            // The primary broadcast `RunAborted`
+                                            // (#3a pre-phase duplicate). Propagate
+                                            // to the PyO3 boundary for exit(1) — an
+                                            // observer exits non-zero on a
+                                            // cluster-wide abort, same as the
+                                            // secondary.
+                                            tracing::error!(
+                                                reason = %reason,
+                                                "observer run aborted by primary; propagating \
+                                                 to PyO3 boundary for exit(1)"
+                                            );
+                                            return Ok(ObserverRunOutcome::Aborted(reason));
+                                        }
+                                        Some(SecondaryTerminal::Failed { reason }) => {
+                                            // `Failed` propagates as the run
+                                            // loop's `Err` (handled above), so
+                                            // this is unexpected on a
+                                            // `Terminal` — surface as an error.
+                                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                                format!("observer late-joiner: secondary failed: {reason}"),
+                                            ));
+                                        }
+                                    }
                                 }
                                 RunOutcome::SetupPending => {
                                     // Defensive: a late-joiner observer

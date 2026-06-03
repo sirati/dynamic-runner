@@ -181,9 +181,9 @@ where
     ///      continue / re-elect.
     ///   2. Take down every worker pgid this secondary owns via
     ///      [`dynrunner_manager_local::pool::WorkerPool::kill_all_workers_with_grace`].
-    ///   3. Surface the matched path + reason to the caller for
-    ///      [`crate::secondary::RunOutcome::PanikShutdown`] (this
-    ///      node's own local exit).
+    ///   3. Surface the matched path + reason to the caller, which records
+    ///      the [`crate::secondary::SecondaryTerminal::Panik`] lifecycle
+    ///      terminal (this node's own local exit).
     ///
     /// **SIGTERM source** (`matched_path` is the documented sentinel
     /// [`crate::panik_watcher::SIGTERM_SENTINEL_PATH`], fired by the

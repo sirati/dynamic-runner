@@ -7,7 +7,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_manager_distributed::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
+use dynrunner_manager_distributed::{
+    RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
+};
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
@@ -45,7 +47,6 @@ impl PySecondaryCoordinator {
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
-        let dist_setup_deadline = self.distributed_config.setup_deadline();
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
@@ -292,7 +293,6 @@ impl PySecondaryCoordinator {
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     primary_link_failure_threshold: dist_primary_link_failure_threshold,
                     primary_link_failure_window: dist_primary_link_failure_window,
-                    setup_deadline: dist_setup_deadline,
                     unconfigured_deadline: dist_unconfigured_deadline,
                     is_observer: false,
                     resource_check_interval: dist_resource_check_interval,
@@ -690,46 +690,59 @@ impl PySecondaryCoordinator {
                         }
                     };
                     match outcome {
-                        RunOutcome::Done => {
-                            tracing::info!("secondary finished successfully");
-                            break LoopResult::Ok(());
-                        }
-                        RunOutcome::PanikShutdown {
-                            matched_path,
-                            reason,
-                        } => {
-                            // The coordinator has already announced
-                            // this node's departure (self-authored
-                            // `ClusterMutation::PeerRemoved
-                            // { SelfDeparture }`, file source only) and
-                            // killed every worker pgid in this
-                            // secondary. The PyO3 outer scope owns
-                            // the actual `exit(137)` call (and the
-                            // log) so this arm just propagates the
-                            // matched_path through the loop's typed
-                            // result; see [`LoopResult`] above.
-                            tracing::warn!(
-                                matched_path = %matched_path.display(),
-                                reason = %reason,
-                                "secondary panik shutdown; propagating \
-                                 to PyO3 boundary for exit(137)"
-                            );
-                            break LoopResult::Panik(matched_path);
-                        }
-                        RunOutcome::Aborted { reason } => {
-                            // The primary broadcast `RunAborted` (#3a
-                            // pre-phase duplicate). The coordinator's
-                            // `Done`-shaped teardown already ran in
-                            // `run_until_setup_or_done`. The PyO3 outer
-                            // scope owns the `exit(1)` call; this arm
-                            // propagates the reason through the typed
-                            // loop result.
-                            tracing::error!(
-                                reason = %reason,
-                                "secondary run aborted by primary; propagating \
-                                 to PyO3 boundary for exit(1)"
-                            );
-                            break LoopResult::Aborted(reason);
+                        RunOutcome::Terminal => {
+                            // The per-secondary terminal is the single
+                            // source of truth on the lifecycle; read it
+                            // back to choose the boundary action. The
+                            // coordinator already ran the matching teardown
+                            // (and, for panik, killed every worker pgid)
+                            // inside `run_until_setup_or_done`.
+                            match secondary.terminal() {
+                                Some(SecondaryTerminal::Done) | None => {
+                                    tracing::info!("secondary finished successfully");
+                                    break LoopResult::Ok(());
+                                }
+                                Some(SecondaryTerminal::Panik {
+                                    matched_path,
+                                    reason,
+                                }) => {
+                                    // The PyO3 outer scope owns the actual
+                                    // `exit(137)` call (and the log); this
+                                    // arm just propagates the matched_path
+                                    // through the loop's typed result.
+                                    tracing::warn!(
+                                        matched_path = %matched_path.display(),
+                                        reason = %reason,
+                                        "secondary panik shutdown; propagating \
+                                         to PyO3 boundary for exit(137)"
+                                    );
+                                    break LoopResult::Panik(matched_path);
+                                }
+                                Some(SecondaryTerminal::Aborted { reason }) => {
+                                    // The primary broadcast `RunAborted`
+                                    // (#3a pre-phase duplicate). The PyO3
+                                    // outer scope owns the `exit(1)` call;
+                                    // this arm propagates the reason.
+                                    tracing::error!(
+                                        reason = %reason,
+                                        "secondary run aborted by primary; propagating \
+                                         to PyO3 boundary for exit(1)"
+                                    );
+                                    break LoopResult::Aborted(reason);
+                                }
+                                Some(SecondaryTerminal::Failed { reason }) => {
+                                    // `Failed` propagates as the run loop's
+                                    // `Err` (handled by the `Err(e)` arm
+                                    // above), so a `Terminal` with a `Failed`
+                                    // lifecycle is unexpected — surface it as
+                                    // an error rather than silently succeeding.
+                                    break LoopResult::Err(
+                                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                            "secondary failed: {reason}"
+                                        )),
+                                    );
+                                }
+                            }
                         }
                         RunOutcome::SetupPending => {
                             // Re-acquire the GIL ONLY for the duration

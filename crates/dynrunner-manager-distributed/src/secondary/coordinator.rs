@@ -73,7 +73,7 @@ where
             // and `Configuring → Operational` transitions, which is what
             // makes a pre-`Configuring` worker-spawn / task-accept
             // unrepresentable by construction.
-            lifecycle: SecondaryLifecycle::connecting(std::time::Instant::now()),
+            lifecycle: SecondaryLifecycle::connecting(),
             // The orthogonal peer-mesh sub-concern starts in its resting
             // pre-dial state, carried across the lifecycle's config states
             // (it begins forming on the unconfigured peer).
@@ -330,7 +330,8 @@ where
     /// (announce a self-authored `ClusterMutation::PeerRemoved
     /// { SelfDeparture }` on the file-source path — observability only,
     /// no cluster-wide cancellation — kill all worker process trees,
-    /// return `RunOutcome::PanikShutdown`). The PyO3
+    /// record the `Panik` lifecycle terminal and return
+    /// `RunOutcome::Terminal`). The PyO3
     /// wrapper owns spawning [`crate::panik_watcher::spawn_panik_watcher`]
     /// and threading its `take_signal_rx()` here; that separation is
     /// what lets each Rust-only caller (tests, the existing `run`
@@ -780,6 +781,63 @@ where
         self.cluster_state.outcome_counts().succeeded
     }
 
+    /// The per-secondary terminal outcome, or `None` if the lifecycle has
+    /// not reached a terminal.
+    ///
+    /// The single source of truth for "how did this secondary end" is the
+    /// [`SecondaryLifecycle`] terminal; this accessor projects it to the
+    /// public [`RunOutcome`](super::RunOutcome)'s sibling boundary type
+    /// [`super::SecondaryTerminal`] for the PyO3 wrapper, which reads it
+    /// after `run_until_setup_or_done` reports `RunOutcome::Terminal` to
+    /// decide the process exit code (`Done`→Ok, `Aborted`→`exit(1)`,
+    /// `Panik`→`exit(137)`).
+    pub fn terminal(&self) -> Option<super::SecondaryTerminal> {
+        self.lifecycle.terminal()
+    }
+
+    /// Drive the lifecycle to the `Done` terminal (normal completion).
+    pub(in crate::secondary) fn enter_terminal_done(&mut self) {
+        self.replace_lifecycle(SecondaryLifecycle::enter_done);
+    }
+
+    /// Drive the lifecycle to the `Aborted` terminal, carrying the
+    /// cluster-wide abort reason.
+    pub(in crate::secondary) fn enter_terminal_aborted(&mut self, reason: String) {
+        self.replace_lifecycle(|lc| lc.enter_aborted(reason));
+    }
+
+    /// Drive the lifecycle to the `Panik` terminal, carrying the matched
+    /// panik file path + reason.
+    pub(in crate::secondary) fn enter_terminal_panik(
+        &mut self,
+        matched_path: std::path::PathBuf,
+        reason: String,
+    ) {
+        self.replace_lifecycle(|lc| lc.enter_panik(matched_path, reason));
+    }
+
+    /// Drive the lifecycle to the `Failed` terminal, carrying the
+    /// `fatal_exit` reason the run loop also propagates as its `Err`.
+    pub(in crate::secondary) fn enter_terminal_failed(&mut self, reason: String) {
+        self.replace_lifecycle(|lc| lc.enter_failed(reason));
+    }
+
+    /// Move the lifecycle out, apply a by-value terminal transition, and
+    /// store it back. The terminal `enter_*` transitions consume `self` by
+    /// value (they are absorbing), so the move-out/move-in is the only way
+    /// to drive them through a `&mut self` coordinator method; the
+    /// placeholder is the cheap `Connecting` variant.
+    fn replace_lifecycle(
+        &mut self,
+        transition: impl FnOnce(SecondaryLifecycle<M, I>) -> SecondaryLifecycle<M, I>,
+    ) {
+        let lifecycle = std::mem::replace(
+            &mut self.lifecycle,
+            SecondaryLifecycle::connecting(),
+        );
+        self.lifecycle = transition(lifecycle);
+    }
+
     /// Read-only borrow of the replicated cluster ledger.
     ///
     /// # Single concern
@@ -916,7 +974,6 @@ where
     /// and no test/non-pyo3 setup ever sends one.
     pub async fn run(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
         match self.run_until_setup_or_done(factory).await? {
-            RunOutcome::Done => Ok(()),
             RunOutcome::SetupPending => Err(
                 "secondary yielded SetupPending but caller is the legacy run() \
                  wrapper which cannot drive setup discovery — programming error \
@@ -924,35 +981,38 @@ where
                  may be promoted with required_setup=true)"
                     .to_string(),
             ),
-            // Surface PanikShutdown as a String error on the legacy
-            // `run()` path. The PyO3 wrapper takes the structured
-            // `RunOutcome` directly and calls `std::process::exit(137)`;
-            // the legacy wrapper has no such side-effect channel, so
-            // operators using the Rust-only API observe panik as a
-            // normal error return with the matched path in the
-            // message. (Tests using the legacy `run()` don't trigger
-            // the watcher — no panik file is ever created — so this
-            // arm is structurally cold in production Rust-only usage.)
-            RunOutcome::PanikShutdown {
-                matched_path,
-                reason,
-            } => Err(format!(
-                "secondary panik shutdown: {reason} (matched_path={})",
-                matched_path.display()
-            )),
-            // Surface RunAborted as a String error on the legacy
-            // `run()` path, same disposition as PanikShutdown: the PyO3
-            // wrapper takes the structured `RunOutcome::Aborted`
-            // directly and calls `std::process::exit(1)`; the legacy
-            // wrapper has no such side-effect channel, so the abort
-            // surfaces as a normal error return carrying the reason.
-            RunOutcome::Aborted { reason } => Err(format!("run aborted by primary: {reason}")),
+            // Reached a terminal — read the per-secondary terminal off the
+            // lifecycle (the single source of truth). The PyO3 wrapper
+            // takes the structured terminal and calls `std::process::exit`
+            // (137 panik / 1 abort); the legacy `run()` path has no such
+            // side-effect channel, so it surfaces `Aborted`/`Panik` as a
+            // normal String error and `Done` as `Ok`. (`Failed` never
+            // reaches here — `fatal_exit` propagates as the run loop's
+            // `Err` before this match. The watcher is not triggered by
+            // legacy `run()` callers, so the panik arm is structurally cold
+            // in production Rust-only usage.)
+            RunOutcome::Terminal => match self.lifecycle.terminal() {
+                Some(super::SecondaryTerminal::Done) | None => Ok(()),
+                Some(super::SecondaryTerminal::Panik {
+                    matched_path,
+                    reason,
+                }) => Err(format!(
+                    "secondary panik shutdown: {reason} (matched_path={})",
+                    matched_path.display()
+                )),
+                Some(super::SecondaryTerminal::Aborted { reason }) => {
+                    Err(format!("run aborted by primary: {reason}"))
+                }
+                Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
+            },
         }
     }
 
     /// Drive the secondary coordination loop until it either yields
     /// for setup discovery (`RunOutcome::SetupPending`) or reaches a
-    /// terminal state (`RunOutcome::Done`).
+    /// terminal (`RunOutcome::Terminal`, with the specific per-secondary
+    /// terminal recorded on the lifecycle and readable via
+    /// [`Self::terminal`]).
     ///
     /// First invocation: enters `AwaitingPrimary`, runs the setup
     /// handshake (welcome / cert exchange / wait_for_setup) under
@@ -1066,7 +1126,7 @@ where
         // re-entry is already `Operational`, so this leaves it unchanged).
         self.lifecycle = std::mem::replace(
             &mut self.lifecycle,
-            SecondaryLifecycle::connecting(std::time::Instant::now()),
+            SecondaryLifecycle::connecting(),
         )
         .enter_awaiting_primary();
 
@@ -1204,21 +1264,7 @@ where
         // latches). May yield with SetupPending or run to completion.
         let outcome = self.process_tasks(factory).await?;
 
-        match &outcome {
-            RunOutcome::Done => {
-                // Normal termination — drain the sampler BEFORE
-                // `stop_all_workers` so its last tick still sees
-                // the per-worker cgroup leaves the pool's teardown
-                // is about to Drop-rmdir. Mirrors
-                // `LocalManager::process_binaries`'s teardown order.
-                self.shutdown_sampler_if_present().await;
-                self.stop_all_workers().await;
-                tracing::info!(
-                    secondary = %self.config.secondary_id,
-                    completed = self.completed_count(),
-                    "secondary finished"
-                );
-            }
+        match outcome {
             RunOutcome::SetupPending => {
                 // Workers stay alive; the caller's re-entry resumes
                 // the loop in `process_tasks`. No final log line yet —
@@ -1228,38 +1274,75 @@ where
                     "secondary yielding for setup discovery"
                 );
             }
-            RunOutcome::PanikShutdown {
-                matched_path,
-                reason,
-            } => {
-                // Workers have already been taken down via the
-                // panik-react path's `kill_all_workers_with_grace`;
-                // skip the clean `stop_all_workers` ladder (it would
-                // try to send a protocol Stop on a dead transport
-                // and waste teardown time). The PyO3 wrapper will
-                // call `std::process::exit(137)` as soon as it sees
-                // this variant.
-                tracing::warn!(
-                    secondary = %self.config.secondary_id,
-                    matched_path = %matched_path.display(),
-                    reason = %reason,
-                    "secondary panik shutdown"
-                );
-            }
-            RunOutcome::Aborted { reason } => {
-                // Run aborted cluster-wide. The run is over, so tear
-                // down workers the same way as `Done` (drain the
-                // sampler before `stop_all_workers`); the PyO3 wrapper
-                // will call `std::process::exit(1)` once it sees this
-                // variant. Logged at error level — an abort is a
-                // failure outcome, not a clean finish.
-                self.shutdown_sampler_if_present().await;
-                self.stop_all_workers().await;
-                tracing::error!(
-                    secondary = %self.config.secondary_id,
-                    reason = %reason,
-                    "secondary exiting: run aborted by primary"
-                );
+            RunOutcome::Terminal => {
+                // `process_tasks` already recorded the per-secondary
+                // terminal on the lifecycle (the single source of truth);
+                // read it back to choose the matching teardown.
+                match self.lifecycle.terminal() {
+                    Some(super::SecondaryTerminal::Done) | None => {
+                        // Normal termination — drain the sampler BEFORE
+                        // `stop_all_workers` so its last tick still sees
+                        // the per-worker cgroup leaves the pool's teardown
+                        // is about to Drop-rmdir. Mirrors
+                        // `LocalManager::process_binaries`'s teardown order.
+                        self.shutdown_sampler_if_present().await;
+                        self.stop_all_workers().await;
+                        tracing::info!(
+                            secondary = %self.config.secondary_id,
+                            completed = self.completed_count(),
+                            "secondary finished"
+                        );
+                    }
+                    Some(super::SecondaryTerminal::Panik {
+                        matched_path,
+                        reason,
+                    }) => {
+                        // Workers have already been taken down via the
+                        // panik-react path's `kill_all_workers_with_grace`;
+                        // skip the clean `stop_all_workers` ladder (it would
+                        // try to send a protocol Stop on a dead transport
+                        // and waste teardown time). The PyO3 wrapper reads
+                        // the `Panik` terminal and calls
+                        // `std::process::exit(137)`.
+                        tracing::warn!(
+                            secondary = %self.config.secondary_id,
+                            matched_path = %matched_path.display(),
+                            reason = %reason,
+                            "secondary panik shutdown"
+                        );
+                    }
+                    Some(super::SecondaryTerminal::Aborted { reason }) => {
+                        // Run aborted cluster-wide. The run is over, so tear
+                        // down workers the same way as `Done` (drain the
+                        // sampler before `stop_all_workers`); the PyO3
+                        // wrapper reads the `Aborted` terminal and calls
+                        // `std::process::exit(1)`. Logged at error level —
+                        // an abort is a failure outcome, not a clean finish.
+                        self.shutdown_sampler_if_present().await;
+                        self.stop_all_workers().await;
+                        tracing::error!(
+                            secondary = %self.config.secondary_id,
+                            reason = %reason,
+                            "secondary exiting: run aborted by primary"
+                        );
+                    }
+                    Some(super::SecondaryTerminal::Failed { reason }) => {
+                        // A `Failed` terminal is reached only via the
+                        // `fatal_exit` read, which propagates an `Err` from
+                        // `process_tasks` (short-circuiting the `?` above) —
+                        // so this arm is unreachable on a `RunOutcome::
+                        // Terminal`. Guard defensively rather than weaken
+                        // the match.
+                        tracing::error!(
+                            secondary = %self.config.secondary_id,
+                            reason = %reason,
+                            "secondary reported Terminal with a Failed lifecycle \
+                             (unexpected — fatal_exit should propagate Err)"
+                        );
+                        self.shutdown_sampler_if_present().await;
+                        self.stop_all_workers().await;
+                    }
+                }
             }
         }
 

@@ -100,7 +100,6 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -223,9 +222,9 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             });
 
             let mut factory = FakeWorkerFactory;
-            // Drive the secondary. The panik handler returns
-            // `Ok(RunOutcome::PanikShutdown)` from
-            // `run_until_setup_or_done`; the test's bounded sleep
+            // Drive the secondary. The panik handler records the `Panik`
+            // lifecycle terminal and returns `Ok(RunOutcome::Terminal)`
+            // from `run_until_setup_or_done`; the test's bounded sleep
             // above guarantees that fires within a few hundred
             // milliseconds.
             let outcome = tokio::time::timeout(
@@ -236,19 +235,23 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             .expect("secondary did not return within budget")
             .expect("secondary returned Err on the panik path");
 
-            match &outcome {
-                RunOutcome::PanikShutdown {
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal on the panik path, got: {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Panik {
                     matched_path,
                     reason,
-                } => {
-                    assert_eq!(matched_path, &expected_path);
+                }) => {
+                    assert_eq!(matched_path, expected_path);
                     assert!(
                         reason.contains("synthetic-panik-test"),
                         "panik reason should contain the matched-path \
                          substring; got: {reason}"
                     );
                 }
-                other => panic!("expected RunOutcome::PanikShutdown, got: {other:?}"),
+                other => panic!("expected SecondaryTerminal::Panik, got: {other:?}"),
             }
 
             // Confirm the departure announcement reached the MESH (the
@@ -352,7 +355,6 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -463,13 +465,17 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             .expect("secondary did not return within budget")
             .expect("secondary returned Err on the SIGTERM panik path");
 
-            match &outcome {
-                RunOutcome::PanikShutdown {
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal on the SIGTERM panik path, got: {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Panik {
                     matched_path,
                     reason,
-                } => {
+                }) => {
                     assert_eq!(
-                        matched_path, &expected_path,
+                        matched_path, expected_path,
                         "SIGTERM panik should surface the sentinel \
                          matched_path verbatim to the caller"
                     );
@@ -480,7 +486,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                          conflated source type with file path)"
                     );
                 }
-                other => panic!("expected RunOutcome::PanikShutdown, got: {other:?}"),
+                other => panic!("expected SecondaryTerminal::Panik, got: {other:?}"),
             }
 
             // Assert NO self-authored `PeerRemoved { SelfDeparture }`
