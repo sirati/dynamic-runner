@@ -31,9 +31,7 @@ use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, ResourceMap, TaskDep
 
 use crate::primary::lifecycle::dispatch_order;
 use crate::primary::wire::compute_task_hash;
-use crate::worker_signal::{
-    drain_worker_signal_batch, WorkerMgmtSignal, WorkerSignalBatch,
-};
+use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch, drain_worker_signal_batch};
 
 type TestPrimary = PrimaryCoordinator<
     ChannelPeerTransport<TestId>,
@@ -173,8 +171,7 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
             let _ = assigned_task_ids(&mut ends[0].1);
 
             // Install the worker-management bus to capture the emit.
-            let (wm_tx, mut wm_rx) =
-                tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
             primary
                 .cluster_state_mut_for_test()
                 .install_worker_mgmt_sender(wm_tx);
@@ -351,8 +348,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
 
             // A TasksAdded recheck dispatches the remaining task to the
             // free worker (index 1, local worker_id 1).
-            let (wm_tx, mut wm_rx) =
-                tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
             primary
                 .cluster_state_mut_for_test()
                 .install_worker_mgmt_sender(wm_tx);
@@ -391,8 +387,7 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
                 .unwrap();
             let _ = assigned_task_ids(&mut ends[0].1);
 
-            let (wm_tx, mut wm_rx) =
-                tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
             primary
                 .cluster_state_mut_for_test()
                 .install_worker_mgmt_sender(wm_tx);

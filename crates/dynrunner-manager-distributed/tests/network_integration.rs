@@ -4,13 +4,17 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TypeId};
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
+use dynrunner_core::{
+    MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
+};
+use dynrunner_manager_distributed::{
+    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
+};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
-use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd};
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
 use dynrunner_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
 use dynrunner_transport_tunnel::{TunneledPeerTransport, UnifiedSecondaryTransport};
 use serde::{Deserialize, Serialize};
@@ -69,11 +73,7 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
                     Some(Command::ProcessTask { .. }) => {
-                        let _ = runner
-                            .send(Response::Done {
-                                result_data: None,
-                            })
-                            .await;
+                        let _ = runner.send(Response::Done { result_data: None }).await;
                     }
                     None => break,
                 }
@@ -97,131 +97,135 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 async fn e2e_primary_secondary_over_wss() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // Post-collapse: build the unified `TunneledPeerTransport`
-        // first so the network server's accept loops feed its inbound +
-        // registration sinks directly. The transport OWNS the inbound
-        // demux; the server shrinks to bind + accept-loops. The primary
-        // holds this transport as its single `Tr`.
-        let (peer_transport, _shared_outgoing, inbound, registration) =
-            TunneledPeerTransport::<TestId>::new("primary".into());
-        let server: NetworkServer =
-            NetworkServer::bind::<TestId>(addr, inbound, registration)
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            // Post-collapse: build the unified `TunneledPeerTransport`
+            // first so the network server's accept loops feed its inbound +
+            // registration sinks directly. The transport OWNS the inbound
+            // demux; the server shrinks to bind + accept-loops. The primary
+            // holds this transport as its single `Tr`.
+            let (peer_transport, _shared_outgoing, inbound, registration) =
+                TunneledPeerTransport::<TestId>::new("primary".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
                 .await
                 .unwrap();
-        let port = server.port();
-        let _server = server;
-        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let port = server.port();
+            let _server = server;
+            let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let secondary_id = "sec-0".to_string();
-        let ram = 1024 * 1024 * 1024u64;
+            let secondary_id = "sec-0".to_string();
+            let ram = 1024 * 1024 * 1024u64;
 
-        // Spawn secondary on a separate task, connecting via WSS
-        let sec_id = secondary_id.clone();
-        let sec_handle = tokio::task::spawn_local(async move {
-            let client = NetworkClient::connect_wss_only(server_addr)
-                .await
-                .expect("WSS connect failed");
+            // Spawn secondary on a separate task, connecting via WSS
+            let sec_id = secondary_id.clone();
+            let sec_handle = tokio::task::spawn_local(async move {
+                let client = NetworkClient::connect_wss_only(server_addr)
+                    .await
+                    .expect("WSS connect failed");
 
-            let config = SecondaryConfig {
-                secondary_id: sec_id,
-                num_workers: 2,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
-                hostname: "test-host".into(),
-                keepalive_interval: Duration::from_secs(60),
-                src_network: None,
-                src_tmp: None,
-                peer_timeout: Duration::from_secs(120),
+                let config = SecondaryConfig {
+                    secondary_id: sec_id,
+                    num_workers: 2,
+                    max_resources: dynrunner_core::ResourceMap::from([(
+                        dynrunner_core::ResourceKind::memory(),
+                        ram,
+                    )]),
+                    hostname: "test-host".into(),
+                    keepalive_interval: Duration::from_secs(60),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                    oom_retry_max_passes: 1,
+                    primary_link_failure_threshold: 5,
+                    primary_link_failure_window: Duration::from_secs(30),
+                    setup_deadline: Duration::from_secs(60),
+                    is_observer: false,
+                    resource_check_interval: Duration::from_millis(100),
+                    log_oom_watcher: false,
+                    promoted_primary_quiesce_grace: Duration::from_millis(100),
+                    unfulfillable_reinject_max_per_task: None,
+                    mem_manager_reserved_bytes: None,
+                    output_dir: None,
+                    memuse_log_path: None,
+                };
+
+                let unified = UnifiedSecondaryTransport::new(
+                    config.secondary_id.clone(),
+                    client,
+                    NoPeerTransport,
+                );
+                let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
+                    SecondaryCoordinator::new(
+                        config,
+                        unified,
+                        ResourceStealingScheduler::memory(),
+                        FixedEstimator(100),
+                    );
+                let mut factory = FakeWorkerFactory;
+                secondary.run(&mut factory).await.unwrap();
+                secondary.completed_count()
+            });
+
+            // Primary coordinator
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
                 keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
                 retry_max_passes: 1,
                 oom_retry_max_passes: 1,
-                primary_link_failure_threshold: 5,
-                primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
-                is_observer: false,
-                resource_check_interval: Duration::from_millis(100),
-                log_oom_watcher: false,
-                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(60),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
                 unfulfillable_reinject_max_per_task: None,
-                mem_manager_reserved_bytes: None,
-                output_dir: None,
-                memuse_log_path: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
 
-            let unified = UnifiedSecondaryTransport::new(
-                config.secondary_id.clone(),
-                client,
-                NoPeerTransport,
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                peer_transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
             );
-            let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
-                SecondaryCoordinator::new(
-                    config,
-                    unified,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
-            let mut factory = FakeWorkerFactory;
-            secondary.run(&mut factory).await.unwrap();
-            secondary.completed_count()
-        });
 
-        // Primary coordinator
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-                    keepalive_interval: Duration::from_secs(5),
-                    keepalive_miss_threshold: 3,
-                    source_pre_staged_root: None,
-                    uses_file_based_items: true,
-                    required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(60),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let binaries: Vec<TaskInfo<TestId>> = (0..5)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            peer_transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            primary
+                .run(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    Box::new(|_| {}),
+                    Box::new(|_, _, _| {}),
+                )
+                .await
+                .unwrap();
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..5)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
 
-        primary
-            .run(
-                binaries,
-                std::collections::HashMap::new(),
-                Box::new(|_| {}),
-                Box::new(|_, _, _| {}),
-            )
-            .await
-            .unwrap();
+            // Drop primary to close transport, allowing secondary to exit
+            drop(primary);
 
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
+            let sec_completed = sec_handle.await.unwrap();
 
-        // Drop primary to close transport, allowing secondary to exit
-        drop(primary);
-
-        let sec_completed = sec_handle.await.unwrap();
-
-        assert_eq!(completed, 5, "primary should see 5 completed");
-        assert_eq!(failed, 0, "no failures expected");
-        assert_eq!(sec_completed, 5, "secondary should see 5 completed");
-    }).await;
+            assert_eq!(completed, 5, "primary should see 5 completed");
+            assert_eq!(failed, 0, "no failures expected");
+            assert_eq!(sec_completed, 5, "secondary should see 5 completed");
+        })
+        .await;
 }
 
 /// End-to-end: 1 primary + 1 secondary over real QUIC networking.
@@ -236,136 +240,140 @@ async fn e2e_primary_secondary_over_wss() {
 async fn e2e_primary_secondary_over_quic() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        // Same Shape-A construction as the WSS sibling: transport first,
-        // then bind the server with its inbound + registration sinks.
-        let (peer_transport, _shared_outgoing, inbound, registration) =
-            TunneledPeerTransport::<TestId>::new("primary".into());
-        let server: NetworkServer =
-            NetworkServer::bind::<TestId>(addr, inbound, registration)
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            // Same Shape-A construction as the WSS sibling: transport first,
+            // then bind the server with its inbound + registration sinks.
+            let (peer_transport, _shared_outgoing, inbound, registration) =
+                TunneledPeerTransport::<TestId>::new("primary".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
                 .await
                 .unwrap();
-        let port = server.port();
-        let cert_der = server.cert_der().clone();
-        let _server = server;
-        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let port = server.port();
+            let cert_der = server.cert_der().clone();
+            let _server = server;
+            let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-        let secondary_id = "sec-0".to_string();
-        let ram = 1024 * 1024 * 1024u64;
+            let secondary_id = "sec-0".to_string();
+            let ram = 1024 * 1024 * 1024u64;
 
-        // Spawn secondary connecting via QUIC
-        let sec_id = secondary_id.clone();
-        let sec_handle = tokio::task::spawn_local(async move {
-            let client = NetworkClient::connect(
-                server_addr,
-                "primary",
-                &cert_der,
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("QUIC connect failed");
+            // Spawn secondary connecting via QUIC
+            let sec_id = secondary_id.clone();
+            let sec_handle = tokio::task::spawn_local(async move {
+                let client = NetworkClient::connect(
+                    server_addr,
+                    "primary",
+                    &cert_der,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("QUIC connect failed");
 
-            // Should have used QUIC
-            assert!(matches!(client, NetworkClient::Quic(_)));
+                // Should have used QUIC
+                assert!(matches!(client, NetworkClient::Quic(_)));
 
-            let config = SecondaryConfig {
-                secondary_id: sec_id,
-                num_workers: 2,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
-                hostname: "test-host".into(),
-                keepalive_interval: Duration::from_secs(60),
-                src_network: None,
-                src_tmp: None,
-                peer_timeout: Duration::from_secs(120),
+                let config = SecondaryConfig {
+                    secondary_id: sec_id,
+                    num_workers: 2,
+                    max_resources: dynrunner_core::ResourceMap::from([(
+                        dynrunner_core::ResourceKind::memory(),
+                        ram,
+                    )]),
+                    hostname: "test-host".into(),
+                    keepalive_interval: Duration::from_secs(60),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                    oom_retry_max_passes: 1,
+                    primary_link_failure_threshold: 5,
+                    primary_link_failure_window: Duration::from_secs(30),
+                    setup_deadline: Duration::from_secs(60),
+                    is_observer: false,
+                    resource_check_interval: Duration::from_millis(100),
+                    log_oom_watcher: false,
+                    promoted_primary_quiesce_grace: Duration::from_millis(100),
+                    unfulfillable_reinject_max_per_task: None,
+                    mem_manager_reserved_bytes: None,
+                    output_dir: None,
+                    memuse_log_path: None,
+                };
+
+                let unified = UnifiedSecondaryTransport::new(
+                    config.secondary_id.clone(),
+                    client,
+                    NoPeerTransport,
+                );
+                let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
+                    SecondaryCoordinator::new(
+                        config,
+                        unified,
+                        ResourceStealingScheduler::memory(),
+                        FixedEstimator(100),
+                    );
+                let mut factory = FakeWorkerFactory;
+                secondary.run(&mut factory).await.unwrap();
+                secondary.completed_count()
+            });
+
+            // Primary coordinator
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
                 keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
                 retry_max_passes: 1,
                 oom_retry_max_passes: 1,
-                primary_link_failure_threshold: 5,
-                primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
-                is_observer: false,
-                resource_check_interval: Duration::from_millis(100),
-                log_oom_watcher: false,
-                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(60),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
                 unfulfillable_reinject_max_per_task: None,
-                mem_manager_reserved_bytes: None,
-                output_dir: None,
-                memuse_log_path: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
 
-            let unified = UnifiedSecondaryTransport::new(
-                config.secondary_id.clone(),
-                client,
-                NoPeerTransport,
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                peer_transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
             );
-            let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
-                SecondaryCoordinator::new(
-                    config,
-                    unified,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
-            let mut factory = FakeWorkerFactory;
-            secondary.run(&mut factory).await.unwrap();
-            secondary.completed_count()
-        });
 
-        // Primary coordinator
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-                    keepalive_interval: Duration::from_secs(5),
-                    keepalive_miss_threshold: 3,
-                    source_pre_staged_root: None,
-                    uses_file_based_items: true,
-                    required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(60),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let binaries: Vec<TaskInfo<TestId>> = (0..5)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            peer_transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            primary
+                .run(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    Box::new(|_| {}),
+                    Box::new(|_, _, _| {}),
+                )
+                .await
+                .unwrap();
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..5)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
 
-        primary
-            .run(
-                binaries,
-                std::collections::HashMap::new(),
-                Box::new(|_| {}),
-                Box::new(|_, _, _| {}),
-            )
-            .await
-            .unwrap();
+            drop(primary);
 
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
+            let sec_completed = sec_handle.await.unwrap();
 
-        drop(primary);
-
-        let sec_completed = sec_handle.await.unwrap();
-
-        assert_eq!(completed, 5, "primary should see 5 completed");
-        assert_eq!(failed, 0, "no failures expected");
-        assert_eq!(sec_completed, 5, "secondary should see 5 completed");
-    }).await;
+            assert_eq!(completed, 5, "primary should see 5 completed");
+            assert_eq!(failed, 0, "no failures expected");
+            assert_eq!(sec_completed, 5, "secondary should see 5 completed");
+        })
+        .await;
 }
 
 /// Post-collapse unified-inbound contract: a `ClusterMutation` frame

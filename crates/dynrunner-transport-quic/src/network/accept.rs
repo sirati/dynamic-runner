@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver};
-use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
 use dynrunner_transport_tunnel::{InboundTap, PeerRegistration, RegistrationSink};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;

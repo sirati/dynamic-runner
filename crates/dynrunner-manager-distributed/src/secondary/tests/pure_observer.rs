@@ -23,18 +23,18 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    election_config, make_transport, FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId,
-    TestTransport,
+    FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId, TestTransport, election_config,
+    make_transport,
 };
 use super::super::*;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::cell::RefCell;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Build an observer-mode SecondaryCoordinator (`is_observer=true`,
@@ -107,12 +107,7 @@ fn snapshot_with(
     }
     for i in 0..n_completed {
         let id = format!("done-{i}");
-        tasks.insert(
-            id.clone(),
-            TaskState::Completed {
-                task: mk_task(&id),
-            },
-        );
+        tasks.insert(id.clone(), TaskState::Completed { task: mk_task(&id) });
     }
     crate::cluster_state::ClusterStateSnapshot {
         tasks,
@@ -135,8 +130,7 @@ async fn observer_originates_nothing_and_reads_terminal_state_from_crdt() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, peer_log, mut uplink_rx) =
-                make_observer_with_recorder("observer-1");
+            let (mut sec, peer_log, mut uplink_rx) = make_observer_with_recorder("observer-1");
             // Full CRDT: 2 pending + 3 completed.
             sec.restore_from_snapshot_and_skip_setup(snapshot_with(2, 3, &["observer-1"]));
 
@@ -185,8 +179,7 @@ async fn observer_exits_only_on_run_complete() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, peer_log, _uplink_rx) =
-                make_observer_with_recorder("observer-1");
+            let (mut sec, peer_log, _uplink_rx) = make_observer_with_recorder("observer-1");
             sec.restore_from_snapshot_and_skip_setup(snapshot_with(0, 1, &["observer-1"]));
             sec.cluster_state.apply(ClusterMutation::RunComplete);
             assert!(sec.cluster_state.run_complete());
@@ -281,7 +274,10 @@ fn late_joining_worker_gets_full_snapshot_without_observer_role() {
             .contains("late-worker"),
         "worker must NOT be mis-projected into the observer set"
     );
-    assert!(!sec.config.is_observer, "worker config carries is_observer=false");
+    assert!(
+        !sec.config.is_observer,
+        "worker config carries is_observer=false"
+    );
 }
 
 /// (5): N concurrent observers each restore the SAME full CRDT

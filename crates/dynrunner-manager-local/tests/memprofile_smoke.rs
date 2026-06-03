@@ -75,11 +75,8 @@ fn write_fake_cgroup_leaf(leaf: &Path, memory_current: u64, swap_current: u64) {
         format!("{swap_current}\n"),
     )
     .expect("write memory.swap.current");
-    fs::write(
-        leaf.join("memory.stat"),
-        "anon 4096\nfile 0\npgfault 7\n",
-    )
-    .expect("write memory.stat");
+    fs::write(leaf.join("memory.stat"), "anon 4096\nfile 0\npgfault 7\n")
+        .expect("write memory.stat");
 }
 
 /// Decode all complete zstd frames in `path` into the JSONL lines
@@ -98,9 +95,7 @@ fn decode_samples(path: &Path) -> Vec<serde_json::Value> {
     text.split_terminator('\n')
         .map(|line| {
             serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!(
-                    "every JSONL line must parse as Sample JSON; got {line:?}: {e}"
-                )
+                panic!("every JSONL line must parse as Sample JSON; got {line:?}: {e}")
             })
         })
         .collect()
@@ -166,9 +161,7 @@ fn assert_sample_shape(sample: &serde_json::Value, expected_worker_id: u64) {
 #[tokio::test(flavor = "current_thread")]
 async fn memprofile_smoke_local_two_tasks_produces_two_files() {
     if !cgroup_v2_with_memory_available() {
-        eprintln!(
-            "skipping memprofile_smoke: cgroup-v2 with memory controller not available"
-        );
+        eprintln!("skipping memprofile_smoke: cgroup-v2 with memory controller not available");
         return;
     }
 
@@ -201,18 +194,8 @@ async fn memprofile_smoke_local_two_tasks_produces_two_files() {
     });
 
     let started = Instant::now();
-    sampler.on_task_assigned(
-        "task-A".to_string(),
-        0,
-        leaf_w0.clone(),
-        started,
-    );
-    sampler.on_task_assigned(
-        "task-B".to_string(),
-        1,
-        leaf_w1.clone(),
-        started,
-    );
+    sampler.on_task_assigned("task-A".to_string(), 0, leaf_w0.clone(), started);
+    sampler.on_task_assigned("task-B".to_string(), 1, leaf_w1.clone(), started);
 
     // Let the tick loop fire several times so each writer accumulates
     // at least one frame. 200 ms / 30 ms ≈ 6 ticks worst case, plenty

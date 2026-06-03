@@ -20,10 +20,7 @@ use super::resource::SoftPreferredSecondaries;
 /// Generic over the identifier type `I` so different task definitions
 /// can use different identifier structures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct TaskInfo<I> {
     pub path: PathBuf,
     pub size: u64,
@@ -287,9 +284,8 @@ mod task_dep_tests {
     #[test]
     fn task_dep_struct_default_inherit_outputs_false() {
         // The `inherit_outputs` key may be omitted from the struct shape.
-        let dep: TaskDep =
-            serde_json::from_str("{\"task_id\":\"foo\",\"phase_id\":\"p\"}")
-                .expect("struct without flag");
+        let dep: TaskDep = serde_json::from_str("{\"task_id\":\"foo\",\"phase_id\":\"p\"}")
+            .expect("struct without flag");
         assert_eq!(
             dep,
             TaskDep {
@@ -333,6 +329,10 @@ mod task_dep_tests {
             inherit_outputs: false,
         };
         explicit.fill_phase(&PhaseId::from("enclosing"));
-        assert_eq!(explicit.phase_id, PhaseId::from("other"), "new dep untouched");
+        assert_eq!(
+            explicit.phase_id,
+            PhaseId::from("other"),
+            "new dep untouched"
+        );
     }
 }

@@ -81,11 +81,7 @@ impl<I: Identifier> ClusterState<I> {
     /// arm before this helper fires, so the insert is effectively
     /// first-write-wins under the apply rule. No explicit `.entry().
     /// or_insert(_)` guard is needed at this layer.
-    pub(super) fn record_task_outputs(
-        &mut self,
-        hash: &str,
-        result_data: Option<Vec<u8>>,
-    ) {
+    pub(super) fn record_task_outputs(&mut self, hash: &str, result_data: Option<Vec<u8>>) {
         let Some(bytes) = result_data else {
             return;
         };
@@ -131,12 +127,6 @@ impl<I: Identifier> ClusterState<I> {
         }
         resumed
     }
-
-
-
-
-
-
 
     /// Apply a `ClusterMutation::TasksSpawned` batch.
     ///

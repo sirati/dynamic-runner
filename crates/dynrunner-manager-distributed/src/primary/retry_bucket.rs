@@ -35,7 +35,9 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
+use dynrunner_core::{
+    ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo,
+};
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -269,9 +271,7 @@ where
             .filter(|b| b.phase_id == *phase)
             .filter(|b| {
                 let h = compute_task_hash(*b);
-                self.failed_tasks
-                    .get(&h)
-                    .is_some_and(|et| kind.matches(et))
+                self.failed_tasks.get(&h).is_some_and(|et| kind.matches(et))
             })
             .cloned()
             .collect();
@@ -390,8 +390,8 @@ mod important_event_tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
 
-    use super::{try_phase_retry_bucket_core, BucketKind, RetryPassesUsed};
-    use crate::test_capture::{important_only, ImportantCapture};
+    use super::{BucketKind, RetryPassesUsed, try_phase_retry_bucket_core};
+    use crate::test_capture::{ImportantCapture, important_only};
 
     fn task(name: &str, phase: &PhaseId) -> TaskInfo<RunnerIdentifier> {
         TaskInfo {
@@ -428,8 +428,7 @@ mod important_event_tests {
             used.insert((phase.clone(), kind), used_seed);
         }
         let capture = ImportantCapture::default();
-        let subscriber =
-            Registry::default().with(capture.clone().with_filter(important_only()));
+        let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
         let reinjected = with_default(subscriber, || {
             try_phase_retry_bucket_core(
                 &phase,
@@ -477,7 +476,10 @@ mod important_event_tests {
     fn empty_candidates_emit_no_event() {
         let (reinjected, events) = run_with_capture(BucketKind::Recoverable, vec![], 1, 0);
         assert!(!reinjected);
-        assert!(events.is_empty(), "no important event on empty bucket: {events:?}");
+        assert!(
+            events.is_empty(),
+            "no important event on empty bucket: {events:?}"
+        );
     }
 
     #[test]

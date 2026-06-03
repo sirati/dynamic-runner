@@ -2,9 +2,9 @@
 //! `lib.rs` only under `#[cfg(test)]`. Covers send/recv round-trips
 //! plus the disconnect semantics on either side.
 
+use crate::manager_runner::channel_pair;
 use dynrunner_core::{MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::{Command, Response};
-use crate::manager_runner::channel_pair;
 
 #[tokio::test]
 async fn command_roundtrip() {

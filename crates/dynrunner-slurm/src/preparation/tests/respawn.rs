@@ -6,18 +6,18 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::process::Child;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
+use crate::preparation::SlurmPreparation;
 use crate::preparation::establish::establish_one_tunnel_inner;
 use crate::preparation::options::{InfoFileReader, PrepError};
-use crate::preparation::SlurmPreparation;
 
 use super::establish::alive_child;
 use super::opts_for;
@@ -58,8 +58,7 @@ fn establish_one_tunnel_pushes_child_handle() {
         let tmp = tempfile::tempdir().unwrap();
         let opts = opts_for(&tmp);
         let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
-        let port_map: Arc<StdMutex<HashMap<String, u16>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
+        let port_map: Arc<StdMutex<HashMap<String, u16>>> = Arc::new(StdMutex::new(HashMap::new()));
         let establish_pool = Arc::new(Semaphore::new(1));
         let reader = CannedUriReader {
             uri: "tcp://compute-77:54321".into(),
@@ -118,8 +117,7 @@ fn establish_one_tunnel_applies_rate_limiter() {
         let tmp = tempfile::tempdir().unwrap();
         let opts = opts_for(&tmp);
         let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
-        let port_map: Arc<StdMutex<HashMap<String, u16>>> =
-            Arc::new(StdMutex::new(HashMap::new()));
+        let port_map: Arc<StdMutex<HashMap<String, u16>>> = Arc::new(StdMutex::new(HashMap::new()));
         let establish_pool = Arc::new(Semaphore::new(MAX));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
@@ -204,7 +202,11 @@ fn establish_one_tunnel_errors_without_prior_setup() {
         .expect_err("must fail without prior setup_ssh_tunnels")
     }));
     match err {
-        PrepError::TunnelFailed { secondary_id, stderr, .. } => {
+        PrepError::TunnelFailed {
+            secondary_id,
+            stderr,
+            ..
+        } => {
             assert_eq!(secondary_id, "secondary-0");
             assert!(
                 stderr.contains("primary QUIC port"),

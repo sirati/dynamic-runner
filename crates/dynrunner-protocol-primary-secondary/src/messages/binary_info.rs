@@ -21,10 +21,7 @@ use serde::{Deserialize, Serialize};
 /// — keeping it a `String` on the wire decouples the protocol crate from
 /// the runner's choice of opaque payload representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct DistributedBinaryInfo<I> {
     pub path: String,
     pub size: u64,
@@ -148,10 +145,7 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
 
 /// Zip file with assigned binaries for initial assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct ZipFileAssignment<I> {
     pub zip_name: String,
     pub binaries: Vec<ZipBinaryEntry<I>>,
@@ -159,10 +153,7 @@ pub struct ZipFileAssignment<I> {
 
 /// A single binary entry within a zip assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct ZipBinaryEntry<I> {
     pub local_path: String,
     pub binary_info: DistributedBinaryInfo<I>,

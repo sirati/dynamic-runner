@@ -6,7 +6,7 @@
 //! connections we initiated via `connect_to_peers`.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;

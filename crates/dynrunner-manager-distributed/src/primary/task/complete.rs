@@ -1,20 +1,17 @@
-
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 use crate::worker_signal::WorkerMgmtSignal;
 
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
     /// applies inline before the next `drain_empty_active_phases`
@@ -71,12 +68,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // post-completion state by applying this mutation. CRDT
             // semantics make duplicate applies (e.g. on a re-broadcast
             // for a task already terminal locally) a NoOp.
-            self.apply_and_broadcast_cluster_mutations(vec![
-                ClusterMutation::TaskCompleted {
-                    hash: task_hash.clone(),
-                    result_data: result_data.clone(),
-                },
-            ])
+            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
+                hash: task_hash.clone(),
+                result_data: result_data.clone(),
+            }])
             .await;
 
             // A successful TaskComplete from this secondary proves
@@ -109,19 +104,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // (paired with the reserve in `commit_assignment`), so the
             // cascade below only runs the per-phase counter; `type_id`
             // is carried purely for the diagnostic DEBUG line.
-            let completed_meta: Option<(
-                dynrunner_core::PhaseId,
-                dynrunner_core::TypeId,
-                String,
-            )> = self
-                .free_slot_on_terminal(&secondary_id, worker_id, task_hash)
-                .map(|entry| {
-                    (
-                        entry.phase,
-                        entry.task.type_id.clone(),
-                        entry.task.task_id.clone(),
-                    )
-                });
+            let completed_meta: Option<(dynrunner_core::PhaseId, dynrunner_core::TypeId, String)> =
+                self.free_slot_on_terminal(&secondary_id, worker_id, task_hash)
+                    .map(|entry| {
+                        (
+                            entry.phase,
+                            entry.task.type_id.clone(),
+                            entry.task.task_id.clone(),
+                        )
+                    });
 
             // Operator-facing INFO: enough to grep "did task X
             // complete and how are aggregate counts moving?". The
@@ -151,7 +142,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             );
 
             if let Some((phase, _type_id, task_id)) = completed_meta {
-                self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
+                self.note_item_completed(&phase, Some(task_id.as_str()), command_rx)
+                    .await;
             }
 
             // A task completed: its worker freed AND a previously-
@@ -221,5 +213,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             }
         }
     }
-
 }

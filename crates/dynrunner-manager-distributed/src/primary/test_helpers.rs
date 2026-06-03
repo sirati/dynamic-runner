@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{
-    TaskInfo, Identifier, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TypeId,
+    Identifier, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -12,9 +12,7 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerTransport,
 };
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{
-    channel_pair, ChannelManagerEnd, ChannelPeerTransport,
-};
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPeerTransport, channel_pair};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -111,9 +109,7 @@ impl<I: Identifier> RecordingPeer<I> {
 
     /// Clone of the shared log handle. The recorder is moved into
     /// `PrimaryCoordinator::new`, so the test grabs this before the move.
-    pub(super) fn log_handle(
-        &self,
-    ) -> std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>> {
+    pub(super) fn log_handle(&self) -> std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<I>>>> {
         self.broadcasts.clone()
     }
 }
@@ -492,15 +488,9 @@ pub(super) async fn fake_secondary_with_addrs(
                 // `worker_id=0`, which after demotion is no longer
                 // self-healed by the heartbeat-driven requeue and
                 // leaves later workers permanently mid-dispatch.
-                let entries: Vec<_> = zip_files
-                    .iter()
-                    .flat_map(|zf| zf.binaries.iter())
-                    .collect();
+                let entries: Vec<_> = zip_files.iter().flat_map(|zf| zf.binaries.iter()).collect();
                 for (idx, entry) in entries.iter().enumerate() {
-                    let worker_id = workers_ready
-                        .get(idx)
-                        .map(|w| w.worker_id)
-                        .unwrap_or(0);
+                    let worker_id = workers_ready.get(idx).map(|w| w.worker_id).unwrap_or(0);
                     pending_hashes.remove(&entry.hash);
                     outgoing_to_primary
                         .send(DistributedMessage::TaskComplete {

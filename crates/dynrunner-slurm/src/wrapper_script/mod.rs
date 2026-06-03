@@ -34,6 +34,6 @@ mod test_generate;
 #[cfg(test)]
 mod tests;
 
-pub use config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
+pub use config::{ConnectionMode, WRAPPER_SRC_NETWORK_CONTAINER_PATH, WrapperScriptConfig};
 pub use generate::generate_wrapper_script;
-pub use test_generate::{generate_test_wrapper_script, TestWrapperScriptConfig};
+pub use test_generate::{TestWrapperScriptConfig, generate_test_wrapper_script};

@@ -54,8 +54,8 @@
 //! `run_until_setup_or_done` for the prior art.
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio::sync::mpsc;
 

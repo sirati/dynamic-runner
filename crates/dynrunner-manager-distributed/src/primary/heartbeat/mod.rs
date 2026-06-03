@@ -18,8 +18,8 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::{PendingMassDeath, PrimaryCoordinator};
 use super::wire::timestamp_now;
+use super::{PendingMassDeath, PrimaryCoordinator};
 use crate::worker_signal::WorkerMgmtSignal;
 
 /// Outcome of a single periodic heartbeat sweep.
@@ -200,8 +200,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Drop every worker hosted by the dead secondary — its host is
         // gone. The slot state is discarded with the worker; the task
         // it held (if any) was already requeued via the ledger above.
-        self.workers
-            .retain(|w| w.secondary_id != secondary_id);
+        self.workers.retain(|w| w.secondary_id != secondary_id);
         // Now clear pool-side affinity for the dead workers so any
         // bucket they pinned is free for survivors.
         for wid in dead_global_ids {
@@ -383,7 +382,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // singleton/dual-secondary runs from biasing toward correlated
         // inference. `alive_count` excludes already-deferred peers
         // (they're "dead from the alive set's perspective" too).
-        let alive_count = self.secondaries.len().saturating_sub(self.pending_mass_death.len());
+        let alive_count = self
+            .secondaries
+            .len()
+            .saturating_sub(self.pending_mass_death.len());
         let mass_event = self.config.mass_death_grace > Duration::ZERO
             && new_dead.len() >= self.config.mass_death_min_count as usize
             && new_dead.len() == alive_count;
@@ -466,4 +468,3 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
 #[cfg(test)]
 mod tests;
-

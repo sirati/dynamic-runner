@@ -299,7 +299,9 @@ mod tests {
         }
 
         let calls: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Recorder { calls: calls.clone() };
+        let recorder = Recorder {
+            calls: calls.clone(),
+        };
         run_cleanup(recorder).await;
         assert_eq!(*calls.lock().unwrap(), vec![1u8, 2, 3]);
     }
@@ -391,7 +393,9 @@ mod tests {
         }
 
         let calls: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorder = AlwaysErrors { calls: calls.clone() };
+        let recorder = AlwaysErrors {
+            calls: calls.clone(),
+        };
         run_cleanup(recorder).await;
         assert_eq!(*calls.lock().unwrap(), vec![1u8, 2, 3]);
     }

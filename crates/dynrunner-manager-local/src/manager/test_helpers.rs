@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 
 use dynrunner_core::{
-    TaskInfo, ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
-    SoftPreferredSecondaries, TypeId, WorkerId,
+    ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
+    SoftPreferredSecondaries, TaskInfo, TypeId, WorkerId,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelRunnerEnd, channel_pair};
 use serde::{Deserialize, Serialize};
 
 use super::{LocalManagerConfig, WorkerFactory};

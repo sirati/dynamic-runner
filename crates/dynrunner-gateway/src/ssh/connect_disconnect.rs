@@ -14,10 +14,10 @@ use tokio::process::Command;
 
 use crate::traits::GatewayError;
 
+use super::SshGateway;
 use super::argv::{
     build_master_argv, generate_master_control_path, probe_master_pid, terminate_daemon_blocking,
 };
-use super::SshGateway;
 
 impl SshGateway {
     pub(super) async fn connect_inner(&mut self) -> Result<(), GatewayError> {
@@ -73,7 +73,11 @@ impl SshGateway {
                         stderr.trim()
                     )));
                 }
-                tracing::info!(local_port, remote_port, "added reverse forward to external master");
+                tracing::info!(
+                    local_port,
+                    remote_port,
+                    "added reverse forward to external master"
+                );
             }
 
             tracing::info!("SSH master connection established");
@@ -131,9 +135,9 @@ impl SshGateway {
         // PID-reuse victim. Daemon teardown goes through
         // `terminate_daemon_blocking(daemon_pid)` in Drop.
 
-        let mut launcher = cmd.spawn().map_err(|e| {
-            GatewayError::Other(format!("failed to spawn ssh master: {e}"))
-        })?;
+        let mut launcher = cmd
+            .spawn()
+            .map_err(|e| GatewayError::Other(format!("failed to spawn ssh master: {e}")))?;
         let launcher_pid = launcher.id();
 
         // Wait for the control socket to appear. 10s timeout — the
@@ -177,24 +181,25 @@ impl SshGateway {
         // Exit status non-zero means the control socket exists but
         // doesn't respond — a real fault, not an interim handshake
         // state (we already waited for the socket to appear).
-        let daemon_pid = match probe_master_pid(&cp, &self.ssh_target(), &self.base_ssh_args()).await {
-            Ok(pid) => pid,
-            Err(e) => {
-                // Best-effort cleanup so a probe failure doesn't leak
-                // the launcher / daemon. The launcher will exit on
-                // its own; we *don't* know the daemon PID, so fall
-                // back to `ssh -O exit` which goes via the socket and
-                // lands at the daemon.
-                let mut exit_cmd = Command::new("ssh");
-                for arg in self.base_ssh_args() {
-                    exit_cmd.arg(&arg);
+        let daemon_pid =
+            match probe_master_pid(&cp, &self.ssh_target(), &self.base_ssh_args()).await {
+                Ok(pid) => pid,
+                Err(e) => {
+                    // Best-effort cleanup so a probe failure doesn't leak
+                    // the launcher / daemon. The launcher will exit on
+                    // its own; we *don't* know the daemon PID, so fall
+                    // back to `ssh -O exit` which goes via the socket and
+                    // lands at the daemon.
+                    let mut exit_cmd = Command::new("ssh");
+                    for arg in self.base_ssh_args() {
+                        exit_cmd.arg(&arg);
+                    }
+                    exit_cmd.args(["-O", "exit", "-o", &format!("ControlPath={cp}")]);
+                    exit_cmd.arg(self.ssh_target());
+                    let _ = exit_cmd.output().await;
+                    return Err(e);
                 }
-                exit_cmd.args(["-O", "exit", "-o", &format!("ControlPath={cp}")]);
-                exit_cmd.arg(self.ssh_target());
-                let _ = exit_cmd.output().await;
-                return Err(e);
-            }
-        };
+            };
 
         // Reap the launcher zombie ASAP. Reading exit status is
         // bookkeeping-only; we don't gate on it. On the rare path
@@ -352,5 +357,4 @@ impl SshGateway {
         tracing::info!("SSH gateway disconnected");
         Ok(())
     }
-
 }

@@ -7,8 +7,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_core::{
-    resolve_against_root, PhaseId, PrimaryCommand, ResourceKind, ResourceMap, TaskInfo,
-    COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, PhaseId, PrimaryCommand, ResourceKind, ResourceMap, TaskInfo,
+    resolve_against_root,
 };
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -22,7 +22,7 @@ use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::RunnerIdentifier;
 use crate::managers::primary_handle::{PyPrimaryHandle, ReinjectCapCell};
 use crate::network::gethostname;
-use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
+use crate::pytypes::{PyFailedTask, PyProcessingStats, PyTaskInfo, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 use crate::transport::EitherManagerEnd;
@@ -208,9 +208,9 @@ impl PyLocalManager {
                 h
             }
         };
-        let log_dir =
-            task.log_paths
-                .resolve_log_dir(py, &task.log_path, &secondary_id)?;
+        let log_dir = task
+            .log_paths
+            .resolve_log_dir(py, &task.log_path, &secondary_id)?;
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             pyo3::exceptions::PyOSError::new_err(format!(
                 "failed to create log directory {log_dir:?}: {e}"
@@ -221,13 +221,11 @@ impl PyLocalManager {
         let conn_mode = match connection_mode {
             "socketpair" => ConnectionMode::Socketpair,
             "named" => {
-                let dir = socket_dir
-                    .map(PathBuf::from)
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err(
-                            "socket_dir is required when connection_mode is 'named'",
-                        )
-                    })?;
+                let dir = socket_dir.map(PathBuf::from).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "socket_dir is required when connection_mode is 'named'",
+                    )
+                })?;
                 std::fs::create_dir_all(&dir).ok();
                 ConnectionMode::Named { socket_dir: dir }
             }
@@ -242,17 +240,18 @@ impl PyLocalManager {
         // typed `max_resources` ResourceMap (preferred) or just the legacy
         // scalar `max_memory: u64` (single-key memory). When both are
         // given, the typed map wins. Same shape for `low_resource_thresholds`.
-        let max_resources = max_resources.map(|m| m.to_rust()).unwrap_or_else(|| {
-            ResourceMap::from([(ResourceKind::memory(), max_memory)])
-        });
-        let low_resource_thresholds = low_resource_thresholds
+        let max_resources = max_resources
             .map(|m| m.to_rust())
-            .unwrap_or_else(|| {
-                ResourceMap::from([(
-                    ResourceKind::memory(),
-                    low_memory_threshold.unwrap_or(300 * 1024 * 1024),
-                )])
-            });
+            .unwrap_or_else(|| ResourceMap::from([(ResourceKind::memory(), max_memory)]));
+        let low_resource_thresholds =
+            low_resource_thresholds
+                .map(|m| m.to_rust())
+                .unwrap_or_else(|| {
+                    ResourceMap::from([(
+                        ResourceKind::memory(),
+                        low_memory_threshold.unwrap_or(300 * 1024 * 1024),
+                    )])
+                });
 
         // Pre-mint the command-channel pair so `.handle()` is
         // callable BEFORE `process_binaries`. Both halves are
@@ -261,9 +260,7 @@ impl PyLocalManager {
         // `LocalManager` at `process_binaries` time via
         // `command_rx.lock().take()`.
         let (command_tx, command_rx) =
-            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(
-                COMMAND_CHANNEL_CAPACITY,
-            );
+            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(COMMAND_CHANNEL_CAPACITY);
 
         Ok(Self {
             python_executable: task.python_executable,
@@ -359,10 +356,11 @@ impl PyLocalManager {
 
         let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
             let cb = cb.clone_ref(py);
-            let predicate: dynrunner_manager_local::RestartPredicate =
-                Box::new(move |ctx: &dynrunner_manager_local::RestartContext<'_>| -> bool {
+            let predicate: dynrunner_manager_local::RestartPredicate = Box::new(
+                move |ctx: &dynrunner_manager_local::RestartContext<'_>| -> bool {
                     crate::managers::factory_callback::invoke_restart_predicate(&cb, ctx)
-                });
+                },
+            );
             predicate
         });
 
@@ -475,9 +473,8 @@ impl PyLocalManager {
         // `if let Ok(signal) = …` and the select! falls through to
         // the manager-future arm.
         let panik_watcher_paths = self.panik_watcher_paths.clone();
-        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
-            self.panik_watcher_poll_interval_secs,
-        );
+        let panik_watcher_poll_interval =
+            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
         // Panik-grace window for the worker tree-kill. 5s matches
         // the SubprocessWorkerFactory's `TERMINATE_GRACE` and the
         // secondary's `PANIK_KILL_GRACE`.
@@ -541,11 +538,7 @@ impl PyLocalManager {
 
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::with_command_channel(
-                        config,
-                        scheduler,
-                        estimator,
-                        command_tx,
-                        command_rx,
+                        config, scheduler, estimator, command_tx, command_rx,
                     );
                 // phase_deps comes from LoadedTaskDefinition (5A);
                 // on_phase_* closures bridge to Python (5B).
@@ -762,8 +755,12 @@ task_args = SimpleNamespace()
         PyModule::from_code(
             py,
             std::ffi::CString::new(source).unwrap().as_c_str(),
-            std::ffi::CString::new("stub_local_task_def.py").unwrap().as_c_str(),
-            std::ffi::CString::new("stub_local_task_def").unwrap().as_c_str(),
+            std::ffi::CString::new("stub_local_task_def.py")
+                .unwrap()
+                .as_c_str(),
+            std::ffi::CString::new("stub_local_task_def")
+                .unwrap()
+                .as_c_str(),
         )
         .expect("compile stub TaskDefinition module")
     }
@@ -776,10 +773,7 @@ task_args = SimpleNamespace()
         let task = module.getattr("task")?;
         let task_args = module.getattr("task_args")?;
         // tempdir: PyLocalManager::new creates log_dir under it.
-        let tmp = std::env::temp_dir().join(format!(
-            "rust_pylocal_test_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("rust_pylocal_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).expect("tmp");
         let source = tmp.join("src");
         let output = tmp.join("out");
@@ -829,7 +823,7 @@ task_args = SimpleNamespace()
                 .expect("handle() must succeed before process_binaries");
             // Downcast to prove the type contract.
             let _handle: pyo3::PyRef<'_, PyPrimaryHandle> = handle_obj
-                .downcast::<PyPrimaryHandle>()
+                .cast::<PyPrimaryHandle>()
                 .expect("handle() must return a PrimaryHandle pyclass")
                 .borrow();
         });
@@ -843,20 +837,10 @@ task_args = SimpleNamespace()
     fn handle_clones_share_same_command_channel() {
         Python::attach(|py| {
             let mgr = build_manager(py).expect("manager constructs");
-            let h1 = mgr
-                .bind(py)
-                .call_method0("handle")
-                .expect("first handle");
-            let h2 = mgr
-                .bind(py)
-                .call_method0("handle")
-                .expect("second handle");
-            let r1 = h1
-                .downcast::<PyPrimaryHandle>()
-                .unwrap();
-            let r2 = h2
-                .downcast::<PyPrimaryHandle>()
-                .unwrap();
+            let h1 = mgr.bind(py).call_method0("handle").expect("first handle");
+            let h2 = mgr.bind(py).call_method0("handle").expect("second handle");
+            let r1 = h1.cast::<PyPrimaryHandle>().unwrap();
+            let r2 = h2.cast::<PyPrimaryHandle>().unwrap();
             let r1_sender = r1.borrow().sender.clone();
             let r2_sender = r2.borrow().sender.clone();
             assert!(
@@ -873,4 +857,3 @@ task_args = SimpleNamespace()
         });
     }
 }
-

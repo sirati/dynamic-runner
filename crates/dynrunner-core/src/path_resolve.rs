@@ -46,10 +46,7 @@ pub fn resolve_against_root(path: &Path, root: &Path) -> ResolvedPath {
     } else {
         root.join(path)
     };
-    let relative = absolute
-        .strip_prefix(root)
-        .ok()
-        .map(|p| p.to_path_buf());
+    let relative = absolute.strip_prefix(root).ok().map(|p| p.to_path_buf());
     ResolvedPath { absolute, relative }
 }
 
@@ -67,10 +64,7 @@ mod tests {
 
     #[test]
     fn abs_under_root_nested_strips_to_nested_tail() {
-        let r = resolve_against_root(
-            Path::new("/srv/data/nested/bin_1"),
-            Path::new("/srv/data"),
-        );
+        let r = resolve_against_root(Path::new("/srv/data/nested/bin_1"), Path::new("/srv/data"));
         assert_eq!(r.absolute, PathBuf::from("/srv/data/nested/bin_1"));
         assert_eq!(r.relative, Some(PathBuf::from("nested/bin_1")));
     }

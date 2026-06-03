@@ -6,11 +6,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::preparation::options::{InfoFileReader, PrepError, PreparationOptions};
 use crate::preparation::SlurmPreparation;
+use crate::preparation::options::{InfoFileReader, PrepError, PreparationOptions};
 
 use super::opts_for;
 
@@ -72,7 +72,9 @@ fn timeout_when_no_secondary_ready() {
 
     let opts = opts_for(&tmp);
     let polls = Arc::new(AtomicUsize::new(0));
-    let reader = StuckReader { polls: polls.clone() };
+    let reader = StuckReader {
+        polls: polls.clone(),
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -109,14 +111,7 @@ fn timeout_when_no_secondary_ready() {
 /// call is a no-op. This exercises the `drain(..)` pattern.
 #[test]
 fn cleanup_is_idempotent() {
-    let opts = PreparationOptions::new(
-        "/tmp".into(),
-        "h".into(),
-        None,
-        22,
-        vec![],
-        vec![],
-    );
+    let opts = PreparationOptions::new("/tmp".into(), "h".into(), None, 22, vec![], vec![]);
     let prep = SlurmPreparation::new(opts);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -144,8 +139,12 @@ fn local_dir_reader_resolves_existing_and_missing_paths() {
     std::fs::write(&present, "tcp://h:1234\n").unwrap();
     let absent = tmp.path().join("absent.info");
     let reader = LocalDirReader;
-    let got = rt.block_on(reader.read(present.display().to_string())).unwrap();
+    let got = rt
+        .block_on(reader.read(present.display().to_string()))
+        .unwrap();
     assert_eq!(got.as_deref(), Some("tcp://h:1234\n"));
-    let none = rt.block_on(reader.read(absent.display().to_string())).unwrap();
+    let none = rt
+        .block_on(reader.read(absent.display().to_string()))
+        .unwrap();
     assert!(none.is_none());
 }

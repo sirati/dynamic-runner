@@ -38,7 +38,8 @@ fn release_worker_unpins_only_if_last_pin() {
         t("P", "T", "alpha", 1),
         t("P", "T", "alpha", 2),
         t("P", "T", "alpha", 3),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     // Worker 1 claims alpha. Worker 2 also picks (co-pin via step 4 after
     // the only typed bucket is already pinned).
     let _ = p.pop_for_worker(1).unwrap();
@@ -161,7 +162,8 @@ fn drain_queued_empties_buckets_without_touching_inflight() {
         t("P", "T", "alpha", 1),
         t("P", "T", "beta", 2),
         t("P", "T", "", 3),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     // Take one to bump in-flight.
     let _ = p.pop_for_worker(1).unwrap();
     let in_flight_before = p.in_flight(&phase("P"));
@@ -174,10 +176,7 @@ fn drain_queued_empties_buckets_without_touching_inflight() {
 
 #[test]
 fn activation_cascade_through_chain() {
-    let mut p = pool_with(
-        &["A", "B", "C"],
-        &[("B", &["A"]), ("C", &["B"])],
-    );
+    let mut p = pool_with(&["A", "B", "C"], &[("B", &["A"]), ("C", &["B"])]);
     p.mark_phase_done(&phase("A"));
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Active));
     assert_eq!(p.phase_state(&phase("C")), Some(PhaseState::Blocked));

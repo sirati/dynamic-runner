@@ -96,9 +96,7 @@ impl<I: Identifier> ColocatedPrimaryTransport<I> {
     }
 }
 
-impl<I: Identifier> MessageReceiver<DistributedMessage<I>>
-    for ColocatedPrimaryTransport<I>
-{
+impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for ColocatedPrimaryTransport<I> {
     async fn recv(&mut self) -> Option<DistributedMessage<I>> {
         // Drain the role-aware tap. `None` only when the secondary's
         // unified transport has been torn down (its loopback/tap sender
@@ -126,10 +124,7 @@ impl<I: Identifier> SecondaryTransport<I> for ColocatedPrimaryTransport<I> {
         }
     }
 
-    async fn broadcast(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), Vec<(String, String)>> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), Vec<(String, String)>> {
         // Loopback to the co-located secondary AND fan out over the
         // mesh to every remote secondary. The co-located secondary is
         // NOT a mesh peer of itself, so the loopback leg is required for
@@ -178,13 +173,15 @@ impl<I: Identifier> PeerTransport<I> for ColocatedPrimaryTransport<I> {
     /// not this return value (same collapse the submitter primary's
     /// keepalive emitter already relies on).
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
-        SecondaryTransport::broadcast(self, msg).await.map_err(|failures| {
-            failures
-                .into_iter()
-                .map(|(id, err)| format!("{id}: {err}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
+        SecondaryTransport::broadcast(self, msg)
+            .await
+            .map_err(|failures| {
+                failures
+                    .into_iter()
+                    .map(|(id, err)| format!("{id}: {err}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
     }
 
     /// Drain the role-aware inbound tap — the same stream

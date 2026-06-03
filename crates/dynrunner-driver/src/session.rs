@@ -141,7 +141,10 @@ impl Session {
         }
         c.args([
             "-o",
-            &format!("ControlPath={}", self.master.control_path().to_string_lossy()),
+            &format!(
+                "ControlPath={}",
+                self.master.control_path().to_string_lossy()
+            ),
         ]);
         c.arg(local.to_string_lossy().as_ref());
         c.arg(format!("{}:{remote}", self.master.target().as_str()));
@@ -171,7 +174,10 @@ impl Session {
         }
         c.args([
             "-o",
-            &format!("ControlPath={}", self.master.control_path().to_string_lossy()),
+            &format!(
+                "ControlPath={}",
+                self.master.control_path().to_string_lossy()
+            ),
         ]);
         c.arg(format!("{}:{remote}", self.master.target().as_str()));
         c.arg(local.to_string_lossy().as_ref());

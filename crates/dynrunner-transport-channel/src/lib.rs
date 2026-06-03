@@ -28,7 +28,7 @@ pub mod mesh;
 pub mod peer_transport;
 pub mod secondary_transport;
 
-pub use manager_runner::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
+pub use manager_runner::{ChannelManagerEnd, ChannelRunnerEnd, channel_pair};
 pub use mesh::{peer_mesh, peer_mesh_with_adjacency};
 pub use peer_transport::ChannelPeerTransport;
 pub use secondary_transport::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};

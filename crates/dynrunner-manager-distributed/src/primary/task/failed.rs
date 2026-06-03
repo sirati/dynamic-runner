@@ -1,21 +1,17 @@
 use std::time::Instant;
 
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 use crate::worker_signal::WorkerMgmtSignal;
 
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
     /// applies inline before the next `drain_empty_active_phases`
@@ -57,8 +53,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // earlier landing).
             let dedup_is_backpressure = error_message == "No idle worker available"
                 || error_message == "worker pipe broken; respawning"
-                || error_message
-                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
+                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if !dedup_is_backpressure
                 && (self.completed_tasks.contains(task_hash)
                     || self.failed_tasks.contains_key(task_hash))
@@ -141,8 +136,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // the other two markers.
             let is_backpressure = error_message == "No idle worker available"
                 || error_message == "worker pipe broken; respawning"
-                || error_message
-                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
+                || error_message == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if is_backpressure {
                 let backoff_ms = 500;
                 self.backpressured_secondaries.insert(
@@ -198,13 +192,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // post-failure state. The wire `error_type` is now the
             // typed `ErrorType` enum (Phase D), so the CRDT mutation
             // takes it verbatim — no string-token mapping.
-            self.apply_and_broadcast_cluster_mutations(vec![
-                ClusterMutation::TaskFailed {
-                    hash: task_hash.clone(),
-                    kind: error_type.clone(),
-                    error: error_message.clone(),
-                },
-            ])
+            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskFailed {
+                hash: task_hash.clone(),
+                kind: error_type.clone(),
+                error: error_message.clone(),
+            }])
             .await;
 
             // Operator-facing WARN: per-class for retry/policy
@@ -240,7 +232,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // uniformly — the latter simply had no slot/type-slot to
             // free, matching the deleted pre-owned fallback's contract.
             if let Some(binary) = recovered_binary {
-                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
+                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx)
+                    .await;
             }
 
             // Same rationale as `handle_task_complete`: this terminal
@@ -267,5 +260,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 .await;
         }
     }
-
 }

@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::pool::WorkerPool;
+use crate::stats::ProcessingStats;
 use dynrunner_core::{
-    compute_task_hash, FailedTask, Identifier, PhaseId, PrimaryCommand, ResourceKind, ResourceMap,
-    TaskInfo, TaskOutputs, TypeId, WorkerId, COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, FailedTask, Identifier, PhaseId, PrimaryCommand, ResourceKind,
+    ResourceMap, TaskInfo, TaskOutputs, TypeId, WorkerId, compute_task_hash,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
-use crate::pool::WorkerPool;
-use crate::stats::ProcessingStats;
 
 /// Per-completion context handed to a `RestartPredicate`. References borrow
 /// from the manager's per-worker state and live only for the predicate call.
@@ -199,7 +199,12 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
 /// real sockets and in-process channels for testing.
 /// Generic over `I` (the identifier type) so different task definitions
 /// can use different identifier structures.
-pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier = ()> {
+pub struct LocalManager<
+    M: ManagerEndpoint,
+    S: Scheduler<I>,
+    E: ResourceEstimator<I>,
+    I: Identifier = (),
+> {
     pub(crate) config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
@@ -337,7 +342,9 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     pub(crate) unfulfillable_reinject_remaining: HashMap<String, u32>,
 }
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     /// Construct a manager with a freshly-minted command channel.
     /// The Rust-test surface uses this form — the test never needs to
     /// reach into the channel sender, so a self-built pair is the
@@ -439,8 +446,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // Snapshot the phase set from the binaries' `phase_id`s. Any phase
         // that appears as a dep but not in the items must still be in the
         // pool's phase set, so merge in dep-graph keys/values too.
-        let mut phase_ids: HashSet<PhaseId> =
-            binaries.iter().map(|t| t.phase_id.clone()).collect();
+        let mut phase_ids: HashSet<PhaseId> = binaries.iter().map(|t| t.phase_id.clone()).collect();
         for (child, parents) in &phase_deps {
             phase_ids.insert(child.clone());
             for parent in parents {
@@ -458,8 +464,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.on_phase_start_cb = Some(Box::new(on_phase_start));
         self.on_phase_end_cb = Some(Box::new(on_phase_end));
 
-        let pool = PendingPool::new(phase_ids, phase_deps)
-            .map_err(|e| e.to_string())?;
+        let pool = PendingPool::new(phase_ids, phase_deps).map_err(|e| e.to_string())?;
         self.pending = Some(pool);
         // Mirror the initial batch into `task_by_hash` BEFORE
         // `pool.extend`. The mirror is the command-channel handler's
@@ -526,15 +531,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // queue exists for non-cgroup messages (Disconnected fan-out)
         // and so the local-mode integration test can pin lifecycle
         // semantics independently of cgroup-v2 availability.
-        self.sampler = self
-            .config
-            .output_dir
-            .as_ref()
-            .map(|dir| {
-                crate::memprofile::MemProfileSampler::spawn(
-                    crate::memprofile::MemProfileConfig::new(dir.clone()),
-                )
-            });
+        self.sampler = self.config.output_dir.as_ref().map(|dir| {
+            crate::memprofile::MemProfileSampler::spawn(crate::memprofile::MemProfileConfig::new(
+                dir.clone(),
+            ))
+        });
 
         // Outer loop: every iteration runs the full 5-phase pipeline
         // and breaks when `task_by_hash` did not grow during the pass.
@@ -669,10 +670,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     ///     resolves + cascade-drops (matching the runtime cascade).
     ///   * **valid** → handed to `extend`, preserving its atomic
     ///     contract (a cycle among valid tasks is still a hard error).
-    fn ingest_partition_local(
-        &mut self,
-        binaries: Vec<TaskInfo<I>>,
-    ) -> Result<(), String> {
+    fn ingest_partition_local(&mut self, binaries: Vec<TaskInfo<I>>) -> Result<(), String> {
         let partition = self.pool_ref().partition_ingest(binaries);
 
         // Duplicates: hard error (no cluster-abort concept in local
@@ -794,7 +792,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         success: bool,
         task_id: Option<&str>,
     ) {
-        let entry = self.phase_completion_counts.entry(phase_id.clone()).or_insert((0, 0));
+        let entry = self
+            .phase_completion_counts
+            .entry(phase_id.clone())
+            .or_insert((0, 0));
         if success {
             entry.0 += 1;
         } else {

@@ -40,7 +40,6 @@ impl MessageReceiver<Response> for ChannelManagerEnd {
     async fn recv(&mut self) -> Option<Response> {
         self.resp_rx.recv().await
     }
-
 }
 
 impl MessageReceiver<Command> for ChannelRunnerEnd {

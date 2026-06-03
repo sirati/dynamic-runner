@@ -2,7 +2,7 @@
 //! substitution and the `is_observer=true` flag propagation.
 
 use crate::config::SlurmConfig;
-use crate::wrapper_script::{generate_wrapper_script, ConnectionMode, WrapperScriptConfig};
+use crate::wrapper_script::{ConnectionMode, WrapperScriptConfig, generate_wrapper_script};
 
 #[test]
 fn reverse_mode_script_contains_tunnel_port() {
@@ -91,4 +91,3 @@ fn reverse_mode_script_renders_is_observer_true() {
     let script = generate_wrapper_script(&cfg);
     assert!(script.contains("printf 'is_observer=true\\n'"));
 }
-

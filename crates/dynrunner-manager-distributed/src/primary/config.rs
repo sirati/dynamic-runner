@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dynrunner_core::{resolve_against_root, Identifier, PhaseId, TaskInfo};
+use dynrunner_core::{Identifier, PhaseId, TaskInfo, resolve_against_root};
 
 /// Per-phase lifecycle hook invoked by the coordinator when a phase
 /// flips Blocked → Active. The pyo3 layer (Phase 5B) wires this to the

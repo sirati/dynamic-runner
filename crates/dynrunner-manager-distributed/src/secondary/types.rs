@@ -319,7 +319,10 @@ impl Default for SecondaryConfig {
         Self {
             secondary_id: String::new(),
             num_workers: 1,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024,
+            )]),
             hostname: String::new(),
             keepalive_interval: Duration::from_secs(1),
             src_network: None,

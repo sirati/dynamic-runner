@@ -80,12 +80,8 @@ impl InfoFileReader for PyGatewayReader {
                 })
             })
             .await
-            .map_err(|e| PrepError::WatcherPanic(format!(
-                "execute_command join failed: {e}"
-            )))?
-            .map_err(|e| PrepError::WatcherLost(format!(
-                "execute_command raised: {e}"
-            )))?;
+            .map_err(|e| PrepError::WatcherPanic(format!("execute_command join failed: {e}")))?
+            .map_err(|e| PrepError::WatcherLost(format!("execute_command raised: {e}")))?;
 
             // Match Python: `returncode == 0 and stdout.strip()` →
             // we have content; otherwise still polling.
@@ -190,10 +186,7 @@ impl PySlurmPreparation {
             est.attempts = n;
         }
         if let Some(backoff) = establishment_backoff_secs {
-            est.backoff = backoff
-                .into_iter()
-                .map(Duration::from_secs_f64)
-                .collect();
+            est.backoff = backoff.into_iter().map(Duration::from_secs_f64).collect();
         }
         if let Some(t) = establishment_per_tunnel_timeout_secs {
             est.per_tunnel_timeout = Duration::from_secs_f64(t);
@@ -253,9 +246,7 @@ impl PySlurmPreparation {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!(
-                    "tokio runtime: {e}"
-                )))?;
+                .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("tokio runtime: {e}")))?;
             rt.block_on(async {
                 inner.cleanup().await;
             });
@@ -273,7 +264,6 @@ impl PySlurmPreparation {
         }
         Ok(dict.into())
     }
-
 }
 
 impl PySlurmPreparation {
@@ -311,4 +301,3 @@ fn prep_err_to_pyerr(e: PrepError) -> PyErr {
         | PrepError::WatcherLost(_) => pyo3::exceptions::PyRuntimeError::new_err(e.to_string()),
     }
 }
-

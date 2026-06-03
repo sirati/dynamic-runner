@@ -171,7 +171,10 @@ fn response_error_roundtrip() {
             error_type,
             message,
         } => {
-            assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
+            assert_eq!(
+                error_type,
+                ErrorType::ResourceExhausted(ResourceKind::memory())
+            );
             assert_eq!(message, "worker exceeded budget");
         }
         _ => panic!("expected Error"),
@@ -322,7 +325,10 @@ fn response_error_with_colons_in_message() {
             error_type,
             message,
         } => {
-            assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
+            assert_eq!(
+                error_type,
+                ErrorType::ResourceExhausted(ResourceKind::memory())
+            );
             assert_eq!(message, "path:to:something ran out");
         }
         _ => panic!("expected Error"),

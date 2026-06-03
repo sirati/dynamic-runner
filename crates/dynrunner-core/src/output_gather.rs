@@ -79,7 +79,13 @@ where
     for dep in task_deps {
         insert_outputs_for(&outputs_for, &dep.phase_id, &dep.task_id, &mut result);
         if dep.inherit_outputs {
-            walk_ancestry(&outputs_for, &deps_of, &dep.phase_id, &dep.task_id, &mut result);
+            walk_ancestry(
+                &outputs_for,
+                &deps_of,
+                &dep.phase_id,
+                &dep.task_id,
+                &mut result,
+            );
         }
     }
 
@@ -259,10 +265,7 @@ mod tests {
         outputs.insert(key("A"), a_outputs.clone());
         outputs.insert(key("B"), b_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            key("B"),
-            vec![dep("A", false)],
-        );
+        deps.insert(key("B"), vec![dep("A", false)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
         let c_deps = vec![dep("B", true)];
@@ -282,10 +285,7 @@ mod tests {
         outputs.insert(key("A"), outputs_with("x", "1"));
         outputs.insert(key("B"), b_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            key("B"),
-            vec![dep("A", false)],
-        );
+        deps.insert(key("B"), vec![dep("A", false)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
         let c_deps = vec![dep("B", false)];
@@ -306,10 +306,7 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert(key("A"), a_outputs.clone());
         let mut deps = HashMap::new();
-        deps.insert(
-            key("A"),
-            vec![dep("A", true)],
-        );
+        deps.insert(key("A"), vec![dep("A", true)]);
         let (outputs_for, deps_of) = lookups(outputs, deps);
 
         let a_deps = vec![dep("A", true)];

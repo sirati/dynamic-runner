@@ -1,15 +1,12 @@
-
 use std::time::Instant;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport,
-    SetupBootstrapMessage,
+    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-
 
 use super::SecondaryCoordinator;
 use super::wire::{distributed_to_binary, timestamp_now};
@@ -124,10 +121,7 @@ where
     /// original primary these frames address. No locality branching
     /// leaks to the manager; setup is just another opaque
     /// role-addressed send.
-    async fn send_setup_frame(
-        &mut self,
-        msg: SetupBootstrapMessage,
-    ) -> Result<(), String> {
+    async fn send_setup_frame(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         let wire: DistributedMessage<I> = msg.into();
         self.transport
             .send(
@@ -185,7 +179,10 @@ where
                                 .iter()
                                 .filter(|p| p.secondary_id != self.config.secondary_id)
                                 .count();
-                            tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
+                            tracing::info!(
+                                peers = peer_count,
+                                "received peer list, kicking off peer dials"
+                            );
                             // Observer-set replication no longer rides
                             // PeerInfo: the primary originates one
                             // `ClusterMutation::PeerJoined { is_observer:
@@ -324,8 +321,7 @@ where
             } else {
                 Some(zip_name.as_str())
             };
-            let resolved_path =
-                self.resolve_for_dispatch(zip_ref, &local_path, &hash);
+            let resolved_path = self.resolve_for_dispatch(zip_ref, &local_path, &hash);
 
             // Same fail-loud guard as the operational dispatch path
             // (see `dispatch::report_unresolvable_task`). Without
@@ -367,7 +363,9 @@ where
 
             let estimated = self.estimator.estimate(&binary);
 
-            if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
+            if (wid as usize) < self.pool.workers.len()
+                && self.pool.workers[wid as usize].is_idle_state()
+            {
                 // Per-type subprocess dispatch: bind the worker's
                 // loaded TypeId to this task's `type_id` (no-op fast
                 // path when they already match — the dominant case).

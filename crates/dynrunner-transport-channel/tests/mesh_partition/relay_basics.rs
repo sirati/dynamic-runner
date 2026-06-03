@@ -13,14 +13,14 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport, SendOutcome, MSG_DROPPED_AT_ORIGINATOR,
+    DistributedMessage, MSG_DROPPED_AT_ORIGINATOR, PeerTransport, SendOutcome,
 };
 use tokio::sync::mpsc;
 
 #[allow(unused_imports)]
 use crate::helpers::{
-    build_mesh, keepalive, pump_until, pump_until_received, pump_until_with_deadline,
-    with_relay_log_capture, CapturedRecord, TestId,
+    CapturedRecord, TestId, build_mesh, keepalive, pump_until, pump_until_received,
+    pump_until_with_deadline, with_relay_log_capture,
 };
 
 // ── Scenario 1 ──
@@ -33,13 +33,7 @@ use crate::helpers::{
 async fn a_to_d_via_lowest_id_relay() {
     let mut mesh = build_mesh(
         &["a", "b", "c", "d"],
-        &[
-            ("a", "b"),
-            ("a", "c"),
-            ("b", "c"),
-            ("b", "d"),
-            ("c", "d"),
-        ],
+        &[("a", "b"), ("a", "c"), ("b", "c"), ("b", "d"), ("c", "d")],
     );
     mesh.get_mut("a")
         .unwrap()
@@ -48,7 +42,10 @@ async fn a_to_d_via_lowest_id_relay() {
         .expect("send ok");
     let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
     let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
-    assert!(ok, "d did not receive within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive within deadline; delivered={delivered:?}"
+    );
     let outcome = mesh.get("a").unwrap().last_outcome.clone();
     match outcome {
         Some(SendOutcome::Relayed {
@@ -75,13 +72,7 @@ async fn a_to_d_via_lowest_id_relay() {
 async fn partition_forces_alternate_relay() {
     let mut mesh = build_mesh(
         &["a", "b", "c", "d"],
-        &[
-            ("a", "b"),
-            ("a", "c"),
-            ("b", "c"),
-            ("b", "d"),
-            ("c", "d"),
-        ],
+        &[("a", "b"), ("a", "c"), ("b", "c"), ("b", "d"), ("c", "d")],
     );
     mesh.get_mut("a").unwrap().disconnect_from("b");
     mesh.get_mut("a")
@@ -91,7 +82,10 @@ async fn partition_forces_alternate_relay() {
         .expect("send ok");
     let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
     let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
-    assert!(ok, "d did not receive within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive within deadline; delivered={delivered:?}"
+    );
     let outcome = mesh.get("a").unwrap().last_outcome.clone();
     match outcome {
         Some(SendOutcome::Relayed { forwarder, .. }) => {
@@ -139,8 +133,12 @@ async fn heal_restores_direct_then_silent() {
     // the test.
     let (a_to_d_tx, _a_to_d_rx) = mpsc::unbounded_channel();
     let (d_to_a_tx, _d_to_a_rx) = mpsc::unbounded_channel();
-    mesh.get_mut("a").unwrap().connect_to("d".to_string(), a_to_d_tx);
-    mesh.get_mut("d").unwrap().connect_to("a".to_string(), d_to_a_tx);
+    mesh.get_mut("a")
+        .unwrap()
+        .connect_to("d".to_string(), a_to_d_tx);
+    mesh.get_mut("d")
+        .unwrap()
+        .connect_to("a".to_string(), d_to_a_tx);
     // Second send: must take Direct.
     mesh.get_mut("a")
         .unwrap()
@@ -176,10 +174,7 @@ async fn heal_restores_direct_then_silent() {
 #[tokio::test]
 async fn dead_end_propagates_backoff_to_originator() {
     let ((), captured) = with_relay_log_capture(async {
-        let mut mesh = build_mesh(
-            &["a", "b", "c", "d"],
-            &[("a", "b"), ("a", "c"), ("b", "c")],
-        );
+        let mut mesh = build_mesh(&["a", "b", "c", "d"], &[("a", "b"), ("a", "c"), ("b", "c")]);
         // D exists in the mesh by virtue of being in `peer_ids`;
         // with no adjacency entry referencing it, its outgoing map
         // is empty and no other transport has a sender into its
@@ -189,8 +184,7 @@ async fn dead_end_propagates_backoff_to_originator() {
             .send_to_peer("d", keepalive("a"))
             .await
             .expect("send ok");
-        let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> =
-            HashMap::new();
+        let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
         // Pump until the backoff cascade quiesces. There's no
         // positive done-condition (we're asserting absence), so we
         // use a short dedicated deadline rather than the 5s abort
@@ -253,7 +247,10 @@ async fn backoff_retries_through_alternate_then_succeeds() {
         .expect("send ok");
     let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
     let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
-    assert!(ok, "d did not receive within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive within deadline; delivered={delivered:?}"
+    );
     // Originator picked B as first forwarder.
     match &mesh.get("a").unwrap().last_outcome {
         Some(SendOutcome::Relayed { forwarder, .. }) => {
@@ -272,13 +269,7 @@ async fn backoff_retries_through_alternate_then_succeeds() {
 async fn forwarder_picks_alternate_when_direct_link_severed_pre_send() {
     let mut mesh = build_mesh(
         &["a", "b", "c", "d"],
-        &[
-            ("a", "b"),
-            ("a", "c"),
-            ("b", "c"),
-            ("b", "d"),
-            ("c", "d"),
-        ],
+        &[("a", "b"), ("a", "c"), ("b", "c"), ("b", "d"), ("c", "d")],
     );
     // Sever B's direct link to D before A's send. (The plan calls
     // this "mid-relay"; with the synchronous send semantics of the
@@ -294,7 +285,10 @@ async fn forwarder_picks_alternate_when_direct_link_severed_pre_send() {
         .expect("send ok");
     let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
     let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
-    assert!(ok, "d did not receive within deadline; delivered={delivered:?}");
+    assert!(
+        ok,
+        "d did not receive within deadline; delivered={delivered:?}"
+    );
     // A still picked B as first forwarder.
     match &mesh.get("a").unwrap().last_outcome {
         Some(SendOutcome::Relayed { forwarder, .. }) => {

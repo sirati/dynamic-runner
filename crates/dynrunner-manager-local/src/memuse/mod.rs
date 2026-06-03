@@ -123,9 +123,8 @@ mod tests {
         // No output_dir but an explicit path — the operator
         // points the log at a fixed location independent of any
         // run-level dir.
-        let resolved =
-            derive_memuse_log_path(None, Some(Path::new("/var/log/custom.csv")))
-                .expect("explicit alone must be honoured");
+        let resolved = derive_memuse_log_path(None, Some(Path::new("/var/log/custom.csv")))
+            .expect("explicit alone must be honoured");
         assert_eq!(resolved, PathBuf::from("/var/log/custom.csv"));
     }
 }

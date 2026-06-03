@@ -194,8 +194,8 @@ mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     use tracing::subscriber::with_default;
-    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// A `MakeWriter` over a shared in-memory buffer so a test can read back
     /// exactly what a layer emitted.
@@ -250,11 +250,20 @@ mod tests {
         let (full, stdio) = run_capture(true);
 
         // The full sink records EVERYTHING.
-        assert!(full.contains("wake-the-llm"), "full sink missing important event: {full}");
-        assert!(full.contains("routine-chatter"), "full sink missing normal event: {full}");
+        assert!(
+            full.contains("wake-the-llm"),
+            "full sink missing important event: {full}"
+        );
+        assert!(
+            full.contains("routine-chatter"),
+            "full sink missing normal event: {full}"
+        );
 
         // The stdio sink passes ONLY the important target.
-        assert!(stdio.contains("wake-the-llm"), "stdio missing important event: {stdio}");
+        assert!(
+            stdio.contains("wake-the-llm"),
+            "stdio missing important event: {stdio}"
+        );
         assert!(
             !stdio.contains("routine-chatter"),
             "stdio leaked a normal event in importance mode: {stdio}"
@@ -267,7 +276,10 @@ mod tests {
 
         assert!(full.contains("wake-the-llm") && full.contains("routine-chatter"));
         // No gate: stdio behaves exactly as today — everything passes.
-        assert!(stdio.contains("wake-the-llm"), "stdio missing important event: {stdio}");
+        assert!(
+            stdio.contains("wake-the-llm"),
+            "stdio missing important event: {stdio}"
+        );
         assert!(
             stdio.contains("routine-chatter"),
             "stdio dropped a normal event with the gate off: {stdio}"
@@ -293,7 +305,11 @@ mod tests {
             full_sink: FullSink::Stdout,
         };
         let layers = build_layers::<Registry>(&config);
-        assert_eq!(layers.len(), 1, "expected a single stdout layer when no full-log file is set");
+        assert_eq!(
+            layers.len(),
+            1,
+            "expected a single stdout layer when no full-log file is set"
+        );
     }
 
     #[test]

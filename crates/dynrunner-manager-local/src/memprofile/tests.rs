@@ -26,11 +26,7 @@ use super::{MemProfileConfig, MemProfileSampler};
 fn make_fake_cgroup(dir: &Path, current: u64, swap: u64) {
     fs::write(dir.join("memory.current"), format!("{current}\n")).unwrap();
     fs::write(dir.join("memory.swap.current"), format!("{swap}\n")).unwrap();
-    fs::write(
-        dir.join("memory.stat"),
-        "anon 100\nfile 200\npgfault 5\n",
-    )
-    .unwrap();
+    fs::write(dir.join("memory.stat"), "anon 100\nfile 200\npgfault 5\n").unwrap();
 }
 
 /// Decode a memprofile file into its complete JSONL lines. The file
@@ -66,10 +62,8 @@ async fn assign_tick_complete_round_trip() {
     let cg = tempdir().expect("cg dir");
     make_fake_cgroup(cg.path(), 1_024, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(30)));
 
     sampler.on_task_assigned(
         "task-1".to_string(),
@@ -110,10 +104,8 @@ async fn disconnect_with_active_task_flushes() {
     let cg = tempdir().expect("cg dir");
     make_fake_cgroup(cg.path(), 2_048, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(30)));
 
     sampler.on_task_assigned(
         "task-1".to_string(),
@@ -150,10 +142,8 @@ async fn shutdown_race_no_panic() {
     let cg = tempdir().expect("cg dir");
     make_fake_cgroup(cg.path(), 4_096, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(50),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(50)));
 
     sampler.on_task_assigned(
         "task-1".to_string(),
@@ -184,10 +174,8 @@ async fn unsafe_task_id_skipped() {
     let cg = tempdir().expect("cg dir");
     make_fake_cgroup(cg.path(), 1_024, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(30)));
 
     sampler.on_task_assigned(
         "../../etc/passwd".to_string(),
@@ -212,10 +200,7 @@ async fn unsafe_task_id_skipped() {
     assert!(
         entries.is_empty(),
         "no file should escape output dir, found {:?}",
-        entries
-            .iter()
-            .map(|e| e.path())
-            .collect::<Vec<_>>(),
+        entries.iter().map(|e| e.path()).collect::<Vec<_>>(),
     );
 }
 
@@ -229,10 +214,8 @@ async fn slash_task_id_creates_nested_subdir() {
     let cg = tempdir().expect("cg dir");
     make_fake_cgroup(cg.path(), 8_192, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(30)));
 
     sampler.on_task_assigned(
         "nping/x86/clang/9/Os".to_string(),
@@ -251,7 +234,10 @@ async fn slash_task_id_creates_nested_subdir() {
         .join("clang")
         .join("9")
         .join("Os.worker-3.memprofile.jsonl.zst");
-    assert!(path.exists(), "nested per-task file should exist at {path:?}");
+    assert!(
+        path.exists(),
+        "nested per-task file should exist at {path:?}"
+    );
 }
 
 /// Two concurrent tasks on two different workers with different
@@ -265,10 +251,8 @@ async fn per_worker_isolation() {
     make_fake_cgroup(cg_a.path(), 1_111, 0);
     make_fake_cgroup(cg_b.path(), 2_222, 0);
 
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
+    let sampler =
+        MemProfileSampler::spawn(config(out.path().to_path_buf(), Duration::from_millis(30)));
 
     sampler.on_task_assigned(
         "task-a".to_string(),

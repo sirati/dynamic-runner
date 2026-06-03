@@ -24,7 +24,7 @@ mod task_info;
 mod task_view;
 
 pub(crate) use extract::{extract_binaries, task_to_pytask};
-pub(crate) use identifier::{identifier_from_pyobj, PyBinaryIdentifier};
+pub(crate) use identifier::{PyBinaryIdentifier, identifier_from_pyobj};
 pub(crate) use path_str::PyPathStr;
 pub(crate) use results::{PyFailedTask, PyProcessingStats};
 pub(crate) use task_info::PyTaskInfo;

@@ -152,7 +152,9 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
 
     // Install the worker-management bus sender, then fire phase starts.
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
-    primary.cluster_state_mut_for_test().install_worker_mgmt_sender(tx);
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(tx);
 
     primary.fire_initial_phase_starts();
 
@@ -187,7 +189,7 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
 /// once-per-phase transition as the worker-management signal.
 #[test]
 fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
-    use crate::test_capture::{important_only, ImportantCapture};
+    use crate::test_capture::{ImportantCapture, important_only};
     use tracing::subscriber::with_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
@@ -219,7 +221,9 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
     // Worker-management sender so the emit path doesn't drop on a
     // missing sender (orthogonal to the important-event assertion).
     let (tx, _rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
-    primary.cluster_state_mut_for_test().install_worker_mgmt_sender(tx);
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(tx);
 
     let capture = ImportantCapture::default();
     let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));

@@ -12,7 +12,7 @@ use dynrunner_core::{
     TypeId,
 };
 
-use super::identifier::{identifier_from_pyobj, PyBinaryIdentifier};
+use super::identifier::{PyBinaryIdentifier, identifier_from_pyobj};
 use super::task_info::PyTaskInfo;
 
 /// Build a `PyTaskInfo` Python object from any `TaskInfo<I>`.
@@ -295,7 +295,9 @@ mod tests {
         let kwargs = pyo3::types::PyDict::new(py);
         kwargs.set_item("task_id", task_id).unwrap();
         kwargs.set_item("inherit_outputs", inherit_outputs).unwrap();
-        simplens.call((), Some(&kwargs)).expect("SimpleNamespace(...)")
+        simplens
+            .call((), Some(&kwargs))
+            .expect("SimpleNamespace(...)")
     }
 
     /// As `make_task_dep` but carrying an explicit cross-phase
@@ -312,7 +314,9 @@ mod tests {
         kwargs.set_item("task_id", task_id).unwrap();
         kwargs.set_item("phase_id", phase_id).unwrap();
         kwargs.set_item("inherit_outputs", inherit_outputs).unwrap();
-        simplens.call((), Some(&kwargs)).expect("SimpleNamespace(...)")
+        simplens
+            .call((), Some(&kwargs))
+            .expect("SimpleNamespace(...)")
     }
 
     #[test]
@@ -334,7 +338,10 @@ mod tests {
             let obj = make_task_dep(py, "beta", true);
             let dep = extract_task_dep(&obj, &enclosing).expect("attribute-bearing object");
             assert_eq!(dep.task_id, "beta");
-            assert_eq!(dep.phase_id, enclosing, "phase-less dataclass takes enclosing phase");
+            assert_eq!(
+                dep.phase_id, enclosing,
+                "phase-less dataclass takes enclosing phase"
+            );
             assert!(dep.inherit_outputs);
 
             let obj2 = make_task_dep(py, "gamma", false);
@@ -368,10 +375,8 @@ mod tests {
             let enclosing = PhaseId::from("phaseX");
             let bare = pyo3::types::PyString::new(py, "A").into_any();
             let struct_dep = make_task_dep(py, "B", true);
-            let tuple = pyo3::types::PyTuple::new(py, [bare, struct_dep])
-                .expect("mixed tuple");
-            let deps =
-                extract_task_depends_on(tuple.as_any(), &enclosing).expect("mixed iterable");
+            let tuple = pyo3::types::PyTuple::new(py, [bare, struct_dep]).expect("mixed tuple");
+            let deps = extract_task_depends_on(tuple.as_any(), &enclosing).expect("mixed iterable");
             assert_eq!(deps.len(), 2);
             assert_eq!(deps[0].task_id, "A");
             assert_eq!(deps[0].phase_id, enclosing);

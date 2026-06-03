@@ -42,11 +42,13 @@ mod worker_lifecycle;
 // alternative is duplicated `use` lines in 11 sibling files.
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
-    fake_secondary, fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
-    FakeWorkerFactory, FixedEstimator, NoPeers, SlowFakeWorkerFactory, TestId,
+    FakeWorkerFactory, FixedEstimator, NoPeers, SlowFakeWorkerFactory, TestId, fake_secondary,
+    fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;
+#[allow(unused_imports)]
+pub(super) use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 #[allow(unused_imports)]
 pub(super) use dynrunner_core::TaskInfo;
 #[allow(unused_imports)]
@@ -56,8 +58,6 @@ pub(super) use dynrunner_scheduler::ResourceStealingScheduler;
 #[allow(unused_imports)]
 pub(super) use dynrunner_transport_channel::{ChannelPeerTransport, ChannelPrimaryTransportEnd};
 #[allow(unused_imports)]
-pub(super) use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
-#[allow(unused_imports)]
 pub(super) use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
 #[allow(unused_imports)]
 pub(super) use std::collections::HashMap;
@@ -65,7 +65,6 @@ pub(super) use std::collections::HashMap;
 pub(super) use std::time::Duration;
 #[allow(unused_imports)]
 pub(super) use tokio::sync::mpsc as tokio_mpsc;
-
 
 /// Phase 4b: tests that don't care about phase lifecycle pass an empty
 /// dep map and no-op closures. Centralised here so individual tests
@@ -86,9 +85,9 @@ pub(super) fn spawn_real_secondary(
     num_workers: u32,
     max_resources: dynrunner_core::ResourceMap,
 ) -> (
-    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,  // primary→secondary
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>, // primary→secondary
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
-    tokio::task::JoinHandle<usize>,                    // returns completed count
+    tokio::task::JoinHandle<usize>,                          // returns completed count
 ) {
     spawn_real_secondary_with_src_network(secondary_id, num_workers, max_resources, None)
 }
@@ -122,7 +121,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             src_network,
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
-                keepalive_miss_threshold: 3,
+            keepalive_miss_threshold: 3,
             retry_max_passes: 1,
             oom_retry_max_passes: 1,
             primary_link_failure_threshold: 5,
@@ -137,11 +136,8 @@ pub(super) fn spawn_real_secondary_with_src_network(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified = UnifiedSecondaryTransport::new(
-            config.secondary_id.clone(),
-            transport,
-            NoPeers,
-        );
+        let unified =
+            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
             unified,
@@ -203,11 +199,8 @@ pub(super) fn spawn_real_secondary_slow(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified = UnifiedSecondaryTransport::new(
-            config.secondary_id.clone(),
-            transport,
-            NoPeers,
-        );
+        let unified =
+            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
             unified,
@@ -280,11 +273,8 @@ pub(super) fn spawn_real_secondary_flaky(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified = UnifiedSecondaryTransport::new(
-            config.secondary_id.clone(),
-            transport,
-            NoPeers,
-        );
+        let unified =
+            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
             unified,

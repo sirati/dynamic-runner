@@ -58,9 +58,7 @@ impl<R: InfoFileReader + Send + Sync> SlurmPreparationTunnelEstablisher<R> {
     }
 }
 
-impl<R: InfoFileReader + Send + Sync> TunnelEstablisher
-    for SlurmPreparationTunnelEstablisher<R>
-{
+impl<R: InfoFileReader + Send + Sync> TunnelEstablisher for SlurmPreparationTunnelEstablisher<R> {
     fn establish_one_tunnel<'a>(
         &'a self,
         secondary_id: &'a str,

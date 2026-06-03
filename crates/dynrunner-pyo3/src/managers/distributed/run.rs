@@ -49,9 +49,8 @@ impl PyDistributedManager {
         // (their workers are spawned in their own pgids and survive
         // their parent's exit).
         let panik_watcher_paths = self.panik_watcher_paths.clone();
-        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
-            self.panik_watcher_poll_interval_secs,
-        );
+        let panik_watcher_poll_interval =
+            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
         // Compose the per-secondary memprofile output dir once on
         // the GIL thread so the per-secondary spawn closures below
         // receive identical `Option<PathBuf>` values without each
@@ -71,11 +70,10 @@ impl PyDistributedManager {
         // `{self.output_dir}/memuse.log`; `None` only if
         // `self.output_dir` is itself unset (it isn't — the field
         // is always populated by the constructor).
-        let memuse_log_path =
-            dynrunner_manager_local::memuse::derive_memuse_log_path(
-                Some(self.output_dir.as_path()),
-                None,
-            );
+        let memuse_log_path = dynrunner_manager_local::memuse::derive_memuse_log_path(
+            Some(self.output_dir.as_path()),
+            None,
+        );
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -89,8 +87,7 @@ impl PyDistributedManager {
         // `output_dir` is `/app/out-network`. Single-host callers
         // that did not supply a separate log dir get `log_path ==
         // output_dir` from the fallback in `LoadedTaskDefinition`.
-        let mut sec_log_dirs: Vec<(String, PathBuf)> =
-            Vec::with_capacity(num_secondaries as usize);
+        let mut sec_log_dirs: Vec<(String, PathBuf)> = Vec::with_capacity(num_secondaries as usize);
         for i in 0..num_secondaries {
             let sid = format!("sec-{i}");
             let dir = log_paths.resolve_log_dir(py, &log_path, &sid)?;
@@ -104,8 +101,7 @@ impl PyDistributedManager {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
-        let dist_keepalive_miss_threshold =
-            self.distributed_config.keepalive_miss_threshold();
+        let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
@@ -156,14 +152,10 @@ impl PyDistributedManager {
         // methods. Built before `py.detach` so the closures can capture
         // ref-bumped `Py<PyAny>` clones.
         let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-            crate::managers::lifecycle::make_on_phase_start(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
         );
         let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
         );
 
         // Clone the task_definition once per secondary so the in-process
@@ -183,14 +175,10 @@ impl PyDistributedManager {
         )> = Vec::with_capacity(num_secondaries as usize);
         for _ in 0..num_secondaries {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-                crate::managers::lifecycle::make_on_phase_start(
-                    self.task_definition.clone_ref(py),
-                ),
+                crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
             );
             let on_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-                crate::managers::lifecycle::make_on_phase_end(
-                    self.task_definition.clone_ref(py),
-                ),
+                crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
             );
             sec_phase_lifecycle_callbacks.push((on_start, on_end));
         }
@@ -203,18 +191,18 @@ impl PyDistributedManager {
         // PyO3-agnostic. The in-process secondaries do NOT receive
         // the listener (see the field doc on
         // `peer_lifecycle_listener`).
-        let peer_lifecycle_listener =
-            self.peer_lifecycle_listener
-                .take()
-                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+        let peer_lifecycle_listener = self
+            .peer_lifecycle_listener
+            .take()
+            .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Same shape for the task-completion listener: independent
         // dispatcher pair on the in-process primary; same
         // pre-`run()` registration contract.
-        let task_completed_listener =
-            self.task_completed_listener
-                .take()
-                .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
+        let task_completed_listener = self
+            .task_completed_listener
+            .take()
+            .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
@@ -278,9 +266,9 @@ impl PyDistributedManager {
                 // the unified `recv_peer()` both run over this one
                 // transport.
                 let (peer_transport, shared_outgoing, inbound, _registration) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<
-                        RunnerIdentifier,
-                    >::new("primary".into());
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
+                        "primary".into(),
+                    );
 
                 for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
                     sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
@@ -368,10 +356,8 @@ impl PyDistributedManager {
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                             retry_max_passes: dist_retry_max_passes,
                             oom_retry_max_passes: dist_oom_retry_max_passes,
-                            primary_link_failure_threshold:
-                                dist_primary_link_failure_threshold,
-                            primary_link_failure_window:
-                                dist_primary_link_failure_window,
+                            primary_link_failure_threshold: dist_primary_link_failure_threshold,
+                            primary_link_failure_window: dist_primary_link_failure_window,
                             setup_deadline: dist_setup_deadline,
                             is_observer: false,
                             resource_check_interval: dist_resource_check_interval,
@@ -437,12 +423,11 @@ impl PyDistributedManager {
                         // resolves to the loopback channel while the role
                         // cache is cold — exactly the in-process
                         // primary. See `UnifiedSecondaryTransport`.
-                        let unified =
-                            dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
-                                config.secondary_id.clone(),
-                                transport,
-                                dynrunner_transport_quic::NoPeerTransport,
-                            );
+                        let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                            config.secondary_id.clone(),
+                            transport,
+                            dynrunner_transport_quic::NoPeerTransport,
+                        );
                         let mut secondary = SecondaryCoordinator::new(
                             config,
                             unified,
@@ -637,24 +622,25 @@ impl PyDistributedManager {
                 // process polls independently and fires its own
                 // teardown when its file appears. Handle held in
                 // scope for `Drop::abort()` at loop exit.
-                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
-                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
-                        paths: panik_watcher_paths,
-                        poll_interval: panik_watcher_poll_interval,
-                        // PRIMARY-role spawner: SIGTERM listening
-                        // OFF. The host-driven SIGTERM cascade is
-                        // a secondary-side concern (SLURM
-                        // time-limit applies to allocations
-                        // running secondary jobs; the primary
-                        // typically runs on the operator host,
-                        // not in a SLURM-allocated container).
-                        // Primary shutdown is driven by the
-                        // sentinel-file path, by orchestrator
-                        // teardown, or by panik broadcast from a
-                        // secondary that hit SIGTERM.
-                        listen_for_sigterm: false,
-                    },
-                );
+                let mut panik_watcher =
+                    dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                        dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                            paths: panik_watcher_paths,
+                            poll_interval: panik_watcher_poll_interval,
+                            // PRIMARY-role spawner: SIGTERM listening
+                            // OFF. The host-driven SIGTERM cascade is
+                            // a secondary-side concern (SLURM
+                            // time-limit applies to allocations
+                            // running secondary jobs; the primary
+                            // typically runs on the operator host,
+                            // not in a SLURM-allocated container).
+                            // Primary shutdown is driven by the
+                            // sentinel-file path, by orchestrator
+                            // teardown, or by panik broadcast from a
+                            // secondary that hit SIGTERM.
+                            listen_for_sigterm: false,
+                        },
+                    );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     primary.register_panik_signal_rx(rx);
                 }

@@ -82,7 +82,10 @@ fn master_watcher_loop(daemon_pid: u32, cancel: Arc<AtomicBool>, invalidated: Ar
 ///   2. The polite `ssh -O exit` already had its sync chance up the
 ///      stack; this is the fallback ladder, where blocking for at
 ///      most ~250ms is cheap.
-pub(super) fn terminate_daemon_blocking(daemon_pid: u32, target: &SshTarget) -> Result<(), SshMasterError> {
+pub(super) fn terminate_daemon_blocking(
+    daemon_pid: u32,
+    target: &SshTarget,
+) -> Result<(), SshMasterError> {
     use nix::errno::Errno;
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;

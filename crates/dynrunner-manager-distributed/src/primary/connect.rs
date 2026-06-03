@@ -1,11 +1,8 @@
-
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, MessageType, PeerTransport,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
@@ -13,7 +10,9 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn wait_for_connections(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -25,7 +24,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
         loop {
             // Check if all secondaries have completed cert exchange
-            let cert_done = self.secondaries.values()
+            let cert_done = self
+                .secondaries
+                .values()
                 .filter(|s| s.is_at_least_cert_exchanged())
                 .count();
             if cert_done >= expected {
@@ -229,7 +230,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             ..
         } = msg
         {
-            let ram_bytes = resources.iter()
+            let ram_bytes = resources
+                .iter()
                 .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
@@ -249,14 +251,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // cloned once.
             let advertised_resources = resources.clone();
             let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn = conn.receive_welcome(
-                worker_count,
-                resources,
-                hostname,
-                0,
-                None,
-                is_observer,
-            );
+            let conn =
+                conn.receive_welcome(worker_count, resources, hostname, 0, None, is_observer);
             self.secondaries.insert(
                 secondary_id.clone(),
                 SecondaryConnectionState::Handshaking(conn),
@@ -333,5 +329,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     }
 
     // ── Phase 3: Send Peer Lists ──
-
 }

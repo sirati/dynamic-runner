@@ -15,8 +15,8 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -26,7 +26,6 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-
     /// Sweep stale peer keepalives so the failover election's liveness
     /// view is current. Pure per-node peer-liveness tracking — the
     /// secondary holds no authority and no in-flight ledger, so a

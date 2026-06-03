@@ -1,4 +1,4 @@
-use dynrunner_core::{TaskInfo, Identifier, ResourceKind, ResourceMap};
+use dynrunner_core::{Identifier, ResourceKind, ResourceMap, TaskInfo};
 use dynrunner_scheduler_api::{
     AssignmentDecision, KillReason, ResourceEstimator, ResourcePressureDecision, Scheduler,
     WorkerBudgetInfo,
@@ -36,11 +36,7 @@ pub struct ResourceStealingScheduler {
 
 impl ResourceStealingScheduler {
     pub fn memory() -> Self {
-        Self::for_kind(
-            ResourceKind::memory(),
-            150 * 1024 * 1024,
-            500 * 1024 * 1024,
-        )
+        Self::for_kind(ResourceKind::memory(), 150 * 1024 * 1024, 500 * 1024 * 1024)
     }
 
     /// Build a scheduler for an arbitrary resource kind. Pair with
@@ -297,8 +293,6 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         ResourcePressureDecision::NoAction
     }
 }
-
-
 
 #[cfg(test)]
 mod tests;

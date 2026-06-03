@@ -42,10 +42,7 @@ pub(super) fn rand_hex8() -> String {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom")
         && f.read_exact(&mut buf).is_ok()
     {
-        return format!(
-            "{:02x}{:02x}{:02x}{:02x}",
-            buf[0], buf[1], buf[2], buf[3]
-        );
+        return format!("{:02x}{:02x}{:02x}{:02x}", buf[0], buf[1], buf[2], buf[3]);
     }
     // Fallback: hash of nanoseconds-since-epoch — not cryptographic
     // but identical entropy semantics for the suffix's purpose

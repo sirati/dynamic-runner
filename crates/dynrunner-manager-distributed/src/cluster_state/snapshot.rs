@@ -69,10 +69,7 @@ use super::TaskState;
 /// same snapshot twice is a no-op, applying overlapping snapshots
 /// converges to the same state regardless of order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub struct ClusterStateSnapshot<I> {
     pub tasks: HashMap<String, TaskState<I>>,
     pub current_primary: Option<String>,

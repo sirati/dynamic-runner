@@ -97,9 +97,7 @@ pub enum ReadDirError {
 /// accepts); that translation lives in the caller because it depends
 /// on the `Identifier`-generic wire type, which this crate does not
 /// see.
-pub fn read_dir_v2<P: AsRef<std::path::Path>>(
-    dir: P,
-) -> Result<Vec<PeerInfoRecord>, ReadDirError> {
+pub fn read_dir_v2<P: AsRef<std::path::Path>>(dir: P) -> Result<Vec<PeerInfoRecord>, ReadDirError> {
     let dir_ref = dir.as_ref();
     let dir_display = dir_ref.display().to_string();
     let entries = std::fs::read_dir(dir_ref).map_err(|source| ReadDirError::Io {
@@ -157,10 +155,7 @@ pub fn read_dir_v2<P: AsRef<std::path::Path>>(
     }
 
     if out.is_empty() {
-        return Err(ReadDirError::NoV2Records {
-            dir: dir_display,
-        });
+        return Err(ReadDirError::NoV2Records { dir: dir_display });
     }
     Ok(out)
 }
-

@@ -18,14 +18,10 @@ impl CommandResult {
 /// either locally or over SSH.
 pub trait Gateway: Send + Sync {
     /// Establish connection to gateway.
-    fn connect(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<(), GatewayError>> + Send;
+    fn connect(&mut self) -> impl std::future::Future<Output = Result<(), GatewayError>> + Send;
 
     /// Close connection to gateway.
-    fn disconnect(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<(), GatewayError>> + Send;
+    fn disconnect(&mut self) -> impl std::future::Future<Output = Result<(), GatewayError>> + Send;
 
     /// Execute a command on the gateway.
     fn execute_command(

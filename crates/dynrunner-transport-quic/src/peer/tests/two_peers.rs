@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use super::super::PeerNetwork;
 use super::TestId;
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 
 #[tokio::test(flavor = "current_thread")]
 async fn two_peers_exchange_messages() {

@@ -1,8 +1,8 @@
 //! Contract-level constructor smoke tests. Full integration
 //! (spawner ↔ dispatcher ↔ JoinSet drain) lands in sibling F6.
 
-use super::*;
 use super::types::push_event;
+use super::*;
 use dynrunner_protocol_primary_secondary::RemovalCause;
 use std::time::{Duration, SystemTime};
 
@@ -116,9 +116,9 @@ fn respawn_event_ringbuffer_drops_oldest_at_1024_cap() {
 // transitively (a spawn future that resolves before assertions
 // lands its outcome on the JoinSet; the test reads the
 // resolved entry to confirm the new id).
-use crate::primary::test_helpers::{setup_test, FixedEstimator, TestId};
-use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use crate::peer_lifecycle::PeerLifecycleEvent;
+use crate::primary::test_helpers::{FixedEstimator, TestId, setup_test};
+use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPeerTransport;
 use std::collections::HashMap;
@@ -156,10 +156,7 @@ impl MockSpawner {
 
 #[async_trait::async_trait(?Send)]
 impl SecondarySpawner for MockSpawner {
-    async fn spawn(
-        &self,
-        spec: SecondarySpawnSpec,
-    ) -> Result<(), SpawnError> {
+    async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.captured_ids
             .lock()
@@ -172,8 +169,7 @@ impl SecondarySpawner for MockSpawner {
 /// Build a coordinator wired with 1 reserved initial-cohort id so
 /// the first minted respawn lands on `secondary-1`. The minted-id
 /// monotonic test pins this contract directly.
-fn make_coordinator(
-) -> PrimaryCoordinator<
+fn make_coordinator() -> PrimaryCoordinator<
     ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
@@ -302,7 +298,9 @@ async fn respawn_dispatcher_skips_when_policy_disabled() {
     // transformation); the coordinator we built simply has no
     // listener registered, so its operational-loop arm would
     // never see the request. That's the CCD-5 invariant.
-    let req = rx.try_recv().expect("free-standing listener should still translate");
+    let req = rx
+        .try_recv()
+        .expect("free-standing listener should still translate");
     assert_eq!(req.original_id, "secondary-0");
 }
 

@@ -20,7 +20,7 @@ use dynrunner_core::{
     AffinityId, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId,
 };
 
-use super::identifier::{split_identifier, PyBinaryIdentifier};
+use super::identifier::{PyBinaryIdentifier, split_identifier};
 
 /// Python-visible wrapper for TaskInfo.
 #[pyclass(name = "TaskInfo", from_py_object)]

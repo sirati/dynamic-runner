@@ -93,11 +93,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ///   recovery is neither in progress nor possible, the phase is
     ///   wedged forever — escalate to a clean run failure rather than
     ///   idle until an unrelated timeout.
-    fn handle_phase_started_needs_workers(
-        &mut self,
-        phase: &dynrunner_core::PhaseId,
-        min: usize,
-    ) {
+    fn handle_phase_started_needs_workers(&mut self, phase: &dynrunner_core::PhaseId, min: usize) {
         if min == 0 {
             return;
         }
@@ -175,9 +171,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             return true;
         }
         match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref()) {
-            (Some(_), Some(budget)) => {
-                (self.respawn_events.len() as u32) < budget.max_total
-            }
+            (Some(_), Some(budget)) => (self.respawn_events.len() as u32) < budget.max_total,
             _ => false,
         }
     }

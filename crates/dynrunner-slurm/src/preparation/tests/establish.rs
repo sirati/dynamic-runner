@@ -3,8 +3,8 @@
 //! via dependency injection on the spawner closure (no real ssh).
 //! Also includes the `EstablishmentPolicy` defaults contract test.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::process::{Child, Command};
@@ -73,24 +73,22 @@ fn establish_tunnel_retries_then_succeeds() {
         let attempt_counter = Arc::new(AtomicUsize::new(0));
         let attempts_ref = Arc::clone(&attempt_counter);
 
-        let res = establish_tunnel(
-            "secondary-0",
-            &policy,
-            &pool,
-            move || {
-                let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if i == 0 {
-                        // First attempt: simulate rc=255 (LMU
-                        // gateway random-drop on overloaded sshd).
-                        Ok(fail_child("kex_exchange_identification: Connection closed by remote host", 255))
-                    } else {
-                        // Second attempt: lives past 3s gate.
-                        Ok(alive_child())
-                    }
+        let res = establish_tunnel("secondary-0", &policy, &pool, move || {
+            let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if i == 0 {
+                    // First attempt: simulate rc=255 (LMU
+                    // gateway random-drop on overloaded sshd).
+                    Ok(fail_child(
+                        "kex_exchange_identification: Connection closed by remote host",
+                        255,
+                    ))
+                } else {
+                    // Second attempt: lives past 3s gate.
+                    Ok(alive_child())
                 }
-            },
-        )
+            }
+        })
         .await;
 
         match res {
@@ -124,17 +122,10 @@ fn establish_tunnel_exhausts_attempts_then_fails_loud() {
         let attempt_counter = Arc::new(AtomicUsize::new(0));
         let attempts_ref = Arc::clone(&attempt_counter);
 
-        let res = establish_tunnel(
-            "secondary-0",
-            &policy,
-            &pool,
-            move || {
-                let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    Ok(fail_child(&format!("ATTEMPT-{i}-FAIL"), 255))
-                }
-            },
-        )
+        let res = establish_tunnel("secondary-0", &policy, &pool, move || {
+            let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(fail_child(&format!("ATTEMPT-{i}-FAIL"), 255)) }
+        })
         .await;
 
         let err = res.expect_err("3 failing attempts must surface TunnelFailed");
@@ -142,7 +133,11 @@ fn establish_tunnel_exhausts_attempts_then_fails_loud() {
     }));
     assert_eq!(attempts, 3, "must hit attempts cap exactly");
     match err {
-        PrepError::TunnelFailed { secondary_id, rc, stderr } => {
+        PrepError::TunnelFailed {
+            secondary_id,
+            rc,
+            stderr,
+        } => {
             assert_eq!(secondary_id, "secondary-0");
             // /bin/sh `exit 255` → POSIX raw exit code 255. The
             // exact rc isn't load-bearing (load-bearing is "did
@@ -204,31 +199,26 @@ fn establish_tunnel_caps_in_flight_spawns_at_max_concurrent() {
             set.spawn_local(async move {
                 let in_flight_for_spawner = Arc::clone(&in_flight);
                 let peak_for_spawner = Arc::clone(&peak);
-                let res = establish_tunnel(
-                    &id,
-                    &policy,
-                    &pool,
-                    move || {
-                        let in_flight = Arc::clone(&in_flight_for_spawner);
-                        let peak = Arc::clone(&peak_for_spawner);
-                        async move {
-                            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                            // Update the peak watermark with the
-                            // post-increment value — load-bearing
-                            // for the assertion below.
-                            peak.fetch_max(now, Ordering::SeqCst);
-                            // Hold the permit window long enough to
-                            // overlap with sibling spawns. 50ms ×
-                            // ceil(N/MAX) = 100ms total run.
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                            in_flight.fetch_sub(1, Ordering::SeqCst);
-                            // Return a long-lived child so verify
-                            // passes — we're testing the permit
-                            // gating, not the verify branch.
-                            Ok(alive_child())
-                        }
-                    },
-                )
+                let res = establish_tunnel(&id, &policy, &pool, move || {
+                    let in_flight = Arc::clone(&in_flight_for_spawner);
+                    let peak = Arc::clone(&peak_for_spawner);
+                    async move {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        // Update the peak watermark with the
+                        // post-increment value — load-bearing
+                        // for the assertion below.
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // Hold the permit window long enough to
+                        // overlap with sibling spawns. 50ms ×
+                        // ceil(N/MAX) = 100ms total run.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        // Return a long-lived child so verify
+                        // passes — we're testing the permit
+                        // gating, not the verify branch.
+                        Ok(alive_child())
+                    }
+                })
                 .await;
                 res.map(|_| ())
             });
@@ -273,22 +263,21 @@ fn establish_tunnel_enforces_per_tunnel_wall_clock_budget() {
             per_tunnel_timeout: Duration::from_millis(200),
         };
 
-        establish_tunnel(
-            "secondary-0",
-            &policy,
-            &pool,
-            move || async move {
-                // Each attempt fails fast; the long backoff +
-                // 200ms budget means the timeout fires before
-                // attempt 2 even starts.
-                Ok(fail_child("FAIL", 255))
-            },
-        )
+        establish_tunnel("secondary-0", &policy, &pool, move || async move {
+            // Each attempt fails fast; the long backoff +
+            // 200ms budget means the timeout fires before
+            // attempt 2 even starts.
+            Ok(fail_child("FAIL", 255))
+        })
         .await
         .expect_err("budget exhaustion must surface error")
     }));
     match err {
-        PrepError::TunnelFailed { secondary_id, rc, stderr } => {
+        PrepError::TunnelFailed {
+            secondary_id,
+            rc,
+            stderr,
+        } => {
             assert_eq!(secondary_id, "secondary-0");
             assert_eq!(rc, None, "budget-exhaustion has no spawn rc");
             assert!(
@@ -310,7 +299,10 @@ fn establishment_policy_defaults_match_consumer_contract() {
     let p = EstablishmentPolicy::default();
     assert_eq!(p.max_concurrent, 4);
     assert_eq!(p.attempts, 3);
-    assert_eq!(p.backoff, vec![Duration::from_secs(5), Duration::from_secs(15)]);
+    assert_eq!(
+        p.backoff,
+        vec![Duration::from_secs(5), Duration::from_secs(15)]
+    );
     assert_eq!(p.per_tunnel_timeout, Duration::from_secs(90));
     // Backoff indexing: attempt 0 has no pre-sleep, attempts 1
     // and 2 use backoff[0] and backoff[1] respectively, anything

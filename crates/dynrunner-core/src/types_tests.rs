@@ -11,10 +11,14 @@ fn error_type_wire_roundtrip() {
         ErrorType::NonRecoverable,
         ErrorType::Recoverable,
         ErrorType::Unfulfillable {
-            reason: "toolchain outpath /nix/store/abc-foo missing".to_string().into(),
+            reason: "toolchain outpath /nix/store/abc-foo missing"
+                .to_string()
+                .into(),
         },
         ErrorType::InvalidTask {
-            reason: "dependency (phase-a, task-7) does not exist".to_string().into(),
+            reason: "dependency (phase-a, task-7) does not exist"
+                .to_string()
+                .into(),
         },
     ] {
         let wire = et.wire_value();
@@ -323,7 +327,10 @@ fn soft_preferred_secondaries_round_trips_through_serde() {
     assert_eq!(json, "[\"sec-a\",\"sec-b\"]");
     let parsed: SoftPreferredSecondaries = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, hint);
-    assert_eq!(parsed.as_slice(), &["sec-a".to_string(), "sec-b".to_string()]);
+    assert_eq!(
+        parsed.as_slice(),
+        &["sec-a".to_string(), "sec-b".to_string()]
+    );
     assert!(!parsed.is_empty());
 
     let empty = SoftPreferredSecondaries::default();
@@ -370,7 +377,9 @@ fn task_info_preferred_secondaries_default_empty() {
     let bi = TaskInfo {
         path: PathBuf::from("/tmp/x"),
         size: 8,
-        identifier: ShapeId { old: "shape".into() },
+        identifier: ShapeId {
+            old: "shape".into(),
+        },
         phase_id: PhaseId::from("default"),
         type_id: TypeId::from("default"),
         affinity_id: None,

@@ -70,7 +70,10 @@ fn parse_memory_max(content: &str) -> Option<u64> {
 /// container_max` (operator misconfiguration); the result floors at
 /// 0, which the kernel rejects, surfacing the misconfiguration as a
 /// loud write error rather than silently nullifying the cap.
-fn compute_workers_memory_max(leaf: &Path, reserved_bytes: u64) -> Result<Option<u64>, CgroupSetupError> {
+fn compute_workers_memory_max(
+    leaf: &Path,
+    reserved_bytes: u64,
+) -> Result<Option<u64>, CgroupSetupError> {
     let content = std::fs::read_to_string(leaf.join("memory.max")).map_err(CgroupSetupError::Io)?;
     match parse_memory_max(&content) {
         None => Ok(None),

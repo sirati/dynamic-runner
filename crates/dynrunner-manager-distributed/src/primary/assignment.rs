@@ -1,21 +1,20 @@
 use std::collections::HashMap;
 
-use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
+use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport,
-    StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
+    Address, DistributedMessage, PeerTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
     ZipFileAssignment,
 };
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler};
 
 use crate::state::SecondaryConnectionState;
 
-use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
+use super::{PrimaryCoordinator, RemoteWorkerState};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
 
@@ -237,7 +236,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 .iter()
                 .map(|(worker_id, _, est_res)| WorkerReadyInfo {
                     worker_id: *worker_id,
-                    resource_budgets: est_res.iter()
+                    resource_budgets: est_res
+                        .iter()
                         .map(|(kind, amount)| dynrunner_core::ResourceAmount {
                             kind: kind.clone(),
                             amount,
@@ -386,5 +386,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     }
 
     // ── Phase 6: Transfer Complete ──
-
 }

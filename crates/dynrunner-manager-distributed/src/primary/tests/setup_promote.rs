@@ -3,7 +3,6 @@
 
 use super::*;
 
-
 /// T1 — setup-promote: operational loop does NOT exit at the first
 /// tick when `setup_pending = true` and `total_tasks = 0`, even though
 /// the counter check `0 + 0 >= 0` is satisfied. After a `TaskAdded`
@@ -188,104 +187,105 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
 #[tokio::test(flavor = "current_thread")]
 async fn pre_seeded_counter_exit_unchanged() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
-        let (_sec_id, _to_sec_rx, _incoming_tx) =
-            secondary_ends.into_iter().next().unwrap();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let (_sec_id, _to_sec_rx, _incoming_tx) = secondary_ends.into_iter().next().unwrap();
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            // Pre-seeded bootstrap: `seed_cluster_state` ran locally, so
-            // `total_tasks` is set by `run()` from `binaries.len()`
-            // and the counter-based exit must fire on the very first
-            // iteration once completions cover the total.
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                // Pre-seeded bootstrap: `seed_cluster_state` ran locally, so
+                // `total_tasks` is set by `run()` from `binaries.len()`
+                // and the counter-based exit must fire on the very first
+                // iteration once completions cover the total.
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        // Pin invariant: pre-seeded path leaves `setup_pending = false`.
-        assert!(
-            !primary.setup_pending(),
-            "setup_pending must default to false when required_setup_on_promote = false"
-        );
+            // Pin invariant: pre-seeded path leaves `setup_pending = false`.
+            assert!(
+                !primary.setup_pending(),
+                "setup_pending must default to false when required_setup_on_promote = false"
+            );
 
-        // Pre-seeded mid-run state: 2 tasks total, both already in the
-        // completed set (mirrors what would normally arrive via
-        // TaskComplete handlers). No active workers. The counter
-        // check on the first iteration is `2+0 >= 2 && 0 == 0` —
-        // must trip immediately.
-        let phase = dynrunner_core::PhaseId::from("default");
-        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
-            [phase.clone()],
-            std::collections::HashMap::new(),
-        )
-        .expect("default-phase pool");
-        primary.pending = Some(pool);
-        primary.phase_completed.insert(phase.clone(), 0);
-        primary.phase_failed.insert(phase, 0);
-        primary.total_tasks = 2;
-        primary.completed_tasks.insert("h-legacy-1".into());
-        primary.completed_tasks.insert("h-legacy-2".into());
+            // Pre-seeded mid-run state: 2 tasks total, both already in the
+            // completed set (mirrors what would normally arrive via
+            // TaskComplete handlers). No active workers. The counter
+            // check on the first iteration is `2+0 >= 2 && 0 == 0` —
+            // must trip immediately.
+            let phase = dynrunner_core::PhaseId::from("default");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                std::collections::HashMap::new(),
+            )
+            .expect("default-phase pool");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.total_tasks = 2;
+            primary.completed_tasks.insert("h-legacy-1".into());
+            primary.completed_tasks.insert("h-legacy-2".into());
 
-        // Bounded wait. The counter-check exit should fire on
-        // iteration 1 of the loop — well under 1s. A 5s ceiling is
-        // overkill but stays consistent with the other operational-
-        // loop tests in this file.
-        let exit = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            primary.operational_loop(),
-        )
-        .await;
+            // Bounded wait. The counter-check exit should fire on
+            // iteration 1 of the loop — well under 1s. A 5s ceiling is
+            // overkill but stays consistent with the other operational-
+            // loop tests in this file.
+            let exit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                primary.operational_loop(),
+            )
+            .await;
 
-        match exit {
-            Ok(Ok(())) => {
-                // Exit path pinning: still on the pre-seeded counter-based
-                // exit. `setup_pending` stayed false the entire time
-                // (no TaskAdded / RunComplete arrived to clear it),
-                // and `cluster_state.run_complete()` was never set.
-                assert!(
-                    !primary.setup_pending(),
-                    "pre-seeded bootstrap must not flip setup_pending true at any point"
-                );
-                assert!(
-                    !primary.cluster_state_for_test().run_complete(),
-                    "pre-seeded bootstrap exit must be via the counter check, \
+            match exit {
+                Ok(Ok(())) => {
+                    // Exit path pinning: still on the pre-seeded counter-based
+                    // exit. `setup_pending` stayed false the entire time
+                    // (no TaskAdded / RunComplete arrived to clear it),
+                    // and `cluster_state.run_complete()` was never set.
+                    assert!(
+                        !primary.setup_pending(),
+                        "pre-seeded bootstrap must not flip setup_pending true at any point"
+                    );
+                    assert!(
+                        !primary.cluster_state_for_test().run_complete(),
+                        "pre-seeded bootstrap exit must be via the counter check, \
                      not via the cluster_state.run_complete() branch"
-                );
-            }
-            Ok(Err(e)) => panic!(
-                "operational_loop returned Err in pre-seeded bootstrap scenario: {e}"
-            ),
-            Err(_) => panic!(
-                "pre-seeded bootstrap operational_loop did not exit within 5s \
+                    );
+                }
+                Ok(Err(e)) => {
+                    panic!("operational_loop returned Err in pre-seeded bootstrap scenario: {e}")
+                }
+                Err(_) => panic!(
+                    "pre-seeded bootstrap operational_loop did not exit within 5s \
                  despite the counter check `2+0 >= 2 && active_workers == 0` \
                  being satisfied on the first iteration — regression on the \
                  historical exit semantics"
-            ),
-        }
-    }).await;
+                ),
+            }
+        })
+        .await;
 }
 
 /// T3 — setup-promote: the initial-empty-phase cascade does NOT fire
@@ -617,141 +617,143 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
 #[tokio::test(flavor = "current_thread")]
 async fn setup_deadline_fires_when_promoted_secondary_silent() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
-        // Keep the secondary end alive so transport.recv() doesn't
-        // return None (which would exit via the both-channels-closed
-        // fallback, not the deadline arm we're testing).
-        let (_sec_id, _to_sec_rx, _incoming_tx) =
-            secondary_ends.into_iter().next().unwrap();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            // Keep the secondary end alive so transport.recv() doesn't
+            // return None (which would exit via the both-channels-closed
+            // fallback, not the deadline arm we're testing).
+            let (_sec_id, _to_sec_rx, _incoming_tx) = secondary_ends.into_iter().next().unwrap();
 
-        let deadline = Duration::from_millis(200);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            // Setup-promote intent: `setup_pending` starts true and
-            // there is no TaskAdded / TasksSpawned / RunComplete
-            // coming. The new deadline arm is the only exit cue.
-            required_setup_on_promote: true,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            // The arm under test. 200ms is comfortably above the
-            // tokio timer resolution (1ms) so the elapsed-> Duration
-            // check below has room without flake-prone tight bounds.
-            setup_promote_deadline: deadline,
-        };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let deadline = Duration::from_millis(200);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                // Setup-promote intent: `setup_pending` starts true and
+                // there is no TaskAdded / TasksSpawned / RunComplete
+                // coming. The new deadline arm is the only exit cue.
+                required_setup_on_promote: true,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                // The arm under test. 200ms is comfortably above the
+                // tokio timer resolution (1ms) so the elapsed-> Duration
+                // check below has room without flake-prone tight bounds.
+                setup_promote_deadline: deadline,
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        // Sanity: latch was initialised from
-        // `required_setup_on_promote`. If this fails the rest of the
-        // test's reasoning collapses.
-        assert!(
-            primary.setup_pending(),
-            "setup_pending must be initialised from \
+            // Sanity: latch was initialised from
+            // `required_setup_on_promote`. If this fails the rest of the
+            // test's reasoning collapses.
+            assert!(
+                primary.setup_pending(),
+                "setup_pending must be initialised from \
              config.required_setup_on_promote at construction"
-        );
+            );
 
-        // Mirror what `run()` would set up before the operational
-        // loop entry: empty pool, default phase tracked, no binaries,
-        // `total_tasks = 0`. The CRDT-derived `setup_pending()` gate
-        // suppresses the counter exit; this isolates the
-        // deadline arm as the ONLY non-trivial exit cue (the counter
-        // / pool-drain / run_complete / fleet_dead / transport-closed
-        // arms are all structurally unavailable: total_tasks=0 is
-        // gated by setup_pending, secondaries={} is the test rig's
-        // synthetic state, the channels stay open).
-        let phase = dynrunner_core::PhaseId::from("default");
-        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
-            [phase.clone()],
-            std::collections::HashMap::new(),
-        )
-        .expect("default-phase pool");
-        primary.pending = Some(pool);
-        primary.phase_completed.insert(phase.clone(), 0);
-        primary.phase_failed.insert(phase, 0);
-        primary.total_tasks = 0;
+            // Mirror what `run()` would set up before the operational
+            // loop entry: empty pool, default phase tracked, no binaries,
+            // `total_tasks = 0`. The CRDT-derived `setup_pending()` gate
+            // suppresses the counter exit; this isolates the
+            // deadline arm as the ONLY non-trivial exit cue (the counter
+            // / pool-drain / run_complete / fleet_dead / transport-closed
+            // arms are all structurally unavailable: total_tasks=0 is
+            // gated by setup_pending, secondaries={} is the test rig's
+            // synthetic state, the channels stay open).
+            let phase = dynrunner_core::PhaseId::from("default");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                std::collections::HashMap::new(),
+            )
+            .expect("default-phase pool");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.total_tasks = 0;
 
-        // Outer ceiling: a stuck operational loop should fail the
-        // test loudly rather than hang the runner. 5s is 25× the
-        // deadline so a healthy run finishes well within budget.
-        let start = std::time::Instant::now();
-        let exit = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            primary.operational_loop(),
-        )
-        .await;
-        let elapsed = start.elapsed();
+            // Outer ceiling: a stuck operational loop should fail the
+            // test loudly rather than hang the runner. 5s is 25× the
+            // deadline so a healthy run finishes well within budget.
+            let start = std::time::Instant::now();
+            let exit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                primary.operational_loop(),
+            )
+            .await;
+            let elapsed = start.elapsed();
 
-        match exit {
-            Ok(Ok(())) => {
-                // (A) Loop returned Ok via `break`, not via Err.
-                // (B) The deadline arm set the outcome field with a
-                //     plausible elapsed value.
-                let outcome = primary.setup_deadline_outcome
-                    .expect("setup_deadline_outcome must be Some after deadline-driven exit");
-                assert!(
-                    outcome >= deadline,
-                    "elapsed ({outcome:?}) must be at least the deadline ({deadline:?}) — \
+            match exit {
+                Ok(Ok(())) => {
+                    // (A) Loop returned Ok via `break`, not via Err.
+                    // (B) The deadline arm set the outcome field with a
+                    //     plausible elapsed value.
+                    let outcome = primary
+                        .setup_deadline_outcome
+                        .expect("setup_deadline_outcome must be Some after deadline-driven exit");
+                    assert!(
+                        outcome >= deadline,
+                        "elapsed ({outcome:?}) must be at least the deadline ({deadline:?}) — \
                      the arm should not fire EARLY"
-                );
-                // Slack for scheduler jitter: 500ms above the
-                // deadline is generous on a hot test runner and tight
-                // enough that a real hang would blow through.
-                assert!(
-                    outcome < deadline + Duration::from_millis(500),
-                    "elapsed ({outcome:?}) must be within deadline+500ms ({:?}) — \
+                    );
+                    // Slack for scheduler jitter: 500ms above the
+                    // deadline is generous on a hot test runner and tight
+                    // enough that a real hang would blow through.
+                    assert!(
+                        outcome < deadline + Duration::from_millis(500),
+                        "elapsed ({outcome:?}) must be within deadline+500ms ({:?}) — \
                      a substantially-later fire suggests the arm is being \
                      out-raced by another arm that's letting iterations \
                      leak past the timer",
-                    deadline + Duration::from_millis(500)
-                );
-                // (C) The latch stayed up — no TaskAdded came in.
-                assert!(
-                    primary.setup_pending(),
-                    "setup_pending must remain true after a deadline-driven \
+                        deadline + Duration::from_millis(500)
+                    );
+                    // (C) The latch stayed up — no TaskAdded came in.
+                    assert!(
+                        primary.setup_pending(),
+                        "setup_pending must remain true after a deadline-driven \
                      exit; if this fails the test rig leaked a TaskAdded and \
                      the run actually exited via the counter path, which \
                      defeats the regression's purpose"
-                );
-                // Outer wall-clock sanity: the test itself completed
-                // close to the deadline (the loop didn't hang on
-                // some other arm).
-                assert!(
-                    elapsed < Duration::from_secs(2),
-                    "outer wall-clock ({elapsed:?}) should be much less than the 5s \
+                    );
+                    // Outer wall-clock sanity: the test itself completed
+                    // close to the deadline (the loop didn't hang on
+                    // some other arm).
+                    assert!(
+                        elapsed < Duration::from_secs(2),
+                        "outer wall-clock ({elapsed:?}) should be much less than the 5s \
                      ceiling — a stuck loop would hit the ceiling"
-                );
-            }
-            Ok(Err(e)) => panic!(
-                "operational_loop returned Err: {e} (expected Ok with \
+                    );
+                }
+                Ok(Err(e)) => panic!(
+                    "operational_loop returned Err: {e} (expected Ok with \
                  setup_deadline_outcome set)"
-            ),
-            Err(_) => panic!(
-                "operational_loop did not exit within 5s — the deadline arm \
+                ),
+                Err(_) => panic!(
+                    "operational_loop did not exit within 5s — the deadline arm \
                  ({deadline:?}) is not firing. Either the arm condition is \
                  wrong, the sleep_until isn't waking, or another arm is \
                  raced ahead and disabled the deadline incorrectly."
-            ),
-        }
-    }).await;
+                ),
+            }
+        })
+        .await;
 }
 
 /// Companion to `setup_deadline_fires_when_promoted_secondary_silent`:
@@ -770,129 +772,130 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
 #[tokio::test(flavor = "current_thread")]
 async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
-        let (_sec_id, _to_sec_rx, incoming_tx) =
-            secondary_ends.into_iter().next().unwrap();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let (_sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
 
-        let deadline = Duration::from_millis(500);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: true,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: deadline,
-        };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let deadline = Duration::from_millis(500);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: true,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: deadline,
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let phase = dynrunner_core::PhaseId::from("default");
-        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
-            [phase.clone()],
-            std::collections::HashMap::new(),
-        )
-        .expect("default-phase pool");
-        primary.pending = Some(pool);
-        primary.phase_completed.insert(phase.clone(), 0);
-        primary.phase_failed.insert(phase, 0);
-        primary.total_tasks = 0;
+            let phase = dynrunner_core::PhaseId::from("default");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                std::collections::HashMap::new(),
+            )
+            .expect("default-phase pool");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.total_tasks = 0;
 
-        // Pre-queue a TaskAdded + TaskCompleted that mirror the
-        // shape of the existing
-        // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`
-        // test. The TaskAdded clears the latch + refreshes
-        // total_tasks to 1; the TaskCompleted lets the counter exit
-        // fire at `1+0 >= 1 && active_workers == 0`.
-        //
-        // We deliberately enqueue both messages BEFORE entering the
-        // operational loop — the transport arm drains them
-        // immediately, well before the 500ms deadline. The deadline
-        // arm should observe the cleared latch on its
-        // arm-condition re-evaluation and park.
-        let bin = make_binary("setup-discovered-task", 100);
-        let hash = crate::primary::wire::compute_task_hash(&bin);
-        incoming_tx
-            .send(DistributedMessage::ClusterMutation {
-                sender_id: "sec-promoted".into(),
-                timestamp: 0.0,
-                mutations: vec![ClusterMutation::<TestId>::TaskAdded {
-                    hash: hash.clone(),
-                    task: bin.clone(),
-                }],
-            })
-            .unwrap();
-        // Completion as a `TaskComplete` wire report — the composed
-        // authority's `handle_task_complete` populates `completed_tasks`
-        // (counter-exit input) and broadcasts the CRDT mutation. See the
-        // matching note in
-        // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`.
-        incoming_tx
-            .send(DistributedMessage::TaskComplete {
-                sender_id: "sec-promoted".into(),
-                timestamp: 0.0,
-                secondary_id: "sec-promoted".into(),
-                worker_id: 0,
-                task_hash: hash.clone(),
-                result_data: None,
-            })
-            .unwrap();
-        // Hold the sender so the channel doesn't close (which would
-        // exit via the transport-closed fallback rather than the
-        // counter exit we want to observe).
-        let _hold = incoming_tx;
+            // Pre-queue a TaskAdded + TaskCompleted that mirror the
+            // shape of the existing
+            // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`
+            // test. The TaskAdded clears the latch + refreshes
+            // total_tasks to 1; the TaskCompleted lets the counter exit
+            // fire at `1+0 >= 1 && active_workers == 0`.
+            //
+            // We deliberately enqueue both messages BEFORE entering the
+            // operational loop — the transport arm drains them
+            // immediately, well before the 500ms deadline. The deadline
+            // arm should observe the cleared latch on its
+            // arm-condition re-evaluation and park.
+            let bin = make_binary("setup-discovered-task", 100);
+            let hash = crate::primary::wire::compute_task_hash(&bin);
+            incoming_tx
+                .send(DistributedMessage::ClusterMutation {
+                    sender_id: "sec-promoted".into(),
+                    timestamp: 0.0,
+                    mutations: vec![ClusterMutation::<TestId>::TaskAdded {
+                        hash: hash.clone(),
+                        task: bin.clone(),
+                    }],
+                })
+                .unwrap();
+            // Completion as a `TaskComplete` wire report — the composed
+            // authority's `handle_task_complete` populates `completed_tasks`
+            // (counter-exit input) and broadcasts the CRDT mutation. See the
+            // matching note in
+            // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`.
+            incoming_tx
+                .send(DistributedMessage::TaskComplete {
+                    sender_id: "sec-promoted".into(),
+                    timestamp: 0.0,
+                    secondary_id: "sec-promoted".into(),
+                    worker_id: 0,
+                    task_hash: hash.clone(),
+                    result_data: None,
+                })
+                .unwrap();
+            // Hold the sender so the channel doesn't close (which would
+            // exit via the transport-closed fallback rather than the
+            // counter exit we want to observe).
+            let _hold = incoming_tx;
 
-        let exit = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            primary.operational_loop(),
-        )
-        .await;
+            let exit = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                primary.operational_loop(),
+            )
+            .await;
 
-        match exit {
-            Ok(Ok(())) => {
-                // Latch was cleared by the TaskAdded mirror — the
-                // arm-condition's `self.setup_pending` test should
-                // have flipped false long before the deadline.
-                assert!(
-                    !primary.setup_pending(),
-                    "setup_pending must be cleared by the TaskAdded mirror"
-                );
-                // The deadline arm did NOT set its outcome — the
-                // exit was via the counter path.
-                assert!(
-                    primary.setup_deadline_outcome.is_none(),
-                    "setup_deadline_outcome must be None when the run \
+            match exit {
+                Ok(Ok(())) => {
+                    // Latch was cleared by the TaskAdded mirror — the
+                    // arm-condition's `self.setup_pending` test should
+                    // have flipped false long before the deadline.
+                    assert!(
+                        !primary.setup_pending(),
+                        "setup_pending must be cleared by the TaskAdded mirror"
+                    );
+                    // The deadline arm did NOT set its outcome — the
+                    // exit was via the counter path.
+                    assert!(
+                        primary.setup_deadline_outcome.is_none(),
+                        "setup_deadline_outcome must be None when the run \
                      completes via the counter path before the deadline; \
                      a Some(...) here means the deadline arm fired \
                      spuriously after the latch cleared"
-                );
-                // Sanity: the run produced the expected outcome.
-                assert_eq!(primary.total_tasks, 1);
-                assert!(primary.completed_tasks.contains(&hash));
-            }
-            Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
-            Err(_) => panic!(
-                "operational_loop did not exit within 5s — the counter \
+                    );
+                    // Sanity: the run produced the expected outcome.
+                    assert_eq!(primary.total_tasks, 1);
+                    assert!(primary.completed_tasks.contains(&hash));
+                }
+                Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+                Err(_) => panic!(
+                    "operational_loop did not exit within 5s — the counter \
                  exit is not firing after the latch clears, or the deadline \
                  arm is somehow blocking the natural exit path"
-            ),
-        }
-    }).await;
+                ),
+            }
+        })
+        .await;
 }

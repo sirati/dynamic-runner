@@ -11,13 +11,11 @@
 
 use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -27,7 +25,6 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-
     /// Mirror a batch of `ClusterMutation`s into the local replicated
     /// CRDT. Shared between the operational `dispatch_message` /
     /// `handle_inbound` arms and `wait_for_setup`'s receive loop — every
@@ -42,7 +39,10 @@ where
     /// `PrimaryCoordinator`'s concern, driven on the authority's own
     /// pool. A non-authority node simply converges its CRDT mirror; it
     /// never decides what to dispatch from it.
-    pub(in crate::secondary) fn apply_cluster_mutations(&mut self, mutations: Vec<ClusterMutation<I>>) {
+    pub(in crate::secondary) fn apply_cluster_mutations(
+        &mut self,
+        mutations: Vec<ClusterMutation<I>>,
+    ) {
         let count = mutations.len();
         for m in mutations {
             self.cluster_state.apply(m);
@@ -134,8 +134,7 @@ where
         resolved_path: &Option<std::path::PathBuf>,
     ) -> Result<bool, String> {
         let local_path_is_relative = std::path::Path::new(local_path).is_relative();
-        if resolved_path.is_none()
-            && (self.config.src_network.is_some() || local_path_is_relative)
+        if resolved_path.is_none() && (self.config.src_network.is_some() || local_path_is_relative)
         {
             let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
             let msg = DistributedMessage::TaskFailed {

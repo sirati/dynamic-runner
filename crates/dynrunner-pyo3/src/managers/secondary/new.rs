@@ -94,9 +94,9 @@ impl PySecondaryCoordinator {
         // construction-time failures — silently swallowing this with
         // `.ok()` produced 6h runs with zero worker log output when
         // the mount happened to be read-only or missing.
-        let log_dir =
-            task.log_paths
-                .resolve_log_dir(py, &task.log_path, &secondary_id)?;
+        let log_dir = task
+            .log_paths
+            .resolve_log_dir(py, &task.log_path, &secondary_id)?;
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             pyo3::exceptions::PyOSError::new_err(format!(
                 "failed to create log directory {log_dir:?}: {e}"
@@ -106,9 +106,9 @@ impl PySecondaryCoordinator {
         // Boundary normalization: typed `max_resources` ResourceMap wins
         // when supplied; otherwise fall back to a single-key memory map
         // built from the legacy scalar `ram_bytes`.
-        let max_resources = max_resources.map(|m| m.to_rust()).unwrap_or_else(|| {
-            ResourceMap::from([(ResourceKind::memory(), ram_bytes)])
-        });
+        let max_resources = max_resources
+            .map(|m| m.to_rust())
+            .unwrap_or_else(|| ResourceMap::from([(ResourceKind::memory(), ram_bytes)]));
 
         Ok(Self {
             python_executable: task.python_executable,

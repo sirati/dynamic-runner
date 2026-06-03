@@ -1,4 +1,4 @@
-use dynrunner_core::{TaskInfo, Identifier};
+use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 
 // `compute_task_hash` is the wire-canonical task content hash; it now

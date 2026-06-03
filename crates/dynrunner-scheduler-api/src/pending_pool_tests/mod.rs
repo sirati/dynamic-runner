@@ -59,10 +59,7 @@ pub(super) fn pool_with(phases: &[&str], deps: &[(&str, &[&str])]) -> PendingPoo
     let phases: Vec<PhaseId> = phases.iter().map(|p| phase(p)).collect();
     let mut deps_map: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
     for (child, parents) in deps {
-        deps_map.insert(
-            phase(child),
-            parents.iter().map(|p| phase(p)).collect(),
-        );
+        deps_map.insert(phase(child), parents.iter().map(|p| phase(p)).collect());
     }
     PendingPool::new(phases, deps_map).expect("valid graph")
 }

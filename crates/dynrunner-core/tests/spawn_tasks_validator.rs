@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dynrunner_core::{
-    compute_task_hash, validate_spawn_tasks, AffinityId, PhaseId,
-    SoftPreferredSecondaries, SpawnError, TaskDep, TaskInfo, TypeId,
+    AffinityId, PhaseId, SoftPreferredSecondaries, SpawnError, TaskDep, TaskInfo, TypeId,
+    compute_task_hash, validate_spawn_tasks,
 };
 
 /// Build a minimal `TaskInfo` with a unique `task_id` and an
@@ -72,8 +72,11 @@ fn within_batch_dep_resolves() {
     // must union the batch's own task_ids with the receiver's known
     // set so the dep resolves without any receiver-side knowledge.
     let (present, known) = empty_receiver();
-    let (valid, errors) =
-        validate_spawn_tasks(present, known, vec![task("a", vec![]), task("b", vec!["a"])]);
+    let (valid, errors) = validate_spawn_tasks(
+        present,
+        known,
+        vec![task("a", vec![]), task("b", vec!["a"])],
+    );
     assert_eq!(valid.len(), 2);
     assert!(errors.is_empty());
 }

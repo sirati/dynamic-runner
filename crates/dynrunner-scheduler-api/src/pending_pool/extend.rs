@@ -91,9 +91,8 @@ impl<I: Identifier> PendingPool<I> {
         // (which already excludes resolved/completed entries by construction).
         let mut indegree: HashMap<String, usize> = HashMap::new();
         let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
-        let pre_resolved = |dep: &str| {
-            self.completed_tasks.contains(dep) || self.failed_tasks.contains(dep)
-        };
+        let pre_resolved =
+            |dep: &str| self.completed_tasks.contains(dep) || self.failed_tasks.contains(dep);
         // Existing blocked nodes.
         for (id, deps) in &self.task_deps {
             indegree.entry(id.clone()).or_insert(0);
@@ -102,10 +101,7 @@ impl<I: Identifier> PendingPool<I> {
                     continue;
                 }
                 *indegree.entry(id.clone()).or_insert(0) += 1;
-                children_of
-                    .entry(dep.clone())
-                    .or_default()
-                    .push(id.clone());
+                children_of.entry(dep.clone()).or_default().push(id.clone());
                 indegree.entry(dep.clone()).or_insert(0);
             }
         }
@@ -167,16 +163,14 @@ impl<I: Identifier> PendingPool<I> {
                 let mut cur = first.clone();
                 while visited_walk.insert(cur.clone()) {
                     cycle_walk.push(cur.clone());
-                    let next = children_of
-                        .get(&cur)
-                        .and_then(|cs| {
-                            // Pick the smallest still-unresolved child to
-                            // make the walk deterministic.
-                            cs.iter()
-                                .filter(|c| residual.get(*c).copied().unwrap_or(0) != 0)
-                                .min()
-                                .cloned()
-                        });
+                    let next = children_of.get(&cur).and_then(|cs| {
+                        // Pick the smallest still-unresolved child to
+                        // make the walk deterministic.
+                        cs.iter()
+                            .filter(|c| residual.get(*c).copied().unwrap_or(0) != 0)
+                            .min()
+                            .cloned()
+                    });
                     match next {
                         Some(n) => cur = n,
                         None => break,
@@ -281,9 +275,7 @@ impl<I: Identifier> PendingPool<I> {
     /// included: the pool retains only their `task_id`, not their phase,
     /// so they cannot be expressed as a full identity. Callers that need
     /// those fall back to the phase-less `collect_known_task_ids`.
-    pub(super) fn collect_known_phase_task_ids(
-        &self,
-    ) -> Vec<(dynrunner_core::PhaseId, String)> {
+    pub(super) fn collect_known_phase_task_ids(&self) -> Vec<(dynrunner_core::PhaseId, String)> {
         let mut out: Vec<(dynrunner_core::PhaseId, String)> = Vec::new();
         for bucket in self.buckets.values() {
             for item in &bucket.items {

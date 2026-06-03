@@ -19,19 +19,15 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 /// production; tests that exercise post-initialisation paths
 /// (heartbeat re-queue, etc.) need this so `pool_mut()` doesn't
 /// panic.
-fn install_default_pool<Tr, S, E>(
-    primary: &mut PrimaryCoordinator<Tr, S, E, TestId>,
-) where
+fn install_default_pool<Tr, S, E>(primary: &mut PrimaryCoordinator<Tr, S, E, TestId>)
+where
     Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
     S: dynrunner_scheduler_api::Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
     let phase = PhaseId::from("default");
-    let pool = PendingPool::<TestId>::new(
-        [phase.clone()],
-        std::collections::HashMap::new(),
-    )
-    .expect("default-phase pool");
+    let pool = PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
+        .expect("default-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -57,8 +53,8 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
         keepalive_interval,
         keepalive_miss_threshold: miss_threshold,
         source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
+        uses_file_based_items: true,
+        required_setup_on_promote: false,
         max_concurrent_per_type: std::collections::HashMap::new(),
         retry_max_passes: 1,
         oom_retry_max_passes: 1,
@@ -258,18 +254,12 @@ fn config_with_mass_death(
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_defers_requeue_when_all_secondaries_silent() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -297,18 +287,12 @@ async fn mass_death_defers_requeue_when_all_secondaries_silent() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_recovery_during_grace_undefers_secondary() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -335,18 +319,12 @@ async fn mass_death_recovery_during_grace_undefers_secondary() {
 #[tokio::test(flavor = "current_thread")]
 async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -372,18 +350,12 @@ async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_disabled_when_grace_is_zero() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::ZERO,
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::ZERO, 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -429,18 +401,12 @@ fn collect_peer_removed(
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -457,7 +423,11 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
     // sending its TimeoutDetected first.
     let removed_a = collect_peer_removed(&mut sec_rxs[0]);
     let removed_b = collect_peer_removed(&mut sec_rxs[1]);
-    let merged = if !removed_b.is_empty() { removed_b } else { removed_a };
+    let merged = if !removed_b.is_empty() {
+        removed_b
+    } else {
+        removed_a
+    };
     assert_eq!(
         merged.len(),
         1,
@@ -479,18 +449,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_millis(200),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_millis(200), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -532,8 +496,7 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
     for (_, cause) in &removed {
         assert_eq!(*cause, RemovalCause::MassDeathEscalation);
     }
-    let ids: std::collections::HashSet<&str> =
-        removed.iter().map(|(id, _)| id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = removed.iter().map(|(id, _)| id.as_str()).collect();
     assert!(ids.contains("sec-a"));
     assert!(ids.contains("sec-b"));
 }
@@ -547,13 +510,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config(Duration::from_millis(50), 2),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -607,18 +569,12 @@ async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config_with_mass_death(
-                Duration::from_millis(50),
-                2,
-                Duration::from_secs(60),
-                2,
-            ),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
     register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
     register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
@@ -726,13 +682,12 @@ fn first_task_assignment(
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-        PrimaryCoordinator::new(
-            config(Duration::from_millis(50), 2),
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator,
-        );
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
     install_default_pool(&mut primary);
 
     // sec-a is the wedged secondary; it owns one in-flight task that
@@ -798,12 +753,10 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     // `TasksAdded` rather than dispatching inline. Drain the coalesced
     // batch and run the worker-management reaction synchronously —
     // exactly what the operational loop's worker-management arm does.
-    let batch = crate::worker_signal::drain_worker_signal_batch(
-        &mut wm_rx,
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("dead-secondary requeue must emit a TasksAdded batch");
+    let batch =
+        crate::worker_signal::drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            .await
+            .expect("dead-secondary requeue must emit a TasksAdded batch");
     assert!(
         batch
             .signals
@@ -834,7 +787,10 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     // only) is the right shape: the task moved from queued to
     // in-flight on the kickstart's dispatch call.
     assert!(
-        primary.workers.iter().any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
+        primary
+            .workers
+            .iter()
+            .any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
         "survivor's worker must flip to busy after the kickstart"
     );
     assert_eq!(
@@ -900,8 +856,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
-    let victim_hash =
-        primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
+    let victim_hash = primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
     // Mirror the CRDT to InFlight, the state the live `TaskAssigned`
     // origination would have written at dispatch.
     {

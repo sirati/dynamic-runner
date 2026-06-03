@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{new_role_cache, seed_self_role, DistributedMessage, Router};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, Router, new_role_cache, seed_self_role,
+};
 use tokio::sync::mpsc;
 
 use crate::peer_transport::ChannelPeerTransport;
@@ -69,14 +71,19 @@ pub fn peer_mesh_with_adjacency<I: Identifier>(
     // list. We key by the canonical (lo, hi) ordering so a duplicate
     // — whether listed twice in the same direction or once each
     // direction — surfaces as a panic rather than silent re-insert.
-    let mut outgoing: HashMap<String, HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>> =
-        peer_ids
-            .iter()
-            .map(|id| (id.clone(), HashMap::new()))
-            .collect();
+    let mut outgoing: HashMap<
+        String,
+        HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
+    > = peer_ids
+        .iter()
+        .map(|id| (id.clone(), HashMap::new()))
+        .collect();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (a, b) in links {
-        assert!(a != b, "peer_mesh_with_adjacency: self-link '{a}' is not allowed");
+        assert!(
+            a != b,
+            "peer_mesh_with_adjacency: self-link '{a}' is not allowed"
+        );
         assert!(
             inboxes.contains_key(a),
             "peer_mesh_with_adjacency: link references unknown peer '{a}'"

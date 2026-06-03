@@ -6,13 +6,13 @@
 
 #![cfg(test)]
 
-use super::processing::make_binary;
 use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::super::*;
-use std::time::Duration;
+use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 // (helpers in `r1_helpers` keep the test bodies focused on the
@@ -27,11 +27,11 @@ mod r1_helpers {
     //! that don't go through the operational threshold path, but
     //! wrong for R1 tests that do.
 
-    use crate::secondary::test_helpers::{election_config, FixedEstimator, FixedPeerCount, TestId};
     use super::*;
+    use crate::secondary::test_helpers::{FixedEstimator, FixedPeerCount, TestId, election_config};
     use dynrunner_scheduler::ResourceStealingScheduler;
 
-    use crate::secondary::test_helpers::{make_transport, TestTransport};
+    use crate::secondary::test_helpers::{TestTransport, make_transport};
 
     pub(super) type R1Secondary = SecondaryCoordinator<
         TestTransport<FixedPeerCount>,
@@ -132,13 +132,25 @@ async fn r1_promotion_on_no_route_count_axis() {
     // `send_to_primary` routes to the (dropped-receiver) uplink,
     // errors no-route, and records one failover-health probe.
     // threshold=3 in election_config; the third breaches.
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(!sec.primary_link.should_arm_failover());
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(!sec.primary_link.should_arm_failover());
     // Third no-route send breaches the threshold and backdates
     // primary_last_seen (done inside send_to_primary on the breach).
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(
         sec.primary_link.should_arm_failover(),
         "third no-route send must arm the failover-health probe (threshold=3)"
@@ -181,7 +193,11 @@ async fn r1_recover_on_primary_back() {
     sec.record_primary_message();
 
     // One no-route send opens the health window — a short flap.
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(sec.primary_link.is_link_failing());
 
     // Primary comes back: `record_primary_message` resets the window.
@@ -194,7 +210,10 @@ async fn r1_recover_on_primary_back() {
 
     // Tick re-check is a no-op now that the link is healthy.
     sec.check_primary_link_threshold();
-    assert!(!sec.primary_link.should_arm_failover(), "no arming on healthy link");
+    assert!(
+        !sec.primary_link.should_arm_failover(),
+        "no arming on healthy link"
+    );
 
     // Election stays in Normal — no Suspecting.
     let actions = sec.run_election_tick();
@@ -227,9 +246,21 @@ async fn r1_respects_degraded_guard() {
 
     // Drive the count-axis past threshold via the send-side probe;
     // the third no-route send arms + backdates primary_last_seen.
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(sec.primary_link.should_arm_failover());
 
     // Election tick observes degraded mesh + primary-silent and
@@ -280,15 +311,30 @@ async fn r1_no_mesh_rebuild_during_arming() {
     // Drive the failover-health probe past threshold via no-route
     // sends. The probe touches ONLY the primary-link health
     // sub-state — never the mesh.
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
-    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
+    assert!(
+        sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
+            .await
+            .is_err()
+    );
     assert!(sec.primary_link.should_arm_failover());
 
     // Peer-mesh view unchanged.
     let peers_after: std::collections::HashSet<String> =
         sec.peer_keepalives.keys().cloned().collect();
-    assert_eq!(peers_before, peers_after, "arming must not mutate peer keepalives");
+    assert_eq!(
+        peers_before, peers_after,
+        "arming must not mutate peer keepalives"
+    );
 
     // The replicated current_primary stays None (no PromotePrimary
     // observed) — arming alone doesn't pick a candidate; that's the
@@ -339,7 +385,8 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             // disconnected during setup` arm in milliseconds, well
             // before setup_deadline fires; we want to exercise the
             // deadline path.
-            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (_pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let transport = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
@@ -348,7 +395,10 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             let config = SecondaryConfig {
                 secondary_id: "sec-cold".into(),
                 num_workers: 1,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_millis(50),
                 src_network: None,
@@ -434,7 +484,8 @@ async fn cold_start_with_peers_emits_distinct_error() {
             // Same blocking-recv trick as the no-peers test above —
             // keep the sender bound so the secondary blocks waiting
             // for the primary that never speaks.
-            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (_pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let transport = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
@@ -443,7 +494,10 @@ async fn cold_start_with_peers_emits_distinct_error() {
             let config = SecondaryConfig {
                 secondary_id: "sec-cold-with-peers".into(),
                 num_workers: 1,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_millis(50),
                 src_network: None,
@@ -518,7 +572,8 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
     local
         .run_until(async {
             let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (_pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let transport = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
@@ -527,7 +582,10 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             let config = SecondaryConfig {
                 secondary_id: "sec-1".into(),
                 num_workers: 1,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -582,7 +640,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // tests).
             secondary.pool.workers[0].loaded_type_id = Some(binary.type_id.clone());
             let assignment = DistributedMessage::TaskAssignment {
-                sender_id: "sec-0".into(),       // promoted peer-primary
+                sender_id: "sec-0".into(), // promoted peer-primary
                 timestamp: 0.0,
                 secondary_id: "sec-1".into(),
                 worker_id: 0,
@@ -596,7 +654,9 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // The critical call: route via the single inbound handler.
             // The TaskAssignment falls to the catch-all, which delegates
             // to `dispatch_message` (the wire-frame dispatcher).
-            secondary.handle_inbound(assignment, &mut FakeWorkerFactory).await;
+            secondary
+                .handle_inbound(assignment, &mut FakeWorkerFactory)
+                .await;
 
             // Worker received the assignment → `active_tasks` records it.
             // (The `dispatch_message` body inserts on the assign_task

@@ -5,14 +5,14 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    make_transport, FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
+    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, make_transport,
 };
 use super::super::*;
-use std::time::Duration;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Simulate a primary that coordinates with the secondary.
@@ -52,7 +52,7 @@ pub(super) async fn fake_primary(
     to_secondary
         .send(DistributedMessage::InitialAssignment {
             pre_staged_mode: false,
-                    uses_file_based_items: true,
+            uses_file_based_items: true,
             sender_id: "primary".into(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -184,7 +184,10 @@ async fn secondary_with_real_workers_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 1,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -260,7 +263,10 @@ async fn secondary_multi_worker_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 2,
-                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    2 * 1024 * 1024 * 1024,
+                )]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -487,7 +493,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::InitialAssignment {
                         pre_staged_mode: false,
-                    uses_file_based_items: true,
+                        uses_file_based_items: true,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
@@ -545,8 +551,7 @@ async fn stage_file_then_assign_task_succeeds() {
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),
-                                        predecessor_outputs:
-                                            std::collections::BTreeMap::new(),
+                                        predecessor_outputs: std::collections::BTreeMap::new(),
                                     })
                                     .unwrap();
                                 sent_assignment = true;
@@ -659,9 +664,11 @@ async fn fake_primary_abort(
         .send(DistributedMessage::ClusterMutation {
             sender_id: "primary".into(),
             timestamp: 0.0,
-            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
-                reason: "duplicate task identity in the initial batch".into(),
-            }],
+            mutations: vec![
+                dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
+                    reason: "duplicate task identity in the initial batch".into(),
+                },
+            ],
         })
         .unwrap();
     // Drain until the secondary drops its end (it has exited on the

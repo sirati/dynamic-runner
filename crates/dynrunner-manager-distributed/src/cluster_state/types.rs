@@ -24,10 +24,7 @@ use serde::{Deserialize, Serialize};
 /// need for a parallel completed-task-id ledger; the alternative would
 /// reintroduce duplicated state across `cluster_state` and a side cache.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub enum TaskState<I> {
     Pending {
         task: TaskInfo<I>,

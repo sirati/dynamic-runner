@@ -29,15 +29,17 @@ fn snapshot_round_trip_preserves_state() {
         hash: "c".into(),
         task: mk_task("c"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "c".into(),
+        result_data: None,
+    });
     s.apply(ClusterMutation::PrimaryChanged {
         new: "s1".into(),
         epoch: 3,
     });
-    let deps: HashMap<PhaseId, Vec<PhaseId>> =
-        [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
-            .into_iter()
-            .collect();
+    let deps: HashMap<PhaseId, Vec<PhaseId>> = [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
+        .into_iter()
+        .collect();
     s.apply(ClusterMutation::PhaseDepsSet { deps: deps.clone() });
 
     let snap = s.snapshot();
@@ -102,7 +104,10 @@ fn snapshot_round_trip_preserves_invalid_task() {
     });
     joiner.restore(stale.snapshot());
     assert!(
-        matches!(joiner.task_state("bad"), Some(TaskState::InvalidTask { .. })),
+        matches!(
+            joiner.task_state("bad"),
+            Some(TaskState::InvalidTask { .. })
+        ),
         "terminal InvalidTask must win over a stale Pending snapshot"
     );
 }
@@ -176,7 +181,10 @@ fn restore_lattice_merge_preserves_local_terminal() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    joiner.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    joiner.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::TaskAdded {
@@ -258,7 +266,10 @@ fn restore_idempotent_under_double_apply() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    peer.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    peer.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
 
     let snap = peer.snapshot();
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
@@ -355,10 +366,18 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
     assert_eq!(deps.len(), 2);
     // Legacy dep took the enclosing task's phase ("p0").
     assert_eq!(deps[0].task_id, "legacy_prereq");
-    assert_eq!(deps[0].phase_id, PhaseId::from("p0"), "sentinel migrated to enclosing phase");
+    assert_eq!(
+        deps[0].phase_id,
+        PhaseId::from("p0"),
+        "sentinel migrated to enclosing phase"
+    );
     assert!(!deps[0].is_unphased());
     // Explicit cross-phase dep is unaffected by the shim.
     assert_eq!(deps[1].task_id, "explicit_prereq");
-    assert_eq!(deps[1].phase_id, PhaseId::from("other-phase"), "explicit dep untouched");
+    assert_eq!(
+        deps[1].phase_id,
+        PhaseId::from("other-phase"),
+        "explicit dep untouched"
+    );
     assert!(deps[1].inherit_outputs);
 }

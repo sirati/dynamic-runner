@@ -28,8 +28,8 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
-use super::wire::timestamp_now;
 use super::SecondaryCoordinator;
+use super::wire::timestamp_now;
 use crate::cluster_state::apply_locally_for_broadcast;
 
 /// Stable hash of a `TaskInfo`'s path+identifier, matching the wire
@@ -91,7 +91,6 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-
     /// Originator-side apply + broadcast for a batch of
     /// `ClusterMutation`s the promoted-secondary is producing (not
     /// receiving). Mirrors the live primary's
@@ -353,9 +352,7 @@ where
         if task_count == 0 {
             self.apply_and_broadcast_mutations(vec![ClusterMutation::RunComplete])
                 .await?;
-            tracing::info!(
-                "empty-discovery: RunComplete broadcast — no tasks to run"
-            );
+            tracing::info!("empty-discovery: RunComplete broadcast — no tasks to run");
         }
         Ok(())
     }

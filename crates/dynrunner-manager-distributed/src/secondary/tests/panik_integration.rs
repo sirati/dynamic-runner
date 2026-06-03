@@ -45,7 +45,7 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{make_transport, FakeWorkerFactory, RecordingPeer, TestId};
+use super::super::test_helpers::{FakeWorkerFactory, RecordingPeer, TestId, make_transport};
 use super::super::*;
 
 /// File source: run a secondary against a fake primary, register a
@@ -107,13 +107,12 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> =
-                SecondaryCoordinator::new(
-                    config,
-                    make_transport("sec-panik", uplink, mesh_recorder),
-                    dynrunner_scheduler::ResourceStealingScheduler::memory(),
-                    super::super::test_helpers::FixedEstimator(100),
-                );
+            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> = SecondaryCoordinator::new(
+                config,
+                make_transport("sec-panik", uplink, mesh_recorder),
+                dynrunner_scheduler::ResourceStealingScheduler::memory(),
+                super::super::test_helpers::FixedEstimator(100),
+            );
 
             // Register the panik signal receiver BEFORE entering
             // run_until_setup_or_done — the field is taken into the
@@ -131,8 +130,7 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             // watcher's polling behaviour. (The watcher's polling +
             // first-match-wins logic is covered separately by
             // `panik_watcher::tests::detects_file_creation_and_carries_path`.)
-            let expected_path =
-                std::path::PathBuf::from("/tmp/synthetic-panik-test");
+            let expected_path = std::path::PathBuf::from("/tmp/synthetic-panik-test");
 
             // Fire the panik signal AFTER spawning the secondary's
             // run loop and AFTER a small settle window so the
@@ -244,9 +242,7 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                          substring; got: {reason}"
                     );
                 }
-                other => panic!(
-                    "expected RunOutcome::PanikShutdown, got: {other:?}"
-                ),
+                other => panic!("expected RunOutcome::PanikShutdown, got: {other:?}"),
             }
 
             // Confirm the departure announcement reached the MESH (the
@@ -359,13 +355,12 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> =
-                SecondaryCoordinator::new(
-                    config,
-                    make_transport("sec-panik-sigterm", uplink, mesh_recorder),
-                    dynrunner_scheduler::ResourceStealingScheduler::memory(),
-                    super::super::test_helpers::FixedEstimator(100),
-                );
+            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> = SecondaryCoordinator::new(
+                config,
+                make_transport("sec-panik-sigterm", uplink, mesh_recorder),
+                dynrunner_scheduler::ResourceStealingScheduler::memory(),
+                super::super::test_helpers::FixedEstimator(100),
+            );
 
             let (panik_tx, panik_rx) = tokio::sync::oneshot::channel();
             secondary.register_panik_signal_rx(panik_rx);
@@ -376,9 +371,8 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             // literal duplicated here) so any future change to the
             // sentinel propagates to this test through the type
             // system rather than silently desynchronising.
-            let expected_path = std::path::PathBuf::from(
-                crate::panik_watcher::SIGTERM_SENTINEL_PATH,
-            );
+            let expected_path =
+                std::path::PathBuf::from(crate::panik_watcher::SIGTERM_SENTINEL_PATH);
 
             // Same settle window + fire pattern as the file-source
             // test — see that test's comment block for rationale on
@@ -476,9 +470,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                          conflated source type with file path)"
                     );
                 }
-                other => panic!(
-                    "expected RunOutcome::PanikShutdown, got: {other:?}"
-                ),
+                other => panic!("expected RunOutcome::PanikShutdown, got: {other:?}"),
             }
 
             // Assert NO self-authored `PeerRemoved { SelfDeparture }`

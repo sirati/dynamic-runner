@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    election_config, make_transport, FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId,
+    FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId, election_config, make_transport,
 };
 use super::super::*;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
@@ -76,8 +76,7 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, _pri_rx, peer_log) =
-                make_secondary_with_recording_peer("responder");
+            let (mut sec, _pri_rx, peer_log) = make_secondary_with_recording_peer("responder");
 
             assert!(
                 sec.cluster_state.role_table().observers.is_empty(),
@@ -135,8 +134,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, _pri_rx, peer_log) =
-                make_secondary_with_recording_peer("responder");
+            let (mut sec, _pri_rx, peer_log) = make_secondary_with_recording_peer("responder");
 
             let req = DistributedMessage::RequestClusterSnapshot {
                 sender_id: "late-worker-1".into(),

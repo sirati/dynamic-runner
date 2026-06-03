@@ -70,14 +70,9 @@ impl<I: Identifier> PendingPool<I> {
             // Walk dependents and possibly unblock them. Collect ids
             // first to avoid borrowing `self.dependents_of` while we
             // mutate `self.blocked` / `self.task_deps`.
-            let dependents = self
-                .dependents_of
-                .remove(id)
-                .unwrap_or_default();
+            let dependents = self.dependents_of.remove(id).unwrap_or_default();
             for dep_id in dependents {
-                let still_blocked = if let Some(remaining) =
-                    self.task_deps.get_mut(&dep_id)
-                {
+                let still_blocked = if let Some(remaining) = self.task_deps.get_mut(&dep_id) {
                     remaining.remove(id);
                     !remaining.is_empty()
                 } else {
@@ -110,7 +105,8 @@ impl<I: Identifier> PendingPool<I> {
                 // `Draining` only because everything was blocked, flip
                 // it back to `Active`. Mirrors `requeue` behaviour.
                 if self.phase_state.get(&dep_phase) == Some(&PhaseState::Draining) {
-                    self.phase_state.insert(dep_phase.clone(), PhaseState::Active);
+                    self.phase_state
+                        .insert(dep_phase.clone(), PhaseState::Active);
                 }
                 // A drained-pending entry for this phase is now stale —
                 // the phase is no longer drained.
@@ -274,7 +270,8 @@ impl<I: Identifier> PendingPool<I> {
             current,
             Some(PhaseState::Draining | PhaseState::Drained | PhaseState::Done)
         ) {
-            self.phase_state.insert(phase_id.clone(), PhaseState::Active);
+            self.phase_state
+                .insert(phase_id.clone(), PhaseState::Active);
             // If it was queued for drain notification, drop that entry —
             // the phase is no longer drained.
             self.drained_pending.retain(|p| p != &phase_id);
@@ -409,11 +406,7 @@ impl<I: Identifier> PendingPool<I> {
         }
         let queued = self.queued_count(phase_id);
         let in_flight = self.in_flight(phase_id);
-        let blocked = self
-            .blocked_per_phase
-            .get(phase_id)
-            .copied()
-            .unwrap_or(0);
+        let blocked = self.blocked_per_phase.get(phase_id).copied().unwrap_or(0);
 
         let next = match (queued, in_flight, blocked) {
             (0, 0, 0) => PhaseState::Drained,

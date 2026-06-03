@@ -149,12 +149,18 @@ impl SshGateway {
     /// "SSH keepalive — anti-leak floor" for the rationale.
     pub(super) fn master_only_options() -> &'static [&'static str] {
         &[
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=yes",
-            "-o", "ServerAliveInterval=60",
-            "-o", "ServerAliveCountMax=1080",
-            "-o", "TCPKeepAlive=yes",
-            "-o", "LogLevel=ERROR",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=yes",
+            "-o",
+            "ServerAliveInterval=60",
+            "-o",
+            "ServerAliveCountMax=1080",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            "LogLevel=ERROR",
         ]
     }
 
@@ -233,7 +239,6 @@ impl SshGateway {
         ])
     }
 
-
     pub(super) fn expand_remote_path(&self, path: &str) -> String {
         expand_tilde(path, self.remote_home.as_deref())
     }
@@ -263,7 +268,6 @@ impl SshGateway {
             .expect("failed to spawn ssh-master-watch thread");
         self.watcher_thread = Some(handle);
     }
-
 }
 
 impl Drop for SshGateway {

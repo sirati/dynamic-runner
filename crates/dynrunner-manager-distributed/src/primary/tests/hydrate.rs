@@ -84,10 +84,7 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
         let cs = primary.cluster_state_mut_for_test();
         // Phase deps: `compile` depends on `build`.
         cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(
-                PhaseId::from("compile"),
-                vec![PhaseId::from("build")],
-            )]),
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
@@ -116,8 +113,7 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
     // left the pool `None`).
     let pool = primary.pool();
     assert_eq!(pool.len(), 2, "both dependents must enter the pool");
-    let ids: std::collections::HashSet<&str> =
-        pool.iter().map(|t| t.task_id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = pool.iter().map(|t| t.task_id.as_str()).collect();
     assert!(ids.contains("dep-a"));
     assert!(ids.contains("dep-b"));
     // The terminal toolchain hash is recorded in the primary-side
@@ -151,10 +147,7 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(
-                PhaseId::from("compile"),
-                vec![PhaseId::from("build")],
-            )]),
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
@@ -180,10 +173,15 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
     // `completed_task_ids`, so `extend()` accepted it without an
     // `UnknownTaskDep` rejection.
     let pool = primary.pool();
-    let ids: std::collections::HashSet<&str> =
-        pool.iter().map(|t| t.task_id.as_str()).collect();
-    assert!(ids.contains("dep-a"), "dependent of an InvalidTask prereq must enter the pool");
-    assert!(!ids.contains("toolchain"), "the terminal InvalidTask prereq is not re-queued");
+    let ids: std::collections::HashSet<&str> = pool.iter().map(|t| t.task_id.as_str()).collect();
+    assert!(
+        ids.contains("dep-a"),
+        "dependent of an InvalidTask prereq must enter the pool"
+    );
+    assert!(
+        !ids.contains("toolchain"),
+        "the terminal InvalidTask prereq is not re-queued"
+    );
     // The terminal InvalidTask hash is recorded in the primary-side
     // completed ledger.
     assert!(primary.completed_tasks.contains("toolchain"));
@@ -286,13 +284,12 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             let task = dep_binary("inflight-1", "work", &[]);
             {
@@ -367,13 +364,12 @@ async fn activate_local_primary_hydrates_on_seeded_resume() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Replicated ledger as a failover-resuming node would have
             // it: one completed prereq + two pending dependents, with the
@@ -385,10 +381,7 @@ async fn activate_local_primary_hydrates_on_seeded_resume() {
             {
                 let cs = primary.cluster_state_mut_for_test();
                 cs.apply(ClusterMutation::PhaseDepsSet {
-                    deps: HashMap::from([(
-                        PhaseId::from("compile"),
-                        vec![PhaseId::from("build")],
-                    )]),
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
                 });
                 cs.apply(ClusterMutation::TaskAdded {
                     hash: "toolchain".into(),
@@ -454,13 +447,12 @@ async fn activate_local_primary_does_not_hydrate_on_bootstrap() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Bootstrap shape: a pool already built and `total_tasks`
             // set, with the CRDT also holding a (mirrored) ledger. The
@@ -523,13 +515,12 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
             // combined with all-terminal CRDT the operational loop's
             // top-of-iteration `run_complete_check` exits at once.
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Parked primary starts with NO local pool AND an empty
             // cluster_state (the role-aware tap does not feed it CRDT
@@ -608,18 +599,18 @@ async fn run_parked_exits_clean_when_gate_dropped() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
             // Drop the gate sender WITHOUT firing — this node is never
             // promoted, so no snapshot is delivered and the seeded
             // resume never runs.
-            let (promote_tx, promote_rx) =
-                tokio::sync::oneshot::channel::<crate::cluster_state::ClusterStateSnapshot<TestId>>();
+            let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<
+                crate::cluster_state::ClusterStateSnapshot<TestId>,
+            >();
             drop(promote_tx);
 
             primary
@@ -654,13 +645,12 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Replicated ledger as a promoted primary inherits it: one
             // secondary advertising 2 worker slots (D1 capacity) and one
@@ -763,13 +753,12 @@ async fn promotion_resume_reconstructs_roster_without_redispatch() {
     local
         .run_until(async {
             let (transport, mut ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Parked-primary signature: pool unseeded (`total_tasks == 0`),
             // replicated ledger holds capacity (1 worker on sec-0) + that
@@ -853,13 +842,12 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
             // in-flight on sec-dead's worker 0. ---
             let snapshot = {
                 let (transport, _ends) = setup_test(1);
-                let mut live: PrimaryCoordinator<_, _, _, TestId> =
-                    PrimaryCoordinator::new(
-                        PrimaryConfig::default(),
-                        transport,
-                        ResourceStealingScheduler::memory(),
-                        FixedEstimator(100),
-                    );
+                let mut live: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
 
                 let task = dep_binary("t-0", "work", &[]);
                 let hash = compute_task_hash(&task);
@@ -919,13 +907,12 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
             // `setup_test(1)` transport routes `Address::Peer("sec-0")`
             // assignments to the live `ends[0]` inbox. ---
             let (transport, mut ends) = setup_test(1);
-            let mut promoted: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    PrimaryConfig::default(),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let mut promoted: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
             promoted.cluster_state_mut_for_test().restore(snapshot);
 
             promoted.hydrate_from_cluster_state();

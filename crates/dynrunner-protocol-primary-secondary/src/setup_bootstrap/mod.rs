@@ -62,7 +62,6 @@
 //! [`TunneledPeerTransport`]: ../../../dynrunner-transport-tunnel/index.html
 //! [`DistributedMessage`]: crate::DistributedMessage
 
-
 pub mod adapters;
 pub mod message;
 pub mod trait_defs;
@@ -70,8 +69,6 @@ pub mod trait_defs;
 #[cfg(test)]
 mod tests;
 
-pub use adapters::{
-    PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap,
-};
+pub use adapters::{PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap};
 pub use message::SetupBootstrapMessage;
 pub use trait_defs::{SetupBootstrap, SetupBootstrapBroadcast};

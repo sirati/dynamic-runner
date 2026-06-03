@@ -18,9 +18,9 @@ use dynrunner_manager_distributed::primary::respawn::{
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 /// Recording gateway: every `execute_command` is captured, sbatch
@@ -184,59 +184,64 @@ fn make_spec(id: &str) -> SecondarySpawnSpec {
 /// the production caller (the operational loop's `run_until`).
 #[tokio::test]
 async fn slurm_spawner_submit_job_called_with_new_id() {
-    tokio::task::LocalSet::new().run_until(async {
-    let gw = RecordingGateway::default();
-    let cfg = SlurmConfig {
-        root_folder: "/srv/slurm-test".into(),
-        ..SlurmConfig::default()
-    };
-    let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
-    let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway::default();
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+            let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
 
-    let captured_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
-    let captured_id_for_closure = Arc::clone(&captured_id);
-    let wrap_gen: WrapperScriptGenerator = Arc::new(move |spec: &SecondarySpawnSpec| {
-        *captured_id_for_closure.lock().unwrap() = Some(spec.new_secondary_id.clone());
-        Ok(format!("#!/bin/sh\n# wrapper for {}\n", spec.new_secondary_id))
-    });
+            let captured_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+            let captured_id_for_closure = Arc::clone(&captured_id);
+            let wrap_gen: WrapperScriptGenerator = Arc::new(move |spec: &SecondarySpawnSpec| {
+                *captured_id_for_closure.lock().unwrap() = Some(spec.new_secondary_id.clone());
+                Ok(format!(
+                    "#!/bin/sh\n# wrapper for {}\n",
+                    spec.new_secondary_id
+                ))
+            });
 
-    let spawner = SlurmSecondarySpawner::new(
-        Arc::clone(&mgr),
-        Arc::clone(&tunnel),
-        wrap_gen,
-        "/srv/slurm-test/log/run-1".into(),
-    );
+            let spawner = SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+            );
 
-    spawner
-        .spawn(make_spec("sec-replacement-7"))
-        .await
-        .expect("spawn must succeed");
+            spawner
+                .spawn(make_spec("sec-replacement-7"))
+                .await
+                .expect("spawn must succeed");
 
-    // (a) wrapper generator received the new id.
-    assert_eq!(
-        captured_id.lock().unwrap().as_deref(),
-        Some("sec-replacement-7"),
-    );
+            // (a) wrapper generator received the new id.
+            assert_eq!(
+                captured_id.lock().unwrap().as_deref(),
+                Some("sec-replacement-7"),
+            );
 
-    // (b) sbatch was invoked with --job-name=<new_id>.
-    let mgr_locked = mgr.lock().await;
-    let cmds = mgr_locked.gateway().commands();
-    let sbatch = cmds
-        .iter()
-        .find(|c| c.starts_with("sbatch "))
-        .expect("sbatch command must have been issued");
-    assert!(
-        sbatch.contains("--job-name=sec-replacement-7"),
-        "new id must propagate into sbatch --job-name; got: {sbatch}",
-    );
+            // (b) sbatch was invoked with --job-name=<new_id>.
+            let mgr_locked = mgr.lock().await;
+            let cmds = mgr_locked.gateway().commands();
+            let sbatch = cmds
+                .iter()
+                .find(|c| c.starts_with("sbatch "))
+                .expect("sbatch command must have been issued");
+            assert!(
+                sbatch.contains("--job-name=sec-replacement-7"),
+                "new id must propagate into sbatch --job-name; got: {sbatch}",
+            );
 
-    // (c) `--nodes=1` per spec (1-node allocation for one
-    // secondary), matches the brief's "1-node sbatch" contract.
-    assert!(
-        sbatch.contains("--nodes=1"),
-        "respawn must request exactly 1 node; got: {sbatch}",
-    );
-    }).await;
+            // (c) `--nodes=1` per spec (1-node allocation for one
+            // secondary), matches the brief's "1-node sbatch" contract.
+            assert!(
+                sbatch.contains("--nodes=1"),
+                "respawn must request exactly 1 node; got: {sbatch}",
+            );
+        })
+        .await;
 }
 
 /// When sbatch fails (non-zero rc), `spawn()` must surface the
@@ -253,55 +258,57 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
 ///       respawn flow's failure-budget arithmetic correct upstream.
 #[tokio::test]
 async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
-    tokio::task::LocalSet::new().run_until(async {
-    let gw = RecordingGateway {
-        sbatch_fails: true,
-        ..RecordingGateway::default()
-    };
-    let cfg = SlurmConfig {
-        root_folder: "/srv/slurm-test".into(),
-        ..SlurmConfig::default()
-    };
-    let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
-    let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway {
+                sbatch_fails: true,
+                ..RecordingGateway::default()
+            };
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+            let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
 
-    let wrap_gen: WrapperScriptGenerator =
-        Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
+            let wrap_gen: WrapperScriptGenerator =
+                Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
 
-    let spawner = SlurmSecondarySpawner::new(
-        Arc::clone(&mgr),
-        Arc::clone(&tunnel),
-        wrap_gen,
-        "/srv/slurm-test/log/run-1".into(),
-    );
-
-    let err = spawner
-        .spawn(make_spec("sec-replacement-8"))
-        .await
-        .expect_err("sbatch failure must surface");
-    match err {
-        SpawnError::Other(msg) => {
-            assert!(
-                msg.starts_with("sbatch: "),
-                "sbatch failure must be tagged with the 'sbatch:' prefix; got: {msg}",
+            let spawner = SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
             );
-            assert!(
-                msg.contains("simulated failure"),
-                "underlying sbatch stderr must be preserved; got: {msg}",
-            );
-        }
-        other => panic!("expected SpawnError::Other, got {other:?}"),
-    }
 
-    // Tunnel was NOT attempted — the recorder counts every entry,
-    // so zero calls proves the failure short-circuited before the
-    // tunnel step.
-    assert_eq!(
-        tunnel.calls(),
-        0,
-        "tunnel establishment must not run when sbatch failed",
-    );
-    }).await;
+            let err = spawner
+                .spawn(make_spec("sec-replacement-8"))
+                .await
+                .expect_err("sbatch failure must surface");
+            match err {
+                SpawnError::Other(msg) => {
+                    assert!(
+                        msg.starts_with("sbatch: "),
+                        "sbatch failure must be tagged with the 'sbatch:' prefix; got: {msg}",
+                    );
+                    assert!(
+                        msg.contains("simulated failure"),
+                        "underlying sbatch stderr must be preserved; got: {msg}",
+                    );
+                }
+                other => panic!("expected SpawnError::Other, got {other:?}"),
+            }
+
+            // Tunnel was NOT attempted — the recorder counts every entry,
+            // so zero calls proves the failure short-circuited before the
+            // tunnel step.
+            assert_eq!(
+                tunnel.calls(),
+                0,
+                "tunnel establishment must not run when sbatch failed",
+            );
+        })
+        .await;
 }
 
 /// On the happy path, the tunnel port must be invoked AFTER
@@ -322,52 +329,54 @@ async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
 /// branch.
 #[tokio::test]
 async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
-    tokio::task::LocalSet::new().run_until(async {
-    let gw = RecordingGateway::default();
-    let cfg = SlurmConfig {
-        root_folder: "/srv/slurm-test".into(),
-        ..SlurmConfig::default()
-    };
-    let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
-    let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway::default();
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+            let tunnel = Arc::new(RecordingTunnelEstablisher::ok());
 
-    let wrap_gen: WrapperScriptGenerator =
-        Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
+            let wrap_gen: WrapperScriptGenerator =
+                Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
 
-    let spawner = SlurmSecondarySpawner::new(
-        Arc::clone(&mgr),
-        Arc::clone(&tunnel),
-        wrap_gen,
-        "/srv/slurm-test/log/run-1".into(),
-    );
+            let spawner = SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+            );
 
-    spawner
-        .spawn(make_spec("sec-replacement-9"))
-        .await
-        .expect("spawn must succeed");
+            spawner
+                .spawn(make_spec("sec-replacement-9"))
+                .await
+                .expect("spawn must succeed");
 
-    // (a) tunnel-establishment path ran exactly once.
-    assert_eq!(
-        tunnel.calls(),
-        1,
-        "establish_one_tunnel must be invoked exactly once per spawn",
-    );
+            // (a) tunnel-establishment path ran exactly once.
+            assert_eq!(
+                tunnel.calls(),
+                1,
+                "establish_one_tunnel must be invoked exactly once per spawn",
+            );
 
-    // (b) the recorded id is the spec's new_secondary_id.
-    assert_eq!(
-        tunnel.last_id().as_deref(),
-        Some("sec-replacement-9"),
-        "tunnel must target the new secondary's id",
-    );
+            // (b) the recorded id is the spec's new_secondary_id.
+            assert_eq!(
+                tunnel.last_id().as_deref(),
+                Some("sec-replacement-9"),
+                "tunnel must target the new secondary's id",
+            );
 
-    // (c) submission happened (sbatch line in the command log).
-    let mgr_locked = mgr.lock().await;
-    let cmds = mgr_locked.gateway().commands();
-    assert!(
-        cmds.iter().any(|c| c.starts_with("sbatch ")),
-        "submit_job must have issued an sbatch command",
-    );
-    }).await;
+            // (c) submission happened (sbatch line in the command log).
+            let mgr_locked = mgr.lock().await;
+            let cmds = mgr_locked.gateway().commands();
+            assert!(
+                cmds.iter().any(|c| c.starts_with("sbatch ")),
+                "submit_job must have issued an sbatch command",
+            );
+        })
+        .await;
 }
 
 /// Orphan-safety contract: after `spawn()` has submitted sbatch
@@ -390,118 +399,119 @@ async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
 ///    abort sequence preserved the orphan-cleanup invariant.
 #[tokio::test]
 async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() {
-    tokio::task::LocalSet::new().run_until(async {
-        let gw = RecordingGateway::default();
-        let cfg = SlurmConfig {
-            root_folder: "/srv/slurm-test".into(),
-            ..SlurmConfig::default()
-        };
-        let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let gw = RecordingGateway::default();
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
 
-        // Gate the tunnel step so we can observe the post-sbatch /
-        // pre-tunnel window. The sender is dropped by the test at
-        // the right moment to release the inner task.
-        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
-        let tunnel = Arc::new(RecordingTunnelEstablisher::gated(gate_rx));
+            // Gate the tunnel step so we can observe the post-sbatch /
+            // pre-tunnel window. The sender is dropped by the test at
+            // the right moment to release the inner task.
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+            let tunnel = Arc::new(RecordingTunnelEstablisher::gated(gate_rx));
 
-        let wrap_gen: WrapperScriptGenerator = Arc::new(
-            |_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()),
-        );
+            let wrap_gen: WrapperScriptGenerator =
+                Arc::new(|_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()));
 
-        let spawner = Arc::new(SlurmSecondarySpawner::new(
-            Arc::clone(&mgr),
-            Arc::clone(&tunnel),
-            wrap_gen,
-            "/srv/slurm-test/log/run-1".into(),
-        ));
+            let spawner = Arc::new(SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+            ));
 
-        // Mirror the operational-loop shape: the outer `spawn()`
-        // future lives on a separate spawn_local (the JoinSet's
-        // task). When we abort that JoinHandle, only the outer
-        // future is cancelled — the inner spawn_local the
-        // production code spawned during `spawn()` survives.
-        let spawner_for_task = Arc::clone(&spawner);
-        let outer_handle = tokio::task::spawn_local(async move {
-            spawner_for_task.spawn(make_spec("sec-orphan-test")).await
-        });
+            // Mirror the operational-loop shape: the outer `spawn()`
+            // future lives on a separate spawn_local (the JoinSet's
+            // task). When we abort that JoinHandle, only the outer
+            // future is cancelled — the inner spawn_local the
+            // production code spawned during `spawn()` survives.
+            let spawner_for_task = Arc::clone(&spawner);
+            let outer_handle = tokio::task::spawn_local(async move {
+                spawner_for_task.spawn(make_spec("sec-orphan-test")).await
+            });
 
-        // Yield until sbatch has run. The recording gateway logs
-        // every `execute_command`; sbatch is the second one (the
-        // first writes the wrapper script via `printf`). We poll
-        // for the sbatch line rather than sleeping a fixed
-        // duration so the test stays deterministic on slow CI.
-        let sbatch_seen = async {
-            loop {
-                {
-                    let mgr_locked = mgr.lock().await;
-                    if mgr_locked
-                        .gateway()
-                        .commands()
-                        .iter()
-                        .any(|c| c.starts_with("sbatch "))
+            // Yield until sbatch has run. The recording gateway logs
+            // every `execute_command`; sbatch is the second one (the
+            // first writes the wrapper script via `printf`). We poll
+            // for the sbatch line rather than sleeping a fixed
+            // duration so the test stays deterministic on slow CI.
+            let sbatch_seen = async {
+                loop {
                     {
-                        break;
+                        let mgr_locked = mgr.lock().await;
+                        if mgr_locked
+                            .gateway()
+                            .commands()
+                            .iter()
+                            .any(|c| c.starts_with("sbatch "))
+                        {
+                            break;
+                        }
                     }
+                    tokio::task::yield_now().await;
                 }
+            };
+            sbatch_seen.await;
+
+            // Confirm the orphan-safety pre-condition: the job_id is
+            // already on `job_ids` immediately after `submit_job`
+            // returns. This pins the invariant the production code
+            // relies on for the post-abort scancel path.
+            {
+                let mgr_locked = mgr.lock().await;
+                assert_eq!(
+                    mgr_locked.job_ids(),
+                    &["67890".to_string()],
+                    "submit_job must push the id onto job_ids before \
+                 yielding control back to the spawner",
+                );
+            }
+
+            // Abort the outer future (mirrors `JoinSet::shutdown`).
+            // The inner spawn_local task is parented to the
+            // surrounding LocalSet, NOT to this handle, so it keeps
+            // running.
+            outer_handle.abort();
+            // Yield so the abort actually takes effect; the inner
+            // task is still pending on the gate.
+            tokio::task::yield_now().await;
+
+            // Release the gate so the inner task can finish its
+            // tunnel step. With the production implementation, the
+            // tunnel succeeds, the inner task tries to send on the
+            // oneshot (the rx is gone — the outer future was
+            // aborted), and the `let _ =` swallows the error.
+            let _ = gate_tx.send(());
+
+            // Yield a few times so the inner task drains. We can't
+            // join on it directly (it's a detached spawn_local), but
+            // a handful of yields are enough for the recorder's
+            // `calls` counter to settle.
+            for _ in 0..16 {
                 tokio::task::yield_now().await;
             }
-        };
-        sbatch_seen.await;
 
-        // Confirm the orphan-safety pre-condition: the job_id is
-        // already on `job_ids` immediately after `submit_job`
-        // returns. This pins the invariant the production code
-        // relies on for the post-abort scancel path.
-        {
+            // The orphan-safety contract: the id is still on
+            // `job_ids` so the coordinator's `cleanup()` can scancel
+            // it on drop. Plus: the tunnel establishment ran (the
+            // inner task wasn't aborted along with the outer).
             let mgr_locked = mgr.lock().await;
             assert_eq!(
                 mgr_locked.job_ids(),
                 &["67890".to_string()],
-                "submit_job must push the id onto job_ids before \
-                 yielding control back to the spawner",
-            );
-        }
-
-        // Abort the outer future (mirrors `JoinSet::shutdown`).
-        // The inner spawn_local task is parented to the
-        // surrounding LocalSet, NOT to this handle, so it keeps
-        // running.
-        outer_handle.abort();
-        // Yield so the abort actually takes effect; the inner
-        // task is still pending on the gate.
-        tokio::task::yield_now().await;
-
-        // Release the gate so the inner task can finish its
-        // tunnel step. With the production implementation, the
-        // tunnel succeeds, the inner task tries to send on the
-        // oneshot (the rx is gone — the outer future was
-        // aborted), and the `let _ =` swallows the error.
-        let _ = gate_tx.send(());
-
-        // Yield a few times so the inner task drains. We can't
-        // join on it directly (it's a detached spawn_local), but
-        // a handful of yields are enough for the recorder's
-        // `calls` counter to settle.
-        for _ in 0..16 {
-            tokio::task::yield_now().await;
-        }
-
-        // The orphan-safety contract: the id is still on
-        // `job_ids` so the coordinator's `cleanup()` can scancel
-        // it on drop. Plus: the tunnel establishment ran (the
-        // inner task wasn't aborted along with the outer).
-        let mgr_locked = mgr.lock().await;
-        assert_eq!(
-            mgr_locked.job_ids(),
-            &["67890".to_string()],
-            "post-abort, job_id must remain on job_ids so \
+                "post-abort, job_id must remain on job_ids so \
              cleanup() can scancel the orphan",
-        );
-        assert_eq!(
-            tunnel.calls(),
-            1,
-            "the inner task must keep running after outer abort \
+            );
+            assert_eq!(
+                tunnel.calls(),
+                1,
+                "the inner task must keep running after outer abort \
              (proves the spawn_local detach)",
-        );
-    }).await;
+            );
+        })
+        .await;
 }

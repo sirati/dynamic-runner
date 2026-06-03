@@ -61,13 +61,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// duplicates — on the abort path the run never seeds). On the
     /// abort path the pool is left untouched and the caller short-
     /// circuits at the abort gate.
-    pub(crate) fn ingest_initial_batch(
-        &mut self,
-        batch: Vec<TaskInfo<I>>,
-    ) -> Result<(), RunError> {
-        let partition = self
-            .pool()
-            .partition_ingest(batch);
+    pub(crate) fn ingest_initial_batch(&mut self, batch: Vec<TaskInfo<I>>) -> Result<(), RunError> {
+        let partition = self.pool().partition_ingest(batch);
 
         // #3a: a duplicate in the INITIAL batch aborts the whole run.
         // Discriminator is structural: this runs before
@@ -118,9 +113,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // target) and counted in `total_tasks` (so the operational
         // loop's exit denominator accounts for them — they terminate as
         // InvalidTask, not as stranded).
-        let mut all: Vec<TaskInfo<I>> = Vec::with_capacity(
-            valid.len() + partition.invalid_deps.len(),
-        );
+        let mut all: Vec<TaskInfo<I>> =
+            Vec::with_capacity(valid.len() + partition.invalid_deps.len());
         all.extend(valid.iter().cloned());
         for (task, reason) in &partition.invalid_deps {
             all.push(task.clone());
@@ -130,11 +124,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.all_binaries = all;
         self.total_tasks = self.all_binaries.len();
 
-        self.pool_mut()
-            .extend(valid)
-            .map_err(|e| RunError::Other(format!(
-                "PendingPool::extend rejected task graph: {e}"
-            )))?;
+        self.pool_mut().extend(valid).map_err(|e| {
+            RunError::Other(format!("PendingPool::extend rejected task graph: {e}"))
+        })?;
         Ok(())
     }
 
@@ -154,11 +146,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // abort inherits the identical delivery semantics — the CRDT
         // `run_aborted` flag lands on every connected secondary and its
         // `process_tasks` loop returns `RunOutcome::Aborted`.
-        self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::RunAborted {
-                reason: reason.clone(),
-            },
-        ])
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunAborted {
+            reason: reason.clone(),
+        }])
         .await;
         // Brief settle window so the broadcast lands before the
         // dispatcher tears down its transport — mirrors the
@@ -233,9 +223,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .filter_map(|(hash, state)| match state {
                 TaskState::Pending { task }
                 | TaskState::InFlight { task, .. }
-                | TaskState::Blocked { task, .. } => {
-                    Some((hash.clone(), task.clone()))
-                }
+                | TaskState::Blocked { task, .. } => Some((hash.clone(), task.clone())),
                 TaskState::Completed { .. }
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }

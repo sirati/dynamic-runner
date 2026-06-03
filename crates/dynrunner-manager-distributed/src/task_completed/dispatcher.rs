@@ -127,8 +127,7 @@ mod tests {
     #[tokio::test]
     async fn task_completed_dispatcher_drains_events_to_rust_listener() {
         let (tx, rx) = unbounded_channel();
-        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let listeners: Vec<Box<dyn TaskCompletedListener>> = vec![Box::new(CapturingListener {
             captured: Arc::clone(&captured),
         })];
@@ -175,8 +174,7 @@ mod tests {
     #[tokio::test]
     async fn task_completed_dispatcher_isolates_python_panic() {
         let (tx, rx) = unbounded_channel();
-        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<TaskCompletedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let listeners: Vec<Box<dyn TaskCompletedListener>> = vec![
             Box::new(PanickingListener),
             Box::new(CapturingListener {

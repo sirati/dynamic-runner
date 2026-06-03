@@ -2,12 +2,9 @@ use std::net::SocketAddr;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
-    tungstenite::Message,
-};
 use futures_util::{SinkExt, StreamExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 
 /// A WSS (WebSocket Secure) connection that can send/receive distributed messages.
 ///
@@ -43,13 +40,11 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for WssConnection {
     async fn recv(&mut self) -> Option<DistributedMessage<I>> {
         loop {
             match self.ws.next().await {
-                Some(Ok(Message::Binary(data))) => {
-                    match codec::decode_frame(&data) {
-                        Ok(Some((msg, _))) => return Some(msg),
-                        Ok(None) => continue,
-                        Err(_) => return None,
-                    }
-                }
+                Some(Ok(Message::Binary(data))) => match codec::decode_frame(&data) {
+                    Ok(Some((msg, _))) => return Some(msg),
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                },
                 Some(Ok(Message::Close(_))) | None => return None,
                 Some(Ok(_)) => continue, // skip ping/pong/text
                 Some(Err(_)) => return None,
@@ -67,9 +62,7 @@ pub struct WssListener {
 impl WssListener {
     /// Bind a WSS server on the given address.
     pub async fn bind(addr: SocketAddr) -> Result<Self, String> {
-        let tcp_listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| e.to_string())?;
+        let tcp_listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
         let local_addr = tcp_listener.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%local_addr, "WSS listener bound");
         Ok(Self {
@@ -163,9 +156,7 @@ mod tests {
         let (server_msg, echoed) = tokio::join!(server_task, client_task);
 
         match &echoed {
-            DistributedMessage::Keepalive {
-                active_workers, ..
-            } => {
+            DistributedMessage::Keepalive { active_workers, .. } => {
                 assert_eq!(*active_workers, 4);
             }
             _ => panic!("expected Keepalive"),

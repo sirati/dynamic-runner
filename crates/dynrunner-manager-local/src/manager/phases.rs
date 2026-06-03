@@ -1,25 +1,21 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    gather_predecessor_outputs, ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
+    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId, gather_predecessor_outputs,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler,
-};
-
+use dynrunner_scheduler_api::{AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler};
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     pub(super) async fn run_initial_assignments(&mut self, factory: &mut impl WorkerFactory<M>) {
         tracing::info!("starting initial assignment phase");
 
         loop {
-            let all_assigned = self
-                .pool.workers
-                .iter()
-                .all(|w| w.has_initial_assignment);
+            let all_assigned = self.pool.workers.iter().all(|w| w.has_initial_assignment);
             if all_assigned {
                 break;
             }
@@ -34,25 +30,32 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
 
         let opp_mem: u64 = self
-            .pool.workers
+            .pool
+            .workers
             .iter()
             .filter(|w| w.opportunistic && w.current_binary.is_some())
             .map(|w| w.estimated_resources.get(&ResourceKind::memory()))
             .sum();
         let non_opp_mem: u64 = self
-            .pool.workers
+            .pool
+            .workers
             .iter()
             .filter(|w| !w.opportunistic && w.current_binary.is_some())
             .map(|w| w.estimated_resources.get(&ResourceKind::memory()))
             .sum();
         tracing::info!(
-            total_assigned_mb = self.total_assigned_resources.get(&ResourceKind::memory()) / (1024 * 1024),
+            total_assigned_mb =
+                self.total_assigned_resources.get(&ResourceKind::memory()) / (1024 * 1024),
             non_opportunistic_mb = non_opp_mem / (1024 * 1024),
             opportunistic_mb = opp_mem / (1024 * 1024),
             "initial assignments complete"
         );
     }
-    pub(super) async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
+    pub(super) async fn try_assign_initial(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let max = self.max_resources();
         let view = self.pool_ref().view_for_worker(worker_id, None);
@@ -74,7 +77,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let binary = self.pool_mut().take_from_view(view, binary_index);
                 self.total_assigned_resources.add(&estimated_usage);
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
-                let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = binary
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
 
                 // Per-type subprocess dispatch: see worker_loop's
                 // `try_assign_normal` for the full rationale. Initial
@@ -160,11 +167,16 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     pub(super) async fn run_main_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
         tracing::info!("starting main phase");
 
-        let mut active_workers: HashSet<WorkerId> =
-            (0..self.config.num_workers).collect();
+        let mut active_workers: HashSet<WorkerId> = (0..self.config.num_workers).collect();
 
-        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::MainPhase, factory)
-            .await;
+        self.process_worker_loop(
+            &mut active_workers,
+            false,
+            true,
+            ProcessingPhase::MainPhase,
+            factory,
+        )
+        .await;
 
         // Move any items still queued in the pool into `unassigned_tasks`.
         // These are tasks the scheduler couldn't fit during the main phase
@@ -221,11 +233,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // invalid_tasks remain) — stop the passes.
                 break;
             }
-            tracing::info!(
-                pass = pass + 1,
-                count = retry_tasks.len(),
-                "retry pass"
-            );
+            tracing::info!(pass = pass + 1, count = retry_tasks.len(), "retry pass");
             for task in retry_tasks {
                 // Re-inject preserves in-flight counts (these tasks were
                 // never `on_item_finished`'d) and reactivates the phase
@@ -266,13 +274,19 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
     // ── Phase 4: Resource Pressure Phase ──
 
-    pub(super) async fn run_resource_pressure_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
+    pub(super) async fn run_resource_pressure_phase(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         if self.resource_pressure_tasks.is_empty() {
             tracing::info!("resource pressure phase skipped - no pressure tasks");
             return;
         }
 
-        tracing::info!(count = self.resource_pressure_tasks.len(), "starting resource pressure phase");
+        tracing::info!(
+            count = self.resource_pressure_tasks.len(),
+            "starting resource pressure phase"
+        );
 
         self.in_pressure_phase = true;
 
@@ -292,8 +306,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let mut active_workers: HashSet<WorkerId> = HashSet::new();
         active_workers.insert(0);
 
-        self.process_worker_loop(&mut active_workers, false, false, ProcessingPhase::ResourcePressurePhase, factory)
-            .await;
+        self.process_worker_loop(
+            &mut active_workers,
+            false,
+            false,
+            ProcessingPhase::ResourcePressurePhase,
+            factory,
+        )
+        .await;
 
         self.in_pressure_phase = false;
 
@@ -320,12 +340,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // Sort by size (smallest first) matching Python behavior
         self.unassigned_tasks.sort_by_key(|b| b.size);
 
-        let low_mem_threshold = self.config.low_resource_thresholds.get(&ResourceKind::memory());
+        let low_mem_threshold = self
+            .config
+            .low_resource_thresholds
+            .get(&ResourceKind::memory());
         let mut kept = Vec::new();
         for task in self.unassigned_tasks.drain(..) {
             let free_mem = Self::get_free_system_memory();
             if free_mem > 0 && free_mem < low_mem_threshold {
-                let name = task.path.file_name()
+                let name = task
+                    .path
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 tracing::warn!(
@@ -387,7 +412,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             for binary in remaining {
                 let estimated = self.estimator.estimate(&binary);
                 let est_mb = estimated.get(&ResourceKind::memory()) / (1024 * 1024);
-                let name = binary.path.file_name()
+                let name = binary
+                    .path
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 tracing::error!(

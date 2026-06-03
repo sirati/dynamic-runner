@@ -9,11 +9,9 @@ use dynrunner_transport_channel::ChannelPeerTransport;
 use tokio::sync::oneshot;
 
 use crate::cluster_state::TaskState;
-use crate::primary::command_channel::{
-    handle_primary_command, PrimaryCommand,
-};
+use crate::primary::command_channel::{PrimaryCommand, handle_primary_command};
 use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, RecordingPeer, TestId,
+    FixedEstimator, RecordingPeer, TestId, make_binary, setup_test,
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
@@ -76,16 +74,12 @@ fn install_pool_for_phase(
 ) {
     let mut phase_set = std::collections::HashSet::new();
     phase_set.insert(binary.phase_id.clone());
-    coordinator.pending = Some(
-        PendingPool::<TestId>::new(phase_set, HashMap::new())
-            .expect("pool init"),
-    );
+    coordinator.pending =
+        Some(PendingPool::<TestId>::new(phase_set, HashMap::new()).expect("pool init"));
     coordinator
         .phase_completed
         .insert(binary.phase_id.clone(), 0);
-    coordinator
-        .phase_failed
-        .insert(binary.phase_id.clone(), 0);
+    coordinator.phase_failed.insert(binary.phase_id.clone(), 0);
 }
 
 /// Build a `PrimaryCoordinator` whose SINGLE transport is a
@@ -109,12 +103,7 @@ fn make_recording_coordinator(
     keepalive_interval: Duration,
     mesh_ready_timeout: Duration,
 ) -> (
-    PrimaryCoordinator<
-        RecordingPeer<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    PrimaryCoordinator<RecordingPeer<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>,
     std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
     Vec<(
         String,
@@ -172,14 +161,14 @@ fn seed_secondary(
 ) {
     coordinator.secondaries.insert(
         secondary_id.into(),
-        SecondaryConnectionState::AwaitingWelcome(SecondaryConnection::new(
-            secondary_id.into(),
-        )),
+        SecondaryConnectionState::AwaitingWelcome(SecondaryConnection::new(secondary_id.into())),
     );
 }
 
 /// Count the `Keepalive` messages in a recorded broadcast log.
-fn count_keepalives(log: &std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>) -> usize {
+fn count_keepalives(
+    log: &std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
+) -> usize {
     log.borrow()
         .iter()
         .filter(|m| matches!(m, DistributedMessage::Keepalive { .. }))
@@ -199,11 +188,8 @@ async fn activate_local_primary_emits_a_keepalive() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut coordinator, log, _ends) = make_recording_coordinator(
-                1,
-                Duration::from_millis(100),
-                Duration::from_secs(1),
-            );
+            let (mut coordinator, log, _ends) =
+                make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
             seed_secondary(&mut coordinator, "sec-0");
 
             assert_eq!(
@@ -234,7 +220,7 @@ async fn activate_local_primary_emits_a_keepalive() {
 /// `--important-stdio-only`.
 #[tokio::test(flavor = "current_thread")]
 async fn activate_local_primary_emits_initial_setup_done_important_event() {
-    use crate::test_capture::{important_only, ImportantCapture};
+    use crate::test_capture::{ImportantCapture, important_only};
     use tracing::subscriber::set_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
@@ -242,11 +228,8 @@ async fn activate_local_primary_emits_initial_setup_done_important_event() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut coordinator, _log, _ends) = make_recording_coordinator(
-                1,
-                Duration::from_millis(100),
-                Duration::from_secs(1),
-            );
+            let (mut coordinator, _log, _ends) =
+                make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
             seed_secondary(&mut coordinator, "sec-0");
 
             let capture = ImportantCapture::default();
@@ -267,10 +250,7 @@ async fn activate_local_primary_emits_initial_setup_done_important_event() {
                 1,
                 "exactly one initial-setup-done important event: {msgs:?}"
             );
-            assert!(
-                msgs[0].contains("activated as sole authority"),
-                "{msgs:?}"
-            );
+            assert!(msgs[0].contains("activated as sole authority"), "{msgs:?}");
         })
         .await;
 }
@@ -304,9 +284,7 @@ async fn wait_for_mesh_ready_ticks_keepalive() {
             // `sec-0` never reports MeshReady → the wait blocks on its
             // select! until the mesh-ready deadline elapses, ticking the
             // pre-operational keepalive arm in the meantime.
-            let mut no_cmd_rx: Option<
-                tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>,
-            > = None;
+            let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
             coordinator
                 .wait_for_mesh_ready(&mut no_cmd_rx)
                 .await
@@ -338,67 +316,67 @@ async fn wait_for_mesh_ready_ticks_keepalive() {
 #[tokio::test(flavor = "current_thread")]
 async fn retry_bucket_skips_unfulfillable_failures() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let mut coordinator = make_coordinator(/* retry_max_passes = */ 3);
+    local
+        .run_until(async {
+            let mut coordinator = make_coordinator(/* retry_max_passes = */ 3);
 
-        // Seed two binaries in the same phase: one Unfulfillable, one
-        // Recoverable. `all_binaries` is the lookup table the bucket
-        // primitive uses to map hashes back to dispatchable
-        // `TaskInfo`s.
-        let unfulfillable_bin = make_binary("operator-only", 50);
-        let recoverable_bin = make_binary("retriable", 40);
-        let unfulfillable_hash = compute_task_hash(&unfulfillable_bin);
-        let recoverable_hash = compute_task_hash(&recoverable_bin);
-        coordinator.all_binaries =
-            vec![unfulfillable_bin.clone(), recoverable_bin.clone()];
+            // Seed two binaries in the same phase: one Unfulfillable, one
+            // Recoverable. `all_binaries` is the lookup table the bucket
+            // primitive uses to map hashes back to dispatchable
+            // `TaskInfo`s.
+            let unfulfillable_bin = make_binary("operator-only", 50);
+            let recoverable_bin = make_binary("retriable", 40);
+            let unfulfillable_hash = compute_task_hash(&unfulfillable_bin);
+            let recoverable_hash = compute_task_hash(&recoverable_bin);
+            coordinator.all_binaries = vec![unfulfillable_bin.clone(), recoverable_bin.clone()];
 
-        install_pool_for_phase(&mut coordinator, &unfulfillable_bin);
+            install_pool_for_phase(&mut coordinator, &unfulfillable_bin);
 
-        coordinator.failed_tasks.insert(
-            unfulfillable_hash.clone(),
-            ErrorType::Unfulfillable {
-                reason: "missing toolchain".to_string().into(),
-            },
-        );
-        coordinator
-            .failed_tasks
-            .insert(recoverable_hash.clone(), ErrorType::Recoverable);
+            coordinator.failed_tasks.insert(
+                unfulfillable_hash.clone(),
+                ErrorType::Unfulfillable {
+                    reason: "missing toolchain".to_string().into(),
+                },
+            );
+            coordinator
+                .failed_tasks
+                .insert(recoverable_hash.clone(), ErrorType::Recoverable);
 
-        // Drive the Recoverable bucket directly. The bucket now EMITS a
-        // `TasksAdded` instead of dispatching inline; with no worker-
-        // management receiver installed the emit is a silent no-op, but
-        // the partition + reinject step happens unconditionally.
-        let phase = unfulfillable_bin.phase_id.clone();
-        let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
-            None;
-        let reinjected = coordinator
-            .try_run_phase_retry_bucket(
-                &phase,
-                crate::primary::retry_bucket::BucketKind::Recoverable,
-                &mut no_cmd_rx,
-            )
-            .await
-            .expect("retry bucket runs cleanly");
-        assert!(reinjected, "Recoverable failure should reinject");
+            // Drive the Recoverable bucket directly. The bucket now EMITS a
+            // `TasksAdded` instead of dispatching inline; with no worker-
+            // management receiver installed the emit is a silent no-op, but
+            // the partition + reinject step happens unconditionally.
+            let phase = unfulfillable_bin.phase_id.clone();
+            let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
+            let reinjected = coordinator
+                .try_run_phase_retry_bucket(
+                    &phase,
+                    crate::primary::retry_bucket::BucketKind::Recoverable,
+                    &mut no_cmd_rx,
+                )
+                .await
+                .expect("retry bucket runs cleanly");
+            assert!(reinjected, "Recoverable failure should reinject");
 
-        // Retriable entry was drained from the failed-set into the
-        // pool; the Unfulfillable entry stayed because the
-        // Recoverable bucket's predicate doesn't match it.
-        assert!(
-            !coordinator.failed_tasks.contains_key(&recoverable_hash),
-            "retry bucket should drain Recoverable entries from \
+            // Retriable entry was drained from the failed-set into the
+            // pool; the Unfulfillable entry stayed because the
+            // Recoverable bucket's predicate doesn't match it.
+            assert!(
+                !coordinator.failed_tasks.contains_key(&recoverable_hash),
+                "retry bucket should drain Recoverable entries from \
              failed_tasks before reinjecting"
-        );
-        match coordinator.failed_tasks.get(&unfulfillable_hash) {
-            Some(ErrorType::Unfulfillable { reason }) => {
-                assert_eq!(reason.as_ref(), "missing toolchain");
-            }
-            other => panic!(
-                "Unfulfillable entry must remain in failed_tasks; \
+            );
+            match coordinator.failed_tasks.get(&unfulfillable_hash) {
+                Some(ErrorType::Unfulfillable { reason }) => {
+                    assert_eq!(reason.as_ref(), "missing toolchain");
+                }
+                other => panic!(
+                    "Unfulfillable entry must remain in failed_tasks; \
                  got {other:?}"
-            ),
-        }
-    }).await;
+                ),
+            }
+        })
+        .await;
 }
 
 /// Pin the cleanup invariant ReinjectTask depends on: the local
@@ -412,68 +390,70 @@ async fn retry_bucket_skips_unfulfillable_failures() {
 #[tokio::test(flavor = "current_thread")]
 async fn reinject_clears_failed_tasks_entry_for_hash() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let mut coordinator = make_coordinator(/* retry_max_passes = */ 0);
+    local
+        .run_until(async {
+            let mut coordinator = make_coordinator(/* retry_max_passes = */ 0);
 
-        let binary = make_binary("op-resolvable", 50);
-        let hash = compute_task_hash(&binary);
-        install_pool_for_phase(&mut coordinator, &binary);
-        coordinator.all_binaries = vec![binary.clone()];
+            let binary = make_binary("op-resolvable", 50);
+            let hash = compute_task_hash(&binary);
+            install_pool_for_phase(&mut coordinator, &binary);
+            coordinator.all_binaries = vec![binary.clone()];
 
-        // Pre-state: worker reported Unfulfillable. The CRDT
-        // lands in `TaskState::Unfulfillable`; the local
-        // `failed_tasks` mirror records the same kind.
-        coordinator.cluster_state.apply(
-            dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
-                hash: hash.clone(),
-                task: binary.clone(),
-            },
-        );
-        coordinator.cluster_state.apply(
-            dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
-                hash: hash.clone(),
-                kind: ErrorType::Unfulfillable {
+            // Pre-state: worker reported Unfulfillable. The CRDT
+            // lands in `TaskState::Unfulfillable`; the local
+            // `failed_tasks` mirror records the same kind.
+            coordinator.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: binary.clone(),
+                },
+            );
+            coordinator.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    hash: hash.clone(),
+                    kind: ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    error: "unfulfillable".into(),
+                },
+            );
+            coordinator.failed_tasks.insert(
+                hash.clone(),
+                ErrorType::Unfulfillable {
                     reason: "missing toolchain".to_string().into(),
                 },
-                error: "unfulfillable".into(),
-            },
-        );
-        coordinator.failed_tasks.insert(
-            hash.clone(),
-            ErrorType::Unfulfillable {
-                reason: "missing toolchain".to_string().into(),
-            },
-        );
+            );
 
-        // Operator dispatches the reinject command.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        handle_primary_command(
-            &mut coordinator,
-            PrimaryCommand::ReinjectTask {
-                hash: hash.clone(),
-                reply: reply_tx,
-            },
-            &mut None,
-        )
+            // Operator dispatches the reinject command.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::ReinjectTask {
+                    hash: hash.clone(),
+                    reply: reply_tx,
+                },
+                &mut None,
+            )
+            .await;
+            assert!(
+                reply_rx.await.unwrap().is_ok(),
+                "reinject should accept Unfulfillable entry"
+            );
+
+            // Post-state: the local `failed_tasks` mirror no longer
+            // claims this hash failed — the operational loop's
+            // exit-counter sees the entry as in-flight / pending
+            // again, matching the CRDT's transition to Pending.
+            assert!(
+                !coordinator.failed_tasks.contains_key(&hash),
+                "reinject must clear failed_tasks[hash]"
+            );
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&hash),
+                Some(TaskState::Pending { .. })
+            ));
+        })
         .await;
-        assert!(
-            reply_rx.await.unwrap().is_ok(),
-            "reinject should accept Unfulfillable entry"
-        );
-
-        // Post-state: the local `failed_tasks` mirror no longer
-        // claims this hash failed — the operational loop's
-        // exit-counter sees the entry as in-flight / pending
-        // again, matching the CRDT's transition to Pending.
-        assert!(
-            !coordinator.failed_tasks.contains_key(&hash),
-            "reinject must clear failed_tasks[hash]"
-        );
-        assert!(matches!(
-            coordinator.cluster_state.task_state(&hash),
-            Some(TaskState::Pending { .. })
-        ));
-    }).await;
 }
 
 /// Full round-trip: Unfulfillable failure → operator reinjects →
@@ -488,89 +468,90 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
 #[tokio::test(flavor = "current_thread")]
 async fn unfulfillable_reinjected_task_can_use_retry_pass() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let mut coordinator = make_coordinator(/* retry_max_passes = */ 2);
+    local
+        .run_until(async {
+            let mut coordinator = make_coordinator(/* retry_max_passes = */ 2);
 
-        let binary = make_binary("round-trip", 50);
-        let hash = compute_task_hash(&binary);
-        install_pool_for_phase(&mut coordinator, &binary);
-        coordinator.all_binaries = vec![binary.clone()];
+            let binary = make_binary("round-trip", 50);
+            let hash = compute_task_hash(&binary);
+            install_pool_for_phase(&mut coordinator, &binary);
+            coordinator.all_binaries = vec![binary.clone()];
 
-        // Step 1: Unfulfillable failure observed.
-        coordinator.cluster_state.apply(
-            dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
-                hash: hash.clone(),
-                task: binary.clone(),
-            },
-        );
-        coordinator.cluster_state.apply(
-            dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
-                hash: hash.clone(),
-                kind: ErrorType::Unfulfillable {
+            // Step 1: Unfulfillable failure observed.
+            coordinator.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: binary.clone(),
+                },
+            );
+            coordinator.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    hash: hash.clone(),
+                    kind: ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    error: "unfulfillable".into(),
+                },
+            );
+            coordinator.failed_tasks.insert(
+                hash.clone(),
+                ErrorType::Unfulfillable {
                     reason: "missing toolchain".to_string().into(),
                 },
-                error: "unfulfillable".into(),
-            },
-        );
-        coordinator.failed_tasks.insert(
-            hash.clone(),
-            ErrorType::Unfulfillable {
-                reason: "missing toolchain".to_string().into(),
-            },
-        );
+            );
 
-        // Step 2: operator reinjects.
-        let (reply_tx, reply_rx) = oneshot::channel();
-        handle_primary_command(
-            &mut coordinator,
-            PrimaryCommand::ReinjectTask {
-                hash: hash.clone(),
-                reply: reply_tx,
-            },
-            &mut None,
-        )
-        .await;
-        assert!(reply_rx.await.unwrap().is_ok());
-        assert!(!coordinator.failed_tasks.contains_key(&hash));
-
-        // Step 3: task re-runs and fails Recoverably this time
-        // (the operator's resource provisioning worked, but the
-        // re-attempted execution hit a generic transient error).
-        // The CRDT-side state machine takes Pending → Failed{
-        // Recoverable } via the Pending arm of TaskFailed.
-        coordinator.cluster_state.apply(
-            dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
-                hash: hash.clone(),
-                kind: ErrorType::Recoverable,
-                error: "transient".into(),
-            },
-        );
-        coordinator
-            .failed_tasks
-            .insert(hash.clone(), ErrorType::Recoverable);
-
-        // Step 4: per-phase Recoverable bucket drains the entry
-        // into the pool. The fresh Recoverable kind — not the
-        // carried Unfulfillable — is what determines bucket
-        // eligibility.
-        let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
-            None;
-        let reinjected = coordinator
-            .try_run_phase_retry_bucket(
-                &binary.phase_id,
-                crate::primary::retry_bucket::BucketKind::Recoverable,
-                &mut no_cmd_rx,
+            // Step 2: operator reinjects.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::ReinjectTask {
+                    hash: hash.clone(),
+                    reply: reply_tx,
+                },
+                &mut None,
             )
-            .await
-            .expect("retry bucket runs cleanly");
-        assert!(reinjected, "Recoverable failure should reinject");
+            .await;
+            assert!(reply_rx.await.unwrap().is_ok());
+            assert!(!coordinator.failed_tasks.contains_key(&hash));
 
-        // The hash was drained (no zero-worker re-failure can
-        // re-populate it), confirming the retry bucket picked it up.
-        assert!(
-            !coordinator.failed_tasks.contains_key(&hash),
-            "Recoverable failure on a previously-reinjected hash \
+            // Step 3: task re-runs and fails Recoverably this time
+            // (the operator's resource provisioning worked, but the
+            // re-attempted execution hit a generic transient error).
+            // The CRDT-side state machine takes Pending → Failed{
+            // Recoverable } via the Pending arm of TaskFailed.
+            coordinator.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    hash: hash.clone(),
+                    kind: ErrorType::Recoverable,
+                    error: "transient".into(),
+                },
+            );
+            coordinator
+                .failed_tasks
+                .insert(hash.clone(), ErrorType::Recoverable);
+
+            // Step 4: per-phase Recoverable bucket drains the entry
+            // into the pool. The fresh Recoverable kind — not the
+            // carried Unfulfillable — is what determines bucket
+            // eligibility.
+            let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
+            let reinjected = coordinator
+                .try_run_phase_retry_bucket(
+                    &binary.phase_id,
+                    crate::primary::retry_bucket::BucketKind::Recoverable,
+                    &mut no_cmd_rx,
+                )
+                .await
+                .expect("retry bucket runs cleanly");
+            assert!(reinjected, "Recoverable failure should reinject");
+
+            // The hash was drained (no zero-worker re-failure can
+            // re-populate it), confirming the retry bucket picked it up.
+            assert!(
+                !coordinator.failed_tasks.contains_key(&hash),
+                "Recoverable failure on a previously-reinjected hash \
              must still be retry-bucket-eligible"
-        );
-    }).await;
+            );
+        })
+        .await;
 }

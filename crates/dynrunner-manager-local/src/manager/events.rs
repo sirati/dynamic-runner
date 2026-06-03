@@ -2,14 +2,12 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{
-    TaskInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskInfo, TaskResult, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{
-    ResourceEstimator, ProcessingPhase, Scheduler,
-};
+use dynrunner_scheduler_api::{ProcessingPhase, ResourceEstimator, Scheduler};
 
-use crate::oom::{classify_disconnect, OomWatcher};
+use crate::oom::{OomWatcher, classify_disconnect};
 use crate::worker::WorkerEvent;
 
 use super::{LocalManager, WorkerFactory};
@@ -22,7 +20,9 @@ use super::{LocalManager, WorkerFactory};
 /// kernel-OOM that already killed a different worker.
 const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     // Same justification as `handle_task_completed` below — every
     // argument either destructures one variant of `WorkerEvent` or
     // threads loop-scoped state (active_workers / phase / factory /
@@ -48,7 +48,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 estimated_resources,
             } => {
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 if result.success
@@ -136,7 +138,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
 
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 tracing::warn!(
@@ -193,7 +197,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
                 // Restart worker and keep it in the active set (matching Python's
                 // _handle_monitor_result which restarts on NonRecoverable errors)
-                tracing::info!(worker_id, "restarting worker after disconnect/non-recoverable error");
+                tracing::info!(
+                    worker_id,
+                    "restarting worker after disconnect/non-recoverable error"
+                );
                 self.restart_worker(worker_id, factory).await;
                 self.pending_worker_assignments.insert(worker_id);
             }
@@ -238,7 +245,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     ) {
         // Log resource usage before recording result (capture actual before clearing)
         let actual_usage = self.pool.workers[worker_id as usize].actual_usage.clone();
-        self.log_resource_usage(binary.as_ref(), &estimated_resources, &actual_usage, !result.success);
+        self.log_resource_usage(
+            binary.as_ref(),
+            &estimated_resources,
+            &actual_usage,
+            !result.success,
+        );
 
         // Release estimated resources from total (only for non-opportunistic workers
         // that received an initial assignment, matching Python behavior)
@@ -285,7 +297,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
 
         // If still no task and no pending, remove from active
-        if self.pool.workers[worker_id as usize].current_binary.is_none()
+        if self.pool.workers[worker_id as usize]
+            .current_binary
+            .is_none()
             && self.pool_ref().is_empty()
         {
             if allow_stop {
@@ -337,10 +351,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         self.resource_pressure_tasks.push(FailedTask {
                             binary: binary.clone(),
                             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
-                            error_message: result
-                                .error_message
-                                .clone()
-                                .unwrap_or_default(),
+                            error_message: result.error_message.clone().unwrap_or_default(),
                             retry_count: 0,
                         });
                     }
@@ -349,14 +360,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     if let Some(binary) = binary {
                         self.failed_tasks.push(FailedTask {
                             binary: binary.clone(),
-                            error_type: result
-                                .error_type
-                                .clone()
-                                .unwrap_or(ErrorType::Recoverable),
-                            error_message: result
-                                .error_message
-                                .clone()
-                                .unwrap_or_default(),
+                            error_type: result.error_type.clone().unwrap_or(ErrorType::Recoverable),
+                            error_message: result.error_message.clone().unwrap_or_default(),
                             retry_count: 0,
                         });
                     }

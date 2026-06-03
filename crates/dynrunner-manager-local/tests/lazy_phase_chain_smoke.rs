@@ -28,14 +28,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use dynrunner_core::{
-    AffinityId, MessageReceiver, MessageSender, PhaseId, PrimaryCommand, ResourceKind,
-    ResourceMap, SoftPreferredSecondaries, TaskInfo, TypeId, WorkerId,
+    AffinityId, MessageReceiver, MessageSender, PhaseId, PrimaryCommand, ResourceKind, ResourceMap,
+    SoftPreferredSecondaries, TaskInfo, TypeId, WorkerId,
 };
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelRunnerEnd, channel_pair};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -105,10 +105,7 @@ fn test_config(num_workers: u32) -> LocalManagerConfig {
         print_pid: false,
         memuse_log_path: None,
         stage_timeouts: HashMap::new(),
-        low_resource_thresholds: ResourceMap::from([(
-            ResourceKind::memory(),
-            300 * 1024 * 1024,
-        )]),
+        low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
         resource_check_interval: std::time::Duration::from_millis(100),
         phase_status_log_intervals: Vec::new(),
         log_oom_watcher: false,
@@ -123,11 +120,8 @@ async fn on_phase_end_spawn_tasks_runs_post_phase_via_outer_loop() {
     local
         .run_until(async {
             let config = test_config(1);
-            let mut manager: LocalManager<ChannelManagerEnd, _, _, TestId> = LocalManager::new(
-                config,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator,
-            );
+            let mut manager: LocalManager<ChannelManagerEnd, _, _, TestId> =
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator);
 
             // Grab the command sender BEFORE process_binaries.
             // `on_phase_end` closes over the sender and fires a
@@ -160,10 +154,9 @@ async fn on_phase_end_spawn_tasks_runs_post_phase_via_outer_loop() {
                 // immediately — the lazy-chain idiom is fire-and-
                 // forget. The handler still applies the spawn; only
                 // the per-task SpawnError vec is silently discarded.
-                let (reply_tx, _reply_rx) =
-                    tokio::sync::oneshot::channel::<
-                        Result<Vec<(usize, dynrunner_core::SpawnError)>, String>,
-                    >();
+                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel::<
+                    Result<Vec<(usize, dynrunner_core::SpawnError)>, String>,
+                >();
                 let cmd = PrimaryCommand::SpawnTasks {
                     tasks: vec![make_binary("p2a", "p2")],
                     reply: reply_tx,
@@ -192,10 +185,7 @@ async fn on_phase_end_spawn_tasks_runs_post_phase_via_outer_loop() {
                 3,
                 "phase-2 task spawned from on_phase_end must run"
             );
-            assert!(
-                manager.failed_tasks().is_empty(),
-                "no failures expected"
-            );
+            assert!(manager.failed_tasks().is_empty(), "no failures expected");
         })
         .await;
 }

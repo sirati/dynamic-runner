@@ -12,8 +12,8 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -23,7 +23,6 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-
     /// One-shot watchdog: 30s after `connect_to_peers` fired with a
     /// non-empty peer list, decide whether the peer mesh formed.
     /// Self-healing if the mesh forms before the deadline
@@ -166,8 +165,7 @@ where
         let connected = self.transport.peer_count() as u32;
         let no_peers_expected = self.peer_dial_count == 0;
         let mesh_formed = connected > 0;
-        let watchdog_done =
-            self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
+        let watchdog_done = self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
         if !(no_peers_expected || mesh_formed || watchdog_done) {
             return;
         }
@@ -189,10 +187,7 @@ where
                  mesh-ready timeout before promoting primary"
             );
         } else {
-            tracing::debug!(
-                connected,
-                "MeshReady sent to primary"
-            );
+            tracing::debug!(connected, "MeshReady sent to primary");
         }
         self.mesh_ready_sent = true;
     }

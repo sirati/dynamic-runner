@@ -42,7 +42,10 @@ fn assigned_late_after_completed_is_noop() {
         task: mk_task("a"),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h".into(),
+            result_data: None
+        }),
         ApplyOutcome::Applied
     );
     assert_eq!(
@@ -53,7 +56,10 @@ fn assigned_late_after_completed_is_noop() {
         }),
         ApplyOutcome::NoOp
     );
-    assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
+    assert!(matches!(
+        s.task_state("h"),
+        Some(TaskState::Completed { .. })
+    ));
 }
 
 #[test]
@@ -63,9 +69,15 @@ fn duplicate_completed_is_noop() {
         hash: "h".into(),
         task: mk_task("a"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h".into(),
+            result_data: None
+        }),
         ApplyOutcome::NoOp
     );
 }
@@ -94,10 +106,16 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
         error: "x".into(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h".into(),
+            result_data: None
+        }),
         ApplyOutcome::Applied
     );
-    assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
+    assert!(matches!(
+        s.task_state("h"),
+        Some(TaskState::Completed { .. })
+    ));
 }
 
 #[test]
@@ -117,7 +135,10 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
         hash: "h".into(),
         task: mk_task("a"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
             hash: "h".into(),
@@ -126,7 +147,10 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
         }),
         ApplyOutcome::NoOp
     );
-    assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
+    assert!(matches!(
+        s.task_state("h"),
+        Some(TaskState::Completed { .. })
+    ));
 }
 
 /// Cosmetic #88 regression pin: a demoted-primary terminal log
@@ -146,7 +170,10 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
             hash: hash.into(),
             task: mk_task(hash),
         });
-        s.apply(ClusterMutation::TaskCompleted { hash: hash.into(), result_data: None });
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: hash.into(),
+            result_data: None,
+        });
     }
     // 1 fail_retry (Recoverable)
     s.apply(ClusterMutation::TaskAdded {
@@ -251,7 +278,10 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     assert_eq!(c.invalid_task, 1, "counts().invalid_task tallies the entry");
     assert_eq!(c.completed, 1);
     assert_eq!(c.pending, 1);
-    assert_eq!(c.failed, 0, "InvalidTask is NOT folded into the generic failed count");
+    assert_eq!(
+        c.failed, 0,
+        "InvalidTask is NOT folded into the generic failed count"
+    );
 
     // iter_terminal includes the InvalidTask entry (it is terminal);
     // the Pending entry is excluded.
@@ -396,7 +426,10 @@ fn iter_pending_only_returns_pending() {
         hash: "c".into(),
         task: mk_task("c"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "c".into(),
+        result_data: None,
+    });
 
     let mut pending: Vec<&str> = s.iter_pending().map(|(h, _)| h.as_str()).collect();
     pending.sort();
@@ -424,8 +457,10 @@ fn convergence_completed_can_race_assigned() {
         secondary: "s".into(),
         worker: 0,
     };
-    let completed: ClusterMutation<RunnerIdentifier> =
-        ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None };
+    let completed: ClusterMutation<RunnerIdentifier> = ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: None,
+    };
 
     let mut a = ClusterState::<RunnerIdentifier>::new();
     a.apply(added.clone());
@@ -437,8 +472,14 @@ fn convergence_completed_can_race_assigned() {
     b.apply(completed);
     b.apply(assigned);
 
-    assert!(matches!(a.task_state("h"), Some(TaskState::Completed { .. })));
-    assert!(matches!(b.task_state("h"), Some(TaskState::Completed { .. })));
+    assert!(matches!(
+        a.task_state("h"),
+        Some(TaskState::Completed { .. })
+    ));
+    assert!(matches!(
+        b.task_state("h"),
+        Some(TaskState::Completed { .. })
+    ));
 }
 
 /// Convergence under duplicates: applying every mutation twice
@@ -460,7 +501,10 @@ fn convergence_under_duplicates() {
             secondary: "s".into(),
             worker: 0,
         },
-        ClusterMutation::TaskCompleted { hash: "h1".into(), result_data: None },
+        ClusterMutation::TaskCompleted {
+            hash: "h1".into(),
+            result_data: None,
+        },
         ClusterMutation::TaskFailed {
             hash: "h2".into(),
             kind: ErrorType::Recoverable,
@@ -477,8 +521,14 @@ fn convergence_under_duplicates() {
         twice.apply(m);
     }
     assert_eq!(once.counts(), twice.counts());
-    assert!(matches!(once.task_state("h1"), Some(TaskState::Completed { .. })));
-    assert!(matches!(twice.task_state("h1"), Some(TaskState::Completed { .. })));
+    assert!(matches!(
+        once.task_state("h1"),
+        Some(TaskState::Completed { .. })
+    ));
+    assert!(matches!(
+        twice.task_state("h1"),
+        Some(TaskState::Completed { .. })
+    ));
     // Failed got applied twice; second TaskFailed bumps attempts.
     match twice.task_state("h2") {
         Some(TaskState::Failed { attempts, .. }) => assert_eq!(*attempts, 2),
@@ -489,10 +539,9 @@ fn convergence_under_duplicates() {
 #[test]
 fn phase_deps_set_then_re_set_is_noop() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
-    let deps: HashMap<PhaseId, Vec<PhaseId>> =
-        [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
-            .into_iter()
-            .collect();
+    let deps: HashMap<PhaseId, Vec<PhaseId>> = [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
+        .into_iter()
+        .collect();
     assert_eq!(
         s.apply(ClusterMutation::PhaseDepsSet { deps: deps.clone() }),
         ApplyOutcome::Applied

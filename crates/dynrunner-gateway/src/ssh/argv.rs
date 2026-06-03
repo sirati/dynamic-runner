@@ -93,17 +93,13 @@ pub(super) async fn probe_master_pid(
     for arg in base_args {
         cmd.arg(arg);
     }
-    cmd.args([
-        "-O",
-        "check",
-        "-o",
-        &format!("ControlPath={control_path}"),
-    ]);
+    cmd.args(["-O", "check", "-o", &format!("ControlPath={control_path}")]);
     cmd.arg(target);
 
-    let output = cmd.output().await.map_err(|e| {
-        GatewayError::CommandFailed(format!("ssh -O check spawn: {e}"))
-    })?;
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| GatewayError::CommandFailed(format!("ssh -O check spawn: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(GatewayError::CommandFailed(format!(
@@ -135,8 +131,7 @@ pub(super) async fn probe_master_pid(
 pub(super) fn parse_master_pid(s: &str) -> Option<u32> {
     let marker = "Master running (pid=";
     let rest = s.find(marker).map(|i| &s[i + marker.len()..])?;
-    let pid_str: String =
-        rest.chars().take_while(char::is_ascii_digit).collect();
+    let pid_str: String = rest.chars().take_while(char::is_ascii_digit).collect();
     if pid_str.is_empty() {
         return None;
     }
@@ -169,10 +164,7 @@ pub(super) fn master_watcher_loop(daemon_pid: u32, cancel: Arc<AtomicBool>) {
         match kill(pid, None) {
             Ok(()) => continue,
             Err(Errno::ESRCH) => {
-                tracing::error!(
-                    daemon_pid,
-                    "SSH master exited unexpectedly"
-                );
+                tracing::error!(daemon_pid, "SSH master exited unexpectedly");
                 return;
             }
             Err(e) => {
@@ -231,8 +223,7 @@ pub(super) fn terminate_daemon_blocking(daemon_pid: u32) {
             "SIGTERM to SSH master daemon failed"
         );
     }
-    let grace = std::time::Instant::now()
-        + std::time::Duration::from_millis(200);
+    let grace = std::time::Instant::now() + std::time::Duration::from_millis(200);
     let poll = std::time::Duration::from_millis(20);
     loop {
         if matches!(kill(pid, None), Err(Errno::ESRCH)) {

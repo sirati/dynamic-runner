@@ -2,165 +2,189 @@
 //! `super::test_helpers`; this file holds the test scenarios.
 
 use super::test_helpers::{
-    make_binary, test_config, FakeWorkerFactory, FakeWorkerMode,
-    FixedEstimator, TestId,
+    FakeWorkerFactory, FakeWorkerMode, FixedEstimator, TestId, make_binary, test_config,
 };
 use super::*;
 use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd};
+use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
 use std::collections::HashMap;
-
 
 #[tokio::test(flavor = "current_thread")]
 async fn single_worker_processes_all_binaries() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
-    }).await;
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_workers_process_binaries() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(3);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(3);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..10)
-            .map(|i| make_binary(&format!("bin_{i}"), 100))
-            .collect();
+            let binaries: Vec<TaskInfo<TestId>> = (0..10)
+                .map(|i| make_binary(&format!("bin_{i}"), 100))
+                .collect();
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 10);
-        assert!(manager.failed_tasks().is_empty());
-    }).await;
+            assert_eq!(manager.stats().completed, 10);
+            assert!(manager.failed_tasks().is_empty());
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn retry_phase_retries_failed_tasks() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::FailThenSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::FailThenSucceed,
+            };
 
-        let binaries = vec![make_binary("retry_me", 50)];
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            let binaries = vec![make_binary("retry_me", 50)];
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        // First attempt fails, retry succeeds
-        assert_eq!(manager.stats().completed, 1);
-        assert!(manager.failed_tasks().is_empty());
-    }).await;
+            // First attempt fails, retry succeeds
+            assert_eq!(manager.stats().completed, 1);
+            assert!(manager.failed_tasks().is_empty());
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn resource_pressure_tasks_collected() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysOom,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysOom,
+            };
 
-        let binaries = vec![make_binary("oom_bin", 50)];
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            let binaries = vec![make_binary("oom_bin", 50)];
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        // OOM in main → retry → OOM again → OOM phase → OOM again
-        // Eventually ends up in resource_pressure_tasks or failed_tasks
-        assert_eq!(manager.stats().completed, 0);
-    }).await;
+            // OOM in main → retry → OOM again → OOM phase → OOM again
+            // Eventually ends up in resource_pressure_tasks or failed_tasks
+            assert_eq!(manager.stats().completed, 0);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn no_binaries_completes_immediately() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        manager
-            .process_binaries(
-                Vec::<TaskInfo<TestId>>::new(),
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    Vec::<TaskInfo<TestId>>::new(),
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 0);
-        assert_eq!(manager.stats().total, 0);
-    }).await;
+            assert_eq!(manager.stats().completed, 0);
+            assert_eq!(manager.stats().total, 0);
+        })
+        .await;
 }
 
 /// #2 dependency-existence parity (local manager): a task whose
@@ -172,46 +196,55 @@ async fn no_binaries_completes_immediately() {
 #[tokio::test(flavor = "current_thread")]
 async fn missing_dep_marks_invalid_task_and_run_continues() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let good = make_binary("good", 50);
-        let mut bad = make_binary("bad", 60);
-        bad.task_depends_on = vec![dynrunner_core::TaskDep {
-            task_id: "ghost".into(),
-            phase_id: PhaseId::from("default"),
-            inherit_outputs: false,
-        }];
+            let good = make_binary("good", 50);
+            let mut bad = make_binary("bad", 60);
+            bad.task_depends_on = vec![dynrunner_core::TaskDep {
+                task_id: "ghost".into(),
+                phase_id: PhaseId::from("default"),
+                inherit_outputs: false,
+            }];
 
-        manager
-            .process_binaries(
-                vec![good, bad],
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .expect("missing dep must NOT fail the whole run (it's a soft invalid_task)");
+            manager
+                .process_binaries(
+                    vec![good, bad],
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .expect("missing dep must NOT fail the whole run (it's a soft invalid_task)");
 
-        // The valid task completed; the missing-dep task is a terminal
-        // invalid_task failure (run continued).
-        assert_eq!(manager.stats().completed, 1, "the valid task ran");
-        assert_eq!(manager.stats().errored, 1, "the missing-dep task is errored");
-        let failed = manager.failed_tasks();
-        assert_eq!(failed.len(), 1, "exactly one failed task");
-        assert_eq!(failed[0].binary.task_id, "bad");
-        assert!(
-            matches!(failed[0].error_type, ErrorType::InvalidTask { .. }),
-            "missing-dep task carries the invalid_task error type, got {:?}",
-            failed[0].error_type
-        );
-    }).await;
+            // The valid task completed; the missing-dep task is a terminal
+            // invalid_task failure (run continued).
+            assert_eq!(manager.stats().completed, 1, "the valid task ran");
+            assert_eq!(
+                manager.stats().errored,
+                1,
+                "the missing-dep task is errored"
+            );
+            let failed = manager.failed_tasks();
+            assert_eq!(failed.len(), 1, "exactly one failed task");
+            assert_eq!(failed[0].binary.task_id, "bad");
+            assert!(
+                matches!(failed[0].error_type, ErrorType::InvalidTask { .. }),
+                "missing-dep task carries the invalid_task error type, got {:?}",
+                failed[0].error_type
+            );
+        })
+        .await;
 }
 
 /// #2 parity: a within-batch duplicate `(phase, task_id)` stays a HARD
@@ -220,36 +253,44 @@ async fn missing_dep_marks_invalid_task_and_run_continues() {
 #[tokio::test(flavor = "current_thread")]
 async fn duplicate_task_id_is_hard_error_local() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let mut a = make_binary("a", 50);
-        a.task_id = "dup".into();
-        let mut b = make_binary("b", 60);
-        b.task_id = "dup".into();
+            let mut a = make_binary("a", 50);
+            a.task_id = "dup".into();
+            let mut b = make_binary("b", 60);
+            b.task_id = "dup".into();
 
-        let result = manager
-            .process_binaries(
-                vec![a, b],
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await;
-        assert!(result.is_err(), "a duplicate task identity is a hard error in local mode");
-    }).await;
+            let result = manager
+                .process_binaries(
+                    vec![a, b],
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await;
+            assert!(
+                result.is_err(),
+                "a duplicate task identity is a hard error in local mode"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn always_restart_worker_respawns_after_success() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct CountingFactory {
         spawn_count: Arc<AtomicU32>,
@@ -270,11 +311,7 @@ async fn always_restart_worker_respawns_after_success() {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
                         Some(Command::ProcessTask { .. }) => {
-                            let _ = runner
-                                .send(Response::Done {
-                                    result_data: None,
-                                })
-                                .await;
+                            let _ = runner.send(Response::Done { result_data: None }).await;
                         }
                         None => break,
                     }
@@ -285,122 +322,147 @@ async fn always_restart_worker_respawns_after_success() {
     }
 
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let spawn_count = Arc::new(AtomicU32::new(0));
-        let spawn_count_clone = spawn_count.clone();
+    local
+        .run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let spawn_count_clone = spawn_count.clone();
 
-        let mut config = test_config(1);
-        config.always_restart_worker = true;
+            let mut config = test_config(1);
+            config.always_restart_worker = true;
 
-        let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = CountingFactory {
-            spawn_count: spawn_count_clone,
-        };
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = CountingFactory {
+                spawn_count: spawn_count_clone,
+            };
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
 
-        // With always_restart_worker=true and 3 binaries with 1 worker:
-        // 1 initial spawn + 1 type-shift respawn (worker's loaded_type_id
-        // starts None; `ensure_worker_for_type` cannot prove the factory
-        // chose the right type so it respawns once to bind the slot)
-        // + 2 restarts (after "a" and "b" complete; "c" is last → no
-        // restart). The post-respawn `loaded_type_id` is preserved
-        // across `restart_worker`, so subsequent same-type tasks hit
-        // the no-op fast path inside `ensure_worker_for_type`.
-        let spawns = spawn_count.load(Ordering::SeqCst);
-        assert_eq!(
-            spawns, 4,
-            "expected 4 spawns (1 initial + 1 first-task type-bind + 2 restarts), got {spawns}"
-        );
-    }).await;
+            // With always_restart_worker=true and 3 binaries with 1 worker:
+            // 1 initial spawn + 1 type-shift respawn (worker's loaded_type_id
+            // starts None; `ensure_worker_for_type` cannot prove the factory
+            // chose the right type so it respawns once to bind the slot)
+            // + 2 restarts (after "a" and "b" complete; "c" is last → no
+            // restart). The post-respawn `loaded_type_id` is preserved
+            // across `restart_worker`, so subsequent same-type tasks hit
+            // the no-op fast path inside `ensure_worker_for_type`.
+            let spawns = spawn_count.load(Ordering::SeqCst);
+            assert_eq!(
+                spawns, 4,
+                "expected 4 spawns (1 initial + 1 first-task type-bind + 2 restarts), got {spawns}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn memuse_log_written() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let tmp_dir = std::env::temp_dir().join("rust_memuse_test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let memuse_path = tmp_dir.join("memuse.log");
-        // Clean up any previous run
-        let _ = std::fs::remove_file(&memuse_path);
+    local
+        .run_until(async {
+            let tmp_dir = std::env::temp_dir().join("rust_memuse_test");
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            let memuse_path = tmp_dir.join("memuse.log");
+            // Clean up any previous run
+            let _ = std::fs::remove_file(&memuse_path);
 
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
-            always_restart_worker: false,
-            restart_predicate: None,
-            retry_max_attempts: 1,
-            print_pid: false,
-            memuse_log_path: Some(memuse_path.clone()),
-            stage_timeouts: HashMap::new(),
-            low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
-            resource_check_interval: std::time::Duration::from_millis(100),
-            phase_status_log_intervals: Vec::new(),
-            log_oom_watcher: false,
-            output_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-        };
+            let config = LocalManagerConfig {
+                num_workers: 1,
+                max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                always_restart_worker: false,
+                restart_predicate: None,
+                retry_max_attempts: 1,
+                print_pid: false,
+                memuse_log_path: Some(memuse_path.clone()),
+                stage_timeouts: HashMap::new(),
+                low_resource_thresholds: ResourceMap::from([(
+                    ResourceKind::memory(),
+                    300 * 1024 * 1024,
+                )]),
+                resource_check_interval: std::time::Duration::from_millis(100),
+                phase_status_log_intervals: Vec::new(),
+                log_oom_watcher: false,
+                output_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+            };
 
-        let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-        ];
+            let binaries = vec![make_binary("a", 50), make_binary("b", 60)];
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 2);
+            assert_eq!(manager.stats().completed, 2);
 
-        // Verify memuse.log was written
-        let contents = std::fs::read_to_string(&memuse_path).expect("memuse.log should exist");
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 lines in memuse.log, got {}", lines.len());
+            // Verify memuse.log was written
+            let contents = std::fs::read_to_string(&memuse_path).expect("memuse.log should exist");
+            let lines: Vec<&str> = contents.lines().collect();
+            assert_eq!(
+                lines.len(),
+                2,
+                "expected 2 lines in memuse.log, got {}",
+                lines.len()
+            );
 
-        // Each line: size,estimated,0,filename,status
-        assert!(lines[0].contains(",OK"), "first line should contain OK: {}", lines[0]);
-        assert!(lines[1].contains(",OK"), "second line should contain OK: {}", lines[1]);
+            // Each line: size,estimated,0,filename,status
+            assert!(
+                lines[0].contains(",OK"),
+                "first line should contain OK: {}",
+                lines[0]
+            );
+            assert!(
+                lines[1].contains(",OK"),
+                "second line should contain OK: {}",
+                lines[1]
+            );
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn non_recoverable_error_restarts_worker_and_continues() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct RestartCountingFactory {
         spawn_count: Arc<AtomicU32>,
@@ -432,11 +494,7 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
                                 break; // NonRecoverable worker exits
                             } else {
                                 // Restarted worker: succeed
-                                let _ = runner
-                                    .send(Response::Done {
-                                        result_data: None,
-                                    })
-                                    .await;
+                                let _ = runner.send(Response::Done { result_data: None }).await;
                             }
                         }
                         None => break,
@@ -448,75 +506,90 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
     }
 
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let spawn_count = Arc::new(AtomicU32::new(0));
-        let spawn_count_clone = spawn_count.clone();
+    local
+        .run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let spawn_count_clone = spawn_count.clone();
 
-        let config = test_config(1);
-        let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = RestartCountingFactory {
-            spawn_count: spawn_count_clone,
-        };
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = RestartCountingFactory {
+                spawn_count: spawn_count_clone,
+            };
 
-        let binaries = vec![
-            make_binary("crash_me", 50),
-            make_binary("succeed", 60),
-        ];
+            let binaries = vec![make_binary("crash_me", 50), make_binary("succeed", 60)];
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        // First task: NonRecoverable -> fails, worker restarted
-        // Second task: succeeds on restarted worker
-        // Retry phase: first task retried on restarted worker and succeeds
-        assert_eq!(manager.stats().completed, 2, "both tasks should complete");
-        assert!(manager.resource_pressure_tasks().is_empty(), "no OOM tasks expected");
+            // First task: NonRecoverable -> fails, worker restarted
+            // Second task: succeeds on restarted worker
+            // Retry phase: first task retried on restarted worker and succeeds
+            assert_eq!(manager.stats().completed, 2, "both tasks should complete");
+            assert!(
+                manager.resource_pressure_tasks().is_empty(),
+                "no OOM tasks expected"
+            );
 
-        // At least 2 spawns: initial + restart after NonRecoverable
-        let spawns = spawn_count.load(Ordering::SeqCst);
-        assert!(spawns >= 2, "expected at least 2 spawns (initial + restart), got {spawns}");
-    }).await;
+            // At least 2 spawns: initial + restart after NonRecoverable
+            let spawns = spawn_count.load(Ordering::SeqCst);
+            assert!(
+                spawns >= 2,
+                "expected at least 2 spawns (initial + restart), got {spawns}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn multiple_workers_with_mixed_results() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
-        let config = test_config(2);
-        let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+    local
+        .run_until(async {
+            // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
+            let config = test_config(2);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..6)
-            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
-            .collect();
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
+                .collect();
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 6);
-        assert_eq!(manager.stats().total, 6);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
-    }).await;
+            assert_eq!(manager.stats().completed, 6);
+            assert_eq!(manager.stats().total, 6);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
+        })
+        .await;
 }
 
 /// Regression pin: when a worker takes tasks of two distinct
@@ -541,9 +614,9 @@ async fn multiple_workers_with_mixed_results() {
 ///      worker's `loaded_type_id` already matches.
 #[tokio::test(flavor = "current_thread")]
 async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_match() {
+    use dynrunner_core::TypeId;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
-    use dynrunner_core::TypeId;
 
     /// Spawn-history entry: `None` means `spawn_worker` (no type),
     /// `Some(_)` means `spawn_worker_for_type(_)`.
@@ -724,35 +797,31 @@ async fn killed_routing_by_kill_reason() {
         KillReason::NoFaultUnderBudget,
     ] {
         let config = test_config(1);
-        let mut manager: LocalManager<
-            ChannelManagerEnd,
-            _,
-            _,
-            super::test_helpers::TestId,
-        > = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+        let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
+            LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
         let mut phase_ids = HashSet::new();
         phase_ids.insert(PhaseId::from("default"));
-        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
-            .expect("pool new");
+        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new()).expect("pool new");
         manager.install_pool_for_test(pool);
         let binary = make_binary("victim", 50);
         let phase = binary.phase_id.clone();
-        manager.pool_mut().extend(vec![binary.clone()]).expect("extend");
+        manager
+            .pool_mut()
+            .extend(vec![binary.clone()])
+            .expect("extend");
         // Simulate `take_from_view`'s in-flight bump so `requeue`
         // decrements correctly (requeue saturates at 0 either way,
         // but this matches the production sequencing).
         manager.pool_mut().mark_in_flight(&phase);
-        manager.handle_resource_pressure_result(
-            crate::pool::ResourcePressureResult::Killed {
-                worker_id: 1,
-                binary: Some(Box::new(binary)),
-                reason,
-            },
-        );
+        manager.handle_resource_pressure_result(crate::pool::ResourcePressureResult::Killed {
+            worker_id: 1,
+            binary: Some(Box::new(binary)),
+            reason,
+        });
         assert!(
             manager.failed_tasks().is_empty(),
             "{reason:?}: no failed_tasks entry expected"
@@ -772,29 +841,22 @@ async fn killed_routing_by_kill_reason() {
     // `failed_tasks`.
     for reason in [KillReason::OomOverBudget, KillReason::OomLastResort] {
         let config = test_config(1);
-        let mut manager: LocalManager<
-            ChannelManagerEnd,
-            _,
-            _,
-            super::test_helpers::TestId,
-        > = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+        let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
+            LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
         let mut phase_ids = HashSet::new();
         phase_ids.insert(PhaseId::from("default"));
-        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
-            .expect("pool new");
+        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new()).expect("pool new");
         manager.install_pool_for_test(pool);
         let binary = make_binary("over_budget", 50);
-        manager.handle_resource_pressure_result(
-            crate::pool::ResourcePressureResult::Killed {
-                worker_id: 0,
-                binary: Some(Box::new(binary)),
-                reason,
-            },
-        );
+        manager.handle_resource_pressure_result(crate::pool::ResourcePressureResult::Killed {
+            worker_id: 0,
+            binary: Some(Box::new(binary)),
+            reason,
+        });
         assert!(
             manager.failed_tasks().is_empty(),
             "{reason:?}: not a Recoverable failure, must not land in failed_tasks"
@@ -807,9 +869,7 @@ async fn killed_routing_by_kill_reason() {
         let entry = &manager.resource_pressure_tasks()[0];
         match &entry.error_type {
             ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {}
-            other => panic!(
-                "{reason:?}: expected ResourceExhausted(memory), got {other:?}"
-            ),
+            other => panic!("{reason:?}: expected ResourceExhausted(memory), got {other:?}"),
         }
     }
 }
@@ -851,21 +911,16 @@ async fn retry_phase_leftover_lands_in_failed_tasks_as_recoverable() {
     local
         .run_until(async {
             let config = test_config(1);
-            let mut manager: LocalManager<
-                ChannelManagerEnd,
-                _,
-                _,
-                super::test_helpers::TestId,
-            > = LocalManager::new(
-                config,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
+            let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
+                LocalManager::new(
+                    config,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
             let mut phase_ids = HashSet::new();
             phase_ids.insert(PhaseId::from("default"));
             let pool =
-                PendingPool::new(phase_ids, std::collections::HashMap::new())
-                    .expect("pool new");
+                PendingPool::new(phase_ids, std::collections::HashMap::new()).expect("pool new");
             manager.install_pool_for_test(pool);
             manager
                 .pool_mut()
@@ -967,53 +1022,58 @@ async fn memprofile_run_level_smoke() {
         return;
     }
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let tmp = tempfile::tempdir().expect("output_dir tempdir");
-        let mut config = test_config(1);
-        config.output_dir = Some(tmp.path().to_path_buf());
-        let mut manager =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
-
-        let binaries = vec![make_binary("a", 50), make_binary("b", 60)];
-
-        // Sampler is None pre-run (constructed lazily inside
-        // `process_binaries` because `MemProfileSampler::spawn`
-        // requires a running tokio runtime).
-        assert!(!manager.sampler_is_some(), "sampler must be lazy");
-
-        let outcome = manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await;
-        // Cgroup setup may still fail post-detection on hosts whose
-        // user cgroup tree exposes `memory` but is read-only to the
-        // test process (the v2-controllers probe doesn't catch that).
-        // Treat the same way the runtime-probe above does — skip
-        // rather than hard-fail.
-        if let Err(e) = &outcome
-            && e.contains("nested workers cgroup setup failed")
-        {
-            eprintln!(
-                "skipping memprofile_run_level_smoke: nested cgroup setup not \
-                 supported in this test env ({e})"
+    local
+        .run_until(async {
+            let tmp = tempfile::tempdir().expect("output_dir tempdir");
+            let mut config = test_config(1);
+            config.output_dir = Some(tmp.path().to_path_buf());
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
             );
-            return;
-        }
-        outcome.unwrap();
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        // Sampler torn down by the teardown path (start of run) so
-        // the next run can construct a fresh one.
-        assert!(!manager.sampler_is_some(), "sampler must be torn down");
-        assert_eq!(manager.stats().completed, 2);
-    }).await;
+            let binaries = vec![make_binary("a", 50), make_binary("b", 60)];
+
+            // Sampler is None pre-run (constructed lazily inside
+            // `process_binaries` because `MemProfileSampler::spawn`
+            // requires a running tokio runtime).
+            assert!(!manager.sampler_is_some(), "sampler must be lazy");
+
+            let outcome = manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await;
+            // Cgroup setup may still fail post-detection on hosts whose
+            // user cgroup tree exposes `memory` but is read-only to the
+            // test process (the v2-controllers probe doesn't catch that).
+            // Treat the same way the runtime-probe above does — skip
+            // rather than hard-fail.
+            if let Err(e) = &outcome
+                && e.contains("nested workers cgroup setup failed")
+            {
+                eprintln!(
+                    "skipping memprofile_run_level_smoke: nested cgroup setup not \
+                 supported in this test env ({e})"
+                );
+                return;
+            }
+            outcome.unwrap();
+
+            // Sampler torn down by the teardown path (start of run) so
+            // the next run can construct a fresh one.
+            assert!(!manager.sampler_is_some(), "sampler must be torn down");
+            assert_eq!(manager.stats().completed, 2);
+        })
+        .await;
 }
 
 /// Hook-level integration: hand-inject a fake `SubcgroupHandle`
@@ -1027,100 +1087,105 @@ async fn memprofile_run_level_smoke() {
 async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
     use std::io::Read;
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // Output dir for profile files.
-        let out = tempfile::tempdir().expect("out tempdir");
-        // Fake cgroup leaf with the three pseudo-files the reader needs.
-        let cg = tempfile::tempdir().expect("cg tempdir");
-        let leaf = cg.path().join("worker-0");
-        std::fs::create_dir(&leaf).unwrap();
-        std::fs::write(leaf.join("memory.current"), "4096\n").unwrap();
-        std::fs::write(leaf.join("memory.swap.current"), "0\n").unwrap();
-        std::fs::write(leaf.join("memory.stat"), "anon 4096\nfile 0\n").unwrap();
+    local
+        .run_until(async {
+            // Output dir for profile files.
+            let out = tempfile::tempdir().expect("out tempdir");
+            // Fake cgroup leaf with the three pseudo-files the reader needs.
+            let cg = tempfile::tempdir().expect("cg tempdir");
+            let leaf = cg.path().join("worker-0");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("memory.current"), "4096\n").unwrap();
+            std::fs::write(leaf.join("memory.swap.current"), "0\n").unwrap();
+            std::fs::write(leaf.join("memory.stat"), "anon 4096\nfile 0\n").unwrap();
 
-        // Build a manager, populate its WorkerPool with one worker via
-        // the existing `FakeWorkerFactory` path so the sampler hooks
-        // have a real `WorkerHandle` slot to look up.
-        //
-        // Leave `config.output_dir = None` so `initialize_workers`
-        // skips the nested cgroup setup (which would otherwise hit
-        // the real /sys/fs/cgroup and fail on hosts without
-        // delegation). The hook-level test injects its OWN sampler
-        // and subcgroup handle below, so the production path is
-        // bypassed deliberately.
-        let config = test_config(1);
-        let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
-            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
-        // Bring up one worker without running process_binaries (we
-        // want to drive the hook surface directly, not the full
-        // dispatch pipeline). `initialize_workers` is the
-        // pool-bootstrap step that allocates `WorkerHandle`s.
-        manager
-            .initialize_workers(&mut factory)
-            .await
-            .expect("worker init");
+            // Build a manager, populate its WorkerPool with one worker via
+            // the existing `FakeWorkerFactory` path so the sampler hooks
+            // have a real `WorkerHandle` slot to look up.
+            //
+            // Leave `config.output_dir = None` so `initialize_workers`
+            // skips the nested cgroup setup (which would otherwise hit
+            // the real /sys/fs/cgroup and fail on hosts without
+            // delegation). The hook-level test injects its OWN sampler
+            // and subcgroup handle below, so the production path is
+            // bypassed deliberately.
+            let config = test_config(1);
+            let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
+                LocalManager::new(
+                    config,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
+            // Bring up one worker without running process_binaries (we
+            // want to drive the hook surface directly, not the full
+            // dispatch pipeline). `initialize_workers` is the
+            // pool-bootstrap step that allocates `WorkerHandle`s.
+            manager
+                .initialize_workers(&mut factory)
+                .await
+                .expect("worker init");
 
-        // Inject the fake subcgroup onto worker 0 — production
-        // would materialise this via `prepare_worker_subgroup` at
-        // pool spawn time, gated on `mem_manager_reserved_bytes`
-        // being `Some(_)` (currently `None` in `LocalManager` mode);
-        // injecting it directly lets us test the sampler wiring
-        // end-to-end without that surface change.
-        let handle = crate::cgroup::SubcgroupHandle::from_cgroup_dir_for_test(leaf.clone());
-        manager.install_worker_subcgroup_for_test(0, handle);
+            // Inject the fake subcgroup onto worker 0 — production
+            // would materialise this via `prepare_worker_subgroup` at
+            // pool spawn time, gated on `mem_manager_reserved_bytes`
+            // being `Some(_)` (currently `None` in `LocalManager` mode);
+            // injecting it directly lets us test the sampler wiring
+            // end-to-end without that surface change.
+            let handle = crate::cgroup::SubcgroupHandle::from_cgroup_dir_for_test(leaf.clone());
+            manager.install_worker_subcgroup_for_test(0, handle);
 
-        // Stand up the sampler with a tight sample interval so the
-        // test doesn't pay the 1 s production cadence. Direct
-        // construction (not via `process_binaries`) keeps the test
-        // focused on the hook surface.
-        let sampler = crate::memprofile::MemProfileSampler::spawn(
-            crate::memprofile::MemProfileConfig {
-                output_dir: out.path().to_path_buf(),
-                sample_interval: std::time::Duration::from_millis(20),
-            },
-        );
-        manager.install_sampler_for_test(sampler);
+            // Stand up the sampler with a tight sample interval so the
+            // test doesn't pay the 1 s production cadence. Direct
+            // construction (not via `process_binaries`) keeps the test
+            // focused on the hook surface.
+            let sampler =
+                crate::memprofile::MemProfileSampler::spawn(crate::memprofile::MemProfileConfig {
+                    output_dir: out.path().to_path_buf(),
+                    sample_interval: std::time::Duration::from_millis(20),
+                });
+            manager.install_sampler_for_test(sampler);
 
-        // Drive the hooks. `binary.task_id == "task-A"` so the
-        // expected file is `task-A.worker-0.memprofile.jsonl.zst`.
-        let mut binary = make_binary("a", 50);
-        binary.task_id = "task-A".to_string();
-        manager.notify_sampler_assigned(0, &binary);
+            // Drive the hooks. `binary.task_id == "task-A"` so the
+            // expected file is `task-A.worker-0.memprofile.jsonl.zst`.
+            let mut binary = make_binary("a", 50);
+            binary.task_id = "task-A".to_string();
+            manager.notify_sampler_assigned(0, &binary);
 
-        // Let several ticks fire so the writer accumulates samples.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // Let several ticks fire so the writer accumulates samples.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        manager.notify_sampler_completed("task-A".to_string());
+            manager.notify_sampler_completed("task-A".to_string());
 
-        // Shutdown drains the sampler's queue and joins the
-        // background task, so the on-disk file is final by the time
-        // shutdown returns.
-        let sampler = manager.sampler.take().expect("sampler installed");
-        sampler.shutdown().await;
+            // Shutdown drains the sampler's queue and joins the
+            // background task, so the on-disk file is final by the time
+            // shutdown returns.
+            let sampler = manager.sampler.take().expect("sampler installed");
+            sampler.shutdown().await;
 
-        let expected = out.path().join("task-A.worker-0.memprofile.jsonl.zst");
-        assert!(
-            expected.exists(),
-            "expected profile file at {}",
-            expected.display()
-        );
-        // Round-trip: zstd-decode + JSONL parse. At least one
-        // complete frame (sample) must have been written.
-        let file = std::fs::File::open(&expected).expect("open profile");
-        let mut decoder = zstd::stream::read::Decoder::new(file).expect("decoder");
-        let mut decoded = Vec::new();
-        let _ = decoder.read_to_end(&mut decoded);
-        let text = std::str::from_utf8(&decoded).expect("utf8");
-        let lines: Vec<&str> = text.split_terminator('\n').collect();
-        assert!(
-            !lines.is_empty(),
-            "expected >= 1 sample in profile file, got 0 (raw: {decoded:?})"
-        );
-        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
-        assert_eq!(first["worker_id"].as_u64(), Some(0));
-        assert_eq!(first["memory_current"].as_u64(), Some(4096));
-    }).await;
+            let expected = out.path().join("task-A.worker-0.memprofile.jsonl.zst");
+            assert!(
+                expected.exists(),
+                "expected profile file at {}",
+                expected.display()
+            );
+            // Round-trip: zstd-decode + JSONL parse. At least one
+            // complete frame (sample) must have been written.
+            let file = std::fs::File::open(&expected).expect("open profile");
+            let mut decoder = zstd::stream::read::Decoder::new(file).expect("decoder");
+            let mut decoded = Vec::new();
+            let _ = decoder.read_to_end(&mut decoded);
+            let text = std::str::from_utf8(&decoded).expect("utf8");
+            let lines: Vec<&str> = text.split_terminator('\n').collect();
+            assert!(
+                !lines.is_empty(),
+                "expected >= 1 sample in profile file, got 0 (raw: {decoded:?})"
+            );
+            let first: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+            assert_eq!(first["worker_id"].as_u64(), Some(0));
+            assert_eq!(first["memory_current"].as_u64(), Some(4096));
+        })
+        .await;
 }

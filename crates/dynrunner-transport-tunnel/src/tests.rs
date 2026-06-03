@@ -37,10 +37,7 @@ impl TestRegistrar {
 }
 
 impl RoleChangeHookRegistrar for TestRegistrar {
-    fn register_role_change_hook(
-        &mut self,
-        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
-    ) {
+    fn register_role_change_hook(&mut self, hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>) {
         self.hooks.push(hook);
     }
 }
@@ -207,8 +204,14 @@ async fn send_role_unresolved_returns_err() {
         .send(Address::Role(Role::Primary), keepalive("primary"))
         .await
         .expect_err("cold cache must error");
-    assert!(err.contains("Role"), "error must reference Role; got: {err}");
-    assert!(err.contains("cache"), "error must reference cache; got: {err}");
+    assert!(
+        err.contains("Role"),
+        "error must reference Role; got: {err}"
+    );
+    assert!(
+        err.contains("cache"),
+        "error must reference cache; got: {err}"
+    );
 }
 
 /// `send(Address::Broadcast(Scope::AllSecondaries), msg)` fans

@@ -63,8 +63,14 @@ fn partition_missing_dep_is_invalid_and_names_the_absent_identity() {
     let (item, reason) = &part.invalid_deps[0];
     assert_eq!(item.task_id, "child");
     // The reason names the literally-absent (phase, task_id).
-    assert!(reason.contains("ghost"), "reason should name the absent dep: {reason}");
-    assert!(reason.contains('P'), "reason should name the absent dep's phase: {reason}");
+    assert!(
+        reason.contains("ghost"),
+        "reason should name the absent dep: {reason}"
+    );
+    assert!(
+        reason.contains('P'),
+        "reason should name the absent dep's phase: {reason}"
+    );
 }
 
 #[test]
@@ -128,7 +134,11 @@ fn partition_cross_phase_same_task_id_is_not_a_duplicate() {
     // The SAME task_id in two DIFFERENT phases is a DISTINCT task.
     let p = pool_with(&["A", "B"], &[]);
     let part = p.partition_ingest([task("A", "shared", &[]), task("B", "shared", &[])]);
-    assert_eq!(part.valid.len(), 2, "cross-phase same id is not a duplicate");
+    assert_eq!(
+        part.valid.len(),
+        2,
+        "cross-phase same id is not a duplicate"
+    );
     assert!(part.duplicates.is_empty());
 }
 
@@ -163,7 +173,11 @@ fn partition_does_not_mutate_the_pool() {
         task("P", "missing_dep", &[("P", "ghost")]),
         task("P", "fine", &[]),
     ]);
-    assert_eq!(p.len(), len_before, "partition_ingest must not mutate the pool");
+    assert_eq!(
+        p.len(),
+        len_before,
+        "partition_ingest must not mutate the pool"
+    );
 }
 
 /// `task(..)` with no deps, fixed id.

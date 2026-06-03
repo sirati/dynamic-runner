@@ -14,9 +14,9 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    read_role_cache, Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo,
-    PeerTransport, Role, RoleAddressedAction, RoleChangeHookRegistrar, SendOutcome,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Role,
+    RoleAddressedAction, RoleChangeHookRegistrar, SendOutcome, apply_role_misaddress_hint,
+    decide_role_addressed_with_cache, install_role_change_hook, read_role_cache,
 };
 
 use super::PeerNetwork;
@@ -153,8 +153,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             // redial immediately rather than waiting for the
             // next periodic tick — the user-directed contract is
             // "reconnect immediately, then every 5 seconds".
-            let first_observation =
-                self.reconnect_tracker.observe_disconnect(peer_id);
+            let first_observation = self.reconnect_tracker.observe_disconnect(peer_id);
             if first_observation {
                 self.spawn_redial(peer_id);
             }

@@ -172,9 +172,7 @@ pub(super) fn prune_stale<I>(
     outgoing_relays: &mut HashMap<(String, u64), OutgoingRelay<I>>,
     now: Instant,
 ) {
-    outgoing_relays.retain(|_, st| {
-        now.duration_since(st.last_used_at) <= RELAY_STATE_TTL
-    });
+    outgoing_relays.retain(|_, st| now.duration_since(st.last_used_at) <= RELAY_STATE_TTL);
 }
 
 /// Drop blacklist entries older than `BLACKLIST_TTL` so a recovered
@@ -183,8 +181,7 @@ pub(super) fn prune_blacklist(
     failed_forwarders: &mut HashMap<(String, String), Instant>,
     now: Instant,
 ) {
-    failed_forwarders
-        .retain(|_, t| now.duration_since(*t) < BLACKLIST_TTL);
+    failed_forwarders.retain(|_, t| now.duration_since(*t) < BLACKLIST_TTL);
 }
 
 /// Build the per-target blacklist for a routing decision: the set
@@ -199,9 +196,7 @@ pub(super) fn blacklist_for(
 ) -> HashSet<String> {
     failed_forwarders
         .iter()
-        .filter(|((t, _), ts)| {
-            t == target && now.duration_since(**ts) < BLACKLIST_TTL
-        })
+        .filter(|((t, _), ts)| t == target && now.duration_since(**ts) < BLACKLIST_TTL)
         .map(|((_, peer), _)| peer.clone())
         .collect()
 }

@@ -14,8 +14,8 @@ pub struct CertPair {
 impl CertPair {
     /// Generate a new self-signed certificate with the given subject name.
     pub fn generate(subject_name: &str) -> Result<Self, String> {
-        let mut params = rcgen::CertificateParams::new(vec![subject_name.into()])
-            .map_err(|e| e.to_string())?;
+        let mut params =
+            rcgen::CertificateParams::new(vec![subject_name.into()]).map_err(|e| e.to_string())?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         params
             .distinguished_name
@@ -39,19 +39,19 @@ impl CertPair {
 
     /// Build a quinn ServerConfig using this cert.
     pub fn server_config(&self) -> Result<quinn::ServerConfig, String> {
-        quinn::ServerConfig::with_single_cert(
-            vec![self.cert_der.clone()],
-            self.key_der.clone_key(),
-        )
-        .map_err(|e| e.to_string())
+        quinn::ServerConfig::with_single_cert(vec![self.cert_der.clone()], self.key_der.clone_key())
+            .map_err(|e| e.to_string())
     }
 
     /// Build a quinn ClientConfig that trusts this specific cert (for peer connections).
-    pub fn client_config_trusting(peer_cert_der: &CertificateDer<'_>) -> Result<quinn::ClientConfig, String> {
+    pub fn client_config_trusting(
+        peer_cert_der: &CertificateDer<'_>,
+    ) -> Result<quinn::ClientConfig, String> {
         let mut root_store = rustls::RootCertStore::empty();
-        root_store.add(peer_cert_der.clone()).map_err(|e| e.to_string())?;
-        quinn::ClientConfig::with_root_certificates(Arc::new(root_store))
-            .map_err(|e| e.to_string())
+        root_store
+            .add(peer_cert_der.clone())
+            .map_err(|e| e.to_string())?;
+        quinn::ClientConfig::with_root_certificates(Arc::new(root_store)).map_err(|e| e.to_string())
     }
 }
 

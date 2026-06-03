@@ -12,9 +12,9 @@ use std::rc::Rc;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    new_role_cache, read_role_cache, seed_self_role, DistributedMessage, PeerConnectionInfo,
-    PeerTransport, Role, RoleAddressedAction, RoleCache, RoleChangeHookRegistrar,
+    DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction, RoleCache,
+    RoleChangeHookRegistrar, apply_role_misaddress_hint, decide_role_addressed_with_cache,
+    install_role_change_hook, new_role_cache, read_role_cache, seed_self_role,
 };
 use tokio::sync::mpsc;
 
@@ -157,9 +157,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     /// `RoleAddressed { intended_role: Self_ }` envelope as Case A
     /// (unwrap) rather than Case C (drop). The write-through hook
     /// covers `Role::Primary` once registered.
-    pub fn new(
-        local_id: String,
-    ) -> (Self, SharedOutgoing<I>, InboundTap<I>, RegistrationSink<I>) {
+    pub fn new(local_id: String) -> (Self, SharedOutgoing<I>, InboundTap<I>, RegistrationSink<I>) {
         let outgoing: SharedOutgoing<I> = Rc::new(RefCell::new(HashMap::new()));
         let (inbound_tap, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
@@ -196,10 +194,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     /// reaching into a [`Router`] because the tunneled transport has
     /// no router state (no relay-via-peer at the submitter — every
     /// secondary is directly addressable via its own tunnel).
-    fn handle_role_layer(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> Option<DistributedMessage<I>> {
+    fn handle_role_layer(&mut self, msg: DistributedMessage<I>) -> Option<DistributedMessage<I>> {
         match msg {
             DistributedMessage::RoleAddressed {
                 sender_id,
@@ -272,11 +267,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     /// the borrow is live, so the workspace's
     /// `await_holding_refcell_ref = "deny"` lint is satisfied), then
     /// dispatches on the cloned sender.
-    fn send_direct(
-        &self,
-        peer_id: &str,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
+    fn send_direct(&self, peer_id: &str, msg: DistributedMessage<I>) -> Result<(), String> {
         let tx_opt = self.outgoing.borrow().get(peer_id).cloned();
         match tx_opt {
             Some(tx) => tx.send(msg).map_err(|e| e.to_string()),

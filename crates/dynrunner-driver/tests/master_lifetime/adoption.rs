@@ -25,7 +25,9 @@ use crate::helpers::{
 async fn adopt_disconnect_partial_cleanup() {
     let _serial = serialise().await;
     if !sshd_reachable() {
-        eprintln!("[skip] sshd not reachable on localhost:22 — adopt-disconnect contract unverified");
+        eprintln!(
+            "[skip] sshd not reachable on localhost:22 — adopt-disconnect contract unverified"
+        );
         return;
     }
     let authorized = match AuthorizedKey::provision() {

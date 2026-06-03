@@ -1,4 +1,4 @@
-use dynrunner_core::{TaskInfo, Identifier};
+use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 
 pub(super) fn timestamp_now() -> f64 {
@@ -15,4 +15,3 @@ pub(super) fn timestamp_now() -> f64 {
 pub(super) fn distributed_to_binary<I: Identifier>(info: &DistributedBinaryInfo<I>) -> TaskInfo<I> {
     info.to_task_info()
 }
-

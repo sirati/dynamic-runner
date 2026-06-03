@@ -162,7 +162,10 @@ fn forward_step_picks_next_lowest_excluding_path() {
                 assert_eq!(relay_id, 5);
             }
             assert_eq!(bookkeeping.predecessor.as_deref(), Some("a"));
-            assert_eq!(bookkeeping.path_at_send, vec!["a".to_string(), "c".to_string()]);
+            assert_eq!(
+                bookkeeping.path_at_send,
+                vec!["a".to_string(), "c".to_string()]
+            );
         }
         other => panic!("expected Relay: {:?}", other),
     }
@@ -235,7 +238,15 @@ fn handle_backoff_retries_with_next_lowest() {
     // + target + self).
     let mut state = outgoing_originator();
     let connections = conns(&["c", "d", "e"]);
-    let decision = handle_backoff(&mut state, &connections, "a", 1, "c", 2.0, &empty_blacklist());
+    let decision = handle_backoff(
+        &mut state,
+        &connections,
+        "a",
+        1,
+        "c",
+        2.0,
+        &empty_blacklist(),
+    );
     match decision {
         BackoffDecision::Retry { via, wrapped } => {
             assert_eq!(via, "d");
@@ -258,7 +269,15 @@ fn handle_backoff_propagates_when_forwarder_exhausted() {
     // backoff to predecessor a.
     let mut state = outgoing_forwarder();
     let connections = conns(&["a", "d"]);
-    let decision = handle_backoff(&mut state, &connections, "c", 9, "d", 3.0, &empty_blacklist());
+    let decision = handle_backoff(
+        &mut state,
+        &connections,
+        "c",
+        9,
+        "d",
+        3.0,
+        &empty_blacklist(),
+    );
     match decision {
         BackoffDecision::PropagateBackoff { to, msg } => {
             assert_eq!(to, "a");
@@ -286,7 +305,15 @@ fn handle_backoff_drops_when_originator_exhausted() {
     // connections — drop with no propagation possible.
     let mut state = outgoing_originator();
     let connections = conns(&["c"]); // only c, which is tried
-    let decision = handle_backoff(&mut state, &connections, "a", 1, "c", 2.0, &empty_blacklist());
+    let decision = handle_backoff(
+        &mut state,
+        &connections,
+        "a",
+        1,
+        "c",
+        2.0,
+        &empty_blacklist(),
+    );
     assert!(matches!(decision, BackoffDecision::Drop));
 }
 
@@ -296,7 +323,15 @@ fn handle_backoff_skips_path_peers_when_picking_retry() {
     // — d failed (tried), a is in path. Only b is eligible.
     let mut state = outgoing_forwarder();
     let connections = conns(&["a", "b", "d"]);
-    let decision = handle_backoff(&mut state, &connections, "c", 9, "d", 3.0, &empty_blacklist());
+    let decision = handle_backoff(
+        &mut state,
+        &connections,
+        "c",
+        9,
+        "d",
+        3.0,
+        &empty_blacklist(),
+    );
     match decision {
         BackoffDecision::Retry { via, .. } => {
             assert_eq!(via, "b", "must skip a (in path) and d (tried)");
@@ -322,4 +357,3 @@ fn handle_backoff_blacklist_skips_known_bad_during_retry() {
         other => panic!("expected Retry via e: {:?}", other),
     }
 }
-

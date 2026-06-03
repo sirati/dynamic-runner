@@ -1,18 +1,20 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    gather_predecessor_outputs, ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
+    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId, gather_predecessor_outputs,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler};
 
-use crate::oom::{OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL};
+use crate::oom::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
+};
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    LocalManager<M, S, E, I>
+{
     pub(super) async fn process_worker_loop(
         &mut self,
         active_workers: &mut HashSet<WorkerId>,
@@ -75,7 +77,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             }
 
             // Try to assign tasks to any idle workers
-            self.assign_idle_workers(active_workers, allow_stop, phase, factory).await;
+            self.assign_idle_workers(active_workers, allow_stop, phase, factory)
+                .await;
 
             // If no workers are processing and no pending assignments, we're done
             let any_processing = active_workers.iter().any(|&wid| {
@@ -162,7 +165,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     self.pending_worker_assignments.iter().copied().collect();
                 for worker_id in pending {
                     let idx = worker_id as usize;
-                    if self.pool.workers[idx].current_binary.is_none() && self.pool.workers[idx].is_ready() {
+                    if self.pool.workers[idx].current_binary.is_none()
+                        && self.pool.workers[idx].is_ready()
+                    {
                         self.try_assign_normal(worker_id, factory).await;
                         self.pending_worker_assignments.remove(&worker_id);
                     }
@@ -193,9 +198,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // `record_result`'s `failed_tasks` branch instead of
         // `resource_pressure_tasks`, matching the actual failure
         // class.
-        if phase == ProcessingPhase::RetryPhase
-            && !self.pool_ref().is_empty()
-        {
+        if phase == ProcessingPhase::RetryPhase && !self.pool_ref().is_empty() {
             let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
             for binary in remaining {
                 self.failed_tasks.push(FailedTask {
@@ -321,7 +324,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
     }
 
-    pub(super) async fn try_assign_normal(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
+    pub(super) async fn try_assign_normal(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
         let max = self.max_resources();
@@ -343,7 +350,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 ..
             } => {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
-                let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = binary
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 // Assemble the predecessor-outputs map BEFORE the
                 // worker-mutation borrow opens — the gather reads
@@ -453,7 +464,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
 
         // Restart the worker
-        tracing::info!(worker_id, attempt = count, "restarting worker after assignment failure");
+        tracing::info!(
+            worker_id,
+            attempt = count,
+            "restarting worker after assignment failure"
+        );
         self.restart_worker(worker_id, factory).await;
         self.pending_worker_assignments.insert(worker_id);
     }
@@ -462,7 +477,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     /// Mid-run respawn failures are logged and the worker is left stopped;
     /// the orchestrator continues with the remaining workers rather than
     /// aborting the whole run for one slot.
-    pub(super) async fn restart_worker(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
+    pub(super) async fn restart_worker(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         if let Err(e) = self
             .pool
             .restart_worker(worker_id, factory, self.config.print_pid)

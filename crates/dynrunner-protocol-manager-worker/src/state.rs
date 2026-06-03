@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskOutputs, TaskResult};
 use crate::command::{Command, Response};
+use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskOutputs, TaskResult};
 
 /// Composite trait: a manager endpoint can send commands and receive responses.
 pub trait ManagerEndpoint: MessageSender<Command> + MessageReceiver<Response> {}
@@ -44,12 +44,10 @@ impl<M: ManagerEndpoint> RunnerProtocol<WaitingForReady, M> {
     /// Returns Idle on success, NotYet if still waiting, or Disconnected.
     pub async fn wait_ready(mut self) -> WaitReadyResult<M> {
         match self.transport.recv().await {
-            Some(Response::Ready) => {
-                WaitReadyResult::Ready(RunnerProtocol {
-                    _state: PhantomData,
-                    transport: self.transport,
-                })
-            }
+            Some(Response::Ready) => WaitReadyResult::Ready(RunnerProtocol {
+                _state: PhantomData,
+                transport: self.transport,
+            }),
             Some(_) => {
                 // Got a non-Ready response, keep waiting
                 WaitReadyResult::NotYet(self)
@@ -248,20 +246,16 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                         }
                     }
                 }
-                Response::PhaseUpdate { phase_name } => {
-                    PollResult::StillRunning {
-                        protocol: self,
-                        phase_update: Some(phase_name),
-                        got_keepalive: false,
-                    }
-                }
-                Response::Keepalive => {
-                    PollResult::StillRunning {
-                        protocol: self,
-                        phase_update: None,
-                        got_keepalive: true,
-                    }
-                }
+                Response::PhaseUpdate { phase_name } => PollResult::StillRunning {
+                    protocol: self,
+                    phase_update: Some(phase_name),
+                    got_keepalive: false,
+                },
+                Response::Keepalive => PollResult::StillRunning {
+                    protocol: self,
+                    phase_update: None,
+                    got_keepalive: true,
+                },
                 Response::Ready => {
                     // Spurious ready during processing — ignore
                     PollResult::StillRunning {

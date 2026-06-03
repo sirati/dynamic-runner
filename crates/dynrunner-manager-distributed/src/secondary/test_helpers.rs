@@ -6,14 +6,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
-use dynrunner_protocol_manager_worker::{Command, Response};
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport,
-};
 use dynrunner_manager_local::WorkerFactory;
-use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPrimaryTransportEnd, channel_pair};
 use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;

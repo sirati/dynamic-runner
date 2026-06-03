@@ -8,7 +8,11 @@ fn decode_frame_incomplete_length() {
 
 #[test]
 fn decode_frame_incomplete_body() {
-    assert!(decode_frame::<TestId>(&[0, 0, 0, 10, 1, 2, 3]).unwrap().is_none());
+    assert!(
+        decode_frame::<TestId>(&[0, 0, 0, 10, 1, 2, 3])
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -30,7 +34,10 @@ fn roundtrip_all_message_types() {
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
-            resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 1024 }],
+            resources: vec![ResourceAmount {
+                kind: ResourceKind::memory(),
+                amount: 1024,
+            }],
             worker_count: 1,
             hostname: "h".into(),
             is_observer: false,
@@ -69,7 +76,10 @@ fn roundtrip_all_message_types() {
             timestamp: 0.0,
             secondary_id: "s".into(),
             worker_id: 0,
-            available_resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 1024 }],
+            available_resources: vec![ResourceAmount {
+                kind: ResourceKind::memory(),
+                amount: 1024,
+            }],
         },
         DistributedMessage::TaskAssignment {
             sender_id: "p".into(),
@@ -172,7 +182,9 @@ fn roundtrip_all_message_types() {
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
-            error: "peer mesh fully failed to form: 0 of 4 peers reachable; cluster routing impossible".into(),
+            error:
+                "peer mesh fully failed to form: 0 of 4 peers reachable; cluster routing impossible"
+                    .into(),
         },
     ];
 

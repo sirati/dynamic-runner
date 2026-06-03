@@ -48,7 +48,12 @@ fn conns_with_log(
     log: &Rc<RefCell<Vec<DispatchedRecord<()>>>>,
 ) -> HashMap<String, RecordingChannel<()>> {
     ids.iter()
-        .map(|id| (id.to_string(), RecordingChannel::new(id.to_string(), log.clone())))
+        .map(|id| {
+            (
+                id.to_string(),
+                RecordingChannel::new(id.to_string(), log.clone()),
+            )
+        })
         .collect()
 }
 

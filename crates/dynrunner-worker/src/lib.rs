@@ -131,114 +131,120 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn runner_processes_task_and_stops() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let (mut manager, mut runner) = channel_pair();
-        let executor = EchoExecutor;
+        local
+            .run_until(async {
+                let (mut manager, mut runner) = channel_pair();
+                let executor = EchoExecutor;
 
-        let runner_handle = tokio::task::spawn_local(async move {
-            runner_main_loop(&mut runner, &executor).await;
-        });
+                let runner_handle = tokio::task::spawn_local(async move {
+                    runner_main_loop(&mut runner, &executor).await;
+                });
 
-        let resp = manager.recv().await.unwrap();
-        assert!(matches!(resp, Response::Ready));
+                let resp = manager.recv().await.unwrap();
+                assert!(matches!(resp, Response::Ready));
 
-        manager
-            .send(Command::ProcessTask {
-                relative_path: "test/bin".into(),
-                payload: None,
-                resolved_path: None,
-                predecessor_outputs: std::collections::BTreeMap::new(),
+                manager
+                    .send(Command::ProcessTask {
+                        relative_path: "test/bin".into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs: std::collections::BTreeMap::new(),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut all = Vec::new();
+                while let Some(r) = manager.recv().await {
+                    let is_done = matches!(r, Response::Done { .. });
+                    all.push(r);
+                    if is_done {
+                        break;
+                    }
+                }
+
+                let has_phase = all
+                    .iter()
+                    .any(|r| matches!(r, Response::PhaseUpdate { .. }));
+                let has_done = all.iter().any(|r| matches!(r, Response::Done { .. }));
+                assert!(has_phase, "expected PhaseUpdate");
+                assert!(has_done, "expected Done");
+
+                manager.send(Command::Stop).await.unwrap();
+                runner_handle.await.unwrap();
             })
-            .await
-            .unwrap();
-
-        let mut all = Vec::new();
-        while let Some(r) = manager.recv().await {
-            let is_done = matches!(r, Response::Done { .. });
-            all.push(r);
-            if is_done {
-                break;
-            }
-        }
-
-        let has_phase = all
-            .iter()
-            .any(|r| matches!(r, Response::PhaseUpdate { .. }));
-        let has_done = all.iter().any(|r| matches!(r, Response::Done { .. }));
-        assert!(has_phase, "expected PhaseUpdate");
-        assert!(has_done, "expected Done");
-
-        manager.send(Command::Stop).await.unwrap();
-        runner_handle.await.unwrap();
-        }).await;
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn runner_handles_failure() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let (mut manager, mut runner) = channel_pair();
-        let executor = EchoExecutor;
+        local
+            .run_until(async {
+                let (mut manager, mut runner) = channel_pair();
+                let executor = EchoExecutor;
 
-        let runner_handle = tokio::task::spawn_local(async move {
-            runner_main_loop(&mut runner, &executor).await;
-        });
+                let runner_handle = tokio::task::spawn_local(async move {
+                    runner_main_loop(&mut runner, &executor).await;
+                });
 
-        let _ = manager.recv().await;
+                let _ = manager.recv().await;
 
-        manager
-            .send(Command::ProcessTask {
-                relative_path: "fail".into(),
-                payload: None,
-                resolved_path: None,
-                predecessor_outputs: std::collections::BTreeMap::new(),
+                manager
+                    .send(Command::ProcessTask {
+                        relative_path: "fail".into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs: std::collections::BTreeMap::new(),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut all = Vec::new();
+                while let Some(r) = manager.recv().await {
+                    let is_error = matches!(r, Response::Error { .. });
+                    all.push(r);
+                    if is_error {
+                        break;
+                    }
+                }
+
+                let error = all
+                    .iter()
+                    .find(|r| matches!(r, Response::Error { .. }))
+                    .unwrap();
+                match error {
+                    Response::Error {
+                        error_type,
+                        message,
+                    } => {
+                        assert_eq!(*error_type, ErrorType::Recoverable);
+                        assert_eq!(message, "intentional failure");
+                    }
+                    _ => unreachable!(),
+                }
+
+                manager.send(Command::Stop).await.unwrap();
+                runner_handle.await.unwrap();
             })
-            .await
-            .unwrap();
-
-        let mut all = Vec::new();
-        while let Some(r) = manager.recv().await {
-            let is_error = matches!(r, Response::Error { .. });
-            all.push(r);
-            if is_error {
-                break;
-            }
-        }
-
-        let error = all
-            .iter()
-            .find(|r| matches!(r, Response::Error { .. }))
-            .unwrap();
-        match error {
-            Response::Error {
-                error_type,
-                message,
-            } => {
-                assert_eq!(*error_type, ErrorType::Recoverable);
-                assert_eq!(message, "intentional failure");
-            }
-            _ => unreachable!(),
-        }
-
-        manager.send(Command::Stop).await.unwrap();
-        runner_handle.await.unwrap();
-        }).await;
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn runner_exits_on_connection_close() {
         let local = tokio::task::LocalSet::new();
-        local.run_until(async {
-        let (manager, mut runner) = channel_pair();
-        let executor = EchoExecutor;
+        local
+            .run_until(async {
+                let (manager, mut runner) = channel_pair();
+                let executor = EchoExecutor;
 
-        let runner_handle = tokio::task::spawn_local(async move {
-            runner_main_loop(&mut runner, &executor).await;
-        });
+                let runner_handle = tokio::task::spawn_local(async move {
+                    runner_main_loop(&mut runner, &executor).await;
+                });
 
-        drop(manager);
+                drop(manager);
 
-        runner_handle.await.unwrap();
-        }).await;
+                runner_handle.await.unwrap();
+            })
+            .await;
     }
 }

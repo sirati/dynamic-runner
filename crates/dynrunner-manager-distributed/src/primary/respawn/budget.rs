@@ -1,6 +1,5 @@
 //! `RespawnBudget::should_respawn` decision logic.
 
-
 use super::types::{RespawnBudget, RespawnDecision, RespawnEvent};
 
 impl RespawnBudget {
@@ -51,8 +50,7 @@ impl RespawnBudget {
         // previous death. `family_ids` accumulates every id (old +
         // new) we've seen so the cooldown check can match on either
         // side.
-        let mut family_ids: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut family_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         family_ids.insert(original_id);
         // Iterative expansion: each pass adds events whose
         // `original_id` or `new_id` is in `family_ids`. Cap the

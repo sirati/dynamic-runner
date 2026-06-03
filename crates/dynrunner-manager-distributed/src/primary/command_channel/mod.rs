@@ -65,6 +65,4 @@ mod types;
 mod tests;
 
 pub use handler::handle_primary_command;
-pub use types::{
-    validate_spawn_tasks, PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY,
-};
+pub use types::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks};

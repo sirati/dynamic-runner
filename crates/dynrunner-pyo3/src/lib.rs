@@ -11,13 +11,13 @@ mod logging;
 mod managers;
 mod network;
 mod peer_lifecycle_bridge;
-mod task_completed_bridge;
 mod protocol_manager_worker;
 mod publish;
 mod pytypes;
 mod slurm;
 mod subprocess_factory;
 mod system_resources;
+mod task_completed_bridge;
 mod task_def;
 mod transport;
 
@@ -36,17 +36,15 @@ use managers::distributed::PyDistributedManager;
 use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
 use managers::multi_process_respawner::PyMultiProcessSpawner;
-use managers::observer_late_joiner::{run_observer_late_joiner, PyObserverLateJoiner};
+use managers::observer_late_joiner::{PyObserverLateJoiner, run_observer_late_joiner};
 use managers::primary::PyPrimaryCoordinator;
 use managers::primary_handle::PyPrimaryHandle;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
-use system_resources::{parse_cores, parse_memory, pick_free_port};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
-use pytypes::{
-    PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView,
-};
+use pytypes::{PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView};
 use slurm::PyRustSlurmJobManager;
+use system_resources::{parse_cores, parse_memory, pick_free_port};
 
 /// Python module definition.
 /// The compiled extension is exposed as `dynamic_runner._native`;
@@ -100,8 +98,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(discovery::find_items, m)?)?;
     m.add("PublishError", m.py().get_type::<publish::PublishError>())?;
     m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
-    m.add_function(wrap_pyfunction!(slurm::wrapper_script::generate_wrapper_script, m)?)?;
-    m.add_function(wrap_pyfunction!(slurm::wrapper_script::generate_test_wrapper_script, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        slurm::wrapper_script::generate_wrapper_script,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        slurm::wrapper_script::generate_test_wrapper_script,
+        m
+    )?)?;
     m.add_class::<slurm::preparation::PySlurmPreparation>()?;
     m.add_function(wrap_pyfunction!(slurm::pipeline::run_slurm_pipeline, m)?)?;
     m.add_function(wrap_pyfunction!(
@@ -119,7 +123,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // imports from `dynamic_runner._native.driver`.
     let driver_mod = PyModule::new(m.py(), "driver")?;
     driver_mod.add_class::<driver::PySshMaster>()?;
-    driver_mod.add_function(wrap_pyfunction!(driver::py_cluster_is_running, &driver_mod)?)?;
+    driver_mod.add_function(wrap_pyfunction!(
+        driver::py_cluster_is_running,
+        &driver_mod
+    )?)?;
     driver_mod.add_function(wrap_pyfunction!(
         driver::py_ensure_dispatcher_keypair,
         &driver_mod

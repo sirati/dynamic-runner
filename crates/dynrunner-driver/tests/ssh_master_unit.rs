@@ -58,7 +58,10 @@ fn adopt_rejects_typoed_path_via_public_api() {
     let err = SshMaster::adopt(nope.clone(), SshTarget::new("user@host"))
         .expect_err("adopt must reject nonexistent path");
     match err {
-        SshMasterError::MasterAdoptFailed { control_path, reason } => {
+        SshMasterError::MasterAdoptFailed {
+            control_path,
+            reason,
+        } => {
             assert_eq!(control_path, nope);
             assert!(
                 reason.contains("not accessible") || reason.contains("No such file"),
@@ -80,7 +83,10 @@ fn adopt_rejects_regular_file_via_public_api() {
     let err = SshMaster::adopt(regular.clone(), SshTarget::new("user@host"))
         .expect_err("adopt must reject non-socket file");
     match err {
-        SshMasterError::MasterAdoptFailed { control_path, reason } => {
+        SshMasterError::MasterAdoptFailed {
+            control_path,
+            reason,
+        } => {
             assert_eq!(control_path, regular);
             assert!(
                 reason.contains("socket"),

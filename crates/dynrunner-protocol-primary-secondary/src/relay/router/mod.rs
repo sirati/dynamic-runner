@@ -26,7 +26,6 @@ mod tests;
 
 pub use dispatcher::Router;
 pub use state::{
-    Clocks, InboundOutcome, PeerRouteState, RouteVia, RoutingError, SendOutcome,
-    MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR, MSG_RELAY_ENGAGED, REDIAL_COOLDOWN,
-    RELAY_LOG_TARGET,
+    Clocks, InboundOutcome, MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR, MSG_RELAY_ENGAGED,
+    PeerRouteState, REDIAL_COOLDOWN, RELAY_LOG_TARGET, RouteVia, RoutingError, SendOutcome,
 };

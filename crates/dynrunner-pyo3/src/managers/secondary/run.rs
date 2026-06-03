@@ -38,8 +38,7 @@ impl PySecondaryCoordinator {
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
-        let dist_keepalive_miss_threshold =
-            self.distributed_config.keepalive_miss_threshold();
+        let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_primary_link_failure_threshold =
@@ -75,11 +74,10 @@ impl PySecondaryCoordinator {
         // writes the same shape; preserves the
         // `Option<PathBuf>` shape (None = disabled) for tests
         // and operators who want to opt out.
-        let cfg_memuse_log_path =
-            dynrunner_manager_local::memuse::derive_memuse_log_path(
-                Some(self.output_dir.as_path()),
-                None,
-            );
+        let cfg_memuse_log_path = dynrunner_manager_local::memuse::derive_memuse_log_path(
+            Some(self.output_dir.as_path()),
+            None,
+        );
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
         // for initial pool init (preserves pre-fix single-type
@@ -129,19 +127,18 @@ impl PySecondaryCoordinator {
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
         let panik_watcher_paths = self.panik_watcher_paths.clone();
-        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
-            self.panik_watcher_poll_interval_secs,
-        );
+        let panik_watcher_poll_interval =
+            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
         // Wrapped through `PyPeerLifecycleListener::new` into a
         // `Box<dyn LifecycleListener>` at the boundary so the
         // manager-distributed registration API stays
         // PyO3-agnostic.
-        let peer_lifecycle_listener =
-            self.peer_lifecycle_listener
-                .take()
-                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+        let peer_lifecycle_listener = self
+            .peer_lifecycle_listener
+            .take()
+            .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Phase-lifecycle callbacks for the post-promotion path. Built
         // here under the GIL (the `make_on_phase_*` constructors
@@ -160,14 +157,10 @@ impl PySecondaryCoordinator {
         // never calls into Python, so the GIL-reacquiring cost is paid
         // only on the post-promotion path.
         let sec_on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-            crate::managers::lifecycle::make_on_phase_start(
-                self.task_definition_py.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition_py.clone_ref(py)),
         );
         let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(
-                self.task_definition_py.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition_py.clone_ref(py)),
         );
 
         // Errors produced inside the async block — including
@@ -1005,8 +998,9 @@ pub(crate) fn resolve_secondary_memprofile_dir(
     memprofile_enabled: bool,
     operator_output_dir: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    let bind_mount =
-        std::path::Path::new(dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR);
+    let bind_mount = std::path::Path::new(
+        dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR,
+    );
     resolve_secondary_memprofile_dir_with_probe(
         memprofile_enabled,
         operator_output_dir,
@@ -1029,9 +1023,7 @@ fn resolve_secondary_memprofile_dir_with_probe(
         return None;
     }
     if let Some(explicit) = operator_output_dir {
-        return Some(
-            explicit.join(dynrunner_manager_local::memprofile::config::MEMPROFILE_SUBDIR),
-        );
+        return Some(explicit.join(dynrunner_manager_local::memprofile::config::MEMPROFILE_SUBDIR));
     }
     if probe(bind_mount) {
         return Some(
@@ -1055,32 +1047,36 @@ mod tests {
     #[test]
     fn disabled_returns_none_regardless_of_probe() {
         // Disabled short-circuits before any anchor is inspected.
-        assert!(resolve_secondary_memprofile_dir_with_probe(
-            false,
-            None,
-            Path::new("/whatever"),
-            |_| true,
-        )
-        .is_none());
-        assert!(resolve_secondary_memprofile_dir_with_probe(
-            false,
-            Some(Path::new("/tmp/run-out")),
-            Path::new("/whatever"),
-            |_| true,
-        )
-        .is_none());
-        assert!(resolve_secondary_memprofile_dir_with_probe(
-            false,
-            None,
-            Path::new("/whatever"),
-            |_| false,
-        )
-        .is_none());
+        assert!(
+            resolve_secondary_memprofile_dir_with_probe(
+                false,
+                None,
+                Path::new("/whatever"),
+                |_| true,
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_secondary_memprofile_dir_with_probe(
+                false,
+                Some(Path::new("/tmp/run-out")),
+                Path::new("/whatever"),
+                |_| true,
+            )
+            .is_none()
+        );
+        assert!(
+            resolve_secondary_memprofile_dir_with_probe(
+                false,
+                None,
+                Path::new("/whatever"),
+                |_| false,
+            )
+            .is_none()
+        );
         // The production wrapper also short-circuits when disabled.
         assert!(resolve_secondary_memprofile_dir(false, None).is_none());
-        assert!(
-            resolve_secondary_memprofile_dir(false, Some(Path::new("/tmp/run-out"))).is_none()
-        );
+        assert!(resolve_secondary_memprofile_dir(false, Some(Path::new("/tmp/run-out"))).is_none());
     }
 
     #[test]
@@ -1139,12 +1135,14 @@ mod tests {
         // Operator-misconfig case: opt-in set, neither anchor
         // available. Helper logs the warn and returns None;
         // sampler is not constructed at the call site.
-        assert!(resolve_secondary_memprofile_dir_with_probe(
-            true,
-            None,
-            Path::new("/app/out-network"),
-            |_| false,
-        )
-        .is_none());
+        assert!(
+            resolve_secondary_memprofile_dir_with_probe(
+                true,
+                None,
+                Path::new("/app/out-network"),
+                |_| false,
+            )
+            .is_none()
+        );
     }
 }

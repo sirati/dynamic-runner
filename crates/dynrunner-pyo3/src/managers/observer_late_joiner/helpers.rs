@@ -22,11 +22,9 @@ pub(super) fn map_read_dir_error(e: PeerInfoReadDirError) -> PyErr {
                 "observer late-joiner: peer-info directory unreadable ({dir}): {e}"
             ))
         }
-        PeerInfoReadDirError::Parse { ref path, .. } => {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "observer late-joiner: malformed peer-info file ({path}): {e}"
-            ))
-        }
+        PeerInfoReadDirError::Parse { ref path, .. } => pyo3::exceptions::PyValueError::new_err(
+            format!("observer late-joiner: malformed peer-info file ({path}): {e}"),
+        ),
         PeerInfoReadDirError::NoV2Records { ref dir } => {
             // The dir is structurally OK but produced no v2 records
             // — fail loud per the late-joiner design constraint.
@@ -85,7 +83,7 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynrunner_slurm::{parse_peer_info, PeerInfoBuilder};
+    use dynrunner_slurm::{PeerInfoBuilder, parse_peer_info};
 
     /// Construct a `PeerInfoRecord` end-to-end via the SLURM-wrapper
     /// public surface (`Builder::format` then `parse`). Goes through
@@ -118,9 +116,7 @@ mod tests {
         // Missing secondary_id: the snapshot RPC envelope keys on
         // the responder's secondary_id; without it, the joiner
         // can't construct the unicast Address::Peer target.
-        let no_id = record_from_builder(
-            PeerInfoBuilder::new("compute3", 40003).quic_port(51202),
-        );
+        let no_id = record_from_builder(PeerInfoBuilder::new("compute3", 40003).quic_port(51202));
 
         let seed = records_to_seed(&[happy, no_port, no_id]);
         assert_eq!(seed.len(), 1);

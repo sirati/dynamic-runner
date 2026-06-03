@@ -1,11 +1,6 @@
-
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
@@ -13,9 +8,9 @@ use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_n
 
 use super::dispatch_order;
 
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Iterate every free worker and dispatch a task from the pool if
     /// one fits. This is worker management's dispatch RECHECK: the
     /// operational loop's worker-management `select!` arm calls it on a
@@ -110,8 +105,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // same helper is consumed by the sibling dispatch site
                 // in `primary/task/request.rs` so the wire shape is
                 // identical regardless of which path fires.
-                let predecessor_outputs =
-                    gather_predecessor_outputs(&self.cluster_state, &binary);
+                let predecessor_outputs = gather_predecessor_outputs(&self.cluster_state, &binary);
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
@@ -170,12 +164,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // transition (the single origination point). After the
                 // send so a failure needs no CRDT compensation (the
                 // rollback above runs before we reach here).
-                self.originate_task_assigned(
-                    task_hash.clone(),
-                    sec_id.clone(),
-                    local_worker_id,
-                )
-                .await;
+                self.originate_task_assigned(task_hash.clone(), sec_id.clone(), local_worker_id)
+                    .await;
 
                 // Operator-facing INFO: which secondary/worker just
                 // took the task. Per-task identity (task_id /
@@ -199,5 +189,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
         Ok(())
     }
-
 }

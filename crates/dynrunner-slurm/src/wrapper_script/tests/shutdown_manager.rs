@@ -35,7 +35,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::SlurmConfig;
-use crate::wrapper_script::{generate_wrapper_script, WrapperScriptConfig};
+use crate::wrapper_script::{WrapperScriptConfig, generate_wrapper_script};
 
 use super::standard_cfg;
 
@@ -201,9 +201,7 @@ fn renders_shutdown_manager_spawn_when_path_set() {
          choosing the systemd-run path; render did not contain the -S probe"
     );
     assert!(
-        script.contains(
-            "XDG_RUNTIME_DIR=\"$SYSTEMD_USER_RUNTIME_DIR\" systemd-run --user --quiet"
-        ),
+        script.contains("XDG_RUNTIME_DIR=\"$SYSTEMD_USER_RUNTIME_DIR\" systemd-run --user --quiet"),
         "systemd-run invocation must be prefixed with \
          `XDG_RUNTIME_DIR=$SYSTEMD_USER_RUNTIME_DIR` so the bus client \
          reads the captured user-runtime dir, not podman's override; \
@@ -689,8 +687,14 @@ fn no_watchdog_block_present() {
     // resurrect it through a conditional.
     let bin = PathBuf::from(SHUTDOWN_BIN);
     let scripts = [
-        ("shutdown_manager_disabled", generate_wrapper_script(&standard_cfg(&config, &[]))),
-        ("shutdown_manager_enabled", generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin))),
+        (
+            "shutdown_manager_disabled",
+            generate_wrapper_script(&standard_cfg(&config, &[])),
+        ),
+        (
+            "shutdown_manager_enabled",
+            generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin)),
+        ),
     ];
     for (label, script) in scripts {
         assert!(

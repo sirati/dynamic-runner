@@ -38,10 +38,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dynrunner_protocol_primary_secondary::{
-    timestamp_now, DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
-    DEFAULT_JOIN_TIMEOUT,
+    DEFAULT_JOIN_TIMEOUT, DistributedMessage, JoinError, PeerConnectionInfo, PeerTransport,
+    timestamp_now,
 };
-use dynrunner_transport_channel::{peer_mesh, ChannelPeerTransport};
+use dynrunner_transport_channel::{ChannelPeerTransport, peer_mesh};
 use serde::{Deserialize, Serialize};
 
 /// In-test identifier — same shape as `mesh_partition.rs`'s `TestId`.
@@ -225,8 +225,13 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
 
     // Task ledger survives the RPC.
     assert_eq!(
-        parsed.tasks.keys().collect::<std::collections::HashSet<_>>(),
-        ["task-1".to_string(), "task-2".to_string()].iter().collect()
+        parsed
+            .tasks
+            .keys()
+            .collect::<std::collections::HashSet<_>>(),
+        ["task-1".to_string(), "task-2".to_string()]
+            .iter()
+            .collect()
     );
 
     // Step 7 + 8 contract: observers survive the snapshot roundtrip.

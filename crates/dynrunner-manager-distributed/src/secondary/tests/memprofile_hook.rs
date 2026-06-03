@@ -158,21 +158,20 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
             // minimal hand-built TaskInfo is sufficient — the rest
             // of the assignment plumbing is the path under test on
             // the LocalManager side and irrelevant here.
-            let binary: dynrunner_core::TaskInfo<
-                super::super::test_helpers::TestId,
-            > = dynrunner_core::TaskInfo {
-                path: std::path::PathBuf::from("/tmp/task-A"),
-                size: 50,
-                identifier: super::super::test_helpers::TestId("task-A".into()),
-                phase_id: dynrunner_core::PhaseId::from("p"),
-                type_id: dynrunner_core::TypeId::from("default"),
-                affinity_id: None,
-                payload: serde_json::Value::Null,
-                task_id: "task-A".to_string(),
-                task_depends_on: vec![],
-                preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
-                resolved_path: None,
-            };
+            let binary: dynrunner_core::TaskInfo<super::super::test_helpers::TestId> =
+                dynrunner_core::TaskInfo {
+                    path: std::path::PathBuf::from("/tmp/task-A"),
+                    size: 50,
+                    identifier: super::super::test_helpers::TestId("task-A".into()),
+                    phase_id: dynrunner_core::PhaseId::from("p"),
+                    type_id: dynrunner_core::TypeId::from("default"),
+                    affinity_id: None,
+                    payload: serde_json::Value::Null,
+                    task_id: "task-A".to_string(),
+                    task_depends_on: vec![],
+                    preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+                    resolved_path: None,
+                };
             secondary.notify_sampler_assigned(0, &binary);
 
             // Let several sample ticks fire so the writer

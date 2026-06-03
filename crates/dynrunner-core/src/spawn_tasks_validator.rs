@@ -40,7 +40,7 @@
 //! the sender side as a slow `send().await`; the handler-side reply
 //! oneshot is the per-command flow-control signal.
 
-use crate::{compute_task_hash, ErrorType, Identifier, TaskInfo};
+use crate::{ErrorType, Identifier, TaskInfo, compute_task_hash};
 use tokio::sync::oneshot;
 
 /// Bounded capacity for the command channel. Sized so a noisy caller
@@ -128,10 +128,8 @@ where
     // the broadcast happens.
     // Every task carries a non-optional `task_id` per the framework's
     // boundary contract; the batch-side known-set is built directly.
-    let batch_task_ids: std::collections::HashSet<String> = tasks
-        .iter()
-        .map(|t| t.task_id.clone())
-        .collect();
+    let batch_task_ids: std::collections::HashSet<String> =
+        tasks.iter().map(|t| t.task_id.clone()).collect();
     // Per-task validation pass. A task can fail multiple checks
     // (duplicate hash AND unknown dep); we surface the FIRST failure
     // per index so the caller sees one error per rejected task.
@@ -147,9 +145,7 @@ where
         }
         let mut bad_dep: Option<String> = None;
         for dep in &task.task_depends_on {
-            if !batch_task_ids.contains(&dep.task_id)
-                && !is_known_task_id(&dep.task_id)
-            {
+            if !batch_task_ids.contains(&dep.task_id) && !is_known_task_id(&dep.task_id) {
                 bad_dep = Some(dep.task_id.clone());
                 break;
             }

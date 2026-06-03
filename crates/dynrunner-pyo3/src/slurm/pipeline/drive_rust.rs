@@ -5,9 +5,9 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::attr_truthy;
 use super::preparation::PreparationOutcome;
 use super::respawn::build_slurm_respawn_kwargs;
-use super::attr_truthy;
 
 /// Hand the run over to `RustPrimaryCoordinator`. Ports the
 /// `_drive_rust_primary` helper from pipeline.py.
@@ -201,11 +201,14 @@ pub(super) fn drive_rust_primary<'py>(
     }
 
     let num_secondaries = outcome.num_secondaries;
-    let args_tuple = PyTuple::new(py, [
-        num_secondaries.into_pyobject(py)?.into_any().unbind(),
-        task.clone().unbind(),
-        no_spawn_callback.unbind(),
-    ])?;
+    let args_tuple = PyTuple::new(
+        py,
+        [
+            num_secondaries.into_pyobject(py)?.into_any().unbind(),
+            task.clone().unbind(),
+            no_spawn_callback.unbind(),
+        ],
+    )?;
     let coord = coord_cls.call(args_tuple, Some(&coord_kwargs))?;
 
     // Park the SLURM `JobManager` on the coordinator so the respawn
@@ -220,8 +223,7 @@ pub(super) fn drive_rust_primary<'py>(
     if let Ok(rust_handle) = job_manager.getattr("_rust")
         && let Ok(rust_jm) = rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>()
     {
-        let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> =
-            rust_jm.borrow().arc_handle();
+        let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> = rust_jm.borrow().arc_handle();
         coord
             .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
             .borrow_mut()
@@ -236,10 +238,8 @@ pub(super) fn drive_rust_primary<'py>(
         // the worker as an opaque identifier.
         log.call_method1(
             "info",
-            (
-                "TaskDefinition.uses_file_based_items=False; \
-                 skipping primary StageFile pass and starting coordinator",
-            ),
+            ("TaskDefinition.uses_file_based_items=False; \
+                 skipping primary StageFile pass and starting coordinator",),
         )?;
     } else if attr_truthy(args, "source_already_staged") {
         // Pre-staged mode: secondaries see source via bind-mount;
@@ -257,10 +257,7 @@ pub(super) fn drive_rust_primary<'py>(
         // Bulk-queue StageFile notifications in Rust — single
         // PyO3 crossing for the whole binary list.
         let source_dir = sel_result.getattr("source_dir")?;
-        coord.call_method1(
-            "queue_initial_staging",
-            (binaries, source_dir.str()?),
-        )?;
+        coord.call_method1("queue_initial_staging", (binaries, source_dir.str()?))?;
         log.call_method1(
             "info",
             (

@@ -32,9 +32,7 @@
 
 use pyo3::prelude::*;
 
-use dynrunner_manager_distributed::task_completed::{
-    TaskCompletedEvent, TaskCompletedListener,
-};
+use dynrunner_manager_distributed::task_completed::{TaskCompletedEvent, TaskCompletedListener};
 
 /// Adapter that holds an unbound Python listener and dispatches each
 /// event to the matching Python call. `Send + Sync` is satisfied by
@@ -147,10 +145,7 @@ mod tests {
     /// `task_id` is always a Python `str` (the framework's boundary
     /// contract guarantees a non-empty id on every event);
     /// `error_kind` remains `str | None` (success → `None`).
-    fn captured_call(
-        globals: &Py<PyAny>,
-        idx: usize,
-    ) -> (String, bool, Option<String>) {
+    fn captured_call(globals: &Py<PyAny>, idx: usize) -> (String, bool, Option<String>) {
         Python::attach(|py| {
             let g = globals.bind(py);
             let calls = g

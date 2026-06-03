@@ -323,7 +323,9 @@ mod tests {
     #[tokio::test]
     async fn empty_paths_yields_disabled_watcher() {
         let mut w = spawn_panik_watcher(PanikWatcherConfig::default());
-        let signal_rx = w.take_signal_rx().expect("first take_signal_rx must succeed");
+        let signal_rx = w
+            .take_signal_rx()
+            .expect("first take_signal_rx must succeed");
         // The receiver MUST resolve quickly (no-op task drops the
         // sender on spawn). Bounded wait to surface the no-leak
         // contract.
@@ -574,7 +576,9 @@ mod tests {
             listen_for_sigterm: false,
             ..Default::default()
         });
-        let signal_rx = w.take_signal_rx().expect("first take_signal_rx must succeed");
+        let signal_rx = w
+            .take_signal_rx()
+            .expect("first take_signal_rx must succeed");
         let result = tokio::time::timeout(Duration::from_millis(100), signal_rx).await;
         let result = result.expect("disabled watcher should resolve immediately");
         assert!(

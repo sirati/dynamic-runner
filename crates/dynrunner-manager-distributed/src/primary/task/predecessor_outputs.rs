@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use dynrunner_core::{
-    gather_predecessor_outputs as core_gather, Identifier, PhaseId, TaskInfo, TaskOutputs,
+    Identifier, PhaseId, TaskInfo, TaskOutputs, gather_predecessor_outputs as core_gather,
 };
 
 use crate::cluster_state::ClusterState;
@@ -304,15 +304,15 @@ mod tests {
             "C",
             vec![
                 TaskDep {
-                task_id: "B".into(),
-                phase_id: PhaseId::from("p0"),
-                inherit_outputs: true,
-            },
+                    task_id: "B".into(),
+                    phase_id: PhaseId::from("p0"),
+                    inherit_outputs: true,
+                },
                 TaskDep {
-                task_id: "missing".into(),
-                phase_id: PhaseId::from("p0"),
-                inherit_outputs: false,
-            },
+                    task_id: "missing".into(),
+                    phase_id: PhaseId::from("p0"),
+                    inherit_outputs: false,
+                },
             ],
         );
         let a_outputs = outputs_with("a-key", "a-val");

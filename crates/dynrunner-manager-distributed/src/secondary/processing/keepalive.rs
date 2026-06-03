@@ -14,8 +14,8 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Scope};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -93,7 +93,8 @@ where
             return;
         }
         let active_count = self
-            .pool.workers
+            .pool
+            .workers
             .iter()
             .filter(|w| w.current_binary.is_some())
             .count() as u32;

@@ -14,8 +14,7 @@ fn new_rejects_dependency_cycle() {
     deps.insert(phase("B"), vec![phase("A")]);
     deps.insert(phase("C"), vec![phase("B")]);
     deps.insert(phase("A"), vec![phase("C")]);
-    let res =
-        PendingPool::<()>::new([phase("A"), phase("B"), phase("C")], deps);
+    let res = PendingPool::<()>::new([phase("A"), phase("B"), phase("C")], deps);
     assert!(matches!(res, Err(PendingPoolError::DependencyCycle(_))));
 }
 

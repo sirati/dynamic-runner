@@ -8,7 +8,7 @@ use pyo3::types::{PyDict, PyList};
 
 use super::drive_rust::drive_rust_primary;
 use super::preparation::run_preparation;
-use super::{attr_truthy, pkill_leftover_tunnels, CleanupGuard};
+use super::{CleanupGuard, attr_truthy, pkill_leftover_tunnels};
 
 /// Python entry point. Mirrors the signature of the Python
 /// `run_slurm_pipeline(task, args, deployment, log)`. The
@@ -57,11 +57,13 @@ pub(crate) fn run_slurm_pipeline<'py>(
     // post-parse so `parse_gateway_url`'s URL signature stays clean.
     gateway_config.setattr(
         "ssh_identity_file",
-        args.getattr("ssh_identity_file").unwrap_or_else(|_| py.None().into_bound(py)),
+        args.getattr("ssh_identity_file")
+            .unwrap_or_else(|_| py.None().into_bound(py)),
     )?;
     gateway_config.setattr(
         "ssh_config_file",
-        args.getattr("ssh_config").unwrap_or_else(|_| py.None().into_bound(py)),
+        args.getattr("ssh_config")
+            .unwrap_or_else(|_| py.None().into_bound(py)),
     )?;
 
     let gateway = pkg_gateway
@@ -149,7 +151,10 @@ pub(crate) fn run_slurm_pipeline<'py>(
     if !use_reverse_connection {
         // Gateway-direct topology: secondaries dial `gateway:primary_quic_port`,
         // so the gateway ControlMaster must hold the `-R` for it.
-        gateway.call_method1("setup_port_forwarding", (primary_quic_port, primary_quic_port))?;
+        gateway.call_method1(
+            "setup_port_forwarding",
+            (primary_quic_port, primary_quic_port),
+        )?;
 
         // Consumer-supplied extra `-R local:gateway` forwards on the
         // ControlMaster, same gateway-direct topology rationale.
@@ -183,10 +188,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
         Ok(_) => {}
         Err(e) if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) => {
             let root = slurm_config.getattr("root_folder")?;
-            log.call_method1(
-                "info",
-                (format!("Creating SLURM root directory: {root}"),),
-            )?;
+            log.call_method1("info", (format!("Creating SLURM root directory: {root}"),))?;
             gateway.call_method1("create_directory", (root,))?;
         }
         Err(e) => return Err(e),
@@ -301,7 +303,13 @@ pub(crate) fn run_slurm_pipeline<'py>(
     let mem_manager_reserved_bytes: Option<u64> = args
         .getattr("mem_manager_reserved")
         .ok()
-        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() })
+        .and_then(|v| {
+            if v.is_none() {
+                None
+            } else {
+                v.extract::<String>().ok()
+            }
+        })
         .and_then(|s| crate::system_resources::parse_memory(&s).ok());
 
     // `args.forwarded_argv` is the dispatcher's `sys.argv[1:]` minus
@@ -338,12 +346,17 @@ pub(crate) fn run_slurm_pipeline<'py>(
     let explicit_deadline_secs: Option<u64> = args
         .getattr("slurm_setup_deadline_secs")
         .ok()
-        .and_then(|v| if v.is_none() { None } else { v.extract::<u64>().ok() });
-    let effective_deadline_secs =
-        dynrunner_slurm::pipeline::compute_setup_deadline_secs(
-            explicit_deadline_secs,
-            num_secondaries,
-        );
+        .and_then(|v| {
+            if v.is_none() {
+                None
+            } else {
+                v.extract::<u64>().ok()
+            }
+        });
+    let effective_deadline_secs = dynrunner_slurm::pipeline::compute_setup_deadline_secs(
+        explicit_deadline_secs,
+        num_secondaries,
+    );
     if explicit_deadline_secs.is_none() {
         // Inject the computed default so the secondary's argparse
         // sees it. Operator-supplied values are already in
@@ -455,10 +468,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
             && uses_file_based_items
             && !attr_truthy(args, "source_already_staged")
         {
-            job_manager.call_method1(
-                "upload_source_binaries",
-                (&binaries, &source_dir),
-            )?;
+            job_manager.call_method1("upload_source_binaries", (&binaries, &source_dir))?;
         }
 
         // ---- Hand-off to the Rust primary coordinator. ----

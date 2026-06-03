@@ -16,9 +16,7 @@
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, RoleChangeHookRegistrar, RoleTable,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, RoleChangeHookRegistrar, RoleTable};
 
 use super::{ApplyOutcome, ClusterState};
 
@@ -31,10 +29,7 @@ use super::{ApplyOutcome, ClusterState};
 /// Today the only registrant is the `PeerTransport` write-through
 /// cache, one per node.
 impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
-    fn register_role_change_hook(
-        &mut self,
-        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
-    ) {
+    fn register_role_change_hook(&mut self, hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>) {
         self.role_change_hooks.push(Arc::from(hook));
     }
 }

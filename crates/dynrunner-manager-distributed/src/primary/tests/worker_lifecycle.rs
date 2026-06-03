@@ -12,7 +12,7 @@
 
 use super::*;
 
-use dynrunner_core::{PhaseId, ResourceMap, ResourceAmount, ResourceKind, TypeId};
+use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, ResourceMap, TypeId};
 
 use crate::primary::wire::compute_task_hash;
 
@@ -59,11 +59,8 @@ fn primary_with_pool_and_idle_worker(
         FixedEstimator(100),
     );
     let phase = PhaseId::from("work");
-    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
-        [phase.clone()],
-        HashMap::new(),
-    )
-    .expect("work-phase pool");
+    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
+        .expect("work-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -218,8 +215,7 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
         .run_until(async {
             let x = phased("task-x", "work");
             let hash_x = compute_task_hash(&x);
-            let (mut primary, _ends) =
-                primary_with_pool_and_idle_worker(vec![x.clone()]);
+            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x.clone()]);
 
             // Seed the CRDT ledger so the live `TaskAssigned` origination
             // has a `Pending` entry to transition (the pool seed alone
@@ -251,9 +247,7 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
             assert_eq!(primary.in_flight_len_for_test(), 1, "X in the ledger");
             match primary.cluster_state_for_test().task_state(&hash_x) {
                 Some(crate::cluster_state::TaskState::InFlight {
-                    secondary,
-                    worker,
-                    ..
+                    secondary, worker, ..
                 }) => {
                     assert_eq!(secondary, "sec-0", "InFlight carries the target secondary");
                     assert_eq!(*worker, 0, "InFlight carries the target worker");
@@ -300,8 +294,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // would otherwise mark the phase Done, hiding Y from
             // `view_for_worker` (Active-only) and blocking the
             // reassignment this test depends on.
-            let (mut primary, _ends) =
-                primary_with_pool_and_idle_worker(vec![x.clone(), y]);
+            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x.clone(), y]);
 
             // Install the worker-management bus: the completion path
             // EMITS a `TasksAdded` (deferred dispatch) instead of
@@ -327,12 +320,12 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // held task, get reassigned to the other" flow is order-
             // independent. We want the slot to end holding the OTHER
             // task after completing the first.
-            let (first_hash, other_hash) =
-                if primary.slot_holds_hash_for_test("sec-0", 0, &hash_x) {
-                    (hash_x.clone(), hash_y.clone())
-                } else {
-                    (hash_y.clone(), hash_x.clone())
-                };
+            let (first_hash, other_hash) = if primary.slot_holds_hash_for_test("sec-0", 0, &hash_x)
+            {
+                (hash_x.clone(), hash_y.clone())
+            } else {
+                (hash_y.clone(), hash_x.clone())
+            };
 
             // The held task completes — slot frees, its ledger entry
             // drains, and the terminal EMITS a `TasksAdded` (deferred
@@ -344,10 +337,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // reassigned" state the stale terminal below must NOT
             // disturb.
             primary
-                .handle_task_complete(
-                    task_complete("sec-0", 0, &first_hash),
-                    &mut None,
-                )
+                .handle_task_complete(task_complete("sec-0", 0, &first_hash), &mut None)
                 .await;
             let batch = crate::worker_signal::drain_worker_signal_batch(
                 &mut wm_rx,
@@ -365,10 +355,8 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // the now-held role) without renaming downstream asserts.
             let (hash_x, hash_y) = (first_hash, other_hash);
             assert_eq!(primary.in_flight_len_for_test(), 1, "only Y in flight");
-            let work_completed_before = *primary
-                .phase_completed
-                .get(&PhaseId::from("work"))
-                .unwrap();
+            let work_completed_before =
+                *primary.phase_completed.get(&PhaseId::from("work")).unwrap();
 
             // A STALE, duplicate TaskComplete for X lands now (a
             // delayed/redundant wire copy). The completed-dedup gate
@@ -437,11 +425,8 @@ fn primary_two_secondaries_with_pool(
         FixedEstimator(100),
     );
     let phase = PhaseId::from("work");
-    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
-        [phase.clone()],
-        HashMap::new(),
-    )
-    .expect("work-phase pool");
+    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
+        .expect("work-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -511,7 +496,10 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
             assert_eq!(primary.in_flight_len_for_test(), 2, "both tasks in flight");
             assert_eq!(primary.pool().in_flight(&phase), 2);
             assert_eq!(
-                *primary.in_flight_per_type.get(&TypeId::from("default")).unwrap(),
+                *primary
+                    .in_flight_per_type
+                    .get(&TypeId::from("default"))
+                    .unwrap(),
                 2,
                 "both tasks hold a type-slot"
             );
@@ -542,10 +530,17 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
 
             // After recovery: survivor task still in flight, dead task
             // requeued (pool in_flight 2 -> 1, type slot 2 -> 1).
-            assert_eq!(primary.in_flight_len_for_test(), 1, "survivor still in flight");
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                1,
+                "survivor still in flight"
+            );
             assert_eq!(primary.pool().in_flight(&phase), 1);
             assert_eq!(
-                *primary.in_flight_per_type.get(&TypeId::from("default")).unwrap(),
+                *primary
+                    .in_flight_per_type
+                    .get(&TypeId::from("default"))
+                    .unwrap(),
                 1
             );
 
@@ -563,10 +558,7 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
             // stable identity it resolves the survivor at its new index
             // 0 and frees cleanly.
             primary
-                .handle_task_complete(
-                    task_complete("sec-1", 0, &survivor_hash),
-                    &mut None,
-                )
+                .handle_task_complete(task_complete("sec-1", 0, &survivor_hash), &mut None)
                 .await;
 
             // No panic reached here. The survivor's slot is freed, its
@@ -587,7 +579,11 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
                 "phase in-flight counter decremented on the survivor terminal"
             );
             assert_eq!(
-                primary.in_flight_per_type.get(&TypeId::from("default")).copied().unwrap_or(0),
+                primary
+                    .in_flight_per_type
+                    .get(&TypeId::from("default"))
+                    .copied()
+                    .unwrap_or(0),
                 0,
                 "survivor's type slot released"
             );

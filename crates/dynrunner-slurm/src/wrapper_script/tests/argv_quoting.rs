@@ -4,14 +4,17 @@
 //! don't break the rendered script.
 
 use crate::config::SlurmConfig;
-use crate::wrapper_script::{generate_wrapper_script, WrapperScriptConfig};
+use crate::wrapper_script::{WrapperScriptConfig, generate_wrapper_script};
 
 use super::standard_cfg;
 
 #[test]
 fn extra_run_args_are_bash_quoted_and_appear_before_image_ref() {
     let config = SlurmConfig::default();
-    let extras = vec!["--ulimit=nofile=65536".to_string(), "--shm-size=2g".to_string()];
+    let extras = vec![
+        "--ulimit=nofile=65536".to_string(),
+        "--shm-size=2g".to_string(),
+    ];
     let cfg = standard_cfg(&config, &extras);
     let script = generate_wrapper_script(&cfg);
     for flag in &extras {
@@ -21,7 +24,9 @@ fn extra_run_args_are_bash_quoted_and_appear_before_image_ref() {
         );
     }
     let image_idx = script.find("test-app:latest").expect("image ref present");
-    let extra_idx = script.find("--ulimit=nofile=65536").expect("extra arg present");
+    let extra_idx = script
+        .find("--ulimit=nofile=65536")
+        .expect("extra arg present");
     assert!(
         extra_idx < image_idx,
         "extra_run_args must precede the image ref; podman parses left-to-right"
@@ -155,4 +160,3 @@ fn forwarded_argv_metacharacters_use_single_quote_escape() {
          script lacks the quoted form"
     );
 }
-

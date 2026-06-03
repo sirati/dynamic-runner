@@ -38,8 +38,8 @@ use std::time::Duration;
 
 use dynrunner_core::TaskInfo;
 
-use super::super::test_helpers::{election_config, make_secondary, FakeWorkerFactory};
 use super::super::test_helpers::TestId;
+use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
 
 /// A snapshot with `n_completed` completed tasks under a designated
 /// primary. No `RunComplete` is set, so a coordinator that restores this

@@ -45,7 +45,11 @@ impl fmt::Display for WorkerExitStatus {
             (Some(code), _) => write!(f, "exited with code {code}"),
             (_, Some(sig)) => {
                 let name = self.signal_name.unwrap_or("?");
-                let core = if self.core_dumped { ", core dumped" } else { "" };
+                let core = if self.core_dumped {
+                    ", core dumped"
+                } else {
+                    ""
+                };
                 write!(f, "killed by SIG{name} ({sig}){core}")
             }
             (None, None) => write!(f, "unknown disposition"),
@@ -113,7 +117,7 @@ fn signal_name_for(sig: i32) -> Option<&'static str> {
 /// child.
 #[cfg(unix)]
 pub(crate) fn try_reap_subprocess(pid: Option<u32>) -> Option<WorkerExitStatus> {
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::Pid;
     let pid = Pid::from_raw(pid? as i32);
     for attempt in 0..=REAP_RETRY_COUNT {

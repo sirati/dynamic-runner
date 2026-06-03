@@ -47,7 +47,10 @@ fn outputs_for_unknown_task_id_is_none() {
     // No TaskCompleted applied yet — the cache is empty and the
     // reader returns None for any lookup. Pins the absent-key shape.
     let s = ClusterState::<RunnerIdentifier>::new();
-    assert!(s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "anything").is_none());
+    assert!(
+        s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "anything")
+            .is_none()
+    );
 }
 
 #[test]
@@ -68,7 +71,10 @@ fn task_completed_populates_task_outputs_cache() {
         result_data: Some(bytes),
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
-    assert_eq!(s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"), Some(&outputs));
+    assert_eq!(
+        s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
+        Some(&outputs)
+    );
 }
 
 #[test]
@@ -85,7 +91,10 @@ fn task_completed_with_no_result_data_does_not_populate() {
         hash: "h".into(),
         result_data: None,
     });
-    assert!(s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a").is_none());
+    assert!(
+        s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a")
+            .is_none()
+    );
 }
 
 #[test]
@@ -107,7 +116,10 @@ fn task_completed_malformed_result_data_stores_empty_outputs() {
         result_data: Some(garbage),
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
-    assert_eq!(s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"), Some(&TaskOutputs::default()));
+    assert_eq!(
+        s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
+        Some(&TaskOutputs::default())
+    );
 }
 
 #[test]
@@ -131,7 +143,10 @@ fn task_outputs_round_trip_via_snapshot() {
     let snap = s.snapshot();
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
     joiner.restore(snap);
-    assert_eq!(joiner.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"), Some(&outputs));
+    assert_eq!(
+        joiner.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
+        Some(&outputs)
+    );
 }
 
 #[test]
@@ -168,7 +183,10 @@ fn restore_first_write_wins_on_task_outputs_collision() {
 
     local.restore(source.snapshot());
     // Local's entry survives; snapshot's same-key entry is ignored.
-    assert_eq!(local.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"), Some(&local_outputs));
+    assert_eq!(
+        local.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a"),
+        Some(&local_outputs)
+    );
 }
 
 #[test]
@@ -207,7 +225,9 @@ fn python_encode_full_wrapper_decodes_outputs() {
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
 
-    let cached = s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a").expect("cache populated");
+    let cached = s
+        .outputs_for(&dynrunner_core::PhaseId::from("p0"), "a")
+        .expect("cache populated");
     assert_eq!(
         cached.0.get("nonce"),
         Some(&ResultValue::Inline("xyz".to_string()))
@@ -240,7 +260,9 @@ fn python_encode_outputs_only_decodes_outputs() {
         hash: "h".into(),
         result_data: Some(wire),
     });
-    let cached = s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a").expect("cache populated");
+    let cached = s
+        .outputs_for(&dynrunner_core::PhaseId::from("p0"), "a")
+        .expect("cache populated");
     assert_eq!(
         cached.0.get("k"),
         Some(&ResultValue::Inline("v".to_string()))
@@ -271,6 +293,8 @@ fn python_encode_counters_only_populates_empty_cache() {
         hash: "h".into(),
         result_data: Some(wire),
     });
-    let cached = s.outputs_for(&dynrunner_core::PhaseId::from("p0"), "a").expect("cache populated");
+    let cached = s
+        .outputs_for(&dynrunner_core::PhaseId::from("p0"), "a")
+        .expect("cache populated");
     assert!(cached.0.is_empty());
 }

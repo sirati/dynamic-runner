@@ -1,11 +1,9 @@
 use dynrunner_core::{ErrorType, Identifier, ResourceKind, WorkerId};
-use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
-use dynrunner_manager_local::WorkerFactory;
-use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, Role,
-};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 /// Wire marker used when a secondary's worker is killed by a no-fault
@@ -17,9 +15,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 /// respawning"` markers. The string is the public contract between
 /// secondary and primary; do not change it without updating the
 /// primary's `is_backpressure` predicate in the same commit.
-pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str =
-    "worker no-fault preempt; resource stealing";
-
+pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resource stealing";
 
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
@@ -68,10 +64,7 @@ where
         &mut self,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        let result = self
-            .transport
-            .send(Address::Role(Role::Primary), msg)
-            .await;
+        let result = self.transport.send(Address::Role(Role::Primary), msg).await;
         if let Err(ref e) = result {
             // No route to the primary — feed the failover-health
             // probe. `record_recv_failure` anchors the failure window
@@ -179,9 +172,7 @@ where
     ) {
         match result {
             ResourcePressureResult::Killed {
-                worker_id,
-                reason,
-                ..
+                worker_id, reason, ..
             } => {
                 // Find and report the task as failed
                 let file_hash = self
@@ -252,9 +243,14 @@ where
         }
 
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-            self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
+            self.pool.workers[worker_id as usize]
+                .reserved_budgets
+                .get(&dynrunner_core::ResourceKind::memory())
         } else {
-            self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
+            self.config
+                .max_resources
+                .get(&dynrunner_core::ResourceKind::memory())
+                / self.config.num_workers as u64
         };
 
         let msg = DistributedMessage::TaskRequest {

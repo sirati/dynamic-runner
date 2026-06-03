@@ -43,10 +43,7 @@ pub struct DispatchedRecord<I: Identifier> {
 impl<I: Identifier> RecordingChannel<I> {
     /// Construct a recorder addressing peer `addressee` that writes
     /// into the shared log.
-    pub fn new(
-        addressee: String,
-        log: Rc<RefCell<Vec<DispatchedRecord<I>>>>,
-    ) -> Self {
+    pub fn new(addressee: String, log: Rc<RefCell<Vec<DispatchedRecord<I>>>>) -> Self {
         Self {
             log,
             addressee,

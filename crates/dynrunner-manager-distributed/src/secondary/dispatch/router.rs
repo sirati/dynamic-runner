@@ -22,9 +22,9 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use crate::cluster_state::ClusterStateSnapshot;
-use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
+use super::super::wire::{distributed_to_binary, timestamp_now};
+use crate::cluster_state::ClusterStateSnapshot;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -67,8 +67,7 @@ where
                 // site on the secondary funnels through it so the
                 // three modes stay in lockstep.
                 let zip_ref = zip_file.as_deref().filter(|z| !z.is_empty());
-                let resolved_path =
-                    self.resolve_for_dispatch(zip_ref, &local_path, &file_hash);
+                let resolved_path = self.resolve_for_dispatch(zip_ref, &local_path, &file_hash);
 
                 // Fail loudly when the worker has no plausible way to
                 // open the binary, instead of silently passing
@@ -127,7 +126,8 @@ where
                 let target_wid = if self.pool.workers[wid as usize].is_idle_state() {
                     wid
                 } else {
-                    self.pool.workers
+                    self.pool
+                        .workers
                         .iter()
                         .position(|w| w.is_idle_state())
                         .map(|i| i as u32)
@@ -135,7 +135,8 @@ where
                 };
 
                 if self.pool.workers[target_wid as usize].is_idle_state() {
-                    let estimated_mb = estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+                    let estimated_mb =
+                        estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     let log_task_hash = file_hash.clone();
                     // Per-type subprocess dispatch via the async-event
                     // flow for both first-bind (`loaded_type_id == None`)
@@ -316,8 +317,7 @@ where
                                 worker_id: target_wid,
                                 task_hash: file_hash,
                                 error_type: ErrorType::Recoverable,
-                                error_message:
-                                    "worker pipe broken; respawning".into(),
+                                error_message: "worker pipe broken; respawning".into(),
                             };
                             self.send_to_primary(msg).await?;
                         }
@@ -368,7 +368,12 @@ where
                 self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
-            DistributedMessage::PromotePrimary { new_primary_id, epoch, required_setup, .. } => {
+            DistributedMessage::PromotePrimary {
+                new_primary_id,
+                epoch,
+                required_setup,
+                ..
+            } => {
                 // Task #36 / Step 7 defensive guard: an observer MUST
                 // NOT be promoted. If we receive a PromotePrimary
                 // naming an observer (either us, or a peer in the
@@ -506,7 +511,11 @@ where
                 tracing::trace!(task_hash, "observed TaskFailed report (no-op)");
                 Ok(())
             }
-            DistributedMessage::RequestClusterSnapshot { sender_id, is_observer, .. } => {
+            DistributedMessage::RequestClusterSnapshot {
+                sender_id,
+                is_observer,
+                ..
+            } => {
                 // Any peer can answer — `cluster_state` is replicated,
                 // so any responder's snapshot is a valid bootstrap
                 // payload. The merge semantics on the receiver
@@ -561,12 +570,10 @@ where
                 // Only `PeerRemoved` ever clears the observer flag, so
                 // the ratchet never regresses a genuine observer.
                 let _ = self
-                    .apply_and_broadcast_mutations(vec![
-                        ClusterMutation::PeerJoined {
-                            peer_id: sender_id,
-                            is_observer,
-                        },
-                    ])
+                    .apply_and_broadcast_mutations(vec![ClusterMutation::PeerJoined {
+                        peer_id: sender_id,
+                        is_observer,
+                    }])
                     .await;
                 Ok(())
             }

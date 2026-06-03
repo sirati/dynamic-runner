@@ -12,9 +12,9 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
-use super::{next_round, primary_node_id, ElectionState, ElectionTickActions};
+use super::super::wire::timestamp_now;
+use super::{ElectionState, ElectionTickActions, next_round, primary_node_id};
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -203,11 +203,7 @@ where
                     + 1; // include us
                 let quorum = peer_count.div_ceil(2) + 1;
                 if agreeing < quorum {
-                    tracing::info!(
-                        agreeing,
-                        quorum,
-                        "no quorum on primary death; waiting"
-                    );
+                    tracing::info!(agreeing, quorum, "no quorum on primary death; waiting");
                     return actions;
                 }
                 // Task #36 / Step 7: filter observer peers from
@@ -268,11 +264,7 @@ where
                 // peer_mesh_degraded guard above catches the
                 // pathological "alone and primary's dead" case.
                 if self.config.is_observer && we_lead {
-                    let next_lowest = self
-                        .peer_keepalives
-                        .keys()
-                        .min()
-                        .cloned();
+                    let next_lowest = self.peer_keepalives.keys().min().cloned();
                     tracing::info!(
                         observer = %self.config.secondary_id,
                         ?next_lowest,
@@ -430,9 +422,7 @@ where
         let quorum = peer_count.div_ceil(2) + 1;
         let promoted = match &mut self.election {
             ElectionState::Candidate {
-                round: r,
-                confirms,
-                ..
+                round: r, confirms, ..
             } if *r == round => {
                 confirms.insert(peer);
                 confirms.len() >= quorum
