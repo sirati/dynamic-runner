@@ -22,9 +22,10 @@ pub struct RestartContext<'a> {
     pub actual_resources: &'a ResourceMap,
 }
 
-/// Decide whether to recycle a worker after a task completes. Used in
-/// addition to the coarse `always_restart_worker` flag — if either is true,
-/// the worker is restarted (when there's still pending work).
+/// Decide whether to recycle a worker after a task completes. Forces a
+/// restart even when the coarse `reuse_workers` opt-in would otherwise
+/// keep the worker — if the predicate returns `true`, the worker is
+/// restarted (when there's still pending work).
 ///
 /// `Send` so that callers may construct the predicate before crossing a
 /// thread boundary (e.g. `pyo3::Python::detach`); the predicate itself runs
@@ -46,9 +47,14 @@ pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32) + Send>;
 pub struct LocalManagerConfig {
     pub num_workers: u32,
     pub max_resources: ResourceMap,
-    pub always_restart_worker: bool,
-    /// Optional fine-grained predicate. Considered alongside (OR'd with)
-    /// `always_restart_worker`. Receives per-completion stats; returning
+    /// Opt-in to reusing worker processes across tasks. Default `false`
+    /// means the manager restarts the worker after every successful task
+    /// (kernel page-cache locality is sacrificed for a clean per-task
+    /// process). Set `true` to recycle the worker slot in place, only
+    /// restarting on failure / type-shift / `restart_predicate`.
+    pub reuse_workers: bool,
+    /// Optional fine-grained predicate. Forces a restart even when
+    /// `reuse_workers` is set. Receives per-completion stats; returning
     /// `true` triggers a restart.
     pub restart_predicate: Option<RestartPredicate>,
     /// Maximum number of times a single binary will be retried after a
@@ -110,7 +116,7 @@ impl Default for LocalManagerConfig {
         Self {
             num_workers: 0,
             max_resources: ResourceMap::new(),
-            always_restart_worker: false,
+            reuse_workers: false,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,

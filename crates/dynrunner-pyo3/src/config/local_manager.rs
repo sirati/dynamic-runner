@@ -22,8 +22,12 @@ pub(crate) struct PyLocalManagerConfig {
     pub(crate) max_resources: PyResourceMap,
     #[pyo3(get, set)]
     pub(crate) low_resource_thresholds: PyResourceMap,
+    /// Opt-in to reusing worker processes across tasks. Default `false`
+    /// restarts the worker after each successful task; `true` recycles
+    /// the slot in place. Mirrors
+    /// `LocalManagerConfig.reuse_workers`.
     #[pyo3(get, set)]
-    pub(crate) always_restart_worker: bool,
+    pub(crate) reuse_workers: bool,
     #[pyo3(get, set)]
     pub(crate) restart_predicate: Option<Py<PyAny>>,
     #[pyo3(get, set)]
@@ -70,7 +74,7 @@ impl PyLocalManagerConfig {
         num_workers,
         max_resources,
         low_resource_thresholds = None,
-        always_restart_worker = false,
+        reuse_workers = false,
         restart_predicate = None,
         retry_max_attempts = 1,
         print_pid = false,
@@ -90,7 +94,7 @@ impl PyLocalManagerConfig {
         num_workers: u32,
         max_resources: PyResourceMap,
         low_resource_thresholds: Option<PyResourceMap>,
-        always_restart_worker: bool,
+        reuse_workers: bool,
         restart_predicate: Option<Py<PyAny>>,
         retry_max_attempts: u32,
         print_pid: bool,
@@ -108,7 +112,7 @@ impl PyLocalManagerConfig {
             max_resources,
             low_resource_thresholds: low_resource_thresholds
                 .unwrap_or_else(|| PyResourceMap::from_single("memory", 300 * 1024 * 1024)),
-            always_restart_worker,
+            reuse_workers,
             restart_predicate,
             retry_max_attempts,
             print_pid,
@@ -155,7 +159,7 @@ impl PyLocalManagerConfig {
         RustLocalManagerConfig {
             num_workers: self.num_workers,
             max_resources: self.max_resources.to_rust(),
-            always_restart_worker: self.always_restart_worker,
+            reuse_workers: self.reuse_workers,
             restart_predicate,
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
@@ -264,7 +268,7 @@ mod tests {
             num_workers: 1,
             max_resources: PyResourceMap::from_single("memory", 64 * 1024 * 1024),
             low_resource_thresholds: PyResourceMap::from_single("memory", 300 * 1024 * 1024),
-            always_restart_worker: false,
+            reuse_workers: true,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,

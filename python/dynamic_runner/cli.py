@@ -88,9 +88,13 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         "--skip-existing", action="store_true", help="Skip binaries that already have output files"
     )
     parser.add_argument(
-        "--always-restart-worker",
+        "--reuse-workers",
         action="store_true",
-        help="Restart worker after each completed task",
+        help=(
+            "Reuse worker processes across tasks (kernel page-cache "
+            "locality). Default: restart the worker after each "
+            "completed task."
+        ),
     )
     parser.add_argument("--pid", action="store_true", help="Print worker PIDs when (re)started")
     parser.add_argument(

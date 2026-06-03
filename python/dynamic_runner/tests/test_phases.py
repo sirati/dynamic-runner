@@ -446,10 +446,9 @@ def test_worker_death_requeues_item(tmp_path: Path) -> None:
     ``os._exit(137)`` before replying ``done`` for the first item it
     sees of ``--phases-kill-phase``. The manager's
     worker-death/disconnect path requeues the in-flight item; the
-    respawned slot (or another worker, with ``always_restart_worker``
-    set) replays it. The first attempt leaves a record in the log
-    with no ``done`` reply; the requeued attempt produces a second
-    record (possibly on a different pid).
+    respawned slot (or another worker) replays it. The first attempt
+    leaves a record in the log with no ``done`` reply; the requeued
+    attempt produces a second record (possibly on a different pid).
 
     Single-phase intentionally — the cross-phase barrier path has a
     separate `xfail` test. Here we verify only that **every distinct
@@ -473,11 +472,11 @@ def test_worker_death_requeues_item(tmp_path: Path) -> None:
         kill_marker=kill_marker,
     )
 
-    # always_restart_worker so the manager respawns the dead worker
-    # rather than running degraded. retry_max_attempts gives the
-    # requeued item a few chances if the timing trips multiple kills.
+    # The default policy already restarts workers each task, and the
+    # worker-death/disconnect path respawns the dead slot regardless.
+    # retry_max_attempts gives the requeued item a few chances if the
+    # timing trips multiple kills.
     cfg_kwargs = {
-        "always_restart_worker": True,
         "retry_max_attempts": 4,
     }
     _run_local(
