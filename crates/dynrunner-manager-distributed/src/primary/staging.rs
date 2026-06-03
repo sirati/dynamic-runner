@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use dynrunner_core::{Identifier, TaskInfo, TypeId};
-use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::PrimaryCoordinator;
@@ -293,8 +293,7 @@ where
             src_path,
             dest_path,
         };
-        self.transport
-            .send(Address::Peer(secondary_id.to_string()), msg)
+        self.send_to(Destination::Secondary(PeerId::from(secondary_id)), msg)
             .await
     }
 }

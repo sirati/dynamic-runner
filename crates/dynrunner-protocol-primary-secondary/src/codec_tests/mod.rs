@@ -11,11 +11,8 @@
 //!     empty-field omission).
 //!   - [`stage_promote`] — `StageFile` and `PromotePrimary`
 //!     (incl. `required_setup` backcompat).
-//!   - [`role`] — `RoleAddressed` / `RoleMisaddressHint` envelopes +
-//!     `attempts` default-decoding.
 
 use super::*;
-use crate::address::Role;
 use crate::messages::*;
 use dynrunner_core::{ErrorType, ResourceKind};
 use serde::{Deserialize, Serialize};
@@ -23,7 +20,6 @@ use serde::{Deserialize, Serialize};
 mod binary_info;
 mod cluster_mutation;
 mod frame;
-mod role;
 mod roundtrip;
 mod stage_promote;
 

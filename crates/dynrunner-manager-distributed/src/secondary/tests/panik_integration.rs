@@ -42,10 +42,9 @@ use std::time::Duration;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, MessageType, RemovalCause,
 };
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{FakeWorkerFactory, RecordingPeer, TestId, make_transport};
+use super::super::test_helpers::{FakeWorkerFactory, TestId};
 use super::super::*;
 
 /// File source: run a secondary against a fake primary, register a
@@ -66,18 +65,23 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
 
-            let uplink = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
-            // The self-departure announcement is a MESH broadcast
-            // (`apply_and_broadcast_mutations` → Address::Broadcast(Mesh)),
-            // so observe it on a RecordingPeer mesh stub, not the uplink.
-            let mesh_recorder = RecordingPeer::<TestId>::new(1);
-            let mesh_log = mesh_recorder.log_handle();
+            // Channel-backed mesh: the primary is folded in (carries the
+            // setup frames the fake-primary task injects), and one observed
+            // peer receives the secondary's mesh `broadcast`s. The
+            // self-departure announcement is a `Destination::All` broadcast
+            // (`apply_and_broadcast_mutations`), which the mesh fans out to
+            // the observed peer (the primary is excluded), so drain
+            // `mesh_observer_rx` to assert it.
+            let (unified, mut mesh_observer_rx) = super::super::test_helpers::channel_mesh_with_observed_peer(
+                "sec-panik",
+                sec_to_pri_tx,
+                pri_to_sec_rx,
+            );
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik".into(),
@@ -110,10 +114,11 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> = SecondaryCoordinator::new(
                 config,
-                make_transport("sec-panik", uplink, mesh_recorder),
+                unified,
                 dynrunner_scheduler::ResourceStealingScheduler::memory(),
                 super::super::test_helpers::FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             // Register the panik signal receiver BEFORE entering
             // run_until_setup_or_done — the field is taken into the
@@ -247,17 +252,17 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             }
 
             // Confirm the departure announcement reached the MESH (the
-            // unified transport routes the self-departure broadcast to
-            // the mesh handle, recorded here). Drop the primary task
-            // first so its setup-handshake loop terminates cleanly.
+            // unified transport fans the self-departure broadcast out to
+            // the observed peer). Drop the primary task first so its
+            // setup-handshake loop terminates cleanly.
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
-            // Scan the recorded mesh broadcasts for the self-authored
+            // Drain the observed peer's inbound for the self-authored
             // PeerRemoved { SelfDeparture }. The wire emission is the
             // load-bearing assertion that drove this test.
             let mut saw_departure = false;
-            for msg in mesh_log.borrow().iter() {
+            while let Ok(msg) = mesh_observer_rx.try_recv() {
                 if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {
@@ -316,17 +321,19 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
 
-            let uplink = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
-            // RecordingPeer mesh stub so the test can assert the SIGTERM
-            // branch broadcasts NOTHING on the mesh.
-            let mesh_recorder = RecordingPeer::<TestId>::new(1);
-            let mesh_log = mesh_recorder.log_handle();
+            // Channel-backed mesh with the primary folded in + one observed
+            // peer, so the test can assert the SIGTERM branch broadcasts
+            // NOTHING onto the mesh (nothing lands in `mesh_observer_rx`).
+            let (unified, mut mesh_observer_rx) = super::super::test_helpers::channel_mesh_with_observed_peer(
+                "sec-panik-sigterm",
+                sec_to_pri_tx,
+                pri_to_sec_rx,
+            );
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik-sigterm".into(),
@@ -359,10 +366,11 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> = SecondaryCoordinator::new(
                 config,
-                make_transport("sec-panik-sigterm", uplink, mesh_recorder),
+                unified,
                 dynrunner_scheduler::ResourceStealingScheduler::memory(),
                 super::super::test_helpers::FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let (panik_tx, panik_rx) = tokio::sync::oneshot::channel();
             secondary.register_panik_signal_rx(panik_rx);
@@ -483,7 +491,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
-            for msg in mesh_log.borrow().iter() {
+            while let Ok(msg) = mesh_observer_rx.try_recv() {
                 if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {

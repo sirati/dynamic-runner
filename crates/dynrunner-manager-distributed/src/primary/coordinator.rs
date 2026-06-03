@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -222,17 +222,22 @@ pub(crate) struct InFlightEntry<I: Identifier> {
 
 /// The primary coordinator: orchestrates work across secondaries.
 ///
-/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send/recv
-/// crosses this single mesh-transport boundary — `Address::Peer(id)`
+/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send goes
+/// through the [`Self::send_to`] egress edge, which resolves a typed
+/// `Destination` to a concrete peer-id — `Destination::Secondary(id)`
 /// for per-secondary writes (initial assignment, task fan-out),
-/// `Address::Broadcast(Scope::AllSecondaries)` for the keepalive +
-/// CRDT fan-out, `recv_peer()` for the unified inbound. The transport
-/// is real-by-construction in every primary construction path
+/// `Destination::All` for the keepalive + CRDT fan-out — then calls the
+/// `PeerId`-only transport; `recv_peer()` is the unified inbound. The
+/// transport is real-by-construction in every primary construction path
 /// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
-/// in-process / tests, `ColocatedPrimaryTransport` for the parked
-/// failover authority) — there is no no-op send path and no per-site
-/// "which transport is real" hazard. This mirrors the secondary side's
-/// collapse onto a single `Tr: PeerTransport` (`UnifiedSecondaryTransport`).
+/// in-process / tests, the role-blind `MeshHandleTransport` over the
+/// host's shared mesh for the parked failover authority) — there is no
+/// no-op send path and no per-site "which transport is real" hazard. The
+/// parked failover primary's own-secondary loopback is NOT a transport
+/// leg: it is delivered at the egress edge (`SendTarget::Loopback` +
+/// the `Destination::All` broadcast loopback leg), so the transport
+/// itself stays role-blind. This mirrors the secondary side's collapse
+/// onto a single `Tr: PeerTransport`.
 pub struct PrimaryCoordinator<
     Tr: PeerTransport<I>,
     S: Scheduler<I>,
@@ -735,6 +740,28 @@ pub struct PrimaryCoordinator<
     /// dispatch tends to share secondaries with the OOM-bucket
     /// retries anyway).
     pub(super) single_worker_mode: bool,
+
+    /// Loopback sender into a CO-LOCATED secondary's inbound, present
+    /// ONLY when this primary shares a host with a secondary it must
+    /// deliver to in-process (the composed parked-failover primary). The
+    /// egress edge ([`Self::send_to`]) writes here whenever
+    /// [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`]
+    /// resolves (a `Destination` whose host id == this node's own id —
+    /// e.g. a `TaskAssignment` to the co-located secondary's own workers)
+    /// and ADDITIONALLY on every `Destination::All` broadcast (the
+    /// co-located secondary is not a mesh peer of itself, so it observes
+    /// the primary's CRDT / `RunComplete` / keepalive fan-out only via
+    /// this leg).
+    ///
+    /// `None` on every other primary (the submitter primary, in-process
+    /// tests) — those have no co-located secondary, so `Loopback`
+    /// resolution is the benign live-primary self-relay no-op and the
+    /// broadcast leg is the plain mesh fan-out. Registered pre-run via
+    /// [`Self::register_colocated_loopback`]; this is purely an egress
+    /// concern (it never resolves a role) and the transport stays
+    /// role-blind.
+    pub(super) colocated_loopback_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>>,
 }
 
 impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
@@ -842,6 +869,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             pending_run_abort: None,
             pending_invalid_dep_tasks: Vec::new(),
             single_worker_mode: false,
+            colocated_loopback_tx: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -869,20 +897,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // through the dispatcher channel from this point onward.
         this.cluster_state
             .install_task_completed_sender(task_completed_tx);
-        // Mirror `SecondaryCoordinator::new`'s registration: attach the
-        // peer transport's write-through `RoleTable` cache to the
-        // authoritative `cluster_state.role_table`. The hook fires on
-        // every applied `PrimaryChanged` mutation; the cache serves
-        // Step 3's `Address::Role(_)` dispatch on the send hot path.
-        // Transports that don't override `register_with_cluster_state`
-        // (`NoPeerTransport`, the `NoPeers` test stub) get the default
-        // no-op — safe by construction. `Role::Self_` is seeded by
-        // the transport's own constructor (`new_role_cache` +
-        // `seed_self_role` for `ChannelPeerTransport` and
-        // `PeerNetwork`), not here, because that's a strictly
-        // transport-local fact.
-        this.transport
-            .register_with_cluster_state(&mut this.cluster_state);
+        // NOTE: no transport role-cache attachment (mirrors
+        // `SecondaryCoordinator::new`). `Destination::Primary` is
+        // resolved at THIS edge (`Self::send_to` reads
+        // `cluster_state.current_primary()` with the primary's own
+        // `node_id` as the bootstrap fallback); the transport is
+        // `PeerId`-only and never mirrors the role table. The former
+        // `transport.register_with_cluster_state(..)` wiring is removed.
         // Subscribe the primary-side "important" (LLM-wake-worthy)
         // emission for `PrimaryChanged` to the same role-change hook
         // fabric. Self-contained observability concern: it reads only
@@ -892,6 +913,90 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // co-located primary coordinator, so the hook rides promotion.
         super::important_events::register_primary_changed_important_hook(&mut this.cluster_state);
         this
+    }
+
+    /// THE egress edge: resolve a typed
+    /// [`dynrunner_protocol_primary_secondary::Destination`] to a
+    /// concrete transport target by reading this coordinator's own role
+    /// facts, then dispatch the `PeerId`-only transport. The transport
+    /// never resolves a role.
+    ///
+    /// Resolution reads `cluster_state.current_primary()` with this
+    /// primary's own `config.node_id` as the bootstrap fallback (the
+    /// submitter primary IS the bootstrap primary), so
+    /// `Destination::Primary` is always resolvable on the primary.
+    /// `Secondary`/`Observer` destinations resolve to their carried host
+    /// id; `All` is the mesh broadcast. A resolved host id equal to this
+    /// node's own id is [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`].
+    pub(super) async fn send_to(
+        &mut self,
+        dst: dynrunner_protocol_primary_secondary::Destination,
+        msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
+    ) -> Result<(), String> {
+        use dynrunner_protocol_primary_secondary::{SendTarget, resolve_destination};
+        let target = resolve_destination(
+            dst,
+            self.cluster_state.current_primary(),
+            Some(&self.config.node_id),
+            &self.config.node_id,
+        )
+        .ok_or_else(|| {
+            "Destination unresolvable: no current primary in the role table".to_string()
+        })?;
+        match target {
+            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
+            // Mesh fan-out to every wire peer; ADDITIONALLY the co-located
+            // own-secondary leg (when composed). The co-located secondary
+            // is not a mesh peer of itself, so a `Destination::All`
+            // broadcast — the CRDT mutation / `RunComplete` / keepalive
+            // fan-out — reaches it ONLY through the loopback. The mesh
+            // result is authoritative; a closed loopback is logged (the
+            // own-secondary tore down) but does not fail the broadcast,
+            // matching the per-leg-failure tolerance the keepalive emitter
+            // already relies on.
+            SendTarget::Broadcast => {
+                if let Some(tx) = &self.colocated_loopback_tx
+                    && tx.send(msg.clone()).is_err()
+                {
+                    tracing::debug!(
+                        "co-located secondary inbound loopback closed during broadcast; \
+                         own-secondary leg dropped (secondary torn down)"
+                    );
+                }
+                self.transport.broadcast(msg).await
+            }
+            // Loopback: the resolved host id == this primary's own id.
+            //
+            // With a CO-LOCATED secondary composed (the parked-failover
+            // primary): deliver in-process to the own-secondary's inbound.
+            // This is the dominant own-host path — a `TaskAssignment` to
+            // `Destination::Secondary(own_id)` resolves here, so dropping
+            // it would lose the co-located secondary's work.
+            //
+            // Without a co-located secondary (the submitter primary,
+            // in-process tests): the only reachable case is the
+            // demoted-vs-live relay arm (`task/request.rs`) — a LIVE
+            // primary that couldn't assign a `TaskRequest` locally falls
+            // through to relay it to `Destination::Primary`, which is
+            // itself. Re-delivering it to the node already holding (and
+            // unable to assign) it is a benign no-op: the task stays in
+            // this primary's pool and the secondary retries on its next
+            // backoff tick. Faithful to the prior behaviour, where the
+            // self-relay resolved to `send_to_peer(own_id)` → NoRoute →
+            // swallowed.
+            SendTarget::Loopback => match &self.colocated_loopback_tx {
+                Some(tx) => tx.send(msg).map_err(|_| {
+                    "co-located secondary inbound loopback closed".to_string()
+                }),
+                None => {
+                    tracing::debug!(
+                        "Destination resolved to self with no co-located secondary \
+                         (live-primary self-relay); no-op — the message is already at this host"
+                    );
+                    Ok(())
+                }
+            },
+        }
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
@@ -925,6 +1030,28 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
     ) {
         self.panik_signal_rx = Some(rx);
+    }
+
+    /// Register the in-process loopback sender into a CO-LOCATED
+    /// secondary's inbound. Set ONLY by the multi-role-host composition
+    /// (the parked-failover primary), where this primary shares a host
+    /// with a secondary it must deliver to without a wire hop. Pre-run
+    /// contract, same one-shot shape as the other `register_*` setters.
+    ///
+    /// Once set, the egress edge ([`Self::send_to`]) delivers a resolved
+    /// [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`]
+    /// (own-host unicast) AND the own-secondary leg of every
+    /// `Destination::All` broadcast through this sender. Absent
+    /// registration (the submitter primary, in-process tests) leaves the
+    /// loopback `None`: own-host `Loopback` resolution is the benign
+    /// live-primary self-relay no-op and broadcasts are the plain mesh
+    /// fan-out. The sender carries the SAME `DistributedMessage` a wire
+    /// frame would, so the receiving secondary processes it identically.
+    pub fn register_colocated_loopback(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        self.colocated_loopback_tx = Some(tx);
     }
 
     /// Tear down the peer-lifecycle dispatcher task spawned at
@@ -2282,15 +2409,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready(&mut command_rx).await?;
 
-        // Activate THIS node's co-located primary as the sole
-        // authority. In the unified model the authority is the node the
-        // secondaries dialled (their transport uplink), so there is no
-        // remote `PromotePrimary` hand-off and no role re-point — every
-        // secondary keeps routing `Role::Primary` to its uplink (this
-        // node). The continuously-replicated ledger is the only source
-        // of truth; `wait_for_mesh_ready` above already held until the
-        // peer mesh settled so cross-node dispatch never routes into a
-        // still-forming mesh. See `activate_local_primary`.
+        // Activate THIS node's co-located primary. It originates the
+        // uniform `PrimaryChanged { new = self }` announcement so every
+        // replica resolves `Role::Primary` to this now-routable mesh
+        // peer. `wait_for_mesh_ready` above already held until the peer
+        // mesh settled, so the announce warms each replica's role cache
+        // to a real connection and cross-node dispatch never routes into
+        // a still-forming mesh. See `activate_local_primary`.
         self.activate_local_primary().await?;
 
         // Put the command-channel receiver back on `self` so

@@ -21,11 +21,7 @@
 //! flight — and a per-field split would force every operational
 //! handler to thread the relevant subset through method arguments.
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
-
-use dynrunner_core::{Identifier, TaskInfo, WorkerId};
-use dynrunner_manager_local::pool::WorkerPool;
+use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -33,7 +29,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
-use self::primary_link::PrimaryLink;
+use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
 mod coordinator;
 mod dispatch;
@@ -112,11 +108,15 @@ pub(super) struct PendingFirstBind<I: Identifier> {
 /// workers. It reports completions back and requests more work.
 ///
 /// Generic over:
-/// - `Tr`: the unified transport (a `PeerTransport<I>`). One opaque
-///   handle: the manager addresses by [`Address`] and never branches
-///   on transport locality. Routing (local-vs-remote primary AND the
-///   promotion re-route) lives entirely inside the transport — see
-///   `dynrunner_transport_tunnel::UnifiedSecondaryTransport`.
+/// - `Tr`: the single `PeerId`-keyed mesh transport (a
+///   `PeerTransport<I>`). One opaque handle: the manager addresses by
+///   typed `Destination` and the egress edge ([`Self::send_to`])
+///   resolves it to a concrete peer-id (current/bootstrap primary,
+///   addressed secondary/observer, or broadcast). The transport never
+///   resolves a role — it is delivered a `PeerId`. The promotion
+///   re-route is implicit: `current_primary()` updates on every
+///   `PrimaryChanged`, so the next `Destination::Primary` resolves to
+///   the new holder.
 /// - `M`: manager endpoint for worker communication
 /// - `S`: scheduler
 /// - `E`: memory estimator
@@ -131,27 +131,34 @@ where
 {
     config: SecondaryConfig,
 
-    /// The single opaque transport handle. Every operational send is
-    /// an [`Address`]-addressed `transport.send(..)`; every inbound
-    /// frame arrives via `transport.recv_peer()` (which merges the
-    /// uplink + mesh streams internally). The manager never names a
-    /// `primary_transport`/`peer_transport`, never reads
-    /// `peer_count()` for routing, and never branches on
-    /// transport-locality — the unified transport owns all of that.
+    /// The single opaque `PeerId`-keyed mesh transport handle. Every
+    /// operational send goes through the [`Self::send_to`] egress edge,
+    /// which resolves a typed [`dynrunner_protocol_primary_secondary::Destination`]
+    /// to a concrete peer-id (or broadcast/loopback) by reading this
+    /// coordinator's own role facts, then calls the transport purely
+    /// by-id — the transport never resolves a role. Every inbound frame
+    /// arrives via `transport.recv_peer()`. The manager never names a
+    /// `primary_transport`/`peer_transport`, never reads `peer_count()`
+    /// for routing, and never branches on transport-locality.
     transport: Tr,
+
+    /// The peer-id of the primary this secondary dialled at bootstrap
+    /// (the conventional `"primary"`), set via
+    /// [`Self::set_bootstrap_primary_id`] alongside the mesh-link
+    /// registration. It is the edge's cold-cache fallback when resolving
+    /// [`dynrunner_protocol_primary_secondary::Destination::Primary`]
+    /// before any `PrimaryChanged` warms `cluster_state.current_primary()`
+    /// — the by-id resolution that lets setup frames route to the
+    /// dialled primary during the pre-announcement window. `None` for a
+    /// secondary with no bootstrap primary link (e.g. channel-only unit
+    /// fixtures that never send to the primary before a `PrimaryChanged`).
+    bootstrap_primary_id: Option<String>,
 
     scheduler: S,
     estimator: E,
 
     // Certificate info for peer connections (set before run)
     peer_cert_info: Option<PeerCertInfo>,
-
-    // Workers
-    pool: WorkerPool<M, I>,
-
-    // Task tracking: file_hash -> worker_id (this node's OWN in-flight
-    // worker assignments — own-worker management, not authority).
-    active_tasks: HashMap<String, WorkerId>,
 
     /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
     /// this secondary's OWN workers fired (i.e. tasks actually
@@ -169,108 +176,31 @@ where
     #[cfg(test)]
     local_tasks_run: usize,
 
-    // State
-    transfer_complete: bool,
-
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
 
-    /// Pre-staged source mode flag — set from the
-    /// `InitialAssignment.pre_staged_mode` the primary sends. When
-    /// true, file resolution skips the extraction-cache hash check
-    /// and trusts `src_network/<local_path>` directly. Off until
-    /// the InitialAssignment lands, which is fine: no TaskAssignment
-    /// can arrive before InitialAssignment.
-    ///
-    /// Also the FIRST half of the setup-discovery yield discriminator:
-    /// `pre_staged_mode == true` means the authority deferred task
-    /// discovery to the corpus-mounting secondaries (the submitter has
-    /// no local corpus view, so it sent an empty `InitialAssignment`
-    /// with this flag set rather than seeding the ledger). See
-    /// [`Self::setup_discovery_done`].
-    pre_staged_mode: bool,
+    /// The typed secondary lifecycle. Replaces the scattered
+    /// configuration latches (`setup_phase_completed`,
+    /// `transfer_complete`, `pre_staged_mode`, `uses_file_based_items`,
+    /// `setup_discovery_done`) and the operational-only state (`pool`,
+    /// `active_tasks`, `peer_keepalives`, `primary_last_seen`,
+    /// `election`, `pending_peer_messages`, `primary_link`,
+    /// `pending_worker_restarts`, `pending_first_bind`) with one state
+    /// value whose variants make the system's capability invariants
+    /// unrepresentable to violate: no worker pool exists before
+    /// `Configuring`, and the `TaskAssignment` / election / keepalive
+    /// handlers are reachable only through the `OperationalState`
+    /// accessor. See `lifecycle/mod.rs` for the full invariant set.
+    pub(in crate::secondary) lifecycle: SecondaryLifecycle<M, I>,
 
-    /// One-shot latch for the setup-discovery `SetupPending` yield.
-    ///
-    /// In pre-staged mode the cluster ledger starts empty (the authority
-    /// deferred discovery). The `process_tasks` loop yields
-    /// `RunOutcome::SetupPending` so the PyO3 wrapper can run Python's
-    /// `task.discover_items` against the locally bind-mounted corpus and
-    /// feed the result back via [`Self::ingest_setup_discovery`], which
-    /// broadcasts `PhaseDepsSet + TaskAdded` onto the mesh and sets this
-    /// latch.
-    ///
-    /// The latch is what makes the yield FIRE-ONCE: the natural
-    /// "ledger non-empty" self-clear (`cluster_state.task_count() > 0`)
-    /// covers the common case, but an *empty* discovery (every item
-    /// already complete under a `--skip-existing` filter) leaves the
-    /// ledger empty forever — without the latch the loop would re-yield
-    /// on every re-entry. `ingest_setup_discovery` sets the latch
-    /// unconditionally (including the empty-discovery path, which also
-    /// broadcasts `RunComplete`), so re-entry never re-yields. Always
-    /// false outside pre-staged mode (no yield is ever produced there).
-    setup_discovery_done: bool,
-
-    /// Whether dispatched task items are backed by real files (the
-    /// historical contract). Set from
-    /// `InitialAssignment.uses_file_based_items`. When false, the
-    /// extraction-cache resolution is skipped entirely and the
-    /// wire's `local_path` is passed through to the worker as an
-    /// opaque identifier — no `stat()`, no hash, no `.exists()`
-    /// check. Defaults to TRUE before InitialAssignment lands so
-    /// the historical behaviour remains in place.
-    uses_file_based_items: bool,
-
-    // Peer keepalive tracking: peer_id -> last_seen timestamp
-    peer_keepalives: HashMap<String, f64>,
-
-    // Primary keepalive tracking for failover detection (F2). `None` until
-    // the first primary message arrives. Updated on every primary message,
-    // not just `Keepalive`, so an actively-routing primary doesn't get
-    // falsely declared dead.
-    primary_last_seen: Option<Instant>,
-
-    // Failover election state (F2). Defaults to Normal until the primary
-    // misses keepalives.
-    election: election::ElectionState,
-
-    // Deferred peer messages to send (queued from sync handlers)
-    pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
-
-    /// Routing target + per-worker request rate limiting for the
-    /// secondary→primary link. Single owner of "where do operational
-    /// sends go?" and "is this worker's request allowed to fire yet?"
-    /// — see `primary_link.rs` for the boundary contract.
-    pub(in crate::secondary) primary_link: PrimaryLink,
-
-    /// One-shot watchdog deadline for "did the peer mesh form?".
-    /// Set to `now + 30s` when `wait_for_setup` kicks off the per-peer
-    /// dials with at least one peer in the list; cleared on first
-    /// keepalive tick after the deadline passes (after the watchdog
-    /// has logged its result). `None` means either we haven't reached
-    /// the dial step yet, the peer list was empty (single-secondary
-    /// runs), or the watchdog has already fired.
-    ///
-    /// Without this, the per-peer "QUIC to peer X timed out, trying
-    /// WSS" / "WSS to peer X also failed" lines are scattered across
-    /// the log with no single signal that the secondary is now
-    /// running primary-only — operators have to grep + count to
-    /// realise. Cohort 4 (tokenizer) hit exactly this: 5 secondaries,
-    /// each printed 4 dial-failure lines, and silence after that;
-    /// the actual "0 peers connected ⇒ degraded" state was implied.
-    peer_mesh_check_at: Option<Instant>,
-    /// Number of peers we asked the transport to dial. Used by the
-    /// watchdog to phrase the WARN ("0 of N peers reachable") and to
-    /// suppress the watchdog when peers is empty (single-secondary).
-    peer_dial_count: u32,
-    /// One-shot guard: have we already emitted `MeshReady` to the
-    /// primary? The primary defers `PromotePrimary` until every
-    /// secondary has reported, so duplicate sends would over-count
-    /// (harmless on the receiving end today, but the contract is
-    /// "exactly once per secondary"). Toggled true the first time
-    /// `report_mesh_ready_if_needed` decides the mesh has settled
-    /// (mesh formed, watchdog elapsed, or no peers to dial).
-    mesh_ready_sent: bool,
+    /// Peer-mesh-formation progress — the orthogonal sub-concern carried
+    /// ACROSS the lifecycle's config states (it begins forming on the
+    /// unconfigured peer and continues unchanged into `Operational`). It
+    /// is NOT a config state and is NOT gated behind configuration: an
+    /// unconfigured secondary joins the mesh as far as it can. Modelled
+    /// as a sibling field of the lifecycle FSM exactly the way the plan
+    /// scopes it — see [`MeshFormation`].
+    pub(in crate::secondary) mesh: MeshFormation,
 
     /// Set by handlers that detect an unrecoverable local fault.
     /// The main `process_tasks` loop checks this once per iteration
@@ -305,13 +235,6 @@ where
     ///     a surprise the day a future peer-transport variant
     ///     buffers messages even when nothing is connected.
     ///
-    /// Distinct from `peer_mesh_check_at`: the watchdog field tracks
-    /// the in-flight deadline (cleared when mesh forms OR watchdog
-    /// fires). `peer_mesh_degraded` is the post-fire latch that
-    /// callers consult to decide whether peer-mesh-dependent
-    /// behaviour is available.
-    pub(super) peer_mesh_degraded: bool,
-
     /// Replicated mirror of the cluster ledger. Maintained by applying
     /// every `DistributedMessage::ClusterMutation` observed on the mesh.
     /// Read-only authority-wise on this node — the secondary never
@@ -323,61 +246,6 @@ where
     /// panik self-departure `PeerRemoved` (both via
     /// `origination::apply_and_broadcast_mutations`).
     pub(super) cluster_state: ClusterState<I>,
-
-    /// Worker IDs queued for respawn at the next `process_tasks`
-    /// tick. Populated by the assignment-dispatch path
-    /// (`dispatch/router.rs`'s `TaskAssignment` arm) when an
-    /// `assign_task` write fails on a broken pipe — i.e. the worker
-    /// subprocess is observed dead WITHOUT a corresponding
-    /// `WorkerEvent::Disconnected` arriving on the pool's event channel.
-    /// (The pre-unification self-assign-vs-wire split — a separate
-    /// `handle_primary_task_request` Err arm — is gone: the unified
-    /// transport delivers a self-addressed assignment via the same
-    /// loopback path as any wire frame, so there is ONE dispatch site.)
-    ///
-    /// In both cases the worker subprocess has voluntarily exited
-    /// — typically because `NonRecoverableError` in the task
-    /// handler causes the runtime to send the error response,
-    /// then the framework's restart-on-next-assignment contract
-    /// (see `dynamic_runner.worker.runtime.NonRecoverableError`
-    /// docstring) kicks in. The `assign_task` write subsequently
-    /// fails on Broken pipe and the worker_id ends up here.
-    ///
-    /// `process_tasks` drains the set at the end of each tick and
-    /// calls `pool.restart_worker(wid, factory, _)` for each
-    /// entry, then re-issues a `TaskRequest` so the fresh worker
-    /// pulls fresh work from the primary's pool. Idempotent on
-    /// duplicate entries — the worker either restarted at the
-    /// last drain (set was emptied) or is still queued (no-op
-    /// already in flight).
-    pub(super) pending_worker_restarts: HashSet<WorkerId>,
-
-    /// Tasks DEFERRED because the target worker's per-type subprocess
-    /// is mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`; the
-    /// `WorkerEvent::Ready` handler picks the entry up and assigns it
-    /// once the slot is Idle with the new type bound. See
-    /// [`PendingFirstBind`] for the full contract.
-    pub(super) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-
-    /// Re-entry guard for `run_until_setup_or_done`. The first call
-    /// runs `initialize_workers`, the setup-handshake (`send_welcome`,
-    /// `send_cert_exchange`, `wait_for_setup`) and then enters
-    /// `process_tasks`. If `process_tasks` returns early with
-    /// `RunOutcome::SetupPending`, the caller (the PyO3 wrapper) runs
-    /// Python discovery and re-enters this same method to resume.
-    /// On that second entry the per-secondary setup phase must NOT
-    /// run again — `initialize_workers` would race against the
-    /// already-spawned worker pool and `wait_for_setup` would block
-    /// on wire messages that have already been consumed. This flag
-    /// is set the moment setup completes successfully and gates the
-    /// setup block on every subsequent entry.
-    ///
-    /// Always false on the pre-seeded (`required_setup_on_promote =
-    /// false`) and failover paths; the existing `run` wrapper only
-    /// calls `run_until_setup_or_done` once, so the flag transition
-    /// is `false → true (mid-call) → (method returns Done)` for
-    /// those callers.
-    pub(super) setup_phase_completed: bool,
 
     /// Peer-lifecycle dispatcher channel receiver, paired with the
     /// `lifecycle_tx` installed on `cluster_state` at construction.
@@ -430,9 +298,8 @@ where
     /// by the spawned announcer task. The matching receiver is
     /// drained by the operational `select!` arm in `process_tasks`,
     /// which dequeues each [`crate::observer::announcer::AnnouncerOutboxItem`]
-    /// and forwards it onto `transport.send(Address::Role(Role::Primary),
-    /// msg)`, returning the outcome through the item's `reply`
-    /// oneshot.
+    /// and forwards it onto `send_to(Destination::Primary, msg)`,
+    /// returning the outcome through the item's `reply` oneshot.
     ///
     /// `None` outside an active observer wiring — non-observer
     /// secondaries (and observer coordinators whose caller hasn't
@@ -624,4 +491,32 @@ where
     /// Mirrors the same field on
     /// [`dynrunner_manager_local::manager::LocalManager`].
     pub(super) sampler: Option<dynrunner_manager_local::memprofile::MemProfileSampler>,
+
+    /// Co-located primary INBOUND sender (channel CH2). Registered by the
+    /// pyo3 composition via [`Self::register_colocated_primary_inbound`]
+    /// when this host runs both a secondary and a (parked) co-located
+    /// primary on the one mesh transport. The secondary forwards every
+    /// `is_primary_facing` frame into this sender when it holds the
+    /// primary role, and routes its own-host terminal reports here via
+    /// the [`Self::send_to`] `Loopback` arm; the co-located
+    /// `PrimaryCoordinator`'s `recv_peer` drains the matching receiver.
+    /// `None` outside a co-located composition (every non-pyo3 path) —
+    /// the forward is then a no-op and the `Loopback` arm drops, exactly
+    /// as before. `take`-n into the operational loop's latches at
+    /// `enter_operational`.
+    pub(super) colocated_primary_inbound_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>>,
+
+    /// Co-located primary LOOPBACK receiver (channel CH1). Registered by
+    /// the pyo3 composition via
+    /// [`Self::register_colocated_loopback_inbound`]. Carries the
+    /// primary→secondary direction (own-host `TaskAssignment` loopback +
+    /// the co-located primary's `Destination::All` broadcast leg); the
+    /// secondary drains it in its operational `select!` loop next to
+    /// `transport.recv_peer` and feeds each frame through `handle_inbound`
+    /// exactly as a wire frame. `None` outside a co-located composition —
+    /// the drain arm parks on `pending()`. `take`-n into the operational
+    /// loop on first entry.
+    pub(super) colocated_loopback_inbound_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }

@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 use dynrunner_core::{ErrorType, ResourceAmount, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
-use crate::address::Role;
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
@@ -28,9 +27,9 @@ use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 /// every dispatch and destructure site through indirection for a
 /// one-time stack-size win, and that field is the bulk of the size;
 /// per-variant fields stay inline to match the rest of the enum. The
-/// existing Box wrappers on `Relay.inner` and `RoleAddressed.payload`
-/// exist for recursive-shape reasons (a self-referential variant must
-/// be boxed), not for size containment.
+/// existing `Box` wrapper on `Relay.inner` exists for recursive-shape
+/// reasons (a self-referential variant must be boxed), not for size
+/// containment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
 #[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
@@ -424,50 +423,6 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         original_sender: String,
         relay_id: u64,
-    },
-    /// Envelope used for role-based addressing. The sender resolves
-    /// `intended_role` to a specific peer-id via its local RoleTable
-    /// cache and ships this envelope to that peer. The receiver checks
-    /// its OWN cache; if it agrees it holds `intended_role`, it unwraps
-    /// and processes `payload`. If not, the receiver's relay-and-hint
-    /// path (Step 4) forwards `payload` to whoever IT thinks holds the
-    /// role AND sends a `RoleMisaddressHint` back to `sender_id` to
-    /// warm the sender's cache.
-    ///
-    /// `attempts` is the relay-hop counter — if it exceeds a safety
-    /// bound (e.g. 3), the receiver drops the envelope rather than
-    /// relay further. This caps relay storms when the cluster is in
-    /// disagreement about who holds the role.
-    ///
-    /// `payload` is boxed because `DistributedMessage` is variant-
-    /// sized; an unboxed recursive enum would blow up the
-    /// discriminant size and force every other variant to carry the
-    /// max-variant overhead. Same pattern as `Relay { inner: Box<_> }`.
-    ///
-    /// `attempts` carries `#[serde(default)]` so pre-Step-3 wire
-    /// senders that omit the field decode as `attempts=0` — same
-    /// backcompat shape we use for `is_observer`, `required_setup`,
-    /// and the Phase-4b binary-info tags.
-    RoleAddressed {
-        sender_id: String,
-        timestamp: f64,
-        intended_role: Role,
-        payload: Box<DistributedMessage<I>>,
-        #[serde(default)]
-        attempts: u8,
-    },
-    /// Sent back to a `RoleAddressed` sender whose cache was stale.
-    /// The receiver tells the sender "you thought I was `role`, but the
-    /// actual holder is `holder_id`". The sender writes `holder_id` into
-    /// its own RoleTable cache for `role`, so the next send via
-    /// `Address::Role(role)` routes correctly on the first hop. Purely
-    /// cache-warming; the original payload was already forwarded by the
-    /// relaying receiver (Step 4), so the sender does NOT re-send.
-    RoleMisaddressHint {
-        sender_id: String,
-        timestamp: f64,
-        role: Role,
-        holder_id: String,
     },
 }
 

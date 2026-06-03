@@ -6,13 +6,12 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport, make_transport,
+    FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary,
 };
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -30,7 +29,7 @@ fn arm_watchdog_no_peers(
     dial_count: u32,
 ) -> (
     SecondaryCoordinator<
-        TestTransport<NoPeers>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -39,13 +38,17 @@ fn arm_watchdog_no_peers(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
 ) {
     use std::time::Instant;
+    // Channel-backed mesh with the primary folded in (so `send_to_primary`
+    // — the watchdog's `MeshReady` emit — delivers onto `sec_to_pri_rx`,
+    // which the direct-method tests drain to observe what the secondary
+    // sent) and NO alive secondaries in global state (no `PeerJoined`/
+    // `SecondaryCapacity` applied, no peer keepalives), so the role-aware
+    // `alive_secondary_count()` reads 0 and arms the degraded path.
+    // Inbound is never fed: these tests drive the watchdog/election via
+    // direct method calls and never inject primary inbound.
     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
-        tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    let (_from_primary_tx, from_primary_rx) = tokio_mpsc::unbounded_channel();
+    let unified = channel_mesh_to_primary(secondary_id, sec_to_pri_tx, from_primary_rx);
     let config = SecondaryConfig {
         secondary_id: secondary_id.into(),
         num_workers: 1,
@@ -75,19 +78,20 @@ fn arm_watchdog_no_peers(
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        TestTransport<NoPeers>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        make_transport(secondary_id, uplink, NoPeers),
+        unified,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    secondary.peer_dial_count = dial_count;
-    secondary.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
+    secondary.set_bootstrap_primary_id("primary".to_string());
+    secondary.mesh.peer_dial_count = dial_count;
+    secondary.mesh.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
     (secondary, sec_to_pri_rx)
 }
 
@@ -115,7 +119,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
 
     // Pre-fault: nothing on the wire, no exit flag, not degraded.
     assert!(secondary.fatal_exit.is_none());
-    assert!(!secondary.peer_mesh_degraded);
+    assert!(!secondary.is_mesh_degraded());
     assert!(sec_to_pri_rx.try_recv().is_err());
 
     secondary.check_peer_mesh_watchdog().await;
@@ -123,7 +127,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
     // Post-fault: degraded latched true, watchdog disarmed, NO
     // fatal_exit (the run continues over WSS).
     assert!(
-        secondary.peer_mesh_degraded,
+        secondary.is_mesh_degraded(),
         "peer_mesh_degraded must latch true after deadline-elapsed-zero-peers"
     );
     assert!(
@@ -131,7 +135,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
         "watchdog must NOT set fatal_exit in graceful-degrade mode"
     );
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "watchdog must disarm after firing"
     );
 
@@ -196,9 +200,9 @@ async fn watchdog_silent_after_run_complete() {
     // Pre-condition: degraded latch off, no fatal exit, deadline
     // armed past the elapsed point so the watchdog WOULD fire
     // without the run-complete short-circuit.
-    assert!(!secondary.peer_mesh_degraded);
+    assert!(!secondary.is_mesh_degraded());
     assert!(secondary.fatal_exit.is_none());
-    assert!(secondary.peer_mesh_check_at.is_some());
+    assert!(secondary.mesh.peer_mesh_check_at.is_some());
 
     // Simulate the primary's run-complete broadcast landing on the
     // local cluster mirror — same code path as the production
@@ -212,12 +216,12 @@ async fn watchdog_silent_after_run_complete() {
     // Post-fire: degraded NOT latched, watchdog disarmed silently,
     // no `MeshReady` and no `SecondaryFatalError` on the wire.
     assert!(
-        !secondary.peer_mesh_degraded,
+        !secondary.is_mesh_degraded(),
         "run-complete short-circuit must NOT enter degraded mode"
     );
     assert!(secondary.fatal_exit.is_none());
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "run-complete short-circuit must disarm the watchdog"
     );
     assert!(
@@ -253,10 +257,10 @@ async fn watchdog_still_fires_pre_run_complete() {
     // #15 contract is preserved: degraded latched, watchdog
     // disarmed, MeshReady(peer_count=0) emitted to the primary.
     assert!(
-        secondary.peer_mesh_degraded,
+        secondary.is_mesh_degraded(),
         "pre-RunComplete watchdog must still enter degraded mode"
     );
-    assert!(secondary.peer_mesh_check_at.is_none());
+    assert!(secondary.mesh.peer_mesh_check_at.is_none());
     assert!(secondary.fatal_exit.is_none());
 
     let mut saw_mesh_ready = false;
@@ -292,10 +296,10 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let uplink = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
+            // Channel-backed mesh: the `fake_primary` is folded in as a
+            // mesh peer (no per-role uplink). Inbound is the
+            // primary→secondary channel; outbound the secondary→primary.
+            let unified = channel_mesh_to_primary("sec-deg", sec_to_pri_tx, pri_to_sec_rx);
             let config = SecondaryConfig {
                 secondary_id: "sec-deg".into(),
                 num_workers: 1,
@@ -338,15 +342,16 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             ));
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                make_transport(&secondary_id, uplink, NoPeers),
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
             // Pre-latch degraded mode so the run starts in the
             // post-watchdog-fire state. The watchdog's actual fire
             // path is covered by `peer_mesh_watchdog_enters_degraded_mode_when_no_peers`.
-            secondary.peer_mesh_degraded = true;
-            secondary.peer_dial_count = 2;
+            secondary.mesh.degraded = true;
+            secondary.mesh.peer_dial_count = 2;
 
             let mut factory = FakeWorkerFactory;
             secondary
@@ -360,7 +365,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 "WSS dispatch must keep flowing after peer-mesh degraded mode"
             );
             assert!(
-                secondary.peer_mesh_degraded,
+                secondary.is_mesh_degraded(),
                 "degraded latch must persist for the duration of the run"
             );
             primary_handle.await.unwrap();
@@ -381,10 +386,11 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
     // Latch degraded mode (skip running the watchdog — the prior
     // test covers that path; this one only exercises the consumer).
-    sec.peer_mesh_degraded = true;
-    sec.peer_dial_count = 4;
+    sec.mesh.degraded = true;
+    sec.mesh.peer_dial_count = 4;
     // Mark the primary as silent past the death deadline. With
     // peer_keepalives empty (no mesh), `run_election_tick` would
     // otherwise enter Suspecting and then self-promote on
@@ -403,7 +409,7 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
         "fatal reason should explain the degraded-failover bail, got: {reason}"
     );
     assert!(
-        matches!(sec.election, ElectionState::Normal),
+        matches!(sec.op_mut().election, ElectionState::Normal),
         "degraded failover bail must NOT transition the election state \
          (no Suspecting, no Candidate, no Promoted)"
     );
@@ -415,23 +421,27 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
 
 /// T-B1-quorum-survives: sanity check that the watchdog's
 /// healthy-mesh path is unaffected by the degrade refactor. With
-/// `FixedPeerCount(3)` reporting a non-empty peer set before the
-/// deadline, the watchdog clears `peer_mesh_check_at`, sends
-/// `MeshReady(peer_count=3)`, and leaves `peer_mesh_degraded`
-/// false.
+/// three alive peer-secondaries in GLOBAL STATE (their `Secondary`
+/// keepalives recorded — the operational signal the watchdog reads)
+/// before the deadline, the watchdog clears `peer_mesh_check_at`,
+/// sends `MeshReady(peer_count=3)`, and leaves `peer_mesh_degraded`
+/// false. The role-aware count is over global state, NOT the
+/// transport's role-blind `peer_count()`.
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
-    use super::super::test_helpers::FixedPeerCount;
+    use super::super::wire::timestamp_now;
     use std::time::Instant;
     let _ = tracing_subscriber::fmt::try_init();
 
     let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    // Channel-backed mesh with ONLY the primary folded in (so the
+    // watchdog's `MeshReady` emit lands on `sec_to_pri_rx`). The three
+    // healthy peer-secondaries are set up as GLOBAL STATE below (recorded
+    // `Secondary` keepalives), since the watchdog's role-aware
+    // `alive_secondary_count()` reads global state, never the transport.
+    let unified = channel_mesh_to_primary("sec-quo", sec_to_pri_tx, pri_to_sec_rx);
     let config = SecondaryConfig {
         secondary_id: "sec-quo".into(),
         num_workers: 1,
@@ -461,32 +471,44 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        TestTransport<FixedPeerCount>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        make_transport("sec-quo", uplink, FixedPeerCount(3)),
+        unified,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    // 4 peers attempted, 3 reported by the transport — healthy
-    // multi-peer config. Deadline still in the future; the
-    // pre-deadline `peer_count > 0` branch is the one that fires.
-    secondary.peer_dial_count = 4;
-    secondary.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));
+    secondary.set_bootstrap_primary_id("primary".to_string());
+    // Drive the coordinator Operational (the regime in which the watchdog
+    // ticks in production, where `peer_keepalives` is the alive-secondary
+    // signal) and record 3 alive peer-secondaries — a fully-formed healthy
+    // mesh in GLOBAL STATE. Deadline still in the future; the
+    // typed-lifecycle watchdog's pre-deadline early-clear fires when EVERY
+    // expected secondary is alive (`alive_secondary_count() ==
+    // peer_dial_count`). With 3 == 3 the full-formed branch disarms early.
+    secondary.enter_operational_for_test();
+    for i in 0..3u32 {
+        secondary
+            .op_mut()
+            .peer_keepalives
+            .insert(format!("peer-{i}"), timestamp_now());
+    }
+    secondary.mesh.peer_dial_count = 3;
+    secondary.mesh.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));
 
     secondary.check_peer_mesh_watchdog().await;
 
     assert!(
-        !secondary.peer_mesh_degraded,
+        !secondary.is_mesh_degraded(),
         "healthy mesh path must NOT touch peer_mesh_degraded"
     );
     assert!(secondary.fatal_exit.is_none());
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "watchdog disarms once the mesh is observed healthy"
     );
 

@@ -30,7 +30,6 @@ use super::super::*;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,13 +56,14 @@ fn make_observer_with_recorder(
     Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
 ) {
-    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
+    // The observer holds the `RecordingPeer` mesh stub directly. The
+    // returned `sec_to_pri_rx` (formerly the uplink's secondary→primary
+    // receiver) stays for the helper signature, but the observer
+    // originates nothing — any primary-bound send would now land in the
+    // mesh recorder's `peer_log`, which the tests assert is empty — so
+    // dropping the uplink does not change what these tests exercise.
+    let (_sec_to_pri_tx, sec_to_pri_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     let recorder = RecordingPeer::<TestId>::new(1);
     let peer_log = recorder.log_handle();
     let mut config = election_config(observer_id);
@@ -71,7 +71,7 @@ fn make_observer_with_recorder(
     config.num_workers = 0;
     let sec = SecondaryCoordinator::new(
         config,
-        make_transport(observer_id, uplink, recorder),
+        make_transport(recorder),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -227,7 +227,7 @@ fn late_joining_observer_gets_full_snapshot_with_observer_role() {
         "observer role must survive the snapshot restore"
     );
     // Setup-skip latched.
-    assert!(sec.setup_phase_completed);
+    assert!(sec.lifecycle.setup_phase_completed());
 }
 
 /// (4b): a late-joining WORKER restores the same full snapshot but is
@@ -236,14 +236,10 @@ fn late_joining_observer_gets_full_snapshot_with_observer_role() {
 /// restore carries the worker's actual (non-observer) role.
 #[test]
 fn late_joining_worker_gets_full_snapshot_without_observer_role() {
-    // A WORKER late-joiner: a regular (non-observer) secondary.
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
-        tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    // A WORKER late-joiner: a regular (non-observer) secondary. It
+    // restores from a snapshot and inspects `cluster_state` directly —
+    // no primary uplink inbound is exercised — so it holds the `NoPeers`
+    // mesh stub directly.
     let config = election_config("late-worker"); // is_observer defaults false
     let mut sec: SecondaryCoordinator<
         TestTransport<super::super::test_helpers::NoPeers>,
@@ -253,7 +249,7 @@ fn late_joining_worker_gets_full_snapshot_without_observer_role() {
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        make_transport("late-worker", uplink, super::super::test_helpers::NoPeers),
+        make_transport(super::super::test_helpers::NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -340,6 +336,7 @@ async fn malformed_cluster_snapshot_latches_fatal_exit() {
         .run_until(async {
             let (mut observer, _peer_log, _uplink_rx) =
                 make_observer_with_recorder("obs-malformed");
+            observer.enter_operational_for_test();
 
             // Precondition: nothing restored yet.
             assert_eq!(

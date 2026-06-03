@@ -3,16 +3,26 @@
 //! Owns a per-peer inbox + outbox table and delegates all routing
 //! decisions to [`Router`]. Tests simulate partitions by mutating
 //! `outgoing` through `disconnect_from` / `connect_to`.
+//!
+//! Role-blind by construction (transport ⊥ roles): it addresses peers
+//! only by [`PeerId`] and never resolves or mentions primary/secondary.
+//! Role-resolution lives at the coordinator egress edge; this transport
+//! just delivers to the id it is handed. The bootstrap primary is folded
+//! in as an ordinary directed-routable member via
+//! [`ChannelPeerTransport::register_primary_link`] — the channel analog
+//! of the QUIC `PeerNetwork::register_primary_link` — so
+//! `send_to_peer(primary)` / `has_peer(primary)` resolve over it. The
+//! transport is role-blind: it counts and broadcasts to the folded
+//! primary like any peer; the role-aware "how many alive secondaries"
+//! policy lives at the coordinator edge (`alive_secondary_count`, over
+//! global state), exactly as the QUIC transport does.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Role,
-    RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    read_role_cache,
+    DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Router,
+    SendOutcome,
 };
 use tokio::sync::mpsc;
 
@@ -35,15 +45,11 @@ use crate::now_clocks;
 /// it directly instead of bypassing the [`PeerTransport`] trait, per
 /// the "abstractions the test path circumvents are wrong" rule.
 pub struct ChannelPeerTransport<I: Identifier> {
-    /// Local peer-id. Surfaced via
-    /// [`PeerTransport::local_id`] so the trait's `send` default
-    /// impl can populate the `sender_id` field of the
-    /// `RoleAddressed` envelope it constructs for
-    /// `Address::Role(_)` dispatches (Step 3). The Router also
-    /// holds this id (for relay-path bookkeeping); duplicating it
-    /// at the transport level is cheap (`String`, populated once at
-    /// mesh construction) and saves a layer of indirection on the
-    /// `local_id` hot path.
+    /// Local peer-id. The Router holds this id for relay-path
+    /// bookkeeping; duplicating it at the transport level is cheap
+    /// (`String`, populated once at mesh construction) and lets the
+    /// transport answer its own identity without reaching into the
+    /// router.
     pub(crate) local_id: String,
     pub(crate) incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
     pub(crate) outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
@@ -56,17 +62,31 @@ pub struct ChannelPeerTransport<I: Identifier> {
     /// assertions per `M5` of the relay-routing plan. Not part of the
     /// stable public API; production callers should ignore it.
     pub last_outcome: Option<SendOutcome>,
-    /// Write-through cache of `Role → peer_id`. Populated by the
-    /// hook registered via
-    /// [`PeerTransport::register_with_cluster_state`]; read by
-    /// [`PeerTransport::peer_for_role`] on the send hot path. Empty
-    /// until registration runs — transports that never register
-    /// observe `None` for every lookup.
-    pub(crate) role_cache: RoleCache,
+    /// Id of the bootstrap-primary's DIRECTED mesh link, if registered
+    /// via [`Self::register_primary_link`]. The secondary registers its
+    /// channel link to the in-process primary here so
+    /// `send_to_peer(primary)` / `has_peer(primary)` resolve over the
+    /// folded wire — the primary becomes a routable mesh member from the
+    /// secondary's side.
+    ///
+    /// The transport treats it as an ordinary mesh member (counted in
+    /// [`PeerTransport::peer_count`] and reached by [`PeerTransport::broadcast`],
+    /// role-blind); the role-aware "how many alive secondaries" policy is
+    /// the coordinator edge's concern (`alive_secondary_count`, over global
+    /// state), NOT the transport's.
+    /// Symmetric with `PeerNetwork::primary_link_id` on the QUIC side.
+    pub(crate) primary_link_id: Option<String>,
 }
 
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        // Role-blind fan-out to every connection incl the folded primary
+        // (mirrors the QUIC `PeerNetwork` Real arm post de-role). The
+        // primary also receiving the secondary's broadcast keepalive/CRDT
+        // is a benign idempotent double (it also arrives via
+        // `send_to_primary`); excluding it would be a role concern the
+        // transport must not encode (TRANSPORT⊥ROLES) — the single
+        // authoritative exclusion lives at the coordinator edge.
         for tx in self.outgoing.values() {
             // Closed senders are tolerated — the peer simply went away.
             let _ = tx.send(msg.clone());
@@ -105,15 +125,11 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
             let msg = self.incoming_rx.recv().await?;
             clocks = now_clocks();
             self.router.prune(clocks.now);
-            let delivered = match self.router.process_inbound(msg, &mut self.outgoing, clocks) {
-                // `msg` is `Box<DistributedMessage<I>>`; unbox to feed
-                // the by-value role-layer entry point.
-                InboundOutcome::Deliver { msg, .. } => *msg,
+            match self.router.process_inbound(msg, &mut self.outgoing, clocks) {
+                // `msg` is `Box<DistributedMessage<I>>`; unbox to yield
+                // the routed frame to the application layer.
+                InboundOutcome::Deliver { msg, .. } => return Some(*msg),
                 InboundOutcome::Handled { .. } => continue,
-            };
-            match self.handle_role_layer(delivered, clocks) {
-                Some(payload) => return Some(payload),
-                None => continue,
             }
         }
     }
@@ -123,26 +139,32 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
-            let delivered = match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => *msg,
+            match self.router.process_inbound_sync(msg, clocks) {
+                InboundOutcome::Deliver { msg, .. } => return Some(*msg),
                 InboundOutcome::Handled { .. } => continue,
-            };
-            match self.handle_role_layer(delivered, clocks) {
-                Some(payload) => return Some(payload),
-                None => continue,
             }
         }
     }
 
     fn peer_count(&self) -> usize {
+        // Pure membership cardinality (role-blind): all connections incl
+        // the folded primary. The transport must NOT special-case the
+        // primary (TRANSPORT⊥ROLES) — the role-aware "how many alive
+        // secondaries" question is the coordinator edge's single
+        // authoritative concern (`alive_secondary_count`, computed over
+        // global state, NOT transport arithmetic). Mirrors the QUIC
+        // `PeerNetwork` Real arm.
         self.outgoing.len()
     }
 
     fn has_peer(&self, id: &PeerId) -> bool {
         // Real per-id membership: a peer is a member iff it has a direct
-        // outbox in `outgoing` (the same table `peer_count` measures).
+        // outbox in `outgoing`. The bootstrap-primary directed link IS
+        // such an entry, so `has_peer(primary)` is `true` once registered
+        // — it is excluded only from the broadcast fan-out and the
+        // mesh-health `peer_count`, not from per-id reachability.
         // Partition tests that `disconnect_from` / `connect_to` a peer
-        // flip this predicate, exactly as they flip `peer_count`.
+        // flip this predicate.
         self.outgoing.contains_key(id.as_str())
     }
 
@@ -152,19 +174,11 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         // heal via `connect_to` directly.
     }
 
-    fn register_with_cluster_state(&self, registrar: &mut dyn RoleChangeHookRegistrar) {
-        // Hand the shared cache handle to the protocol-crate helper
-        // that installs the hook on the registrar. The hook captures
-        // a clone of the `Arc<RwLock<_>>` and writes through to the
-        // same map `peer_for_role` reads. See
-        // `install_role_change_hook` for the lock-poisoning recovery
-        // rationale.
-        install_role_change_hook(Arc::clone(&self.role_cache), registrar);
-    }
-
-    fn peer_for_role(&self, role: &Role) -> Option<String> {
-        read_role_cache(&self.role_cache, role)
-    }
+    // Role-blind by construction (transport ⊥ roles): this transport
+    // carries no role cache and resolves no role — role-resolution lives
+    // at the coordinator egress edge. The only override below is
+    // `local_id`, the bootstrap-RPC return address used by
+    // `join_running_cluster`.
 
     fn local_id(&self) -> &str {
         &self.local_id
@@ -178,131 +192,56 @@ impl<I: Identifier> ChannelPeerTransport<I> {
     /// This is the channel-transport analogue of the public
     /// [`crate::ChannelSecondaryTransportEnd`] `{ outgoing, incoming_rx }`
     /// shape: a fixture that already owns hand-rolled per-peer channels
-    /// (e.g. a primary whose `outgoing[sec-i]` reaches a fake secondary,
-    /// fed inbound by every fake writing to one aggregated `incoming_rx`)
-    /// wraps them in a real [`PeerTransport`] without standing up a full
-    /// mesh of `ChannelPeerTransport`s. The `Router` + role cache are
-    /// constructed the same way [`crate::peer_mesh_with_adjacency`] does
-    /// (own id seeded for `Role::Self_`), so role-addressed dispatch and
-    /// relay behave identically — the only difference is who supplied
-    /// the channels.
+    /// (e.g. a secondary whose inbound `incoming_rx` is fed by the
+    /// in-process primary and whose `outgoing[primary]` reaches it via
+    /// [`Self::register_primary_link`]) wraps them in a real
+    /// [`PeerTransport`] without standing up a full mesh of
+    /// `ChannelPeerTransport`s. The `Router` is constructed the same way
+    /// [`crate::peer_mesh_with_adjacency`] does, so relay behaves
+    /// identically — the only difference is who supplied the channels.
     pub fn from_raw_channels(
         local_id: String,
         outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
         incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
     ) -> Self {
-        let role_cache = dynrunner_protocol_primary_secondary::new_role_cache();
-        dynrunner_protocol_primary_secondary::seed_self_role(&role_cache, &local_id);
         Self {
             router: Router::new(local_id.clone()),
             local_id,
             incoming_rx,
             outgoing,
             last_outcome: None,
-            role_cache,
+            primary_link_id: None,
         }
     }
 
-    /// Role-layer interceptor: handle [`DistributedMessage::RoleAddressed`]
-    /// (Case A unwrap / Case B relay-and-hint / Cases C, D drop) and
-    /// [`DistributedMessage::RoleMisaddressHint`] (silent cache-warm).
+    /// Fold a channel link to the bootstrap primary into THIS transport
+    /// as a DIRECTED-routable member keyed by `primary_id`. The channel
+    /// analog of `PeerNetwork::register_primary_link`: after this call
+    /// the link is just another mesh connection — "the tunnel is just a
+    /// way of joining the mesh."
     ///
-    /// Returns `Some(payload)` when the caller should yield a message
-    /// to the application layer (Case A or "not a role-layer
-    /// envelope"); returns `None` when the envelope was consumed
-    /// internally (Cases B/C/D, or hint absorbed) — caller loops.
+    /// - **Outbound:** `to_primary` is inserted into [`Self::outgoing`],
+    ///   so [`PeerTransport::send_to_peer`]`(primary_id, ..)` reaches the
+    ///   primary and [`PeerTransport::has_peer`]`(primary_id)` is true.
+    /// - **Inbound** is the transport's single [`Self::incoming_rx`] (the
+    ///   primary's frames are fed into it by the constructing fixture /
+    ///   run-mode wiring), so primary frames surface through
+    ///   [`PeerTransport::recv_peer`] like any other peer's.
     ///
-    /// The relay-and-hint sends bypass `PeerTransport::send_to_peer`
-    /// and go straight to `self.router.send_to_peer`: the trait method
-    /// would update `last_outcome` and surface NoRoute as a hard
-    /// error, neither of which is appropriate for transport-internal
-    /// bookkeeping sends. NoRoute on a Case-B relay falls back to a
-    /// warn-and-drop — the originator's `attempts` counter and the
-    /// next periodic role-table refresh together bound the failure
-    /// horizon.
-    fn handle_role_layer(
+    /// The primary is a DIRECTED-only member: it is recorded in
+    /// [`Self::primary_link_id`] and excluded from
+    /// [`PeerTransport::broadcast`] and the [`PeerTransport::peer_count`]
+    /// mesh-health cardinality, preserving the bootstrap behaviour where
+    /// the secondary's mesh broadcast and mesh-health count never include
+    /// the primary. Symmetric with the QUIC side.
+    pub fn register_primary_link(
         &mut self,
-        msg: DistributedMessage<I>,
-        clocks: Clocks,
-    ) -> Option<DistributedMessage<I>> {
-        match msg {
-            DistributedMessage::RoleAddressed {
-                sender_id,
-                intended_role,
-                payload,
-                attempts,
-                ..
-            } => {
-                let decision = decide_role_addressed_with_cache(
-                    &self.local_id,
-                    &self.role_cache,
-                    sender_id,
-                    intended_role,
-                    payload,
-                    attempts,
-                );
-                match decision {
-                    RoleAddressedAction::Unwrap(inner) => Some(inner),
-                    RoleAddressedAction::Relay {
-                        forward_to,
-                        forwarded,
-                        hint_to,
-                        hint,
-                    } => {
-                        // Both sends are fire-and-forget at the
-                        // role-routing layer. Router::send_to_peer
-                        // emits its own warn on NoRoute / dispatch
-                        // failure; we add a target-tagged warn to
-                        // make role-relay failures distinguishable
-                        // from raw direct-send failures in operator
-                        // logs.
-                        if let Err(e) = self.router.send_to_peer(
-                            &forward_to,
-                            forwarded,
-                            &mut self.outgoing,
-                            clocks,
-                        ) {
-                            tracing::warn!(
-                                forward_to = %forward_to,
-                                error = %e,
-                                "RoleAddressed relay forward failed",
-                            );
-                        }
-                        if let Err(e) = self.router.send_to_peer(
-                            &hint_to,
-                            // Unbox once at the dispatch boundary so the
-                            // by-value send_to_peer signature stays
-                            // unchanged.
-                            *hint,
-                            &mut self.outgoing,
-                            clocks,
-                        ) {
-                            tracing::warn!(
-                                hint_to = %hint_to,
-                                error = %e,
-                                "RoleMisaddressHint send failed",
-                            );
-                        }
-                        None
-                    }
-                    RoleAddressedAction::Drop { reason } => {
-                        tracing::warn!(reason, "RoleAddressed dropped");
-                        None
-                    }
-                }
-            }
-            DistributedMessage::RoleMisaddressHint {
-                role, holder_id, ..
-            } => {
-                // Cache-warming only — never surfaced to the
-                // application layer (per Step 4 design rationale:
-                // senders that issued an Address::Role(_) send are
-                // not awaiting a hint reply).
-                apply_role_misaddress_hint(&self.role_cache, role, holder_id);
-                None
-            }
-            other => Some(other),
-        }
+        primary_id: String,
+        to_primary: mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        tracing::debug!(primary = %primary_id, "folded primary channel link into the mesh");
+        self.outgoing.insert(primary_id.clone(), to_primary);
+        self.primary_link_id = Some(primary_id);
     }
 
     /// Remove a peer's outbox so a subsequent send finds no direct

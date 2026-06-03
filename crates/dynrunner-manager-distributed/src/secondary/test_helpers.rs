@@ -2,6 +2,7 @@
 //! `#[cfg(test)]` so it never enters the production binary.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -13,30 +14,120 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPrimaryTransportEnd, channel_pair};
-use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
+use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPeerTransport, channel_pair};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::mpsc;
 
 use super::{SecondaryConfig, SecondaryCoordinator};
 
-/// The single opaque transport type secondary tests construct: the
-/// production `UnifiedSecondaryTransport` over a channel uplink + a
-/// peer-mesh stub. `P` lets a test pick the peer stub (`NoPeers`,
-/// `FixedPeerCount(n)`, `RecordingPeer`); the uplink is always the
-/// channel end so tests can inject inbound frames / observe sends.
-pub(super) type TestTransport<P> =
-    UnifiedSecondaryTransport<ChannelPrimaryTransportEnd<TestId>, P, TestId>;
+/// The single `Tr: PeerTransport` secondary tests construct: the
+/// peer-mesh stub itself. `P` lets a test pick the stub (`NoPeers`,
+/// `RecordingPeer`, or a real routing-aware `ChannelPeerTransport`
+/// built via `channel_mesh_to_primary` / `channel_mesh_no_primary`).
+///
+/// Post-uplink-deletion the secondary holds its mesh `PeerTransport`
+/// DIRECTLY — there is no per-role uplink leg and no wrapper. Tests
+/// that drive the coordinator via direct method calls (election state,
+/// resource-probe, mesh-watchdog) construct it from a stub and exercise
+/// the coordinator without any primary inbound. Tests that previously
+/// injected "primary" frames over the channel uplink (full setup +
+/// dispatch against a `fake_primary` / `spawn_real_secondary`) need the
+/// primary to be a mesh peer they can feed — i.e. a channel-backed mesh
+/// stub with the primary registered — which is the secondary-test
+/// harness mesh-migration concern, NOT this uplink-deletion leaf; those
+/// are `#[ignore]`d at their call sites until that leaf lands.
+pub(super) type TestTransport<P> = P;
 
-/// Build a [`TestTransport`] from a local id, a channel uplink end, and
-/// a peer-mesh stub. Mirrors the production composition (uplink picked
-/// by topology + mesh handle), but with test channel/stub handles.
-pub(super) fn make_transport<P: PeerTransport<TestId>>(
-    local_id: &str,
-    uplink: ChannelPrimaryTransportEnd<TestId>,
-    peer: P,
-) -> TestTransport<P> {
-    UnifiedSecondaryTransport::new(local_id.to_string(), uplink, peer)
+/// Build a [`TestTransport`] from a peer-mesh stub. The secondary holds
+/// the stub directly as its `Tr: PeerTransport` (the primary is a mesh
+/// peer reached by id, not a wrapped uplink).
+pub(super) fn make_transport<P: PeerTransport<TestId>>(peer: P) -> TestTransport<P> {
+    peer
+}
+
+/// Build the channel-backed mesh transport a secondary holds when driven
+/// against a `fake_primary` in-process: the primary is folded in as an
+/// ordinary mesh peer keyed by `"primary"` (via
+/// [`ChannelPeerTransport::register_primary_link`]), the channel analog of
+/// how the QUIC bootstrap wire folds into `PeerNetwork`.
+///
+/// `to_primary` carries the secondary's outbound to the folded primary
+/// link (the `fake_primary` reads its paired receiver); `from_primary`
+/// is the transport's inbound (the `fake_primary` writes its paired
+/// sender). Callers pair this with `set_bootstrap_primary_id("primary")`
+/// so the egress edge resolves `Destination::Primary` to the same id
+/// while the role table is cold.
+pub(super) fn channel_mesh_to_primary(
+    secondary_id: &str,
+    to_primary: mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    from_primary: mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> ChannelPeerTransport<TestId> {
+    let mut transport =
+        ChannelPeerTransport::from_raw_channels(secondary_id.into(), HashMap::new(), from_primary);
+    transport.register_primary_link("primary".into(), to_primary);
+    transport
+}
+
+/// Build a channel-backed mesh transport with the primary folded in AND
+/// a single observed peer outbox, returning the transport plus the
+/// observed peer's inbound receiver. The primary link (keyed `"primary"`)
+/// carries the secondary's primary-bound traffic + the inbound setup
+/// frames; the observed peer receives the secondary's mesh `broadcast`s
+/// (the primary is excluded from the fan-out), so a test can drain
+/// `observer_rx` to assert what the secondary fanned out onto the mesh.
+///
+/// `peer_count()` is 1 (the observed peer; the primary link is excluded),
+/// matching the `RecordingPeer::new(1)` cardinality the broadcast-observer
+/// tests previously used. Pair with `set_bootstrap_primary_id("primary")`.
+pub(super) fn channel_mesh_with_observed_peer(
+    secondary_id: &str,
+    to_primary: mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    from_primary: mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> (
+    ChannelPeerTransport<TestId>,
+    mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) {
+    let (observer_tx, observer_rx) = mpsc::unbounded_channel();
+    let mut outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<TestId>>> =
+        HashMap::new();
+    outgoing.insert("peer-observer".to_string(), observer_tx);
+    let mut transport =
+        ChannelPeerTransport::from_raw_channels(secondary_id.into(), outgoing, from_primary);
+    transport.register_primary_link("primary".into(), to_primary);
+    (transport, observer_rx)
+}
+
+/// Build a routing-aware channel-backed mesh stub with `peer_count` peer
+/// outboxes registered but NO primary link, so `peer_count()` reports the
+/// configured cardinality (a healthy mesh) while `send_to_peer("primary")`
+/// returns a real NoRoute `Err`. Inbound is a never-fed receiver
+/// (`recv_peer` blocks forever, like the prior stubs).
+///
+/// This is what the R1 failover-health-probe tests drive: paired with
+/// `set_bootstrap_primary_id("primary")`, `send_to_primary` resolves
+/// `Destination::Primary` to `"primary"`, finds no outbox for it, and
+/// surfaces the no-route `Err` that arms the count-axis — the real
+/// routing-aware no-route signal, replacing the identity-blind
+/// `FixedPeerCount` stub that could only no-op (Ok) on every send.
+pub(super) fn channel_mesh_no_primary(
+    secondary_id: &str,
+    peer_count: usize,
+) -> ChannelPeerTransport<TestId> {
+    // `incoming_rx` is fed by a sender we immediately drop: `recv_peer`
+    // never yields (the R1 tests drive the coordinator by direct method
+    // calls, never through the transport's inbound).
+    let (_never_tx, never_rx) = mpsc::unbounded_channel();
+    let mut outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<TestId>>> =
+        HashMap::new();
+    for i in 0..peer_count {
+        // Dummy peer outboxes: their receivers are dropped, but the
+        // sender's presence is what `peer_count()` / `has_peer(peer)`
+        // measure. Keyed by `peer-{i}` — never `"primary"`, so the
+        // primary stays unrouteable.
+        let (peer_tx, _peer_rx) = mpsc::unbounded_channel();
+        outgoing.insert(format!("peer-{i}"), peer_tx);
+    }
+    ChannelPeerTransport::from_raw_channels(secondary_id.into(), outgoing, never_rx)
 }
 
 /// Minimal serializable identifier used by every secondary test.
@@ -81,45 +172,6 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
         // Models no peers — every id is a non-member. Consistent with
         // `peer_count == 0`.
         false
-    }
-    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
-}
-
-/// PeerTransport stub that reports a fixed peer count without
-/// actually wiring any messages. Used by the peer-mesh watchdog
-/// tests to drive the "mesh formed" branch (peer_count > 0)
-/// without spinning up real QUIC endpoints.
-pub(super) struct FixedPeerCount(pub usize);
-
-impl<I: Identifier> PeerTransport<I> for FixedPeerCount {
-    async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> {
-        Ok(())
-    }
-    async fn send_to_peer(
-        &mut self,
-        _peer_id: &str,
-        _msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        std::future::pending().await
-    }
-    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        None
-    }
-    fn peer_count(&self) -> usize {
-        self.0
-    }
-    fn has_peer(&self, _id: &PeerId) -> bool {
-        // This stub models a peer CARDINALITY (`self.0`), not specific
-        // identities — it is identity-blind by construction (the
-        // watchdog tests it serves only key off `peer_count > 0`). The
-        // only internally-consistent boolean it can give is derived
-        // from that count: a non-empty mesh has peers, an empty one
-        // does not. So `has_peer` mirrors `peer_count > 0` rather than
-        // fabricating a per-id set the stub never tracked.
-        self.0 > 0
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
@@ -187,9 +239,9 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     fn has_peer(&self, _id: &PeerId) -> bool {
         // Identity-blind recorder: it models a configurable peer
         // CARDINALITY (`self.peer_count`) for the "healthy mesh vs no
-        // peers" branches but records sends keyed by nothing. The
-        // count-consistent answer is `peer_count > 0`; see
-        // `FixedPeerCount::has_peer` for the same rationale.
+        // peers" branches but records sends keyed by nothing. The only
+        // internally-consistent boolean it can give is derived from that
+        // count: a non-empty mesh has peers, an empty one does not.
         self.peer_count > 0
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
@@ -290,16 +342,9 @@ pub(super) fn make_secondary(
     FixedEstimator,
     TestId,
 > {
-    let secondary_id = config.secondary_id.clone();
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     SecondaryCoordinator::new(
         config,
-        make_transport(&secondary_id, uplink, NoPeers),
+        make_transport(NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -325,18 +370,11 @@ pub(super) fn make_secondary_recording(
     >,
     Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
-    let secondary_id = config.secondary_id.clone();
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     let recorder = RecordingPeer::<TestId>::new(peer_count);
     let log = recorder.log_handle();
     let coord = SecondaryCoordinator::new(
         config,
-        make_transport(&secondary_id, uplink, recorder),
+        make_transport(recorder),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

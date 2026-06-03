@@ -5,12 +5,9 @@ use super::super::test_helpers::{
 };
 use super::super::*;
 use dynrunner_core::TaskInfo;
-use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Construct a 3-node-mesh-analogous joiner: a single
 /// `SecondaryCoordinator` configured as observer
@@ -30,19 +27,17 @@ fn make_observer_secondary(
     FixedEstimator,
     TestId,
 > {
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
-        tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    // The observer holds the `NoPeers` mesh stub directly; it restores
+    // from a snapshot, skips setup, and reads its terminal cue from
+    // `cluster_state` (RunComplete applied directly) — it never needs a
+    // primary uplink inbound, so dropping the uplink does not change what
+    // the late-joiner-observer test exercises.
     let mut config = election_config(observer_id);
     config.is_observer = true;
     config.num_workers = 0;
     SecondaryCoordinator::new(
         config,
-        make_transport(observer_id, uplink, NoPeers),
+        make_transport(NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -101,7 +96,7 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
     // catches "the field was already true / non-empty before
     // restore" regressions that would otherwise silently make
     // the post-condition asserts pass for the wrong reason.
-    assert!(!sec.setup_phase_completed);
+    assert!(!sec.lifecycle.setup_phase_completed());
     assert_eq!(sec.cluster_state.task_count(), 0);
     assert!(sec.cluster_state.current_primary().is_none());
     assert!(sec.cluster_state.role_table().observers.is_empty());
@@ -111,7 +106,7 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
     // Latch is set — `run_until_setup_or_done` will skip the
     // entire `!setup_phase_completed` setup block on its next
     // call.
-    assert!(sec.setup_phase_completed);
+    assert!(sec.lifecycle.setup_phase_completed());
 
     // Task ledger merged in: two pending tasks survive.
     assert_eq!(sec.cluster_state.task_count(), 2);
@@ -185,7 +180,7 @@ fn restore_is_idempotent_on_second_call() {
     // "only when local empty" gate) make this a no-op.
     sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
 
-    assert!(sec.setup_phase_completed, "latch stays true");
+    assert!(sec.lifecycle.setup_phase_completed(), "latch stays true");
     assert_eq!(sec.cluster_state.task_count(), tasks_after_first);
     assert_eq!(sec.cluster_state.primary_epoch(), epoch_after_first);
 }

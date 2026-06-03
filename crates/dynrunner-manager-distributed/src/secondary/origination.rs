@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use dynrunner_core::{BoundedString, Identifier, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
+    ClusterMutation, Destination, DistributedMessage, PeerTransport, RemovalCause,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
@@ -99,7 +99,7 @@ where
     /// `Applied`-vs-`NoOp` filter semantics stay identical), then the
     /// applied subset fans out to the mesh.
     ///
-    /// Fan-out shape: ONE `transport.send(Address::Broadcast(Scope::Mesh))`
+    /// Fan-out shape: ONE `send_to(Destination::All)` mesh broadcast
     /// reaches every mesh member. This node IS the authority here
     /// (promoted-secondary originating its own mutations), so a single
     /// mesh broadcast is the authoritative propagation — the demoted
@@ -150,11 +150,7 @@ where
         // ONE mesh broadcast — every mesh member (peers, the co-located
         // authority, any observer) receives it. Errors are logged, not
         // propagated (see method doc).
-        if let Err(e) = self
-            .transport
-            .send(Address::Broadcast(Scope::Mesh), msg)
-            .await
-        {
+        if let Err(e) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %e,
                 "ClusterMutation mesh broadcast failed"
@@ -271,8 +267,12 @@ where
         // Tear down every worker pgid with the SIGTERM → grace →
         // SIGKILL ladder. Owned by the pool concern; coordinator
         // just calls. Runs on both source paths — local teardown is
-        // unconditional.
-        self.pool.kill_all_workers_with_grace(kill_grace).await;
+        // unconditional. The pool lives in `Configuring`/`Operational`;
+        // a panik before the pool was spawned (no `Configuring` reached)
+        // has no workers to kill — `pool_mut()` is `None` there.
+        if let Some(pool) = self.lifecycle.pool_mut() {
+            pool.kill_all_workers_with_grace(kill_grace).await;
+        }
         (matched_path, reason)
     }
 
@@ -335,9 +335,13 @@ where
         // Latch the one-shot so `setup_discovery_pending()` (the
         // `process_tasks` yield discriminator) never fires again on this
         // node — set unconditionally so the empty-discovery path (which
-        // leaves the ledger empty) does not re-yield on re-entry. See
-        // the `setup_discovery_done` field doc.
-        self.setup_discovery_done = true;
+        // leaves the ledger empty) does not re-yield on re-entry. The
+        // latch now lives in `OperationalState`: `ingest_setup_discovery`
+        // is called by the wrapper AFTER `process_tasks` yielded
+        // `SetupPending`, which only happens from the operational loop, so
+        // the lifecycle is `Operational` here. See the
+        // `OperationalState::setup_discovery_done` doc.
+        self.op_mut().setup_discovery_done = true;
         tracing::info!(
             tasks = task_count,
             "ingested setup-discovery; broadcast PhaseDepsSet + TaskAdded batch"

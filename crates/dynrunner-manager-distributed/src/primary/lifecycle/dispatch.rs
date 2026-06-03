@@ -1,5 +1,5 @@
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
@@ -140,8 +140,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // chance this tick. WARN so an operator grepping
                 // for the jam symptom sees the proximate cause.
                 if let Err(send_err) = self
-                    .transport
-                    .send(Address::Peer(sec_id.clone()), assignment_msg)
+                    .send_to(Destination::Secondary(PeerId::from(sec_id.clone())), assignment_msg)
                     .await
                 {
                     tracing::warn!(

@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 
 use dynrunner_manager_distributed::{
-    PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator,
-    cluster_state::ClusterStateSnapshot, observer::run_observer_announcer,
+    RunOutcome, SecondaryConfig, SecondaryCoordinator, cluster_state::ClusterStateSnapshot,
+    observer::run_observer_announcer,
 };
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_slurm::read_peer_info_dir_v2;
-use dynrunner_transport_quic::{NoPrimaryTransport, PeerNetwork};
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
@@ -117,18 +117,26 @@ impl PyObserverLateJoiner {
                 let local = tokio::task::LocalSet::new();
                 rt.block_on(local.run_until(async move {
                     // 1. Stand up the real peer transport with our chosen
-                    //    observer-id. The CN baked into the cert MUST
-                    //    match `observer_id` because every dialing peer
-                    //    validates the SAN against the logical id.
-                    let mut peer_network = PeerNetwork::<RunnerIdentifier>::start(&observer_id)
-                        .await
-                        .map_err(|e| {
-                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "observer late-joiner: failed to start peer network: {e}"
-                            ))
-                        })?;
-                    let peer_cert_pem = peer_network.cert_pem().to_string();
-                    let peer_port = peer_network.port();
+                    //    observer-id through the backend-opaque factory.
+                    //    The CN baked into the cert MUST match
+                    //    `observer_id` because every dialing peer
+                    //    validates the SAN against the logical id. The
+                    //    factory also builds the `PeerCertInfo` (cert +
+                    //    QUIC port) so the manager never reads them off a
+                    //    backend.
+                    let observer_bundle = transport_factory::observer_mesh::<RunnerIdentifier>(
+                        &observer_id,
+                        Some(detect_ipv4(None)),
+                        detect_ipv6(None),
+                    )
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "observer late-joiner: {e}"
+                        ))
+                    })?;
+                    let mut peer_network = observer_bundle.transport;
+                    let observer_cert_info = observer_bundle.peer_cert_info;
 
                     // 2. Bootstrap rendezvous: hand the seed list to the
                     //    trait default impl, which sequences the dial +
@@ -257,25 +265,17 @@ impl PyObserverLateJoiner {
                         child_processes: Vec::new(),
                     };
 
-                    // Compose the opaque secondary transport. A late-joining
-                    // observer never dialled an original primary, so the
-                    // uplink is the `NoPrimaryTransport` stub (its `recv`
-                    // pends forever — there is no setup-phase frame to read);
-                    // the `peer_network` is the mesh it bootstrapped onto via
-                    // the snapshot RPC. `Address::Role(Role::Primary)`
-                    // resolves to a mesh peer once the role cache warms from
-                    // the replicated `PrimaryChanged`; until then the
-                    // observer originates nothing and routes nowhere. See
-                    // `UnifiedSecondaryTransport`.
-                    let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
-                        observer_id.clone(),
-                        NoPrimaryTransport,
-                        peer_network,
-                    );
+                    // The observer holds its mesh `PeerTransport`
+                    // (`PeerNetwork`) DIRECTLY. A late-joining observer
+                    // never dialled an original primary, so there is no
+                    // bootstrap wire to fold in (and never was an `uplink`
+                    // leg): it bootstrapped onto the mesh via the snapshot
+                    // RPC and reaches the primary as a mesh peer once the
+                    // role cache warms from the replicated `PrimaryChanged`.
                     let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
                         SecondaryCoordinator::new(
                             config,
-                            unified,
+                            peer_network,
                             scheduler_config.build_memory_scheduler(),
                             estimator,
                         );
@@ -299,12 +299,7 @@ impl PyObserverLateJoiner {
                     // in cert exchange so peers can dial back into the
                     // observer (e.g. for snapshot RPCs from a later
                     // joiner).
-                    secondary.set_peer_cert_info(PeerCertInfo {
-                        public_cert_pem: peer_cert_pem,
-                        ipv4_address: Some(detect_ipv4(None)),
-                        ipv6_address: detect_ipv6(None),
-                        quic_port: peer_port,
-                    });
+                    secondary.set_peer_cert_info(observer_cert_info);
 
                     // Wire the panik watcher in the same shape as the
                     // regular secondary. The observer doesn't own

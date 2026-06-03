@@ -4,7 +4,7 @@
 //! Implementation of [`TunneledPeerTransport`] along with the
 //! [`SharedOutgoing`] writer table and [`InboundTap`] sender. See the
 //! crate root for the design rationale (this module owns only the
-//! transport's mesh-level state: local id, role cache, inbound mpsc).
+//! transport's mesh-level state: local id, inbound mpsc).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,10 +13,8 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Role,
-    RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    new_role_cache, read_role_cache, seed_self_role,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Router,
+    SendOutcome,
 };
 use tokio::sync::mpsc;
 
@@ -95,21 +93,14 @@ pub type RegistrationSink<I> = mpsc::UnboundedSender<PeerRegistration<I>>;
 /// [`SecondaryTransport`] receives to share writer-table state and
 /// fan inbound messages into the peer queue.
 pub struct TunneledPeerTransport<I: Identifier> {
-    /// Local peer-id. The submitter primary uses a stable id (today
-    /// `"primary"` per `PrimaryConfig::default().node_id`); the value
-    /// is surfaced via [`PeerTransport::local_id`] so the `send`
-    /// default-impl can stamp the `sender_id` field on
-    /// `RoleAddressed` envelopes.
-    local_id: String,
     /// Shared writer table. See [`SharedOutgoing`].
     ///
     /// Populated from TWO sources that both insert here: the
     /// `recv_peer` demux drains [`PeerRegistration`]s minted by the
     /// QUIC/WSS accept loops; the in-process / test paths register
     /// writers directly through their [`SharedOutgoing`] handle. Both
-    /// converge on the same map, so `send_to_peer` / `broadcast` /
-    /// role-resolved dispatch reach every connected peer regardless of
-    /// how it registered.
+    /// converge on the same map, so `send_to_peer` / `broadcast` reach
+    /// every connected peer regardless of how it registered.
     outgoing: SharedOutgoing<I>,
     /// THE canonical inbound stream — owned exclusively here. Fed by
     /// the accept loops' per-connection reader tasks (QUIC/WSS) and the
@@ -131,14 +122,8 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// select! gates the registration arm off after that so its
     /// perpetually-ready closed-channel future can't be selected and
     /// stall the demux (a closed mpsc `recv()` resolves immediately,
-    /// so an ungated arm would starve `incoming_rx`). Mirrors the
-    /// `uplink_open` latch in `UnifiedSecondaryTransport::recv_peer`.
+    /// so an ungated arm would starve `incoming_rx`).
     registrations_open: bool,
-    /// Write-through cache of `Role → peer_id` populated by the hook
-    /// registered via [`PeerTransport::register_with_cluster_state`].
-    /// Same shape as `PeerNetwork.role_cache` and
-    /// `ChannelPeerTransport.role_cache`.
-    role_cache: RoleCache,
     /// Peer-mesh routing dispatcher. Owns ALL routing state (in-flight
     /// relays, blacklist, per-peer route observation, monotonic relay-id
     /// counter) over the SAME `outgoing` connection table — so the
@@ -186,26 +171,20 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     ///
     /// `local_id` is the primary's stable id — must match
     /// `PrimaryConfig::node_id` so cluster-state mutations the primary
-    /// emits are accepted by other peers as originating from itself.
-    /// `Role::Self_` is seeded immediately into the role-cache so the
-    /// receiver-side handling treats a hypothetical inbound
-    /// `RoleAddressed { intended_role: Self_ }` envelope as Case A
-    /// (unwrap) rather than Case C (drop). The write-through hook
-    /// covers `Role::Primary` once registered.
+    /// emits are accepted by other peers as originating from itself,
+    /// and so the [`Router`] recognises relay frames addressed to this
+    /// node. It is consumed to seed the [`Router`]; the transport keeps
+    /// no separate copy (it has no role-addressing envelope to stamp).
     pub fn new(local_id: String) -> (Self, SharedOutgoing<I>, InboundTap<I>, RegistrationSink<I>) {
         let outgoing: SharedOutgoing<I> = Rc::new(RefCell::new(HashMap::new()));
         let (inbound_tap, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
-        let role_cache = new_role_cache();
-        seed_self_role(&role_cache, &local_id);
-        let router = Router::new(local_id.clone());
+        let router = Router::new(local_id);
         let transport = Self {
-            local_id,
             outgoing: Rc::clone(&outgoing),
             incoming_rx,
             new_conn_rx,
             registrations_open: true,
-            role_cache,
             router,
         };
         (transport, outgoing, inbound_tap, new_conn_tx)
@@ -235,90 +214,6 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     fn drain_registrations(&mut self) {
         while let Ok(reg) = self.new_conn_rx.try_recv() {
             self.register_peer(reg);
-        }
-    }
-
-    /// Role-layer interceptor — mirrors
-    /// `PeerNetwork::handle_role_layer`. The
-    /// `decide_role_addressed_with_cache` decision is the single
-    /// source of truth for the four cases (A/B/C/D); the relay-send
-    /// dispatch path goes through the [`Router`] (same as
-    /// `PeerNetwork`) so a role-resolved forward that has no DIRECT
-    /// writer can still be relayed through another peer rather than
-    /// dropped. `clocks` is threaded from the `recv_peer` /
-    /// `try_recv_peer` entry point so the Router's send-side state uses
-    /// the same monotonic clock as inbound dispatch.
-    fn handle_role_layer(
-        &mut self,
-        msg: DistributedMessage<I>,
-        clocks: Clocks,
-    ) -> Option<DistributedMessage<I>> {
-        match msg {
-            DistributedMessage::RoleAddressed {
-                sender_id,
-                intended_role,
-                payload,
-                attempts,
-                ..
-            } => {
-                let decision = decide_role_addressed_with_cache(
-                    &self.local_id,
-                    &self.role_cache,
-                    sender_id,
-                    intended_role,
-                    payload,
-                    attempts,
-                );
-                match decision {
-                    RoleAddressedAction::Unwrap(inner) => Some(inner),
-                    RoleAddressedAction::Relay {
-                        forward_to,
-                        forwarded,
-                        hint_to,
-                        hint,
-                    } => {
-                        // Both sends are fire-and-forget transport-
-                        // internal bookkeeping. They go through the
-                        // Router's send path (NOT the trait's
-                        // `send_to_peer`, whose NoRoute → Err contract
-                        // is wrong for an internal hint) so a forward
-                        // with no direct writer relays through a peer
-                        // instead of erroring — same contract as
-                        // `PeerNetwork::handle_role_layer`.
-                        if let Err(e) = self.router_send(&forward_to, forwarded, clocks) {
-                            tracing::warn!(
-                                forward_to = %forward_to,
-                                error = %e,
-                                "RoleAddressed relay forward failed (tunneled)",
-                            );
-                        }
-                        // Unbox once at the dispatch boundary.
-                        if let Err(e) = self.router_send(&hint_to, *hint, clocks) {
-                            tracing::warn!(
-                                hint_to = %hint_to,
-                                error = %e,
-                                "RoleMisaddressHint send failed (tunneled)",
-                            );
-                        }
-                        None
-                    }
-                    RoleAddressedAction::Drop { reason } => {
-                        tracing::warn!(reason, "RoleAddressed dropped (tunneled)");
-                        None
-                    }
-                }
-            }
-            DistributedMessage::RoleMisaddressHint {
-                role, holder_id, ..
-            } => {
-                // Cache-warming only — never surfaced to the
-                // application layer (per Step 4 design rationale:
-                // senders that issued an `Address::Role(_)` send
-                // are not awaiting a hint reply).
-                apply_role_misaddress_hint(&self.role_cache, role, holder_id);
-                None
-            }
-            other => Some(other),
         }
     }
 
@@ -362,9 +257,9 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     }
 
     /// Drive one inbound frame through the [`Router`] over the shared
-    /// `outgoing` table, returning the frame to deliver to the role
-    /// layer (or `None` when the Router consumed it as a relay /
-    /// backoff / stale-drop). Bridges the `Rc<RefCell<_>>` table to the
+    /// `outgoing` table, returning the frame to deliver to the caller
+    /// (or `None` when the Router consumed it as a relay / backoff /
+    /// stale-drop). Bridges the `Rc<RefCell<_>>` table to the
     /// Router's `&mut HashMap` contract, same borrow discipline as
     /// [`Self::router_send`]. `redial_target` is dropped (no dial path).
     fn router_inbound(
@@ -463,8 +358,8 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         // stream from this single consumer. A registration carries no
         // application payload, so it is applied (writer inserted into
         // `outgoing`) and the loop continues; an inbound frame goes
-        // through the role layer and is yielded (or consumed
-        // internally) exactly as before.
+        // through the Router and is yielded (or consumed internally as a
+        // relay) exactly as before.
         //
         // FIFO: `SecondaryWelcome` and `CertExchange` for one secondary
         // both ride `incoming_rx` (a single mpsc), so their relative
@@ -513,20 +408,15 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
                     }
                 }
             };
-            // Route the raw frame through the Router first: a `Relay`
+            // Route the raw frame through the Router: a `Relay`
             // envelope addressed elsewhere is forwarded (or bounced)
             // through the `outgoing` table and consumed here; a `Relay`
-            // for us is unwrapped; everything else passes through. Only
-            // a delivered frame reaches the role layer. Mirrors
-            // `PeerNetwork::recv_peer`'s `process_inbound` → role-layer
-            // ordering.
+            // for us is unwrapped; everything else passes through. A
+            // delivered frame is yielded to the application layer.
+            // Mirrors `PeerNetwork::recv_peer`'s `process_inbound`.
             let clocks = now_clocks();
-            let Some(delivered) = self.router_inbound(raw, clocks) else {
-                continue;
-            };
-            match self.handle_role_layer(delivered, clocks) {
-                Some(payload) => return Some(payload),
-                None => continue,
+            if let Some(delivered) = self.router_inbound(raw, clocks) {
+                return Some(delivered);
             }
         }
     }
@@ -546,13 +436,9 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
             // `PeerNetwork::try_recv_peer`), passes everything else
             // through. No `outgoing` borrow needed:
             // `process_inbound_sync` is pure state mutation.
-            let delivered = match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => *msg,
+            match self.router.process_inbound_sync(msg, clocks) {
+                InboundOutcome::Deliver { msg, .. } => return Some(*msg),
                 InboundOutcome::Handled { .. } => continue,
-            };
-            match self.handle_role_layer(delivered, clocks) {
-                Some(payload) => return Some(payload),
-                None => continue,
             }
         }
     }
@@ -579,22 +465,5 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         // primary's tunneled transport is meaningful only if the
         // primary itself were to dial secondaries (it does not —
         // dial direction is secondary-to-primary in production).
-    }
-
-    fn register_with_cluster_state(&self, registrar: &mut dyn RoleChangeHookRegistrar) {
-        // Install the Step-2 write-through hook against the cluster
-        // state's `RoleTable`. From this point on every
-        // `apply(PrimaryChanged)` updates this transport's cache;
-        // the cache feeds Step-3's `Address::Role(_)` dispatch on
-        // the send hot path.
-        install_role_change_hook(RoleCache::clone(&self.role_cache), registrar);
-    }
-
-    fn peer_for_role(&self, role: &Role) -> Option<String> {
-        read_role_cache(&self.role_cache, role)
-    }
-
-    fn local_id(&self) -> &str {
-        &self.local_id
     }
 }

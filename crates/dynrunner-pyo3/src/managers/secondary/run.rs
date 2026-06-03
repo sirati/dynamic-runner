@@ -8,10 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
-use dynrunner_transport_quic::NetworkClient;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
@@ -223,115 +223,60 @@ impl PySecondaryCoordinator {
                     }
                 };
 
-                // Connect to primary via WSS, retrying until the configured timeout.
-                let connect_timeout = dist_connect_timeout;
-                let retry_delay = dist_connect_retry_delay;
-                let start = std::time::Instant::now();
-                let mut attempt = 0u32;
-                let client = loop {
-                    attempt += 1;
-                    let elapsed = start.elapsed();
-                    if elapsed > connect_timeout {
-                        tracing::error!(
-                            addr = %addr,
-                            attempts = attempt,
-                            "failed to connect to primary after {:.0}s",
-                            connect_timeout.as_secs_f64()
-                        );
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to connect to primary at {addr} after {:.0}s ({attempt} attempts)",
-                            connect_timeout.as_secs_f64()
-                        )));
-                    }
-                    match NetworkClient::connect_wss_only(addr).await {
-                        Ok(c) => {
-                            tracing::info!(
-                                addr = %addr,
-                                elapsed_s = elapsed.as_secs_f64(),
-                                attempts = attempt,
-                                "connected to primary"
-                            );
-                            break c;
-                        }
-                        Err(e) => {
-                            let remaining = connect_timeout.saturating_sub(elapsed);
-                            if remaining > retry_delay {
-                                tracing::info!(
-                                    attempt,
-                                    error = %e,
-                                    "connection failed, retrying in {:.0}s...",
-                                    retry_delay.as_secs_f64()
-                                );
-                                tokio::time::sleep(retry_delay).await;
-                            } else {
-                                tracing::error!(addr = %addr, error = %e, "failed to connect to primary");
-                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "failed to connect to primary at {addr}: {e}"
-                                )));
-                            }
-                        }
-                    }
-                };
-
-                // Start peer network for peer-to-peer communication. The
-                // identity passed to `PeerNetwork::start` is BOTH the
-                // CN baked into this secondary's QUIC certificate AND
-                // the `peer_id` other secondaries will pass to quinn's
-                // `connect(addr, server_name)` to validate that cert.
-                // The primary distributes peer info keyed by
-                // `secondary_id` (the logical id, e.g. "secondary-0")
-                // — so the cert CN must match the logical id, not
-                // the SLURM hostname or any worker count. The previous
-                // value `format!("sec-{}", num_workers)` produced a
-                // CN like "sec-14" (one per cpus_per_task value) that
-                // never matched anything quinn expected; QUIC dials
-                // failed CN validation on every peer pair and fell
-                // back to WSS, eating the 10s-per-peer timeout budget.
-                // Pick the peer transport at runtime: real `PeerNetwork`
-                // for normal clusters, `NoPeerTransport` for clusters
-                // that firewall inter-compute-node networking (LMU
-                // SLURM, etc.) where every peer dial would time out
-                // anyway. Selection comes from `DistributedConfig
-                // .disable_peer_overlay` — see the CLI flag's help
-                // text for the failover-incompat caveat. The
-                // `EitherPeerTransport` enum lives one level down in
-                // dynrunner-transport-quic because the `PeerTransport`
-                // trait uses RPIT-in-trait and isn't object-safe;
-                // a sum-type is the only way to pick at runtime.
-                let (mut peer_network, peer_cert_pem, peer_port): (
-                    dynrunner_transport_quic::EitherPeerTransport<RunnerIdentifier>,
-                    String,
-                    u16,
-                ) = if dist_disable_peer_overlay {
-                    tracing::info!("peer overlay disabled by config; using NoPeerTransport");
-                    (
-                        dynrunner_transport_quic::EitherPeerTransport::Disabled(
-                            dynrunner_transport_quic::NoPeerTransport,
-                        ),
-                        String::new(),
-                        0,
-                    )
-                } else {
-                    let pn = dynrunner_transport_quic::PeerNetwork::<RunnerIdentifier>::start(
-                        &secondary_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!(error = %e, "failed to start peer network");
-                        // PeerNetwork::start only fails on cert
-                        // generation or bind errors; treat as fatal —
-                        // there's no useful fallback here that keeps
-                        // peer functionality.
-                        panic!("peer network start failed: {e}");
-                    });
-                    let cert_pem = pn.cert_pem().to_string();
-                    let port = pn.port();
-                    (
-                        dynrunner_transport_quic::EitherPeerTransport::Real(Box::new(pn)),
-                        cert_pem,
-                        port,
-                    )
-                };
+                // Stand up the secondary's mesh transport through the
+                // backend-opaque factory. It owns every backend-naming
+                // step: the WSS dial + retry loop, the peer-overlay
+                // selection (real peer mesh for normal clusters vs the
+                // firewalled no-overlay path for clusters that firewall
+                // inter-compute-node networking — selection comes from
+                // `DistributedConfig.disable_peer_overlay`, see the CLI
+                // flag's help text for the failover-incompat caveat),
+                // reading the backend's cert + QUIC port into the
+                // `PeerCertInfo` the `CertExchange` ships, extracting the
+                // mesh-send capability for the co-located parked primary,
+                // and folding the dialed bootstrap wire into the mesh
+                // under the primary's peer-id ("the tunnel is just a way
+                // of joining the mesh").
+                //
+                // The identity passed to the peer mesh is BOTH the CN
+                // baked into this secondary's QUIC certificate AND the
+                // `peer_id` other secondaries pass to quinn's
+                // `connect(addr, server_name)` to validate that cert. The
+                // primary distributes peer info keyed by `secondary_id`
+                // (the logical id, e.g. "secondary-0") — so the cert CN
+                // must match the logical id, not the SLURM hostname or
+                // any worker count.
+                //
+                // The bootstrap primary's peer-id is the conventional
+                // `"primary"` — the same id baked into the primary's
+                // `PrimaryConfig::node_id`, the cert CN the QUIC dialer
+                // validates against, and the host-id `Destination::Primary`
+                // resolves to. The matching `set_bootstrap_primary_id`
+                // below tells the egress edge to resolve
+                // `Destination::Primary` to it while the role table is
+                // still cold (pre-`PrimaryChanged`).
+                let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
+                    transport_factory::SecondaryDialParams {
+                        addr,
+                        connect_timeout: dist_connect_timeout,
+                        retry_delay: dist_connect_retry_delay,
+                        disable_peer_overlay: dist_disable_peer_overlay,
+                        secondary_id: &secondary_id,
+                        bootstrap_primary_id: "primary".to_string(),
+                        ipv4_address: Some(detect_ipv4(None)),
+                        ipv6_address: detect_ipv6(None),
+                    },
+                )
+                .await
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                let peer_network = mesh_bundle.transport;
+                let secondary_cert_info = mesh_bundle.peer_cert_info;
+                // Cloneable mesh-send capability for the co-located parked
+                // primary's role-blind `MeshHandleTransport` (`Some` only
+                // when a real peer mesh exists — `Disabled` overlays have
+                // no remote secondaries and thus no failover, so no
+                // co-located primary is composed). See `MeshSendHandle`.
+                let mesh_send_handle = mesh_bundle.mesh_send;
 
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
@@ -373,75 +318,92 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                // Cloneable mesh-send capability for the co-located
-                // parked primary's send-proxy (`Some` only when a real
-                // peer mesh exists — `Disabled` overlays have no remote
-                // secondaries and thus no failover, so no co-located
-                // primary is composed). Taken BEFORE `peer_network` moves
-                // into the unified transport. See `MeshSendHandle`.
-                let mesh_send_handle = peer_network.mesh_send_handle();
-
-                // Symmetric mesh-link registration: register the dialed
-                // primary connection into the mesh's `connections` keyed
-                // by the primary's peer-id, so the primary is a routable
-                // mesh member from this secondary's side
-                // (`mesh.send_to_peer(primary)` / `has_peer(primary)`
-                // resolve over the bootstrap wire — no second connection
-                // is opened). `client.mesh_writer()` is a fan-in send
-                // handle into the SAME WSS/QUIC wire the bootstrap uplink
-                // still owns, so inbound primary frames keep arriving on
-                // the uplink leg and `send_to_primary`'s routing is
-                // unchanged here. The primary is registered as a
-                // directed-only member (excluded from the mesh broadcast
-                // fan-out and from `peer_count`), so this does not change
-                // broadcast topology or mesh-watchdog behaviour. `Disabled`
-                // overlays no-op the registration (no mesh table).
-                //
-                // The bootstrap primary's peer-id is the conventional
-                // `"primary"` — the same id baked into the primary's
-                // `PrimaryConfig::node_id` and the cert CN the QUIC dialer
-                // validates against (`NetworkClient::connect(.., "primary",
-                // ..)`), and the value `Address::Role(Role::Primary)`
-                // resolves to once the role cache warms. (The
-                // string→typed-`Destination` migration owns replacing this
-                // literal with the resolved primary host-id.)
-                peer_network.register_primary_link("primary".to_string(), client.mesh_writer());
-
-                // Compose the opaque secondary transport: the WSS/QUIC
-                // `NetworkClient` is the uplink to the node this
-                // secondary dialled (the original primary), the
-                // `peer_network` is the mesh. `UnifiedSecondaryTransport`
-                // makes the physical location of the primary opaque —
-                // `Address::Role(Role::Primary)` resolves to the uplink
-                // while the role cache is cold and re-points to a mesh
-                // peer once a `PromotePrimary` (failover) lands. See the
-                // crate docs on `UnifiedSecondaryTransport`.
-                let mut unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
-                    secondary_id.clone(),
-                    client,
-                    peer_network,
-                );
-
-                // Co-located-primary composition handles (the two-coords-
-                // on-one-LocalSet wiring). The ROLE-AWARE inbound tap
-                // diverts primary-facing frames to the parked primary
-                // once this node holds Role::Primary; the loopback
-                // injector is the own-secondary leg of the parked
-                // primary's hybrid SecondaryTransport. Both are inert
-                // until a real mesh + activation exist.
-                let colocated_primary_tap = unified.attach_colocated_primary_tap();
-                let colocated_loopback_tx = unified.loopback_injector();
                 // Clone the estimator for the co-located primary BEFORE
                 // the secondary consumes it; the primary's seeded-resume
                 // dispatch needs its own resource estimator.
                 let primary_estimator = estimator.clone();
 
+                // ── Co-located primary↔secondary loopback channels ──
+                //
+                // Composed ONLY when a real mesh exists (a `Disabled`
+                // overlay has no remote secondaries to fail over among, so
+                // no co-located primary is built). Two in-process channels
+                // wire the two coordinators on this one host WITHOUT any
+                // per-role transport leg — the multi-role host runs the
+                // SINGLE mesh transport (held by the secondary) and the
+                // role-vs-locality split lives at the coordinator egress
+                // edges, not inside a transport:
+                //
+                //   * CH1 loopback_to_secondary: the co-located primary's
+                //     egress (`SendTarget::Loopback` unicast + the
+                //     `Destination::All` broadcast leg) delivers own-host
+                //     frames into the SECONDARY's inbound. The secondary
+                //     drains the matching receiver as if it were a wire
+                //     frame.
+                //   * CH2 primary_inbound: the secondary's ingress demux
+                //     forwards every primary-facing frame
+                //     (`is_primary_facing`) it drains off the host mesh —
+                //     plus its own-host terminal reports (its egress
+                //     `SendTarget::Loopback` arm) — into the co-located
+                //     PRIMARY's inbound. The primary's role-blind
+                //     `MeshHandleTransport::recv_peer` drains it.
+                //
+                // Both are unbounded `tokio::sync::mpsc`; the message type
+                // is `DistributedMessage<RunnerIdentifier>` on both legs.
+                // The four ends are held as `Option` so a `Disabled`
+                // overlay (no real mesh → no co-located primary) leaves
+                // every slot `None` and the registrations / composition
+                // below are no-ops.
+                let (
+                    loopback_to_secondary_tx,
+                    loopback_to_secondary_rx,
+                    primary_inbound_tx,
+                    primary_inbound_rx,
+                ): (
+                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
+                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
+                ) = if mesh_send_handle.is_some() {
+                    let (lb_tx, lb_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (pin_tx, pin_rx) = tokio::sync::mpsc::unbounded_channel();
+                    (Some(lb_tx), Some(lb_rx), Some(pin_tx), Some(pin_rx))
+                } else {
+                    (None, None, None, None)
+                };
+
+                // The secondary holds the mesh `PeerTransport`
+                // (`EitherPeerTransport`) DIRECTLY — the primary is a mesh
+                // peer reached by id, not a wrapped per-role leg.
                 let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
                     config,
-                    unified,
+                    peer_network,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
+
+                // Wire the secondary side of the co-located loopback
+                // channels (when composed). Pre-run, one-shot — same
+                // contract as `register_promote_activation`. The secondary
+                // drains CH1 (`loopback_to_secondary_rx`) into its inbound
+                // and forwards primary-facing frames into CH2
+                // (`primary_inbound_tx`). Both registrations are skipped on
+                // every non-co-located path (the `Disabled` overlay).
+                if let Some(rx) = loopback_to_secondary_rx {
+                    secondary.register_colocated_loopback_inbound(rx);
+                }
+                if let Some(tx) = primary_inbound_tx {
+                    secondary.register_colocated_primary_inbound(tx);
+                }
+
+                // Tell the egress edge which peer-id the bootstrap wire
+                // reaches (the conventional `"primary"`, the same id the
+                // mesh-link registration keyed the dialed connection
+                // under). The edge resolves `Destination::Primary` to it
+                // while the role table is cold (pre-`PrimaryChanged`), so
+                // setup frames route to the dialled primary before the
+                // self-announcement lands.
+                secondary.set_bootstrap_primary_id("primary".to_string());
 
                 // Swap in the Python-facing command channel so the
                 // `PrimaryHandle` Python is holding talks to the same
@@ -460,25 +422,18 @@ impl PySecondaryCoordinator {
                     secondary.register_lifecycle_listener(listener);
                 }
 
-                // Set peer cert info so the CertExchange message
-                // includes our QUIC details. Both families are
-                // detected by `network::detect_ipv4` / `detect_ipv6`
-                // (env-var hint first, `hostname -I` fallback); the
-                // resulting `PeerCertInfo` is what the
-                // `send_cert_exchange` step ships on the wire and the
-                // primary then re-broadcasts via `PeerInfo`. The
-                // dialer (peer/dial.rs) consumes both families and
-                // happy-eyeballs-races them, so a host that has only
-                // one family configured is fine — the missing one is
+                // Set peer cert info so the CertExchange message includes
+                // our connection details. The `PeerCertInfo` was built by
+                // the transport factory from the backend's cert PEM + port
+                // plus both detected address families (`network::detect_ipv4`
+                // / `detect_ipv6` — env-var hint first, `hostname -I`
+                // fallback). It is what the `send_cert_exchange` step ships
+                // on the wire and the primary then re-broadcasts via
+                // `PeerInfo`. The dialer (peer/dial.rs) consumes both
+                // families and happy-eyeballs-races them, so a host that has
+                // only one family configured is fine — the missing one is
                 // simply absent from the candidate set.
-                secondary.set_peer_cert_info(
-                    dynrunner_manager_distributed::PeerCertInfo {
-                        public_cert_pem: peer_cert_pem,
-                        ipv4_address: Some(detect_ipv4(None)),
-                        ipv6_address: detect_ipv6(None),
-                        quic_port: peer_port,
-                    },
-                );
+                secondary.set_peer_cert_info(secondary_cert_info);
 
                 // Spawn the panik watcher and register its signal
                 // receiver on the coordinator BEFORE entering the
@@ -530,129 +485,138 @@ impl PySecondaryCoordinator {
 
                 // ── Two-coordinators-on-one-LocalSet composition ──
                 //
-                // Build a PARKED co-located `PrimaryCoordinator` and
-                // spawn it on the SAME `LocalSet` as this secondary,
-                // behind `run_parked`'s promotion gate. This is the
-                // failover headline: a surviving SLURM secondary becomes
-                // primary in-place (no destroy-and-recompose) by waking
-                // its parked primary on the election's terminal
+                // Build a PARKED co-located `PrimaryCoordinator` and spawn
+                // it on the SAME `LocalSet` as this secondary, behind
+                // `run_parked`'s promotion gate. The failover headline: a
+                // surviving SLURM secondary becomes primary in-place by
+                // waking its parked primary on the election's terminal
                 // `Promoted` transition — the secondary's
                 // `record_promotion_confirm` → `fire_local_promotion`
-                // fires the gate (handing over a cluster_state snapshot)
+                // fires the gate (handing over a `cluster_state` snapshot)
                 // and broadcasts `PromotePrimary { new = self }` so
                 // surviving peers re-point onto this winner.
                 //
-                // Only composed when a REAL mesh exists
-                // (`mesh_send_handle.is_some()`): a `Disabled` peer
-                // overlay has no remote secondaries to fail over among,
-                // so no co-located primary is built and the parked-primary
-                // join below is a no-op. Runtime behaviour (the actual
-                // mid-run failover) is e2e-validated in R5c — pyo3
-                // coordinator runtimes cannot be unit-tested (libpython
-                // linking). The composition's CONSTITUENTS (the parked
-                // `run_parked` seeded resume, the role-aware inbound tap,
-                // the mesh-send proxy, the activation terminal action) are
-                // each unit-tested at the manager / transport layer.
-                let parked_primary_handle: Option<
-                    tokio::task::JoinHandle<()>,
-                > = if let Some(mesh) = mesh_send_handle {
-                    // Promotion-activation gate: the secondary fires it
-                    // (with a cluster_state snapshot) on reaching
-                    // `Promoted`; the parked primary `restore`s + hydrates
-                    // and takes authority.
-                    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
-                    secondary.register_promote_activation(promote_tx);
-
-                    // Transfer the lifecycle/command wiring the PyO3
-                    // surface minted on the secondary onto the co-located
-                    // PRIMARY — the real authority that owns the phase
-                    // machine and the externally-issued `PrimaryCommand`
-                    // ingress. The secondary keeps its own `command_tx`
-                    // clone for any handle minted off it.
-                    let (
-                        p_command_tx,
-                        p_command_rx,
-                        p_on_phase_start,
-                        p_on_phase_end,
-                    ) = secondary.take_composed_primary_wiring();
-
-                    // The parked primary's SINGLE `Tr: PeerTransport`
-                    // (`ColocatedPrimaryTransport`): own-secondary →
-                    // loopback into this secondary's inbound, remote →
-                    // the shared mesh; `recv_peer` = the role-aware tap.
-                    // Real-by-construction — every send routes to a live
-                    // loopback or the live mesh, so the parked failover
-                    // primary's keepalive / dispatch reaches a real path
-                    // (the `NoPeerTransport` no-op-send hazard is gone).
-                    let primary_transport =
-                        dynrunner_transport_quic::ColocatedPrimaryTransport::new(
-                            secondary_id.clone(),
-                            colocated_loopback_tx,
-                            mesh,
-                            colocated_primary_tap,
-                        );
-
-                    // `PrimaryConfig` for the parked failover authority.
-                    // Most fields are bootstrap-phase concerns the seeded
-                    // resume bypasses; the load-bearing ones are
-                    // `node_id` (own id, so `Role::Primary` resolves to
-                    // self) and the retry knobs (mirrored from the
-                    // secondary's config). The CRDT snapshot the gate
-                    // delivers seeds `phase_deps` / `total_tasks` at
-                    // activation, so the config's task-graph fields stay
-                    // at their defaults.
-                    let primary_config = dynrunner_manager_distributed::PrimaryConfig {
-                        node_id: secondary_id.clone(),
-                        keepalive_interval: dist_keepalive,
-                        peer_timeout: dist_peer_timeout,
-                        keepalive_miss_threshold: dist_keepalive_miss_threshold,
-                        retry_max_passes: dist_retry_max_passes,
-                        oom_retry_max_passes: dist_oom_retry_max_passes,
-                        ..dynrunner_manager_distributed::PrimaryConfig::default()
-                    };
-
-                    let mut parked_primary =
-                        dynrunner_manager_distributed::PrimaryCoordinator::new(
-                            primary_config,
-                            primary_transport,
-                            scheduler_config.build_memory_scheduler(),
-                            primary_estimator,
-                        );
-                    // Transfer the command channel onto the primary so a
-                    // Python-minted `PrimaryHandle` (cloned off the
-                    // secondary's `command_sender()`) reaches the
-                    // authority's command loop. `p_command_rx` is `Some`
-                    // on the first (only) `take_composed_primary_wiring`
-                    // call; if it were `None` (defensive — a double
-                    // take), the primary keeps the receiver its own
-                    // `new()` minted and the transferred `tx` simply
-                    // feeds a different receiver, so we skip the swap.
-                    if let Some(rx) = p_command_rx {
-                        parked_primary.replace_command_channel(p_command_tx, rx);
-                    }
-                    if let (Some(on_start), Some(on_end)) =
-                        (p_on_phase_start, p_on_phase_end)
+                // Composed ONLY when a REAL mesh exists
+                // (`mesh_send_handle.is_some()`): a `Disabled` overlay has
+                // no remote secondaries to fail over among. The parked
+                // primary holds the ROLE-BLIND `MeshHandleTransport` over
+                // the host's shared mesh (`mesh_send_handle` for remote
+                // send/broadcast, `primary_inbound_rx` for the demuxed
+                // inbound the secondary forwards). Its own-secondary
+                // loopback is NOT a transport leg: the egress edge delivers
+                // `SendTarget::Loopback` + the `Destination::All` broadcast
+                // leg through `loopback_to_secondary_tx`, registered via
+                // `register_colocated_loopback`.
+                let parked_primary_handle: Option<tokio::task::JoinHandle<()>> =
+                    if let (Some(mesh), Some(loopback_tx), Some(inbound_rx)) =
+                        (mesh_send_handle, loopback_to_secondary_tx, primary_inbound_rx)
                     {
-                        parked_primary.register_phase_lifecycle_callbacks(
-                            on_start, on_end,
-                        );
-                    }
+                        // Promotion-activation gate: the secondary fires it
+                        // (with a `cluster_state` snapshot) on reaching
+                        // `Promoted`; the parked primary `restore`s +
+                        // hydrates and takes authority.
+                        let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
+                        secondary.register_promote_activation(promote_tx);
 
-                    Some(tokio::task::spawn_local(async move {
-                        if let Err(e) = parked_primary.run_parked(promote_rx).await {
-                            tracing::error!(
-                                error = %e,
-                                "co-located parked primary failed after \
-                                 promotion"
+                        // Transfer the lifecycle/command wiring the PyO3
+                        // surface minted on the secondary onto the
+                        // co-located PRIMARY — the real authority that owns
+                        // the phase machine and the externally-issued
+                        // `PrimaryCommand` ingress. The secondary keeps its
+                        // own `command_tx` clone for any handle minted off
+                        // it.
+                        let (
+                            p_command_tx,
+                            p_command_rx,
+                            p_on_phase_start,
+                            p_on_phase_end,
+                        ) = secondary.take_composed_primary_wiring();
+
+                        // The parked primary's role-blind `PeerTransport`,
+                        // built through the backend-opaque factory: every
+                        // remote peer over the shared mesh, recv via the
+                        // demuxed inbound the secondary feeds. No own-id /
+                        // loopback branch — the egress edge owns that (see
+                        // `register_colocated_loopback` below).
+                        let primary_transport =
+                            transport_factory::parked_primary_transport::<RunnerIdentifier>(
+                                mesh, inbound_rx,
+                            );
+
+                        // `PrimaryConfig` for the parked failover authority.
+                        // Most fields are bootstrap-phase concerns the
+                        // seeded resume bypasses; the load-bearing ones are
+                        // `node_id` (own id, so `Destination::Primary`
+                        // resolves to self) and the retry knobs (mirrored
+                        // from the secondary's config). The CRDT snapshot
+                        // the gate delivers seeds `phase_deps` /
+                        // `total_tasks` at activation, so the config's
+                        // task-graph fields stay at their defaults.
+                        let primary_config = dynrunner_manager_distributed::PrimaryConfig {
+                            node_id: secondary_id.clone(),
+                            keepalive_interval: dist_keepalive,
+                            peer_timeout: dist_peer_timeout,
+                            keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                            retry_max_passes: dist_retry_max_passes,
+                            oom_retry_max_passes: dist_oom_retry_max_passes,
+                            ..dynrunner_manager_distributed::PrimaryConfig::default()
+                        };
+
+                        let mut parked_primary =
+                            dynrunner_manager_distributed::PrimaryCoordinator::new(
+                                primary_config,
+                                primary_transport,
+                                scheduler_config.build_memory_scheduler(),
+                                primary_estimator,
+                            );
+
+                        // Register the own-secondary loopback sender on the
+                        // primary's egress edge: a `Destination::Secondary
+                        // (own_id)` `TaskAssignment` (resolved to
+                        // `SendTarget::Loopback`) and every
+                        // `Destination::All` broadcast reach the co-located
+                        // secondary through this leg — the co-located
+                        // secondary is not a mesh peer of itself.
+                        parked_primary.register_colocated_loopback(loopback_tx);
+
+                        // Transfer the command channel onto the primary so
+                        // a Python-minted `PrimaryHandle` (cloned off the
+                        // secondary's `command_sender()`) reaches the
+                        // authority's command loop. `p_command_rx` is
+                        // `Some` on the first (only)
+                        // `take_composed_primary_wiring` call; if it were
+                        // `None` (defensive — a double take), the primary
+                        // keeps the receiver its own `new()` minted and the
+                        // transferred `tx` simply feeds a different
+                        // receiver, so we skip the swap.
+                        if let Some(rx) = p_command_rx {
+                            parked_primary.replace_command_channel(p_command_tx, rx);
+                        }
+                        if let (Some(on_start), Some(on_end)) =
+                            (p_on_phase_start, p_on_phase_end)
+                        {
+                            parked_primary.register_phase_lifecycle_callbacks(
+                                on_start, on_end,
                             );
                         }
-                    }))
-                } else {
-                    // No real mesh → no failover → no co-located primary.
-                    // The secondary keeps its own command/lifecycle wiring
-                    // (never transferred) and runs as a pure follower.
-                    None
-                };
+
+                        Some(tokio::task::spawn_local(async move {
+                            if let Err(e) = parked_primary.run_parked(promote_rx).await {
+                                tracing::error!(
+                                    error = %e,
+                                    "co-located parked primary failed after \
+                                     promotion"
+                                );
+                            }
+                        }))
+                    } else {
+                        // No real mesh → no failover → no co-located
+                        // primary. The secondary keeps its own
+                        // command/lifecycle wiring (never transferred) and
+                        // runs as a pure follower.
+                        let _ = &primary_estimator;
+                        None
+                    };
 
                 // Setup-promote outer loop: drive
                 // `run_until_setup_or_done` to a terminal state,

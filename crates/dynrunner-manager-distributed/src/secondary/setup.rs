@@ -19,10 +19,23 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// Build and initialise the local worker pool, returning it for the
+    /// caller to move INTO the `Configuring` lifecycle state.
+    ///
+    /// Worker-spawn relocation (typed lifecycle): the pool is no longer a
+    /// flat coordinator field initialised before the handshake. It is
+    /// built here as the entry action of the `AwaitingPrimary →
+    /// Configuring` transition — fired by `wait_for_setup` on the FIRST
+    /// primary-originated setup frame (the de-facto announce; PeerInfo
+    /// arrives first on the ordered primary link, before
+    /// `InitialAssignment` dispatch). If the primary never announces, this
+    /// is never called and no worker pool is ever built — exactly the
+    /// invariant the typed lifecycle enforces (a not-yet-configured peer
+    /// must not spin up worker processes).
     pub(super) async fn initialize_workers(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
-    ) -> Result<(), String> {
+    ) -> Result<dynrunner_manager_local::pool::WorkerPool<M, I>, String> {
         let max = self.max_resources();
         // Two distinct callers materialise nested cgroups here:
         //   * `Some(n)` — operator-supplied `--mem-manager-reserved`
@@ -45,16 +58,43 @@ where
         } else {
             self.config.mem_manager_reserved_bytes
         };
-        self.pool
-            .initialize(
-                self.config.num_workers,
-                &max,
-                &self.scheduler,
-                factory,
-                false,
-                mem_manager_reserved_bytes,
-            )
-            .await
+        let mut pool = dynrunner_manager_local::pool::WorkerPool::new();
+        pool.initialize(
+            self.config.num_workers,
+            &max,
+            &self.scheduler,
+            factory,
+            false,
+            mem_manager_reserved_bytes,
+        )
+        .await?;
+        Ok(pool)
+    }
+
+    /// Construct the per-task memory-profile sampler if the operator
+    /// enabled it via `config.output_dir`. Relocated faithfully from the
+    /// pre-typed-lifecycle `run_until_setup_or_done_inner`: it is now
+    /// called from `enter_configuring_on_first_primary_frame`, AFTER the
+    /// pool spawns and BEFORE the `InitialAssignment` dispatch, so the
+    /// initial-assignment sampler hook still captures the first batch.
+    ///
+    /// Deferred from `SecondaryCoordinator::new` because the sampler
+    /// spawns a background tokio task on the current runtime — at
+    /// construction time the caller may not be inside one. The sampler is
+    /// constructed regardless of cgroup-v2 availability so its event queue
+    /// exists for non-cgroup messages (Disconnected fan-out) and the
+    /// secondary-side lifecycle test can pin construction independently of
+    /// cgroup-v2. Mirrors `LocalManager::process_binaries`.
+    pub(super) fn build_sampler_if_enabled(&mut self) {
+        if self.sampler.is_none()
+            && let Some(dir) = self.config.output_dir.as_ref()
+        {
+            self.sampler = Some(
+                dynrunner_manager_local::memprofile::MemProfileSampler::spawn(
+                    dynrunner_manager_local::memprofile::MemProfileConfig::new(dir.clone()),
+                ),
+            );
+        }
     }
 
     pub(super) async fn send_welcome(&mut self) -> Result<(), String> {
@@ -108,28 +148,22 @@ where
         self.send_setup_frame(msg).await
     }
 
-    /// Ship one setup-phase frame to the primary role, opaquely.
+    /// Ship one setup-phase frame to the primary, opaquely.
     ///
     /// Single chokepoint for the two setup-phase sends. Keeps the
     /// narrow-typed `SetupBootstrapMessage` construction at the call
-    /// sites (the compile-time "no runtime frames during setup"
-    /// guard) while routing through the unified transport: convert to
-    /// the wire shape via the lossless `From<SetupBootstrapMessage>`
-    /// and `transport.send(Address::Role(Role::Primary), ..)`. The
-    /// role cache is cold during setup (no `PromotePrimary` yet) so the
-    /// transport resolves `Role::Primary` to the bootstrap uplink — the
-    /// original primary these frames address. No locality branching
-    /// leaks to the manager; setup is just another opaque
-    /// role-addressed send.
+    /// sites (the compile-time "no runtime frames during setup" guard)
+    /// while routing through the [`Destination::Primary`] egress edge:
+    /// convert to the wire shape via the lossless
+    /// `From<SetupBootstrapMessage>` and `send_to(Destination::Primary,
+    /// ..)`. The role table is cold during setup (no `PrimaryChanged`
+    /// yet), so the edge resolver falls back to the bootstrap primary id
+    /// — the dialled primary these frames address. No locality branching
+    /// leaks to the manager; setup is just another destination-addressed
+    /// send.
     async fn send_setup_frame(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         let wire: DistributedMessage<I> = msg.into();
-        self.transport
-            .send(
-                dynrunner_protocol_primary_secondary::Address::Role(
-                    dynrunner_protocol_primary_secondary::Role::Primary,
-                ),
-                wire,
-            )
+        self.send_to(dynrunner_protocol_primary_secondary::Destination::Primary, wire)
             .await
     }
 
@@ -171,7 +205,24 @@ where
             // setup frames over the uplink. The role-layer passes
             // non-`RoleAddressed` setup frames through untouched.
             match self.transport.recv_peer().await {
-                Some(msg) => match msg.msg_type() {
+                Some(msg) => {
+                    // FIRST primary-originated frame = the announce. This
+                    // is the `AwaitingPrimary → Configuring` boundary: the
+                    // primary has made contact, so spawn the worker pool
+                    // (the entry action of `Configuring`) BEFORE handling
+                    // this frame's content. The frames are ordered
+                    // (PeerInfo → InitialAssignment → TransferComplete) on
+                    // the primary link, so the pool exists before any
+                    // `InitialAssignment` dispatch — no race. Awaited
+                    // before the match below exactly as the pre-relocation
+                    // flow awaited `initialize_workers` before
+                    // `wait_for_setup`. Idempotent: only fires while the
+                    // lifecycle is still `AwaitingPrimary` (the
+                    // `enter_configuring` transition is a no-op from any
+                    // other state, but the spawn is gated on the state
+                    // check so workers are built at most once).
+                    self.enter_configuring_on_first_primary_frame(factory).await?;
+                    match msg.msg_type() {
                     MessageType::PeerInfo => {
                         got_peer_info = true;
                         if let DistributedMessage::PeerInfo { peers, .. } = &msg {
@@ -214,8 +265,8 @@ where
                             // peer-direct connectivity" rather than
                             // "the dials are still in flight".
                             if peer_count > 0 {
-                                self.peer_dial_count = peer_count as u32;
-                                self.peer_mesh_check_at =
+                                self.mesh.peer_dial_count = peer_count as u32;
+                                self.mesh.peer_mesh_check_at =
                                     Some(Instant::now() + std::time::Duration::from_secs(30));
                             }
                         }
@@ -245,7 +296,15 @@ where
                     }
                     MessageType::TransferComplete => {
                         got_transfer = true;
-                        self.transfer_complete = true;
+                        // `transfer_complete` is now a `ConfiguringState`
+                        // field (the pool was spawned + the lifecycle
+                        // entered `Configuring` on the first primary frame
+                        // above, so `configuring_mut()` is `Some` here).
+                        // It is the `got_*` config signal the
+                        // `Configuring → Operational` transition gates on.
+                        if let Some(cfg) = self.lifecycle.configuring_mut() {
+                            cfg.mark_transfer_complete();
+                        }
                         tracing::info!("received transfer complete");
                     }
                     MessageType::ClusterMutation => {
@@ -263,11 +322,61 @@ where
                     other => {
                         tracing::debug!(?other, "unexpected message during setup");
                     }
-                },
+                    }
+                }
                 None => return Err("primary disconnected during setup".into()),
             }
         }
 
+        Ok(())
+    }
+
+    /// `AwaitingPrimary → Configuring` entry action, fired on the FIRST
+    /// primary-originated setup frame (the announce). Spawns the worker
+    /// pool, moves it into the new `Configuring` state, and stands up the
+    /// per-task memprofile sampler — the exact pre-handshake side effects
+    /// the pre-relocation flow ran in `run_until_setup_or_done_inner`,
+    /// now relocated here so they only happen once the primary has made
+    /// contact.
+    ///
+    /// Idempotent: a no-op unless the lifecycle is still
+    /// `AwaitingPrimary`, so it fires at most once per run (subsequent
+    /// setup frames find the lifecycle already `Configuring`). The
+    /// carried-forward config flags (`pre_staged_mode` /
+    /// `uses_file_based_items`) start at their historical defaults
+    /// (`false` / `true`) and are updated by the `InitialAssignment`
+    /// handler via `configuring_mut`.
+    async fn enter_configuring_on_first_primary_frame(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
+        if !matches!(
+            self.lifecycle,
+            super::lifecycle::SecondaryLifecycle::AwaitingPrimary { .. }
+        ) {
+            return Ok(());
+        }
+        tracing::info!(
+            secondary = %self.config.secondary_id,
+            workers = self.config.num_workers,
+            "primary announced (first setup frame); spawning workers and entering Configuring"
+        );
+        // Spawn the pool (awaited) BEFORE any InitialAssignment dispatch.
+        let pool = self.initialize_workers(factory).await?;
+        let lifecycle = std::mem::replace(
+            &mut self.lifecycle,
+            super::lifecycle::SecondaryLifecycle::connecting(std::time::Instant::now()),
+        );
+        // `pre_staged_mode` / `uses_file_based_items` default to the
+        // historical pre-InitialAssignment values; the InitialAssignment
+        // handler overwrites them via `set_pre_staged_mode` /
+        // `set_uses_file_based_items` once that frame lands.
+        self.lifecycle = lifecycle.enter_configuring(pool, false, true);
+        // Stand up the memprofile sampler now that the pool exists —
+        // BEFORE the InitialAssignment dispatch so the initial-assignment
+        // sampler hook captures the first batch (the same ordering the
+        // pre-relocation flow had).
+        self.build_sampler_if_enabled();
         Ok(())
     }
 
@@ -314,7 +423,7 @@ where
                 .get(i)
                 .map(|w| w.worker_id)
                 .unwrap_or(i as u32);
-            let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+            let wid = worker_id.min(self.pool_mut().workers.len() as u32 - 1);
 
             let zip_ref = if zip_name.is_empty() {
                 None
@@ -363,14 +472,14 @@ where
 
             let estimated = self.estimator.estimate(&binary);
 
-            if (wid as usize) < self.pool.workers.len()
-                && self.pool.workers[wid as usize].is_idle_state()
+            if (wid as usize) < self.pool_mut().workers.len()
+                && self.pool_mut().workers[wid as usize].is_idle_state()
             {
                 // Per-type subprocess dispatch: bind the worker's
                 // loaded TypeId to this task's `type_id` (no-op fast
                 // path when they already match — the dominant case).
                 if let Err(e) = self
-                    .pool
+                    .pool_mut()
                     .ensure_worker_for_type(wid, &binary.type_id, factory, false)
                     .await
                 {
@@ -387,7 +496,7 @@ where
                 // `task_id` off the borrowed `TaskInfo`; cloning
                 // once here keeps the success arm simple.
                 let binary_for_hook = binary.clone();
-                match self.pool.workers[wid as usize]
+                match self.pool_mut().workers[wid as usize]
                     .assign_task(
                         binary,
                         estimated,
@@ -404,7 +513,7 @@ where
                 {
                     Ok(()) => {
                         self.notify_sampler_assigned(wid, &binary_for_hook);
-                        self.active_tasks.insert(hash, wid);
+                        self.active_tasks_mut().insert(hash, wid);
                         tracing::info!(
                             worker_id = wid,
                             binary = ?binary_info.identifier,

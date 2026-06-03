@@ -136,7 +136,7 @@ where
         let local_path_is_relative = std::path::Path::new(local_path).is_relative();
         if resolved_path.is_none() && (self.config.src_network.is_some() || local_path_is_relative)
         {
-            let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+            let wid = worker_id.min(self.pool_mut().workers.len() as u32 - 1);
             let msg = DistributedMessage::TaskFailed {
                 sender_id: self.config.secondary_id.clone(),
                 timestamp: timestamp_now(),

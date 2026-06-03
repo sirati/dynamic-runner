@@ -1,6 +1,6 @@
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport,
+    ClusterMutation, Destination, DistributedMessage, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -201,8 +201,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .collect();
         for secondary_id in &recipients {
             if let Err(e) = self
-                .transport
-                .send(Address::Peer(secondary_id.clone()), msg.clone())
+                .send_to(
+                    Destination::Secondary(PeerId::from(secondary_id.clone())),
+                    msg.clone(),
+                )
                 .await
             {
                 tracing::debug!(

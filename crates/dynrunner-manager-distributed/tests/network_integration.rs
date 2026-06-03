@@ -15,8 +15,8 @@ use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
-use dynrunner_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
-use dynrunner_transport_tunnel::{TunneledPeerTransport, UnifiedSecondaryTransport};
+use dynrunner_transport_quic::{NetworkClient, NetworkServer, PeerNetwork};
+use dynrunner_transport_tunnel::TunneledPeerTransport;
 use serde::{Deserialize, Serialize};
 
 /// Test identifier that can be flattened by serde (must be a struct with named
@@ -153,18 +153,29 @@ async fn e2e_primary_secondary_over_wss() {
                     memuse_log_path: None,
                 };
 
-                let unified = UnifiedSecondaryTransport::new(
-                    config.secondary_id.clone(),
-                    client,
-                    NoPeerTransport,
-                );
+                // Fold the bootstrap wire into a real mesh: the primary
+                // becomes a mesh peer reached by id over the SAME dialed
+                // connection (both directions), with no separate uplink
+                // leg. The secondary holds the `PeerNetwork` directly —
+                // exactly the production secondary path.
+                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
+                    .await
+                    .expect("peer network start");
+                peer_network.register_primary_link("primary".to_string(), client);
                 let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
                     SecondaryCoordinator::new(
                         config,
-                        unified,
+                        peer_network,
                         ResourceStealingScheduler::memory(),
                         FixedEstimator(100),
                     );
+                // Tell the egress edge which peer-id the dialled bootstrap
+                // wire reaches, so `Destination::Primary` resolves to it
+                // while the role table is cold (the setup window before
+                // any `PrimaryChanged`). This is what makes the primary
+                // reachable cold AND warm — the cold-primary resolution
+                // these tests pin.
+                secondary.set_bootstrap_primary_id("primary".to_string());
                 let mut factory = FakeWorkerFactory;
                 secondary.run(&mut factory).await.unwrap();
                 secondary.completed_count()
@@ -303,18 +314,29 @@ async fn e2e_primary_secondary_over_quic() {
                     memuse_log_path: None,
                 };
 
-                let unified = UnifiedSecondaryTransport::new(
-                    config.secondary_id.clone(),
-                    client,
-                    NoPeerTransport,
-                );
+                // Fold the bootstrap wire into a real mesh: the primary
+                // becomes a mesh peer reached by id over the SAME dialed
+                // connection (both directions), with no separate uplink
+                // leg. The secondary holds the `PeerNetwork` directly —
+                // exactly the production secondary path.
+                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
+                    .await
+                    .expect("peer network start");
+                peer_network.register_primary_link("primary".to_string(), client);
                 let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
                     SecondaryCoordinator::new(
                         config,
-                        unified,
+                        peer_network,
                         ResourceStealingScheduler::memory(),
                         FixedEstimator(100),
                     );
+                // Tell the egress edge which peer-id the dialled bootstrap
+                // wire reaches, so `Destination::Primary` resolves to it
+                // while the role table is cold (the setup window before
+                // any `PrimaryChanged`). This is what makes the primary
+                // reachable cold AND warm — the cold-primary resolution
+                // these tests pin.
+                secondary.set_bootstrap_primary_id("primary".to_string());
                 let mut factory = FakeWorkerFactory;
                 secondary.run(&mut factory).await.unwrap();
                 secondary.completed_count()

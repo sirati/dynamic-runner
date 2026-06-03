@@ -24,16 +24,14 @@ pub use peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 
 /// Unix-epoch wall-clock seconds for use as a wire-frame `timestamp`
 /// field. Single source for envelope construction inside this crate
-/// (e.g. the `RoleAddressed` / `RoleMisaddressHint` envelopes wrapped
-/// by `PeerTransport::send`).
+/// (e.g. the `RequestClusterSnapshot` envelope built by
+/// `PeerTransport::join_running_cluster`).
 ///
 /// Manager-side `wire.rs` helpers (`secondary/wire.rs`,
 /// `primary/wire.rs`) and the per-transport `timestamp_secs` helpers
 /// in `transport-quic` / `transport-channel` predate this one and
 /// remain in place. Consolidating them is a separate cleanup
-/// (single concern, easily grep-driven) — keeping this helper
-/// scoped to envelope construction inside the protocol crate avoids
-/// a four-call-site refactor riding along with Step 3.
+/// (single concern, easily grep-driven).
 pub fn timestamp_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -64,9 +64,8 @@ where
             return;
         };
         let Some(subcgroup_dir) = self
-            .pool
-            .workers
-            .get(worker_id as usize)
+            .pool_ref()
+            .and_then(|p| p.workers.get(worker_id as usize))
             .and_then(|w| w.subcgroup_dir())
         else {
             return;

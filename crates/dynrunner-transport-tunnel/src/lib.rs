@@ -6,27 +6,20 @@
 //! The submitter-side primary keeps a per-secondary writer + a demuxed
 //! inbound channel via the existing SSH-tunneled (or in-process
 //! channel) [`SecondaryTransport`]. Those connections are alive,
-//! peer-routable, and survive promotion — but until now they sat
-//! behind the [`SecondaryTransport`] trait and were therefore invisible
-//! to the mesh-level [`PeerTransport`] surface. Step 5 of the
-//! transport-unification refactor added a `peer_transport: P` field on
-//! `PrimaryCoordinator` and routed primary-bound relays through
-//! `peer_transport.send(Address::Role(Role::Primary), msg)`, but the
-//! production constructors still passed
-//! `dynrunner_transport_quic::NoPeerTransport` — so the role-addressed
-//! send always errored "no holder", the `Err` was swallowed, and the
-//! relay arm was inert.
+//! peer-routable, and survive promotion — but they sat behind the
+//! [`SecondaryTransport`] trait and were therefore invisible to the
+//! mesh-level [`PeerTransport`] surface.
 //!
 //! [`TunneledPeerTransport`] closes that gap. It is a *peer-mesh-only*
 //! view over the same writer table + inbound channel the legacy
 //! [`SecondaryTransport`] already produces. At the mesh-level
 //! abstraction the primary is just another peer; the networking
 //! implementation underneath happens to be SSH tunnels (or channels in
-//! test fixtures) instead of QUIC. No special-casing at the mesh
-//! layer — Step 4's role routing, Step 3's [`Address::Role(_)`]
-//! dispatch, and Step 2's [`RoleTable`] write-through cache all work
-//! against this transport identically to how they work against
-//! `dynrunner_transport_quic::PeerNetwork`.
+//! test fixtures) instead of QUIC. The transport is role-blind
+//! (transport ⊥ roles): it routes by `PeerId` only, exactly as
+//! `dynrunner_transport_quic::PeerNetwork` does. Resolving
+//! [`dynrunner_protocol_primary_secondary::Destination::Primary`] to a
+//! host peer-id is the coordinator edge's job, never the transport's.
 //!
 //! # Module boundary
 //!
@@ -43,8 +36,8 @@
 //! `select!` that the legacy `NetworkServer::recv` used to own. The
 //! `NetworkServer` is reduced to bind + accept-loops + writer-table
 //! population — it no longer consumes inbound or fans out a tap.
-//! Beyond that, `TunneledPeerTransport` owns its mesh-level state:
-//! local-id, role-cache, inbound + registration mpscs.
+//! Beyond that, `TunneledPeerTransport` owns its mesh-level state: the
+//! Router (seeded with the local id), inbound + registration mpscs.
 //!
 //! # Single-threaded by construction
 //!
@@ -64,15 +57,11 @@
 //! secondary call sites keep it for as long as that disable path
 //! exists.
 
-mod secondary_link;
 mod transport;
 
 #[cfg(test)]
-mod secondary_link_tests;
-#[cfg(test)]
 mod tests;
 
-pub use secondary_link::UnifiedSecondaryTransport;
 pub use transport::{
     InboundTap, PeerRegistration, RegistrationSink, SharedOutgoing, TunneledPeerTransport,
 };

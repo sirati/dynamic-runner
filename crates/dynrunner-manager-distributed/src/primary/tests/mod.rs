@@ -42,7 +42,7 @@ mod worker_lifecycle;
 // alternative is duplicated `use` lines in 11 sibling files.
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, NoPeers, SlowFakeWorkerFactory, TestId, fake_secondary,
+    FakeWorkerFactory, FixedEstimator, SlowFakeWorkerFactory, TestId, fake_secondary,
     fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
 };
 #[allow(unused_imports)]
@@ -56,9 +56,7 @@ pub(super) use dynrunner_protocol_primary_secondary::{ClusterMutation, Distribut
 #[allow(unused_imports)]
 pub(super) use dynrunner_scheduler::ResourceStealingScheduler;
 #[allow(unused_imports)]
-pub(super) use dynrunner_transport_channel::{ChannelPeerTransport, ChannelPrimaryTransportEnd};
-#[allow(unused_imports)]
-pub(super) use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
+pub(super) use dynrunner_transport_channel::ChannelPeerTransport;
 #[allow(unused_imports)]
 pub(super) use std::collections::HashMap;
 #[allow(unused_imports)]
@@ -77,9 +75,41 @@ pub(super) fn noop_phase_args() -> (
     (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _| {}))
 }
 
+/// Build the channel-backed mesh transport a real secondary holds when
+/// driven against a primary in-process: the secondary reaches the primary
+/// as an ordinary mesh peer keyed by `"primary"` (folded in via
+/// [`ChannelPeerTransport::register_primary_link`]), the channel analog of
+/// how the QUIC bootstrap wire folds into `PeerNetwork`.
+///
+/// Returns the two channel ends the primary plugs into its own
+/// `ChannelPeerTransport` — `pri_to_sec_tx` goes in the primary's
+/// `outgoing[secondary_id]`, `sec_to_pri_rx` is forwarded into the
+/// primary's inbound — plus the secondary's ready-to-use transport.
+/// Single source of the mesh wiring so the per-factory spawn helpers below
+/// stay focused on config + worker factory.
+fn channel_mesh_secondary_ends(
+    secondary_id: &str,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>, // primary→secondary
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
+    ChannelPeerTransport<TestId>,
+) {
+    // primary→secondary: feeds the secondary transport's inbound.
+    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+    // secondary→primary: the secondary's outbound to the folded primary
+    // link; the primary forwards `sec_to_pri_rx` into its own inbound.
+    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+    let mut transport =
+        ChannelPeerTransport::from_raw_channels(secondary_id.into(), HashMap::new(), pri_to_sec_rx);
+    transport.register_primary_link("primary".into(), sec_to_pri_tx);
+
+    (pri_to_sec_tx, sec_to_pri_rx, transport)
+}
+
 /// Wire up a real SecondaryCoordinator as a tokio task, connected to the
-/// primary via channels. Returns the secondary's channel ends that should
-/// be plugged into the primary's ChannelTransport.
+/// primary via a channel-backed mesh. Returns the secondary's channel ends
+/// that should be plugged into the primary's `ChannelPeerTransport`.
 pub(super) fn spawn_real_secondary(
     secondary_id: String,
     num_workers: u32,
@@ -102,16 +132,9 @@ pub(super) fn spawn_real_secondary_with_src_network(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio::task::JoinHandle<usize>,
 ) {
-    // primary→secondary channel
-    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    // secondary→primary channel
-    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
-        let transport = ChannelPrimaryTransportEnd {
-            tx: sec_to_pri_tx,
-            rx: pri_to_sec_rx,
-        };
         let config = SecondaryConfig {
             secondary_id,
             num_workers,
@@ -137,14 +160,16 @@ pub(super) fn spawn_real_secondary_with_src_network(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified =
-            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
-            unified,
+            transport,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
+        // The egress edge resolves `Destination::Primary` to the
+        // in-process primary's id (`"primary"`) while the role table is
+        // cold — matching the folded primary mesh-link's key.
+        secondary.set_bootstrap_primary_id("primary".to_string());
         let mut factory = FakeWorkerFactory;
         secondary.run(&mut factory).await.unwrap();
         secondary.local_tasks_run_for_test()
@@ -168,14 +193,9 @@ pub(super) fn spawn_real_secondary_slow(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio::task::JoinHandle<usize>,
 ) {
-    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
-        let transport = ChannelPrimaryTransportEnd {
-            tx: sec_to_pri_tx,
-            rx: pri_to_sec_rx,
-        };
         let config = SecondaryConfig {
             secondary_id,
             num_workers,
@@ -201,14 +221,13 @@ pub(super) fn spawn_real_secondary_slow(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified =
-            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
-            unified,
+            transport,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
+        secondary.set_bootstrap_primary_id("primary".to_string());
         let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
         secondary.run(&mut factory).await.unwrap();
         secondary.local_tasks_run_for_test()
@@ -234,14 +253,9 @@ pub(super) fn spawn_real_secondary_flaky(
     // before dropping the primary, not from this secondary handle.
     tokio::task::JoinHandle<usize>,
 ) {
-    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
 
     let handle = tokio::task::spawn_local(async move {
-        let transport = ChannelPrimaryTransportEnd {
-            tx: sec_to_pri_tx,
-            rx: pri_to_sec_rx,
-        };
         let config = SecondaryConfig {
             secondary_id,
             num_workers,
@@ -276,14 +290,13 @@ pub(super) fn spawn_real_secondary_flaky(
             output_dir: None,
             memuse_log_path: None,
         };
-        let unified =
-            UnifiedSecondaryTransport::new(config.secondary_id.clone(), transport, NoPeers);
         let mut secondary = SecondaryCoordinator::new(
             config,
-            unified,
+            transport,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
+        secondary.set_bootstrap_primary_id("primary".to_string());
         let mut factory = flaky;
         secondary.run(&mut factory).await.unwrap();
         secondary.local_tasks_run_for_test()

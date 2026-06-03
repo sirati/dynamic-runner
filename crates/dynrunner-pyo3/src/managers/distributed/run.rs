@@ -11,10 +11,10 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
@@ -254,22 +254,21 @@ impl PyDistributedManager {
                 let mut sec_handles = Vec::new();
                 let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
-                // Build the primary's single `Tr: TunneledPeerTransport`.
-                // Post-collapse this is the ONE transport the coordinator
-                // holds. `shared_outgoing` is the writer table the
-                // in-process path registers each per-secondary writer
-                // into directly (no accept loops here, so the
-                // registration sink goes unused); `inbound` is the sink
-                // the per-secondary forwarder feeds — it is the
-                // transport's real, single inbound stream (no fan-out
-                // tap, no separate legacy `ChannelSecondaryTransportEnd`
-                // consumer). Role-addressed / `Address::Peer` sends and
-                // the unified `recv_peer()` both run over this one
-                // transport.
-                let (peer_transport, shared_outgoing, inbound, _registration) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
-                        "primary".into(),
-                    );
+                // Build the in-process primary's single mesh transport
+                // through the backend-opaque factory. Post-collapse this
+                // is the ONE transport the coordinator holds.
+                // `shared_outgoing` is the writer table the in-process
+                // path registers each per-secondary writer into directly
+                // (no accept loops here); `inbound` is the sink the
+                // per-secondary forwarder feeds — the transport's real,
+                // single inbound stream (no fan-out tap). `Destination`
+                // sends and the unified `recv_peer()` both run over this
+                // one transport.
+                let primary_bundle =
+                    transport_factory::inprocess_primary_mesh::<RunnerIdentifier>();
+                let peer_transport = primary_bundle.transport;
+                let shared_outgoing = primary_bundle.shared_outgoing;
+                let inbound = primary_bundle.inbound;
 
                 for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
                     sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
@@ -321,10 +320,20 @@ impl PyDistributedManager {
                     let sec_memuse_log_path = memuse_log_path.clone();
 
                     let handle = tokio::task::spawn_local(async move {
-                        let transport = ChannelPrimaryTransportEnd {
-                            tx: sec_to_pri_tx,
-                            rx: pri_to_sec_rx,
-                        };
+                        // Channel-backed mesh built through the
+                        // backend-opaque factory: the in-process primary is
+                        // folded in as an ordinary mesh peer keyed by
+                        // `"primary"` (no per-role uplink leg). Inbound is
+                        // the primary→secondary channel; the outbound
+                        // primary link is the secondary→primary channel.
+                        let transport = transport_factory::inprocess_secondary_mesh::<
+                            RunnerIdentifier,
+                        >(
+                            secondary_id.clone(),
+                            "primary".to_string(),
+                            pri_to_sec_rx,
+                            sec_to_pri_tx,
+                        );
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
@@ -418,24 +427,22 @@ impl PyDistributedManager {
                             child_processes: Vec::new(),
                         };
 
-                        // Compose the opaque secondary transport: the
-                        // co-located channel end is the uplink to the
-                        // in-process primary, `NoPeerTransport` is the
-                        // (absent) mesh. `Address::Role(Role::Primary)`
-                        // resolves to the loopback channel while the role
-                        // cache is cold — exactly the in-process
-                        // primary. See `UnifiedSecondaryTransport`.
-                        let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
-                            config.secondary_id.clone(),
-                            transport,
-                            dynrunner_transport_quic::NoPeerTransport,
-                        );
-                        let mut secondary = SecondaryCoordinator::new(
-                            config,
-                            unified,
-                            sec_scheduler_config.build_memory_scheduler(),
-                            estimator,
-                        );
+                        // The secondary holds the channel-backed mesh
+                        // `PeerTransport` directly — the primary is a mesh
+                        // peer reached by id, exactly as the QUIC/WSS
+                        // bootstrap wire now folds into `PeerNetwork`.
+                        let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
+                            SecondaryCoordinator::new(
+                                config,
+                                transport,
+                                sec_scheduler_config.build_memory_scheduler(),
+                                estimator,
+                            );
+                        // The egress edge resolves `Destination::Primary` to
+                        // the in-process primary's id (`"primary"`) while the
+                        // role table is cold — matching the folded primary
+                        // mesh-link's key.
+                        secondary.set_bootstrap_primary_id("primary".to_string());
 
                         // Per-secondary panik watcher. One watcher per
                         // coordinator is the simplest correct shape: a
@@ -499,16 +506,18 @@ impl PyDistributedManager {
                         // distributed manager the authority is the
                         // in-process `PrimaryCoordinator` (built below),
                         // which fires `on_phase_*` directly; these
-                        // in-process secondaries use a `NoPeerTransport`
-                        // mesh and therefore compose NO co-located parked
-                        // primary, so their registered callbacks stay
-                        // dormant (no transfer, no promotion in-process)
-                        // and never call into Python. They are registered
-                        // for shape-parity with the SLURM secondary path
-                        // (which DOES transfer them to a co-located parked
-                        // primary); the closures target the SAME single
-                        // process-wide Python `TaskDefinition` instance
-                        // the in-process primary's callbacks already use.
+                        // in-process secondaries hold a channel-backed mesh
+                        // with only the primary folded in (no peer-to-peer
+                        // mesh among the secondaries) and therefore compose
+                        // NO co-located parked primary, so their registered
+                        // callbacks stay dormant (no transfer, no promotion
+                        // in-process) and never call into Python. They are
+                        // registered for shape-parity with the SLURM
+                        // secondary path (which DOES transfer them to a
+                        // co-located parked primary); the closures target
+                        // the SAME single process-wide Python
+                        // `TaskDefinition` instance the in-process primary's
+                        // callbacks already use.
                         secondary.register_phase_lifecycle_callbacks(
                             sec_on_phase_start,
                             sec_on_phase_end,
