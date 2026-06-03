@@ -307,3 +307,58 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
         other => panic!("expected Blocked, got {other:?}"),
     }
 }
+
+/// Migration shim (snapshot-only): a legacy snapshot carries deps that
+/// predate the `(phase_id, task_id)` identity, so they decode with the
+/// sentinel (empty) phase. On `restore`, the shim must inject the
+/// enclosing task's phase into every sentinel dep — and leave any dep
+/// that already names its phase (a new, explicit cross-phase dep)
+/// untouched.
+#[test]
+fn restore_migrates_unphased_deps_to_enclosing_phase() {
+    use dynrunner_core::TaskDep;
+
+    // Build a task in phase "p0" (mk_task's phase) whose dep list mixes
+    // a legacy un-phased dep (sentinel phase) and an explicit
+    // cross-phase dep.
+    let mut task = mk_task("dependent");
+    task.task_depends_on = vec![
+        // Legacy un-phased dep: sentinel phase, to be migrated.
+        TaskDep {
+            task_id: "legacy_prereq".into(),
+            phase_id: PhaseId::default(),
+            inherit_outputs: false,
+        },
+        // New explicit cross-phase dep: must NOT be rewritten.
+        TaskDep {
+            task_id: "explicit_prereq".into(),
+            phase_id: PhaseId::from("other-phase"),
+            inherit_outputs: true,
+        },
+    ];
+
+    let mut source = ClusterState::<RunnerIdentifier>::new();
+    source.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task,
+    });
+    let snap = source.snapshot();
+
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.restore(snap);
+
+    let restored = match joiner.task_state("h") {
+        Some(TaskState::Pending { task }) => task,
+        other => panic!("expected Pending, got {other:?}"),
+    };
+    let deps = &restored.task_depends_on;
+    assert_eq!(deps.len(), 2);
+    // Legacy dep took the enclosing task's phase ("p0").
+    assert_eq!(deps[0].task_id, "legacy_prereq");
+    assert_eq!(deps[0].phase_id, PhaseId::from("p0"), "sentinel migrated to enclosing phase");
+    assert!(!deps[0].is_unphased());
+    // Explicit cross-phase dep is unaffected by the shim.
+    assert_eq!(deps[1].task_id, "explicit_prereq");
+    assert_eq!(deps[1].phase_id, PhaseId::from("other-phase"), "explicit dep untouched");
+    assert!(deps[1].inherit_outputs);
+}

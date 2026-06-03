@@ -86,6 +86,18 @@ impl From<&str> for PhaseId {
     }
 }
 
+/// `Default` is the empty `PhaseId` — used exclusively as the
+/// `TaskDep` migration sentinel: a legacy un-phased dep decodes to this
+/// value and the snapshot-restore migration shim replaces it with the
+/// enclosing task's real phase. It is never a valid runtime phase (a
+/// real phase is non-empty), so it is safe as the "needs migration"
+/// marker.
+impl Default for PhaseId {
+    fn default() -> Self {
+        Self::new("")
+    }
+}
+
 impl From<String> for PhaseId {
     fn from(s: String) -> Self {
         Self::new(s)

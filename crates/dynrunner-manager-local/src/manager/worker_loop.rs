@@ -357,11 +357,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // primary's call into the same core helper.
                 let predecessor_outputs = gather_predecessor_outputs(
                     &binary.task_depends_on,
-                    |task_id| self.task_outputs_cache.get(task_id).cloned(),
-                    |task_id| {
+                    |phase_id, task_id| {
+                        self.task_outputs_cache
+                            .get(&(phase_id.clone(), task_id.to_string()))
+                            .cloned()
+                    },
+                    |phase_id, task_id| {
                         self.task_payloads
                             .iter()
-                            .find(|(t, _)| t.task_id == task_id)
+                            .find(|(t, _)| t.task_id == task_id && &t.phase_id == phase_id)
                             .map(|(t, _)| t.task_depends_on.clone())
                     },
                 );

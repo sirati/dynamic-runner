@@ -59,35 +59,58 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
 /// Extract one ``task_depends_on`` entry into a Rust-side ``TaskDep``.
 ///
 /// Single concern: bridge the two legal Python shapes — bare ``str``
-/// (legacy ``Vec<String>`` contract) and ``TaskDep`` dataclass (new,
-/// carrying ``inherit_outputs``) — into one Rust value. Order of
-/// attempts:
+/// (legacy ``Vec<String>`` contract) and ``TaskDep`` dataclass
+/// (carrying ``inherit_outputs`` and an optional cross-phase
+/// ``phase_id``) — into one Rust value carrying the dep's full
+/// ``(phase_id, task_id)`` identity. A phase-less entry resolves to the
+/// ENCLOSING task's phase. Order of attempts:
 ///
 /// 1. Try ``extract::<String>``. Succeeds for plain ``str`` values; the
-///    result becomes ``TaskDep { task_id, inherit_outputs: false }``,
-///    matching the untagged ``Bare`` arm in
-///    ``dynrunner_core::types::task::TaskDepWire``.
-/// 2. Fall back to attribute reads (``task_id`` / ``inherit_outputs``).
-///    Works for the Python ``TaskDep`` dataclass (and any duck-typed
-///    object exposing those two attributes). Missing
-///    ``inherit_outputs`` is NOT inferred — it must be a ``bool``;
+///    result becomes
+///    ``TaskDep { task_id, phase_id: <enclosing>, inherit_outputs: false }``.
+/// 2. Fall back to attribute reads (``task_id`` / ``inherit_outputs`` /
+///    optional ``phase_id``). Works for the Python ``TaskDep``
+///    dataclass (and any duck-typed object exposing those attributes).
+///    Missing ``inherit_outputs`` is NOT inferred — it must be a
+///    ``bool``;
 ///    a ``TaskDep`` instance always carries it (default ``False``).
 ///
 /// Failure surfaces as a ``PyErr`` propagated up to ``extract_binaries``,
 /// which becomes a ``ValueError`` / ``AttributeError`` at the Python
 /// boundary — the same shape the surrounding extractors raise for
 /// malformed inputs.
-fn extract_task_dep(obj: &Bound<'_, PyAny>) -> PyResult<TaskDep> {
+fn extract_task_dep(obj: &Bound<'_, PyAny>, enclosing_phase: &PhaseId) -> PyResult<TaskDep> {
+    // A dep's full identity is ``(phase_id, task_id)``. A bare string
+    // names no phase, so it resolves to the ENCLOSING task's phase —
+    // the consumer-boundary normalization for the common intra-phase
+    // case. This is NOT the framework runtime default: by the time the
+    // dep leaves this extractor it carries an explicit phase. A
+    // cross-phase dependency must set ``TaskDep(phase_id=...)``.
     if let Ok(s) = obj.extract::<String>() {
         return Ok(TaskDep {
             task_id: s,
+            phase_id: enclosing_phase.clone(),
             inherit_outputs: false,
         });
     }
     let task_id: String = obj.getattr("task_id")?.extract()?;
     let inherit_outputs: bool = obj.getattr("inherit_outputs")?.extract()?;
+    // ``phase_id`` is optional on the Python ``TaskDep`` dataclass: an
+    // empty / missing value resolves to the enclosing task's phase
+    // (intra-phase, the common case); a non-empty value names a
+    // cross-phase prerequisite explicitly.
+    let phase_id_str: String = obj
+        .getattr("phase_id")
+        .and_then(|v| v.extract())
+        .unwrap_or_default();
+    let phase_id = if phase_id_str.is_empty() {
+        enclosing_phase.clone()
+    } else {
+        PhaseId::from(phase_id_str)
+    };
     Ok(TaskDep {
         task_id,
+        phase_id,
         inherit_outputs,
     })
 }
@@ -95,8 +118,13 @@ fn extract_task_dep(obj: &Bound<'_, PyAny>) -> PyResult<TaskDep> {
 /// Walk a Python iterable of ``task_depends_on`` entries and produce
 /// the Rust-side ``Vec<TaskDep>``. Each entry is bridged by
 /// :func:`extract_task_dep`; the first per-entry error propagates and
-/// aborts the walk.
-fn extract_task_depends_on(value: &Bound<'_, PyAny>) -> PyResult<Vec<TaskDep>> {
+/// aborts the walk. `enclosing_phase` is the phase of the task that
+/// owns these deps — used to resolve phase-less entries to their
+/// intra-phase identity.
+fn extract_task_depends_on(
+    value: &Bound<'_, PyAny>,
+    enclosing_phase: &PhaseId,
+) -> PyResult<Vec<TaskDep>> {
     // ``None`` collapses to the empty default — matches the historical
     // ``v.extract::<Vec<String>>().ok().unwrap_or_default()`` behaviour
     // for consumers passing ``task_depends_on=None`` (or omitting the
@@ -108,7 +136,7 @@ fn extract_task_depends_on(value: &Bound<'_, PyAny>) -> PyResult<Vec<TaskDep>> {
     let iter = value.try_iter()?;
     let mut out = Vec::new();
     for item in iter {
-        out.push(extract_task_dep(&item?)?);
+        out.push(extract_task_dep(&item?, enclosing_phase)?);
     }
     Ok(out)
 }
@@ -212,7 +240,7 @@ pub(crate) fn extract_binaries(
             let task_depends_on: Vec<TaskDep> = item
                 .getattr("task_depends_on")
                 .ok()
-                .map(|v| extract_task_depends_on(&v))
+                .map(|v| extract_task_depends_on(&v, &phase_id))
                 .transpose()?
                 .unwrap_or_default();
             // Optional soft-preferred-secondaries hint. Missing /
@@ -270,12 +298,31 @@ mod tests {
         simplens.call((), Some(&kwargs)).expect("SimpleNamespace(...)")
     }
 
+    /// As `make_task_dep` but carrying an explicit cross-phase
+    /// `phase_id`, mirroring `TaskDep(task_id, phase_id=...)`.
+    fn make_phased_task_dep<'py>(
+        py: Python<'py>,
+        task_id: &str,
+        phase_id: &str,
+        inherit_outputs: bool,
+    ) -> Bound<'py, PyAny> {
+        let types = py.import("types").expect("types module");
+        let simplens = types.getattr("SimpleNamespace").expect("SimpleNamespace");
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("task_id", task_id).unwrap();
+        kwargs.set_item("phase_id", phase_id).unwrap();
+        kwargs.set_item("inherit_outputs", inherit_outputs).unwrap();
+        simplens.call((), Some(&kwargs)).expect("SimpleNamespace(...)")
+    }
+
     #[test]
-    fn extract_task_dep_bare_string_defaults_inherit_outputs_false() {
+    fn extract_task_dep_bare_string_resolves_enclosing_phase() {
         Python::attach(|py| {
             let obj = pyo3::types::PyString::new(py, "alpha");
-            let dep = extract_task_dep(&obj.into_any()).expect("bare string");
+            let enclosing = PhaseId::from("phaseX");
+            let dep = extract_task_dep(&obj.into_any(), &enclosing).expect("bare string");
             assert_eq!(dep.task_id, "alpha");
+            assert_eq!(dep.phase_id, enclosing, "bare string takes enclosing phase");
             assert!(!dep.inherit_outputs);
         });
     }
@@ -283,15 +330,31 @@ mod tests {
     #[test]
     fn extract_task_dep_dataclass_carries_inherit_outputs() {
         Python::attach(|py| {
+            let enclosing = PhaseId::from("phaseX");
             let obj = make_task_dep(py, "beta", true);
-            let dep = extract_task_dep(&obj).expect("attribute-bearing object");
+            let dep = extract_task_dep(&obj, &enclosing).expect("attribute-bearing object");
             assert_eq!(dep.task_id, "beta");
+            assert_eq!(dep.phase_id, enclosing, "phase-less dataclass takes enclosing phase");
             assert!(dep.inherit_outputs);
 
             let obj2 = make_task_dep(py, "gamma", false);
-            let dep2 = extract_task_dep(&obj2).expect("attribute-bearing object");
+            let dep2 = extract_task_dep(&obj2, &enclosing).expect("attribute-bearing object");
             assert_eq!(dep2.task_id, "gamma");
             assert!(!dep2.inherit_outputs);
+        });
+    }
+
+    #[test]
+    fn extract_task_dep_explicit_phase_is_cross_phase() {
+        // An explicit `phase_id` names a cross-phase prerequisite and is
+        // NOT overridden by the enclosing phase.
+        Python::attach(|py| {
+            let enclosing = PhaseId::from("phaseX");
+            let obj = make_phased_task_dep(py, "delta", "phaseY", true);
+            let dep = extract_task_dep(&obj, &enclosing).expect("phased dep");
+            assert_eq!(dep.task_id, "delta");
+            assert_eq!(dep.phase_id, PhaseId::from("phaseY"));
+            assert!(dep.inherit_outputs);
         });
     }
 
@@ -299,18 +362,22 @@ mod tests {
     fn extract_task_depends_on_mixed_iterable() {
         // The wire-equivalent of `["A", TaskDep("B", inherit_outputs=True)]`:
         // a Python tuple mixing the two legal entry shapes. The bridge
-        // must preserve order and the inherit-outputs flag.
+        // must preserve order and the inherit-outputs flag, and resolve
+        // phase-less entries to the enclosing phase.
         Python::attach(|py| {
+            let enclosing = PhaseId::from("phaseX");
             let bare = pyo3::types::PyString::new(py, "A").into_any();
             let struct_dep = make_task_dep(py, "B", true);
             let tuple = pyo3::types::PyTuple::new(py, [bare, struct_dep])
                 .expect("mixed tuple");
             let deps =
-                extract_task_depends_on(tuple.as_any()).expect("mixed iterable");
+                extract_task_depends_on(tuple.as_any(), &enclosing).expect("mixed iterable");
             assert_eq!(deps.len(), 2);
             assert_eq!(deps[0].task_id, "A");
+            assert_eq!(deps[0].phase_id, enclosing);
             assert!(!deps[0].inherit_outputs);
             assert_eq!(deps[1].task_id, "B");
+            assert_eq!(deps[1].phase_id, enclosing);
             assert!(deps[1].inherit_outputs);
         });
     }
@@ -322,8 +389,9 @@ mod tests {
         // behaviour where the wrong-type path collapsed via
         // `extract::<Vec<String>>().ok().unwrap_or_default()`.
         Python::attach(|py| {
+            let enclosing = PhaseId::from("phaseX");
             let none = py.None().into_bound(py);
-            let deps = extract_task_depends_on(&none).expect("None");
+            let deps = extract_task_depends_on(&none, &enclosing).expect("None");
             assert!(deps.is_empty());
         });
     }
