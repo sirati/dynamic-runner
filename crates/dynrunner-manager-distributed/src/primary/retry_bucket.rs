@@ -259,8 +259,9 @@ where
 
         // Build candidates from `all_binaries` (the run-start snapshot)
         // cross-referenced against `failed_tasks` (the hash-keyed
-        // ErrorType ledger). On a parked primary that activated via the
-        // seeded resume, `all_binaries` is empty (the pool was hydrated
+        // ErrorType ledger). On an on-demand co-located primary that
+        // activated via the seeded resume, `all_binaries` is empty (the
+        // pool was hydrated
         // from the CRDT, not a run-start binary list); `failed_tasks` is
         // seeded from the restored ledger, and the candidate set is
         // built from the hydrated pool's view. Both paths share the core

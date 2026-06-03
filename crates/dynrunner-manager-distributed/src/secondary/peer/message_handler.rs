@@ -261,8 +261,8 @@ where
                 // That `true` is the TERMINAL ACTION cue:
                 // `fire_local_promotion` originates + locally applies
                 // `PrimaryChanged { new = self }`, which (via the apply
-                // hook) fires the co-located parked primary's activation
-                // gate (seeded resume from the replicated CRDT), and
+                // hook) builds the co-located primary on demand (seeded
+                // resume from the replicated CRDT), and
                 // broadcasts the same frame so surviving secondaries
                 // re-point `Role::Primary` onto this winner.
                 // Pre-fix this return was discarded, so a surviving

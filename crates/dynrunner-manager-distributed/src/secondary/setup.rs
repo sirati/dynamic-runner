@@ -376,7 +376,7 @@ where
     /// flag is cleared so a re-applied frame does not re-enter. `false`
     /// only on the defensive no-flag path (never reached given the caller
     /// guard).
-    async fn enter_operational_on_transfer(
+    pub(in crate::secondary) async fn enter_operational_on_transfer(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<bool, String> {

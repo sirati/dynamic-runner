@@ -457,8 +457,8 @@ use super::super::test_helpers::make_secondary_recording;
 /// returns `true` (quorum crossed, state → `Promoted`), the message
 /// handler's terminal action `fire_local_promotion` originates a single
 /// `ClusterMutation::PrimaryChanged { new = self }`, applies it locally
-/// through the unified hook — which MUST (1) fire the co-located parked
-/// primary's activation gate and reset the election to `Normal` — and
+/// through the unified hook — which MUST (1) build the co-located
+/// primary on demand and reset the election to `Normal` — and
 /// (2) broadcast that SAME `PrimaryChanged` so surviving secondaries
 /// re-point `Role::Primary` onto this winner. Pre-fix the `true` was
 /// discarded and the failover path dead-ended.
@@ -745,6 +745,138 @@ async fn promotion_without_activator_still_broadcasts() {
                     .any(|mu| matches!(mu, ClusterMutation::PrimaryChanged { .. }))
         )),
         "PrimaryChanged must broadcast even when no co-located primary exists",
+    );
+}
+
+/// Loud-reject fork `(can_be_primary = true, activator = None)`: the node
+/// is marked primary-capable in the replicated CRDT but the runtime
+/// registered NO on-demand activator — a programmer wiring error. The
+/// activation site MUST latch `fatal_exit` (loud, never a silent strand —
+/// the failure mode that produced THE HANG) and build NO primary.
+#[tokio::test(flavor = "current_thread")]
+async fn on_demand_capable_without_activator_latches_fatal_exit() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    // Mark capable through the real CRDT apply path — but register NO
+    // activator (NOT `arm_primary_activator`, which also wires one).
+    sec.cluster_state.apply(ClusterMutation::PeerJoined {
+        peer_id: "sec-a".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
+    assert!(sec.fatal_exit.is_none(), "no fatal_exit before activation");
+
+    sec.activate_co_located_primary_on_demand();
+
+    assert!(
+        sec.fatal_exit.is_some(),
+        "(true, None) is a wiring-error violation — it MUST latch fatal_exit, \
+         never silently strand with no primary",
+    );
+    assert!(
+        sec.activated_primary_handle.is_none(),
+        "no primary may be built on the (true, None) reject arm",
+    );
+}
+
+/// Loud-reject fork `(can_be_primary = false, activator = Some)`: an
+/// activator was wired but the node's replicated capability marker is
+/// unset — selection/election must never name a peer whose marker is
+/// cleared. The activation site MUST latch `fatal_exit` (refuse to build
+/// an unmarked authority) and build NO primary, never silently strand.
+#[tokio::test(flavor = "current_thread")]
+async fn on_demand_incapable_with_activator_latches_fatal_exit() {
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    // Register an activator but DO NOT mark the node capable: the
+    // `(false, Some)` fork. A build attempt here would be a split-brain.
+    let built = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let b = built.clone();
+        sec.register_primary_activator(Box::new(move |_snap| {
+            b.set(true);
+            tokio::spawn(async {})
+        }));
+    }
+    assert!(sec.fatal_exit.is_none(), "no fatal_exit before activation");
+
+    sec.activate_co_located_primary_on_demand();
+
+    assert!(
+        sec.fatal_exit.is_some(),
+        "(false, Some) is a capability violation — it MUST latch fatal_exit, \
+         refusing to build an unmarked authority rather than strand silently",
+    );
+    assert!(
+        !built.get(),
+        "the activator closure must NOT run on the (false, Some) reject arm",
+    );
+    assert!(
+        sec.activated_primary_handle.is_none(),
+        "no primary may be built on the (false, Some) reject arm",
+    );
+}
+
+/// Transferred-during-setup race: a bootstrap `PrimaryChanged { reason:
+/// Transferred, new = self }` that arrives while this node is STILL in
+/// setup (NOT yet Operational — the relocate raced ahead of
+/// TransferComplete) must NOT build inline. Instead it latches
+/// `pending_transfer_activation`; the setup FSM (`enter_operational_on_
+/// transfer`) then consumes the latch and builds the co-located primary on
+/// demand — neither stranding nor panicking. Pins the full latch → setup
+/// transition → on-demand build chain on a primary-capable node.
+#[tokio::test(flavor = "current_thread")]
+async fn transferred_during_setup_latches_then_builds_on_demand() {
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    // NOTE: NO `enter_operational_for_test()` — the node is still in setup
+    // (the `Connecting` lifecycle), which is the whole point of this race.
+    let activated = arm_primary_activator(&mut sec);
+    assert!(
+        sec.lifecycle.operational_mut().is_none(),
+        "fixture precondition: the node is NOT yet Operational",
+    );
+
+    // The Transferred self-naming lands mid-setup. Because the node is not
+    // Operational, `apply_primary_changed` must DEFER the build by latching
+    // the pending flag — it must NOT build inline here.
+    let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "sec-a".into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Transferred,
+    }]);
+    assert!(changed, "a genuine Transferred self-naming advances the identity");
+    assert!(
+        sec.pending_transfer_activation,
+        "Transferred-while-in-setup must latch pending_transfer_activation",
+    );
+    assert!(
+        !activated.get(),
+        "the on-demand build must be DEFERRED (not inline) while still in setup",
+    );
+
+    // The setup FSM picks the latch up in its recv loop and runs the
+    // Transferred transition: it consumes the latch, builds the co-located
+    // primary on demand, and returns `true` so `wait_for_setup` abandons
+    // the handshake and runs this node as the follower of its own primary.
+    let took = sec
+        .enter_operational_on_transfer(&mut FakeWorkerFactory)
+        .await
+        .expect("the Transferred setup transition must not error");
+    assert!(took, "the transition is taken (the latch was set)");
+    assert!(
+        !sec.pending_transfer_activation,
+        "the latch is consumed so a re-applied frame does not re-enter",
+    );
+    assert!(
+        activated.get(),
+        "the setup transition must build the co-located primary on demand \
+         (the activator closure ran)",
+    );
+    assert!(
+        sec.activated_primary_handle.is_some(),
+        "the built primary's join handle is stored for wind-down",
     );
 }
 

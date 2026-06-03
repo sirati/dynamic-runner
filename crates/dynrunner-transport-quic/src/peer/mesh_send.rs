@@ -3,8 +3,8 @@
 //!
 //! # Concern
 //!
-//! A node that runs BOTH a `SecondaryCoordinator` and a co-located
-//! parked `PrimaryCoordinator` on one `LocalSet` owns a SINGLE
+//! A node that runs BOTH a `SecondaryCoordinator` and an on-demand
+//! co-located `PrimaryCoordinator` on one `LocalSet` owns a SINGLE
 //! [`PeerNetwork`] mesh. The secondary holds that mesh by value (the
 //! `EitherPeerTransport`); the co-located primary's role-blind
 //! `Tr: PeerTransport` (`MeshHandleTransport`) still needs to reach

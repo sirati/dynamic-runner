@@ -109,7 +109,7 @@ where
             sampler: None,
             // Co-located loopback channels — registered by the pyo3
             // composition (`register_colocated_*`) only when this host
-            // also runs a parked co-located primary. `None` everywhere
+            // also runs an on-demand co-located primary. `None` everywhere
             // else (the forward / drain become no-ops).
             colocated_primary_inbound_tx: None,
             colocated_loopback_inbound_rx: None,

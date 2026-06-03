@@ -160,7 +160,7 @@ pub enum EitherPeerTransport<I: Identifier> {
 }
 
 impl<I: Identifier> EitherPeerTransport<I> {
-    /// Mint a cloneable [`MeshSendHandle`] for a co-located parked
+    /// Mint a cloneable [`MeshSendHandle`] for an on-demand co-located
     /// primary's send-proxy, when a real mesh exists.
     ///
     /// `Some` for `Real` (a live `PeerNetwork` whose `recv_peer` drains
