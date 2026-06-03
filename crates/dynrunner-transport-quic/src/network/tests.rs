@@ -285,6 +285,78 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
         .await;
 }
 
+/// `NetworkClient::mesh_writer` is a fan-in into the SAME wire: a frame
+/// sent through the minted handle reaches the server over the existing
+/// connection, alongside the client's own `MessageSender::send`. This
+/// is the handle the secondary mesh registers as the directed primary
+/// link, so `mesh.send_to_peer(primary)` reaches the primary over the
+/// bootstrap connection rather than opening a second one.
+#[tokio::test(flavor = "current_thread")]
+async fn mesh_writer_fans_into_the_same_wire() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let (mut transport, _outgoing, inbound, registration) =
+                TunneledPeerTransport::<TestId>::new("primary".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+                .await
+                .unwrap();
+            let port = server.port();
+            let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+            let _client_task = tokio::task::spawn_local(async move {
+                let mut client = NetworkClient::connect_wss_only(server_addr)
+                    .await
+                    .expect("WSS connect failed");
+                // First frame on a fresh connection identifies the
+                // sender to the accept side (it reads `sender_id` from
+                // the first frame); send it via the client's own path.
+                let welcome: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+                    sender_id: "sec-0".into(),
+                    timestamp: 1.0,
+                    secondary_id: "sec-0".into(),
+                    resources: vec![],
+                    worker_count: 1,
+                    hostname: "test".into(),
+                    is_observer: false,
+                };
+                MessageSender::send(&mut client, welcome).await.unwrap();
+
+                // Now mint a mesh_writer and send a SECOND frame through
+                // it — it must travel the same wire and surface at the
+                // server after the welcome (FIFO with the client's send).
+                let mesh_writer = client.mesh_writer();
+                mesh_writer
+                    .send(DistributedMessage::Keepalive {
+                        sender_id: "sec-0".into(),
+                        timestamp: 2.0,
+                        secondary_id: "sec-0".into(),
+                        active_workers: 7,
+                        emitter_role: KeepaliveRole::Secondary,
+                    })
+                    .expect("mesh_writer send must enqueue");
+
+                // Keep the connection alive until the test finishes.
+                let _ = MessageReceiver::<DistributedMessage<TestId>>::recv(&mut client).await;
+            });
+
+            let first = transport.recv_peer().await.expect("welcome");
+            assert!(matches!(first, DistributedMessage::SecondaryWelcome { .. }));
+            let second = transport.recv_peer().await.expect("mesh_writer frame");
+            match second {
+                DistributedMessage::Keepalive { active_workers, .. } => {
+                    assert_eq!(
+                        active_workers, 7,
+                        "the frame sent via mesh_writer must reach the server over the same wire",
+                    );
+                }
+                other => panic!("expected the mesh_writer Keepalive, got {other:?}"),
+            }
+        })
+        .await;
+}
+
 /// Shape-A buffering invariant: frames accepted before the first
 /// `recv_peer()` poll are not lost — the unbounded inbound mpsc buffers
 /// them, and the first poll drains them in FIFO order. Pins that a

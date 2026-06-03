@@ -140,6 +140,14 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         self.router.prune(Instant::now());
         let mut errors = Vec::new();
         for (peer_id, tx) in &self.connections {
+            // The bootstrap-primary directed link is routable
+            // (`send_to_peer` / `has_peer`) but NOT a broadcast member:
+            // the secondary's mesh broadcast reaches peers only, exactly
+            // as before the primary was registered. Folding the primary
+            // into the (deliver-once) broadcast fan-out is a later leaf.
+            if self.primary_link_id.as_deref() == Some(peer_id.as_str()) {
+                continue;
+            }
             if tx.send(msg.clone()).is_err() {
                 errors.push(peer_id.clone());
             }
@@ -345,16 +353,32 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     }
 
     fn peer_count(&self) -> usize {
-        self.connections.len()
+        // Mesh-health cardinality: the count of real peer secondaries.
+        // The bootstrap-primary directed link (if registered) is
+        // routable but is NOT a mesh peer for health purposes — it must
+        // not inflate the count the mesh-watchdog / MeshReady report
+        // read, or a firewalled fleet would falsely look "mesh-formed".
+        // Excluded symmetrically with `broadcast`.
+        let connections = self.connections.len();
+        let primary_link = usize::from(
+            self.primary_link_id
+                .as_deref()
+                .is_some_and(|id| self.connections.contains_key(id)),
+        );
+        connections - primary_link
     }
 
     fn has_peer(&self, id: &PeerId) -> bool {
         // Real per-id membership: a peer is a member iff it has a live
-        // connection entry in the QUIC connection table (the same table
-        // `peer_count` measures the cardinality of). Drained-but-not-yet
-        // -registered accept-loop connections are not counted here — the
-        // table is the single source of truth for "reachable right now",
-        // matching the `peer_count` contract.
+        // connection entry in the QUIC connection table. The
+        // bootstrap-primary directed link IS such an entry, so
+        // `has_peer(primary)` is `true` once registered — the primary is
+        // reachable as a mesh peer from the secondary's side, which is
+        // the correct membership answer (it is excluded only from the
+        // broadcast fan-out and the mesh-health `peer_count`, not from
+        // per-id reachability). Drained-but-not-yet-registered accept-
+        // loop connections are not counted here — the table is the
+        // single source of truth for "reachable right now".
         self.connections.contains_key(id.as_str())
     }
 

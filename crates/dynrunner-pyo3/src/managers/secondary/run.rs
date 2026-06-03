@@ -298,7 +298,7 @@ impl PySecondaryCoordinator {
                 // dynrunner-transport-quic because the `PeerTransport`
                 // trait uses RPIT-in-trait and isn't object-safe;
                 // a sum-type is the only way to pick at runtime.
-                let (peer_network, peer_cert_pem, peer_port): (
+                let (mut peer_network, peer_cert_pem, peer_port): (
                     dynrunner_transport_quic::EitherPeerTransport<RunnerIdentifier>,
                     String,
                     u16,
@@ -380,6 +380,32 @@ impl PySecondaryCoordinator {
                 // primary is composed). Taken BEFORE `peer_network` moves
                 // into the unified transport. See `MeshSendHandle`.
                 let mesh_send_handle = peer_network.mesh_send_handle();
+
+                // Symmetric mesh-link registration: register the dialed
+                // primary connection into the mesh's `connections` keyed
+                // by the primary's peer-id, so the primary is a routable
+                // mesh member from this secondary's side
+                // (`mesh.send_to_peer(primary)` / `has_peer(primary)`
+                // resolve over the bootstrap wire — no second connection
+                // is opened). `client.mesh_writer()` is a fan-in send
+                // handle into the SAME WSS/QUIC wire the bootstrap uplink
+                // still owns, so inbound primary frames keep arriving on
+                // the uplink leg and `send_to_primary`'s routing is
+                // unchanged here. The primary is registered as a
+                // directed-only member (excluded from the mesh broadcast
+                // fan-out and from `peer_count`), so this does not change
+                // broadcast topology or mesh-watchdog behaviour. `Disabled`
+                // overlays no-op the registration (no mesh table).
+                //
+                // The bootstrap primary's peer-id is the conventional
+                // `"primary"` — the same id baked into the primary's
+                // `PrimaryConfig::node_id` and the cert CN the QUIC dialer
+                // validates against (`NetworkClient::connect(.., "primary",
+                // ..)`), and the value `Address::Role(Role::Primary)`
+                // resolves to once the role cache warms. (The
+                // string→typed-`Destination` migration owns replacing this
+                // literal with the resolved primary host-id.)
+                peer_network.register_primary_link("primary".to_string(), client.mesh_writer());
 
                 // Compose the opaque secondary transport: the WSS/QUIC
                 // `NetworkClient` is the uplink to the node this

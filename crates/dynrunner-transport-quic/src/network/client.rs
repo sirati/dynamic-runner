@@ -136,10 +136,51 @@ impl<I: Identifier> NetworkClient<I> {
         matches!(self, NetworkClient::Quic(_))
     }
 
+    fn bridge(&self) -> &BridgedConnection<I> {
+        match self {
+            NetworkClient::Quic(b) | NetworkClient::Wss(b) => b,
+        }
+    }
+
     fn bridge_mut(&mut self) -> &mut BridgedConnection<I> {
         match self {
             NetworkClient::Quic(b) | NetworkClient::Wss(b) => b,
         }
+    }
+
+    /// Mint a cloneable, `DistributedMessage`-typed send handle that
+    /// writes to THIS client's wire — without consuming the client.
+    ///
+    /// The client keeps its own [`MessageSender::send`] path
+    /// (`self.bridge_mut().outgoing_tx`); this handle is a second
+    /// sender into the SAME writer task's FIFO outgoing channel, so
+    /// both feed the one underlying QUIC/WSS connection (a fan-in, not
+    /// a second wire). The returned sender accepts a bare
+    /// `DistributedMessage<I>`; a small forwarder task wraps each frame
+    /// in the internal [`Outgoing::Msg`] envelope and pushes it onto
+    /// the client's outgoing channel, preserving send-order with the
+    /// client's own sends.
+    ///
+    /// Used by the secondary mesh to register its dialed primary
+    /// connection as a directed-routable mesh member keyed by the
+    /// primary's peer-id (so `send_to_peer(primary)` resolves over the
+    /// existing bootstrap link) while the bootstrap uplink keeps
+    /// owning the wire. The forwarder lives on the same `LocalSet` as
+    /// the client's reader/writer tasks; it exits when either end of
+    /// its channel closes (the handle is dropped or the client's
+    /// writer task is gone).
+    pub fn mesh_writer(&self) -> mpsc::UnboundedSender<DistributedMessage<I>> {
+        let outgoing_tx = self.bridge().outgoing_tx.clone();
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+        tokio::task::spawn_local(async move {
+            while let Some(msg) = writer_rx.recv().await {
+                if outgoing_tx.send(Outgoing::Msg(Box::new(msg))).is_err() {
+                    // The client's writer task exited (wire closed).
+                    break;
+                }
+            }
+        });
+        writer_tx
     }
 }
 

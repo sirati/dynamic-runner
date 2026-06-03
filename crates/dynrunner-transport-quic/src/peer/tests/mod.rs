@@ -27,6 +27,7 @@ pub(crate) struct TestId(pub(crate) String);
 mod cert_parsing;
 mod either;
 mod log_capture;
+mod primary_link;
 mod recv_lifetime;
 mod silent_reconnect;
 mod two_peers;
