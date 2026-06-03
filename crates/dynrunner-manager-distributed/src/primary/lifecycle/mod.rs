@@ -38,6 +38,11 @@ mod operational_loop;
 mod promotion;
 mod worker_mgmt;
 
+/// The bootstrap hand-off outcome the `run_pipeline` fork branches on.
+/// Re-exported so the fork (in `primary/coordinator.rs`) can name it
+/// without reaching into the private `promotion` sub-module.
+pub(crate) use promotion::RelocationOutcome;
+
 #[cfg(test)]
 mod tests;
 

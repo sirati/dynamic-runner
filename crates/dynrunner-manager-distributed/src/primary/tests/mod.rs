@@ -28,6 +28,7 @@ mod phase_decision;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
+mod relocate_observe;
 mod result_data_plumbing;
 mod retry;
 mod select_bootstrap;
