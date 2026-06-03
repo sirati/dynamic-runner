@@ -105,6 +105,62 @@ where
             .filter(move |id| Some(id.as_str()) != current_primary)
     }
 
+    /// The role-aware "alive secondaries" set — the single coordinator
+    /// answer to "which peers run a LIVE SECONDARY right now", filtered
+    /// POSITIVELY on the secondary capability. This is the role-aware
+    /// count the PeerMesh deliberately CANNOT answer: the transport
+    /// exposes only role-blind `peer_count()` (raw connection
+    /// cardinality), so the peer-mesh-formation watchdog and the
+    /// cold-start "is any secondary reachable" branch read THIS, computed
+    /// over global state — never `transport.peer_count()`/`has_peer`.
+    ///
+    /// POSITIVE FILTER — never a role negation. A host runs any
+    /// independent subset of {primary, secondary, observer} under one
+    /// peer-id, so "is an alive secondary" is answered by the secondary
+    /// capability itself, NOT by `!primary && !observer`. Consequently a
+    /// co-located primary+secondary host COUNTS (it positively has a
+    /// secondary), an observer is absent because it has no secondary (it
+    /// emits no `Secondary` keepalive / advertises no workers), and a
+    /// primary-only host is absent for the same positive reason. This is
+    /// exactly where the failover-quorum notion DIFFERS: `live_peer_ids`
+    /// additionally subtracts `current_primary` (you cannot elect the node
+    /// being failed-over-from to replace itself), an election-specific
+    /// rule that does NOT belong to the "is a secondary present" question.
+    ///
+    /// Two positive liveness signals, one per lifecycle regime — selected
+    /// by which ledger physically exists, NOT by an arbitrary flag:
+    ///   - OPERATIONAL (the `OperationalState` exists): `peer_keepalives`
+    ///     keys. A peer is in this map IFF it emitted a `Secondary`
+    ///     keepalive — positive proof it runs a live secondary (the
+    ///     co-located primary included; see the recognition arm in
+    ///     `peer/message_handler.rs`). A peer swept by `check_peer_timeouts`
+    ///     is correctly gone.
+    ///   - SETUP / pre-operational (no `OperationalState`, so no
+    ///     `peer_keepalives`): replicated membership via
+    ///     [`ClusterState::alive_secondary_members`] (advertised
+    ///     worker-secondary capacity AND live). It grows as each peer's
+    ///     `PeerJoined` + `SecondaryCapacity` land during setup — the
+    ///     faithful "has any secondary joined" answer for the cold-start
+    ///     branch, where keepalives do not yet flow.
+    pub(in crate::secondary) fn alive_secondary_ids(&self) -> Vec<String> {
+        if let Some(op) = self.op_ref() {
+            op.peer_keepalives.keys().cloned().collect()
+        } else {
+            self.cluster_state
+                .alive_secondary_members()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    /// Count of [`Self::alive_secondary_ids`] — the role-aware
+    /// alive-secondary cardinality. The peer-mesh-formation watchdog and
+    /// the cold-start "is any secondary reachable" branch read this; it
+    /// NEVER derives from `transport.peer_count()`.
+    pub(in crate::secondary) fn alive_secondary_count(&self) -> usize {
+        self.alive_secondary_ids().len()
+    }
+
     /// Advance the election state. Called once per processing-loop tick.
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {

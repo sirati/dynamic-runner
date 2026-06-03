@@ -179,8 +179,9 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
 
     // Role-blind cardinality: the folded primary is a member, so it is
     // counted (`1`), exactly as the `Real` arm counts the primary folded
-    // into its `connections`. The "exclude the primary from mesh-health"
-    // policy is the edge's `real_peer_count()`, not the transport's.
+    // into its `connections`. The role-aware "how many alive secondaries"
+    // policy is the coordinator edge's `alive_secondary_count()` over
+    // global state, not the transport's.
     assert_eq!(PeerTransport::<TestId>::peer_count(&either), 1);
 
     // `send_to_peer(primary)` routes over the folded outbound wire.

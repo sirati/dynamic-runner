@@ -309,6 +309,39 @@ impl<I: Identifier> ClusterState<I> {
         self.secondary_capacities.keys().map(String::as_str)
     }
 
+    /// The replicated-membership roster of peers that POSITIVELY run a
+    /// live worker-secondary: a peer counts IFF it (a) advertised
+    /// worker-secondary capacity (`secondary_capacities` carries a record
+    /// with `worker_count > 0` — the positive "has a secondary" signal,
+    /// originated by the primary alongside `PeerJoined` on welcome) AND
+    /// (b) is currently a live member (`is_peer_alive`). BOTH predicates
+    /// are positive — "has a secondary" and "is live" — never a negation
+    /// of the primary or observer role.
+    ///
+    /// Positive-filter rationale: roles are an independent subset of
+    /// {primary, secondary, observer} per host, so "is an alive secondary"
+    /// MUST be answered by the secondary capability itself, not by
+    /// `!primary && !observer`. A co-located primary+secondary host counts
+    /// (it advertised workers); an observer is excluded by lacking worker
+    /// capacity (`worker_count == 0` is structural for observers), NOT by a
+    /// `!is_observer` test; a primary-only host is excluded by having no
+    /// worker capacity.
+    ///
+    /// Membership is the faithful liveness signal in the SETUP /
+    /// pre-operational window, where no `peer_keepalives` map exists yet:
+    /// the set grows as each peer's `PeerJoined` + `SecondaryCapacity`
+    /// land (applied even pre-`Operational` via the setup recv loop's
+    /// `ClusterMutation` arm). The OPERATIONAL signal is the coordinator's
+    /// keepalive map; `alive_secondary_ids` selects whichever signal
+    /// exists in the current regime.
+    pub fn alive_secondary_members(&self) -> impl Iterator<Item = &str> {
+        self.secondary_capacities
+            .iter()
+            .filter(|(_, record)| record.worker_count > 0)
+            .map(|(id, _)| id.as_str())
+            .filter(move |id| self.is_peer_alive(id))
+    }
+
     /// Total advertised worker-slot count across every secondary with a
     /// replicated capacity record. CRDT-derived occupancy DENOMINATOR
     /// for the worker-roster stats and the failover roster

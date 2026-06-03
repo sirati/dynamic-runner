@@ -48,9 +48,9 @@ use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 /// The primary is a routable member (mirrors the `Real` arm): it is
 /// reachable via `send_to_peer` / `has_peer` and counted by `peer_count`
 /// (`1`, role-blind — the transport counts every member). It is excluded
-/// from `broadcast` (a no-op here anyway — no mesh peers). The
-/// "exclude the primary from mesh-health" policy is the edge's
-/// `real_peer_count()`, not the transport's.
+/// from `broadcast` (a no-op here anyway — no mesh peers). The role-aware
+/// "how many alive secondaries" policy is the coordinator edge's
+/// `alive_secondary_count()` over global state, not the transport's.
 ///
 /// `pub` only so it can be the payload of the `pub`
 /// [`EitherPeerTransport::DisabledWithPrimary`] variant (the same
@@ -277,11 +277,10 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
             // Pure membership cardinality, role-blind (transport ⊥
             // roles): the folded bootstrap-primary link is a member, so
             // it is counted — exactly as the `Real` arm counts the
-            // primary folded into its `connections` table. The
-            // "exclude the primary" mesh-health policy is the edge's:
-            // the secondary's `real_peer_count()` subtracts the primary
-            // when `has_peer(current_primary)`, the single authoritative
-            // exclusion. The transport must not double-exclude it.
+            // primary folded into its `connections` table. The role-aware
+            // "how many alive secondaries" question is the coordinator
+            // edge's `alive_secondary_count()` over global state; the
+            // transport never does role arithmetic on its `peer_count`.
             Self::DisabledWithPrimary(_) => 1,
         }
     }

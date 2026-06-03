@@ -1133,7 +1133,19 @@ where
                     return Err(e);
                 }
                 Err(_elapsed) => {
-                    let peers = self.transport.peer_count();
+                    // Role-aware alive-secondary count over GLOBAL STATE,
+                    // NOT the transport's role-blind `peer_count()`:
+                    // post-de-role the transport counts the folded primary
+                    // as an ordinary mesh peer, so it would read 1 (the
+                    // primary link) when there are 0 alive secondaries and
+                    // wrongly take the "peers reachable" branch. We are
+                    // pre-`Operational` here (the setup trio never
+                    // completed), so `alive_secondary_count` reads the
+                    // replicated MEMBERSHIP roster (`PeerJoined` secondaries
+                    // applied during setup), which is the faithful "has any
+                    // secondary joined" signal — keepalives do not flow
+                    // until `Operational`.
+                    let peers = self.alive_secondary_count();
                     self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
                     if peers == 0 {
