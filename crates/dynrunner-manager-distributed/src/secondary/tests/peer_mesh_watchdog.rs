@@ -6,13 +6,13 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport, make_transport,
+    FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary,
 };
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -30,7 +30,7 @@ fn arm_watchdog_no_peers(
     dial_count: u32,
 ) -> (
     SecondaryCoordinator<
-        TestTransport<NoPeers>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -39,14 +39,15 @@ fn arm_watchdog_no_peers(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
 ) {
     use std::time::Instant;
-    // `sec_to_pri_rx` is returned so the direct-method watchdog tests
-    // can observe what the secondary SENT; its paired sender is held by
-    // the coordinator's own egress only via the (now removed) uplink, so
-    // we keep the channel pair but the secondary no longer holds the
-    // send end. These tests drive the watchdog/election via direct
-    // method calls and never inject primary inbound, so dropping the
-    // uplink does not change what they exercise.
-    let (_sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    // Channel-backed mesh with the primary folded in (so `send_to_primary`
+    // — the watchdog's `MeshReady` emit — delivers onto `sec_to_pri_rx`,
+    // which the direct-method tests drain to observe what the secondary
+    // sent) and NO peers (so `peer_count() == 0` arms the degraded path).
+    // Inbound is never fed: these tests drive the watchdog/election via
+    // direct method calls and never inject primary inbound.
+    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (_from_primary_tx, from_primary_rx) = tokio_mpsc::unbounded_channel();
+    let unified = channel_mesh_to_primary(secondary_id, sec_to_pri_tx, from_primary_rx);
     let config = SecondaryConfig {
         secondary_id: secondary_id.into(),
         num_workers: 1,
@@ -76,17 +77,18 @@ fn arm_watchdog_no_peers(
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        TestTransport<NoPeers>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        make_transport(NoPeers),
+        unified,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+    secondary.set_bootstrap_primary_id("primary".to_string());
     secondary.peer_dial_count = dial_count;
     secondary.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
     (secondary, sec_to_pri_rx)
@@ -110,11 +112,6 @@ fn arm_watchdog_no_peers(
 /// inter-secondary keepalive. Stranded 474 of 484 tasks in
 /// asm-tokenizer's `--jobs 2` regression.
 #[tokio::test(flavor = "current_thread")]
-// IGNORE: observes the secondary's primary-bound sends via the channel
-// `sec_to_pri_rx`; post-uplink deletion those sends route over the mesh
-// (a NoPeers stub drops them), so the send-observation is vacuous until
-// the harness uses a recording channel-backed mesh stub — channel-mesh-fold leaf.
-#[ignore = "send-observation via channel uplink; restore with a recording mesh stub — channel-mesh-fold leaf"]
 async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
     let _ = tracing_subscriber::fmt::try_init();
     let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-x", 4);
@@ -192,7 +189,6 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
 /// (`peer.rs::check_peer_mesh_watchdog`) rather than at each
 /// `cluster_state.apply(RunComplete)` site, so the dispatch /
 /// processing call sites don't need to know about peer-mesh policy.
-#[ignore = "send-observation via channel uplink; restore with a recording mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_silent_after_run_complete() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
@@ -243,7 +239,6 @@ async fn watchdog_silent_after_run_complete() {
 /// run-complete short-circuit doesn't leak past its precondition
 /// (i.e. `cluster_state.run_complete()` flipping is genuinely
 /// required to suppress the fault).
-#[ignore = "send-observation via channel uplink; restore with a recording mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_still_fires_pre_run_complete() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -292,8 +287,6 @@ async fn watchdog_still_fires_pre_run_complete() {
 /// regressions. Pre-setting also makes the test deterministic
 /// regardless of how fast the FakeWorker churns through 3 tasks
 /// vs the 50ms keepalive tick.
-#[ignore = "full run driven by fake_primary over the channel uplink; restore with a channel-backed \
-            mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn degraded_secondary_continues_dispatching_over_wss() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -302,10 +295,10 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let _uplink = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
+            // Channel-backed mesh: the `fake_primary` is folded in as a
+            // mesh peer (no per-role uplink). Inbound is the
+            // primary→secondary channel; outbound the secondary→primary.
+            let unified = channel_mesh_to_primary("sec-deg", sec_to_pri_tx, pri_to_sec_rx);
             let config = SecondaryConfig {
                 secondary_id: "sec-deg".into(),
                 num_workers: 1,
@@ -348,10 +341,11 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             ));
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                make_transport(NoPeers),
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
             // Pre-latch degraded mode so the run starts in the
             // post-watchdog-fire state. The watchdog's actual fire
             // path is covered by `peer_mesh_watchdog_enters_degraded_mode_when_no_peers`.
@@ -429,21 +423,29 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
 /// deadline, the watchdog clears `peer_mesh_check_at`, sends
 /// `MeshReady(peer_count=3)`, and leaves `peer_mesh_degraded`
 /// false.
-#[ignore = "send-observation via channel uplink (asserts MeshReady on sec_to_pri_rx); restore with a \
-            recording mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
-    use super::super::test_helpers::FixedPeerCount;
     use std::time::Instant;
     let _ = tracing_subscriber::fmt::try_init();
 
     let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let _uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    // Channel-backed mesh: 3 peer outboxes (healthy mesh → `peer_count()
+    // == 3`) plus the primary folded in (so the watchdog's `MeshReady`
+    // emit lands on `sec_to_pri_rx`). The peer receivers are dropped —
+    // only their sender presence (what `peer_count` measures) matters.
+    let mut outgoing = HashMap::new();
+    for i in 0..3u32 {
+        let (peer_tx, _peer_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+        outgoing.insert(format!("peer-{i}"), peer_tx);
+    }
+    let mut unified = dynrunner_transport_channel::ChannelPeerTransport::from_raw_channels(
+        "sec-quo".to_string(),
+        outgoing,
+        pri_to_sec_rx,
+    );
+    unified.register_primary_link("primary".into(), sec_to_pri_tx);
     let config = SecondaryConfig {
         secondary_id: "sec-quo".into(),
         num_workers: 1,
@@ -473,17 +475,18 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        TestTransport<FixedPeerCount>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        make_transport(FixedPeerCount(3)),
+        unified,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+    secondary.set_bootstrap_primary_id("primary".to_string());
     // 4 peers attempted, 3 reported by the transport — healthy
     // multi-peer config. Deadline still in the future; the
     // pre-deadline `peer_count > 0` branch is the one that fires.

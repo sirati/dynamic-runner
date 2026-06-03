@@ -36,8 +36,6 @@ use super::*;
 /// picks it up again via the steady-state `request_task_for_worker`
 /// path; the second attempt succeeds. End state on the primary
 /// side: 2 completions, 0 residual failures, 1 retry pass consumed.
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_flaky); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_failure_succeeds_on_retry_pass() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -159,8 +157,6 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
 /// state on the primary side: 1 completion ("ok"), 1
 /// permanent failure ("doomed"), 1 retry pass consumed (=
 /// `retry_max_passes`).
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_flaky); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -693,8 +689,6 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
 /// `run()` returns — so a regression that loses the retry-success
 /// observation between the operational-loop exit and the run-level
 /// accounting surfaces here.
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_flaky); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_bucket_runs_within_phase_drain_edge() {
     let _ = tracing_subscriber::fmt::try_init();

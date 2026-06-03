@@ -5,13 +5,12 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, make_transport,
+    FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary,
 };
 use super::super::*;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -98,11 +97,10 @@ pub(super) async fn fake_primary(
     // Production-faithful shutdown: the primary broadcasts
     // `ClusterMutation::RunComplete` as its last act before exiting, so
     // every secondary's `process_tasks` exits on the
-    // `cluster_state.run_complete()` cue. The unified transport's
-    // `recv_peer()` only yields `None` when EVERY inbound source closes
-    // (uplink AND mesh); with a `NoPeers` mesh stub that never happens,
-    // so RunComplete is the real exit cue (matching production, where
-    // dropping the uplink alone is NOT the run-over signal).
+    // `cluster_state.run_complete()` cue. `RunComplete` is the real exit
+    // cue (matching production, where the primary's last broadcast — not
+    // a transport close — is the run-over signal); the harness drops
+    // `to_secondary` only afterwards.
     to_secondary
         .send(DistributedMessage::ClusterMutation {
             sender_id: "primary".into(),
@@ -167,8 +165,6 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
     }
 }
 
-#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
-            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_with_real_workers_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -177,11 +173,6 @@ async fn secondary_with_real_workers_processes_tasks() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
 
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
@@ -226,14 +217,18 @@ async fn secondary_with_real_workers_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
-            let _ = transport;
-            let unified = make_transport(NoPeers);
+            // Channel-backed mesh: the `fake_primary` is folded in as an
+            // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
+            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            // Cold-cache resolution of `Destination::Primary` to the folded
+            // primary mesh-link's id.
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
@@ -250,8 +245,6 @@ async fn secondary_with_real_workers_processes_tasks() {
         .await;
 }
 
-#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
-            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_multi_worker_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -260,11 +253,6 @@ async fn secondary_multi_worker_processes_tasks() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
 
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
@@ -307,14 +295,18 @@ async fn secondary_multi_worker_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
-            let _ = transport;
-            let unified = make_transport(NoPeers);
+            // Channel-backed mesh: the `fake_primary` is folded in as an
+            // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
+            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            // Cold-cache resolution of `Destination::Primary` to the folded
+            // primary mesh-link's id.
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
@@ -331,8 +323,6 @@ async fn secondary_multi_worker_processes_tasks() {
 /// the remaining 14+ must come via the operational TaskRequest →
 /// TaskAssignment loop. The legacy Python had a known gap here; this test
 /// pins the Rust behaviour so it can't silently regress.
-#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
-            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -341,11 +331,6 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
 
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
@@ -388,14 +373,18 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 pri_to_sec_tx,
             ));
 
-            let _ = transport;
-            let unified = make_transport(NoPeers);
+            // Channel-backed mesh: the `fake_primary` is folded in as an
+            // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
+            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            // Cold-cache resolution of `Destination::Primary` to the folded
+            // primary mesh-link's id.
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
@@ -420,8 +409,6 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
 /// Pinning this end-to-end behaviour is what makes the wire feature
 /// safe to commit: the secondary handler, the cache registration,
 /// and the ExtractionCache lookup all interact correctly.
-#[ignore = "full run driven by fake_primary over the channel uplink; post-uplink deletion the \
-            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn stage_file_then_assign_task_succeeds() {
     use crate::zip_extract::compute_file_hash;
@@ -447,13 +434,10 @@ async fn stage_file_then_assign_task_succeeds() {
             std::fs::write(&staged_src, payload).unwrap();
             let real_hash = compute_file_hash(&staged_src).unwrap();
 
-            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
-
+            let (sec_to_pri_tx, mut sec_to_pri_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let (pri_to_sec_tx, pri_to_sec_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let config = SecondaryConfig {
                 secondary_id: "sec-stage".into(),
                 num_workers: 1,
@@ -582,10 +566,9 @@ async fn stage_file_then_assign_task_succeeds() {
                     }
                 }
                 // Production-faithful exit cue (see `fake_primary`):
-                // broadcast RunComplete before dropping the uplink so
+                // broadcast RunComplete before dropping the primary link so
                 // the secondary's `process_tasks` exits on
-                // `cluster_state.run_complete()` (the unified transport's
-                // `recv_peer()` never yields None with a `NoPeers` mesh).
+                // `cluster_state.run_complete()`.
                 let _ = pri_to_sec_tx.send(DistributedMessage::ClusterMutation {
                     sender_id: "primary".into(),
                     timestamp: 0.0,
@@ -596,14 +579,18 @@ async fn stage_file_then_assign_task_succeeds() {
                 drop(pri_to_sec_tx);
             });
 
-            let _ = transport;
-            let unified = make_transport(NoPeers);
+            // Channel-backed mesh: the `fake_primary` is folded in as an
+            // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
+            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            // Cold-cache resolution of `Destination::Primary` to the folded
+            // primary mesh-link's id.
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
@@ -695,8 +682,6 @@ async fn fake_primary_abort(
 /// `RunAborted` apply → `run_aborted()` set → `process_tasks` returns
 /// `RunOutcome::Aborted` (checked BEFORE the `run_complete()` break, and
 /// without waiting for any task drain — a hard shutdown).
-#[ignore = "full run driven by fake_primary_abort over the channel uplink; post-uplink deletion the \
-            primary must be a mesh peer fed via a channel-backed mesh stub — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn run_aborted_yields_run_outcome_aborted() {
     let local = tokio::task::LocalSet::new();
@@ -704,11 +689,6 @@ async fn run_aborted_yields_run_outcome_aborted() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
 
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
@@ -746,14 +726,18 @@ async fn run_aborted_yields_run_outcome_aborted() {
                 pri_to_sec_tx,
             ));
 
-            let _ = transport;
-            let unified = make_transport(NoPeers);
+            // Channel-backed mesh: the `fake_primary` is folded in as an
+            // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
+            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            // Cold-cache resolution of `Destination::Primary` to the folded
+            // primary mesh-link's id.
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             let outcome = secondary
