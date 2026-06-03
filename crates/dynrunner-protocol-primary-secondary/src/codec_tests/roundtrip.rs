@@ -29,6 +29,34 @@ fn roundtrip_keepalive() {
     }
 }
 
+/// `emitter_role` survives the wire on its NON-default value. `Secondary`
+/// is the `#[serde(default)]`, so `roundtrip_keepalive` (which uses
+/// `Secondary`) would still pass even if the field were dropped on the
+/// wire — a default masks a dropped layer perfectly. A `Primary`
+/// keepalive must decode back as `Primary` for primary-liveness tracking
+/// to be distinguishable from peer-mesh liveness.
+#[test]
+fn roundtrip_keepalive_primary_emitter_role() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+        sender_id: "primary".into(),
+        timestamp: 1234.5,
+        secondary_id: "primary".into(),
+        active_workers: 0,
+        emitter_role: KeepaliveRole::Primary,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::Keepalive { emitter_role, .. } => {
+            assert_eq!(emitter_role, KeepaliveRole::Primary);
+        }
+        _ => panic!("expected Keepalive"),
+    }
+}
+
 #[test]
 fn roundtrip_secondary_welcome() {
     use dynrunner_core::{ResourceAmount, ResourceKind};
