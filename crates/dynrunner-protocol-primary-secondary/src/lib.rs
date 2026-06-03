@@ -9,8 +9,8 @@ pub mod setup_bootstrap;
 pub mod transport;
 
 pub use address::{
-    Address, Role, RoleCache, RoleChangeHookRegistrar, RoleTable, Scope, install_role_change_hook,
-    new_role_cache, read_role_cache, seed_self_role,
+    Address, Destination, PeerId, Role, RoleCache, RoleChangeHookRegistrar, RoleTable, Scope,
+    install_role_change_hook, new_role_cache, read_role_cache, seed_self_role,
 };
 pub use cluster_mutation::{ClusterMutation, SecondaryCapacityRecord};
 pub use codec::{decode_frame, deserialize_message, serialize_message};

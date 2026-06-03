@@ -10,7 +10,7 @@ use std::time::Duration;
 use super::super::{EitherPeerTransport, NoPeerTransport, PeerNetwork};
 use super::TestId;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport,
+    DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerId, PeerTransport,
 };
 
 #[tokio::test(flavor = "current_thread")]
@@ -27,6 +27,13 @@ async fn no_peer_transport_never_receives() {
     .unwrap();
     assert_eq!(PeerTransport::<TestId>::peer_count(&noop), 0);
     assert!(PeerTransport::<TestId>::try_recv_peer(&mut noop).is_none());
+    // No id is ever a member of the no-op overlay — `has_peer` is a
+    // constant `false`, consistent with `peer_count == 0`.
+    assert!(!PeerTransport::<TestId>::has_peer(&noop, &PeerId::from("x")));
+    assert!(!PeerTransport::<TestId>::has_peer(
+        &noop,
+        &PeerId::from("anyone")
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -49,6 +56,12 @@ async fn either_peer_transport_disabled_acts_like_no_peer() {
         .unwrap();
     assert_eq!(PeerTransport::<TestId>::peer_count(&either), 0);
     assert!(PeerTransport::<TestId>::try_recv_peer(&mut either).is_none());
+    // `has_peer` delegates to the disabled arm: always `false`, matching
+    // the bare `NoPeerTransport`.
+    assert!(!PeerTransport::<TestId>::has_peer(
+        &either,
+        &PeerId::from("x")
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -89,6 +102,13 @@ async fn either_peer_transport_real_round_trips_a_message() {
                 },
             ];
 
+            // Before any dial, the real mesh has no peers — `has_peer`
+            // reflects the empty connection table.
+            assert!(!PeerTransport::<TestId>::has_peer(
+                &peer_a,
+                &PeerId::from("peer-b")
+            ));
+
             // Per-peer dials run as spawned tasks; the sleep gives them
             // time to land before we broadcast.
             peer_a.connect_to_peers(&peers).await;
@@ -103,6 +123,15 @@ async fn either_peer_transport_real_round_trips_a_message() {
                 emitter_role: KeepaliveRole::Secondary,
             };
             peer_a.broadcast(msg).await.unwrap();
+
+            // `broadcast` drained the dialed connection into the table,
+            // so `has_peer` now flips false → true against the live QUIC
+            // connection table — the per-id companion to the
+            // `peer_count` the disabled-arm tests pin at 0.
+            assert!(
+                PeerTransport::<TestId>::has_peer(&peer_a, &PeerId::from("peer-b")),
+                "peer-b must be a member of peer-a's mesh once the dial lands"
+            );
 
             let received = tokio::time::timeout(Duration::from_secs(5), peer_b.recv_peer())
                 .await

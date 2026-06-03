@@ -10,8 +10,8 @@
 use crate::UnifiedSecondaryTransport;
 use dynrunner_core::{MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport, Role, RoleCache,
-    RoleChangeHookRegistrar, RoleTable, Scope, install_role_change_hook, new_role_cache,
+    Address, DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerId, PeerTransport, Role,
+    RoleCache, RoleChangeHookRegistrar, RoleTable, Scope, install_role_change_hook, new_role_cache,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -92,6 +92,13 @@ impl PeerTransport<TestId> for MeshStub {
 
     fn peer_count(&self) -> usize {
         self.peers.len()
+    }
+
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Real per-id membership: a peer is a member iff the test
+        // pre-registered a writer for it in `peers` (the same table
+        // `peer_count` measures).
+        self.peers.contains_key(id.as_str())
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}

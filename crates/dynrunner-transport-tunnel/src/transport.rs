@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction, RoleCache,
-    RoleChangeHookRegistrar, apply_role_misaddress_hint, decide_role_addressed_with_cache,
+    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role, RoleAddressedAction,
+    RoleCache, RoleChangeHookRegistrar, apply_role_misaddress_hint, decide_role_addressed_with_cache,
     install_role_change_hook, new_role_cache, read_role_cache, seed_self_role,
 };
 use tokio::sync::mpsc;
@@ -393,6 +393,16 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
 
     fn peer_count(&self) -> usize {
         self.outgoing.borrow().len()
+    }
+
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Real per-id membership: a peer is a member iff it has a writer
+        // in the shared `outgoing` table (the same table `peer_count`
+        // measures). A secondary is inserted once its accept-loop
+        // registration is drained; a demoted/disconnected one is
+        // removed. Short synchronous borrow — no await in scope, so the
+        // `await_holding_refcell_ref` lint is satisfied.
+        self.outgoing.borrow().contains_key(id.as_str())
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {

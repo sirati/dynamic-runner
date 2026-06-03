@@ -9,7 +9,7 @@ use dynrunner_core::{
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerTransport,
+    ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPeerTransport, channel_pair};
@@ -136,6 +136,11 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     fn peer_count(&self) -> usize {
         0
     }
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // Records outbound sends but models no connected peers
+        // (`peer_count == 0`); every id is a non-member.
+        false
+    }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
@@ -161,6 +166,11 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
     }
     fn peer_count(&self) -> usize {
         0
+    }
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // Models no peers — every id is a non-member. Consistent with
+        // `peer_count == 0`.
+        false
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }

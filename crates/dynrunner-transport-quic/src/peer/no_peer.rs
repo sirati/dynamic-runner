@@ -1,7 +1,9 @@
 //! No-op peer transport for single-secondary deployments and tests.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport,
+};
 
 /// A no-op peer transport for when peer-to-peer is not needed
 /// (single-secondary or in-process distributed mode).
@@ -31,6 +33,13 @@ impl<I: Identifier> PeerTransport<I> for NoPeerTransport {
 
     fn peer_count(&self) -> usize {
         0
+    }
+
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // No peers ever — single-secondary / in-process mode has no
+        // mesh, so no id is ever a member. Consistent with
+        // `peer_count == 0`.
+        false
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {
