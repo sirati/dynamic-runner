@@ -187,12 +187,16 @@ impl<I: Identifier> RemoteWorkerState<I> {
 ///
 /// Records every task the authoritative primary believes is currently
 /// executing somewhere in the cluster — whether this coordinator
-/// dispatched it (a local `RemoteWorkerState` slot holds it,
-/// `local_worker_id = Some`) or inherited it from the replicated
-/// `cluster_state` at hydration (no local slot, `local_worker_id =
-/// None`). Folds in and replaces the deleted `pre_owned_in_flight`
-/// two-tier fallback: there is now ONE ledger, consulted BY HASH on
-/// every terminal, so attribution is unambiguous regardless of dispatch
+/// dispatched it (a local `RemoteWorkerState` slot holds it) or
+/// inherited it from the replicated `cluster_state` at hydration. In
+/// BOTH cases the entry carries `local_worker_id = Some(..)`: the live
+/// path records the slot's secondary-local id at `commit_assignment`,
+/// and the failover-resume path now reconstructs the holding slot from
+/// the replicated capacity × `TaskState::InFlight { worker }` occupancy
+/// (`reconstruct_workers_from_cluster_state`) and seeds the same id.
+/// Folds in and replaces the deleted `pre_owned_in_flight` two-tier
+/// fallback: there is now ONE ledger, consulted BY HASH on every
+/// terminal, so attribution is unambiguous regardless of dispatch
 /// origin.
 ///
 /// The holding slot is keyed by STABLE identity `(secondary_id,
@@ -213,10 +217,13 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     /// Half of the stable `(secondary_id, local_worker_id)` holder key.
     pub(super) secondary_id: String,
     /// Secondary-local worker id of the holding slot (the wire
-    /// `worker_id`, stable under Vec compaction), or `None` for an
-    /// inherited (pre-owned) task no local slot holds. The other half
-    /// of the stable holder key; resolved to a live `self.workers` index
-    /// through [`PrimaryCoordinator::worker_idx_for`].
+    /// `worker_id`, stable under Vec compaction). The other half of the
+    /// stable holder key; resolved to a live `self.workers` index through
+    /// [`PrimaryCoordinator::worker_idx_for`]. Always `Some(..)` on every
+    /// origination path today (live dispatch via `commit_assignment`,
+    /// failover resume via `seed_inflight`); the `Option` and the
+    /// matching `free_slot_on_terminal` `None` arm survive as a defensive
+    /// safe-no-op guard for a slot that no longer exists.
     pub(super) local_worker_id: Option<u32>,
     /// The full task — its `task_id` resolves dep edges, its `type_id`
     /// releases the per-type concurrency slot.
@@ -284,13 +291,16 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// THE single hash-keyed in-flight ledger. Records every task the
     /// primary believes is executing in the cluster, keyed by its
     /// canonical `compute_task_hash`. Populated identically at dispatch
-    /// (locally-assigned, `local_worker_id = Some`) AND at hydration
-    /// (inherited from `cluster_state`, `local_worker_id = None`); drained
-    /// BY HASH on every terminal outcome through
-    /// [`Self::free_slot_on_terminal`]. Folds in and replaces the
-    /// deleted `pre_owned_in_flight` two-tier fallback — there is one
-    /// ledger, so a completion is attributed unambiguously to the held
-    /// task regardless of whether a local slot held it.
+    /// (locally-assigned via `commit_assignment`) AND at hydration
+    /// (inherited from `cluster_state` via `seed_inflight`) — both carry
+    /// `local_worker_id = Some(..)` against a holding `RemoteWorkerState`
+    /// slot (live-built at dispatch; failover-rebuilt from the replicated
+    /// capacity × InFlight occupancy). Drained BY HASH on every terminal
+    /// outcome through [`Self::free_slot_on_terminal`]. Folds in and
+    /// replaces the deleted `pre_owned_in_flight` two-tier fallback —
+    /// there is one ledger, so a completion is attributed unambiguously
+    /// to the held task regardless of whether the dispatch was local or
+    /// inherited.
     pub(super) in_flight: HashMap<String, InFlightEntry<I>>,
     /// Failed-task ledger keyed by task hash. The value carries the
     /// most-recent ErrorType so the dispatcher can report per-class
@@ -1415,13 +1425,20 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.in_flight.remove(task_hash);
     }
 
-    /// Seed an inherited (pre-owned) in-flight task into the SAME
-    /// hash-keyed ledger at hydration. No local slot holds it
-    /// (`local_worker_id = None`) — the originating dispatcher owns the
-    /// work; this coordinator observes completion via the broadcast
-    /// path. Folds in the deleted `pre_owned_in_flight` concept: the
-    /// terminal cascade reads this entry BY HASH exactly like a
-    /// locally-dispatched one.
+    /// Seed an inherited in-flight task into the SAME hash-keyed ledger
+    /// at hydration. `local_worker_id` is the secondary-local worker id
+    /// the replicated `TaskState::InFlight { worker }` recorded at the
+    /// originating dispatch — the SAME id `commit_assignment` writes on
+    /// the live path (`local_worker_id_in_secondary`), so the inherited
+    /// entry's stable `(secondary_id, local_worker_id)` holder key
+    /// resolves through [`Self::worker_idx_for`] onto the matching
+    /// reconstructed `RemoteWorkerState` slot. The slot itself is moved
+    /// `Idle -> Assigned` by `reconstruct_workers_from_cluster_state`
+    /// (the roster × occupancy crossing); this records the ledger half so
+    /// the broadcast `TaskComplete` / `TaskFailed` finds the entry BY
+    /// HASH and `free_slot_on_terminal` frees the held slot. Folds in the
+    /// deleted `pre_owned_in_flight` concept: the terminal cascade reads
+    /// this entry exactly like a locally-dispatched one.
     // Reached from `hydrate_from_cluster_state` (the composed primary's
     // seeded resume on failover activation).
     pub(super) fn seed_inflight(
@@ -1429,6 +1446,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         task_hash: String,
         phase: PhaseId,
         secondary_id: String,
+        local_worker_id: u32,
         task: TaskInfo<I>,
     ) {
         self.in_flight.insert(
@@ -1436,7 +1454,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             InFlightEntry {
                 phase,
                 secondary_id,
-                local_worker_id: None,
+                local_worker_id: Some(local_worker_id),
                 task,
             },
         );
@@ -1458,10 +1476,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ///   - the hash is absent from the ledger entirely (already
     ///     terminal / never tracked).
     ///
-    /// An inherited (pre-owned, `local_worker_id = None`) entry has no
-    /// holding slot and no reserved type slot: it is removed from the
-    /// ledger and returned without a slot vacate or a type-slot
-    /// release — exactly the deleted `pre_owned_in_flight` branch's
+    /// Every live ledger entry now carries `local_worker_id = Some(..)`
+    /// against a holding slot — locally-dispatched (`commit_assignment`)
+    /// and inherited-on-failover (`seed_inflight`, whose slot is
+    /// reconstructed by `reconstruct_workers_from_cluster_state`) alike.
+    /// The `local_worker_id = None` arm therefore survives only as a
+    /// defensive safe-no-op: an entry with no resolvable holder is
+    /// removed from the ledger and returned without a slot vacate or a
+    /// type-slot release — the deleted `pre_owned_in_flight` branch's
     /// "no local type-slot was ever taken" contract, now expressed
     /// through the one ledger.
     ///
@@ -1812,6 +1834,16 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .iter()
             .filter(|w| !w.is_idle())
             .count()
+    }
+
+    /// Test-only count of ALIVE worker slots (idle + busy) — the same
+    /// value the phase-floor liveness check's `alive_worker_count()`
+    /// reads (`self.workers.len()`). Used by the roster-reconstruction
+    /// tests to assert a promoted primary holds the full roster and is
+    /// dispatch-capable (`> 0`) where it previously started empty.
+    #[cfg(test)]
+    pub fn alive_worker_count_for_test(&self) -> usize {
+        self.workers.len()
     }
 
     /// Test-only length of the hash-keyed in-flight ledger. Replaces

@@ -1,12 +1,16 @@
 //! Authoritative-primary pool rehydration from the replicated
 //! `cluster_state` ledger.
 //!
-//! Single concern: `hydrate_from_cluster_state` — turn the in-memory
-//! CRDT into a fresh `PendingPool` (plus matching entries in the
-//! unified hash-keyed `in_flight` ledger and the `completed_tasks`
-//! set) so a freshly-composed authoritative `PrimaryCoordinator`
-//! resumes operational dispatch seeded from the cluster view instead
-//! of an empty pool.
+//! Single concern: turn the in-memory CRDT into the primary-local
+//! derived caches a freshly-composed authoritative `PrimaryCoordinator`
+//! needs to resume operational dispatch seeded from the cluster view
+//! instead of empty state. `hydrate_from_cluster_state` rebuilds the
+//! `PendingPool` (plus matching entries in the unified hash-keyed
+//! `in_flight` ledger and the `completed_tasks` set), then
+//! `reconstruct_workers_from_cluster_state` rebuilds the remote-worker
+//! roster (`self.workers`) from the replicated per-secondary capacity ×
+//! `TaskState::InFlight` occupancy. All of these are pure derived caches
+//! of the replicated ledger.
 //!
 //! Faithful port of the now-removed secondary-side
 //! `populate_primary_from_cluster_state` (lived in the deleted
@@ -66,7 +70,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let mut primary_completed: HashSet<String> = HashSet::new();
         let mut items: Vec<TaskInfo<I>> = Vec::new();
         let mut in_flight_pairs: Vec<(String, PhaseId)> = Vec::new();
-        let mut in_flight_seed: Vec<(String, PhaseId, String, TaskInfo<I>)> = Vec::new();
+        let mut in_flight_seed: Vec<(String, PhaseId, String, u32, TaskInfo<I>)> = Vec::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             match state {
@@ -114,13 +118,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 TaskState::Pending { task } => {
                     items.push(task.clone());
                 }
-                TaskState::InFlight { task, secondary, .. } => {
-                    // The originating dispatcher owns the work; this
-                    // coordinator will observe completion via the
-                    // broadcast path (peer's TaskComplete on success /
-                    // TaskFailed on terminal failure). To make that
-                    // observation affect the pool correctly we need
-                    // three things:
+                TaskState::InFlight { task, secondary, worker } => {
+                    // The originating dispatcher dispatched the work; this
+                    // coordinator inherits it on promotion and will observe
+                    // completion via the broadcast path (peer's TaskComplete
+                    // on success / TaskFailed on terminal failure). To make
+                    // that observation affect the pool + roster correctly we
+                    // need three things:
                     //   1. Seed the task_id into `in_flight_tasks` so
                     //      `extend()`'s dep validation accepts Pending
                     //      variants whose `task_depends_on` references
@@ -132,13 +136,19 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     //      correctly when completion arrives — the
                     //      counter must drop from N+1 to N, not from
                     //      0 to 0.
-                    //   3. Insert into the unified `in_flight` ledger
-                    //      keyed by file_hash with `local_worker_id = None`,
-                    //      so when the broadcast TaskComplete lands in
+                    //   3. Insert into the unified `in_flight` ledger keyed
+                    //      by file_hash with `local_worker_id = Some(worker)`
+                    //      (the SAME secondary-local id `commit_assignment`
+                    //      writes on the live path, replicated into
+                    //      `TaskState::InFlight { worker }` by D2). The
+                    //      matching `RemoteWorkerState` slot is reconstructed
+                    //      `Assigned` by `reconstruct_workers_from_cluster_state`
+                    //      below, so when the broadcast TaskComplete lands in
                     //      `handle_task_complete`, `free_slot_on_terminal`
-                    //      resolves the entry BY HASH (no local slot
-                    //      needed), yields the (phase_id, secondary,
-                    //      task), and forwards to `note_item_completed`.
+                    //      resolves the stable `(secondary, worker)` holder to
+                    //      that slot, frees it, yields the (phase_id,
+                    //      secondary, task), and forwards to
+                    //      `note_item_completed`.
                     // (1) and (2) are owned by the pool via
                     // `mark_tasks_in_flight` below; (3) is the ledger
                     // seed performed after `extend` succeeds.
@@ -147,6 +157,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         hash.clone(),
                         task.phase_id.clone(),
                         secondary.clone(),
+                        *worker,
                         task.clone(),
                     ));
                 }
@@ -170,7 +181,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         for (_, phase_id) in &in_flight_pairs {
             phase_ids.insert(phase_id.clone());
         }
-        for (_, phase_id, _, _) in &in_flight_seed {
+        for (_, phase_id, _, _, _) in &in_flight_seed {
             phase_ids.insert(phase_id.clone());
         }
         for (child, parents) in &phase_deps {
@@ -205,18 +216,33 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             }
         };
 
+        // Reconstruct the remote-worker roster from the two replicated
+        // sources — D1's per-secondary capacity (`worker_count` +
+        // resources across `known_secondaries()`) crossed with the live
+        // `TaskState::InFlight { secondary, worker }` occupancy — so a
+        // promoted primary holds the FULL roster (idle + occupied slots)
+        // and `alive_worker_count() > 0`. Without this the roster is
+        // empty on promotion and the first `TaskRequest` resolves no slot.
+        // Run before the ledger seed so each inherited `in_flight` entry's
+        // stable `(secondary, worker)` holder key resolves onto a slot
+        // this pass has already moved `Idle -> Assigned`.
+        self.reconstruct_workers_from_cluster_state();
+
         // Seed the unified `in_flight` ledger only after `extend`
         // succeeded — a failure on the items batch leaves
         // `pending = None` and any ledger entry we'd populated would be
         // stranded. Each inherited task is seeded with `local_worker_id =
-        // None` (no local slot holds it; the originating dispatcher
-        // owns the work), so when its broadcast TaskComplete /
-        // TaskFailed lands, `free_slot_on_terminal` attributes it BY
-        // HASH and runs the correct phase's `note_item_*`. This folds
-        // in the deleted `pre_owned_in_flight` ledger — there is now
-        // ONE ledger, populated identically at dispatch and hydration.
-        for (hash, phase_id, secondary, binary) in in_flight_seed {
-            self.seed_inflight(hash, phase_id, secondary, binary);
+        // Some(worker)` — the same secondary-local id `commit_assignment`
+        // records on the live path, replicated by D2 into
+        // `TaskState::InFlight { worker }` — so when its broadcast
+        // TaskComplete / TaskFailed lands, `free_slot_on_terminal`
+        // resolves the stable `(secondary, worker)` holder onto the
+        // reconstructed `Assigned` slot, frees it, and runs the correct
+        // phase's `note_item_*`. This folds in the deleted
+        // `pre_owned_in_flight` ledger — there is now ONE ledger,
+        // populated identically at dispatch and hydration.
+        for (hash, phase_id, secondary, worker, binary) in in_flight_seed {
+            self.seed_inflight(hash, phase_id, secondary, worker, binary);
         }
 
         // Single source of truth for the run-completion accounting:
@@ -234,6 +260,155 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             succeeded = self.completed_tasks.len(),
             total = self.total_tasks,
             "hydrated primary task list from cluster_state"
+        );
+    }
+
+    /// Reconstruct the remote-worker roster (`self.workers`) from the two
+    /// replicated CRDT sources, so a freshly-promoted primary holds the
+    /// FULL roster (idle + occupied slots) and can dispatch.
+    ///
+    /// One concern: cross D1's per-secondary capacity (the roster —
+    /// `secondary_capacity(id).worker_count` + advertised resources
+    /// across `known_secondaries()`) with D2's live `TaskState::InFlight
+    /// { secondary, worker }` occupancy, mirroring how
+    /// `hydrate_from_cluster_state` rebuilds the pool from one replicated
+    /// source. Today `self.workers` is built ONLY at initial assignment
+    /// from `self.secondaries`; `hydrate` / `activate_local_primary`
+    /// never rebuilt it, so a promoted primary started
+    /// `alive_worker_count() == 0` and a `TaskRequest` resolved no slot.
+    /// This makes `self.workers` a pure DERIVED CACHE of the replicated
+    /// state on the failover path too.
+    ///
+    /// The roster build faithfully mirrors `perform_initial_assignment`'s
+    /// loop (the live primary's roster shape): round-robin across
+    /// NAME-SORTED secondaries, one global `worker_id` monotonic counter,
+    /// `resource_budgets = initial_budget(round, &max_res)` with `round`
+    /// the secondary-local worker index and `max_res` the memory amount
+    /// extracted from the advertised resources. Producing the identical
+    /// shape is load-bearing: `worker_idx_for` / `local_worker_id_in_secondary`
+    /// resolve a stable `(secondary, local_id)` against the contiguous
+    /// per-secondary ordering, and `view_for_worker(global_wid, ..)`
+    /// consumes the global id — so a reconstructed roster must match what
+    /// a live primary would have built for the occupancy crossing and
+    /// subsequent dispatch to be correct.
+    ///
+    /// Occupancy crossing: after the all-idle roster is built, every
+    /// `TaskState::InFlight { secondary, worker, task }` moves its
+    /// matching slot `Idle -> Assigned`, keyed by the CRDT hash
+    /// (`compute_task_hash`-equivalent ledger key) so a later inbound
+    /// terminal frees it through `free_slot_on_terminal`'s stable-id
+    /// resolution. An InFlight entry whose `(secondary, worker)` resolves
+    /// no slot (capacity record missing, or worker id past the advertised
+    /// count) is skipped with a warning — the entry still lives in the
+    /// inherited `in_flight` ledger (seeded by hydrate), so its terminal
+    /// is attributed BY HASH through the ledger's defensive no-slot arm.
+    ///
+    /// The roster is rebuilt wholesale on every call: the replicated
+    /// capacity ledger is the authoritative source and a partial patch
+    /// would risk stale slots this coordinator can't observe from
+    /// outside (same rationale as the pool rebuild).
+    pub(crate) fn reconstruct_workers_from_cluster_state(&mut self) {
+        // Roster source: the replicated per-secondary capacity records
+        // (D1), name-sorted for the same deterministic ordering
+        // `perform_initial_assignment` uses (it sorts `self.secondaries`'
+        // keys). Pull the (id, worker_count, max_res) snapshot up front so
+        // the build loop holds no overlapping borrow on `self`. `max_res`
+        // mirrors initial assignment: the memory `ResourceAmount` from the
+        // advertised set, as a single-entry `ResourceMap`.
+        let mem_kind = dynrunner_core::ResourceKind::memory();
+        let mut secondary_ids: Vec<String> = self
+            .cluster_state
+            .known_secondaries()
+            .map(String::from)
+            .collect();
+        secondary_ids.sort();
+        let roster: Vec<(String, u32, dynrunner_core::ResourceMap)> = secondary_ids
+            .into_iter()
+            .filter_map(|id| {
+                self.cluster_state.secondary_capacity(&id).map(|cap| {
+                    let ram_bytes = cap
+                        .resources
+                        .iter()
+                        .find(|r| r.kind == mem_kind)
+                        .map(|r| r.amount)
+                        .unwrap_or(0);
+                    (
+                        id,
+                        cap.worker_count,
+                        dynrunner_core::ResourceMap::from([(mem_kind.clone(), ram_bytes)]),
+                    )
+                })
+            })
+            .collect();
+
+        // Build the all-idle roster in ROUND-ROBIN order across
+        // secondaries with one monotonic global `worker_id`, faithfully
+        // mirroring `perform_initial_assignment` so the resulting Vec
+        // ordering / global ids / per-worker budgets match what the live
+        // primary built. (`local_worker_id_in_secondary` /
+        // `worker_idx_for` only need the per-secondary 0-based order,
+        // which round-robin preserves; the global id and budgets matter
+        // for the dispatch view.)
+        let max_workers_per_secondary =
+            roster.iter().map(|(_, n, _)| *n).max().unwrap_or(0);
+        let mut workers: Vec<crate::primary::RemoteWorkerState<I>> = Vec::new();
+        let mut global_worker_id: u32 = 0;
+        for round in 0..max_workers_per_secondary {
+            for (id, worker_count, max_res) in &roster {
+                if round < *worker_count {
+                    let budget = self.scheduler.initial_budget(round, max_res);
+                    workers.push(crate::primary::RemoteWorkerState {
+                        worker_id: global_worker_id,
+                        secondary_id: id.clone(),
+                        resource_budgets: budget,
+                        state: crate::primary::SlotState::Idle,
+                    });
+                    global_worker_id += 1;
+                }
+            }
+        }
+        self.workers = workers;
+
+        // Occupancy crossing: move each replicated `TaskState::InFlight`'s
+        // slot `Idle -> Assigned`, keyed by the CRDT hash so the inherited
+        // ledger entry's stable `(secondary, worker)` holder resolves it
+        // on terminal. Collected first to release the `tasks_iter` borrow
+        // before the `&mut self` slot writes.
+        let occupancy: Vec<(String, String, u32, TaskInfo<I>)> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(hash, state)| match state {
+                TaskState::InFlight { task, secondary, worker } => {
+                    Some((hash.clone(), secondary.clone(), *worker, task.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (hash, secondary, worker, task) in occupancy {
+            match self.worker_idx_for(&secondary, worker) {
+                Some(idx) => {
+                    let estimated = self.estimator.estimate(&task);
+                    self.workers[idx].assign(hash, task, estimated);
+                }
+                None => {
+                    tracing::warn!(
+                        secondary = %secondary,
+                        worker,
+                        task_hash = %hash,
+                        "inherited InFlight task resolves no reconstructed worker \
+                         slot (capacity record missing or worker id out of range); \
+                         leaving the slot count unchanged — the ledger entry still \
+                         tracks it by hash"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            workers = self.workers.len(),
+            secondaries = roster.len(),
+            "reconstructed remote-worker roster from replicated capacity \
+             and in-flight occupancy"
         );
     }
 }
