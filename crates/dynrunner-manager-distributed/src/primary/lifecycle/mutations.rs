@@ -186,6 +186,33 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         .await;
     }
 
+    /// Originate the uniform primary announcement: `PrimaryChanged { new
+    /// = self }` at the bootstrap/failover convergence point
+    /// (`activate_local_primary`).
+    ///
+    /// Single concern: assert THIS host as the primary in every replica's
+    /// `RoleTable` / role cache, so `current_primary()` resolves to it
+    /// uniformly cluster-wide through the one mesh — the SAME mechanism
+    /// every primary uses, replacing the old "sole authority" special
+    /// case. Sibling to `originate_primary_membership` (which records
+    /// MEMBERSHIP); this records the ROLE. The epoch is
+    /// `primary_epoch() + 1`, mirroring the election winner's
+    /// `fire_local_promotion`, so a failover re-announce strictly
+    /// supersedes the prior identity via epoch-LWW. Routed through
+    /// `apply_and_broadcast_cluster_mutations`, so it inherits the same
+    /// local-apply and wire fan-out as every other primary-originated
+    /// mutation. The local apply warms the transport `Role::Primary`
+    /// write-through cache and fires the primary-changed important-event
+    /// hook on a genuine holder transition.
+    pub(crate) async fn originate_primary_changed(&mut self) {
+        let epoch = self.cluster_state.primary_epoch() + 1;
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+            new: self.config.node_id.clone(),
+            epoch,
+        }])
+        .await;
+    }
+
     /// Phase-S/B: seed the replicated cluster ledger with the run's
     /// task graph and phase-dependency graph. Emits one
     /// `PhaseDepsSet` (carrying the canonical per-run dep graph)

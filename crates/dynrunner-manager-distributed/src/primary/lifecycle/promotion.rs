@@ -144,39 +144,26 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// (the run pipeline reaches its operational loop) and failover (the
     /// election's terminal `Promoted` transition) both call this.
     ///
-    /// # Why this does NOT broadcast a remote `PromotePrimary`
+    /// # Uniform primary announcement
     ///
-    /// In the unified model every node runs one `PrimaryCoordinator` +
-    /// one `SecondaryCoordinator`; the authority is the node the
-    /// secondaries already dialled (their `UnifiedSecondaryTransport`
-    /// uplink). A secondary routes `Address::Role(Role::Primary)` to its
-    /// uplink while its role cache is COLD — which is exactly "the
-    /// original primary I dialled". Broadcasting `PromotePrimary { new =
-    /// <some secondary id> }` here was the LEGACY submitter→secondary
-    /// hand-off: it re-pointed every secondary's role cache at the named
-    /// node, so the chosen secondary's own `Role::Primary` resolved to
-    /// LOOPBACK — and with the secondary-internal primary mirror now
-    /// demolished, that loopback had no primary to receive the
-    /// secondary's own keepalives / completions / requests. They looped
-    /// back and died, the authority saw the secondary go silent, and the
-    /// fleet-dead timeout stranded the run. The composed authority IS the
-    /// original primary, so no role re-point is needed: leaving every
-    /// secondary's cache cold keeps `Role::Primary` routed to the uplink
-    /// (this node).
-    ///
-    /// The genuine FAILOVER re-point — a *new* node taking over from a
-    /// dead original primary — is owned by the election winner's
-    /// authoritative `PrimaryChanged` apply (broadcast on the
-    /// `PromotePrimary` it emits after winning, in
-    /// `record_promotion_confirm`'s terminal action), which the
-    /// surviving secondaries' role-change hook applies to re-point
-    /// `Role::Primary` from the dead uplink to the winner's mesh peer.
-    /// That is a distinct concern from this bootstrap activation.
+    /// Every primary — bootstrap and promoted alike — originates
+    /// `ClusterMutation::PrimaryChanged { new = self, epoch }` here, so
+    /// `current_primary()` resolves to this host uniformly cluster-wide
+    /// through the one peer mesh. The submitter is now a routable mesh
+    /// peer (registered in every replica's `connections` under its
+    /// host-id), so warming the `Role::Primary` cache to its id routes
+    /// correctly — there is no longer a "sole authority" special case
+    /// that suppresses the announce. Epoch is `primary_epoch() + 1`, so
+    /// on failover the announce strictly supersedes the prior primary
+    /// identity via epoch-LWW; the re-announce names the same holder the
+    /// election winner's `PromotePrimary` already installed, so the
+    /// primary-changed important-event hook (which fires only on a
+    /// genuine holder transition) stays silent.
     ///
     /// `primary_id` is set to this node's own id for the heartbeat
     /// requeue path's "did the primary just die?" check — which can
-    /// never match a secondary id, so the standalone authority never
-    /// self-clears the pointer.
+    /// never match a secondary id, so the authority never self-clears
+    /// the pointer.
     ///
     /// # Seeded resume (failover activation)
     ///
@@ -217,18 +204,19 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             self.hydrate_from_cluster_state();
         }
 
-        // Initial-setup-done / first-operational milestone (LLM-wake
-        // important event): the single bootstrap+failover convergence
-        // point at which this node asserts primary authority, reached
-        // immediately before the operational loop. Emitted at the
-        // importance target so the dual-sink surfaces it on stdio under
-        // `--important-stdio-only`.
-        tracing::info!(
-            target: crate::primary::important_events::IMPORTANT_TARGET,
-            node = %self.config.node_id,
-            "co-located primary activated as sole authority; secondaries route \
-             Role::Primary to their uplink (this node) — no remote PromotePrimary"
-        );
+        // Uniform primary announcement: originate `PrimaryChanged { new
+        // = self }` so `current_primary()` resolves to this host
+        // cluster-wide through the one mesh. This is THE single
+        // bootstrap+failover convergence point at which this node asserts
+        // primary authority; the announce warms the `Role::Primary` cache
+        // to this now-routable mesh peer (replacing the old "sole
+        // authority" suppression). `primary_epoch() + 1` strictly
+        // supersedes the prior identity via epoch-LWW. The replicated
+        // `PrimaryChanged` apply drives the primary-changed important
+        // event (registered as a role-change hook at construction), so
+        // the LLM-wake milestone is emitted uniformly on every primary
+        // transition without a hand-written per-call-site log line.
+        self.originate_primary_changed().await;
 
         // Liveness spans authority, not the operational phase. This is
         // the single bootstrap+failover convergence point (the brief's
