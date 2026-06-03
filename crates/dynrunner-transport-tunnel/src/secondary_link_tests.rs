@@ -10,7 +10,7 @@
 use crate::UnifiedSecondaryTransport;
 use dynrunner_core::{MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleCache,
+    Address, DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport, Role, RoleCache,
     RoleChangeHookRegistrar, RoleTable, Scope, install_role_change_hook, new_role_cache,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,7 @@ fn keepalive(sender: &str) -> DistributedMessage<TestId> {
         timestamp: 1.0,
         secondary_id: sender.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

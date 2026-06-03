@@ -309,6 +309,20 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         secondary_id: String,
         active_workers: u32,
+        /// Role whose liveness this keepalive asserts. A multi-role host
+        /// runs under one peer-id, so the keepalive must say which role's
+        /// liveness it is asserting: a `Primary` keepalive refreshes the
+        /// receiver's primary-liveness tracking, a `Secondary` keepalive
+        /// refreshes its peer-mesh liveness — without this tag the two
+        /// signals collapse onto one entry and a co-located node is
+        /// dropped from `peer_keepalives`, corrupting election quorum.
+        ///
+        /// `#[serde(default)]` decodes a missing field as `Secondary`,
+        /// keeping pre-field senders wire-compatible (their keepalives
+        /// were the secondary-mesh kind, so `Secondary` is the faithful
+        /// historical interpretation).
+        #[serde(default)]
+        emitter_role: KeepaliveRole,
     },
     TimeoutDetected {
         sender_id: String,
@@ -455,4 +469,25 @@ pub enum DistributedMessage<I> {
         role: Role,
         holder_id: String,
     },
+}
+
+/// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.
+///
+/// A host runs any subset of {primary, secondary, observer} under one
+/// peer-id, so a bare keepalive cannot say whether it is a
+/// primary-liveness or a peer-mesh-liveness signal. Stamping the emitter
+/// role makes the two distinguishable on the wire: the primary keepalive
+/// emitter stamps [`Primary`](KeepaliveRole::Primary); the secondary
+/// keepalive emitter stamps [`Secondary`](KeepaliveRole::Secondary).
+///
+/// `Secondary` is the `#[default]` so a keepalive whose `emitter_role`
+/// field is absent (a pre-field wire sender) decodes as the
+/// secondary-mesh kind — the faithful historical interpretation, since
+/// every legacy keepalive fed peer-mesh liveness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepaliveRole {
+    Primary,
+    #[default]
+    Secondary,
 }

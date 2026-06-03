@@ -113,6 +113,7 @@ pub async fn connect_wss(addr: SocketAddr) -> Result<WssConnection, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dynrunner_protocol_primary_secondary::KeepaliveRole;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -130,6 +131,7 @@ mod tests {
             timestamp: 99.0,
             secondary_id: "wss-test".into(),
             active_workers: 4,
+            emitter_role: KeepaliveRole::Secondary,
         };
 
         let server_task = async {

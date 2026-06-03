@@ -13,7 +13,8 @@ use super::super::PeerNetwork;
 use super::TestId;
 use super::log_capture::{CaptureLayer, CapturedEvent, pump_b_until};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED, PeerConnectionInfo, PeerTransport,
+    DistributedMessage, KeepaliveRole, MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED, PeerConnectionInfo,
+    PeerTransport,
 };
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -149,6 +150,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     timestamp: 1.0,
                     secondary_id: "peer-a".into(),
                     active_workers: 0,
+                    emitter_role: KeepaliveRole::Secondary,
                 })
                 .await
                 .unwrap();
@@ -181,6 +183,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     timestamp: 1.0,
                     secondary_id: "peer-b".into(),
                     active_workers: 0,
+                    emitter_role: KeepaliveRole::Secondary,
                 })
                 .await
                 .unwrap();
@@ -236,6 +239,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                 timestamp: 1.5,
                 secondary_id: "peer-a".into(),
                 active_workers: 1,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_a
                 .send_to_peer("peer-b", warmup)
@@ -291,6 +295,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                 timestamp: 2.0,
                 secondary_id: "peer-a".into(),
                 active_workers: 5,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_a
                 .send_to_peer("peer-b", msg1)
@@ -342,6 +347,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                 timestamp: 3.0,
                 secondary_id: "peer-a".into(),
                 active_workers: 6,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_a
                 .send_to_peer("peer-b", msg2)

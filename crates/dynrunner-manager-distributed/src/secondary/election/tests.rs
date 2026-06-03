@@ -13,6 +13,7 @@
 use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
 use super::super::wire::timestamp_now;
 use super::*;
+use dynrunner_protocol_primary_secondary::KeepaliveRole;
 use std::time::Duration;
 
 /// The death deadline given the helper's keepalive_interval (50ms) and
@@ -540,6 +541,7 @@ fn keepalive_from(from: &str) -> DistributedMessage<super::super::test_helpers::
         timestamp: timestamp_now(),
         secondary_id: from.to_string(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

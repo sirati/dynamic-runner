@@ -148,6 +148,7 @@ fn roundtrip_all_message_types() {
             timestamp: 0.0,
             secondary_id: "s".into(),
             active_workers: 1,
+            emitter_role: KeepaliveRole::Secondary,
         },
         DistributedMessage::TimeoutDetected {
             sender_id: "s".into(),

@@ -4,7 +4,7 @@
 //! Broadcast(Mesh) / Broadcast(AllSecondaries) plus the unresolved-
 //! Role error case).
 
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole, PeerTransport};
 
 use crate::mesh::peer_mesh;
 
@@ -31,6 +31,7 @@ async fn peer_mesh_broadcasts_to_all_others() {
         timestamp: 1.0,
         secondary_id: "a".into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     };
     transports[0].broadcast(msg).await.unwrap();
 
@@ -57,6 +58,7 @@ async fn peer_mesh_send_to_specific_peer() {
         timestamp: 1.0,
         secondary_id: "a".into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     };
     transports[0].send_to_peer("b", msg).await.unwrap();
 
@@ -85,6 +87,7 @@ pub(crate) fn keepalive(sender: &str) -> DistributedMessage<SendTestId> {
         timestamp: 1.0,
         secondary_id: sender.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

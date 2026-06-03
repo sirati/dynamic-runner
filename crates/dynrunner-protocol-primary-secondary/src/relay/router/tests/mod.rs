@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use super::*;
-use crate::messages::DistributedMessage;
+use crate::messages::{DistributedMessage, KeepaliveRole};
 use crate::relay::testing::{DispatchedRecord, RecordingChannel};
 
 mod inbound;
@@ -38,6 +38,7 @@ fn keepalive(sender: &str) -> DistributedMessage<()> {
         timestamp: 1.0,
         secondary_id: sender.into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     }
 }
 

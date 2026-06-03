@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
+    Address, ClusterMutation, DistributedMessage, KeepaliveRole, PeerTransport, RemovalCause, Scope,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -129,6 +129,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             timestamp: timestamp_now(),
             secondary_id: self.config.node_id.clone(),
             active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
+            emitter_role: KeepaliveRole::Primary,
         };
         if let Err(error) = self
             .transport

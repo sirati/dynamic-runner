@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use super::super::PeerNetwork;
 use super::TestId;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn two_peers_exchange_messages() {
@@ -61,6 +63,7 @@ async fn two_peers_exchange_messages() {
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),
                 active_workers: 2,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_a.broadcast(msg).await.unwrap();
 
@@ -155,6 +158,7 @@ async fn higher_id_does_not_dial_lower_id() {
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),
                 active_workers: 2,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_low.broadcast(msg).await.unwrap();
             let received = tokio::time::timeout(Duration::from_secs(5), peer_high.recv_peer())

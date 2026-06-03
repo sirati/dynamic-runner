@@ -7,6 +7,7 @@ fn roundtrip_keepalive() {
         timestamp: 1234.5,
         secondary_id: "sec-1".into(),
         active_workers: 4,
+        emitter_role: KeepaliveRole::Secondary,
     };
 
     let bytes = serialize_message(&msg).unwrap();

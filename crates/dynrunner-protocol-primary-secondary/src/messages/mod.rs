@@ -18,7 +18,7 @@ pub mod message_type;
 pub mod peer_info;
 
 pub use binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipBinaryEntry, ZipFileAssignment};
-pub use distributed::DistributedMessage;
+pub use distributed::{DistributedMessage, KeepaliveRole};
 pub use message_type::MessageType;
 pub use peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 

@@ -74,6 +74,7 @@ mod r1_helpers {
             timestamp: timestamp_now(),
             secondary_id: sender.into(),
             active_workers: 0,
+            emitter_role: dynrunner_protocol_primary_secondary::KeepaliveRole::Secondary,
         }
     }
 

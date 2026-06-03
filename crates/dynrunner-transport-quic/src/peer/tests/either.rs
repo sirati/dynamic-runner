@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use super::super::{EitherPeerTransport, NoPeerTransport, PeerNetwork};
 use super::TestId;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, KeepaliveRole, PeerConnectionInfo, PeerTransport,
+};
 
 #[tokio::test(flavor = "current_thread")]
 async fn no_peer_transport_never_receives() {
@@ -19,6 +21,7 @@ async fn no_peer_transport_never_receives() {
         timestamp: 0.0,
         secondary_id: "x".into(),
         active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
     })
     .await
     .unwrap();
@@ -40,6 +43,7 @@ async fn either_peer_transport_disabled_acts_like_no_peer() {
             timestamp: 0.0,
             secondary_id: "x".into(),
             active_workers: 0,
+            emitter_role: KeepaliveRole::Secondary,
         })
         .await
         .unwrap();
@@ -96,6 +100,7 @@ async fn either_peer_transport_real_round_trips_a_message() {
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),
                 active_workers: 2,
+                emitter_role: KeepaliveRole::Secondary,
             };
             peer_a.broadcast(msg).await.unwrap();
 
