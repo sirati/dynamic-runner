@@ -35,8 +35,7 @@ def _setup_package_stub() -> pathlib.Path:
     package `__init__` (which imports the PyO3 `_native` extension
     and would otherwise require a maturin build to import).
 
-    Mirrors the stub pattern in `test_memprofile_cli.py` and
-    `test_setup_deadline_cli.py`.
+    Mirrors the stub pattern in `test_memprofile_cli.py`.
     """
     here = pathlib.Path(__file__).resolve()
     package_root = here.parent.parent

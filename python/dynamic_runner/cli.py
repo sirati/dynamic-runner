@@ -420,25 +420,6 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--slurm-setup-deadline-secs",
-        type=int,
-        default=None,
-        help=(
-            "Per-secondary wall-clock budget (in seconds) for the setup "
-            "phase (welcome + cert exchange + wait-for-setup) before the "
-            "secondary cold-exits. Slow clusters can take well over 60s "
-            "to schedule + boot every secondary; at scale this default "
-            "helps avoid early-arriving secondaries cold-exiting before "
-            "the late ones have connected (which would otherwise cause "
-            "the primary's setup-bootstrap broadcast to fail with "
-            "'channel closed' on the gone secondaries). When unset, the "
-            "SLURM pipeline derives a scale-aware default of "
-            "max(60, num_secondaries * 15) so --jobs 1..4 keeps the "
-            "60s minimum and --jobs 15 ramps to 225s, --jobs 32 to 480s. "
-            "An explicit value here always wins regardless of --jobs."
-        ),
-    )
-    parser.add_argument(
         "--retry-max-passes",
         type=int,
         default=None,
