@@ -53,15 +53,15 @@ fn make_secondary_with_recording_peer(
 /// the same vector, so the filter walks any-arm-any-frame.
 fn find_peer_joined(
     log: &std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
-) -> Option<(String, bool)> {
+) -> Option<(String, bool, bool)> {
     log.borrow().iter().find_map(|msg| match msg {
         DistributedMessage::ClusterMutation { mutations, .. } => {
             mutations.iter().find_map(|m| match m {
                 ClusterMutation::PeerJoined {
                     peer_id,
                     is_observer,
-                    ..
-                } => Some((peer_id.clone(), *is_observer)),
+                    can_be_primary,
+                } => Some((peer_id.clone(), *is_observer, *can_be_primary)),
                 _ => None,
             })
         }
@@ -92,6 +92,8 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
                 sender_id: "late-observer-1".into(),
                 timestamp: 0.0,
                 is_observer: true,
+                // An observer is never primary-capable.
+                can_be_primary: false,
             };
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
@@ -117,9 +119,9 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
             );
             assert_eq!(
                 observed,
-                ("late-observer-1".to_string(), true),
-                "observer late-joiner PeerJoined must carry is_observer=true; \
-                 got {:?}",
+                ("late-observer-1".to_string(), true, false),
+                "observer late-joiner PeerJoined must carry is_observer=true + \
+                 can_be_primary=false; got {:?}",
                 observed
             );
         })
@@ -144,6 +146,9 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
                 sender_id: "late-worker-1".into(),
                 timestamp: 0.0,
                 is_observer: false,
+                // A re-bootstrapping compute worker declares it can host the
+                // primary on demand; the relay must carry that truth.
+                can_be_primary: true,
             };
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
@@ -167,9 +172,9 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
             );
             assert_eq!(
                 observed,
-                ("late-worker-1".to_string(), false),
-                "worker late-joiner PeerJoined must carry is_observer=false; \
-                 got {:?}",
+                ("late-worker-1".to_string(), false, true),
+                "worker late-joiner PeerJoined must carry is_observer=false + \
+                 can_be_primary=true; got {:?}",
                 observed
             );
         })

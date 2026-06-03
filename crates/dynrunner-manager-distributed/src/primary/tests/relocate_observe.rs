@@ -14,7 +14,6 @@ use dynrunner_core::ErrorType;
 use dynrunner_protocol_primary_secondary::PeerId;
 
 use crate::primary::lifecycle::RelocationOutcome;
-use crate::primary::test_helpers::RecordingPeer;
 use crate::primary::wire::compute_task_hash;
 
 /// Build a submitter coordinator whose mesh transport confirms exactly
@@ -60,7 +59,7 @@ fn drain_primary_changes(
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
             for m in mutations {
-                if let ClusterMutation::PrimaryChanged { new, epoch } = m {
+                if let ClusterMutation::PrimaryChanged { new, epoch, .. } = m {
                     out.push((new, epoch));
                 }
             }
@@ -81,14 +80,11 @@ async fn relocate_originates_primary_changed_and_does_not_pin_self() {
         .run_until(async {
             let (mut coordinator, mut ends) = coordinator_with_confirmed_peers(1);
 
-            // Pre-state: the submitter is the bootstrap epoch-1 primary.
-            coordinator.cluster_state_mut_for_test().apply(
-                ClusterMutation::PrimaryChanged {
-                    new: "primary".into(),
-                    epoch: 1,
-                },
-            );
-            assert_eq!(coordinator.cluster_state_for_test().primary_epoch(), 1);
+            // Pre-state: the submitter is the bootstrap primary WITHOUT a
+            // self-announce — the relocate path does no submitter epoch-1
+            // self-announce, so `primary_epoch` starts at 0 (the bootstrap
+            // pin is not a `PrimaryChanged`).
+            assert_eq!(coordinator.cluster_state_for_test().primary_epoch(), 0);
 
             let outcome = coordinator
                 .relocate_primary_to(PeerId::from("sec-0"))
@@ -101,22 +97,23 @@ async fn relocate_originates_primary_changed_and_does_not_pin_self() {
             );
 
             // Wire announce: exactly one PrimaryChanged naming the CHOSEN
-            // peer at epoch 2 fanned out over the mesh.
+            // peer at epoch 1 (= primary_epoch()+1 = 0+1) fanned out over
+            // the mesh.
             let (_id, rx, _tx) = &mut ends[0];
             assert_eq!(
                 drain_primary_changes(rx),
-                vec![("sec-0".to_string(), 2)],
+                vec![("sec-0".to_string(), 1)],
                 "relocate must broadcast PrimaryChanged{{ chosen, epoch+1 }}"
             );
 
             // The submitter applied its own broadcast: current_primary is
-            // now the chosen peer at epoch 2 (it dropped Role::Primary).
+            // now the chosen peer at epoch 1 (it dropped Role::Primary).
             assert_eq!(
                 coordinator.cluster_state_for_test().current_primary(),
                 Some("sec-0"),
                 "the submitter's own apply must repoint current_primary to the chosen peer"
             );
-            assert_eq!(coordinator.cluster_state_for_test().primary_epoch(), 2);
+            assert_eq!(coordinator.cluster_state_for_test().primary_epoch(), 1);
 
             // The bootstrap pin is GONE: relocate must NOT set
             // primary_id = self (that is `activate_local_primary`'s job,
@@ -185,6 +182,7 @@ async fn relocate_falls_back_when_candidate_became_observer() {
                 .apply(ClusterMutation::PeerJoined {
                     peer_id: "sec-0".into(),
                     is_observer: true,
+                    can_be_primary: false,
                 });
             assert!(
                 coordinator

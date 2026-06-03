@@ -67,6 +67,35 @@ pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal};
 /// no `Send` bound (invoked inline on the coordinator's own task).
 pub type ClusterStateRefreshFn<I> = Box<dyn Fn(&ClusterState<I>)>;
 
+/// The shape of the ON-DEMAND primary-activator closure registered via
+/// [`SecondaryCoordinator::register_primary_activator`].
+///
+/// A peer becomes the primary by CONSTRUCTING a `PrimaryCoordinator` the
+/// moment it is named primary — there is no pre-parked object. This
+/// closure IS that construction-on-demand, fully type-erased so the
+/// secondary (generic over its OWN transport) never names the primary's
+/// `MeshHandleTransport` type and TRANSPORT⊥ROLES holds: the runtime
+/// layer (PyO3 / e2e harness) captures the construction inputs — the
+/// host's mesh transport handle + the loopback/demux channels + config +
+/// scheduler + estimator + command/phase wiring — and the secondary only
+/// decides WHEN to invoke it.
+///
+/// Invoked exactly once, synchronously, at the activation site (the apply
+/// hook for a failover-self `Election`, the setup FSM for a bootstrap
+/// `Transferred`), with a `snapshot` of the secondary's
+/// continuously-mirrored `cluster_state`. It builds the
+/// `PrimaryCoordinator`, `spawn_local`s its
+/// [`crate::primary::PrimaryCoordinator::run_activated`] (seeded resume
+/// from the snapshot), and returns the spawned `JoinHandle` so the
+/// runtime can join the activated primary at wind-down. `FnOnce` because
+/// it moves the captured single-use wiring (the mesh handle, the loopback
+/// channels) into the one coordinator it builds.
+///
+/// No `Send` bound: invoked on the coordinator's own `LocalSet`-bound
+/// task and the built primary is `spawn_local`'d onto the same `LocalSet`.
+pub type PrimaryActivator<I> =
+    Box<dyn FnOnce(crate::cluster_state::ClusterStateSnapshot<I>) -> tokio::task::JoinHandle<()>>;
+
 /// A task DEFERRED on this secondary because the target worker's
 /// per-type subprocess is mid-respawn (the dispatch arm observed
 /// [`dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress`]).
@@ -394,43 +423,50 @@ where
     /// state.
     pub(super) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
 
-    /// Promotion-activation gate sender for the co-located parked
-    /// `PrimaryCoordinator`.
+    /// The ON-DEMAND primary-activator: a type-erased closure that
+    /// CONSTRUCTS + spawns a co-located `PrimaryCoordinator` the moment
+    /// this node becomes the primary. There is NO pre-parked object — the
+    /// coordinator does not exist until this closure runs.
     ///
-    /// The composed runtime (`PySecondaryCoordinator::run`) builds both
-    /// coordinators on one `LocalSet` and parks the primary behind
-    /// `PrimaryCoordinator::run_parked`'s oneshot gate; the matching
-    /// sender is registered here via
-    /// [`Self::register_promote_activation`]. The gate is fired when THIS
-    /// node is named primary — either by winning its own election
-    /// ([`election::coordinator`]'s `record_promotion_confirm` returning
-    /// `true` → [`Self::fire_local_promotion`], which originates +
-    /// locally applies `PrimaryChanged { new = self }`) or by a peer's
-    /// `PrimaryChanged` naming this node, applied through the unified
-    /// `apply_cluster_mutations` hook. The same hook also broadcasts (on
-    /// the own-win path) `PrimaryChanged { new = self }` so surviving
-    /// secondaries re-point `Role::Primary` onto this winner's mesh peer.
+    /// The runtime layer (`PySecondaryCoordinator::run` / the e2e harness)
+    /// captures the construction inputs (the host's mesh transport handle,
+    /// the loopback/demux channels, config, scheduler, estimator,
+    /// command/phase wiring) into this closure and registers it via
+    /// [`Self::register_primary_activator`]. It is invoked exactly once —
+    /// `take()`-n at the activation site
+    /// ([`Self::activate_co_located_primary_on_demand`]) — when THIS node
+    /// is named primary, for BOTH a failover-self election win and a
+    /// bootstrap transfer naming it. The activation site gates the invoke
+    /// on `cluster_state.can_be_primary(self)` (the explicit replicated
+    /// marker) and snapshots the continuously-mirrored `cluster_state` to
+    /// hand the freshly-built primary its seeded resume.
     ///
-    /// The gate carries a [`crate::cluster_state::ClusterStateSnapshot`]
-    /// — NOT a bare `()`. A parked co-located primary's `cluster_state`
-    /// is empty (it never ran the bootstrap pool-build and the role-aware
-    /// inbound tap deliberately does NOT feed it CRDT mirror frames —
-    /// those stay with this secondary, which mirrors the ledger for the
-    /// node). At promotion the secondary snapshots its continuously-
-    /// mirrored `cluster_state` and sends it through this gate; the
-    /// parked primary `restore`s it before `hydrate_from_cluster_state`,
-    /// so the seeded resume rebuilds its pool from the full replicated
-    /// ledger (the brief's "restore cluster_state snapshot + hydrate").
-    ///
-    /// `Option<oneshot::Sender>` makes the activation FIRE-ONCE: the
-    /// terminal action `take()`s it, so the two promotion paths reaching
-    /// `Promoted` (own-election win + peer-named) never double-activate.
-    /// `None` when no co-located primary was composed (Rust-only tests,
-    /// the legacy single-`run()` callers) — the terminal action is then
-    /// a no-op on the gate (the broadcast still fires) and the secondary
-    /// runs without a local authority to promote.
-    pub(super) promote_activation_tx:
-        Option<tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>>,
+    /// `None` when no activator was registered (Rust-only tests, legacy
+    /// single-`run()` callers, a `disable_peer_overlay` / observer host
+    /// that joined with `can_be_primary = false`): the activation site
+    /// never attempts a build for a node whose marker is unset, so the
+    /// `None` is reached only on the never-capable paths and the broadcast
+    /// still fires. A registered activator with the marker SET but a
+    /// missing closure is a programmer error and is loudly rejected.
+    pub(super) primary_activator: Option<PrimaryActivator<I>>,
+
+    /// The `JoinHandle` of the co-located primary this node activated on
+    /// demand, set the instant
+    /// [`Self::activate_co_located_primary_on_demand`] invokes the
+    /// activator. The runtime ([`Self::take_activated_primary_handle`])
+    /// joins it at wind-down so the activated-primary future is never
+    /// leaked. `None` on every node that was never named primary.
+    pub(super) activated_primary_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Set by the apply hook when a `PrimaryChanged { reason: Transferred,
+    /// new = self }` (a bootstrap hand-off naming this node) is applied
+    /// while this secondary is still in setup. The `wait_for_setup` loop
+    /// reads + clears it to run the setup-FSM Transferred transition
+    /// (build the co-located primary on demand, advance to Operational) —
+    /// keeping the build co-located with the lifecycle advance rather than
+    /// in the sync apply hook. A failover-self `Election` (the Operational
+    /// path) never sets this; it builds directly in the apply hook.
+    pub(super) pending_transfer_activation: bool,
 
     /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
     /// closure calling Python's `task.on_phase_end(phase_id, completed,
@@ -442,10 +478,11 @@ where
     /// registration ANCHOR: the PyO3 secondary wrapper accepts the
     /// closure (keeping the `register_phase_lifecycle_callbacks` pre-run
     /// contract stable for callers minting a handle from a secondary),
-    /// and the composed runtime transfers it to the co-located primary
-    /// via [`SecondaryCoordinator::take_composed_primary_wiring`] before
-    /// the primary's `run_parked` enters. That extraction is the in-crate
-    /// consumer, so this field carries no `#[allow(dead_code)]`.
+    /// and the runtime transfers it (via
+    /// [`SecondaryCoordinator::take_composed_primary_wiring`]) into the
+    /// on-demand primary-activator closure, so the co-located primary
+    /// built on demand fires it. That extraction is the in-crate consumer,
+    /// so this field carries no `#[allow(dead_code)]`.
     pub(super) on_phase_end: Option<crate::primary::OnPhaseEnd>,
 
     /// Phase-start sibling of `on_phase_end`; same registration-anchor
@@ -494,8 +531,8 @@ where
 
     /// Co-located primary INBOUND sender (channel CH2). Registered by the
     /// pyo3 composition via [`Self::register_colocated_primary_inbound`]
-    /// when this host runs both a secondary and a (parked) co-located
-    /// primary on the one mesh transport. The secondary forwards every
+    /// when this host runs a secondary that can build a co-located primary
+    /// on demand on the one mesh transport. The secondary forwards every
     /// `is_primary_facing` frame into this sender when it holds the
     /// primary role, and routes its own-host terminal reports here via
     /// the [`Self::send_to`] `Loopback` arm; the co-located

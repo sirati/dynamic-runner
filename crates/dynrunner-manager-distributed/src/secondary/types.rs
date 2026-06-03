@@ -177,6 +177,25 @@ pub struct SecondaryConfig {
     /// with this flag; tracked as a follow-up to this commit.
     pub is_observer: bool,
 
+    /// Whether this secondary can host the primary role ON DEMAND — it is
+    /// an overlay-enabled (real peer mesh present), non-observer compute
+    /// secondary whose runtime registered a primary-activator (a closure
+    /// that constructs + spawns a `PrimaryCoordinator` the moment this
+    /// node is named primary). The secondary advertises this in its
+    /// `SecondaryWelcome`; the primary records it in the replicated
+    /// `RoleTable.can_be_primary`, which `select_bootstrap_primary` reads
+    /// as the single authoritative capability marker.
+    ///
+    /// This is the JOIN-TIME advertised value (twin of `is_observer`). It
+    /// is NOT itself the activation gate — the activation site reads
+    /// `cluster_state.can_be_primary(self)` (the replicated marker, which
+    /// a client may also flip at runtime via `SetCanBePrimary`). A host
+    /// with no mesh / `disable_peer_overlay` or an observer joins with
+    /// `false` so the submitter never relocates to it.
+    ///
+    /// Default `false` (regular non-overlay secondary).
+    pub can_be_primary: bool,
+
     /// How often the OOM/resource-pressure check fires inside the
     /// secondary's processing loop. Mirrors
     /// `LocalManagerConfig::resource_check_interval`. Default: 100ms.
@@ -351,6 +370,7 @@ impl Default for SecondaryConfig {
             primary_link_failure_threshold: super::primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: super::primary_link::DEFAULT_FAILURE_WINDOW,
             is_observer: false,
+            can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             unconfigured_deadline: Duration::from_secs(600),

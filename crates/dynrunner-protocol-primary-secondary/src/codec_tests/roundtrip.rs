@@ -71,6 +71,7 @@ fn roundtrip_secondary_welcome() {
         worker_count: 4,
         hostname: "node-01".into(),
         is_observer: false,
+        can_be_primary: true,
     };
 
     let bytes = serialize_message(&msg).unwrap();

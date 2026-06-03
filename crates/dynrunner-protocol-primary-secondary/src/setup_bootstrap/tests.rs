@@ -19,6 +19,7 @@ fn welcome_roundtrip() {
         worker_count: 2,
         hostname: "host".into(),
         is_observer: false,
+        can_be_primary: true,
     };
     let wire: DistributedMessage<()> = original.clone().into();
     let back: SetupBootstrapMessage = wire.try_into().expect("setup variant");
@@ -28,18 +29,21 @@ fn welcome_roundtrip() {
                 secondary_id: a,
                 worker_count: aw,
                 is_observer: ai,
+                can_be_primary: ac,
                 ..
             },
             SetupBootstrapMessage::SecondaryWelcome {
                 secondary_id: b,
                 worker_count: bw,
                 is_observer: bi,
+                can_be_primary: bc,
                 ..
             },
         ) => {
             assert_eq!(a, b);
             assert_eq!(aw, bw);
             assert_eq!(ai, bi);
+            assert_eq!(ac, bc, "can_be_primary must survive the wire conversion");
         }
         _ => panic!("variant changed across roundtrip"),
     }

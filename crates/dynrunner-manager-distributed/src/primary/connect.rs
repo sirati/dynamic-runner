@@ -228,6 +228,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             worker_count,
             hostname,
             is_observer,
+            can_be_primary,
             ..
         } = msg
         {
@@ -287,10 +288,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 ClusterMutation::PeerJoined {
                     peer_id: secondary_id.clone(),
                     is_observer,
-                    // Foundation leaf: capability stays the conservative
-                    // `false`. Wiring the secondary's advertised
-                    // primary-capability through here is Leaf 3's concern.
-                    can_be_primary: false,
+                    // The connecting secondary advertised its own
+                    // primary-capability in the `SecondaryWelcome` (an
+                    // overlay-enabled compute secondary ⇒ true; a no-mesh
+                    // host / observer ⇒ false). Record that truth in the
+                    // replicated `RoleTable.can_be_primary` so
+                    // `select_bootstrap_primary` reads the explicit marker.
+                    can_be_primary,
                 },
                 ClusterMutation::SecondaryCapacity {
                     secondary: secondary_id,

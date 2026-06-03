@@ -246,6 +246,7 @@ pub trait PeerTransport<I: Identifier> {
         seed: &[crate::PeerConnectionInfo],
         timeout: Duration,
         is_observer: bool,
+        can_be_primary: bool,
     ) -> impl std::future::Future<Output = Result<String, JoinError>>
     where
         I: 'static,
@@ -309,10 +310,11 @@ pub trait PeerTransport<I: Identifier> {
                 let request = DistributedMessage::RequestClusterSnapshot {
                     sender_id: local_id.clone(),
                     timestamp: timestamp_now(),
-                    // The joiner declares its own role so the responder
-                    // broadcasts a truthful `PeerJoined` rather than
-                    // assuming observer.
+                    // The joiner declares its own role + capability so the
+                    // responder broadcasts a truthful `PeerJoined` rather
+                    // than assuming observer / incapable.
                     is_observer,
+                    can_be_primary,
                 };
                 match self
                     .send_to_peer(&peer.secondary_id, request)

@@ -4,12 +4,13 @@
 //! The selector is a pure `&self` CRDT accessor: candidate =
 //! `alive_secondary_members` (alive AND worker_count>0 ⇒ observers
 //! excluded by capacity) ∩ `mesh_ready_secondaries` ∩
-//! `transport.has_peer` − `role_table().observers`; result = the
-//! deterministic `min()` by id, or `None` when the set is empty. These
-//! tests seed each predicate via its real apply/record path
-//! (`SecondaryCapacity` + `PeerJoined` mutations, `handle_mesh_ready`,
-//! and the channel transport's membership-keyed `has_peer`) and assert
-//! the policy bites at every boundary.
+//! `transport.has_peer` ∩ `can_be_primary` − `role_table().observers`;
+//! result = the deterministic `min()` by id, or `None` when the set is
+//! empty. These tests seed each predicate via its real apply/record path
+//! (`SecondaryCapacity` + `PeerJoined { can_be_primary }` mutations,
+//! `handle_mesh_ready`, and the channel transport's membership-keyed
+//! `has_peer`) and assert the policy bites at every boundary, including
+//! the explicit `can_be_primary` capability marker.
 
 use super::*;
 use dynrunner_protocol_primary_secondary::PeerId;
@@ -37,9 +38,12 @@ fn coordinator_with_confirmed_peers(
 }
 
 /// Seed one secondary into the coordinator's replicated `cluster_state`:
-/// `PeerJoined` (→ Alive, and into `observers` when `is_observer`) plus
+/// `PeerJoined { is_observer, can_be_primary }` (→ Alive, into `observers`
+/// when `is_observer`, into `can_be_primary` when capable) plus
 /// `SecondaryCapacity` (→ the capacity record `alive_secondary_members`
-/// reads). `worker_count == 0` is the structural observer shape.
+/// reads). `worker_count == 0` is the structural observer shape; a
+/// non-observer compute secondary is `can_be_primary = true` (an
+/// overlay-enabled host that advertised capability at join).
 fn seed_secondary(
     coordinator: &mut PrimaryCoordinator<
         ChannelPeerTransport<TestId>,
@@ -50,12 +54,13 @@ fn seed_secondary(
     id: &str,
     worker_count: u32,
     is_observer: bool,
+    can_be_primary: bool,
 ) {
     let state = coordinator.cluster_state_mut_for_test();
     let _ = state.apply(ClusterMutation::PeerJoined {
         peer_id: id.to_string(),
         is_observer,
-        can_be_primary: false,
+        can_be_primary,
     });
     let _ = state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.to_string(),
@@ -90,7 +95,7 @@ fn mark_mesh_ready(
 fn returns_lowest_id_among_eligible() {
     let mut coordinator = coordinator_with_confirmed_peers(3);
     for id in ["sec-2", "sec-0", "sec-1"] {
-        seed_secondary(&mut coordinator, id, 4, false);
+        seed_secondary(&mut coordinator, id, 4, false, true);
         mark_mesh_ready(&mut coordinator, id);
     }
 
@@ -119,7 +124,7 @@ fn none_when_no_secondaries() {
 fn none_when_all_observers() {
     let mut coordinator = coordinator_with_confirmed_peers(2);
     for id in ["sec-0", "sec-1"] {
-        seed_secondary(&mut coordinator, id, 0, true);
+        seed_secondary(&mut coordinator, id, 0, true, false);
         mark_mesh_ready(&mut coordinator, id);
     }
 
@@ -137,9 +142,9 @@ fn none_when_all_observers() {
 fn excludes_capacity_observer() {
     let mut coordinator = coordinator_with_confirmed_peers(2);
     // sec-0 is an observer (no workers); sec-1 is a real worker-secondary.
-    seed_secondary(&mut coordinator, "sec-0", 0, true);
+    seed_secondary(&mut coordinator, "sec-0", 0, true, false);
     mark_mesh_ready(&mut coordinator, "sec-0");
-    seed_secondary(&mut coordinator, "sec-1", 4, false);
+    seed_secondary(&mut coordinator, "sec-1", 4, false, true);
     mark_mesh_ready(&mut coordinator, "sec-1");
 
     assert_eq!(
@@ -156,12 +161,13 @@ fn excludes_capacity_observer() {
 fn excludes_unconfirmed_peer() {
     // Only `sec-0` is a confirmed transport member; `sec-99` is not.
     let mut coordinator = coordinator_with_confirmed_peers(1);
-    seed_secondary(&mut coordinator, "sec-0", 4, false);
+    seed_secondary(&mut coordinator, "sec-0", 4, false, true);
     mark_mesh_ready(&mut coordinator, "sec-0");
-    // `sec-99` is alive + has workers + mesh-ready, but `has_peer` is
-    // false for it (not in the transport's `outgoing`), and its id sorts
-    // ABOVE sec-0 so its exclusion is what keeps sec-0 the answer.
-    seed_secondary(&mut coordinator, "sec-99", 4, false);
+    // `sec-99` is alive + has workers + mesh-ready + capable, but
+    // `has_peer` is false for it (not in the transport's `outgoing`), and
+    // its id sorts ABOVE sec-0 so its exclusion is what keeps sec-0 the
+    // answer.
+    seed_secondary(&mut coordinator, "sec-99", 4, false, true);
     mark_mesh_ready(&mut coordinator, "sec-99");
 
     assert_eq!(
@@ -173,7 +179,7 @@ fn excludes_unconfirmed_peer() {
     // And with sec-0 removed from the eligible set, the unconfirmed
     // sec-99 must NOT step in — the result collapses to None.
     let mut only_unconfirmed = coordinator_with_confirmed_peers(0);
-    seed_secondary(&mut only_unconfirmed, "sec-99", 4, false);
+    seed_secondary(&mut only_unconfirmed, "sec-99", 4, false, true);
     mark_mesh_ready(&mut only_unconfirmed, "sec-99");
     assert_eq!(
         only_unconfirmed.select_bootstrap_primary(),
@@ -190,10 +196,10 @@ fn excludes_unconfirmed_peer() {
 fn excludes_observer_by_role_table_even_with_workers() {
     let mut coordinator = coordinator_with_confirmed_peers(2);
     // sec-0: an inconsistent record — worker_count>0 AND flagged observer.
-    seed_secondary(&mut coordinator, "sec-0", 4, true);
+    seed_secondary(&mut coordinator, "sec-0", 4, true, false);
     mark_mesh_ready(&mut coordinator, "sec-0");
     // sec-1: a clean worker-secondary.
-    seed_secondary(&mut coordinator, "sec-1", 4, false);
+    seed_secondary(&mut coordinator, "sec-1", 4, false, true);
     mark_mesh_ready(&mut coordinator, "sec-1");
 
     assert!(
@@ -219,9 +225,9 @@ fn excludes_observer_by_role_table_even_with_workers() {
 fn excludes_not_mesh_ready_peer() {
     let mut coordinator = coordinator_with_confirmed_peers(2);
     // sec-0 is fully eligible EXCEPT it never reported MeshReady.
-    seed_secondary(&mut coordinator, "sec-0", 4, false);
+    seed_secondary(&mut coordinator, "sec-0", 4, false, true);
     // sec-1 is fully eligible.
-    seed_secondary(&mut coordinator, "sec-1", 4, false);
+    seed_secondary(&mut coordinator, "sec-1", 4, false, true);
     mark_mesh_ready(&mut coordinator, "sec-1");
 
     assert_eq!(
@@ -229,5 +235,52 @@ fn excludes_not_mesh_ready_peer() {
         Some(PeerId::from("sec-1")),
         "a peer absent from mesh_ready_secondaries must be excluded \
          even at a lower id"
+    );
+}
+
+/// The EXPLICIT capability cut: a peer that is alive, has workers,
+/// mesh-ready, and a confirmed non-observer mesh peer but whose
+/// `can_be_primary` marker is UNSET is excluded — even though every
+/// liveness/membership predicate passes. The lower-id incapable peer must
+/// lose to the higher-id capable one, proving capability is read from the
+/// explicit marker and never re-derived from membership.
+#[test]
+fn excludes_peer_without_can_be_primary_marker() {
+    let mut coordinator = coordinator_with_confirmed_peers(2);
+    // sec-0: fully eligible by liveness/membership but did NOT advertise
+    // primary-capability (a `disable_peer_overlay` / no-mesh host).
+    seed_secondary(&mut coordinator, "sec-0", 4, false, false);
+    mark_mesh_ready(&mut coordinator, "sec-0");
+    // sec-1: a capable overlay-enabled worker-secondary.
+    seed_secondary(&mut coordinator, "sec-1", 4, false, true);
+    mark_mesh_ready(&mut coordinator, "sec-1");
+
+    assert_eq!(
+        coordinator.select_bootstrap_primary(),
+        Some(PeerId::from("sec-1")),
+        "a peer without the explicit can_be_primary marker must be excluded \
+         even at a lower id"
+    );
+}
+
+/// No peer set its `can_be_primary` marker (every secondary joined with
+/// `false` — the `disable_peer_overlay` cluster shape) → `None`, so the
+/// submitter stays primary ("primary loss = job loss"). This is the
+/// no-capable-peer→stay-primary case.
+#[test]
+fn none_when_no_peer_is_can_be_primary() {
+    let mut coordinator = coordinator_with_confirmed_peers(2);
+    // Both are alive, mesh-ready, confirmed non-observer worker-secondaries
+    // — but neither advertised primary-capability.
+    for id in ["sec-0", "sec-1"] {
+        seed_secondary(&mut coordinator, id, 4, false, false);
+        mark_mesh_ready(&mut coordinator, id);
+    }
+
+    assert_eq!(
+        coordinator.select_bootstrap_primary(),
+        None,
+        "a fleet where no peer is can_be_primary (disable_peer_overlay) has \
+         no hand-off target; the submitter stays primary"
     );
 }

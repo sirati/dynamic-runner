@@ -41,6 +41,7 @@ fn roundtrip_all_message_types() {
             worker_count: 1,
             hostname: "h".into(),
             is_observer: false,
+            can_be_primary: true,
         },
         DistributedMessage::Entropy {
             sender_id: "p".into(),
@@ -113,6 +114,7 @@ fn roundtrip_all_message_types() {
             sender_id: "s".into(),
             timestamp: 0.0,
             is_observer: false,
+            can_be_primary: true,
         },
         DistributedMessage::ClusterSnapshot {
             sender_id: "p".into(),

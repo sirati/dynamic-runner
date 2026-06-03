@@ -174,6 +174,7 @@ async fn gated_mesh_secondary(
             worker_count: num_workers,
             hostname: "test-host".into(),
             is_observer: false,
+            can_be_primary: false,
         })
         .unwrap();
 

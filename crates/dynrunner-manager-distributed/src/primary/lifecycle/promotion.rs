@@ -336,6 +336,12 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
             new: chosen.into_string(),
             epoch,
+            // Bootstrap TRANSFER: the submitter names a DIFFERENT chosen
+            // peer (`new != self`). The chosen peer's apply hook routes
+            // this through its setup FSM's Transferred transition (build
+            // the co-located primary on demand), distinct from a
+            // failover-self `Election`.
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
         }])
         .await;
 
