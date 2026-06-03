@@ -30,13 +30,17 @@
 //! (`Done`/`Aborted`/`Panik`/`Failed`). The invariant each state encodes:
 //!
 //! - **`AwaitingPrimary` cannot spawn workers and cannot accept a
-//!   `TaskAssignment`** — by construction, in a later wiring leaf: the
-//!   worker pool lives *only* inside [`ConfiguringState`]/[`OperationalState`],
-//!   so there is no pool to spawn into before `Configuring`, and the
-//!   `TaskAssignment` handler arm (written against `&mut ConfiguringState`
-//!   / `&mut OperationalState`) is simply unreachable while the lifecycle
-//!   is `AwaitingPrimary`. No runtime `if not configured { reject }`
-//!   guard is needed — the type makes the bad call uncompilable.
+//!   `TaskAssignment`** — by construction for the spawn target, by an
+//!   expect-contract for the handler. The worker pool lives *only* inside
+//!   [`ConfiguringState`]/[`OperationalState`], so there is structurally no
+//!   pool to spawn into before `Configuring`. The `TaskAssignment` handler
+//!   reaches the pool / operational state through the
+//!   `op_mut()` / `pool_mut()` accessors, which `#[track_caller] .expect(…)`
+//!   that the carrying variant is present; that contract holds because
+//!   dispatch is routed to run only after `enter_operational`, never while
+//!   the lifecycle is `AwaitingPrimary`. No runtime
+//!   `if not configured { reject }` guard is needed — a stray pre-config
+//!   dispatch is a loud panic at the accessor, not a silent bad state.
 //! - **Workers spawn on the `AwaitingPrimary → Configuring` transition.**
 //!   `initialize_workers` runs as the entry action of `Configuring` (after
 //!   the primary has announced itself, before the InitialAssignment
@@ -723,11 +727,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     }
 
     /// `&mut` access to the operational state, iff the lifecycle has
-    /// reached `Operational`. The handlers that own worker dispatch,
-    /// election, and keepalive are written against this — they are
-    /// reachable ONLY through this accessor, so they are unrepresentable
-    /// while the lifecycle is `Connecting` / `AwaitingPrimary` /
-    /// `Configuring` (those variants carry no [`OperationalState`]).
+    /// reached `Operational`; `None` in every pre-`Operational` / terminal
+    /// variant (those carry no [`OperationalState`]). The handlers that own
+    /// worker dispatch, election, and keepalive are written against this and
+    /// reach it through the coordinator's `op_mut()`, which `.expect(…)`s
+    /// the operational variant is present — an expect-contract honoured by
+    /// routing dispatch to run only after `enter_operational`, not a
+    /// compile-time guarantee that the call is unrepresentable.
     pub(in crate::secondary) fn operational_mut(&mut self) -> Option<&mut OperationalState<M, I>> {
         match self {
             SecondaryLifecycle::Operational(state) => Some(state),

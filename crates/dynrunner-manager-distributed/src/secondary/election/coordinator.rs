@@ -673,22 +673,4 @@ where
             );
         }
     }
-
-    /// Whether the secondary has been elected primary in this run. `false`
-    /// pre-`Operational` (no election state exists yet).
-    #[allow(dead_code)]
-    pub(in crate::secondary) fn is_promoted(&self) -> bool {
-        matches!(
-            self.op_ref().map(|op| &op.election),
-            Some(ElectionState::Promoted)
-        )
-    }
-
-    /// Whether we're still in the normal pre-election state. `true`
-    /// pre-`Operational` (the election machine defaults to `Normal` and
-    /// has not started).
-    #[allow(dead_code)]
-    pub(in crate::secondary) fn election_is_normal(&self) -> bool {
-        self.op_ref().map(|op| op.election.is_normal()).unwrap_or(true)
-    }
 }

@@ -518,8 +518,9 @@ impl PyObserverLateJoiner {
 
                     // 6. Drive the run loop. The first iteration's
                     //    setup-skip guard fires immediately; subsequent
-                    //    iterations are `RunOutcome::Done` once the
-                    //    cluster broadcasts `RunComplete`. SetupPending
+                    //    iterations are `RunOutcome::Terminal` (projecting
+                    //    to `SecondaryTerminal::Done`) once the cluster
+                    //    broadcasts `RunComplete`. SetupPending
                     //    is unreachable for an observer (only
                     //    pre-staged-mode primaries emit the
                     //    PromotePrimary that triggers it, and an observer
@@ -701,7 +702,8 @@ impl PyObserverLateJoiner {
                 // GIL re-acquired. The primary aborted the run
                 // cluster-wide (#3a pre-phase duplicate). Log then
                 // exit(1) — same exit-on-terminal shape as the
-                // secondary's `RunOutcome::Aborted` arm.
+                // secondary's `RunOutcome::Terminal` /
+                // `SecondaryTerminal::Aborted` arm.
                 tracing::error!(
                     reason = %reason,
                     "run aborted by primary: observer exiting with code 1"

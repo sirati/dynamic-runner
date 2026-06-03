@@ -145,7 +145,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Same broadcast/apply/settle path as `RunComplete`, so the
         // abort inherits the identical delivery semantics — the CRDT
         // `run_aborted` flag lands on every connected secondary and its
-        // `process_tasks` loop returns `RunOutcome::Aborted`.
+        // `process_tasks` loop returns `RunOutcome::Terminal` (projecting
+        // to `SecondaryTerminal::Aborted`).
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunAborted {
             reason: reason.clone(),
         }])

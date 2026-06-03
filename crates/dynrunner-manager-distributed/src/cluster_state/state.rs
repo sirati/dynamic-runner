@@ -58,7 +58,8 @@ pub struct ClusterState<I> {
     /// has been aborted cluster-wide and every node should exit
     /// non-zero. `None` until the first abort lands. The secondary's
     /// `process_tasks` loop checks this BEFORE the `run_complete` break
-    /// and returns `RunOutcome::Aborted`; the `mesh_watchdog` disarms
+    /// and returns `RunOutcome::Terminal` (projecting to
+    /// `SecondaryTerminal::Aborted`); the `mesh_watchdog` disarms
     /// on it too (failover has nothing left to guard once the run is
     /// aborting). Carries the abort reason for the PyO3-boundary log.
     pub(super) run_aborted: Option<String>,

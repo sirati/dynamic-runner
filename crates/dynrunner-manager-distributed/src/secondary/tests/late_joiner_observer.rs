@@ -112,15 +112,14 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
     assert_eq!(sec.cluster_state.task_count(), 2);
 
     // current_primary and primary_epoch reflect the snapshot's
-    // authority — the joiner's role cache (read via the
-    // PeerTransport hook registered in `new()`) now knows
-    // who's primary, so Address::Role(Role::Primary) dispatches
-    // resolve immediately rather than failing with
-    // "role-table cache empty".
+    // authority — the egress edge (`send_to` → `resolve_destination`)
+    // reads `cluster_state.current_primary()`, so a
+    // `Destination::Primary` send resolves immediately rather than
+    // falling back to the bootstrap peer-id.
     assert_eq!(sec.cluster_state.current_primary(), Some("primary-peer"),);
     assert_eq!(sec.cluster_state.primary_epoch(), 7);
 
-    // Observer set merged — Step 7's election filter will skip
+    // Observer set merged — the election filter will skip
     // `observer-peer` from `lowest_alive` candidate selection
     // even before the next live PeerInfo broadcast lands.
     let observers = &sec.cluster_state.role_table().observers;

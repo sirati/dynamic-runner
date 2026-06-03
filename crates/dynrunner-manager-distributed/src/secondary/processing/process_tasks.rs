@@ -582,9 +582,10 @@ where
             // break because an abort is a HARD cluster shutdown: unlike
             // the clean-completion path, we do NOT wait for
             // `active_tasks` to drain (the run is being torn down, not
-            // finished). Returns `RunOutcome::Aborted` so the PyO3
-            // secondary/observer wrappers translate it to
-            // `std::process::exit(1)`. Single originator today: the
+            // finished). Returns `RunOutcome::Terminal` projecting to
+            // `SecondaryTerminal::Aborted` so the PyO3 secondary/observer
+            // wrappers translate it to `std::process::exit(1)`. Single
+            // originator today: the
             // pre-phase duplicate-task-id case (#3a).
             if let Some(reason) = self.cluster_state.run_aborted() {
                 let reason = reason.to_string();

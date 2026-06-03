@@ -56,12 +56,6 @@ pub(super) enum ElectionState {
     Promoted,
 }
 
-impl ElectionState {
-    pub(super) fn is_normal(&self) -> bool {
-        matches!(self, ElectionState::Normal)
-    }
-}
-
 /// Output of one election tick: messages the caller should flush onto the
 /// peer transport before the next iteration.
 pub(super) struct ElectionTickActions<I: Identifier> {

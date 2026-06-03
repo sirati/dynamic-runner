@@ -65,14 +65,19 @@ where
             local_tasks_run: 0,
             extraction_cache,
             // The lifecycle begins as `Connecting` the moment the
-            // coordinator is built; `since` anchors the long
-            // `unconfigured_deadline` that governs the whole
-            // pre-`Operational` span. The worker pool, election,
+            // coordinator is built. `Connecting` carries no entry-instant;
+            // the long `unconfigured_deadline` that governs the whole
+            // pre-`Operational` span is applied relatively as the
+            // `tokio::time::timeout` wrapping the setup trio in
+            // `run_until_setup_or_done`. The worker pool, election,
             // keepalive tracking, and primary link do NOT exist yet —
             // they are constructed at the `AwaitingPrimary → Configuring`
-            // and `Configuring → Operational` transitions, which is what
-            // makes a pre-`Configuring` worker-spawn / task-accept
-            // unrepresentable by construction.
+            // and `Configuring → Operational` transitions. Because the
+            // pool field exists only from `Configuring` onward, a
+            // pre-`Configuring` worker-spawn is unrepresentable by
+            // construction; a stray pre-`Operational` task-accept is held
+            // off instead by the `op_mut()` / `pool_mut()` expect-contract
+            // (dispatch is routed to run only after `enter_operational`).
             lifecycle: SecondaryLifecycle::connecting(),
             // The orthogonal peer-mesh sub-concern starts in its resting
             // pre-dial state, carried across the lifecycle's config states
@@ -592,15 +597,6 @@ where
         self.lifecycle.pre_staged_mode()
             && !self.lifecycle.setup_discovery_done()
             && self.cluster_state.task_count() == 0
-    }
-
-    /// Whether dispatched task items back to real files (default true).
-    /// When false, the worker receives `local_path` as an opaque
-    /// identifier and the framework performs no filesystem
-    /// resolution.
-    #[allow(dead_code)]
-    pub(in crate::secondary) fn uses_file_based_items(&self) -> bool {
-        self.lifecycle.uses_file_based_items()
     }
 
     pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
