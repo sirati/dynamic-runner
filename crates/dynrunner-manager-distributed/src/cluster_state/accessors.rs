@@ -166,6 +166,19 @@ impl<I: Identifier> ClusterState<I> {
         self.current_primary.as_deref()
     }
 
+    /// Whether the named peer-id is currently a live member of the
+    /// cluster — i.e. its `peer_state` entry exists and is `Alive`. A
+    /// never-seen id (no `PeerJoined` applied) and a `Dead` id (a
+    /// `PeerRemoved`/sticky-removal id) both read `false`. This is the
+    /// read-side of the `peer_state` membership ledger the `PeerJoined`/
+    /// `PeerRemoved` apply rules maintain; the liveness bit itself stays
+    /// module-private (callers get a `bool`, never the `PeerState` enum).
+    pub fn is_peer_alive(&self, peer_id: &str) -> bool {
+        self.peer_state
+            .get(peer_id)
+            .is_some_and(|entry| entry.state == super::types::PeerState::Alive)
+    }
+
     pub fn primary_epoch(&self) -> u64 {
         self.primary_epoch
     }

@@ -294,6 +294,76 @@ async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
         .await;
 }
 
+/// The primary registers ITSELF as a first-class cluster member:
+/// `originate_primary_membership` originates a `ClusterMutation::PeerJoined`
+/// for the primary's own `config.node_id`, on the same canonical
+/// `apply_and_broadcast_cluster_mutations` path the secondary accept site
+/// uses for each secondary. Asserts both surfaces from one fixture (mirror
+/// of `handle_welcome_emits_peer_joined_for_accepted_secondary`):
+///
+/// 1. The broadcast envelope carries exactly one `PeerJoined { peer_id:
+///    "primary", is_observer: false }` — `is_observer` is false because the
+///    primary is never an observer.
+/// 2. The local apply recorded the primary as a LIVE member in the
+///    replicated ledger, readable via the new `is_peer_alive` accessor —
+///    `mesh.send_to_peer(primary)` / relay membership now treat it as a peer.
+///
+/// The non-default value the multi-layer plumb is pinned against is the
+/// non-empty `peer_id` ("primary"): a dropped origination would leave
+/// `is_peer_alive("primary") == false` and an empty `drain_peer_joined`.
+#[tokio::test(flavor = "current_thread")]
+async fn originate_primary_membership_self_joins_the_primary_host() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut secondary_ends) = setup_test(1);
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                make_test_primary_config(1),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Sanity: before origination the primary is NOT yet a member —
+            // proves the assertion below is load-bearing, not a default.
+            assert!(
+                !primary.cluster_state_for_test().is_peer_alive("primary"),
+                "primary must not be a member before originate_primary_membership"
+            );
+
+            let (_id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+
+            primary.originate_primary_membership().await;
+
+            // Surface 1: exactly one self-PeerJoined on the wire, observer=false.
+            let observed = drain_peer_joined(&mut to_sec_rx);
+            assert_eq!(
+                observed,
+                vec![("primary".to_string(), false)],
+                "originate_primary_membership must broadcast exactly one \
+                 PeerJoined for the primary's own node_id with is_observer=false; \
+                 got {:?}",
+                observed
+            );
+
+            // Surface 2: the primary is now a live member locally, and its
+            // non-observer self-join did NOT touch the observer projection.
+            let cs = primary.cluster_state_for_test();
+            assert!(
+                cs.is_peer_alive("primary"),
+                "the primary must be a live member of its own cluster ledger \
+                 after originate_primary_membership"
+            );
+            assert!(
+                !cs.role_table().observers.contains("primary"),
+                "the primary's non-observer self-join must NOT enter \
+                 role_table.observers; got {:?}",
+                cs.role_table().observers
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
     let local = tokio::task::LocalSet::new();
