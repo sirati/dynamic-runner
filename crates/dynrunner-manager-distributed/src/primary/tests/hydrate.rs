@@ -804,7 +804,7 @@ fn drain_requeued(
 /// secondary dying AFTER promotion is detected and its inherited in-flight
 /// task is requeued (a `TaskRequeued` broadcast), NOT stranded forever.
 ///
-/// Pre-fix the parked-promotion path (`activate_local_primary` → hydrate)
+/// Pre-fix the on-demand promotion path (`activate_local_primary` → hydrate)
 /// rebuilt `self.workers` but left `self.secondaries` empty, so
 /// `collect_heartbeat_report` (which keys off `self.secondaries`) could
 /// mark NO secondary dead → `process_heartbeat_tick` ran the recovery for
