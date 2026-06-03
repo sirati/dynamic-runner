@@ -55,11 +55,13 @@
 mod dispatch;
 mod extend;
 mod lifecycle;
+mod partition;
 mod pool;
 mod queries;
 mod types;
 mod view;
 
+pub use partition::IngestPartition;
 pub use pool::PendingPool;
 pub use types::{BucketKey, PendingPoolError, PhaseState, PreferencePredicate};
 pub use view::WorkerView;
