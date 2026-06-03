@@ -283,16 +283,6 @@ pub fn compute_file_hash(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// Compute task hash from binary metadata (matches Python's _compute_task_hash).
-pub fn compute_task_hash_from_parts(path: &str, fields: &[&str]) -> String {
-    let hash_input = std::iter::once(path)
-        .chain(fields.iter().copied())
-        .collect::<Vec<_>>()
-        .join(":");
-    let hash = Sha256::digest(hash_input.as_bytes());
-    format!("{:x}", hash)[..16].to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,13 +303,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn task_hash_from_parts() {
-        let hash =
-            compute_task_hash_from_parts("path/to/bin", &["binname", "x64", "gcc", "5", "O0"]);
-        assert_eq!(hash.len(), 16);
     }
 
     #[test]

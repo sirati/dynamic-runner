@@ -27,7 +27,7 @@ pub use role_routing::{
     decide_role_addressed, decide_role_addressed_with_cache,
 };
 pub use setup_bootstrap::{
-    PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap, SetupBootstrap,
-    SetupBootstrapBroadcast, SetupBootstrapMessage,
+    PrimaryPeerSetupBootstrap, SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapBroadcast,
+    SetupBootstrapMessage,
 };
 pub use transport::{DEFAULT_JOIN_TIMEOUT, JoinError, PeerTransport, SecondaryTransport};
