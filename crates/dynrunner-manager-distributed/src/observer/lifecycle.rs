@@ -210,6 +210,7 @@ mod tests {
         let outcome = state.apply(ClusterMutation::PrimaryChanged {
             new: "secondary-7".into(),
             epoch: 5,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         });
         assert_eq!(outcome, crate::cluster_state::ApplyOutcome::Applied);
 

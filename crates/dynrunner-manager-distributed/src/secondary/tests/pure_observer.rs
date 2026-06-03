@@ -115,6 +115,7 @@ fn snapshot_with(
         primary_epoch: 3,
         phase_deps: HashMap::new(),
         observers: observers.iter().map(|s| s.to_string()).collect(),
+        can_be_primary: Default::default(),
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
         secondary_capacities: HashMap::new(),

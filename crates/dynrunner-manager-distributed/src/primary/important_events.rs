@@ -123,6 +123,7 @@ mod tests {
                 state.apply(ClusterMutation::PrimaryChanged {
                     new: "secondary-3".into(),
                     epoch: 1,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
                 }),
                 ApplyOutcome::Applied
             );
@@ -133,6 +134,7 @@ mod tests {
                 state.apply(ClusterMutation::PeerJoined {
                     peer_id: "obs-1".into(),
                     is_observer: true,
+                    can_be_primary: false,
                 }),
                 ApplyOutcome::Applied
             );
@@ -142,6 +144,7 @@ mod tests {
                 state.apply(ClusterMutation::PrimaryChanged {
                     new: "secondary-7".into(),
                     epoch: 2,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
                 }),
                 ApplyOutcome::Applied
             );
@@ -152,6 +155,7 @@ mod tests {
                 state.apply(ClusterMutation::PrimaryChanged {
                     new: "secondary-7".into(),
                     epoch: 2,
+                    reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
                 }),
                 ApplyOutcome::NoOp
             );

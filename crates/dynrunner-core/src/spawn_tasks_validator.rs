@@ -246,6 +246,18 @@ pub enum PrimaryCommand<I: Identifier> {
         reply: oneshot::Sender<Result<(), String>>,
     },
 
+    /// External-control update of a peer's primary-capability — whether
+    /// the named peer may ever host the primary role. The distributed
+    /// backend broadcasts `ClusterMutation::SetCanBePrimary` so every
+    /// node's `RoleTable.can_be_primary` set converges; the local
+    /// backend has no peer concept, so it is a no-op that replies `Ok`
+    /// (the operator's intent has no error path in local mode).
+    SetCanBePrimary {
+        peer_id: String,
+        can_be_primary: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
     /// Runtime task injection: a batch of brand-new `TaskInfo<I>`
     /// entries to add to the receiver's task set so the live backend
     /// dispatches them.

@@ -141,6 +141,7 @@ async fn r1_promotion_on_no_route_count_axis() {
         .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
             new: "primary-orig".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         });
     sec.record_primary_message();
 
@@ -575,6 +576,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                     dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::PeerJoined {
                         peer_id: peer_id.clone(),
                         is_observer: false,
+                        can_be_primary: false,
                     },
                 );
                 secondary.cluster_state.apply(

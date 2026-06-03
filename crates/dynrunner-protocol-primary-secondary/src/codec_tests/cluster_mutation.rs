@@ -1,5 +1,5 @@
 use super::*;
-use crate::cluster_mutation::ClusterMutation;
+use crate::cluster_mutation::{ClusterMutation, PrimaryChangeReason};
 
 #[test]
 fn roundtrip_task_completed_with_result_data() {
@@ -113,6 +113,54 @@ fn roundtrip_run_aborted() {
             assert_eq!(reason, "2 duplicate task identities in the initial batch");
         }
         _ => panic!("expected RunAborted"),
+    }
+}
+
+/// `PrimaryChanged` round-trips through serde carrying a NON-DEFAULT
+/// `reason: Transferred` — the bootstrap-transfer marker survives
+/// encode→decode rather than collapsing to the `Election` default. A
+/// default-valued test (`Election`) would pass even if the field were
+/// dropped on the wire, so the assertion is pinned on the non-default.
+#[test]
+fn roundtrip_primary_changed_transferred_reason() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::PrimaryChanged {
+        new: "chosen-peer".into(),
+        epoch: 2,
+        reason: PrimaryChangeReason::Transferred,
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::PrimaryChanged { new, epoch, reason } => {
+            assert_eq!(new, "chosen-peer");
+            assert_eq!(epoch, 2);
+            assert_eq!(reason, PrimaryChangeReason::Transferred);
+        }
+        _ => panic!("expected PrimaryChanged"),
+    }
+}
+
+/// Backward-compat: a sender that predates the `reason` field emits a
+/// `PrimaryChanged` JSON shape with only `{ new, epoch }`. `#[serde(default)]`
+/// must decode it as `reason: Election` (the only shape that existed before),
+/// keeping the wire safe under a coordinated/rolling restart.
+#[test]
+fn legacy_primary_changed_decodes_reason_as_election() {
+    let legacy = serde_json::json!({
+        "PrimaryChanged": { "new": "legacy-primary", "epoch": 1 }
+    });
+    let json = legacy.to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::PrimaryChanged { new, epoch, reason } => {
+            assert_eq!(new, "legacy-primary");
+            assert_eq!(epoch, 1);
+            assert_eq!(reason, PrimaryChangeReason::Election);
+        }
+        _ => panic!("expected PrimaryChanged"),
     }
 }
 

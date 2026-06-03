@@ -185,6 +185,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
                     dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
                         peer_id: "secondary-late".into(),
                         is_observer: false,
+                        can_be_primary: false,
                     },
                 ],
             };

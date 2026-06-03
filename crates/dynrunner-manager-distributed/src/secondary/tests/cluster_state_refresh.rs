@@ -74,6 +74,7 @@ fn snapshot_with_completed(
         primary_epoch: 3,
         phase_deps: HashMap::new(),
         observers: std::iter::once("observer-1".to_string()).collect(),
+        can_be_primary: Default::default(),
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
         secondary_capacities: HashMap::new(),

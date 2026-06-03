@@ -197,6 +197,7 @@ fn cluster_mutation(epoch: u64) -> DistributedMessage<TestId> {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "primary".into(),
             epoch,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     }
 }

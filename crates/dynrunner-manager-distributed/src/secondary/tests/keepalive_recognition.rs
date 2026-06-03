@@ -42,6 +42,7 @@ fn promote(primary_id: &str) -> DistributedMessage<TestId> {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: primary_id.into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     }
 }

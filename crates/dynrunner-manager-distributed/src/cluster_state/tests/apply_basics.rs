@@ -330,12 +330,14 @@ fn primary_changed_higher_epoch_wins() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     // Lower epoch is rejected.
     assert_eq!(
         s.apply(ClusterMutation::PrimaryChanged {
             new: "b".into(),
             epoch: 0,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }),
         ApplyOutcome::NoOp
     );
@@ -344,6 +346,7 @@ fn primary_changed_higher_epoch_wins() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "c".into(),
         epoch: 5,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(s.current_primary(), Some("c"));
     assert_eq!(s.primary_epoch(), 5);
@@ -366,6 +369,7 @@ fn primary_epoch_mirror_tracks_apply() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "a".into(),
         epoch: 3,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(mirror.load(Ordering::Acquire), 3);
 
@@ -373,12 +377,14 @@ fn primary_epoch_mirror_tracks_apply() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "b".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(mirror.load(Ordering::Acquire), 3);
 
     s.apply(ClusterMutation::PrimaryChanged {
         new: "c".into(),
         epoch: 7,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(mirror.load(Ordering::Acquire), 7);
 }
@@ -396,6 +402,7 @@ fn primary_epoch_mirror_tracks_restore() {
     origin.apply(ClusterMutation::PrimaryChanged {
         new: "primary-id".into(),
         epoch: 11,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     let snap = origin.snapshot();
 

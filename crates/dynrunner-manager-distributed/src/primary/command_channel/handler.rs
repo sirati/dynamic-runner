@@ -63,6 +63,16 @@ pub async fn handle_primary_command<Tr, S, E, I>(
                 .await;
             let _ = reply.send(result);
         }
+        PrimaryCommand::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+            reply,
+        } => {
+            let result = coordinator
+                .apply_set_can_be_primary(peer_id, can_be_primary)
+                .await;
+            let _ = reply.send(result);
+        }
         PrimaryCommand::SpawnTasks { tasks, reply } => {
             let result = coordinator.apply_spawn_tasks(tasks).await;
             let _ = reply.send(result);
@@ -314,6 +324,27 @@ where
         self.apply_and_broadcast_cluster_mutations(vec![
             ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries },
         ])
+        .await;
+        Ok(())
+    }
+
+    /// Handler for `PrimaryCommand::SetCanBePrimary`. Broadcasts a
+    /// `ClusterMutation::SetCanBePrimary` so every node's
+    /// `RoleTable.can_be_primary` set converges on the new capability.
+    /// Pure cluster-state mutation — no pool side effect (capability is
+    /// a coordinator-edge fact, not a per-task one). Always `Ok`: a
+    /// client may permit or forbid any peer id at any time, including
+    /// one not yet joined (the apply rule is idempotent and does not
+    /// gate on membership).
+    pub(super) async fn apply_set_can_be_primary(
+        &mut self,
+        peer_id: String,
+        can_be_primary: bool,
+    ) -> Result<(), String> {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+        }])
         .await;
         Ok(())
     }

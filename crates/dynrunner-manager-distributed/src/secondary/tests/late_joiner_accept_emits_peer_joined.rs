@@ -60,6 +60,7 @@ fn find_peer_joined(
                 ClusterMutation::PeerJoined {
                     peer_id,
                     is_observer,
+                    ..
                 } => Some((peer_id.clone(), *is_observer)),
                 _ => None,
             })

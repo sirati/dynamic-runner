@@ -232,6 +232,21 @@ impl PyPrimaryHandle {
         })
     }
 
+    /// Set whether `peer_id` may ever host the primary role. Broadcasts
+    /// the `SetCanBePrimary` CRDT mutation so every node's
+    /// `RoleTable.can_be_primary` set converges on the new capability.
+    /// A client uses this to permit/forbid specific peers from hosting
+    /// the primary at any time during the run (independent of the
+    /// peer's join-time advertisement). Raises `PyRuntimeError` on
+    /// channel failure.
+    fn set_can_be_primary(&self, peer_id: String, can_be_primary: bool) -> PyResult<()> {
+        self.run_command(move |reply| PrimaryCommand::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+            reply,
+        })
+    }
+
     /// Inject a batch of brand-new tasks into the running primary's
     /// cluster ledger. Single wire-broadcast event for the batch —
     /// a 100-task graph computed at runtime is ONE mutation, not

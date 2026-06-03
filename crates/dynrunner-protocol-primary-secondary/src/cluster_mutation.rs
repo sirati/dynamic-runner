@@ -31,6 +31,31 @@ pub struct SecondaryCapacityRecord {
     pub resources: Vec<ResourceAmount>,
 }
 
+/// Why a `PrimaryChanged` was originated. Advisory routing metadata
+/// only — the CRDT apply rule and snapshot merge are `reason`-BLIND
+/// ("highest epoch wins, one primary" never reads it). It distinguishes
+/// a node naming ITSELF primary (an election win / self-announce) from
+/// the submitter handing authority to a DIFFERENT chosen peer (a
+/// bootstrap transfer), so a receiver can route a transfer through its
+/// setup FSM rather than the failover-self path.
+///
+/// `#[serde(default)]` on the carrying field defaults a wire frame with
+/// no reason to [`Self::Election`]; this project does coordinated
+/// restarts, so a frame from a peer running an older crate (which omits
+/// the field) is safely read as the self-announce shape that was the
+/// only shape before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PrimaryChangeReason {
+    /// A node named ITSELF primary (`new == originator`): an election
+    /// win (`fire_local_promotion`) or the bootstrap/failover self-
+    /// announce (`originate_primary_changed`). The default.
+    #[default]
+    Election,
+    /// The submitter named a DIFFERENT chosen peer (`new != originator`):
+    /// a bootstrap transfer of full primary authority to a compute peer.
+    Transferred,
+}
+
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
@@ -59,6 +84,14 @@ pub enum ClusterMutation<I> {
     PrimaryChanged {
         new: String,
         epoch: u64,
+        /// Why the primary changed (advisory routing metadata; the
+        /// epoch-LWW apply rule and snapshot merge ignore it). See
+        /// [`PrimaryChangeReason`]. `#[serde(default)]` makes a frame
+        /// from a peer that predates this field read as
+        /// [`PrimaryChangeReason::Election`] — the only shape that
+        /// existed before, wire-safe under coordinated restart.
+        #[serde(default)]
+        reason: PrimaryChangeReason,
     },
     /// Per-run static phase dependency graph. Emitted once by the
     /// primary at run start (alongside the bulk `TaskAdded` batch);
@@ -221,9 +254,39 @@ pub enum ClusterMutation<I> {
     /// This variant is the single-writer cutover for
     /// `RoleTable.observers` and the authoritative source of "this
     /// peer is alive" in the replicated ledger.
+    ///
+    /// `can_be_primary` is the SEPARATE, EXPLICIT per-peer capability
+    /// the joining peer advertises — the exact twin of `is_observer`.
+    /// When `true` the apply rule records the id into
+    /// `RoleTable.can_be_primary` (the single source of truth for "may
+    /// this peer ever host the primary"). It is NOT deduced from
+    /// membership/liveness/observer status, and a runtime
+    /// [`Self::SetCanBePrimary`] can flip it at any time after join.
+    /// `#[serde(default)]` (defaulting `false`) keeps wire compat with a
+    /// peer that predates the field — a missing field decodes as "not
+    /// primary-capable", the conservative default.
     PeerJoined {
         peer_id: String,
         is_observer: bool,
+        #[serde(default)]
+        can_be_primary: bool,
+    },
+    /// Runtime update of a peer's [`RoleTable.can_be_primary`] capability
+    /// — the dedicated mutation that lets a CLIENT permit/forbid a
+    /// specific peer from ever hosting the primary at any point in the
+    /// run, independent of the join-time `PeerJoined { can_be_primary }`
+    /// advertisement.
+    ///
+    /// Originated by the primary's command channel
+    /// (`PrimaryCommand::SetCanBePrimary`, exposed through the framework
+    /// client API) and broadcast over the canonical
+    /// `apply_and_broadcast_cluster_mutations` path so every replica's
+    /// `RoleTable.can_be_primary` set converges. `can_be_primary = true`
+    /// inserts the id; `false` removes it. Idempotent: re-applying the
+    /// same value is a NoOp.
+    SetCanBePrimary {
+        peer_id: String,
+        can_be_primary: bool,
     },
     /// A peer has been removed from the cluster (authoritative
     /// observation by the primary; `cause` carries the reason — see

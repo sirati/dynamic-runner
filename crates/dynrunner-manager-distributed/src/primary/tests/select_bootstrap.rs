@@ -55,6 +55,7 @@ fn seed_secondary(
     let _ = state.apply(ClusterMutation::PeerJoined {
         peer_id: id.to_string(),
         is_observer,
+        can_be_primary: false,
     });
     let _ = state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.to_string(),
