@@ -5,8 +5,20 @@
   rustPlatform,
   openssl,
   pkg-config,
-  shutdownManagerBin,
-  wrapperManagerBin,
+  pkgs,
+  # The two musl-static helper binaries default to building the in-repo
+  # derivations on the TOP-LEVEL pkgs. They must be built there (not via
+  # the Python package-set callPackage) because the cross/musl
+  # rustPlatform needs `pkgsCross`, which some consumer nixpkgs pins do
+  # not expose on the Python package scope (this is why overlay.nix /
+  # flake.nix build them with the top-level `callPackage`). Defaulting
+  # them means a bare `python3Packages.callPackage ./nix/wheel.nix {}`
+  # bundles both binaries, so a consumer needs no special preparation.
+  # flake.nix and overlay.nix still pass them explicitly to single-source
+  # the derivation shared with the `dynrunner-slurm-{shutdown,wrapper}`
+  # outputs.
+  shutdownManagerBin ? pkgs.callPackage ./shutdown-manager-bin.nix { },
+  wrapperManagerBin ? pkgs.callPackage ./wrapper-bin.nix { },
 }:
 
 # Wheel/Python-package derivation for dynamic_runner.
