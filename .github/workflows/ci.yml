@@ -5,7 +5,8 @@
 #   - push to main
 #
 # Runs three independent validators in parallel:
-#   - cargo: rustfmt, clippy (warnings = errors), and the workspace test suite
+#   - cargo: rustfmt, clippy (warnings = errors), the workspace test suite
+#           (minus dynrunner-pyo3), and a dedicated libpython-linked pyo3 leg
 #   - nix:   `nix flake check --no-build` to validate flake metadata
 #   - pytest: runs the Python test suite inside `nix develop` (skipped until
 #             tests/ exists in the tree)
@@ -37,8 +38,18 @@ jobs:
       - name: cargo clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # dynrunner-pyo3 is excluded here: its default `extension-module`
+      # feature strips the libpython link, so a standalone lib-test binary
+      # cannot resolve the CPython C-API symbols. It is tested separately
+      # below with the libpython-linked feature set.
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude dynrunner-pyo3
+
+      # dynrunner-pyo3 with default features off (no `extension-module`) and
+      # `test-with-python` on (pyo3/auto-initialize), so the test binary links
+      # against libpython and brings up a CPython interpreter at runtime.
+      - name: Test pyo3 (python-linked)
+        run: cargo test -p dynrunner-pyo3 --no-default-features --features test-with-python
 
   nix:
     name: nix flake check
