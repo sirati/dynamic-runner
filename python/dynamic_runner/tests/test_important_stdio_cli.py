@@ -40,7 +40,7 @@ def _setup_package_stub() -> pathlib.Path:
     (which imports the PyO3 `_native` extension and would otherwise
     require a maturin build to import).
 
-    Mirrors the stub pattern in `test_setup_deadline_cli.py`.
+    Mirrors the stub pattern in `test_forwarded_argv.py`.
     """
     here = pathlib.Path(__file__).resolve()
     package_root = here.parent.parent

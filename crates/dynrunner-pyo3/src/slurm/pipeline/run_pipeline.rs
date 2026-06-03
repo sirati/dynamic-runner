@@ -320,71 +320,11 @@ pub(crate) fn run_slurm_pipeline<'py>(
     // container-command argv. Empty default keeps the field optional
     // for legacy callers constructing SlurmPreparation directly
     // (programmatic test fixtures); `run.py` always populates it.
-    let mut forwarded_argv: Vec<String> = args
+    let forwarded_argv: Vec<String> = args
         .getattr("forwarded_argv")
         .ok()
         .and_then(|v| v.extract::<Vec<String>>().ok())
         .unwrap_or_default();
-
-    // Scale-aware setup-deadline override. Drives the secondary's
-    // `SecondaryConfig.setup_deadline` (via the secondary's argparse
-    // → `_dispatch_secondary` → `DistributedConfig`). When the
-    // operator passed `--slurm-setup-deadline-secs N` the value is
-    // already present in `forwarded_argv` (preserved verbatim by
-    // `filter_framework_argv`) AND on `args.slurm_setup_deadline_secs`
-    // — we feed the parsed-int value through `compute_setup_deadline_secs`
-    // as the explicit-override branch so the formula stays the single
-    // source of truth. When the operator left it unset, the formula's
-    // `max(60, num_secondaries * 15)` branch fires and we INJECT the
-    // computed value into `forwarded_argv` so every secondary's argparse
-    // re-derives the same effective deadline as the dispatcher — the
-    // alternative (re-running the formula on the secondary side) would
-    // duplicate the heuristic across the language boundary and risk
-    // drift. See `compute_setup_deadline_secs` for the formula's
-    // rationale and the `--slurm-setup-deadline-secs` help text for
-    // the operator-facing knob.
-    let explicit_deadline_secs: Option<u64> = args
-        .getattr("slurm_setup_deadline_secs")
-        .ok()
-        .and_then(|v| {
-            if v.is_none() {
-                None
-            } else {
-                v.extract::<u64>().ok()
-            }
-        });
-    let effective_deadline_secs = dynrunner_slurm::pipeline::compute_setup_deadline_secs(
-        explicit_deadline_secs,
-        num_secondaries,
-    );
-    if explicit_deadline_secs.is_none() {
-        // Inject the computed default so the secondary's argparse
-        // sees it. Operator-supplied values are already in
-        // `forwarded_argv` verbatim, so we only push when WE derived
-        // the value — avoids a duplicated flag the secondary's
-        // argparse would resolve to whichever appears last (correct
-        // either way, but the diagnostic-noise penalty is real).
-        forwarded_argv.push(format!(
-            "--slurm-setup-deadline-secs={}",
-            effective_deadline_secs
-        ));
-        log.call_method1(
-            "info",
-            (format!(
-                "SLURM setup-deadline: derived {}s for {} secondaries (formula \
-                 max(60, jobs*15); override with --slurm-setup-deadline-secs)",
-                effective_deadline_secs, num_secondaries
-            ),),
-        )?;
-    } else {
-        log.call_method1(
-            "info",
-            (format!(
-                "SLURM setup-deadline: operator override {}s (--slurm-setup-deadline-secs)",
-                effective_deadline_secs
-            ),),
-        )?;
-    }
 
     let skip_image_build: bool = args
         .getattr("skip_image_build")
