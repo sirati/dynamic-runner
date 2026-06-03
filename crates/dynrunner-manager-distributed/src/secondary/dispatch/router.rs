@@ -41,6 +41,23 @@ where
     /// TaskComplete/TaskFailed arms). The secondary holds NO authority:
     /// every arm here is either own-worker management, a CRDT mirror
     /// apply, or a CLASS-1 report to the primary role.
+    ///
+    /// State contract (NOT a compile-time guarantee). The pool-touching
+    /// arms (`TaskAssignment`, the `PromotePrimary` repoll/backoff resets)
+    /// reach the worker pool / operational fields through the
+    /// `op_mut()` / `pool_mut()` typed accessors. Those accessors are
+    /// `#[track_caller]` `.expect(...)` RUNTIME asserts on the lifecycle
+    /// state, NOT a type-level "unrepresentable by construction" — making
+    /// the bad call truly uncompilable would require threading
+    /// coordinator-level state through `OperationalState`. What guarantees
+    /// the accessors are only reached when `Operational` is CALL-SITE
+    /// ROUTING: `dispatch_message` runs only on the operational inbound
+    /// path (post-`enter_operational`); the pre-`Operational` setup
+    /// handlers route elsewhere and never enter this dispatcher. A
+    /// 0-worker `Operational` node (late-joiner / observer / phase-end
+    /// observer) is a VALID state on this path, so the `TaskAssignment`
+    /// arm guards the empty pool explicitly (a no-op, never an index/
+    /// underflow) rather than relying on a non-existent type invariant.
     pub(in crate::secondary) async fn dispatch_message(
         &mut self,
         msg: DistributedMessage<I>,
@@ -120,7 +137,32 @@ where
                     binary.resolved_path = Some(path);
                 }
                 let estimated = self.estimator.estimate(&binary);
-                let wid = worker_id.min(self.op_mut().pool.workers.len() as u32 - 1);
+
+                // Empty-pool guard, BEFORE any indexing. A 0-worker
+                // `Operational` node is a VALID state (a late-joiner /
+                // observer constructs `Operational` with an empty pool, and
+                // a node can end a phase as a 0-worker observer) and IS on
+                // this dispatch path. With no worker to receive the
+                // assignment there is nothing to dispatch to, so this must
+                // be a graceful no-op — never `pool.workers.len() - 1`
+                // arithmetic (which underflows on `len() == 0` →
+                // debug-panic / release-`u32::MAX`-OOB) and never an index
+                // into an empty slice.
+                let worker_count = self.op_mut().pool.workers.len();
+                if worker_count == 0 {
+                    tracing::warn!(
+                        worker_id,
+                        file_hash = %file_hash,
+                        "TaskAssignment reached a 0-worker node; no worker to \
+                         dispatch to — skipping (no-op)"
+                    );
+                    return Ok(());
+                }
+
+                // Clamp the requested worker into range. `worker_count >= 1`
+                // here (guarded above), so `worker_count - 1` cannot
+                // underflow.
+                let wid = worker_id.min(worker_count as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle
                 let target_wid = if self.op_mut().pool.workers[wid as usize].is_idle_state() {
@@ -431,12 +473,15 @@ where
                     );
                     return Ok(());
                 }
-                // The `PrimaryChanged` apply above drove the
-                // transport's RoleCache write-through hook, which is
-                // the single source of "who is primary" — the
-                // promotion re-route happens entirely inside the
-                // transport layer. The secondary manager carries NO
-                // self-promotion machinery: there is no separate
+                // The `PrimaryChanged` apply above updated
+                // `cluster_state.current_primary()` — the single source
+                // of "who is primary". The promotion re-route is implicit:
+                // the next `Destination::Primary` send re-resolves at the
+                // egress edge (`send_to` → `resolve_destination`, reading
+                // `current_primary()`) to the newly-named host id. The
+                // transport never resolves a role and holds no RoleCache.
+                // The secondary manager carries NO self-promotion
+                // machinery: there is no separate
                 // promoted-secondary-as-primary mirror to activate.
                 let _ = required_setup;
                 // Sync the FAILOVER ELECTION state with the role
@@ -481,9 +526,10 @@ where
                 self.op_mut().primary_link.reset_all_backoff();
                 // Immediate repoll: every idle worker re-issues its
                 // pending `TaskRequest` against the freshly-identified
-                // primary (resolved through the transport's RoleCache,
-                // now updated by the `PrimaryChanged` apply above)
-                // instead of waiting up to a keepalive interval.
+                // primary (`Destination::Primary` re-resolved at the
+                // egress edge from `cluster_state.current_primary()`,
+                // updated by the `PrimaryChanged` apply above) instead of
+                // waiting up to a keepalive interval.
                 self.repoll_idle_workers().await;
                 Ok(())
             }
