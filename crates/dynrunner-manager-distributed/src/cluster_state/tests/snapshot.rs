@@ -36,6 +36,7 @@ fn snapshot_round_trip_preserves_state() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "s1".into(),
         epoch: 3,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     let deps: HashMap<PhaseId, Vec<PhaseId>> = [(PhaseId::from("p1"), vec![PhaseId::from("p0")])]
         .into_iter()
@@ -125,10 +126,12 @@ fn snapshot_round_trip_preserves_observers() {
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-1".into(),
         is_observer: true,
+        can_be_primary: false,
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-2".into(),
         is_observer: true,
+        can_be_primary: false,
     });
 
     let snap = s.snapshot();
@@ -154,12 +157,14 @@ fn restore_keeps_local_observers_when_already_populated() {
     joiner.apply(ClusterMutation::PeerJoined {
         peer_id: "live-obs".into(),
         is_observer: true,
+        can_be_primary: false,
     });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::PeerJoined {
         peer_id: "stale-obs".into(),
         is_observer: true,
+        can_be_primary: false,
     });
 
     joiner.restore(peer.snapshot());
@@ -238,11 +243,13 @@ fn restore_higher_epoch_wins_for_primary() {
     joiner.apply(ClusterMutation::PrimaryChanged {
         new: "old".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::PrimaryChanged {
         new: "new".into(),
         epoch: 5,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     joiner.restore(peer.snapshot());
     assert_eq!(joiner.current_primary(), Some("new"));
@@ -253,6 +260,7 @@ fn restore_higher_epoch_wins_for_primary() {
     stale_peer.apply(ClusterMutation::PrimaryChanged {
         new: "ancient".into(),
         epoch: 2,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     joiner.restore(stale_peer.snapshot());
     assert_eq!(joiner.current_primary(), Some("new"));

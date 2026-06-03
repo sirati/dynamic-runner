@@ -68,6 +68,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .map(|s| ClusterMutation::PeerJoined {
                 peer_id: s.id().to_string(),
                 is_observer: true,
+                // Observers are never primary-capable; the conservative
+                // `false` is also the correct steady-state value here.
+                can_be_primary: false,
             })
             .collect();
 

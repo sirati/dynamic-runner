@@ -267,7 +267,7 @@ async fn activate_local_primary_announces_primary_changed() {
                 })
                 .flatten()
                 .filter_map(|mutation| match mutation {
-                    ClusterMutation::PrimaryChanged { new, epoch } => Some((new, epoch)),
+                    ClusterMutation::PrimaryChanged { new, epoch, .. } => Some((new, epoch)),
                     _ => None,
                 })
                 .collect();

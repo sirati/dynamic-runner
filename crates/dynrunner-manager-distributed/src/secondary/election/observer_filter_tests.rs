@@ -29,6 +29,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
+        can_be_primary: false,
     });
     sec.record_primary_message();
 
@@ -85,6 +86,7 @@ async fn primary_changed_naming_observer_is_rejected() {
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
+        can_be_primary: false,
     });
 
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
@@ -93,6 +95,7 @@ async fn primary_changed_naming_observer_is_rejected() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "obs-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     let result = sec.dispatch_message(promote, &mut FakeWorkerFactory).await;
@@ -133,6 +136,7 @@ async fn primary_changed_naming_self_observer_is_rejected() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "obs-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
@@ -178,6 +182,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
+        can_be_primary: false,
     });
     sec.op_mut().peer_keepalives.insert("obs-a".into(), timestamp_now());
     sec.record_primary_message();
@@ -216,6 +221,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "obs-a".into(),
             epoch: 99,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)

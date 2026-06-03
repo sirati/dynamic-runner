@@ -71,7 +71,11 @@ where
         let mut primary_changed = false;
         for m in mutations {
             match m {
-                ClusterMutation::PrimaryChanged { new, epoch } => {
+                // `reason` is advisory routing metadata; the activation
+                // hook does not branch on it yet (Leaf 3 wires the
+                // Transferred-vs-Election fork). Ignore it here so the
+                // apply stays reason-blind.
+                ClusterMutation::PrimaryChanged { new, epoch, .. } => {
                     primary_changed |= self.apply_primary_changed(new, epoch);
                 }
                 other => {
@@ -147,6 +151,9 @@ where
         let outcome = self.cluster_state.apply(ClusterMutation::PrimaryChanged {
             new: new.clone(),
             epoch,
+            // The central CRDT apply is reason-blind (epoch-LWW only), so
+            // the value carried here is immaterial to the resulting state.
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
         });
         if outcome == ApplyOutcome::NoOp {
             tracing::debug!(

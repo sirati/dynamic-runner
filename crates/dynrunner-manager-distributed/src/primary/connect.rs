@@ -287,6 +287,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 ClusterMutation::PeerJoined {
                     peer_id: secondary_id.clone(),
                     is_observer,
+                    // Foundation leaf: capability stays the conservative
+                    // `false`. Wiring the secondary's advertised
+                    // primary-capability through here is Leaf 3's concern.
+                    can_be_primary: false,
                 },
                 ClusterMutation::SecondaryCapacity {
                     secondary: secondary_id,

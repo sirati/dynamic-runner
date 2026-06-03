@@ -84,6 +84,19 @@ pub struct ClusterStateSnapshot<I> {
     /// promote an observer candidate.
     #[serde(default)]
     pub observers: HashSet<String>,
+    /// Replicated primary-capability set (`RoleTable.can_be_primary`).
+    /// Carried so a late-joiner / reconnecting node sees which peers may
+    /// host the primary the moment it restores a snapshot — before any
+    /// live `PeerJoined { can_be_primary }` / `SetCanBePrimary` mutation
+    /// reaches it. Replaced on `restore` when local is empty; otherwise
+    /// kept — the same first-bootstrap-only contract as `observers`
+    /// (the live `PeerJoined`/`SetCanBePrimary` apply path is the
+    /// steady-state writer; subsequent broadcasts converge any
+    /// divergence via the idempotent set ops). `#[serde(default)]`
+    /// keeps wire compat with a peer that predates the field (missing
+    /// field decodes as an empty set, the conservative pre-field shape).
+    #[serde(default)]
+    pub can_be_primary: HashSet<String>,
     /// Replicated per-peer holdings map. Carried so a late-joiner
     /// sees the current set of opaque resource strings each peer
     /// announces before any live `PeerResourceHoldingsUpdated`
@@ -199,6 +212,10 @@ impl<I: Identifier> ClusterState<I> {
             // apply rule writes; the snapshot is authoritative for
             // first-bootstrap and inert thereafter.
             observers: self.role_table.observers.clone(),
+            // Replicated primary-capability set — same first-bootstrap-
+            // only contract as `observers`. Carried so a late-joiner
+            // sees which peers may host the primary on snapshot-restore.
+            can_be_primary: self.role_table.can_be_primary.clone(),
             // Per-peer holdings — same first-bootstrap-only
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
@@ -285,6 +302,18 @@ impl<I: Identifier> ClusterState<I> {
         // path.
         if self.role_table.observers.is_empty() && !snap.observers.is_empty() {
             self.role_table.observers = snap.observers;
+            self.fire_role_change_hooks();
+        }
+        // Primary-capability set: replace if local is empty (first-
+        // bootstrap), otherwise keep local — the same contract as
+        // `observers`. The live `PeerJoined { can_be_primary }` /
+        // `SetCanBePrimary` apply path is the steady-state writer; this
+        // branch only fires on the very first restore before any such
+        // mutation arrives. Fire the role-change hooks on a genuine
+        // change so the write-through cache stays coherent on the
+        // snapshot path the same way the live apply does.
+        if self.role_table.can_be_primary.is_empty() && !snap.can_be_primary.is_empty() {
+            self.role_table.can_be_primary = snap.can_be_primary;
             self.fire_role_change_hooks();
         }
         // Peer-holdings map: same first-bootstrap-only contract

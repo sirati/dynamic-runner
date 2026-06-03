@@ -40,6 +40,7 @@ async fn primary_dies_lowest_id_promotes() {
     sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
         new: "primary-orig".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     sec.record_primary_message();
 
@@ -173,6 +174,7 @@ async fn promote_primary_routing_survives_keepalive() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
@@ -222,6 +224,7 @@ async fn self_named_primary_resets_election_to_normal() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
@@ -279,6 +282,7 @@ async fn primary_changed_clears_per_worker_backoff() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
@@ -307,6 +311,7 @@ async fn primary_changed_applies_with_epoch_lww() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-c".into(),
             epoch: 5,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(high, &mut FakeWorkerFactory)
@@ -323,6 +328,7 @@ async fn primary_changed_applies_with_epoch_lww() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 2,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(stale, &mut FakeWorkerFactory)
@@ -509,7 +515,7 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     let change = log.borrow().iter().find_map(|m| match m {
         DistributedMessage::ClusterMutation { mutations, .. } => {
             mutations.iter().find_map(|mu| match mu {
-                ClusterMutation::PrimaryChanged { new, epoch } => Some((new.clone(), *epoch)),
+                ClusterMutation::PrimaryChanged { new, epoch, .. } => Some((new.clone(), *epoch)),
                 _ => None,
             })
         }
@@ -582,6 +588,7 @@ async fn wake_frame_self_named_fires_gate_and_resets_to_normal() {
     let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
 
     assert!(changed, "a genuine PrimaryChanged advance returns true");
@@ -610,6 +617,7 @@ async fn wake_frame_peer_named_does_not_fire_gate() {
     let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-b".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
 
     assert!(changed, "a peer-named PrimaryChanged still advances the identity");
@@ -638,6 +646,7 @@ async fn wake_frame_double_apply_is_fire_once() {
     let first = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
     assert!(first, "first apply advances the identity");
     assert!(promote_rx.try_recv().is_ok(), "first apply fires the gate");
@@ -647,6 +656,7 @@ async fn wake_frame_double_apply_is_fire_once() {
     let second = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
     assert!(!second, "a re-applied identical PrimaryChanged is a NoOp");
     assert!(
@@ -675,6 +685,7 @@ async fn wake_frame_self_observer_is_rejected() {
     let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "obs-a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
 
     assert!(!changed, "naming an observer is rejected — no genuine advance");
@@ -775,6 +786,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
@@ -854,6 +866,7 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
             epoch: 1,
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)

@@ -33,7 +33,21 @@ impl<I: Identifier> ClusterState<I> {
     /// when the set actually changes. A `PeerLifecycleEvent::Added`
     /// is emitted on every state-changing apply; pure-idempotent
     /// re-deliveries return NoOp and emit nothing.
-    pub(super) fn apply_peer_joined(&mut self, peer_id: String, is_observer: bool) -> ApplyOutcome {
+    ///
+    /// `can_be_primary` rides the same join the exact way `is_observer`
+    /// does: when `true` the id is inserted into
+    /// `RoleTable.can_be_primary` (the explicit per-peer capability set).
+    /// The insert is independent of the observer projection and of
+    /// liveness — capability is its own first-class fact. The set change
+    /// participates in the same "state-changing apply" accounting as the
+    /// observer set, so a join that advertises capability without
+    /// touching the observer set is still `Applied`.
+    pub(super) fn apply_peer_joined(
+        &mut self,
+        peer_id: String,
+        is_observer: bool,
+        can_be_primary: bool,
+    ) -> ApplyOutcome {
         match self.peer_state.get(&peer_id) {
             Some(entry) if entry.state == PeerState::Dead => {
                 tracing::warn!(
@@ -45,6 +59,13 @@ impl<I: Identifier> ClusterState<I> {
             }
             _ => {}
         }
+        // Capability projection: insert when the join advertises it.
+        // `HashSet::insert` returns `true` only on a genuine widening,
+        // so a re-advertised capability is idempotent. Recorded before
+        // the per-id `peer_state` match so the role-change hook (fired
+        // on any set change below) observes the post-mutation set.
+        let capability_set_changed =
+            can_be_primary && self.role_table.can_be_primary.insert(peer_id.clone());
         let (entry_was_new, observer_set_changed) = match self.peer_state.get_mut(&peer_id) {
             None => {
                 self.peer_state.insert(
@@ -75,10 +96,10 @@ impl<I: Identifier> ClusterState<I> {
                 }
             }
         };
-        if observer_set_changed {
+        if observer_set_changed || capability_set_changed {
             self.fire_role_change_hooks();
         }
-        if !entry_was_new && !observer_set_changed {
+        if !entry_was_new && !observer_set_changed && !capability_set_changed {
             return ApplyOutcome::NoOp;
         }
         self.emit_lifecycle_event(PeerLifecycleEvent::Added {
@@ -86,6 +107,39 @@ impl<I: Identifier> ClusterState<I> {
             is_observer,
         });
         ApplyOutcome::Applied
+    }
+
+    /// Apply a `ClusterMutation::SetCanBePrimary`.
+    ///
+    /// Runtime client update of a peer's explicit primary-capability:
+    /// `true` widens `RoleTable.can_be_primary`, `false` removes the id.
+    /// Idempotent — re-applying the current value (a no-op set
+    /// operation) returns `NoOp` and fires no hook. A genuine change
+    /// fires the role-change hooks so any registered write-through
+    /// cache stays coherent, mirroring the observer-set update path.
+    ///
+    /// Capability is decoupled from membership/liveness: this rule does
+    /// NOT gate on `peer_state` (a client may pre-arm or revoke a peer's
+    /// capability around its join), and it never touches the observer
+    /// projection. It is the dedicated steady-state writer for the
+    /// capability set the way `PeerResourceHoldingsUpdated` is for
+    /// holdings.
+    pub(super) fn apply_set_can_be_primary(
+        &mut self,
+        peer_id: String,
+        can_be_primary: bool,
+    ) -> ApplyOutcome {
+        let changed = if can_be_primary {
+            self.role_table.can_be_primary.insert(peer_id)
+        } else {
+            self.role_table.can_be_primary.remove(&peer_id)
+        };
+        if changed {
+            self.fire_role_change_hooks();
+            ApplyOutcome::Applied
+        } else {
+            ApplyOutcome::NoOp
+        }
     }
 
     /// Apply a `ClusterMutation::PeerRemoved`.
@@ -97,12 +151,21 @@ impl<I: Identifier> ClusterState<I> {
     /// their projection on removal; role-change hooks fire when the
     /// set actually shrinks. A `PeerLifecycleEvent::Removed` is
     /// emitted on every state-changing apply.
+    ///
+    /// The primary-capability projection is cleared on removal too — the
+    /// exact twin of the observer projection. A dead id never resurrects
+    /// (sticky-per-id), so dropping it from `RoleTable.can_be_primary`
+    /// keeps the capability set free of ids that can no longer host a
+    /// primary.
     pub(super) fn apply_peer_removed(&mut self, id: String, cause: RemovalCause) -> ApplyOutcome {
         if let Some(entry) = self.peer_state.get(&id)
             && entry.state == PeerState::Dead
         {
             return ApplyOutcome::NoOp;
         }
+        // Capability projection: a removed peer can no longer host the
+        // primary. Drop it regardless of whether it was an observer.
+        self.role_table.can_be_primary.remove(&id);
         let observer_set_changed = match self.peer_state.get_mut(&id) {
             None => {
                 self.peer_state.insert(

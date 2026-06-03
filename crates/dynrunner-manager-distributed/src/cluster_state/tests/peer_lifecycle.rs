@@ -93,6 +93,7 @@ fn peer_removed_is_sticky() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "p1".into(),
             is_observer: false,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -124,6 +125,7 @@ fn peer_joined_dead_is_noop() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "p1".into(),
             is_observer: false,
+            can_be_primary: false,
         });
         s.apply(ClusterMutation::PeerRemoved {
             id: "p1".into(),
@@ -133,6 +135,7 @@ fn peer_joined_dead_is_noop() {
             s.apply(ClusterMutation::PeerJoined {
                 peer_id: "p1".into(),
                 is_observer: true,
+                can_be_primary: false,
             }),
             ApplyOutcome::NoOp,
             "PeerJoined for a Dead id must be NoOp"
@@ -161,6 +164,7 @@ fn peer_joined_alive_extends_observer_set() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-a".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -168,6 +172,7 @@ fn peer_joined_alive_extends_observer_set() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-a".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::NoOp,
         "re-applying the same PeerJoined is idempotent NoOp"
@@ -176,6 +181,7 @@ fn peer_joined_alive_extends_observer_set() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-b".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -194,6 +200,7 @@ fn peer_removed_observer_drops_from_role_table() {
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-1".into(),
         is_observer: true,
+        can_be_primary: false,
     });
     assert!(s.role_table().observers.contains("obs-1"));
 

@@ -293,7 +293,9 @@ impl<I: Identifier> ClusterState<I> {
                 }
                 outcome
             }
-            ClusterMutation::PrimaryChanged { new, epoch } => {
+            // `reason` is advisory routing metadata only; the epoch-LWW
+            // apply ("highest epoch wins, one primary") is `reason`-blind.
+            ClusterMutation::PrimaryChanged { new, epoch, .. } => {
                 if epoch < self.primary_epoch {
                     return ApplyOutcome::NoOp;
                 }
@@ -450,7 +452,12 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::PeerJoined {
                 peer_id,
                 is_observer,
-            } => self.apply_peer_joined(peer_id, is_observer),
+                can_be_primary,
+            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary),
+            ClusterMutation::SetCanBePrimary {
+                peer_id,
+                can_be_primary,
+            } => self.apply_set_can_be_primary(peer_id, can_be_primary),
             ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,

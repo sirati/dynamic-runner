@@ -498,6 +498,9 @@ where
                     .apply_and_broadcast_mutations(vec![ClusterMutation::PeerJoined {
                         peer_id: sender_id,
                         is_observer,
+                        // Foundation leaf: capability stays `false` here;
+                        // Leaf 3 wires the relayed peer's capability.
+                        can_be_primary: false,
                     }])
                     .await;
                 Ok(())

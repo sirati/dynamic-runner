@@ -654,6 +654,10 @@ where
         let mutation = dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
             new: self.config.secondary_id.clone(),
             epoch,
+            // Election win (`new == self`): this winner names ITSELF the
+            // primary. The bootstrap-transfer reason is set only by the
+            // submitter's relocate path naming a DIFFERENT chosen peer.
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         };
 
         // (1) Apply locally through the unified hook so THIS winner's own

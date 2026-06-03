@@ -222,10 +222,21 @@ pub fn resolve_destination(
 /// `observers` is reserved for the future observer story; no current
 /// mutation populates it. Keeping the field present here means the
 /// table shape stays stable when observer roles are tracked.
+///
+/// `can_be_primary` is the SEPARATE, EXPLICIT, first-class per-peer
+/// capability set: the authoritative "may this peer ever host the
+/// primary role" property. It is NOT deduced from membership / liveness
+/// / observer status and is NOT a transport property (the transport
+/// edge never reads it) — it is set explicitly by a peer at join (riding
+/// `ClusterMutation::PeerJoined { can_be_primary }`, the exact twin of
+/// `is_observer` → `observers`) and updatable at runtime by a client via
+/// `ClusterMutation::SetCanBePrimary`. Membership in this set is the
+/// single source of truth for primary capability.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoleTable {
     pub primary: Option<String>,
     pub observers: std::collections::HashSet<String>,
+    pub can_be_primary: std::collections::HashSet<String>,
 }
 
 /// Boundary trait that downstream replicated-state owners implement

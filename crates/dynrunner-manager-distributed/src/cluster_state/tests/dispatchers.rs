@@ -32,6 +32,7 @@ async fn apply_peer_joined_emits_event_through_dispatcher() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "peer-x".into(),
             is_observer: false,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );

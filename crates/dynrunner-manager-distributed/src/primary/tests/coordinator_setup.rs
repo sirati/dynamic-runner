@@ -150,6 +150,7 @@ fn drain_peer_joined(
                 if let dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
                     peer_id,
                     is_observer,
+                    ..
                 } = m
                 {
                     out.push((peer_id, is_observer));

@@ -234,5 +234,22 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             }
             let _ = reply.send(Ok(()));
         }
+        PrimaryCommand::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+            reply,
+        } => {
+            // Local mode has no peer mesh and no cluster `RoleTable`, so
+            // primary-capability has no effect here. Reply Ok so the
+            // operator's intent (record the capability for the named
+            // peer) has no spurious error path — mirroring the
+            // `UpdatePreferredSecondaries` no-op contract above.
+            tracing::debug!(
+                peer_id = %peer_id,
+                can_be_primary,
+                "set_can_be_primary: local mode has no peer concept; no-op"
+            );
+            let _ = reply.send(Ok(()));
+        }
     }
 }

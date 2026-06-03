@@ -176,6 +176,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
             peer_id: self.config.node_id.clone(),
             is_observer: false,
+            // Foundation leaf: capability stays the conservative `false`.
+            // A node setting its own primary-capability marker from its
+            // lifecycle is Leaf 3's concern.
+            can_be_primary: false,
         }])
         .await;
     }
@@ -203,6 +207,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
             new: self.config.node_id.clone(),
             epoch,
+            // Self-announce (`new == self`): this host names ITSELF the
+            // primary at the bootstrap/failover convergence point.
+            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }])
         .await;
     }

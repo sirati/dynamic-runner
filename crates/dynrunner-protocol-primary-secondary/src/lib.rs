@@ -10,7 +10,7 @@ pub mod transport;
 pub use address::{
     Destination, PeerId, RoleChangeHookRegistrar, RoleTable, SendTarget, resolve_destination,
 };
-pub use cluster_mutation::{ClusterMutation, SecondaryCapacityRecord};
+pub use cluster_mutation::{ClusterMutation, PrimaryChangeReason, SecondaryCapacityRecord};
 pub use codec::{decode_frame, deserialize_message, serialize_message};
 pub use messages::*;
 pub use relay::{

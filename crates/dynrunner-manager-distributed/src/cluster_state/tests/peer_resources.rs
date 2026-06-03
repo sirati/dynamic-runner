@@ -51,6 +51,7 @@ fn peer_resource_holdings_updated_stale_epoch_is_noop() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "lead".into(),
         epoch: 5,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(s.primary_epoch(), 5);
 

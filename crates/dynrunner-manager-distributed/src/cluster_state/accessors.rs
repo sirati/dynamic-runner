@@ -223,6 +223,18 @@ impl<I: Identifier> ClusterState<I> {
         &self.role_table
     }
 
+    /// Whether the named peer-id carries the explicit
+    /// `RoleTable.can_be_primary` capability — the single authoritative
+    /// "may this peer ever host the primary role" property. Set by the
+    /// peer at join (`PeerJoined { can_be_primary = true }`) and
+    /// updatable at runtime by a client (`SetCanBePrimary`); NOT deduced
+    /// from membership / liveness / observer status. Read-side of the
+    /// capability set the apply rules maintain; callers get a `bool`,
+    /// the set itself stays reachable via `role_table()`.
+    pub fn can_be_primary(&self, peer_id: &str) -> bool {
+        self.role_table.can_be_primary.contains(peer_id)
+    }
+
     /// Resolve a dependency's full `(phase_id, task_id)` identity to its
     /// wire-canonical hash via a linear scan over `self.tasks`. Returns
     /// `None` if no entry in the ledger carries that exact identity.

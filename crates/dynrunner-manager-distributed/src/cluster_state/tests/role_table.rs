@@ -30,6 +30,7 @@ fn role_table_updates_on_primary_changed() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-2".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(s.role_table().primary, Some("sec-2".to_string()));
 
@@ -37,6 +38,7 @@ fn role_table_updates_on_primary_changed() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-7".into(),
         epoch: 5,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(s.role_table().primary, Some("sec-7".to_string()));
 
@@ -44,6 +46,7 @@ fn role_table_updates_on_primary_changed() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-stale".into(),
         epoch: 2,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     assert_eq!(s.role_table().primary, Some("sec-7".to_string()));
 }
@@ -69,14 +72,17 @@ fn role_change_hook_fires_after_apply() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
         epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-b".into(),
         epoch: 2,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-c".into(),
         epoch: 3,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
 
     // Three Applied mutations → three callback fires, in order.
@@ -95,6 +101,7 @@ fn role_change_hook_fires_after_apply() {
     s.apply(ClusterMutation::PrimaryChanged {
         new: "sec-c".into(),
         epoch: 3,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     let obs_after_noop = observed.lock().unwrap().clone();
     assert_eq!(obs_after_noop.len(), 3, "NoOp must not fire hook");
@@ -127,6 +134,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-1".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -141,6 +149,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-1".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::NoOp
     );
@@ -150,6 +159,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-2".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -183,6 +193,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-1".into(),
             is_observer: true,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -195,6 +206,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "obs-1".into(),
             is_observer: false,
+            can_be_primary: false,
         }),
         ApplyOutcome::NoOp
     );
@@ -210,6 +222,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "never-joined".into(),
             is_observer: false,
+            can_be_primary: false,
         }),
         ApplyOutcome::Applied
     );
@@ -237,10 +250,148 @@ fn role_change_hook_fires_on_restore_when_primary_advances() {
     peer.apply(ClusterMutation::PrimaryChanged {
         new: "lead".into(),
         epoch: 7,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });
     joiner.restore(peer.snapshot());
 
     assert_eq!(joiner.role_table().primary, Some("lead".to_string()));
     let obs = observed.lock().unwrap().clone();
     assert_eq!(obs, vec![Some("lead".to_string())]);
+}
+
+// ── can_be_primary: explicit per-peer primary-capability ──
+//
+// These pin that capability is a SEPARATE first-class CRDT property:
+// set at join (twin of `is_observer`), updatable at runtime via the
+// dedicated mutation, and replicated through the snapshot. NOT deduced
+// from membership / liveness / observer status.
+
+/// A peer that joins with `can_be_primary = true` is recorded in the
+/// `RoleTable.can_be_primary` set and visible through the
+/// `can_be_primary(id)` accessor; a peer that joins with it `false`
+/// is NOT capability-eligible (capability is explicit, not deduced
+/// from membership).
+#[test]
+fn peer_joined_records_can_be_primary_capability() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "capable".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "incapable".into(),
+        is_observer: false,
+        can_be_primary: false,
+    });
+
+    assert!(
+        s.can_be_primary("capable"),
+        "a peer joining with can_be_primary=true must be capability-eligible"
+    );
+    assert!(
+        !s.can_be_primary("incapable"),
+        "a peer joining with can_be_primary=false must NOT be capability-eligible"
+    );
+    assert!(
+        !s.can_be_primary("never-joined"),
+        "an unknown peer is not capability-eligible (capability is explicit)"
+    );
+    assert!(s.role_table().can_be_primary.contains("capable"));
+    assert!(!s.role_table().can_be_primary.contains("incapable"));
+}
+
+/// `SetCanBePrimary` updates a peer's capability at runtime — both
+/// granting it to a peer that joined without it and revoking it — and
+/// is idempotent (re-applying the current value is a NoOp). Decoupled
+/// from membership: the apply rule does not gate on `peer_state`.
+#[test]
+fn set_can_be_primary_updates_capability_at_runtime() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    // Grant to a peer that never advertised it at join.
+    let granted = s.apply(ClusterMutation::SetCanBePrimary {
+        peer_id: "p".into(),
+        can_be_primary: true,
+    });
+    assert_eq!(granted, ApplyOutcome::Applied);
+    assert!(s.can_be_primary("p"));
+
+    // Re-granting the same value is a NoOp.
+    let again = s.apply(ClusterMutation::SetCanBePrimary {
+        peer_id: "p".into(),
+        can_be_primary: true,
+    });
+    assert_eq!(again, ApplyOutcome::NoOp);
+
+    // Revoke at runtime.
+    let revoked = s.apply(ClusterMutation::SetCanBePrimary {
+        peer_id: "p".into(),
+        can_be_primary: false,
+    });
+    assert_eq!(revoked, ApplyOutcome::Applied);
+    assert!(!s.can_be_primary("p"));
+
+    // Revoking an already-absent id is a NoOp.
+    let revoke_absent = s.apply(ClusterMutation::SetCanBePrimary {
+        peer_id: "p".into(),
+        can_be_primary: false,
+    });
+    assert_eq!(revoke_absent, ApplyOutcome::NoOp);
+}
+
+/// The primary-capability set round-trips through a snapshot: a
+/// freshly-restored late-joiner (empty local capability set) picks up
+/// the originator's `can_be_primary` ids on `restore`. Mirrors the
+/// `observers` first-bootstrap-replace contract.
+#[test]
+fn snapshot_round_trips_can_be_primary() {
+    let mut origin = ClusterState::<RunnerIdentifier>::new();
+    origin.apply(ClusterMutation::PeerJoined {
+        peer_id: "compute-a".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
+    origin.apply(ClusterMutation::SetCanBePrimary {
+        peer_id: "compute-b".into(),
+        can_be_primary: true,
+    });
+
+    let snap = origin.snapshot();
+    assert!(snap.can_be_primary.contains("compute-a"));
+    assert!(snap.can_be_primary.contains("compute-b"));
+
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    assert!(!joiner.can_be_primary("compute-a"));
+    joiner.restore(snap);
+
+    assert!(
+        joiner.can_be_primary("compute-a"),
+        "snapshot restore must carry the capability set to a late-joiner"
+    );
+    assert!(joiner.can_be_primary("compute-b"));
+}
+
+/// `PeerRemoved` clears a peer's primary-capability — the exact twin of
+/// the observer projection. A dead id never resurrects, so it must not
+/// linger in the capability set.
+#[test]
+fn peer_removed_clears_can_be_primary() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "doomed".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
+    assert!(s.can_be_primary("doomed"));
+
+    s.apply(ClusterMutation::PeerRemoved {
+        id: "doomed".into(),
+        cause: RemovalCause::KeepaliveMiss,
+    });
+    assert!(
+        !s.can_be_primary("doomed"),
+        "a removed peer must be dropped from the capability set"
+    );
 }
