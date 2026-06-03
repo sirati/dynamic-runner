@@ -1,6 +1,15 @@
 {
   description = "dynamic_runner - generic Rust runner backend with Python bindings";
 
+  # Single nixpkgs for the whole flake: `rust-overlay` follows it and
+  # `flake-utils` pulls no nixpkgs, so the lock has exactly ONE nixpkgs
+  # node. A consumer therefore pins EVERYTHING transitively just by
+  # pinning this one input from their own (parent) flake:
+  #
+  #     inputs.dynamic-runner.inputs.nixpkgs.follows = "nixpkgs";
+  #
+  # After that, dynamic_runner — and rust-overlay underneath it — build
+  # against the consumer's nixpkgs, so there is no second nixpkgs to drift.
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
