@@ -166,7 +166,7 @@ pub struct SecondaryConfig {
     ///     state — the observer never self-promotes even when it
     ///     would otherwise be the lowest-id alive peer. See
     ///     `election.rs::run_election_tick`'s `we_lead` branch.
-    ///   - A `PromotePrimary` naming this secondary is rejected
+    ///   - A `PrimaryChanged` naming this secondary is rejected
     ///     with a loud error (defensive: should not happen if peers
     ///     honour the same flag, but protects against a misconfigured
     ///     peer or a wire-level forgery).

@@ -18,7 +18,6 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { sender_id, .. }
             | Self::TransferComplete { sender_id, .. }
             | Self::StageFile { sender_id, .. }
-            | Self::PromotePrimary { sender_id, .. }
             | Self::RequestClusterSnapshot { sender_id, .. }
             | Self::ClusterSnapshot { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
@@ -48,7 +47,6 @@ impl<I> DistributedMessage<I> {
             | Self::TaskAssignment { timestamp, .. }
             | Self::TransferComplete { timestamp, .. }
             | Self::StageFile { timestamp, .. }
-            | Self::PromotePrimary { timestamp, .. }
             | Self::RequestClusterSnapshot { timestamp, .. }
             | Self::ClusterSnapshot { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
@@ -78,7 +76,6 @@ impl<I> DistributedMessage<I> {
             Self::TaskAssignment { .. } => MessageType::TaskAssignment,
             Self::TransferComplete { .. } => MessageType::TransferComplete,
             Self::StageFile { .. } => MessageType::StageFile,
-            Self::PromotePrimary { .. } => MessageType::PromotePrimary,
             Self::RequestClusterSnapshot { .. } => MessageType::RequestClusterSnapshot,
             Self::ClusterSnapshot { .. } => MessageType::ClusterSnapshot,
             Self::MeshReady { .. } => MessageType::MeshReady,

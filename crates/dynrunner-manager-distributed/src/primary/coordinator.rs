@@ -373,10 +373,10 @@ pub struct PrimaryCoordinator<
 
     /// Set of secondary ids that have reported `MeshReady`. The
     /// primary's `wait_for_mesh_ready` step blocks on this set
-    /// growing to the connected-secondaries set before it issues
-    /// `PromotePrimary` — without that wait, the promoted
-    /// secondary becomes authoritative against a still-forming
-    /// peer mesh and every pre-mesh-formation message goes
+    /// growing to the connected-secondaries set before it issues its
+    /// `PrimaryChanged` announcement — without that wait, the
+    /// newly-named primary becomes authoritative against a still-
+    /// forming peer mesh and every pre-mesh-formation message goes
     /// nowhere. Recorded by `handle_mesh_ready`; consumed by
     /// `wait_for_mesh_ready`.
     pub(super) mesh_ready_secondaries: HashSet<String>,
@@ -2363,8 +2363,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // launched with `--source-already-staged` and has no local
         // view of the corpus to discover or seed); in that mode the
         // chosen secondary runs task discovery + ledger seed after the
-        // bootstrap promotion (see `PromotePrimary { required_setup:
-        // true }` below). To keep the secondaries' `wait_for_setup`
+        // bootstrap promotion (the discovery-yield rides
+        // `InitialAssignment { pre_staged_mode: true }`, emitted by
+        // `emit_setup_defer_handshake` below). To keep the secondaries'
+        // `wait_for_setup`
         // loop unchanged in either mode, `emit_setup_defer_handshake`
         // sends the degenerate InitialAssignment + state transitions
         // the legacy path would have sent — empty payloads but the
@@ -2394,10 +2396,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.send_transfer_complete().await?;
 
         // Phase 6.5: Wait for every connected secondary to report
-        // its peer-mesh has settled before promoting one of them
-        // to primary. Pre-fix `PromotePrimary` fired ~750µs
-        // after cert-exchange completed — the promoted
-        // secondary then became authoritative against a still-
+        // its peer-mesh has settled before announcing the primary.
+        // Pre-fix the `PrimaryChanged` announcement fired ~750µs
+        // after cert-exchange completed — the newly-named
+        // primary then became authoritative against a still-
         // forming peer mesh (per-peer dial budget: 10s QUIC + 10s
         // WSS) and every pre-mesh-formation peer-broadcast routed
         // into the void for the duration. Holding the promotion

@@ -91,8 +91,8 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 /// 5/0 — proves the tunnel wiring did not regress the wire flow
 /// (per-secondary writes go via the same `connections` map, inbound
 /// flows through the same `incoming_rx`, and the role-cache stays
-/// cold throughout because no `PromotePrimary` is exercised in this
-/// 1-secondary path).
+/// cold throughout because no `PrimaryChanged` re-point is exercised in
+/// this 1-secondary path).
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_secondary_over_wss() {
     let _ = tracing_subscriber::fmt::try_init();

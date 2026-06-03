@@ -17,7 +17,6 @@ pub enum MessageType {
     TaskAssignment,
     TransferComplete,
     StageFile,
-    PromotePrimary,
     /// Late-joiner / reconnecting node asks any connected peer for a
     /// full snapshot of the current `ClusterState`. Replaces the
     /// pre-Phase-B `FullTaskList` broadcast — under continuously-

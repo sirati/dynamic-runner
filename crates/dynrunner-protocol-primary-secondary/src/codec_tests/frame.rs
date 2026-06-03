@@ -109,13 +109,6 @@ fn roundtrip_all_message_types() {
             total_files: 10,
             total_bytes: 1024,
         },
-        DistributedMessage::PromotePrimary {
-            sender_id: "p".into(),
-            timestamp: 0.0,
-            new_primary_id: "s".into(),
-            epoch: 1,
-            required_setup: false,
-        },
         DistributedMessage::RequestClusterSnapshot {
             sender_id: "s".into(),
             timestamp: 0.0,

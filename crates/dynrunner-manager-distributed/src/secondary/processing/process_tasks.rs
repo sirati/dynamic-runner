@@ -133,7 +133,8 @@ where
         let mut oom_decision_interval = oom_watcher.decision_interval_ticker();
 
         // Tell the primary the peer-mesh has settled so it can release
-        // `PromotePrimary`. For the single-secondary / no-peers case
+        // its `PrimaryChanged` announcement. For the single-secondary /
+        // no-peers case
         // (`peer_dial_count == 0`) this is the only place the signal
         // gets emitted — `check_peer_mesh_watchdog` has nothing to do
         // (no deadline armed) and would never fire MeshReady.

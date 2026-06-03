@@ -3,14 +3,15 @@
 
 use super::*;
 
-/// Multi-secondary mesh-ready gate: the primary must NOT issue
-/// `PromotePrimary` until every connected secondary has reported
-/// `MeshReady`. Pre-fix the promotion fired ~750µs after cert-
-/// exchange completed; the promoted secondary then became
+/// Multi-secondary mesh-ready gate: the primary must NOT issue its
+/// bootstrap primary announcement (`ClusterMutation::PrimaryChanged
+/// { new = primary }`) until every connected secondary has reported
+/// `MeshReady`. Pre-fix the announcement fired ~750µs after cert-
+/// exchange completed; the newly-named primary then became
 /// authoritative against a still-forming peer mesh, and every
 /// pre-mesh-formation peer-broadcast routed into the void for up
-/// to 30s. This test pins the new ordering: wire `PromotePrimary`
-/// arrives at every fake secondary AFTER all of them have sent
+/// to 30s. This test pins the new ordering: the `PrimaryChanged`
+/// frame arrives at every fake secondary AFTER all of them have sent
 /// their own `MeshReady`. Implementation uses a per-secondary
 /// `tokio::sync::oneshot` to gate the MeshReady send so the test
 /// can drive the order deterministically.
@@ -24,12 +25,12 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             let (transport, secondary_ends) = setup_test(N_SECONDARIES);
 
             // Per-secondary oneshot triggers. Test drives them in
-            // order to enforce: the primary doesn't fire
-            // PromotePrimary until ALL three have flipped.
+            // order to enforce: the primary doesn't announce
+            // PrimaryChanged until ALL three have flipped.
             let mut mesh_triggers: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
-            // Per-secondary observation: did this secondary see
-            // PromotePrimary BEFORE it was allowed to send
-            // MeshReady? (true = bug present)
+            // Per-secondary observation: did this secondary see the
+            // primary's `PrimaryChanged` announcement BEFORE it was
+            // allowed to send MeshReady? (true = bug present)
             let mut promote_seen_pre_mesh_observers: Vec<tokio::sync::oneshot::Receiver<bool>> =
                 Vec::new();
 
@@ -98,9 +99,10 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             // wait loop to observe the freshly-arrived
             // MeshReady. The primary must NOT have advanced past
             // `wait_for_mesh_ready` until all three triggers have
-            // fired — otherwise the per-secondary "did I see
-            // PromotePrimary before being allowed to MeshReady?"
-            // observer would have reported true for some of them.
+            // fired — otherwise the per-secondary "did I see the
+            // PrimaryChanged announcement before being allowed to
+            // MeshReady?" observer would have reported true for some
+            // of them.
             for trigger in mesh_triggers {
                 trigger.send(()).expect("trigger send");
                 // Yield repeatedly so the primary task gets a
@@ -114,15 +116,15 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             }
 
             // Collect the per-secondary observations. None of
-            // them should have seen PromotePrimary before being
-            // allowed to send MeshReady.
+            // them should have seen the PrimaryChanged announcement
+            // before being allowed to send MeshReady.
             for (i, obs) in promote_seen_pre_mesh_observers.into_iter().enumerate() {
                 let saw = obs.await.expect("observer recv");
                 assert!(
                     !saw,
-                    "secondary {i} observed PromotePrimary BEFORE its own \
-                     MeshReady was allowed to send — primary's \
-                     wait_for_mesh_ready step is not gating PromotePrimary"
+                    "secondary {i} observed the PrimaryChanged announcement \
+                     BEFORE its own MeshReady was allowed to send — primary's \
+                     wait_for_mesh_ready step is not gating the announcement"
                 );
             }
 
@@ -133,9 +135,10 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
 }
 
 /// Fake secondary that defers `MeshReady` until the test fires
-/// `mesh_trigger`. Reports via `observer` whether it saw
-/// `PromotePrimary` arrive before its `MeshReady` was permitted to
-/// send (true = bug). Otherwise behaves like `fake_secondary`.
+/// `mesh_trigger`. Reports via `observer` whether it saw the primary's
+/// `PrimaryChanged` announcement arrive before its `MeshReady` was
+/// permitted to send (true = bug). Otherwise behaves like
+/// `fake_secondary`.
 async fn gated_mesh_secondary(
     secondary_id: String,
     num_workers: u32,
@@ -145,7 +148,19 @@ async fn gated_mesh_secondary(
     mesh_trigger: tokio::sync::oneshot::Receiver<()>,
     observer: tokio::sync::oneshot::Sender<bool>,
 ) {
-    use dynrunner_protocol_primary_secondary::MessageType;
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+
+    /// The primary's bootstrap promotion announcement is a
+    /// `ClusterMutation` carrying `PrimaryChanged` — detect it to gate.
+    fn is_primary_changed(m: &DistributedMessage<TestId>) -> bool {
+        matches!(
+            m,
+            DistributedMessage::ClusterMutation { mutations, .. }
+                if mutations
+                    .iter()
+                    .any(|mu| matches!(mu, ClusterMutation::PrimaryChanged { .. }))
+        )
+    }
 
     outgoing_to_primary
         .send(DistributedMessage::SecondaryWelcome {
@@ -175,8 +190,8 @@ async fn gated_mesh_secondary(
         .unwrap();
 
     // Race: receive the trigger to send MeshReady against
-    // observing PromotePrimary on the inbound path. If
-    // PromotePrimary arrives first, the gate failed.
+    // observing the PrimaryChanged announcement on the inbound path.
+    // If PrimaryChanged arrives first, the gate failed.
     let mut mesh_trigger_opt = Some(mesh_trigger);
     let mut observer_opt = Some(observer);
     let mut mesh_sent = false;
@@ -184,7 +199,7 @@ async fn gated_mesh_secondary(
 
     loop {
         // While we're still pre-MeshReady, race the trigger
-        // against an inbound PromotePrimary. After MeshReady has
+        // against an inbound PrimaryChanged. After MeshReady has
         // been sent, the trigger arm is removed and we fall back
         // to a normal recv loop.
         if !mesh_sent {
@@ -207,7 +222,7 @@ async fn gated_mesh_secondary(
                 }
                 msg = incoming_from_primary.recv() => match msg {
                     Some(m) => {
-                        if matches!(m.msg_type(), MessageType::PromotePrimary) {
+                        if is_primary_changed(&m) {
                             promote_seen_pre_mesh = true;
                         }
                         handle_inbound_for_gated_secondary(
@@ -255,10 +270,13 @@ fn handle_inbound_for_gated_secondary(
             // primary's kickstart re-dispatch eventually cleared
             // every worker's `current_task` regardless of which one
             // a TaskComplete was attributed to. Post-demotion the
-            // primary stops dispatching after `PromotePrimary`, so a
+            // primary stops dispatching after relinquishing via
+            // `PrimaryChanged`, so a
             // mis-attributed TaskComplete leaves the OTHER worker
             // permanently mid-dispatch and `active_workers > 0`
-            // forever — operational_loop never terminates.
+            // forever — operational_loop never terminates. (The
+            // primary stops dispatching once it relinquishes the role
+            // via `PrimaryChanged`.)
             let entries: Vec<_> = zip_files.iter().flat_map(|zf| zf.binaries.iter()).collect();
             for (idx, entry) in entries.iter().enumerate() {
                 let worker_id = workers_ready.get(idx).map(|w| w.worker_id).unwrap_or(0);

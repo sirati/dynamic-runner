@@ -87,7 +87,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             if expected.is_subset(&self.mesh_ready_secondaries) {
                 tracing::info!(
                     count = expected.len(),
-                    "all secondaries reported MeshReady; releasing PromotePrimary"
+                    "all secondaries reported MeshReady; releasing PrimaryChanged announcement"
                 );
                 return Ok(());
             }
@@ -127,10 +127,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         expected = expected.len(),
                         timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
                         "mesh-ready timeout: some secondaries never reported \
-                         MeshReady; proceeding with PromotePrimary anyway. The \
-                         promoted secondary may briefly route into a \
-                         partially-formed peer mesh until those secondaries \
-                         finish (or fail) their dials."
+                         MeshReady; proceeding with the PrimaryChanged \
+                         announcement anyway. The newly-named primary may \
+                         briefly route into a partially-formed peer mesh until \
+                         those secondaries finish (or fail) their dials."
                     );
                     return Ok(());
                 }
@@ -156,7 +156,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// that suppresses the announce. Epoch is `primary_epoch() + 1`, so
     /// on failover the announce strictly supersedes the prior primary
     /// identity via epoch-LWW; the re-announce names the same holder the
-    /// election winner's `PromotePrimary` already installed, so the
+    /// election winner's `PrimaryChanged` already installed, so the
     /// primary-changed important-event hook (which fires only on a
     /// genuine holder transition) stays silent.
     ///

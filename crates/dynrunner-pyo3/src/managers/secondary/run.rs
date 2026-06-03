@@ -493,7 +493,7 @@ impl PySecondaryCoordinator {
                 // `Promoted` transition — the secondary's
                 // `record_promotion_confirm` → `fire_local_promotion`
                 // fires the gate (handing over a `cluster_state` snapshot)
-                // and broadcasts `PromotePrimary { new = self }` so
+                // and broadcasts `PrimaryChanged { new = self }` so
                 // surviving peers re-point onto this winner.
                 //
                 // Composed ONLY when a REAL mesh exists

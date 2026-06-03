@@ -73,12 +73,12 @@ async fn non_observer_filters_observer_from_lowest_alive() {
     );
 }
 
-/// Defensive guard test: a PromotePrimary naming an observer is
+/// Defensive guard test: a `PrimaryChanged` naming an observer is
 /// rejected loud rather than installed in the routing target.
 /// Should not happen if peers honour the filter, but the
 /// rejection protects against forgeries and misconfigured peers.
 #[tokio::test(flavor = "current_thread")]
-async fn promote_primary_naming_observer_is_rejected() {
+async fn primary_changed_naming_observer_is_rejected() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
@@ -87,20 +87,21 @@ async fn promote_primary_naming_observer_is_rejected() {
         is_observer: true,
     });
 
-    let promote = DistributedMessage::PromotePrimary::<super::super::test_helpers::TestId> {
+    let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "obs-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "obs-a".into(),
+            epoch: 1,
+        }],
     };
     let result = sec.dispatch_message(promote, &mut FakeWorkerFactory).await;
 
     // Handler returns Ok(()) (silently rejects) — we don't
     // upgrade to Err because Err propagates to the processing
     // loop and exits the secondary, which is overkill for a
-    // single bad PromotePrimary message. The rejection is
-    // logged as error-level, which suffices.
+    // single bad announcement. The rejection is logged as
+    // error-level inside the apply hook, which suffices.
     assert!(result.is_ok());
 
     // The replicated CRDT — the single source of "who is primary"
@@ -114,10 +115,40 @@ async fn promote_primary_naming_observer_is_rejected() {
     );
 }
 
+/// Mirror of the above for the SELF-observer case: a node configured as
+/// an observer, applying `PrimaryChanged { new = self }`, must reject it
+/// (an observer cannot host the primary role) — `current_primary` stays
+/// uninstalled.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_changed_naming_self_observer_is_rejected() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut cfg = election_config("obs-a");
+    cfg.is_observer = true;
+    let mut sec = make_secondary(cfg);
+    sec.enter_operational_for_test();
+
+    let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
+        sender_id: "primary".into(),
+        timestamp: 0.0,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "obs-a".into(),
+            epoch: 1,
+        }],
+    };
+    sec.dispatch_message(promote, &mut FakeWorkerFactory)
+        .await
+        .expect("handler returns Ok even when rejecting");
+
+    assert!(
+        sec.cluster_state.current_primary().is_none(),
+        "a self-observer must NOT be installed as primary"
+    );
+}
+
 /// Step 7 / Decision G end-to-end: the `ClusterMutation::
 /// PeerJoined { is_observer: true }` apply rule is the SAME
 /// source of truth that both `lowest_alive` filtering and the
-/// defensive PromotePrimary rejection read. Without storage
+/// defensive PrimaryChanged rejection read. Without storage
 /// relocation, the deleted `peer_observers` HashSet would have
 /// produced identical results; with it, callers consult
 /// `cluster_state.role_table().observers` instead.
@@ -129,7 +160,7 @@ async fn promote_primary_naming_observer_is_rejected() {
 ///       mutation alongside the PeerInfo broadcast).
 ///   (b) `lowest_alive` filter excludes the observer just as the
 ///       deleted `peer_observers` HashSet would have.
-///   (c) The defensive PromotePrimary rejection also reads from
+///   (c) The defensive PrimaryChanged rejection also reads from
 ///       the role-table, refusing to install an observer as
 ///       primary even if the broadcast tries to.
 ///
@@ -176,19 +207,20 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
         "expected PromotionVote naming sec-b"
     );
 
-    // (c) Defensive PromotePrimary rejection: a spurious
-    // PromotePrimary naming the observer is silently rejected
+    // (c) Defensive PrimaryChanged rejection: a spurious
+    // PrimaryChanged naming the observer is silently rejected
     // (logged at error level) without flipping role.
-    let promote = DistributedMessage::PromotePrimary::<super::super::test_helpers::TestId> {
+    let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "obs-a".into(),
-        epoch: 99,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "obs-a".into(),
+            epoch: 99,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler returns Ok even when rejecting");
+        .expect("PrimaryChanged handler returns Ok even when rejecting");
     assert!(
         sec.cluster_state
             .current_primary()

@@ -73,8 +73,8 @@ pub enum ClusterMutation<I> {
     ///
     /// Emitted exactly once by the primary just before it returns
     /// from `run()`, after `run_retry_passes` settles. Without this
-    /// signal, non-promoted secondaries (which were waiting for
-    /// PromotePrimary or driving their workers via the promoted
+    /// signal, non-promoted secondaries (which were waiting for a
+    /// `PrimaryChanged` or driving their workers via the promoted
     /// peer) have no termination cue when the local primary
     /// disconnects: they enter failover detection, can't tell the
     /// run is genuinely over vs. just a primary crash, and stay

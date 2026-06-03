@@ -523,8 +523,9 @@ impl PyObserverLateJoiner {
                     //    broadcasts `RunComplete`. SetupPending
                     //    is unreachable for an observer (only
                     //    pre-staged-mode primaries emit the
-                    //    PromotePrimary that triggers it, and an observer
-                    //    is never the elected secondary).
+                    //    `InitialAssignment { pre_staged_mode: true }`
+                    //    that triggers it, and an observer is never the
+                    //    elected secondary).
                     //
                     // # Why a sub-block
                     //
@@ -613,11 +614,11 @@ impl PyObserverLateJoiner {
                                 RunOutcome::SetupPending => {
                                     // Defensive: a late-joiner observer
                                     // should never see SetupPending — that
-                                    // outcome comes from a
-                                    // PromotePrimary{required_setup=true}
-                                    // arrival, which an observer cannot
-                                    // accept (the election filter + the
-                                    // dispatch.rs defensive reject keep
+                                    // outcome comes from an
+                                    // `InitialAssignment { pre_staged_mode:
+                                    // true }` arrival, which an observer
+                                    // cannot accept (the election filter +
+                                    // the apply-hook defensive reject keep
                                     // observers off the promote path).
                                     // Surface it as a typed error rather
                                     // than retrying — silent re-entry on
@@ -626,7 +627,8 @@ impl PyObserverLateJoiner {
                                     return Err(pyo3::exceptions::PyRuntimeError::new_err(
                                         "observer late-joiner: secondary returned \
                                      RunOutcome::SetupPending — unreachable for an \
-                                     observer (PromotePrimary should be rejected); \
+                                     observer (a PrimaryChanged naming it should be \
+                                     rejected); \
                                      this indicates a protocol or election-filter \
                                      regression",
                                     ));

@@ -23,7 +23,7 @@ use super::module;
 /// `required_setup_on_promote = source_pre_staged_root.is_some()`.
 /// The Python dispatch helper has already returned an empty
 /// `binaries` list in pre-staged mode, so the bootstrap
-/// `PromotePrimary` defers discovery + ledger-seed to the chosen
+/// the setup-defer handshake defers discovery + ledger-seed to the chosen
 /// secondary. Mirrors the kwarg on `run_primary` and the SLURM
 /// pipeline's direct `RustPrimaryCoordinator` construction so all
 /// three multi-computer modes share one signal.

@@ -402,7 +402,7 @@ where
     /// contract, same single-shot shape as the other `register_*`
     /// setters. Absent registration (Rust-only tests / legacy single-
     /// `run()` callers) leaves the gate `None`; the terminal action then
-    /// only broadcasts `PromotePrimary { new = self }`. The gate carries
+    /// only broadcasts `PrimaryChanged { new = self }`. The gate carries
     /// a [`crate::cluster_state::ClusterStateSnapshot`] — the seed for
     /// the parked primary's `restore` + `hydrate_from_cluster_state`.
     pub fn register_promote_activation(
@@ -966,8 +966,9 @@ where
     /// caller other than the PyO3 secondary wrapper, which has to
     /// re-enter the loop after running Python `task.discover_items`).
     /// The outcome can only be `Done` here, because `SetupPending`
-    /// requires a `PromotePrimary { required_setup: true }` wire arrival
-    /// and no test/non-pyo3 setup ever sends one.
+    /// requires an `InitialAssignment { pre_staged_mode: true }` wire
+    /// arrival (the discovery-yield carrier) and no test/non-pyo3 setup
+    /// ever sends one.
     pub async fn run(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
         match self.run_until_setup_or_done(factory).await? {
             RunOutcome::SetupPending => Err(

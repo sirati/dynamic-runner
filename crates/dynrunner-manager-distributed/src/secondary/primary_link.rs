@@ -140,8 +140,9 @@ impl PrimaryLink {
     }
 
     /// Clear EVERY worker's request backoff. Used when the primary
-    /// identity changes (PromotePrimary): backoff accrued against the
-    /// prior primary is stale the moment the role flips, so every idle
+    /// identity changes (an applied `PrimaryChanged`): backoff accrued
+    /// against the prior primary is stale the moment the role flips, so
+    /// every idle
     /// worker must be free to re-issue its `TaskRequest` immediately at
     /// the new primary. Keyed off the backoff maps themselves (not the
     /// worker pool) so it works regardless of whether the pool has been

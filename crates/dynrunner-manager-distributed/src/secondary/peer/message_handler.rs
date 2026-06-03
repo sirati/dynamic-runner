@@ -37,10 +37,10 @@ where
     /// types it owns directly (Keepalive, election frames, role-aware
     /// TaskComplete/TaskFailed, ClusterMutation) carry the
     /// non-authoritative secondary behavior. Frame types it does not
-    /// own (TaskAssignment, StageFile, PromotePrimary,
-    /// RequestClusterSnapshot, ClusterSnapshot, PeerInfo) fall to the
-    /// catch-all, which delegates to [`Self::dispatch_message`] — the
-    /// wire-frame dispatcher, still directly callable by tests.
+    /// own (TaskAssignment, StageFile, RequestClusterSnapshot,
+    /// ClusterSnapshot, PeerInfo) fall to the catch-all, which delegates
+    /// to [`Self::dispatch_message`] — the wire-frame dispatcher, still
+    /// directly callable by tests.
     ///
     /// # Per-frame error fatality
     ///
@@ -258,11 +258,13 @@ where
                 // `record_promotion_confirm` returns `true` the instant
                 // this node's candidate tally crosses quorum and the
                 // election transitions to its terminal `Promoted` state.
-                // That `true` is the TERMINAL ACTION cue: fire the
-                // co-located parked primary's activation gate (seeded
-                // resume from the replicated CRDT) and broadcast
-                // `PromotePrimary { new = self }` so surviving
-                // secondaries re-point `Role::Primary` onto this winner.
+                // That `true` is the TERMINAL ACTION cue:
+                // `fire_local_promotion` originates + locally applies
+                // `PrimaryChanged { new = self }`, which (via the apply
+                // hook) fires the co-located parked primary's activation
+                // gate (seeded resume from the replicated CRDT), and
+                // broadcasts the same frame so surviving secondaries
+                // re-point `Role::Primary` onto this winner.
                 // Pre-fix this return was discarded, so a surviving
                 // secondary that won its election could never actually
                 // become primary — the failover path dead-ended here.
@@ -279,10 +281,19 @@ where
             // the single-concern `apply_cluster_mutations` helper; CRDT
             // idempotency makes any duplicate apply a no-op.
             DistributedMessage::ClusterMutation { mutations, .. } => {
-                self.apply_cluster_mutations(mutations);
+                // Same revive-on-primary-change contract as the operational
+                // dispatch arm: when the batch genuinely advances the
+                // primary identity (e.g. a failover winner's
+                // `PrimaryChanged` relayed over the peer mesh), reset the
+                // stale per-worker backoff and repoll idle workers so they
+                // re-issue TaskRequests at the new primary promptly.
+                if self.apply_cluster_mutations(mutations) {
+                    self.op_mut().primary_link.reset_all_backoff();
+                    self.repoll_idle_workers().await;
+                }
             }
             // Wire-frame / setup / snapshot frames the role-aware base
-            // does not own (TaskAssignment, StageFile, PromotePrimary,
+            // does not own (TaskAssignment, StageFile,
             // RequestClusterSnapshot, ClusterSnapshot, PeerInfo) delegate
             // to the wire-frame dispatcher. ONE delegation path — no
             // physical-origin key.
