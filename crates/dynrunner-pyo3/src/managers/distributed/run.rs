@@ -244,6 +244,13 @@ impl PyDistributedManager {
         // iff the in-process primary's `run` returned
         // `RunError::SetupDeadlineExpired`.
         let mut setup_deadline_expired: Option<RunError> = None;
+        // Pre-phase duplicate-task-id carried out of the detached tokio
+        // runtime — same shape as `PyPrimaryCoordinator::run`. `Some`
+        // iff the in-process primary's `run` aborted on a #3a duplicate
+        // (`RunError::DuplicateTaskIdPrePhase`); the GIL-side tail
+        // raises a `PyRuntimeError` so the wrapper does not return
+        // exit 0.
+        let mut duplicate_task_id_pre_phase: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -694,6 +701,9 @@ impl PyDistributedManager {
                     Err(e @ RunError::SetupDeadlineExpired { .. }) => {
                         setup_deadline_expired = Some(e);
                     }
+                    Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
+                        duplicate_task_id_pre_phase = Some(e);
+                    }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow for non-structured
                         // errors — see `PyPrimaryCoordinator::run`
@@ -750,6 +760,14 @@ impl PyDistributedManager {
             // (strictly stronger) and before cluster-collapsed
             // (deadline expiry means zero tasks dispatched, so
             // stranded accounting carries no useful operator pointer).
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = duplicate_task_id_pre_phase {
+            // Surface the pre-phase duplicate-task-id abort (#3a) — same
+            // shape as `PyPrimaryCoordinator::run`. The in-process
+            // primary already broadcast `RunAborted`; raise here so the
+            // Python wrapper sees a non-zero exit instead of exit 0.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

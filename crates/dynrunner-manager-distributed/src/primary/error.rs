@@ -77,6 +77,30 @@ pub enum RunError {
         /// setup-pending wait before the arm fired.
         elapsed: std::time::Duration,
     },
+    /// A `(phase_id, task_id)` duplicate was detected in the INITIAL
+    /// task batch — BEFORE any phase started (#3a). A collision in the
+    /// initial batch is a producer-side bug that would silently mask
+    /// one of the colliding tasks, so the run is aborted cluster-wide:
+    /// the primary broadcasts `ClusterMutation::RunAborted { reason }`
+    /// (every secondary/observer exits non-zero) and returns this so
+    /// its own PyO3 boundary surfaces a non-zero exit.
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary translates it
+    /// to a structured `PyRuntimeError` (the `Other` path is
+    /// log-and-swallowed → exit 0, which would hide the abort).
+    /// Mirrors `SetupDeadlineExpired`'s role: a structured pre-dispatch
+    /// terminal with no per-task breakdown to render — only the reason
+    /// naming the colliding identities. (A duplicate detected AFTER a
+    /// phase started — #3b — does NOT reach this variant: it
+    /// invalidates the not-yet-terminal tasks run-wide and the run
+    /// CONTINUES to its normal completion.)
+    DuplicateTaskIdPrePhase {
+        /// Human-readable reason naming the colliding `(phase, task_id)`
+        /// identity/identities. Same string carried in the broadcast
+        /// `RunAborted { reason }` so the primary-side exception and the
+        /// secondary-side log agree.
+        reason: String,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     Other(String),
@@ -111,6 +135,16 @@ impl fmt::Display for RunError {
                  `setup_promote_deadline` upward if the consumer's `discover_items` \
                  walk is legitimately long-running.",
                 elapsed.as_secs_f64()
+            ),
+            Self::DuplicateTaskIdPrePhase { reason } => write!(
+                f,
+                "run aborted: duplicate task identity in the initial batch \
+                 (before any phase started) — {reason}. A (phase_id, task_id) \
+                 collision in the initial task set is a producer-side bug that \
+                 would silently mask one of the colliding tasks; the run was \
+                 torn down cluster-wide rather than proceeding on an ambiguous \
+                 task set. Fix the producer so every (phase_id, task_id) is \
+                 unique within the run."
             ),
             Self::Other(msg) => f.write_str(msg),
         }

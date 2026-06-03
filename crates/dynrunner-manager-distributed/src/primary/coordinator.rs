@@ -700,6 +700,31 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// directly (decoupling law).
     pub(super) worker_mgmt_fail_outcome: Option<String>,
 
+    /// Set at INITIAL-batch ingest (`ingest_initial_batch`) when the
+    /// dependency-existence partition found a `(phase_id, task_id)`
+    /// DUPLICATE before any phase started (#3a). Carries the abort
+    /// reason. The bootstrap proceeds far enough to connect secondaries
+    /// (so the `RunAborted` broadcast reaches them), then `run_pipeline`
+    /// reads this directly after `wait_for_connections`, broadcasts
+    /// `ClusterMutation::RunAborted { reason }`, and returns
+    /// `RunError::DuplicateTaskIdPrePhase` — a hard cluster shutdown.
+    /// `None` on a clean ingest. Write-only at ingest, read-once at the
+    /// abort gate (same discipline as `setup_deadline_outcome`).
+    pub(super) pending_run_abort: Option<String>,
+
+    /// Set at INITIAL-batch ingest: the tasks the dependency-existence
+    /// partition flagged as having a literally-absent `(phase_id,
+    /// task_id)` dep (#2 missing-dep), each paired with the reason
+    /// naming the absent ids. They are EXCLUDED from the pool `extend`
+    /// (their `task_id` is pre-seeded into the pool's `failed_tasks`
+    /// so the survivors' dep resolution + cascade stay correct) but
+    /// KEPT in `all_binaries` so `seed_cluster_state` adds them to the
+    /// CRDT as `Pending`; `run_pipeline` then drains this and emits
+    /// `TaskFailed { kind: InvalidTask }` for each through the canonical
+    /// broadcast/apply pipeline (`Pending → InvalidTask`). Empty on a
+    /// clean ingest.
+    pub(super) pending_invalid_dep_tasks: Vec<(TaskInfo<I>, String)>,
+
     /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
     /// OOM retry bucket is actively reinjecting and draining; `false`
     /// otherwise. The retry-bucket primitive
@@ -836,6 +861,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             setup_deadline_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
+            pending_run_abort: None,
+            pending_invalid_dep_tasks: Vec::new(),
             single_worker_mode: false,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
@@ -2011,6 +2038,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // `RunShouldFail`; a coordinator re-used across runs must not
         // inherit a stale outcome.
         self.worker_mgmt_fail_outcome = None;
+        // Per-run reset for the ingest-time invalid-task directives:
+        // `pending_run_abort` (3a) and `pending_invalid_dep_tasks` (#2)
+        // are written by `ingest_initial_batch` below and read once at
+        // their respective gates; a coordinator re-used across runs
+        // must not inherit a previous run's ingest residue.
+        self.pending_run_abort = None;
+        self.pending_invalid_dep_tasks.clear();
 
         // The setup-pending gate is a CRDT-derived predicate
         // (`Self::setup_pending`) rather than a stateful latch field: in
@@ -2069,14 +2103,19 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
         // Sort by size descending for better packing — same intent as
         // pre-Phase-4b. The pool preserves insertion order within a
-        // bucket, so we pre-sort here and `extend` once.
+        // bucket, so we pre-sort here and ingest once.
         let mut sorted = binaries;
         sorted.sort_by_key(|b| std::cmp::Reverse(b.size));
-        self.all_binaries = sorted.clone();
-        self.total_tasks = sorted.len();
-        self.pool_mut()
-            .extend(sorted)
-            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
+        // INITIAL-batch ingest. Runs BEFORE `fire_initial_phase_starts`
+        // below, so `ingest_initial_batch` is unconditionally the
+        // pre-phase (#3a) side of the duplicate split. It runs the
+        // dependency-existence partition (#2), pre-seeds the pool's
+        // failed set for the missing-dep ids, extends the pool with the
+        // VALID subset (preserving `extend`'s atomic contract — a cycle
+        // among valid tasks stays a hard error), sets `all_binaries` /
+        // `total_tasks`, and records the #3a abort + #2 invalid-dep
+        // directives for `run_pipeline` to fire at their gates below.
+        self.ingest_initial_batch(sorted)?;
 
         let total = self.total_tasks;
         tracing::info!(total, num_secondaries = self.config.num_secondaries, "primary starting");
@@ -2171,6 +2210,17 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections(&mut command_rx).await?;
 
+        // #3a abort gate. `ingest_initial_batch` recorded a pending
+        // abort iff the INITIAL batch had a `(phase_id, task_id)`
+        // duplicate (pre-phase). Fire it HERE — the first point the
+        // secondaries are connected — so the `RunAborted` broadcast
+        // reaches them (at ingest time none were connected). Returns
+        // `Err(RunError::DuplicateTaskIdPrePhase)` on the abort path
+        // (the primary's PyO3 boundary surfaces a non-zero exit); a
+        // no-op on the clean path. Hard cluster shutdown — short-
+        // circuits before any seeding / assignment.
+        self.fire_pending_run_abort().await?;
+
         // Phase 2.5: Auto-stage. Run the staging walk on behalf of
         // callers that didn't pre-queue via `queue_stage_file` /
         // `queue_initial_staging_from_binaries`. Gate semantics
@@ -2225,6 +2275,17 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             self.emit_setup_defer_handshake().await?;
         } else {
             self.seed_cluster_state().await;
+            // #2 missing-dep emit. `seed_cluster_state` has now added
+            // every initial task — including the missing-dep ones — to
+            // the CRDT as `Pending`, so the `TaskFailed { InvalidTask }`
+            // emit transitions each `Pending → InvalidTask` (the apply
+            // rule also fans a `TaskCompletedEvent` carrying the
+            // `invalid_task:<reason>` kind, the framework's emission for
+            // the observer monitor). No-op when the partition found no
+            // missing-dep tasks. The cluster continues; these tasks are
+            // never dispatched (the pool pre-seeded them as failed at
+            // ingest), so `perform_initial_assignment` skips them.
+            self.emit_invalid_dep_tasks().await;
             self.perform_initial_assignment().await?;
         }
 

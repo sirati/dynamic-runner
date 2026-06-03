@@ -501,6 +501,25 @@ where
                 return Ok(RunOutcome::SetupPending);
             }
 
+            // Run-aborted exit: the primary broadcast
+            // `ClusterMutation::RunAborted { reason }` — the failure
+            // twin of RunComplete. Checked BEFORE the `run_complete`
+            // break because an abort is a HARD cluster shutdown: unlike
+            // the clean-completion path, we do NOT wait for
+            // `active_tasks` to drain (the run is being torn down, not
+            // finished). Returns `RunOutcome::Aborted` so the PyO3
+            // secondary/observer wrappers translate it to
+            // `std::process::exit(1)`. Single originator today: the
+            // pre-phase duplicate-task-id case (#3a).
+            if let Some(reason) = self.cluster_state.run_aborted() {
+                let reason = reason.to_string();
+                tracing::error!(
+                    reason = %reason,
+                    "RunAborted signal received from primary; exiting non-zero"
+                );
+                return Ok(crate::secondary::RunOutcome::Aborted { reason });
+            }
+
             // Run-complete exit: the primary broadcast
             // `ClusterMutation::RunComplete` just before returning
             // from its `run()` (see primary/mod.rs). Once that flag

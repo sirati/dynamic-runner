@@ -346,6 +346,18 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_complete = true;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::RunAborted { reason } => {
+                // Sticky monotonic: the first abort reason wins. A
+                // re-applied / duplicate `RunAborted` (at-least-once
+                // delivery, or a snapshot re-broadcast) is a NoOp so the
+                // reason and the latched flag never churn. Mirror of
+                // the `RunComplete` arm above — the failure twin.
+                if self.run_aborted.is_some() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.run_aborted = Some(reason);
+                ApplyOutcome::Applied
+            }
             ClusterMutation::TaskReinjected { hash } => {
                 // External-control reinjection moves a
                 // `Unfulfillable { .. }` entry back to `Pending`. Any

@@ -33,6 +33,13 @@ use std::time::Duration;
 ///   (RunComplete observed, drain-down after primary disconnect, or
 ///   single-secondary clean exit). The worker pool has been stopped
 ///   and the secondary is finished.
+/// - `Aborted`: the replicated ledger recorded
+///   `ClusterMutation::RunAborted` (the failure twin of RunComplete).
+///   `process_tasks` checks `cluster_state.run_aborted()` BEFORE the
+///   `run_complete()` break and returns this so the PyO3
+///   secondary/observer wrappers call `std::process::exit(1)`. Carries
+///   the abort `reason` for the boundary log. The cluster-wide
+///   non-zero-exit cue for a pre-phase duplicate-task-id (#3a).
 /// - `PanikShutdown`: the panik watcher observed its sentinel file (or
 ///   SIGTERM). The coordinator announced its own departure (file
 ///   source: a self-authored `ClusterMutation::PeerRemoved
@@ -53,6 +60,9 @@ use std::time::Duration;
 pub enum RunOutcome {
     SetupPending,
     Done,
+    Aborted {
+        reason: String,
+    },
     PanikShutdown {
         matched_path: std::path::PathBuf,
         reason: String,

@@ -271,6 +271,16 @@ impl<I: Identifier> ClusterState<I> {
         self.run_complete
     }
 
+    /// The abort reason if the run has been declared ABORTED by the
+    /// primary (`ClusterMutation::RunAborted`), else `None`. The
+    /// failure twin of [`Self::run_complete`]: sticky monotonic — once
+    /// `Some`, never clears. Secondaries check this BEFORE the
+    /// `run_complete` break in `process_tasks` and exit non-zero
+    /// (`RunOutcome::Aborted`); the `mesh_watchdog` disarms on it too.
+    pub fn run_aborted(&self) -> Option<&str> {
+        self.run_aborted.as_deref()
+    }
+
     /// Borrow a secondary's static capacity record (worker-slot count +
     /// advertised resources), or `None` if no `SecondaryCapacity`
     /// mutation for that id has been applied yet. Set once per

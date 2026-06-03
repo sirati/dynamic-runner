@@ -387,6 +387,46 @@ where
             tasks,
         );
 
+        // #3b: a `(phase_id, task_id)` duplicate in a RUNTIME spawn
+        // (any spawn reaching this handler is post-phase-start — the
+        // 3a/3b discriminator `phase_started_emitted.is_empty()` is
+        // structurally false here) invalidates EVERY not-yet-terminal
+        // task across the whole run; the cluster CONTINUES (no
+        // `RunAborted`). `validate_spawn_tasks`'s `DuplicateTaskHash`
+        // IS the `(phase_id, task_id)` duplicate signal: `compute_task_hash`
+        // is phase-distinct (#97), so a hash already present in the
+        // ledger means the same `(phase_id, task_id)` was already
+        // spawned. We invalidate the existing not-yet-terminal set and
+        // do NOT apply this batch — the run's task set is ambiguous, so
+        // adding the (would-be) survivors only to immediately invalidate
+        // them is pointless.
+        let duplicate_reasons: Vec<String> = errors
+            .iter()
+            .filter_map(|(_, e)| match e {
+                SpawnError::DuplicateTaskHash(hash) => {
+                    Some(format!("duplicate task hash {hash}"))
+                }
+                _ => None,
+            })
+            .collect();
+        if !duplicate_reasons.is_empty() {
+            debug_assert!(
+                !self.phase_started_emitted.is_empty(),
+                "apply_spawn_tasks is a runtime path — a phase must already \
+                 have started (the 3a/3b discriminator); an empty \
+                 phase_started_emitted here means a duplicate reached the \
+                 runtime path before fire_initial_phase_starts, which the \
+                 initial-batch ingest (#3a) should have caught first"
+            );
+            let reason = format!(
+                "{} duplicate task identity/identities in a runtime spawn: {}",
+                duplicate_reasons.len(),
+                duplicate_reasons.join("; ")
+            );
+            self.invalidate_all_pending(reason).await;
+            return Ok(errors);
+        }
+
         if valid_tasks.is_empty() {
             // No mutation to broadcast; the per-index errors are the
             // entire result. Skip the apply+broadcast pass so we
