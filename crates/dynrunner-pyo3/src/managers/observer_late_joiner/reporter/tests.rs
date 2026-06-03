@@ -106,11 +106,16 @@ fn seed_state(
 
 enum Seed {
     Pending,
-    InFlight { secondary: &'static str, worker: WorkerId },
+    InFlight {
+        secondary: &'static str,
+        worker: WorkerId,
+    },
     Completed,
     Failed(ErrorType),
     /// Cascade-paused on the prereq whose hash is `on`.
-    Blocked { on: &'static str },
+    Blocked {
+        on: &'static str,
+    },
 }
 
 // ── stats: CRDT-derived computation ──
@@ -129,10 +134,16 @@ fn stats_counts_each_bucket() {
                     dynrunner_core::ResourceKind::memory(),
                 )),
             ),
-            (task("nf", "P", &[]), Seed::Failed(ErrorType::NonRecoverable)),
+            (
+                task("nf", "P", &[]),
+                Seed::Failed(ErrorType::NonRecoverable),
+            ),
             (
                 task("if1", "P", &[]),
-                Seed::InFlight { secondary: "sec-a", worker: 0 },
+                Seed::InFlight {
+                    secondary: "sec-a",
+                    worker: 0,
+                },
             ),
         ],
     );
@@ -200,7 +211,10 @@ fn stats_invalid_task_unfulfillable_and_final_are_pairwise_disjoint() {
     let s = seed_state(
         &[],
         &[
-            (task("nf", "P", &[]), Seed::Failed(ErrorType::NonRecoverable)),
+            (
+                task("nf", "P", &[]),
+                Seed::Failed(ErrorType::NonRecoverable),
+            ),
             (
                 task("u", "P", &[]),
                 Seed::Failed(ErrorType::Unfulfillable {
@@ -238,7 +252,10 @@ fn stats_blocked_is_separate_from_waiting_on_deps() {
                 }),
             ),
             // entry 1: `dep_blocked` cascade-paused on hash-0 → Blocked.
-            (task("dep_blocked", "P", &["up"]), Seed::Blocked { on: "hash-0" }),
+            (
+                task("dep_blocked", "P", &["up"]),
+                Seed::Blocked { on: "hash-0" },
+            ),
             // entry 2: `pending_prereq`, no deps → ready in active phase.
             (task("pending_prereq", "P", &[]), Seed::Pending),
             // entry 3: `waiter` waits on the still-Pending prereq.
@@ -287,6 +304,153 @@ fn stats_ready_includes_phase_after_upstream_terminates() {
     );
     let snap = Snap::from_cluster_state(&s);
     assert_eq!(snap.ready_in_queue, 1, "b is now ready");
+}
+
+/// Apply a `SecondaryCapacity` record for each `(secondary, worker_count)`
+/// pair — the same wire mutation `primary/connect.rs` originates at the
+/// `SecondaryWelcome` accept. The occupancy DENOMINATORS
+/// (`total_secondaries` = `known_secondaries().count()`, `total_workers`
+/// = `total_worker_count()`) read exactly this replicated map, so the
+/// tests seed it through the public apply path rather than reaching into
+/// private fields. `resources` are irrelevant to occupancy → empty.
+fn with_capacities(mut s: ClusterState<()>, caps: &[(&str, u32)]) -> ClusterState<()> {
+    for (secondary, worker_count) in caps {
+        s.apply(ClusterMutation::SecondaryCapacity {
+            secondary: secondary.to_string(),
+            worker_count: *worker_count,
+            resources: vec![],
+        });
+    }
+    s
+}
+
+// ── stats: occupancy (D1 capacity × D2 InFlight, CRDT-derived) ──
+
+#[test]
+fn stats_occupancy_busy_and_total_secondaries() {
+    // 3 secondaries declared (total). InFlight on sec-a and sec-b only;
+    // sec-c idle → busy = 2. (sec-a runs two tasks but counts ONCE as a
+    // busy secondary.)
+    let s = with_capacities(
+        seed_state(
+            &[],
+            &[
+                (
+                    task("t0", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-a",
+                        worker: 0,
+                    },
+                ),
+                (
+                    task("t1", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-a",
+                        worker: 1,
+                    },
+                ),
+                (
+                    task("t2", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-b",
+                        worker: 0,
+                    },
+                ),
+            ],
+        ),
+        &[("sec-a", 4), ("sec-b", 4), ("sec-c", 2)],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.busy_secondaries, 2, "sec-a + sec-b, sec-c idle");
+    assert_eq!(snap.total_secondaries, 3, "all three known");
+}
+
+#[test]
+fn stats_occupancy_busy_workers_is_distinct_secondary_worker_pairs() {
+    // sec-a runs two tasks on distinct workers 0 and 1; sec-b runs one
+    // on worker 0. Distinct (secondary, worker) slots = (a,0),(a,1),(b,0)
+    // = 3 busy workers. Total = 4 + 4 + 2 = 10.
+    let s = with_capacities(
+        seed_state(
+            &[],
+            &[
+                (
+                    task("t0", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-a",
+                        worker: 0,
+                    },
+                ),
+                (
+                    task("t1", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-a",
+                        worker: 1,
+                    },
+                ),
+                (
+                    task("t2", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-b",
+                        worker: 0,
+                    },
+                ),
+            ],
+        ),
+        &[("sec-a", 4), ("sec-b", 4), ("sec-c", 2)],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.busy_workers, 3, "distinct (secondary,worker) slots");
+    assert_eq!(snap.total_workers, 10, "4 + 4 + 2 advertised slots");
+}
+
+#[test]
+fn stats_occupancy_worker_id_distinct_across_secondaries() {
+    // The SAME local worker id (0) on TWO secondaries is TWO distinct
+    // slots — busy_workers keys on the (secondary, worker) PAIR, not the
+    // bare worker id, so they must not collapse to one.
+    let s = with_capacities(
+        seed_state(
+            &[],
+            &[
+                (
+                    task("t0", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-a",
+                        worker: 0,
+                    },
+                ),
+                (
+                    task("t1", "P", &[]),
+                    Seed::InFlight {
+                        secondary: "sec-b",
+                        worker: 0,
+                    },
+                ),
+            ],
+        ),
+        &[("sec-a", 1), ("sec-b", 1)],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.busy_workers, 2, "(a,0) and (b,0) are distinct slots");
+    assert_eq!(snap.busy_secondaries, 2);
+    assert_eq!(snap.total_workers, 2);
+    assert_eq!(snap.total_secondaries, 2);
+}
+
+#[test]
+fn stats_occupancy_zero_numerators_when_no_in_flight() {
+    // Capacity declared but nothing executing → numerators 0,
+    // denominators still reflect the roster.
+    let s = with_capacities(
+        seed_state(&[], &[(task("p", "P", &[]), Seed::Pending)]),
+        &[("sec-a", 4), ("sec-b", 2)],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.busy_secondaries, 0);
+    assert_eq!(snap.busy_workers, 0);
+    assert_eq!(snap.total_secondaries, 2);
+    assert_eq!(snap.total_workers, 6);
 }
 
 // ── format: delta + inclusion rule ──
@@ -350,15 +514,104 @@ fn format_silent_on_all_zero() {
     assert!(render_report(&cur, &prev).is_none());
 }
 
+// ── format: occupancy ratio inclusion rule ──
+
+fn occupancy_snap(
+    busy_secondaries: usize,
+    total_secondaries: usize,
+    busy_workers: usize,
+    total_workers: usize,
+) -> StatsSnapshot {
+    StatsSnapshot {
+        busy_secondaries,
+        total_secondaries,
+        busy_workers,
+        total_workers,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn format_occupancy_renders_busy_over_total() {
+    // Both numerators nonzero and changed (0→2 secondaries, 0→3 workers).
+    let prev = StatsSnapshot::default();
+    let cur = occupancy_snap(2, 3, 3, 10);
+    let body = render_report(&cur, &prev).expect("occupancy change reports");
+    assert!(body.contains("busy secondaries: 2/3"), "got: {body}");
+    assert!(body.contains("busy workers: 3/10"), "got: {body}");
+}
+
+#[test]
+fn format_occupancy_omitted_when_numerator_zero() {
+    // busy=0 → numerator-not-present → omitted as zero (NOT unchanged),
+    // even though the denominator (total) is nonzero. No footer.
+    let prev = StatsSnapshot::default();
+    let cur = occupancy_snap(0, 3, 0, 10);
+    // Nothing else changed → whole report silent.
+    assert!(
+        render_report(&cur, &prev).is_none(),
+        "zero-numerator occupancy is not wake-worthy"
+    );
+}
+
+#[test]
+fn format_occupancy_omitted_unchanged_appends_footer() {
+    // Occupancy nonzero but identical to last announcement → omitted-
+    // because-unchanged → footer; an unrelated changed metric carries
+    // the report so it is not silent.
+    let prev = occupancy_snap(2, 3, 3, 10);
+    let mut cur = occupancy_snap(2, 3, 3, 10);
+    cur.succeeded = 5; // changed nonzero so SOMETHING is included.
+    let body = render_report(&cur, &prev).expect("succeeded change reports");
+    assert!(body.contains("succeeded: 5(+5)"), "got: {body}");
+    assert!(
+        !body.contains("busy secondaries"),
+        "unchanged occupancy omitted"
+    );
+    assert!(
+        !body.contains("busy workers"),
+        "unchanged occupancy omitted"
+    );
+    assert!(
+        body.trim_end().ends_with("Omitted unchanged stats."),
+        "footer expected, got: {body}"
+    );
+}
+
+#[test]
+fn format_occupancy_changed_when_only_total_changes() {
+    // busy unchanged (2→2) but total grew (3→4, a new secondary joined)
+    // → "changed" per the ratio rule (busy OR total). Included.
+    let prev = occupancy_snap(2, 3, 5, 12);
+    let cur = occupancy_snap(2, 4, 5, 12);
+    let body = render_report(&cur, &prev).expect("total change reports");
+    assert!(body.contains("busy secondaries: 2/4"), "got: {body}");
+    // The worker ratio is genuinely unchanged → omitted, footer appears.
+    assert!(
+        !body.contains("busy workers"),
+        "unchanged worker ratio omitted"
+    );
+    assert!(
+        body.trim_end().ends_with("Omitted unchanged stats."),
+        "footer expected, got: {body}"
+    );
+}
+
+#[test]
+fn format_occupancy_changed_when_only_busy_changes() {
+    // total unchanged but busy moved (2→3 secondaries) → included.
+    let prev = occupancy_snap(2, 4, 5, 12);
+    let cur = occupancy_snap(3, 4, 5, 12);
+    let body = render_report(&cur, &prev).expect("busy change reports");
+    assert!(body.contains("busy secondaries: 3/4"), "got: {body}");
+}
+
 // ── idle detector ──
 
 fn in_flight_snap(pairs: &[(&str, usize)], ready: usize) -> StatsSnapshot {
     StatsSnapshot {
         ready_in_queue: ready,
-        per_secondary_in_flight: pairs
-            .iter()
-            .map(|(s, n)| (s.to_string(), *n))
-            .collect(),
+        per_secondary_in_flight: pairs.iter().map(|(s, n)| (s.to_string(), *n)).collect(),
         ..Default::default()
     }
 }
@@ -461,7 +714,10 @@ fn live_feed_publishes_real_crdt_projection_to_reporter() {
             (task("r", "P", &[]), Seed::Failed(ErrorType::Recoverable)),
             (
                 task("if1", "P", &[]),
-                Seed::InFlight { secondary: "sec-a", worker: 0 },
+                Seed::InFlight {
+                    secondary: "sec-a",
+                    worker: 0,
+                },
             ),
             (task("ready1", "P", &[]), Seed::Pending),
         ],
