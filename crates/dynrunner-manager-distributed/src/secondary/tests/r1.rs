@@ -123,6 +123,14 @@ async fn r1_promotion_on_no_route_count_axis() {
         .insert("sec-b".into(), r1_helpers::timestamp_now());
     sec.peer_keepalives
         .insert("sec-c".into(), r1_helpers::timestamp_now());
+    // Post-uniform-announce a secondary knows the primary's identity
+    // before it can suspect its death; the Suspecting `TimeoutQuery`
+    // names it. Install it via the real apply path.
+    sec.cluster_state
+        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+            new: "primary-orig".into(),
+            epoch: 1,
+        });
     sec.record_primary_message();
 
     // Drive the count-axis via the SEND-SIDE probe: each

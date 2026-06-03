@@ -13,7 +13,7 @@
 use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
@@ -68,48 +68,57 @@ where
                 secondary_id,
                 timestamp,
                 active_workers,
+                emitter_role,
                 ..
             } => {
-                // Recognition by ROLE. A keepalive whose originator IS the
-                // recognized primary is a PRIMARY-liveness assertion, so it
-                // refreshes `primary_last_seen` via the same
-                // `record_primary_message` the dispatch path uses;
-                // otherwise it is a peer's mesh keepalive and feeds
-                // `peer_keepalives` (which drives this node's failover
-                // timing for its peers). Without this split, primary
-                // liveness was parasitic on workload dispatch and
-                // `primary_silent` tripped the instant dispatch quiesced.
+                // Recognition by the EMITTER ROLE the keepalive carries, NOT
+                // an either/or on identity. A host runs any subset of
+                // {primary, secondary, observer} under one peer-id, so the
+                // same id can legitimately emit BOTH a primary-liveness and a
+                // peer-mesh-liveness keepalive; the two signals are tracked
+                // independently and a multi-role host lands in BOTH.
                 //
-                // The recognition IDENTITY is `recognized_primary_id()`, a
-                // TOTAL function decoupled from ROUTING. Routing reads the
-                // transport `RoleCache` (mirrored from `current_primary()`),
-                // which is COLD on bootstrap by design so traffic flows over
-                // the uplink — and that COLD state surfaces as
-                // `current_primary() == None`. Keying recognition on bare
-                // `current_primary()` would inherit that routing artifact
-                // and NEVER recognize the bootstrap primary's keepalives
-                // (filing them as peer keepalives), so `primary_last_seen`
-                // would go stale once dispatch quiesced and a false election
-                // would trip. `recognized_primary_id()` falls back to the
-                // bootstrap primary's well-known canonical identity
-                // (`primary_node_id()`, the id it stamps onto its keepalives)
-                // exactly while no failover has named a concrete winner; once
-                // one has, the fallback is off and a zombie old bootstrap
-                // primary's keepalives no longer match.
-                if self.recognized_primary_id() == secondary_id {
-                    self.record_primary_message();
-                    tracing::trace!(
-                        primary = %secondary_id,
-                        active_workers,
-                        "primary keepalive received"
-                    );
-                } else {
-                    self.peer_keepalives.insert(secondary_id.clone(), timestamp);
-                    tracing::trace!(
-                        peer = %secondary_id,
-                        active_workers,
-                        "peer keepalive received"
-                    );
+                //  - A `Primary` keepalive whose originator IS the current
+                //    primary (`current_primary()`, the single source of "who
+                //    is primary now", always `Some` once configured) is a
+                //    PRIMARY-liveness assertion: it refreshes
+                //    `primary_last_seen` via the same `record_primary_message`
+                //    the dispatch path uses, so primary liveness is no longer
+                //    parasitic on workload dispatch. A stray `Primary`
+                //    keepalive from some other id (a demoted/zombie ex-primary
+                //    whose `current_primary()` no longer matches) is ignored
+                //    for primary-liveness.
+                //  - A `Secondary` keepalive ALWAYS feeds `peer_keepalives`,
+                //    even when its originator id == the current primary (a
+                //    co-located primary+secondary host's secondary capability
+                //    is a live mesh peer like any other). The quorum/candidate
+                //    sites read `live_peer_ids()`, which excludes the current
+                //    primary, so this entry never inflates election counts.
+                match emitter_role {
+                    KeepaliveRole::Primary => {
+                        if self.cluster_state.current_primary() == Some(secondary_id.as_str()) {
+                            self.record_primary_message();
+                            tracing::trace!(
+                                primary = %secondary_id,
+                                active_workers,
+                                "primary keepalive received"
+                            );
+                        } else {
+                            tracing::trace!(
+                                origin = %secondary_id,
+                                active_workers,
+                                "primary keepalive from non-current-primary id; ignored"
+                            );
+                        }
+                    }
+                    KeepaliveRole::Secondary => {
+                        self.peer_keepalives.insert(secondary_id.clone(), timestamp);
+                        tracing::trace!(
+                            peer = %secondary_id,
+                            active_workers,
+                            "peer keepalive received"
+                        );
+                    }
                 }
             }
             DistributedMessage::TaskComplete {

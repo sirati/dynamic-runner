@@ -76,13 +76,6 @@ impl<I: Identifier> Default for ElectionTickActions<I> {
     }
 }
 
-/// Conventional id used inside `TimeoutQuery::query_node_id` when the
-/// queried party is the primary. Keeps every secondary using the same
-/// string so peers can match queries up.
-pub(super) fn primary_node_id() -> String {
-    "primary".into()
-}
-
 pub(super) fn next_round(state: &ElectionState) -> u32 {
     match state {
         ElectionState::Voting { round, .. } | ElectionState::Candidate { round, .. } => round + 1,
