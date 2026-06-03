@@ -6,9 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, Router, new_role_cache, seed_self_role,
-};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, Router};
 use tokio::sync::mpsc;
 
 use crate::peer_transport::ChannelPeerTransport;
@@ -120,20 +118,13 @@ pub fn peer_mesh_with_adjacency<I: Identifier>(
         let outgoing_for_peer = outgoing
             .remove(id)
             .expect("outgoing table allocated for every id");
-        let role_cache = new_role_cache();
-        // Self_ is a strictly local fact — the role-table hook
-        // populates Primary only. Seeding at construction so the
-        // receiver-side RoleAddressed handling (Step 4) treats
-        // `intended_role == Self_` envelopes as Case A (local
-        // unwrap) rather than Case C (no cached holder → drop).
-        seed_self_role(&role_cache, id);
         transports.push(ChannelPeerTransport {
             local_id: id.clone(),
             incoming_rx,
             outgoing: outgoing_for_peer,
             router: Router::new(id.clone()),
             last_outcome: None,
-            role_cache,
+            primary_link_id: None,
         });
     }
     transports

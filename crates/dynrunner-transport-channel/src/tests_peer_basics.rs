@@ -162,40 +162,6 @@ async fn send_address_broadcast_mesh_fans_out() {
     assert!(transports[2].try_recv_peer().is_some());
 }
 
-/// Post-Step 3: `send(Address::Role(Role::Primary), msg)`
-/// against a cold role-table cache returns an `Err` that names
-/// "Role" and the missing cache state. Pins the cache-cold
-/// contract for `Role::Primary`; `Role::Self_` has its own
-/// cache-seeded behavior (Step 4 — see
-/// [`role_self_cache_populated_at_init`]) and is covered there.
-/// Pre-Step-3 this test asserted "not yet supported"; the
-/// assertion shifted to the new contract when the real
-/// dispatch landed.
-#[tokio::test]
-async fn send_address_role_returns_err() {
-    use dynrunner_protocol_primary_secondary::{Address, Role};
-
-    let ids = vec!["a".to_string(), "b".to_string()];
-    let mut transports = peer_mesh::<SendTestId>(&ids);
-
-    let err = transports[0]
-        .send(Address::Role(Role::Primary), keepalive("a"))
-        .await
-        .expect_err("Role(Primary) with cold cache must error");
-    assert!(
-        err.contains("Role"),
-        "error must reference Role; got: {err}"
-    );
-    assert!(
-        err.contains("cache"),
-        "error must reference cache state; got: {err}"
-    );
-
-    // No message must have been delivered to any peer's inbox.
-    assert!(transports[0].try_recv_peer().is_none());
-    assert!(transports[1].try_recv_peer().is_none());
-}
-
 /// Post-Step 5: `send(Address::Broadcast(Scope::AllSecondaries), msg)`
 /// fans out via the default impl's `broadcast` delegation. From a
 /// primary caller's vantage (the only Step-5 caller), every

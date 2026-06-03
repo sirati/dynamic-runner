@@ -42,7 +42,7 @@ mod worker_lifecycle;
 // alternative is duplicated `use` lines in 11 sibling files.
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, NoPeers, SlowFakeWorkerFactory, TestId, fake_secondary,
+    FakeWorkerFactory, FixedEstimator, SlowFakeWorkerFactory, TestId, fake_secondary,
     fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
 };
 #[allow(unused_imports)]
@@ -56,7 +56,7 @@ pub(super) use dynrunner_protocol_primary_secondary::{ClusterMutation, Distribut
 #[allow(unused_imports)]
 pub(super) use dynrunner_scheduler::ResourceStealingScheduler;
 #[allow(unused_imports)]
-pub(super) use dynrunner_transport_channel::{ChannelPeerTransport, ChannelPrimaryTransportEnd};
+pub(super) use dynrunner_transport_channel::ChannelPeerTransport;
 #[allow(unused_imports)]
 pub(super) use std::collections::HashMap;
 #[allow(unused_imports)]
@@ -75,9 +75,41 @@ pub(super) fn noop_phase_args() -> (
     (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _| {}))
 }
 
+/// Build the channel-backed mesh transport a real secondary holds when
+/// driven against a primary in-process: the secondary reaches the primary
+/// as an ordinary mesh peer keyed by `"primary"` (folded in via
+/// [`ChannelPeerTransport::register_primary_link`]), the channel analog of
+/// how the QUIC bootstrap wire folds into `PeerNetwork`.
+///
+/// Returns the two channel ends the primary plugs into its own
+/// `ChannelPeerTransport` — `pri_to_sec_tx` goes in the primary's
+/// `outgoing[secondary_id]`, `sec_to_pri_rx` is forwarded into the
+/// primary's inbound — plus the secondary's ready-to-use transport.
+/// Single source of the mesh wiring so the per-factory spawn helpers below
+/// stay focused on config + worker factory.
+fn channel_mesh_secondary_ends(
+    secondary_id: &str,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>, // primary→secondary
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
+    ChannelPeerTransport<TestId>,
+) {
+    // primary→secondary: feeds the secondary transport's inbound.
+    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+    // secondary→primary: the secondary's outbound to the folded primary
+    // link; the primary forwards `sec_to_pri_rx` into its own inbound.
+    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+    let mut transport =
+        ChannelPeerTransport::from_raw_channels(secondary_id.into(), HashMap::new(), pri_to_sec_rx);
+    transport.register_primary_link("primary".into(), sec_to_pri_tx);
+
+    (pri_to_sec_tx, sec_to_pri_rx, transport)
+}
+
 /// Wire up a real SecondaryCoordinator as a tokio task, connected to the
-/// primary via channels. Returns the secondary's channel ends that should
-/// be plugged into the primary's ChannelTransport.
+/// primary via a channel-backed mesh. Returns the secondary's channel ends
+/// that should be plugged into the primary's `ChannelPeerTransport`.
 pub(super) fn spawn_real_secondary(
     secondary_id: String,
     num_workers: u32,
@@ -100,24 +132,50 @@ pub(super) fn spawn_real_secondary_with_src_network(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio::task::JoinHandle<usize>,
 ) {
-    // This helper ran a full SecondaryCoordinator against the primary
-    // over a channel UPLINK (the secondary reached the primary via
-    // `ChannelPrimaryTransportEnd`). Post-uplink deletion the secondary
-    // holds its mesh `PeerTransport` directly and reaches the primary as
-    // a mesh peer by id — so this helper must wire the channel link as a
-    // channel-backed mesh connection (primary folded into the secondary's
-    // mesh, symmetric to how the QUIC bootstrap wire now folds into
-    // `PeerNetwork`). Building that channel-backed mesh harness is the
-    // channel→mesh fold leaf's job, NOT this uplink-deletion leaf. Left
-    // unimplemented so the owning leaf supplies the real-API harness; the
-    // primary-side tests that drive a real secondary through this helper
-    // are `#[ignore]`d until then.
-    let _ = (secondary_id, num_workers, max_resources, src_network);
-    unimplemented!(
-        "spawn_real_secondary over a channel link: the secondary must join the primary's mesh \
-         (primary as a mesh peer reached by id) via a channel-backed mesh stub — owned by the \
-         channel-mesh-fold leaf, not the uplink-deletion leaf"
-    )
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
+
+    let handle = tokio::task::spawn_local(async move {
+        let config = SecondaryConfig {
+            secondary_id,
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            keepalive_interval: Duration::from_secs(60),
+            src_network,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
+            oom_retry_max_passes: 1,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
+            unconfigured_deadline: Duration::from_secs(600),
+            is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
+            unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
+            output_dir: None,
+            memuse_log_path: None,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        // The egress edge resolves `Destination::Primary` to the
+        // in-process primary's id (`"primary"`) while the role table is
+        // cold — matching the folded primary mesh-link's key.
+        secondary.set_bootstrap_primary_id("primary".to_string());
+        let mut factory = FakeWorkerFactory;
+        secondary.run(&mut factory).await.unwrap();
+        secondary.local_tasks_run_for_test()
+    });
+
+    (pri_to_sec_tx, sec_to_pri_rx, handle)
 }
 
 /// Like [`spawn_real_secondary`] but the worker factory is a
@@ -135,14 +193,47 @@ pub(super) fn spawn_real_secondary_slow(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio::task::JoinHandle<usize>,
 ) {
-    // See `spawn_real_secondary_with_src_network` — the channel-uplink
-    // secondary-against-primary harness is the channel→mesh fold leaf's
-    // job, not this uplink-deletion leaf. Callers are `#[ignore]`d.
-    let _ = (secondary_id, num_workers, max_resources, slow_markers);
-    unimplemented!(
-        "spawn_real_secondary_slow over a channel link: needs the channel-backed mesh harness — \
-         owned by the channel-mesh-fold leaf, not the uplink-deletion leaf"
-    )
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
+
+    let handle = tokio::task::spawn_local(async move {
+        let config = SecondaryConfig {
+            secondary_id,
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            keepalive_interval: Duration::from_secs(60),
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
+            oom_retry_max_passes: 1,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
+            unconfigured_deadline: Duration::from_secs(600),
+            is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
+            unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
+            output_dir: None,
+            memuse_log_path: None,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        secondary.set_bootstrap_primary_id("primary".to_string());
+        let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
+        secondary.run(&mut factory).await.unwrap();
+        secondary.local_tasks_run_for_test()
+    });
+
+    (pri_to_sec_tx, sec_to_pri_rx, handle)
 }
 
 #[allow(clippy::type_complexity)]
@@ -162,18 +253,54 @@ pub(super) fn spawn_real_secondary_flaky(
     // before dropping the primary, not from this secondary handle.
     tokio::task::JoinHandle<usize>,
 ) {
-    // See `spawn_real_secondary_with_src_network` — the channel-uplink
-    // secondary-against-primary harness is the channel→mesh fold leaf's
-    // job, not this uplink-deletion leaf. Callers are `#[ignore]`d.
-    let _ = (
-        secondary_id,
-        num_workers,
-        max_resources,
-        flaky,
-        retry_max_passes,
-    );
-    unimplemented!(
-        "spawn_real_secondary_flaky over a channel link: needs the channel-backed mesh harness — \
-         owned by the channel-mesh-fold leaf, not the uplink-deletion leaf"
-    )
+    let (pri_to_sec_tx, sec_to_pri_rx, transport) = channel_mesh_secondary_ends(&secondary_id);
+
+    let handle = tokio::task::spawn_local(async move {
+        let config = SecondaryConfig {
+            secondary_id,
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            // Tight keepalive so the keepalive-tick backstop fires
+            // quickly enough that tests don't hit the default 60s
+            // wait if any code path needs the periodic drain-check
+            // (the synchronous one in `note_primary_item_failed` is
+            // the primary trigger — this is just defensive).
+            keepalive_interval: Duration::from_millis(50),
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes,
+            // Mirror Recoverable retries: the existing fixture
+            // callers want one budget value passed in for both
+            // channels; the new `oom_retry_max_passes` knob is
+            // unit-tested in `secondary/tests` separately.
+            oom_retry_max_passes: retry_max_passes,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
+            unconfigured_deadline: Duration::from_secs(600),
+            is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
+            unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
+            output_dir: None,
+            memuse_log_path: None,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        secondary.set_bootstrap_primary_id("primary".to_string());
+        let mut factory = flaky;
+        secondary.run(&mut factory).await.unwrap();
+        secondary.local_tasks_run_for_test()
+    });
+
+    (pri_to_sec_tx, sec_to_pri_rx, handle)
 }

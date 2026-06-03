@@ -53,15 +53,11 @@ pub(crate) fn now_clocks() -> Clocks {
     }
 }
 
-// Test files split by concern. `tests_role_routing` sits slightly
-// above the 500-line guideline (~530 lines) because every test in
-// it shares one `TestRegistrar` fixture + cache-state invariants
-// that span all four receiver-side cases; partitioning further
-// would scatter the per-case assertions across files for no
-// maintainability gain.
+// Test files split by concern. The role-routing test family was
+// removed when the channel transport was de-roled (transport ⊥ roles):
+// the transport no longer carries a role cache or intercepts
+// `RoleAddressed`, so there is no channel-side role layer to test.
 #[cfg(test)]
 mod tests_manager_runner;
 #[cfg(test)]
 mod tests_peer_basics;
-#[cfg(test)]
-mod tests_role_routing;

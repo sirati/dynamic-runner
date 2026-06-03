@@ -76,8 +76,6 @@ enum PhaseEvent {
 /// `slow_slow` completes ~500ms later. Phase `next` depends on `slow`
 /// and is also pre-populated. Verifies `on_phase_end(slow)` fires
 /// AFTER both slow items terminate.
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_slow); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn on_phase_end_fires_after_last_in_flight_completes() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -115,8 +113,6 @@ async fn on_phase_end_fires_after_last_in_flight_completes() {
 /// activate `slow` — a phase-slow task would dispatch while `fast_3`
 /// is still in-flight. Mirrors the prior subagent's local-mode shape
 /// applied to the distributed-mode in-process fixture.
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_slow); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn on_phase_end_fires_after_every_in_flight_item_terminates() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -154,8 +150,6 @@ async fn on_phase_end_fires_after_every_in_flight_item_terminates() {
 /// (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
 /// where the next phase's items only enter the pool after
 /// `on_phase_end` fires.
-#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary_slow); \
-            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn on_phase_end_fires_after_last_in_flight_completes_with_lazy_spawn() {
     let _ = tracing_subscriber::fmt::try_init();

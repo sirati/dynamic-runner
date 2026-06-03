@@ -1,17 +1,19 @@
 //! R1 promotion-threshold tests + cold-start no-primary tests +
-//! the post-promotion peer-message dispatch test. All share the
-//! `r1_helpers::make_with_peers` builder that wires a
-//! `FixedPeerCount(N)` peer-transport stub so the processing-loop
-//! sees a healthy mesh.
+//! the post-promotion peer-message dispatch test. The promotion tests
+//! share the `r1_helpers::make_with_peers` builder, which wires a
+//! routing-aware channel-backed mesh stub (N peer outboxes, no primary
+//! link) so the processing-loop sees a healthy mesh while
+//! `send_to_primary` returns a real no-route `Err`.
 
 #![cfg(test)]
 
 use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::channel_mesh_to_primary;
 use super::super::*;
 use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -19,45 +21,51 @@ use tokio::sync::mpsc as tokio_mpsc;
 // state-machine assertions rather than wiring boilerplate)
 
 mod r1_helpers {
-    //! Shared setup for R1 tests. Uses `FixedPeerCount(N)` so the
-    //! processing-loop's peer-count check observes a healthy mesh
-    //! (which is what makes promotion via election possible). The
-    //! `make_secondary` helper in `test_helpers.rs` uses `NoPeers`,
-    //! which reports peer_count=0 — fine for election-state tests
-    //! that don't go through the operational threshold path, but
-    //! wrong for R1 tests that do.
+    //! Shared setup for R1 tests. Uses a routing-aware channel-backed
+    //! mesh stub with N peer outboxes so the processing-loop's peer-count
+    //! check observes a healthy mesh (which is what makes promotion via
+    //! election possible) while the primary stays unrouteable (no primary
+    //! link), so `send_to_primary` returns a real no-route `Err`. The
+    //! `make_secondary` helper in `test_helpers.rs` uses `NoPeers`, which
+    //! reports peer_count=0 — fine for election-state tests that don't go
+    //! through the operational threshold path, but wrong for R1 tests
+    //! that do.
 
     use super::*;
-    use crate::secondary::test_helpers::{FixedEstimator, FixedPeerCount, TestId, election_config};
+    use crate::secondary::test_helpers::{
+        FixedEstimator, TestId, channel_mesh_no_primary, election_config,
+    };
     use dynrunner_scheduler::ResourceStealingScheduler;
 
-    use crate::secondary::test_helpers::{TestTransport, make_transport};
-
     pub(super) type R1Secondary = SecondaryCoordinator<
-        TestTransport<FixedPeerCount>,
+        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     >;
 
-    /// Construct a SecondaryCoordinator over a `FixedPeerCount(peers)`
-    /// mesh stub so mesh-health reads observe the configured size.
+    /// Construct a SecondaryCoordinator over a routing-aware channel-backed
+    /// mesh stub with `peers` peer outboxes but NO primary link, so
+    /// mesh-health reads observe the configured size while
+    /// `send_to_primary` returns a real no-route `Err`.
     ///
-    /// Post-uplink-deletion the secondary holds the mesh stub directly.
-    /// `Address::Role(Role::Primary)` has no cached holder (no
-    /// `PrimaryChanged` applied) and `FixedPeerCount` does not override
-    /// `peer_for_role`, so `send_to_primary` returns a no-route `Err` —
-    /// exactly the send-side failover-health probe signal the R1 arming
-    /// tests drive (previously surfaced by the dropped-receiver uplink;
-    /// now by the empty role cache, same `Err` observable).
+    /// The secondary holds the mesh transport directly. The egress edge
+    /// resolves `Destination::Primary` to the bootstrap id `"primary"`
+    /// (set below); the transport has no outbox for it, so `send_to_peer`
+    /// surfaces the NoRoute `Err` that drives the send-side
+    /// failover-health probe — the real routing-aware no-route signal the
+    /// R1 arming tests need (the prior `FixedPeerCount` stub was
+    /// identity-blind and could only no-op `Ok` on every send).
     pub(super) fn make_with_peers(secondary_id: &str, peers: usize) -> R1Secondary {
-        SecondaryCoordinator::new(
+        let mut sec = SecondaryCoordinator::new(
             election_config(secondary_id),
-            make_transport(FixedPeerCount(peers)),
+            channel_mesh_no_primary(secondary_id, peers),
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
-        )
+        );
+        sec.set_bootstrap_primary_id("primary".to_string());
+        sec
     }
 
     /// A keepalive frame for driving `send_to_primary` in the probe
@@ -96,25 +104,22 @@ mod r1_helpers {
 //   4. Promotion preserves the peer mesh: no transport-close events
 //      on inter-peer connections during the promotion window.
 //
-// The tests use the `make_secondary` helper (channel transports +
-// NoPeers / FixedPeerCount stubs) and drive the threshold via
-// direct `check_primary_link_threshold` / `run_election_tick`
-// calls. The full `process_tasks` loop is not exercised here —
+// The tests use the `make_with_peers` helper (a routing-aware
+// channel-backed mesh stub) and drive the threshold via direct
+// `check_primary_link_threshold` / `run_election_tick` calls. The full
+// `process_tasks` loop is not exercised here —
 // existing integration tests already cover the loop's structural
 // behaviour, and these tests would be flaky against the loop's
 // internal `tokio::select!` ordering.
 
 /// T-R1-promotion-on-no-route (count axis): a non-promoted secondary
 /// with a healthy peer mesh drives the send-side failover-health probe
-/// — `send_to_primary` returns a no-route `Err` (the uplink is closed
-/// and no peer holds the role), which arms the primary-link count axis
-/// and backdates `primary_last_seen`; the next election tick enters
-/// Suspecting. Replaces the deleted recv-None arming path; the count
-/// axis keeps the test deterministic (no wall-clock).
-#[ignore = "send-side no-route probe: post-A0 send_to_primary resolves Destination::Primary to \
-            current_primary and sends via the mesh; the FixedPeerCount stub models a count not ids \
-            (no-op Ok send), so it cannot express no-route. Needs the routing-aware channel-backed \
-            mesh stub — channel-mesh-fold #133 (un-ignore + assert real NoRoute there)."]
+/// — `send_to_primary` returns a no-route `Err` (the primary is not a
+/// member of the mesh stub, so its resolved id has no outbox), which arms
+/// the primary-link count axis and backdates `primary_last_seen`; the
+/// next election tick enters Suspecting. Replaces the deleted recv-None
+/// arming path; the count axis keeps the test deterministic (no
+/// wall-clock).
 #[tokio::test(flavor = "current_thread")]
 async fn r1_promotion_on_no_route_count_axis() {
     use super::super::election::ElectionState;
@@ -138,9 +143,10 @@ async fn r1_promotion_on_no_route_count_axis() {
     sec.record_primary_message();
 
     // Drive the count-axis via the SEND-SIDE probe: each
-    // `send_to_primary` routes to the (dropped-receiver) uplink,
-    // errors no-route, and records one failover-health probe.
-    // threshold=3 in election_config; the third breaches.
+    // `send_to_primary` resolves `Destination::Primary` to the bootstrap
+    // id `"primary"`, finds no outbox for it on the mesh stub, errors
+    // no-route, and records one failover-health probe. threshold=3 in
+    // election_config; the third breaches.
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
@@ -376,9 +382,6 @@ async fn r1_no_mesh_rebuild_during_arming() {
 /// messages). The deadline wraps the entire setup phase from
 /// outside, so a cancellation simply abandons the partial state
 /// — no subsequent iteration touches it.
-#[ignore = "drives full setup with the primary simulated over the channel uplink; post-uplink \
-            deletion the primary must be a mesh peer fed via a channel-backed mesh stub — the \
-            secondary-test-harness mesh-migration concern, not the uplink-deletion leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -388,22 +391,19 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             // KEEP `_pri_to_sec_tx` bound (the `_` prefix is just an
             // unused-name lint suppressor — Rust drops bindings at
-            // end of scope, not immediately). This makes
-            // `primary_transport.recv()` BLOCK forever rather than
-            // returning None — simulating the asm-dataset-nix T7
-            // scenario where the primary URL is unreachable and the
-            // transport's internal retries never give up. Returning
-            // None hits `wait_for_setup`'s existing `primary
-            // disconnected during setup` arm in milliseconds, well
-            // before setup_deadline fires; we want to exercise the
-            // deadline path.
+            // end of scope, not immediately). This makes the transport's
+            // `recv_peer()` BLOCK forever rather than returning None —
+            // simulating the asm-dataset-nix T7 scenario where the primary
+            // is unreachable and never speaks. Returning None hits
+            // `wait_for_setup`'s existing `primary disconnected during
+            // setup` arm in milliseconds, well before setup_deadline
+            // fires; we want to exercise the deadline path.
             let (_pri_to_sec_tx, pri_to_sec_rx) =
                 tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
-            let _ = transport;
+            // Channel-backed mesh with the (silent) primary folded in as a
+            // mesh peer and NO other peers — so `peer_count() == 0` drives
+            // the "no primary, no peers" cold-start branch.
+            let unified = channel_mesh_to_primary("sec-cold", sec_to_pri_tx, pri_to_sec_rx);
 
             let config = SecondaryConfig {
                 secondary_id: "sec-cold".into(),
@@ -435,13 +435,13 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 memuse_log_path: None,
             };
 
-            let unified = super::super::test_helpers::make_transport(NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             let start = std::time::Instant::now();
@@ -482,13 +482,8 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
 /// distinct from "everyone is gone" and should be operator-
 /// distinguishable. Pinning the branch divergence to prevent
 /// future code from silently merging them.
-#[ignore = "drives full setup with the primary simulated over the channel uplink; post-uplink \
-            deletion the primary must be a mesh peer fed via a channel-backed mesh stub — the \
-            secondary-test-harness mesh-migration concern, not the uplink-deletion leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn cold_start_with_peers_emits_distinct_error() {
-    use crate::secondary::test_helpers::FixedPeerCount;
-
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -499,11 +494,24 @@ async fn cold_start_with_peers_emits_distinct_error() {
             // for the primary that never speaks.
             let (_pri_to_sec_tx, pri_to_sec_rx) =
                 tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-            let transport = ChannelPrimaryTransportEnd {
-                tx: sec_to_pri_tx,
-                rx: pri_to_sec_rx,
-            };
-            let _ = transport;
+            // Channel-backed mesh: the (silent) primary is folded in AND
+            // two peer outboxes are registered, so `peer_count() == 2`
+            // routes the setup-deadline expiry to the "peers reachable"
+            // branch (distinct from the no-peers cold-start). The two
+            // peer receivers are dropped — only the sender presence (what
+            // `peer_count` measures) matters.
+            let mut outgoing = HashMap::new();
+            for i in 0..2u32 {
+                let (peer_tx, _peer_rx) =
+                    tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+                outgoing.insert(format!("peer-{i}"), peer_tx);
+            }
+            let mut unified = dynrunner_transport_channel::ChannelPeerTransport::from_raw_channels(
+                "sec-cold-with-peers".to_string(),
+                outgoing,
+                pri_to_sec_rx,
+            );
+            unified.register_primary_link("primary".into(), sec_to_pri_tx);
 
             let config = SecondaryConfig {
                 secondary_id: "sec-cold-with-peers".into(),
@@ -534,17 +542,13 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 memuse_log_path: None,
             };
 
-            // FixedPeerCount(2) reports peer_count() == 2 without
-            // actually wiring messages; that's enough for the
-            // `peer_count() == 0` check to fail and route to the
-            // "peers reachable" branch.
-            let unified = super::super::test_helpers::make_transport(FixedPeerCount(2));
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
+            secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             let result = secondary.run(&mut factory).await;

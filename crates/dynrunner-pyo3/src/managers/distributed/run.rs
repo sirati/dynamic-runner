@@ -11,7 +11,6 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
@@ -320,41 +319,19 @@ impl PyDistributedManager {
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
                     let sec_memuse_log_path = memuse_log_path.clone();
 
-                    // These captures are consumed ONLY by the deferred
-                    // (unimplemented) secondary task's unreachable tail —
-                    // the scheduler build, the panik watcher, the
-                    // phase-lifecycle registration. Bind them here so the
-                    // intent ("the owning channel→mesh fold leaf reuses
-                    // them") is explicit rather than an unused-warning.
-                    let _ = (
-                        &sec_scheduler_config,
-                        &sec_panik_paths,
-                        sec_panik_poll,
-                        &sec_on_phase_start,
-                        &sec_on_phase_end,
-                    );
-
-                    // The whole in-process secondary task is deferred to
-                    // the channel→mesh fold leaf: its transport
-                    // (`unimplemented!()` below) can't be built without
-                    // that leaf, so everything past the transport — the
-                    // worker pool, panik watcher, lifecycle callbacks, the
-                    // run loop — is intentionally unreachable and its
-                    // captures unread until then. One scoped allow on the
-                    // task keeps the deferred body honest (it is the SAME
-                    // wiring the owning leaf reuses) without per-line noise.
-                    #[allow(
-                        unreachable_code,
-                        unused_variables,
-                        unused_mut,
-                        unused_assignments,
-                        clippy::diverging_sub_expression
-                    )]
                     let handle = tokio::task::spawn_local(async move {
-                        let transport = ChannelPrimaryTransportEnd {
-                            tx: sec_to_pri_tx,
-                            rx: pri_to_sec_rx,
-                        };
+                        // Channel-backed mesh: the in-process primary is
+                        // folded in as an ordinary mesh peer keyed by
+                        // `"primary"` (no per-role uplink leg). Inbound is
+                        // the primary→secondary channel; the outbound
+                        // primary link is the secondary→primary channel.
+                        let mut transport =
+                            dynrunner_transport_channel::ChannelPeerTransport::<RunnerIdentifier>::from_raw_channels(
+                                secondary_id.clone(),
+                                std::collections::HashMap::new(),
+                                pri_to_sec_rx,
+                            );
+                        transport.register_primary_link("primary".to_string(), sec_to_pri_tx);
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
@@ -448,45 +425,22 @@ impl PyDistributedManager {
                             child_processes: Vec::new(),
                         };
 
-                        // In-process distributed mode reached the
-                        // co-located primary ONLY through the channel
-                        // uplink (`transport`), with no peer mesh. With the
-                        // per-role uplink leg deleted, this path needs the
-                        // primary to be a mesh peer reached by id — i.e. the
-                        // in-process channel link registered as a
-                        // channel-backed mesh connection (primary folded
-                        // in), exactly as the QUIC/WSS bootstrap wire now
-                        // folds into `PeerNetwork`. Building that
-                        // channel-backed mesh join is the channel→mesh fold
-                        // leaf's job, NOT this uplink-deletion leaf — so the
-                        // mesh the secondary holds is left unimplemented. The
-                        // surrounding config / worker / lifecycle wiring
-                        // stays intact (it is the SAME wiring the owning leaf
-                        // will reuse); only the transport is deferred, and
-                        // the construction that consumes it is unreachable.
-                        let _ = transport;
-                        #[allow(unreachable_code, clippy::diverging_sub_expression)]
-                        let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> = {
-                            let unified: dynrunner_transport_quic::NoPeerTransport = unimplemented!(
-                                "in-process distributed secondary transport: fold the channel link \
-                                 to the in-process primary into a channel-backed mesh (primary as a \
-                                 mesh peer reached by id) — owned by the channel→mesh fold leaf, \
-                                 not the uplink-deletion leaf"
-                            );
-                            let mut sec = SecondaryCoordinator::new(
+                        // The secondary holds the channel-backed mesh
+                        // `PeerTransport` directly — the primary is a mesh
+                        // peer reached by id, exactly as the QUIC/WSS
+                        // bootstrap wire now folds into `PeerNetwork`.
+                        let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
+                            SecondaryCoordinator::new(
                                 config,
-                                unified,
+                                transport,
                                 sec_scheduler_config.build_memory_scheduler(),
                                 estimator,
                             );
-                            // The egress edge resolves `Destination::Primary`
-                            // to the in-process primary's id (`"primary"`)
-                            // while the role table is cold. Unreachable until
-                            // the channel→mesh fold leaf supplies the real
-                            // channel-backed mesh transport above.
-                            sec.set_bootstrap_primary_id("primary".to_string());
-                            sec
-                        };
+                        // The egress edge resolves `Destination::Primary` to
+                        // the in-process primary's id (`"primary"`) while the
+                        // role table is cold — matching the folded primary
+                        // mesh-link's key.
+                        secondary.set_bootstrap_primary_id("primary".to_string());
 
                         // Per-secondary panik watcher. One watcher per
                         // coordinator is the simplest correct shape: a
@@ -550,16 +504,18 @@ impl PyDistributedManager {
                         // distributed manager the authority is the
                         // in-process `PrimaryCoordinator` (built below),
                         // which fires `on_phase_*` directly; these
-                        // in-process secondaries use a `NoPeerTransport`
-                        // mesh and therefore compose NO co-located parked
-                        // primary, so their registered callbacks stay
-                        // dormant (no transfer, no promotion in-process)
-                        // and never call into Python. They are registered
-                        // for shape-parity with the SLURM secondary path
-                        // (which DOES transfer them to a co-located parked
-                        // primary); the closures target the SAME single
-                        // process-wide Python `TaskDefinition` instance
-                        // the in-process primary's callbacks already use.
+                        // in-process secondaries hold a channel-backed mesh
+                        // with only the primary folded in (no peer-to-peer
+                        // mesh among the secondaries) and therefore compose
+                        // NO co-located parked primary, so their registered
+                        // callbacks stay dormant (no transfer, no promotion
+                        // in-process) and never call into Python. They are
+                        // registered for shape-parity with the SLURM
+                        // secondary path (which DOES transfer them to a
+                        // co-located parked primary); the closures target
+                        // the SAME single process-wide Python
+                        // `TaskDefinition` instance the in-process primary's
+                        // callbacks already use.
                         secondary.register_phase_lifecycle_callbacks(
                             sec_on_phase_start,
                             sec_on_phase_end,
