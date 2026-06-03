@@ -1464,6 +1464,121 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
         .await;
 }
 
+/// SITE B (runtime SpawnTasks): a spawned task depending on
+/// `(phase=B, foo)` while `foo` exists only in a DIFFERENT phase (A)
+/// is minted `UnknownDependency` and NOT applied — it must NOT land
+/// silently Pending with an unsatisfiable dep.
+///
+/// Pre-fix the validator's dep resolution was phase-blind, so the
+/// phase-B dep passed (any phase carrying `foo` satisfied it). The
+/// task then reached `apply_tasks_spawned`, whose phase-aware
+/// `task_hash_for_dep(B, foo)` returned `None` → "treat as resolved" →
+/// the task landed Pending and never-runnable.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut coordinator = make_coordinator();
+            // `foo` exists in phase A only (seeded Pending in the ledger).
+            let mut foo = make_binary("foo", 100);
+            foo.phase_id = PhaseId::from("A");
+            foo.task_id = "foo".into();
+            let foo_hash = compute_task_hash(&foo);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: foo_hash.clone(),
+                task: foo.clone(),
+            });
+            seed_pool(
+                &mut coordinator,
+                &[&PhaseId::from("A"), &PhaseId::from("B")],
+            );
+
+            // `child` in phase B depends on (phase=B, foo) — absent in B.
+            let mut child = make_binary("child", 100);
+            child.phase_id = PhaseId::from("B");
+            child.task_id = "child".into();
+            child.task_depends_on = vec![TaskDep {
+                task_id: "foo".into(),
+                phase_id: PhaseId::from("B"),
+                inherit_outputs: false,
+            }];
+
+            let errors = spawn_via_handler(&mut coordinator, vec![child.clone()])
+                .await
+                .expect("spawn_tasks call itself succeeds");
+            assert_eq!(errors.len(), 1, "the phase-B dep is unsatisfiable");
+            match &errors[0].1 {
+                super::SpawnError::UnknownDependency { dep_task_id, .. } => {
+                    assert_eq!(dep_task_id, "foo");
+                }
+                other => panic!("expected UnknownDependency, got {other:?}"),
+            }
+
+            // The task must NOT have been applied (no silent Pending).
+            let child_hash = compute_task_hash(&child);
+            assert!(
+                coordinator.cluster_state.task_state(&child_hash).is_none(),
+                "the invalid-dep task must NOT land in the ledger"
+            );
+            assert!(
+                !coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id == "child"),
+                "the invalid-dep task must NOT be in the pool"
+            );
+        })
+        .await;
+}
+
+/// SITE B companion: a cross-phase dep naming the RIGHT phase resolves.
+/// `child` (phase B) depends on (phase=A, foo) where `foo` lives in A —
+/// it applies and lands Blocked-on-foo (foo is Pending).
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_cross_phase_dep_naming_right_phase_resolves() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut foo = make_binary("foo", 100);
+            foo.phase_id = PhaseId::from("A");
+            foo.task_id = "foo".into();
+            let foo_hash = compute_task_hash(&foo);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: foo_hash.clone(),
+                task: foo.clone(),
+            });
+            seed_pool(
+                &mut coordinator,
+                &[&PhaseId::from("A"), &PhaseId::from("B")],
+            );
+
+            let mut child = make_binary("child", 100);
+            child.phase_id = PhaseId::from("B");
+            child.task_id = "child".into();
+            child.task_depends_on = vec![TaskDep {
+                task_id: "foo".into(),
+                phase_id: PhaseId::from("A"),
+                inherit_outputs: false,
+            }];
+
+            let errors = spawn_via_handler(&mut coordinator, vec![child.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "cross-phase dep resolves: {errors:?}");
+
+            let child_hash = compute_task_hash(&child);
+            match coordinator.cluster_state.task_state(&child_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &foo_hash, "Blocked.on points to foo's phase-A hash");
+                }
+                other => panic!("expected Blocked-on-foo, got {other:?}"),
+            }
+        })
+        .await;
+}
+
 /// `ClusterMutation::TasksSpawned` round-trips through serde.
 /// Pins wire-codec compatibility for the new variant.
 #[test]

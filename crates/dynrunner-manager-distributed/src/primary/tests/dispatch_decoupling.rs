@@ -41,15 +41,20 @@ type TestPrimary = PrimaryCoordinator<
 >;
 
 /// Build a `TaskInfo` with an explicit phase + task-level dep list.
-fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> {
+/// Each dep is fully qualified `(prereq_phase, prereq_task_id)` — a
+/// dep names the PREREQUISITE's full `(phase_id, task_id)` identity
+/// (the consumer-boundary contract: a phase-less dep resolves to the
+/// prereq's phase, never the enclosing task's), so a cross-phase dep
+/// must name the phase the prerequisite actually lives in.
+fn dep_binary(name: &str, phase: &str, depends_on: &[(&str, &str)]) -> TaskInfo<TestId> {
     let mut t = make_binary(name, 100);
     t.phase_id = PhaseId::from(phase);
     t.type_id = TypeId::from("default");
     t.task_depends_on = depends_on
         .iter()
-        .map(|d| TaskDep {
-            task_id: (*d).to_string(),
-            phase_id: PhaseId::from(phase),
+        .map(|(dep_phase, dep_id)| TaskDep {
+            task_id: (*dep_id).to_string(),
+            phase_id: PhaseId::from(*dep_phase),
             inherit_outputs: false,
         })
         .collect();
@@ -106,7 +111,9 @@ fn primary_two_phase_one_worker() -> (
     );
 
     let a = dep_binary("a", "a", &[]);
-    let b = dep_binary("b", "b", &["a"]);
+    // `b` (phase "b") depends on the prerequisite `a`, which lives in
+    // phase "a" — the dep names that full `("a", "a")` identity.
+    let b = dep_binary("b", "b", &[("a", "a")]);
     let hash_a = compute_task_hash(&a);
     let hash_b = compute_task_hash(&b);
     {
@@ -296,6 +303,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
             );
             let t0 = dep_binary("t0", "work", &[]);
             let t1 = dep_binary("t1", "work", &[]);
+            // (both zero-dep, same phase)
             let hash_t0 = compute_task_hash(&t0);
             let hash_t1 = compute_task_hash(&t1);
             {
