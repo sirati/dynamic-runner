@@ -851,6 +851,39 @@ where
         self.sampler = Some(sampler);
     }
 
+    /// Test seam: land the lifecycle DIRECTLY in `Operational` with a
+    /// live operational state (empty pool, `ElectionState::Normal`, empty
+    /// peer-keepalives, a fresh `PrimaryLink` from config, empty
+    /// pending/active collections), bypassing the full
+    /// handshake/`wait_for_setup`/`enter_operational` boundary.
+    ///
+    /// This is the test analog of `restore_from_snapshot_and_skip_setup`'s
+    /// `operational_observer` construction, for the (non-observer) tests
+    /// that drive the operational handlers — election state machine,
+    /// peer-keepalive/primary-liveness tracking, the worker pool — via
+    /// direct method calls. Those tests construct `make_secondary()` (which
+    /// starts `Connecting`, where no operational state exists) and then
+    /// reach the operational fields; they must call this first so
+    /// [`Self::op_mut`] / [`Self::op_ref`] / [`Self::pool_mut`] resolve.
+    /// Election semantics are identical to the observer construction —
+    /// `config.is_observer` (not the state shape) is what gates candidacy
+    /// — so reusing `operational_observer` is faithful.
+    ///
+    /// `take`-s the take-once latch `Option` fields (matching the single
+    /// `enter_operational` consumption boundary) and discards them; tests
+    /// driving the loop end-to-end go through `run_until_setup_or_done`
+    /// instead, which owns the real latch round-trip.
+    #[cfg(test)]
+    pub(in crate::secondary) fn enter_operational_for_test(&mut self) {
+        let primary_link = PrimaryLink::with_failover_threshold(
+            self.config.primary_link_failure_threshold,
+            self.config.primary_link_failure_window,
+        );
+        let (lifecycle, _empty) =
+            SecondaryLifecycle::operational_observer(OperationalLatches::empty(), primary_link);
+        self.lifecycle = lifecycle;
+    }
+
     /// Test seam mirroring
     /// `LocalManager::install_worker_subcgroup_for_test`: inject a
     /// `SubcgroupHandle` onto an existing worker slot so the
