@@ -4,14 +4,11 @@ pub mod codec;
 pub mod messages;
 pub mod relay;
 pub mod removal_cause;
-pub mod role_routing;
 pub mod setup_bootstrap;
 pub mod transport;
 
 pub use address::{
-    Address, Destination, PeerId, Role, RoleCache, RoleChangeHookRegistrar, RoleTable, Scope,
-    SendTarget, install_role_change_hook, new_role_cache, read_role_cache, resolve_destination,
-    seed_self_role,
+    Destination, PeerId, RoleChangeHookRegistrar, RoleTable, SendTarget, resolve_destination,
 };
 pub use cluster_mutation::{ClusterMutation, SecondaryCapacityRecord};
 pub use codec::{decode_frame, deserialize_message, serialize_message};
@@ -23,10 +20,6 @@ pub use relay::{
     handle_backoff, pick_relay, route_send,
 };
 pub use removal_cause::RemovalCause;
-pub use role_routing::{
-    MAX_ROLE_RELAY_ATTEMPTS, RoleAddressedAction, apply_role_misaddress_hint,
-    decide_role_addressed, decide_role_addressed_with_cache,
-};
 pub use setup_bootstrap::{
     PrimaryPeerSetupBootstrap, SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapBroadcast,
     SetupBootstrapMessage,

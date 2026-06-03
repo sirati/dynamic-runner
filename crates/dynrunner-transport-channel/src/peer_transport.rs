@@ -178,11 +178,11 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         // heal via `connect_to` directly.
     }
 
-    // `register_with_cluster_state` / `peer_for_role` are intentionally
-    // NOT overridden: the transport is role-blind (transport ⊥ roles),
-    // so it carries no role cache and resolves no role. The trait's no-op
-    // / `None` defaults are exactly correct here — role-resolution lives
-    // at the coordinator egress edge. [de-role-trait #136]
+    // Role-blind by construction (transport ⊥ roles): this transport
+    // carries no role cache and resolves no role — role-resolution lives
+    // at the coordinator egress edge. The only override below is
+    // `local_id`, the bootstrap-RPC return address used by
+    // `join_running_cluster`.
 
     fn local_id(&self) -> &str {
         &self.local_id

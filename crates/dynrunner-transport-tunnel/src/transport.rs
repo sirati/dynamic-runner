@@ -99,9 +99,8 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// `recv_peer` demux drains [`PeerRegistration`]s minted by the
     /// QUIC/WSS accept loops; the in-process / test paths register
     /// writers directly through their [`SharedOutgoing`] handle. Both
-    /// converge on the same map, so `send_to_peer` / `broadcast` /
-    /// role-resolved dispatch reach every connected peer regardless of
-    /// how it registered.
+    /// converge on the same map, so `send_to_peer` / `broadcast` reach
+    /// every connected peer regardless of how it registered.
     outgoing: SharedOutgoing<I>,
     /// THE canonical inbound stream — owned exclusively here. Fed by
     /// the accept loops' per-connection reader tasks (QUIC/WSS) and the
@@ -258,9 +257,9 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     }
 
     /// Drive one inbound frame through the [`Router`] over the shared
-    /// `outgoing` table, returning the frame to deliver to the role
-    /// layer (or `None` when the Router consumed it as a relay /
-    /// backoff / stale-drop). Bridges the `Rc<RefCell<_>>` table to the
+    /// `outgoing` table, returning the frame to deliver to the caller
+    /// (or `None` when the Router consumed it as a relay / backoff /
+    /// stale-drop). Bridges the `Rc<RefCell<_>>` table to the
     /// Router's `&mut HashMap` contract, same borrow discipline as
     /// [`Self::router_send`]. `redial_target` is dropped (no dial path).
     fn router_inbound(
@@ -359,8 +358,8 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         // stream from this single consumer. A registration carries no
         // application payload, so it is applied (writer inserted into
         // `outgoing`) and the loop continues; an inbound frame goes
-        // through the role layer and is yielded (or consumed
-        // internally) exactly as before.
+        // through the Router and is yielded (or consumed internally as a
+        // relay) exactly as before.
         //
         // FIFO: `SecondaryWelcome` and `CertExchange` for one secondary
         // both ride `incoming_rx` (a single mpsc), so their relative

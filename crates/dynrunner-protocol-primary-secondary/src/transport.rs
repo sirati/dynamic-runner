@@ -3,7 +3,7 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, MessageReceiver};
 
 use crate::DistributedMessage;
-use crate::address::{Address, PeerId, Role, RoleChangeHookRegistrar, Scope};
+use crate::address::PeerId;
 use crate::messages::timestamp_now;
 
 /// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
@@ -170,139 +170,19 @@ pub trait PeerTransport<I: Identifier> {
         peers: &[crate::PeerConnectionInfo],
     ) -> impl std::future::Future<Output = ()>;
 
-    /// Send a message via role-aware addressing.
+    /// The local node's own peer-id, used as the bootstrap RPC's
+    /// return address (the `sender_id` of the
+    /// [`DistributedMessage::RequestClusterSnapshot`] frame
+    /// [`Self::join_running_cluster`] constructs) and to skip the
+    /// joiner's own entry when iterating the seed list.
     ///
-    /// Default implementation routes the well-known address shapes to
-    /// the existing primitives:
-    ///   - `Address::Peer(id)` → `send_to_peer(id, msg)`
-    ///   - `Address::Broadcast(Scope::Mesh)` → `broadcast(msg)`
-    ///   - `Address::Role(role)` → resolve `role` through the transport's
-    ///     write-through cache (Step 2), wrap `msg` in a
-    ///     [`DistributedMessage::RoleAddressed`] envelope, ship via
-    ///     `send_to_peer` to the resolved holder. The wrapper is what
-    ///     lets the receiver detect misaddress and relay-and-hint in
-    ///     Step 4 — the receiver inspects `intended_role` against its
-    ///     own cache. Cache-cold lookups return `Err`: a sender that
-    ///     hasn't yet observed `PromotePrimary` cannot route by role,
-    ///     and silently fanning out would mask the design defect.
-    ///
-    /// Step 5 lifts `Address::Broadcast(Scope::AllSecondaries)` from the
-    /// pre-migration `Err`-return to the same fan-out shape as
-    /// `Scope::Mesh`: a primary calling `send(Broadcast(AllSecondaries))`
-    /// from its peer-mesh vantage already has every-peer-is-a-secondary
-    /// (the primary is not its own peer), so the wire effect is
-    /// identical to `broadcast(msg)`. The semantic distinction the
-    /// `Scope` enum encodes — "exclude the current primary holder" —
-    /// only matters for a SECONDARY caller (who'd otherwise broadcast
-    /// to a peer set that includes the primary); no such caller exists
-    /// today, so the default delegates to `broadcast` and the
-    /// per-impl override path stays open for the future
-    /// secondary-broadcasts-to-non-primary-peers use case.
-    fn send(
-        &mut self,
-        addr: Address,
-        msg: DistributedMessage<I>,
-    ) -> impl std::future::Future<Output = Result<(), String>> {
-        async move {
-            match addr {
-                Address::Peer(id) => self.send_to_peer(&id, msg).await,
-                Address::Broadcast(Scope::Mesh) | Address::Broadcast(Scope::AllSecondaries) => {
-                    self.broadcast(msg).await
-                }
-                Address::Role(role) => {
-                    // Resolve via the write-through cache (Step 2).
-                    // Cache-cold is a hard error here: Step 4 lands
-                    // the receiver-side relay-and-hint that warms
-                    // the cache through observation; until the
-                    // sender's `ClusterState` has fired its first
-                    // `PromotePrimary` hook, the safe behaviour is
-                    // to surface "no route" to the caller rather
-                    // than broadcast or guess.
-                    let holder = self.peer_for_role(&role).ok_or_else(|| {
-                        format!(
-                            "Address::Role({role:?}) unresolvable: role-table cache empty for \
-                             this role; cluster_state has not yet observed PromotePrimary \
-                             (or the equivalent role-assignment mutation)"
-                        )
-                    })?;
-                    // Wrap in the role-addressed envelope so the
-                    // receiver can detect misaddress and relay
-                    // (Step 4). `sender_id` lets a misaddress hint
-                    // travel back; we read it through `local_id`
-                    // rather than threading it through every send
-                    // call site (see trait doc for the design
-                    // tradeoff).
-                    let envelope = DistributedMessage::RoleAddressed {
-                        sender_id: self.local_id().to_owned(),
-                        timestamp: timestamp_now(),
-                        intended_role: role,
-                        payload: Box::new(msg),
-                        attempts: 0,
-                    };
-                    self.send_to_peer(&holder, envelope).await
-                }
-            }
-        }
-    }
-
-    /// Attach this transport's write-through role cache to the
-    /// authoritative [`RoleTable`] owner. The registrar is the
-    /// downstream `ClusterState` (or a test fixture implementing
-    /// [`RoleChangeHookRegistrar`]).
-    ///
-    /// Default impl is a no-op: transports that don't keep a
-    /// role-cache (e.g. `NoPeerTransport`, or the channel transport
-    /// in tests that never exercise role addressing) compile cleanly
-    /// without overriding. Real transports override to register a
-    /// hook that writes their local `HashMap<Role, String>` cache
-    /// whenever the authoritative table mutates — that's how Step 3
-    /// gets a lock-free read of "who is primary now" on the send
-    /// hot path.
-    ///
-    /// The registration is one-shot; callers invoke this once at
-    /// coordinator construction.
-    fn register_with_cluster_state(&self, _registrar: &mut dyn RoleChangeHookRegistrar) {}
-
-    /// Look up the current id of whoever holds `role` per this
-    /// transport's local write-through cache.
-    ///
-    /// Default impl returns `None` — transports without a cache
-    /// silently report "no holder", which is the safe answer
-    /// upstream (Step 3's role dispatch will surface `None` as a
-    /// no-route error, not a mis-send).
-    ///
-    /// Real transports override to read their cached map populated
-    /// by the hook registered via [`Self::register_with_cluster_state`].
-    /// The returned `String` is a clone — the cache stays locked for
-    /// the minimum window.
-    fn peer_for_role(&self, _role: &Role) -> Option<String> {
-        None
-    }
-
-    /// The local node's own peer-id, used as the `sender_id` field
-    /// of envelopes the transport constructs internally — currently
-    /// the `RoleAddressed` wrapper produced by [`Self::send`] when
-    /// dispatching an `Address::Role(_)` send.
-    ///
-    /// Default impl returns the empty string. The reason for the
-    /// default (over making this a required method) is that not
-    /// every `PeerTransport` impl exercises role addressing — the
-    /// `NoPeerTransport` arm is the canonical example — and forcing
-    /// them to plumb an id just to satisfy the trait would be
-    /// noise. Real impls (`ChannelPeerTransport`, `PeerNetwork`,
-    /// `EitherPeerTransport`) override; both already stash the
-    /// local id (channel transport via `peer_mesh`'s id parameter,
-    /// `PeerNetwork.peer_id` field).
-    ///
-    /// The alternative — threading `sender_id` as a parameter on
-    /// every `send` call site — was rejected because every call
-    /// site would have to know about it; the transport already
-    /// knows. The empty-string default is only observable on the
-    /// role-addressing path, and a misaddress hint travelling back
-    /// to an empty-string sender id is a no-op (the receiver's
-    /// `send_to_peer("")` errors out cleanly) — the failure mode
-    /// is contained to "cache stays cold", not "cluster
-    /// corruption".
+    /// Default impl returns the empty string: transports whose join
+    /// path never needs a self-identifying return address (the
+    /// `NoPeerTransport` arm, or any transport that pre-wires its
+    /// mesh) compile cleanly without overriding. A transport that
+    /// participates in the snapshot-bootstrap rendezvous overrides to
+    /// return its real id so the responder's `PeerJoined` broadcast
+    /// carries the truthful joiner id.
     fn local_id(&self) -> &str {
         ""
     }
@@ -324,28 +204,18 @@ pub trait PeerTransport<I: Identifier> {
     ///    return address and `is_observer` declaring the joiner's own
     ///    role (so the responder's `PeerJoined` broadcast carries the
     ///    truth instead of assuming observer).
-    /// 4. Send it via [`Self::send`] with `Address::Peer(<first
-    ///    reachable seed id>)`. The receiver-side handler in
+    /// 4. Send it via [`Self::send_to_peer`] to the first reachable
+    ///    seed id. The receiver-side handler in
     ///    `secondary/dispatch.rs` accepts the request from any peer
     ///    (`cluster_state` is replicated, so any responder's snapshot
     ///    is valid bootstrap material) and replies with a unicast
     ///    [`DistributedMessage::ClusterSnapshot`].
     ///
-    ///    NOTE: the original plan called for `Address::Role(Role::Primary)`
-    ///    dispatch here so the receiver-side relay (Step 4) would
-    ///    forward to whichever peer holds the primary role. That
-    ///    shape doesn't work for a cold-start joiner — its role
-    ///    cache is empty (no `PromotePrimary` mutation has been
-    ///    observed yet), so the Step-3 `Address::Role(_)` dispatch
-    ///    surfaces "role-table cache empty" and the request never
-    ///    leaves the wire. Sending unicast to the first reachable
-    ///    seed peer is equivalent semantically (any peer can
-    ///    answer per the dispatch.rs comment) and works regardless
-    ///    of cache state. The role cache is then warmed by the
-    ///    `restore` path on the cluster state once the joiner
-    ///    deserialises the returned snapshot — by `current_primary`
-    ///    triggering [`crate::address::RoleTable.primary`] update +
-    ///    role-change-hook fire.
+    ///    The request is addressed by concrete peer-id, not by role: a
+    ///    cold-start joiner cannot resolve `Destination::Primary` yet
+    ///    (it has observed no `PrimaryChanged`), and any peer can answer
+    ///    per the dispatch.rs handler, so unicast to the first reachable
+    ///    seed is both correct and cache-independent.
     ///
     /// 5. Drive [`Self::recv_peer`] inside a `tokio::time::timeout`
     ///    until a [`DistributedMessage::ClusterSnapshot`] arrives, or

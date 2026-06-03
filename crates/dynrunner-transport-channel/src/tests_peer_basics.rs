@@ -1,8 +1,6 @@
 //! Unit tests for the channel peer transport's basics: full-mesh
-//! and partial-mesh constructors, plus the `send(Address::…)`
-//! dispatch contract covered by the trait's default impl (Peer /
-//! Broadcast(Mesh) / Broadcast(AllSecondaries) plus the unresolved-
-//! Role error case).
+//! and partial-mesh constructors, the `broadcast` / `send_to_peer`
+//! fan-out contract, and per-id membership (`has_peer`).
 
 use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole, PeerTransport};
 
@@ -67,14 +65,12 @@ async fn peer_mesh_send_to_specific_peer() {
     assert!(transports[0].try_recv_peer().is_none());
 }
 
-// ── PeerTransport::send default-impl contract tests ──
+// ── PeerTransport unicast / broadcast fan-out tests ──
 //
-// These pin the Step 1 default impl so Step 3 (which will replace
-// the Role/AllSecondaries error arms with real dispatch) has a
-// regression net. Each test exercises exactly one Address variant
-// through the trait's default body — the channel transport itself
-// does not override `send`, so what we observe here is the protocol-
-// crate default routing through `send_to_peer` / `broadcast`.
+// These pin the by-id `send_to_peer` and mesh `broadcast` delivery
+// contract the coordinator edge rests on after resolving a typed
+// `Destination` to a concrete peer-id (role-blind: the transport
+// never sees a role).
 
 use serde::{Deserialize, Serialize};
 
@@ -124,17 +120,14 @@ async fn has_peer_tracks_outgoing_membership() {
     assert!(!transports[0].has_peer(&PeerId::from("b")));
 }
 
-/// `send(Address::Peer(id), msg)` routes through the default impl
-/// to `send_to_peer` and reaches exactly that peer.
+/// `send_to_peer(id, msg)` reaches exactly that peer and nobody else.
 #[tokio::test]
-async fn send_address_peer_reaches_recipient() {
-    use dynrunner_protocol_primary_secondary::Address;
-
+async fn send_to_peer_reaches_recipient() {
     let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
     let mut transports = peer_mesh::<SendTestId>(&ids);
 
     transports[0]
-        .send(Address::Peer("b".to_string()), keepalive("a"))
+        .send_to_peer("b", keepalive("a"))
         .await
         .unwrap();
 
@@ -143,48 +136,15 @@ async fn send_address_peer_reaches_recipient() {
     assert!(transports[0].try_recv_peer().is_none());
 }
 
-/// `send(Address::Broadcast(Scope::Mesh), msg)` routes through the
-/// default impl to `broadcast` and fans out to every other peer.
+/// `broadcast(msg)` fans out to every other peer; nothing loops back
+/// to the sender.
 #[tokio::test]
-async fn send_address_broadcast_mesh_fans_out() {
-    use dynrunner_protocol_primary_secondary::{Address, Scope};
-
+async fn broadcast_fans_out_to_all_others() {
     let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
     let mut transports = peer_mesh::<SendTestId>(&ids);
 
-    transports[0]
-        .send(Address::Broadcast(Scope::Mesh), keepalive("a"))
-        .await
-        .unwrap();
+    transports[0].broadcast(keepalive("a")).await.unwrap();
 
-    assert!(transports[0].try_recv_peer().is_none());
-    assert!(transports[1].try_recv_peer().is_some());
-    assert!(transports[2].try_recv_peer().is_some());
-}
-
-/// Post-Step 5: `send(Address::Broadcast(Scope::AllSecondaries), msg)`
-/// fans out via the default impl's `broadcast` delegation. From a
-/// primary caller's vantage (the only Step-5 caller), every
-/// peer-mesh member is by definition a secondary, so `AllSecondaries`
-/// and `Mesh` produce the same wire effect today; the Scope variant
-/// is preserved for the future case of a secondary broadcasting
-/// only-to-non-primary peers (which would override the default
-/// impl with a per-impl `outgoing.iter().filter(|id| id !=
-/// primary_holder)` walk).
-#[tokio::test]
-async fn send_address_broadcast_all_secondaries_fans_out() {
-    use dynrunner_protocol_primary_secondary::{Address, Scope};
-
-    let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-    let mut transports = peer_mesh::<SendTestId>(&ids);
-
-    transports[0]
-        .send(Address::Broadcast(Scope::AllSecondaries), keepalive("a"))
-        .await
-        .unwrap();
-
-    // Same delivery pattern as `Scope::Mesh`: peer 0 keeps nothing,
-    // peers 1 and 2 both received.
     assert!(transports[0].try_recv_peer().is_none());
     assert!(transports[1].try_recv_peer().is_some());
     assert!(transports[2].try_recv_peer().is_some());
