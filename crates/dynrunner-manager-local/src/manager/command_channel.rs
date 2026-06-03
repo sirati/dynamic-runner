@@ -57,15 +57,19 @@ pub(crate) async fn handle_local_command<M, S, E, I>(
             // Closure-based validator from `dynrunner-core`: same
             // rules the distributed primary and promoted-secondary
             // apply paths use. `task_by_hash` is our duplicate-hash
-            // probe; the `task_id` known-set is also derived from
-            // `task_by_hash` (the mirror covers every task the
-            // manager has ever known about in this run).
+            // probe; the full-identity `(phase_id, task_id)` known-set
+            // is also derived from `task_by_hash` (the mirror covers
+            // every task the manager has ever known about in this run).
             let (valid, errors) = validate_spawn_tasks(
                 |hash| mgr.task_by_hash.contains_key(hash),
-                |task_id| {
+                // Phase-aware dep resolution: a dep names a full
+                // `(phase_id, task_id)`. The SAME `task_id` in two phases
+                // is a DISTINCT task, so resolve against the full
+                // identity in the `task_by_hash` mirror.
+                |phase_id, task_id| {
                     mgr.task_by_hash
                         .values()
-                        .any(|t| t.task_id.as_str() == task_id)
+                        .any(|t| t.task_id.as_str() == task_id && &t.phase_id == phase_id)
                 },
                 tasks,
             );

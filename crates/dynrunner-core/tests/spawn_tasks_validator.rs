@@ -42,11 +42,29 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
     }
 }
 
+/// Build a `TaskInfo` with an explicit phase + caller-chosen `task_id`
+/// and a list of fully-qualified `(dep_phase, dep_task_id)` deps so
+/// cross-phase identity can be expressed.
+fn task_in(phase: &str, task_id: &str, deps: &[(&str, &str)]) -> TaskInfo<Arc<str>> {
+    let mut t = task(task_id, vec![]);
+    t.phase_id = PhaseId::from(phase);
+    t.task_depends_on = deps
+        .iter()
+        .map(|(dp, dt)| TaskDep {
+            task_id: (*dt).to_string(),
+            phase_id: PhaseId::from(*dp),
+            inherit_outputs: false,
+        })
+        .collect();
+    t
+}
+
 /// Closures that say "nothing is known on the receiver side": every
-/// task is fresh, no task_ids exist in the ledger. The validator must
-/// still treat within-batch task_ids as known for dep resolution.
-fn empty_receiver() -> (impl Fn(&str) -> bool, impl Fn(&str) -> bool) {
-    (|_h: &str| false, |_id: &str| false)
+/// task is fresh, no `(phase, task_id)` exists in the ledger. The
+/// validator must still treat within-batch `(phase, task_id)` identities
+/// as known for dep resolution.
+fn empty_receiver() -> (impl Fn(&str) -> bool, impl Fn(&PhaseId, &str) -> bool) {
+    (|_h: &str| false, |_p: &PhaseId, _id: &str| false)
 }
 
 #[test]
@@ -112,7 +130,7 @@ fn duplicate_hash_surfaces_as_per_task_error() {
     let a_hash = compute_task_hash(&a);
     let dup_hash = a_hash.clone();
     let is_present = move |h: &str| h == dup_hash;
-    let is_known = |_id: &str| false;
+    let is_known = |_p: &PhaseId, _id: &str| false;
     let (valid, errors) = validate_spawn_tasks(is_present, is_known, vec![a]);
     assert!(valid.is_empty());
     assert_eq!(errors.len(), 1);
@@ -130,11 +148,66 @@ fn dep_on_receiver_side_resolves_via_known_closure() {
     // closure must accept it; nothing else (no within-batch token,
     // no hash entry) should be needed.
     let is_present = |_h: &str| false;
-    let is_known = |id: &str| id == "ledger_only";
+    let is_known = |_p: &PhaseId, id: &str| id == "ledger_only";
     let (valid, errors) =
         validate_spawn_tasks(is_present, is_known, vec![task("b", vec!["ledger_only"])]);
     assert_eq!(valid.len(), 1);
     assert!(errors.is_empty());
+}
+
+#[test]
+fn dep_resolution_is_phase_aware_on_receiver_side() {
+    // The receiver knows `foo` only in phase A. A spawned task in
+    // phase B depends on (phase=B, foo) — absent in the NAMED phase —
+    // so it must be minted UnknownDependency, NOT silently passed.
+    // Pre-fix the phase-blind closure accepted any phase carrying `foo`.
+    let is_present = |_h: &str| false;
+    let is_known = |p: &PhaseId, id: &str| p == &PhaseId::from("A") && id == "foo";
+    let (valid, errors) =
+        validate_spawn_tasks(is_present, is_known, vec![task_in("B", "child", &[("B", "foo")])]);
+    assert!(valid.is_empty(), "the phase-B dep is unsatisfiable");
+    assert_eq!(errors.len(), 1);
+    match &errors[0].1 {
+        SpawnError::UnknownDependency { dep_task_id, .. } => assert_eq!(dep_task_id, "foo"),
+        other => panic!("expected UnknownDependency, got {other:?}"),
+    }
+}
+
+#[test]
+fn cross_phase_dep_naming_right_phase_resolves_on_receiver_side() {
+    // The receiver knows `foo` in phase A; a phase-B task depending on
+    // (phase=A, foo) names the right phase → resolves.
+    let is_present = |_h: &str| false;
+    let is_known = |p: &PhaseId, id: &str| p == &PhaseId::from("A") && id == "foo";
+    let (valid, errors) =
+        validate_spawn_tasks(is_present, is_known, vec![task_in("B", "child", &[("A", "foo")])]);
+    assert_eq!(valid.len(), 1);
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn within_batch_dep_resolution_is_phase_aware() {
+    // `parent` is in the batch under phase A only. `child` (phase B)
+    // depends on (phase=B, parent) — the within-batch known set is
+    // keyed on (phase, task_id), so the phase-B identity is absent and
+    // `child` is UnknownDependency. `parent` itself validates.
+    let (present, known) = empty_receiver();
+    let (valid, errors) = validate_spawn_tasks(
+        present,
+        known,
+        vec![
+            task_in("A", "parent", &[]),
+            task_in("B", "child", &[("B", "parent")]),
+        ],
+    );
+    assert_eq!(valid.len(), 1);
+    assert_eq!(valid[0].task_id, "parent");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].0, 1);
+    match &errors[0].1 {
+        SpawnError::UnknownDependency { dep_task_id, .. } => assert_eq!(dep_task_id, "parent"),
+        other => panic!("expected UnknownDependency, got {other:?}"),
+    }
 }
 
 #[test]
@@ -145,7 +218,7 @@ fn first_failure_short_circuits_per_task_checks() {
     let a = task("a", vec!["missing"]);
     let a_hash = compute_task_hash(&a);
     let is_present = move |h: &str| h == a_hash;
-    let is_known = |_id: &str| false;
+    let is_known = |_p: &PhaseId, _id: &str| false;
     let (valid, errors) = validate_spawn_tasks(is_present, is_known, vec![a]);
     assert!(valid.is_empty());
     assert_eq!(errors.len(), 1);
