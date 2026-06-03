@@ -77,6 +77,36 @@ where
         }
     }
 
+    /// The node id whose keepalives count as PRIMARY-liveness assertions
+    /// for failover, as a TOTAL function — recognition never has a "no
+    /// primary" hole.
+    ///
+    /// This is the RECOGNITION concern, deliberately decoupled from the
+    /// ROUTING concern. Routing (how to physically reach the primary) reads
+    /// `role_table.primary` / the transport `RoleCache`, which is COLD on
+    /// bootstrap on purpose so traffic flows over the uplink — that COLD
+    /// state mirrors as `cluster_state.current_primary() == None`. But the
+    /// bootstrap primary's IDENTITY is not unknown: it is the well-known
+    /// canonical `primary_node_id()` constant — the same value election
+    /// stamps into `TimeoutQuery::query_node_id` and the bootstrap primary
+    /// stamps onto every keepalive it broadcasts. So recognition resolves
+    /// `current_primary()` when a failover has named a concrete winner, and
+    /// otherwise falls back to that canonical bootstrap identity. The
+    /// `None`-means-routes-via-uplink artifact must NOT leak into
+    /// recognition, or the bootstrap primary's keepalives are never
+    /// recognized and primary liveness stays parasitic on dispatch traffic.
+    ///
+    /// The fallback is DISABLED once a failover commits a concrete primary
+    /// (`current_primary() == Some(winner)`): a zombie/demoted old bootstrap
+    /// primary's keepalives (still stamped `primary_node_id()`) then no
+    /// longer match, so they correctly fall through to `peer_keepalives`.
+    pub(in crate::secondary) fn recognized_primary_id(&self) -> String {
+        self.cluster_state
+            .current_primary()
+            .map(str::to_owned)
+            .unwrap_or_else(primary_node_id)
+    }
+
     /// Advance the election state. Called once per processing-loop tick.
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {

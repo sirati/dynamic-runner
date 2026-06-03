@@ -824,6 +824,142 @@ async fn promotion_resume_reconstructs_roster_without_redispatch() {
         .await;
 }
 
+/// Drain a secondary inbox and return every `hash` carried by a
+/// `ClusterMutation::TaskRequeued` across all envelopes. The dead-
+/// secondary recovery originates these (InFlight → Pending) through the
+/// canonical broadcast pipeline, so a promoted primary's roster must hold
+/// the dead secondary for them to be emitted at all.
+fn drain_requeued(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            for m in mutations {
+                if let ClusterMutation::TaskRequeued { hash } = m {
+                    out.push(hash);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (D R-1, post-promotion) A promoted primary must reconstruct its
+/// SECONDARY roster (`self.secondaries` + `self.secondary_keepalives`)
+/// from the replicated capacity ledger — not just `self.workers` — so a
+/// secondary dying AFTER promotion is detected and its inherited in-flight
+/// task is requeued (a `TaskRequeued` broadcast), NOT stranded forever.
+///
+/// Pre-fix the parked-promotion path (`activate_local_primary` → hydrate)
+/// rebuilt `self.workers` but left `self.secondaries` empty, so
+/// `collect_heartbeat_report` (which keys off `self.secondaries`) could
+/// mark NO secondary dead → `process_heartbeat_tick` ran the recovery for
+/// nobody → the inherited InFlight task stayed in-flight forever (no
+/// `TaskRequeued`). This pins the roster reconstruction end-to-end through
+/// the heartbeat path.
+///
+/// Determinism note: the keepalive deadline is measured via
+/// `std::time::Instant` (`tokio::time::advance` does not move it — see the
+/// in-tree note at `heartbeat/tests.rs`), so this models "advance past the
+/// deadline" with a short real-time interval (50ms × 2 = 100ms deadline,
+/// a 200ms sleep crosses it), the same approach every heartbeat-deadline
+/// test in this crate uses.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_primary_detects_dead_secondary_and_requeues_inherited_inflight() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            // Short keepalive deadline so the test crosses it with a brief
+            // real sleep; everything else is the production default.
+            let config = PrimaryConfig {
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 2,
+                ..PrimaryConfig::default()
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Parked-primary signature: pool unseeded (`total_tasks == 0`),
+            // replicated ledger holds sec-0's capacity (1 worker) + that
+            // worker's in-flight task — the state a promoted primary
+            // inherits via the CRDT snapshot.
+            let task = dep_binary("inflight-1", "work", &[]);
+            let hash = compute_task_hash(&task);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task,
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    hash: hash.clone(),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                });
+            }
+            assert_eq!(primary.total_tasks, 0, "parked primary counts no tasks yet");
+
+            // THE production entry: hydrate (reconstructs workers AND the
+            // secondary roster from the CRDT) + assert authority.
+            primary
+                .activate_local_primary()
+                .await
+                .expect("activation must succeed");
+
+            // The inherited task is in-flight on the reconstructed slot.
+            assert_eq!(primary.in_flight_len_for_test(), 1);
+            assert!(primary.slot_holds_hash_for_test("sec-0", 0, &hash));
+
+            // Drain setup noise (the bootstrap PrimaryChanged broadcast).
+            let _ = ends[0].1.try_recv();
+            while ends[0].1.try_recv().is_ok() {}
+
+            // sec-0 goes silent past the keepalive deadline.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            // The promoted primary's heartbeat tick must detect sec-0 dead
+            // (its roster + keepalive entry were reconstructed) and requeue
+            // the inherited in-flight task.
+            primary
+                .process_heartbeat_tick()
+                .await
+                .expect("heartbeat tick must succeed");
+
+            // A TaskRequeued for the inherited hash was broadcast — the
+            // task is recovered, not stranded.
+            let requeued = drain_requeued(&mut ends[0].1);
+            assert_eq!(
+                requeued,
+                vec![hash.clone()],
+                "the promoted primary must requeue the dead secondary's \
+                 inherited in-flight task (pre-fix: empty roster → stranded)"
+            );
+            // CRDT reflects the recovery: the task is Pending again, and
+            // the ledger entry drained.
+            assert!(matches!(
+                primary.cluster_state_for_test().task_state(&hash),
+                Some(crate::cluster_state::TaskState::Pending { .. })
+            ));
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                0,
+                "the inherited in-flight ledger entry must drain on recovery"
+            );
+        })
+        .await;
+}
+
 /// (D3-c / R-1) Dead-secondary requeue → snapshot → hydrate dispatches
 /// the requeued task EXACTLY ONCE. A live primary holds the task
 /// in-flight on a secondary; that secondary dies, so

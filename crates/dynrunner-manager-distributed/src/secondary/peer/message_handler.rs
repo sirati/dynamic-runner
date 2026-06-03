@@ -70,11 +70,8 @@ where
                 active_workers,
                 ..
             } => {
-                // Recognition by ROLE, resolved through the one
-                // authoritative cluster view (`current_primary`, kept by
-                // the `PrimaryChanged` apply — the single source of "who
-                // is primary now"). A keepalive whose originator IS the
-                // current primary is a PRIMARY-liveness assertion, so it
+                // Recognition by ROLE. A keepalive whose originator IS the
+                // recognized primary is a PRIMARY-liveness assertion, so it
                 // refreshes `primary_last_seen` via the same
                 // `record_primary_message` the dispatch path uses;
                 // otherwise it is a peer's mesh keepalive and feeds
@@ -83,10 +80,23 @@ where
                 // liveness was parasitic on workload dispatch and
                 // `primary_silent` tripped the instant dispatch quiesced.
                 //
-                // The co-located primary's OWN keepalive is excluded
-                // naturally: `is_primary_facing()` does NOT mark
-                // Keepalive, so a primary never receives its own here.
-                if self.cluster_state.current_primary() == Some(secondary_id.as_str()) {
+                // The recognition IDENTITY is `recognized_primary_id()`, a
+                // TOTAL function decoupled from ROUTING. Routing reads the
+                // transport `RoleCache` (mirrored from `current_primary()`),
+                // which is COLD on bootstrap by design so traffic flows over
+                // the uplink — and that COLD state surfaces as
+                // `current_primary() == None`. Keying recognition on bare
+                // `current_primary()` would inherit that routing artifact
+                // and NEVER recognize the bootstrap primary's keepalives
+                // (filing them as peer keepalives), so `primary_last_seen`
+                // would go stale once dispatch quiesced and a false election
+                // would trip. `recognized_primary_id()` falls back to the
+                // bootstrap primary's well-known canonical identity
+                // (`primary_node_id()`, the id it stamps onto its keepalives)
+                // exactly while no failover has named a concrete winner; once
+                // one has, the fallback is off and a zombie old bootstrap
+                // primary's keepalives no longer match.
+                if self.recognized_primary_id() == secondary_id {
                     self.record_primary_message();
                     tracing::trace!(
                         primary = %secondary_id,

@@ -26,6 +26,7 @@
 //! local-active.
 
 use std::collections::HashSet;
+use std::time::Instant;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 use dynrunner_protocol_primary_secondary::PeerTransport;
@@ -34,6 +35,7 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::secondary::origination::cascade_drain_done;
+use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
     PrimaryCoordinator<Tr, S, E, I>
@@ -233,6 +235,19 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // this pass has already moved `Idle -> Assigned`.
         self.reconstruct_workers_from_cluster_state();
 
+        // Reconstruct the secondary roster (`self.secondaries` +
+        // `self.secondary_keepalives`) from the same CRDT source. The
+        // parked-promotion path bypasses connect.rs / peer_setup.rs (the
+        // only writers of `self.secondaries`), so without this a promoted
+        // primary's roster is empty: `broadcast_primary_keepalive`
+        // early-returns (the promoted primary emits NO keepalives →
+        // surviving secondaries trip `primary_silent`), `record_keepalive`
+        // no-ops, and `collect_heartbeat_report` can mark NO secondary dead
+        // — a secondary dying AFTER promotion strands its inherited
+        // in-flight tasks forever. Same "derived cache of the CRDT"
+        // treatment `self.workers` gets above.
+        self.reconstruct_secondaries_from_cluster_state();
+
         // Seed the unified `in_flight` ledger only after `extend`
         // succeeded — a failure on the items batch leaves
         // `pending = None` and any ledger entry we'd populated would be
@@ -415,6 +430,84 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             secondaries = roster.len(),
             "reconstructed remote-worker roster from replicated capacity \
              and in-flight occupancy"
+        );
+    }
+
+    /// Reconstruct the secondary roster (`self.secondaries` +
+    /// `self.secondary_keepalives`) from the replicated per-secondary
+    /// capacity ledger, so the heartbeat monitor + keepalive emitter
+    /// operate on the CRDT-derived roster on the failover path too.
+    ///
+    /// One concern: turn `cluster_state.known_secondaries()` (D1's
+    /// replicated capacity records) into the minimal per-secondary
+    /// connection + keepalive state the three heartbeat methods read.
+    /// Sibling of [`Self::reconstruct_workers_from_cluster_state`]: both
+    /// derive a primary-local cache from the same CRDT roster source, each
+    /// owning its own cache (workers vs. secondary connections), so neither
+    /// reaches into the other's. Today `self.secondaries` is written ONLY
+    /// by `connect.rs` / `peer_setup.rs` (the bootstrap handshake); the
+    /// parked-promotion path bypasses both, so before this a promoted
+    /// primary's `self.secondaries` was empty and
+    /// `broadcast_primary_keepalive` / `record_keepalive` /
+    /// `collect_heartbeat_report` all degraded. This makes the roster a
+    /// pure DERIVED CACHE of the replicated state on failover.
+    ///
+    /// The promoted primary reaches every secondary over the UNIFIED mesh
+    /// transport (`Address::Broadcast(Scope::AllSecondaries)` /
+    /// `Address::Peer`), NOT the per-`SecondaryConnection` `QuicConnection`
+    /// handle — that handle is the bootstrap dialer's artifact and cannot
+    /// (and need not) be reconstructed here. The three heartbeat methods
+    /// read only `is Operational` + the metadata fields (`num_workers`,
+    /// `resources`, `is_observer`), never `transport`, so a metadata-only
+    /// `Operational` seed with `transport = None` satisfies all of them.
+    /// `is_observer` is read from the replicated `RoleTable.observers`
+    /// projection so the seed matches the bootstrap welcome's flag.
+    ///
+    /// `secondary_keepalives` is seeded `Instant::now()` per known
+    /// secondary — the same treatment `seed_keepalive` gives a bootstrap
+    /// secondary at welcome — so the death deadline counts from promotion,
+    /// not from `Instant`'s epoch (which would declare every inherited
+    /// secondary instantly dead on the first heartbeat tick).
+    ///
+    /// Rebuilt wholesale on every call (like the worker roster): the
+    /// replicated capacity ledger is the authoritative source.
+    pub(crate) fn reconstruct_secondaries_from_cluster_state(&mut self) {
+        let observers = self.cluster_state.role_table().observers.clone();
+        let roster: Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>)> = self
+            .cluster_state
+            .known_secondaries()
+            .map(String::from)
+            .filter_map(|id| {
+                self.cluster_state
+                    .secondary_capacity(&id)
+                    .map(|cap| (id, cap.worker_count, cap.resources.clone()))
+            })
+            .collect();
+
+        self.secondaries.clear();
+        self.secondary_keepalives.clear();
+        let now = Instant::now();
+        for (id, worker_count, resources) in roster {
+            let is_observer = observers.contains(&id);
+            // Metadata-only Operational seed: walk the typestate to
+            // Operational (the only state the heartbeat deadline applies
+            // to) carrying the advertised capacity + observer flag, with
+            // no `QuicConnection` (reached via the unified mesh instead).
+            let conn = SecondaryConnection::new(id.clone())
+                .receive_welcome(worker_count, resources, String::new(), 0, None, is_observer)
+                .receive_cert_exchange(String::new(), None, None, 0)
+                .begin_peer_discovery()
+                .peers_ready()
+                .assignments_sent();
+            self.secondaries
+                .insert(id.clone(), SecondaryConnectionState::Operational(conn));
+            self.secondary_keepalives.insert(id, now);
+        }
+
+        tracing::info!(
+            secondaries = self.secondaries.len(),
+            "reconstructed secondary roster (connection + keepalive state) \
+             from replicated capacity ledger"
         );
     }
 }

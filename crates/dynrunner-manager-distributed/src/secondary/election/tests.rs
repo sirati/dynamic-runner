@@ -663,3 +663,103 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
              scoped to the current primary, not a blanket disable)",
     );
 }
+
+// ── Bootstrap-recognition (Y1) ──
+//
+// On bootstrap NO `PrimaryChanged` is ever originated (routing uses the
+// uplink while the RoleCache is COLD), so `current_primary() == None`
+// clusterwide. The bootstrap primary nonetheless stamps its well-known
+// canonical id (`primary_node_id()`) onto every keepalive it broadcasts.
+// Recognition must resolve that identity via the TOTAL
+// `recognized_primary_id()` (`current_primary() ?? primary_node_id()`),
+// NOT bare `current_primary()`: keying on the latter inherits the
+// routing-only `None` and files the bootstrap primary's keepalives as
+// PEER keepalives, so `primary_last_seen` never refreshes and a false
+// election trips once dispatch quiesces past the death window.
+//
+// Note the existing `promoted_*` regressions inject `PromotePrimary`
+// first (`current_primary() == Some(peer)`), so they do NOT cover this
+// `current_primary() == None` bootstrap path. Deterministic time follows
+// the short-real-interval pattern (50ms interval × 2 threshold, real
+// `tokio::time::sleep`): `primary_silent` reads `std::time::Instant`,
+// which `tokio::time::advance` does NOT move, so paused time is unusable
+// here.
+
+/// The bootstrap primary's keepalive (originator == `primary_node_id()`)
+/// must be RECOGNIZED while `current_primary() == None` — routed through
+/// `record_primary_message` so `primary_last_seen` advances, NOT filed in
+/// `peer_keepalives`. This is the discriminating RED-before / GREEN-after
+/// assertion: with bare `current_primary()` the keepalive lands in
+/// `peer_keepalives` and `primary_last_seen` stays `None`.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_primary_keepalive_recognized_while_current_primary_none() {
+    let mut sec = make_secondary(election_config("sec-a"));
+    // Bootstrap precondition: no failover has named a concrete primary.
+    assert_eq!(
+        sec.cluster_state.current_primary(),
+        None,
+        "precondition: bootstrap leaves current_primary() COLD (routing \
+         artifact); the test exercises exactly this path",
+    );
+    assert!(sec.primary_last_seen.is_none(), "precondition: never seen");
+
+    // Feed the bootstrap primary's keepalive through the REAL recognition
+    // path. Its originator is the canonical `primary_node_id()`, exactly
+    // what `broadcast_primary_keepalive` stamps (node_id == "primary").
+    sec.handle_inbound(keepalive_from(&primary_node_id()), &mut FakeWorkerFactory)
+        .await;
+
+    assert!(
+        sec.primary_last_seen.is_some(),
+        "the bootstrap primary's keepalive must refresh primary_last_seen \
+         via record_primary_message (recognition is a TOTAL function, not \
+         keyed on the routing-only current_primary() == None)",
+    );
+    assert!(
+        !sec.peer_keepalives.contains_key(&primary_node_id()),
+        "the bootstrap primary's keepalive must NOT be filed as a peer \
+         keepalive — that is the bug that leaves primary_last_seen stale",
+    );
+}
+
+/// End-to-end consequence: with the bootstrap primary's keepalives kept
+/// flowing across a full death window, no false election is entered even
+/// though `current_primary()` stays `None` the whole time. A surviving
+/// mesh peer makes the election path non-degraded, so a spurious trip
+/// would visibly broadcast a `TimeoutQuery`.
+#[tokio::test(flavor = "current_thread")]
+async fn bootstrap_primary_keepalives_prevent_false_election() {
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.peer_keepalives.insert("sec-b".into(), timestamp_now());
+    assert_eq!(sec.cluster_state.current_primary(), None, "bootstrap");
+
+    // Beat the bootstrap primary's keepalive across more than a full
+    // death window (PAST_DEATH = 110ms > 50ms × 2), re-feeding faster than
+    // the deadline so `primary_last_seen` stays fresh via recognition.
+    for _ in 0..4 {
+        sec.handle_inbound(keepalive_from(&primary_node_id()), &mut FakeWorkerFactory)
+            .await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let actions = sec.run_election_tick();
+        assert!(
+            matches!(sec.election, ElectionState::Normal),
+            "a recognized bootstrap primary must keep us Normal; got {:?}",
+            std::mem::discriminant(&sec.election),
+        );
+        assert!(
+            !actions
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            "no false TimeoutQuery while the bootstrap primary is alive",
+        );
+    }
+    // current_primary() must STILL be None — recognition never warmed the
+    // routing view (no PrimaryChanged originated), proving the fix is pure
+    // recognition and leaves routing untouched.
+    assert_eq!(
+        sec.cluster_state.current_primary(),
+        None,
+        "recognition must not have warmed the routing view",
+    );
+}
