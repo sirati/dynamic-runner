@@ -417,7 +417,6 @@ where
                 .get(i)
                 .map(|w| w.worker_id)
                 .unwrap_or(i as u32);
-            let wid = worker_id.min(self.pool_mut().workers.len() as u32 - 1);
 
             let zip_ref = if zip_name.is_empty() {
                 None
@@ -436,21 +435,57 @@ where
             // (where the dispatch.rs guard now correctly fails it
             // NonRecoverable). Failing fast here makes the two paths
             // behave consistently and avoids the wasted re-enqueue.
+            // Keyed by the ORIGINAL wire `worker_id` (no clamp), the same
+            // un-clamped id the operational `dispatch_message` path reports.
             match self
-                .report_unresolvable_task(wid, &hash, &local_path, &resolved_path)
+                .report_unresolvable_task(worker_id, &hash, &local_path, &resolved_path)
                 .await
             {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
                     tracing::error!(
-                        worker_id = wid,
+                        worker_id,
                         error = %e,
                         "failed to send TaskFailed for unresolvable initial-assignment task"
                     );
                     continue;
                 }
             }
+
+            // Select the dispatch target worker SAFELY, mirroring the
+            // operational `dispatch_message` selection. Prefer the primary's
+            // requested slot IF it is a valid, idle worker; otherwise fall
+            // back to any idle worker. Both `.get()` and `position()` return
+            // `None` for an empty pool, so a 0-worker pool (an observer /
+            // late-joiner that spawned no slots) is just the degenerate "no
+            // idle worker" case — no `pool.workers.len() - 1` underflow and
+            // no unconditional index into the slice. An out-of-range
+            // `worker_id` likewise resolves to `None` on the preference and
+            // falls back to an idle worker, never silently clamped onto the
+            // last slot. `None` ⇒ skip this task's assignment (no worker can
+            // take it); the authority still holds it Pending.
+            let pool = self.pool_mut();
+            let target_wid: Option<u32> = pool
+                .workers
+                .get(worker_id as usize)
+                .filter(|w| w.is_idle_state())
+                .map(|_| worker_id)
+                .or_else(|| {
+                    pool.workers
+                        .iter()
+                        .position(|w| w.is_idle_state())
+                        .map(|i| i as u32)
+                });
+
+            let Some(wid) = target_wid else {
+                tracing::debug!(
+                    requested_worker_id = worker_id,
+                    "no idle worker for initial task assignment; leaving it for the \
+                     authority to dispatch"
+                );
+                continue;
+            };
 
             // Hydrate from the wire info first (preserves
             // phase/type/affinity/payload), then surface the locally-
@@ -466,61 +501,57 @@ where
 
             let estimated = self.estimator.estimate(&binary);
 
-            if (wid as usize) < self.pool_mut().workers.len()
-                && self.pool_mut().workers[wid as usize].is_idle_state()
+            // Per-type subprocess dispatch: bind the worker's
+            // loaded TypeId to this task's `type_id` (no-op fast
+            // path when they already match — the dominant case).
+            if let Err(e) = self
+                .pool_mut()
+                .ensure_worker_for_type(wid, &binary.type_id, factory, false)
+                .await
             {
-                // Per-type subprocess dispatch: bind the worker's
-                // loaded TypeId to this task's `type_id` (no-op fast
-                // path when they already match — the dominant case).
-                if let Err(e) = self
-                    .pool_mut()
-                    .ensure_worker_for_type(wid, &binary.type_id, factory, false)
-                    .await
-                {
+                tracing::error!(
+                    worker_id = wid,
+                    error = %e,
+                    type_id = %binary.type_id,
+                    "failed to ensure worker type for initial task; skipping"
+                );
+                continue;
+            }
+            // Snapshot for the sampler hook before the binary
+            // is moved into `assign_task`. The hook reads
+            // `task_id` off the borrowed `TaskInfo`; cloning
+            // once here keeps the success arm simple.
+            let binary_for_hook = binary.clone();
+            match self.pool_mut().workers[wid as usize]
+                .assign_task(
+                    binary,
+                    estimated,
+                    false,
+                    // Initial assignments fire at run start before
+                    // any task has produced outputs. The wire
+                    // `InitialAssignment` message carries no
+                    // `predecessor_outputs` field (there are none
+                    // to gather), so an empty map is the correct
+                    // wire shape here.
+                    std::collections::BTreeMap::new(),
+                )
+                .await
+            {
+                Ok(()) => {
+                    self.notify_sampler_assigned(wid, &binary_for_hook);
+                    self.active_tasks_mut().insert(hash, wid);
+                    tracing::info!(
+                        worker_id = wid,
+                        binary = ?binary_info.identifier,
+                        "initial task assigned"
+                    );
+                }
+                Err(e) => {
                     tracing::error!(
                         worker_id = wid,
                         error = %e,
-                        type_id = %binary.type_id,
-                        "failed to ensure worker type for initial task; skipping"
+                        "failed to assign initial task"
                     );
-                    continue;
-                }
-                // Snapshot for the sampler hook before the binary
-                // is moved into `assign_task`. The hook reads
-                // `task_id` off the borrowed `TaskInfo`; cloning
-                // once here keeps the success arm simple.
-                let binary_for_hook = binary.clone();
-                match self.pool_mut().workers[wid as usize]
-                    .assign_task(
-                        binary,
-                        estimated,
-                        false,
-                        // Initial assignments fire at run start before
-                        // any task has produced outputs. The wire
-                        // `InitialAssignment` message carries no
-                        // `predecessor_outputs` field (there are none
-                        // to gather), so an empty map is the correct
-                        // wire shape here.
-                        std::collections::BTreeMap::new(),
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.notify_sampler_assigned(wid, &binary_for_hook);
-                        self.active_tasks_mut().insert(hash, wid);
-                        tracing::info!(
-                            worker_id = wid,
-                            binary = ?binary_info.identifier,
-                            "initial task assigned"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            worker_id = wid,
-                            error = %e,
-                            "failed to assign initial task"
-                        );
-                    }
                 }
             }
         }
