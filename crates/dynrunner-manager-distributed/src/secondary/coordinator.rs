@@ -954,16 +954,20 @@ where
     /// for setup discovery (`RunOutcome::SetupPending`) or reaches a
     /// terminal state (`RunOutcome::Done`).
     ///
-    /// First invocation: runs `initialize_workers`, the setup handshake
-    /// (welcome / cert exchange / wait_for_setup) under
-    /// `config.setup_deadline`, then enters `process_tasks`.
+    /// First invocation: enters `AwaitingPrimary`, runs the setup
+    /// handshake (welcome / cert exchange / wait_for_setup) under
+    /// `config.unconfigured_deadline` — `wait_for_setup` spawns the worker
+    /// pool and enters `Configuring` on the first primary frame — then
+    /// `process_tasks` drives the `Configuring → Operational` transition
+    /// and runs the loop.
     ///
     /// Subsequent invocations (only reached on the `SetupPending`
     /// caller-loop re-entry): skip the setup phase — workers are still
     /// alive and the handshake messages have already been consumed —
-    /// and re-enter `process_tasks` directly. The re-entry guard is
-    /// `self.setup_phase_completed`, set the moment the first
-    /// invocation finishes the handshake successfully.
+    /// and re-enter `process_tasks` directly. The re-entry guard is the
+    /// `self.lifecycle.setup_phase_completed()` projection (true once the
+    /// lifecycle reaches `Operational`), which `process_tasks` flips on
+    /// the first invocation.
     ///
     /// Cleanup (`stop_all_workers` + the "secondary finished" log)
     /// fires only on the `Done` branch. On `SetupPending` the worker
