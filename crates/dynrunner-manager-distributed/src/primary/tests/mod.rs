@@ -54,9 +54,7 @@ pub(super) use dynrunner_protocol_primary_secondary::{ClusterMutation, Distribut
 #[allow(unused_imports)]
 pub(super) use dynrunner_scheduler::ResourceStealingScheduler;
 #[allow(unused_imports)]
-pub(super) use dynrunner_transport_channel::{
-    ChannelPeerTransport, ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd,
-};
+pub(super) use dynrunner_transport_channel::{ChannelPeerTransport, ChannelPrimaryTransportEnd};
 #[allow(unused_imports)]
 pub(super) use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 #[allow(unused_imports)]

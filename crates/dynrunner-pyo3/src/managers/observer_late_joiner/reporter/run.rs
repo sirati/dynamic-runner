@@ -21,6 +21,8 @@
 
 use std::time::{Duration, Instant};
 
+use dynrunner_core::IMPORTANT_TARGET;
+
 use super::format::render_report;
 use super::idle::IdleDetector;
 use super::stats::StatsSnapshot;
@@ -141,7 +143,7 @@ impl Reporter {
             // The whole report is one importance-channel event so the
             // dual-sink routes it to stdio atomically under
             // `--important-stdio-only` (C1's filter keys on the target).
-            tracing::info!(target: "dynrunner_important", "periodic cluster stats (10m):\n{report}");
+            tracing::info!(target: IMPORTANT_TARGET, "periodic cluster stats (10m):\n{report}");
             self.last_announced = snapshot.clone();
         }
     }
@@ -151,7 +153,7 @@ impl Reporter {
     pub fn on_idle_tick(&mut self, snapshot: &StatsSnapshot, now: Instant) {
         for secondary in self.idle.tick(snapshot, now) {
             tracing::info!(
-                target: "dynrunner_important",
+                target: IMPORTANT_TARGET,
                 secondary = %secondary,
                 "secondary has been idle (0 in-flight tasks) for ≥1 minute while ready work is queued"
             );

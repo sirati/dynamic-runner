@@ -38,9 +38,13 @@ use tracing_subscriber::{EnvFilter, Layer};
 
 /// Tracing target that marks an event as "important" (LLM-wake-worthy).
 /// Events emitted at this target reach stdio even in importance mode.
-/// Fixed contract: the Python side mirrors it with the child logger
-/// `dynamic_runner.important`.
-pub(crate) const IMPORTANT_TARGET: &str = "dynrunner_important";
+///
+/// Re-exported from the single cross-crate source of truth
+/// ([`dynrunner_core::IMPORTANT_TARGET`]); the Python side mirrors it with
+/// the child logger `dynamic_runner.important`. Keying the stdio filter
+/// ([`important_stdio_filter`]) on this same const is what guarantees the
+/// emit target and the gate can never diverge.
+pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
 /// Environment variable selecting importance mode. Truthy = on. Read once
 /// at [`init`]; set by Python before the first `_native` import.

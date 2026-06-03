@@ -102,7 +102,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
     ///
-    /// Keepalive rides `peer_transport.send(Address::Broadcast(
+    /// Keepalive rides `self.transport.send(Address::Broadcast(
     /// Scope::AllSecondaries), msg)` since Step 6 — the Step 5b
     /// `TunneledPeerTransport` made the primary a real mesh member, so
     /// the mesh-level broadcast reaches every connected secondary
@@ -141,7 +141,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // warn would spam the log on an already-handled state
             // transition. (Pre-Step-6 the legacy
             // `transport.broadcast` returned per-secondary failure
-            // tuples; `peer_transport.send` collapses them into a
+            // tuples; `self.transport.send` collapses them into a
             // single Err — the heartbeat-monitor is the
             // per-secondary signal, not this log line.)
             tracing::debug!(

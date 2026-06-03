@@ -1,4 +1,5 @@
 pub mod bounded_string;
+pub mod importance;
 pub mod output_gather;
 pub mod types;
 pub mod traits;
@@ -7,6 +8,7 @@ pub mod task_hash;
 pub mod spawn_tasks_validator;
 
 pub use bounded_string::BoundedString;
+pub use importance::IMPORTANT_TARGET;
 pub use output_gather::gather_predecessor_outputs;
 pub use traits::{MessageReceiver, MessageSender};
 pub use path_resolve::{resolve_against_root, ResolvedPath};
