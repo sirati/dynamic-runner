@@ -152,9 +152,13 @@ impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
         worker_id: WorkerId,
         _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
-        let socket_path = self.socket_dir.join(format!("worker_{worker_id}.sock"));
-        let manager_end = NamedSocketManagerEnd::bind(&socket_path)
+        let requested_path = self.socket_dir.join(format!("worker_{worker_id}.sock"));
+        let manager_end = NamedSocketManagerEnd::bind(&requested_path)
             .map_err(|e| format!("failed to bind named socket for worker {worker_id}: {e}"))?;
+        // `bind` hands back a per-bind-unique sibling of the requested
+        // path (respawn-unlink fix); the worker must connect to the path
+        // the endpoint actually bound, so read it back for the argv.
+        let socket_path = manager_end.socket_path().to_owned();
 
         let mut cmd = process::Command::new("python3");
         cmd.arg("-m")
@@ -202,34 +206,28 @@ impl Drop for NamedSocketWorkerFactory {
     }
 }
 
-// ROOT CAUSE (why these two named-socket tests are #[ignore]'d):
+// Respawn-unlink regression pin (was the reason these two named-socket
+// tests were #[ignore]'d):
 //
 // A worker's `loaded_type_id` is `None` until its first assignment, so the
 // pool's `ensure_worker_for_type` always fires its type-shift respawn arm on
 // the FIRST task per slot (see pool.rs — "Empty-state path: ... fires once on
-// the first assignment per slot"). That respawn:
-//   1. binds a fresh `NamedSocketManagerEnd` at the per-worker path
-//      `worker_<id>.sock` and spawns a new python3 worker that polls for it;
-//   2. then `self.workers[idx] = new_handle`, which DROPS the prior handle.
-//      `NamedSocketManagerEnd::Drop` runs `remove_file(socket_path)` on the
-//      SAME `worker_<id>.sock` the new handle just bound — deleting the file
-//      out from under the freshly-spawned worker.
-// Under the `current_thread` runtime there is no `.await` yield point between
-// the bind and the drop, so the new worker never gets a scheduling window to
-// connect before its socket file vanishes. It polls `os.path.exists(...)` for
-// 10s, raises TimeoutError, and exits; the manager's `accept()` then blocks
-// forever -> the test hangs (was: 180s CI timeout).
+// the first assignment per slot"). That respawn binds a fresh
+// `NamedSocketManagerEnd` for the slot, then `self.workers[idx] = new_handle`
+// DROPS the prior handle. Previously both binds landed on the SAME
+// `worker_<id>.sock`, so the dropped prior endpoint's
+// `NamedSocketManagerEnd::Drop` (which unlinks `self.socket_path`) deleted the
+// freshly-bound socket out from under the new worker. Under the
+// `current_thread` runtime there is no `.await` yield point between the new
+// bind and the old drop, so the deletion was deterministic and the worker
+// hung polling for its vanished socket.
 //
-// This is NOT test-infra-specific: production's `SubprocessWorkerFactory`
-// (crates/dynrunner-pyo3) reuses the same stable `worker_<id>.sock` path
-// across respawns and shares the identical bind-new-then-drop-old race. The
-// real fix lives in the transport / pool lifecycle (e.g. drop-old-before-bind-
-// new, a per-spawn-unique socket path, or making `NamedSocketManagerEnd::Drop`
-// not unlink a path a newer endpoint owns) — all OUTSIDE dynrunner-manager-
-// local. Ignored here so `cargo test` stays green; the socketpair variants
-// (which use anonymous fd pairs with no shared filesystem name) exercise the
-// same manager pipeline and pass, so coverage of the dispatch path is retained.
-#[ignore = "named-socket type-shift respawn re-binds worker_<id>.sock then the dropped prior endpoint unlinks it (current_thread: no yield window); fix belongs in dynrunner-transport-socket/pool lifecycle. Run with `cargo test -- --ignored` after that fix"]
+// Fixed in dynrunner-transport-socket: `NamedSocketManagerEnd::bind` now owns
+// a per-bind-unique on-disk filename (a `.<pid>.<gen>` sibling of the
+// requested path), so a dropped endpoint's unlink can only ever target the
+// path IT bound — never a newer endpoint's. The factory below reads the
+// actual bound path back via `socket_path()` for the worker argv. These tests
+// drive the real python3 worker over that path and assert all tasks complete.
 #[tokio::test(flavor = "current_thread")]
 async fn single_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -305,11 +303,10 @@ async fn single_worker_named_socket_processes_all() {
         .await;
 }
 
-// Same root cause as `single_worker_named_socket_processes_all` above: every
-// worker slot hits the first-assignment type-shift respawn that re-binds and
-// then unlinks `worker_<id>.sock`. See that test's comment for the full
-// analysis and where the real (out-of-scope) fix belongs.
-#[ignore = "named-socket type-shift respawn re-binds worker_<id>.sock then the dropped prior endpoint unlinks it (current_thread: no yield window); fix belongs in dynrunner-transport-socket/pool lifecycle. Run with `cargo test -- --ignored` after that fix"]
+// Same respawn-unlink regression as `single_worker_named_socket_processes_all`
+// above, across multiple worker slots: every slot hits the first-assignment
+// type-shift respawn that re-binds its endpoint. See that test's comment for
+// the full analysis and the per-bind-unique-path fix that resolves it.
 #[tokio::test(flavor = "current_thread")]
 async fn multi_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();

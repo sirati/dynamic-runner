@@ -475,9 +475,15 @@ impl SubprocessWorkerFactory {
         socket_dir: &Path,
         subcgroup_procs: Option<PathBuf>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
-        let socket_path = self.log_paths.socket_path(socket_dir, worker_id);
-        let manager_end = NamedSocketManagerEnd::bind(&socket_path)
+        let requested_path = self.log_paths.socket_path(socket_dir, worker_id);
+        let manager_end = NamedSocketManagerEnd::bind(&requested_path)
             .map_err(|e| format!("failed to bind named socket: {e}"))?;
+        // `bind` owns the on-disk filename and hands back a per-bind-
+        // unique sibling of the requested path (respawn-unlink fix), so
+        // the worker's argv MUST carry the path the endpoint actually
+        // bound — not the requested template path the worker could not
+        // connect to.
+        let socket_path = manager_end.socket_path().to_owned();
 
         let rendered = self.render_command(worker_id, runtime, FdOrSocket::Socket(&socket_path));
 
