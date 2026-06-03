@@ -98,16 +98,30 @@ pub enum SpawnError {
 /// * `is_task_present_by_hash(&str) -> bool` — is a task with the
 ///   given content hash already in the receiver's ledger? `true`
 ///   triggers `SpawnError::DuplicateTaskHash`.
-/// * `is_known_task_id(&str) -> bool` — is the given task_id known to
-///   the receiver's ledger? Used to validate `task_depends_on` entries
-///   that reference IDs outside the input batch itself. (Within-batch
-///   dependencies validate automatically — the helper unions every
-///   `task_id` from the input batch onto the known-set before walking
-///   the dep references.)
+/// * `is_known_task_id(&PhaseId, &str) -> bool` — does the receiver's
+///   ledger know the FULL `(phase_id, task_id)` identity? Used to
+///   validate `task_depends_on` entries that reference identities
+///   outside the input batch itself. (Within-batch dependencies
+///   validate automatically — the helper unions every
+///   `(phase_id, task_id)` from the input batch onto the known-set
+///   before walking the dep references.)
 ///
-/// `task_depends_on` references resolve against (a) every task_id the
-/// `is_known_task_id` closure accepts AND (b) every task_id contributed
-/// by the input batch itself, so within-batch dependencies validate.
+/// Dep resolution is keyed on the FULL `(phase_id, task_id)` identity
+/// (the same rule the scheduler-api `PendingPool::partition_ingest`
+/// ingest enforces, mirrored here because this helper lives in
+/// `dynrunner-core` and cannot depend on the scheduler-api crate that
+/// owns `partition_ingest`). The SAME `task_id` in two DIFFERENT phases
+/// is a DISTINCT task: a dep naming a phase where its `task_id` is
+/// absent is `UnknownDependency`, even if a same-named `task_id` exists
+/// in another phase — without this the task would pass pre-validation
+/// only to land silently never-runnable (the receiver's phase-aware
+/// `task_hash_for_dep` returns `None` for the mismatched phase and the
+/// apply rule treats the dep as resolved).
+///
+/// `task_depends_on` references resolve against (a) every
+/// `(phase_id, task_id)` the `is_known_task_id` closure accepts AND
+/// (b) every `(phase_id, task_id)` contributed by the input batch
+/// itself, so within-batch dependencies validate.
 pub fn validate_spawn_tasks<I, F, G>(
     is_task_present_by_hash: F,
     is_known_task_id: G,
@@ -116,20 +130,23 @@ pub fn validate_spawn_tasks<I, F, G>(
 where
     I: Identifier,
     F: Fn(&str) -> bool,
-    G: Fn(&str) -> bool,
+    G: Fn(&crate::PhaseId, &str) -> bool,
 {
     let mut errors: Vec<(usize, SpawnError)> = Vec::new();
     let mut valid_tasks: Vec<TaskInfo<I>> = Vec::with_capacity(tasks.len());
-    // Build a set of task_ids the pre-validation pass treats as
-    // known: every task_id the receiver knows PLUS every task_id
-    // contributed by the input batch (so within-batch dependencies
-    // validate). The wire-side apply rule does its own dep resolution
-    // per-task; this pre-pass surfaces failures for the caller before
-    // the broadcast happens.
-    // Every task carries a non-optional `task_id` per the framework's
-    // boundary contract; the batch-side known-set is built directly.
-    let batch_task_ids: std::collections::HashSet<String> =
-        tasks.iter().map(|t| t.task_id.clone()).collect();
+    // Build a set of full `(phase_id, task_id)` identities the
+    // pre-validation pass treats as known: every identity the receiver
+    // knows PLUS every identity contributed by the input batch (so
+    // within-batch dependencies validate). The wire-side apply rule
+    // does its own phase-aware dep resolution per-task
+    // (`task_hash_for_dep`); this pre-pass surfaces failures for the
+    // caller before the broadcast happens.
+    // Both fields are non-optional per the framework's boundary
+    // contract; the batch-side known-set is built directly.
+    let batch_identities: std::collections::HashSet<(crate::PhaseId, String)> = tasks
+        .iter()
+        .map(|t| (t.phase_id.clone(), t.task_id.clone()))
+        .collect();
     // Per-task validation pass. A task can fail multiple checks
     // (duplicate hash AND unknown dep); we surface the FIRST failure
     // per index so the caller sees one error per rejected task.
@@ -145,7 +162,10 @@ where
         }
         let mut bad_dep: Option<String> = None;
         for dep in &task.task_depends_on {
-            if !batch_task_ids.contains(&dep.task_id) && !is_known_task_id(&dep.task_id) {
+            let dep_key = (dep.phase_id.clone(), dep.task_id.clone());
+            if !batch_identities.contains(&dep_key)
+                && !is_known_task_id(&dep.phase_id, &dep.task_id)
+            {
                 bad_dep = Some(dep.task_id.clone());
                 break;
             }

@@ -350,20 +350,13 @@ where
         // supplies two closures that probe its own ledger shape.
         let (valid_tasks, errors) = validate_spawn_tasks(
             |hash| self.cluster_state.task_state(hash).is_some(),
-            |task_id| {
-                self.cluster_state.tasks_iter().any(|(_, s)| {
-                    let task = match s {
-                        crate::cluster_state::TaskState::Pending { task }
-                        | crate::cluster_state::TaskState::InFlight { task, .. }
-                        | crate::cluster_state::TaskState::Completed { task }
-                        | crate::cluster_state::TaskState::Failed { task, .. }
-                        | crate::cluster_state::TaskState::Unfulfillable { task, .. }
-                        | crate::cluster_state::TaskState::InvalidTask { task, .. }
-                        | crate::cluster_state::TaskState::Blocked { task, .. } => task,
-                    };
-                    task.task_id == task_id
-                })
-            },
+            // Phase-aware dep resolution: a dep names a full
+            // `(phase_id, task_id)`. Reuse the SAME `task_hash_for_dep`
+            // lookup `apply_tasks_spawned` uses, so the pre-validator and
+            // the apply rule agree — a dep that resolves to no ledger
+            // entry for its NAMED phase is `UnknownDependency` here
+            // rather than silently landing Pending never-runnable.
+            |phase_id, task_id| self.cluster_state.task_hash_for_dep(phase_id, task_id).is_some(),
             tasks,
         );
 

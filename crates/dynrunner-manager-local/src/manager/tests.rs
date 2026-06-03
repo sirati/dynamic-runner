@@ -287,6 +287,57 @@ async fn duplicate_task_id_is_hard_error_local() {
         .await;
 }
 
+/// Full-identity ingest parity (local manager): the SAME `task_id` in
+/// two DIFFERENT phases is a DISTINCT task, NOT a duplicate. The batch
+/// is valid per `partition_ingest`; `extend` must AGREE and not
+/// false-reject it. Both tasks run to completion.
+#[tokio::test(flavor = "current_thread")]
+async fn cross_phase_same_task_id_both_run_local() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
+
+            // Same task_id "shared" in two distinct phases.
+            let mut a = make_binary("a", 50);
+            a.phase_id = PhaseId::from("phaseA");
+            a.task_id = "shared".into();
+            let mut b = make_binary("b", 60);
+            b.phase_id = PhaseId::from("phaseB");
+            b.task_id = "shared".into();
+
+            manager
+                .process_binaries(
+                    vec![a, b],
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .expect("cross-phase same task_id must NOT be a duplicate");
+
+            assert_eq!(
+                manager.stats().completed,
+                2,
+                "both cross-phase tasks ran"
+            );
+            assert!(
+                manager.failed_tasks().is_empty(),
+                "no false invalid/duplicate rejection"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn always_restart_worker_respawns_after_success() {
     use std::sync::Arc;

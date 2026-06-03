@@ -233,3 +233,97 @@ fn update_first_match_in_place_returns_false_on_no_match() {
     let a = p.pop_for_worker(1).expect("a");
     assert!(a.preferred_secondaries.as_slice().is_empty());
 }
+
+/// Fixture variant carrying a caller-chosen `(phase, task_id)` and a
+/// list of fully-qualified `(dep_phase, dep_task_id)` deps so
+/// cross-phase identity can be expressed (the shared `t_with_id` pins
+/// each dep's phase to the item's own phase).
+fn t_cross(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<()> {
+    let mut item = t(phase, "T", "", 1);
+    item.task_id = id.to_string();
+    item.task_depends_on = deps
+        .iter()
+        .map(|(dp, dt)| TaskDep {
+            task_id: dt.to_string(),
+            phase_id: PhaseId::from(*dp),
+            inherit_outputs: false,
+        })
+        .collect();
+    item
+}
+
+/// `extend` keys duplicate detection on the FULL `(phase_id, task_id)`
+/// identity (agreeing with `partition_ingest`): the SAME `task_id` in
+/// two DIFFERENT phases is a DISTINCT task, NOT a duplicate. Pre-fix
+/// `extend` dedup'd on the bare `task_id` and FALSE-rejected this batch
+/// with `DuplicateTaskId`.
+#[test]
+fn extend_cross_phase_same_task_id_is_not_a_duplicate() {
+    let mut p = pool_with(&["A", "B"], &[]);
+    p.extend([t_cross("A", "shared", &[]), t_cross("B", "shared", &[])])
+        .expect("cross-phase same task_id must NOT be a duplicate");
+    // Both landed (one per phase bucket).
+    let ids: Vec<_> = p.iter().map(|i| i.task_id.clone()).collect();
+    assert_eq!(ids, vec!["shared".to_string(), "shared".to_string()]);
+}
+
+/// `extend`'s within-batch duplicate detection still fires when the
+/// FULL identity collides (same phase AND task_id).
+#[test]
+fn extend_same_phase_same_task_id_is_a_duplicate() {
+    let mut p = pool_with(&["A"], &[]);
+    let res = p.extend([t_cross("A", "dup", &[]), t_cross("A", "dup", &[])]);
+    assert!(matches!(res, Err(PendingPoolError::DuplicateTaskId(_))));
+}
+
+/// `extend`'s dep-existence check keys on the FULL `(phase_id, task_id)`:
+/// a dep naming a phase where the `task_id` is absent is an
+/// `UnknownTaskDep`, even though a same-named `task_id` exists in
+/// another phase. Pre-fix the bare-id resolution accepted it.
+#[test]
+fn extend_cross_phase_missing_dep_in_named_phase_is_unknown() {
+    let mut p = pool_with(&["A", "B"], &[]);
+    // `parent` exists only in phase A; `child` in B depends on
+    // (phase=B, parent) — absent in the named phase.
+    let res = p.extend([
+        t_cross("A", "parent", &[]),
+        t_cross("B", "child", &[("B", "parent")]),
+    ]);
+    match res {
+        Err(PendingPoolError::UnknownTaskDep {
+            task,
+            referenced_by,
+        }) => {
+            assert_eq!(task, "parent");
+            assert_eq!(referenced_by, "child");
+        }
+        other => panic!("expected UnknownTaskDep, got {:?}", other),
+    }
+}
+
+/// A cross-phase dep that names the RIGHT phase resolves under
+/// `extend`'s full-identity rule.
+#[test]
+fn extend_cross_phase_dep_in_named_phase_resolves() {
+    let mut p = pool_with(&["A", "B"], &[]);
+    p.extend([
+        t_cross("A", "parent", &[]),
+        t_cross("B", "child", &[("A", "parent")]),
+    ])
+    .expect("cross-phase dep naming the right phase resolves");
+}
+
+/// The cycle check keys on full `(phase_id, task_id)` node identity: a
+/// same-`task_id`-different-phase pair that depend on each other along
+/// their NAMED phases is a genuine cycle. (A regression here would let
+/// a phase-blind node-collapse hide or fabricate a cycle.)
+#[test]
+fn extend_cross_phase_cycle_uses_full_identity_nodes() {
+    let mut p = pool_with(&["A", "B"], &[]);
+    // (A,x) → (B,x) → (A,x): a real cross-phase cycle.
+    let res = p.extend([
+        t_cross("A", "x", &[("B", "x")]),
+        t_cross("B", "x", &[("A", "x")]),
+    ]);
+    assert!(matches!(res, Err(PendingPoolError::TaskDepCycle(_))));
+}

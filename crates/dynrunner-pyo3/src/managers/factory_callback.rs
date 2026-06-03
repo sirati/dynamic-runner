@@ -94,9 +94,15 @@ impl WorkerFactory<EitherManagerEnd> for PyCallbackWorkerFactory {
                 Ok((EitherManagerEnd::Socketpair(manager_end), pid))
             }
             Some(dir) => {
-                let socket_path = self.log_paths.socket_path(dir, worker_id);
-                let manager_end = NamedSocketManagerEnd::bind(&socket_path)
+                let requested_path = self.log_paths.socket_path(dir, worker_id);
+                let manager_end = NamedSocketManagerEnd::bind(&requested_path)
                     .map_err(|e| format!("failed to bind named socket: {e}"))?;
+                // `bind` owns the on-disk filename and returns a per-bind-
+                // unique sibling of the requested path (respawn-unlink
+                // fix), so the Python spawn callback must be handed the
+                // path the endpoint actually bound — that is the path the
+                // worker connects to.
+                let socket_path = manager_end.socket_path().to_owned();
                 let pid = self.invoke_spawn(
                     worker_id,
                     None,

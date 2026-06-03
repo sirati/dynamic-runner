@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use dynrunner_core::{Identifier, TaskInfo};
+use dynrunner_core::{Identifier, PhaseId, TaskInfo};
 
 use super::pool::PendingPool;
 use super::types::{Bucket, PendingPoolError, affinity_key};
@@ -20,19 +20,29 @@ impl<I: Identifier> PendingPool<I> {
     /// pushed FIFO — caller is responsible for the order it wants
     /// dispatched (typically size-DESC).
     ///
-    /// Validates `task_id` uniqueness and `task_depends_on`
-    /// well-formedness:
-    /// * `DuplicateTaskId` — a new item's `task_id` collides with
-    ///   another in the same batch, or with an existing
-    ///   queued / blocked / completed / failed task. Hard error
-    ///   because the contract is "every task_id is unique within a
-    ///   run" — a collision is a producer-side bug that would
-    ///   otherwise mask one of the colliding tasks.
-    /// * `UnknownTaskDep` — a `task_depends_on` entry references an id
-    ///   that is not present in the union of (existing pool tasks,
-    ///   batch tasks, completed tasks, failed tasks).
+    /// Validates `(phase_id, task_id)` uniqueness and `task_depends_on`
+    /// well-formedness, keyed on the FULL `(phase_id, task_id)` identity
+    /// so it AGREES with the non-mutating sibling
+    /// [`PendingPool::partition_ingest`] (the single duplicate +
+    /// dep-resolution authority): the SAME `task_id` in two DIFFERENT
+    /// phases is a DISTINCT task, and a dep names a full
+    /// `(phase_id, task_id)`.
+    ///
+    /// * `DuplicateTaskId` — a new item's `(phase_id, task_id)` collides
+    ///   with another in the same batch, or with an existing
+    ///   queued / blocked entry of the same identity, or with a
+    ///   phase-less terminal / in-flight `task_id` (the pool does not
+    ///   retain the phase for those, so a collision against a
+    ///   finished/in-flight id is a producer-side reuse bug regardless
+    ///   of phase). Hard error because the contract is "every
+    ///   `(phase_id, task_id)` is unique within a run".
+    /// * `UnknownTaskDep` — a `task_depends_on` entry names a
+    ///   `(phase_id, task_id)` absent from the union of (existing pool
+    ///   tasks, batch tasks — both keyed on full identity) AND the
+    ///   phase-less terminal / in-flight `task_id` fallback.
     /// * `TaskDepCycle` — the union dep graph (existing blocked entries
-    ///   + new batch) contains a cycle.
+    ///   unioned with the new batch), with `(phase_id, task_id)` node
+    ///   identity, contains a cycle.
     ///
     /// On error the pool is unchanged (atomic validate-then-commit).
     /// Items whose every `task_depends_on` entry is already in
@@ -47,33 +57,51 @@ impl<I: Identifier> PendingPool<I> {
     ) -> Result<(), PendingPoolError> {
         let new_items: Vec<TaskInfo<I>> = items.into_iter().collect();
 
-        // ---------- 1. Validate duplicate task_ids ----------
-        // Duplicate within batch. `task_id` is non-optional per the
+        // ---------- 1. Validate duplicate (phase_id, task_id) ----------
+        // Identity is the full `(phase_id, task_id)`, mirroring
+        // `partition_ingest`. Both fields are non-optional per the
         // boundary contract (see `dynrunner_core::types::task::TaskInfo`)
-        // so the dedup loop reads the field directly.
-        let mut seen_in_batch: HashSet<&str> = HashSet::new();
+        // so the dedup loop reads them directly.
+        //
+        // Pool-resident full identities (queued + blocked) plus the
+        // phase-less terminal / in-flight `task_id` fallback (the pool
+        // does not retain the phase for those). Computed ONCE and reused
+        // for the dep-resolution known set below.
+        let pool_full: HashSet<(PhaseId, String)> =
+            self.collect_known_phase_task_ids().into_iter().collect();
+        let known_ids_phaseless: HashSet<String> = self.collect_known_task_ids();
+        // Duplicate within batch on full identity.
+        let mut seen_in_batch: HashSet<(PhaseId, String)> = HashSet::new();
         for item in &new_items {
-            if !seen_in_batch.insert(item.task_id.as_str()) {
+            let key = (item.phase_id.clone(), item.task_id.clone());
+            if !seen_in_batch.insert(key) {
                 return Err(PendingPoolError::DuplicateTaskId(item.task_id.clone()));
             }
         }
-        // Duplicate against existing state.
-        let existing_ids = self.collect_known_task_ids();
+        // Duplicate against existing state: same full identity in the
+        // pool, OR a phase-less reuse of a finished / in-flight id.
         for item in &new_items {
-            if existing_ids.contains(item.task_id.as_str()) {
+            let key = (item.phase_id.clone(), item.task_id.clone());
+            if pool_full.contains(&key) || known_ids_phaseless.contains(item.task_id.as_str()) {
                 return Err(PendingPoolError::DuplicateTaskId(item.task_id.clone()));
             }
         }
 
         // ---------- 2. Validate every dep references a known id ----------
-        // Known = existing pool tasks ∪ batch tasks ∪ completed ∪ failed.
-        let mut known: HashSet<String> = existing_ids;
+        // Known (full identity) = existing pool tasks ∪ batch tasks. A
+        // dep resolves against its FULL `(phase_id, task_id)`, or — for a
+        // finished/in-flight prereq the pool only remembers by id — the
+        // phase-less `known_ids_phaseless` fallback.
+        let mut known_full: HashSet<(PhaseId, String)> = pool_full;
         for item in &new_items {
-            known.insert(item.task_id.clone());
+            known_full.insert((item.phase_id.clone(), item.task_id.clone()));
         }
         for item in &new_items {
             for dep in &item.task_depends_on {
-                if !known.contains(&dep.task_id) {
+                let dep_key = (dep.phase_id.clone(), dep.task_id.clone());
+                let resolves =
+                    known_full.contains(&dep_key) || known_ids_phaseless.contains(dep.task_id.as_str());
+                if !resolves {
                     return Err(PendingPoolError::UnknownTaskDep {
                         task: dep.task_id.clone(),
                         referenced_by: item.task_id.clone(),
@@ -83,53 +111,58 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         // ---------- 3. Cycle check (Kahn's on the union graph) ----------
-        // Nodes: union of (existing blocked task_ids, batch task_ids).
-        // Edges: dep → dependent. Already-completed deps are pre-resolved
-        // and excluded; already-failed deps will cascade-fail (no edge).
-        // Within-batch items contribute their full task_depends_on; existing
-        // blocked items contribute their current `task_deps[id]` set
-        // (which already excludes resolved/completed entries by construction).
-        let mut indegree: HashMap<String, usize> = HashMap::new();
-        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        // Nodes: union of (existing blocked, batch), keyed on the FULL
+        // `(phase_id, task_id)` identity so the SAME `task_id` in two
+        // phases is two DISTINCT nodes (a phase-blind collapse would
+        // both fabricate self-cycles and hide genuine cross-phase
+        // cycles). Edges: dep → dependent. Already-completed deps are
+        // pre-resolved and excluded; already-failed deps cascade-fail
+        // (no edge). Existing blocked items contribute their original
+        // `task_depends_on` (carried on the stored `TaskInfo`, with each
+        // dep's full identity) filtered by `pre_resolved` — the same
+        // treatment the batch gets. Pre-resolution is matched on the
+        // dep's bare `task_id` because the terminal sets are phase-less.
+        type Node = (PhaseId, String);
+        let mut indegree: HashMap<Node, usize> = HashMap::new();
+        let mut children_of: HashMap<Node, Vec<Node>> = HashMap::new();
         let pre_resolved =
             |dep: &str| self.completed_tasks.contains(dep) || self.failed_tasks.contains(dep);
-        // Existing blocked nodes.
-        for (id, deps) in &self.task_deps {
-            indegree.entry(id.clone()).or_insert(0);
+        let mut add_edges = |node: Node, deps: &[dynrunner_core::TaskDep]| {
+            indegree.entry(node.clone()).or_insert(0);
             for dep in deps {
-                if pre_resolved(dep) {
+                if pre_resolved(dep.task_id.as_str()) {
                     continue;
                 }
-                *indegree.entry(id.clone()).or_insert(0) += 1;
-                children_of.entry(dep.clone()).or_default().push(id.clone());
-                indegree.entry(dep.clone()).or_insert(0);
-            }
-        }
-        // New batch nodes. Every task carries a `task_id` (boundary
-        // contract); the cycle-check graph nodes are exactly the
-        // batch's task_ids unioned with the existing-blocked set.
-        for item in &new_items {
-            let id = item.task_id.clone();
-            indegree.entry(id.clone()).or_insert(0);
-            for dep in &item.task_depends_on {
-                if pre_resolved(&dep.task_id) {
-                    continue;
-                }
-                *indegree.entry(id.clone()).or_insert(0) += 1;
+                let dep_node = (dep.phase_id.clone(), dep.task_id.clone());
+                *indegree.entry(node.clone()).or_insert(0) += 1;
                 children_of
-                    .entry(dep.task_id.clone())
+                    .entry(dep_node.clone())
                     .or_default()
-                    .push(id.clone());
-                indegree.entry(dep.task_id.clone()).or_insert(0);
+                    .push(node.clone());
+                indegree.entry(dep_node).or_insert(0);
             }
+        };
+        // Existing blocked nodes: full identity + original deps.
+        for item in self.blocked.values() {
+            add_edges(
+                (item.phase_id.clone(), item.task_id.clone()),
+                &item.task_depends_on,
+            );
+        }
+        // New batch nodes.
+        for item in &new_items {
+            add_edges(
+                (item.phase_id.clone(), item.task_id.clone()),
+                &item.task_depends_on,
+            );
         }
         // Kahn's: drain zero-indegree, decrement children, count.
-        let mut queue: VecDeque<String> = indegree
+        let mut queue: VecDeque<Node> = indegree
             .iter()
             .filter_map(|(id, &d)| if d == 0 { Some(id.clone()) } else { None })
             .collect();
-        // Deterministic order: lowest id first.
-        let mut queue_vec: Vec<String> = queue.drain(..).collect();
+        // Deterministic order: lowest `(phase_id, task_id)` first.
+        let mut queue_vec: Vec<Node> = queue.drain(..).collect();
         queue_vec.sort();
         queue.extend(queue_vec);
         let mut visited = 0usize;
@@ -150,19 +183,22 @@ impl<I: Identifier> PendingPool<I> {
             }
         }
         if visited != residual.len() {
-            // Pick the lowest-id node with non-zero residual indegree as
-            // the cycle start; report the SCC walk reachable from it.
-            let mut start: Vec<String> = residual
+            // Pick the lowest-identity node with non-zero residual
+            // indegree as the cycle start; report the SCC walk reachable
+            // from it. The `TaskDepCycle` payload stays a `Vec<String>`
+            // of `task_id`s (the public error shape) — the phase lives in
+            // the node identity that drove the walk.
+            let mut start: Vec<Node> = residual
                 .iter()
                 .filter_map(|(id, &d)| if d != 0 { Some(id.clone()) } else { None })
                 .collect();
             start.sort();
             let mut cycle_walk: Vec<String> = Vec::new();
-            let mut visited_walk: HashSet<String> = HashSet::new();
+            let mut visited_walk: HashSet<Node> = HashSet::new();
             if let Some(first) = start.first() {
                 let mut cur = first.clone();
                 while visited_walk.insert(cur.clone()) {
-                    cycle_walk.push(cur.clone());
+                    cycle_walk.push(cur.1.clone());
                     let next = children_of.get(&cur).and_then(|cs| {
                         // Pick the smallest still-unresolved child to
                         // make the walk deterministic.
