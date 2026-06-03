@@ -120,27 +120,7 @@ fn distinct_count(collected: &[CollectedFailure]) -> usize {
 fn render_invalid_tasks(collected: &[CollectedFailure]) -> String {
     collected
         .iter()
-        .map(|f| {
-            let msg = f
-                .representative
-                .last_error
-                .as_deref()
-                .unwrap_or("<no message>");
-            let kind = f
-                .representative
-                .error_kind
-                .as_deref()
-                .unwrap_or("invalid_task:");
-            let repeat = if f.repeat_count > 0 {
-                format!(" (x{} other tasks)", f.repeat_count)
-            } else {
-                String::new()
-            };
-            format!(
-                "  - task {} [{}]: {}{}",
-                f.representative.task_id, kind, msg, repeat
-            )
-        })
+        .map(|f| f.render_detail_line("invalid_task:"))
         .collect::<Vec<_>>()
         .join("\n")
 }

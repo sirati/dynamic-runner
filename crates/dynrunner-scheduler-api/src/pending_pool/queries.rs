@@ -200,33 +200,4 @@ impl<I: Identifier> PendingPool<I> {
     pub fn in_flight(&self, phase_id: &PhaseId) -> u32 {
         self.in_flight_per_phase.get(phase_id).copied().unwrap_or(0)
     }
-
-    /// Count of queued items that are READY to dispatch right now: items
-    /// sitting in a bucket whose phase is `Active`. This is the
-    /// "tasks-ready-in-queue" primitive — distinct from [`Self::len`]
-    /// (which folds in in-flight + blocked) and from [`Self::iter`]
-    /// (which ignores phase state and so also surfaces items parked in
-    /// `Blocked`/`Drained`/`Done` phases that are NOT dispatchable).
-    ///
-    /// Phase filter = `Active` only. A `Blocked` phase's items are not
-    /// yet eligible; `Drained`/`Done` phases hold no live work; and a
-    /// `Draining` phase is — by the state machine's definition — one
-    /// whose queued buckets have already emptied (the empty-pool
-    /// transition is what flipped it to `Draining`), so it contributes
-    /// nothing to a queued count in steady state. Items requeued back
-    /// into a draining phase flip it to `Active` first (see
-    /// `lifecycle::requeue`), so they are counted under `Active` rather
-    /// than being lost. Restricting to `Active` keeps this accessor's
-    /// semantics exactly "items a worker could be handed this instant".
-    ///
-    /// Task-level blocked items (waiting on unresolved `task_depends_on`
-    /// prereqs) live in `self.blocked`, never in a bucket, so they are
-    /// already excluded — this counts only genuinely-ready work.
-    pub fn ready_in_active_phase(&self) -> usize {
-        self.buckets
-            .iter()
-            .filter(|(key, _)| matches!(self.phase_state.get(&key.0), Some(PhaseState::Active)))
-            .map(|(_, bucket)| bucket.items.len())
-            .sum()
-    }
 }

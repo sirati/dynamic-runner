@@ -47,11 +47,11 @@
 //! # Implementation pattern
 //!
 //! Step 10 does not rewrite the underlying connection. The same
-//! per-secondary writer / inbound channel today's
-//! [`SecondaryTransport`] (primary side) / `MessageSender +
+//! per-secondary writer / inbound channel the unified
+//! [`PeerTransport`] (primary side) / `MessageSender +
 //! MessageReceiver` (secondary side) already owns gets a
 //! **narrower-typed view** via [`SecondarySetupBootstrap`] /
-//! [`PrimarySetupBootstrap`]. The adapter wraps a `&mut T` of the
+//! [`PrimaryPeerSetupBootstrap`]. The adapter wraps a `&mut T` of the
 //! existing transport, converts between [`SetupBootstrapMessage`] and
 //! [`DistributedMessage`] at the API boundary, and forwards. This
 //! mirrors the [`TunneledPeerTransport`] pattern from Step 5b (same
@@ -69,6 +69,6 @@ pub mod trait_defs;
 #[cfg(test)]
 mod tests;
 
-pub use adapters::{PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap};
+pub use adapters::{PrimaryPeerSetupBootstrap, SecondarySetupBootstrap};
 pub use message::SetupBootstrapMessage;
 pub use trait_defs::{SetupBootstrap, SetupBootstrapBroadcast};

@@ -96,6 +96,26 @@ fn roundtrip_task_requeued() {
     }
 }
 
+/// `RunAborted` round-trips through serde with its `reason` preserved
+/// (the failure twin of `RunComplete`; carries the operator-facing abort
+/// reason that rides the wire to every connected secondary).
+#[test]
+fn roundtrip_run_aborted() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::RunAborted {
+        reason: "2 duplicate task identities in the initial batch".into(),
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::RunAborted { reason } => {
+            assert_eq!(reason, "2 duplicate task identities in the initial batch");
+        }
+        _ => panic!("expected RunAborted"),
+    }
+}
+
 /// `skip_serializing_if = "Option::is_none"` means an absent `result_data`
 /// elides from the JSON output entirely — the wire bytes are identical to
 /// the legacy bare-hash form, so new senders sending `result_data: None`

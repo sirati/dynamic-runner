@@ -62,3 +62,15 @@ pub use error::RunError;
 // `pub(super) struct` declaration on the coordinator side keeps the
 // fields scoped to siblings within `primary/`.
 pub(crate) use coordinator::{PendingMassDeath, RemoteWorkerState, SlotState};
+
+/// Settle window the authority sleeps after broadcasting a run-terminal
+/// CRDT mutation (`RunComplete` / `RunAborted`) before the dispatcher
+/// tears down its transport. Without it, a fast dispatcher exit races
+/// the broadcast and some peers miss the signal — leftover SLURM jobs in
+/// CG state for wrappers whose secondaries never saw it. 500ms is far
+/// more than the QUIC delivery latency of an in-process / podman-bridge
+/// mesh; the cost on a happy-path exit is negligible. Shared by the
+/// `RunComplete` path (`coordinator`) and the `RunAborted` path
+/// (`ingest`) so the two stay in lockstep.
+pub(crate) const PRIMARY_BROADCAST_SETTLE: std::time::Duration =
+    std::time::Duration::from_millis(500);

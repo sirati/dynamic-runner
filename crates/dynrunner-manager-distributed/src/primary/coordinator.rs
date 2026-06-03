@@ -2451,10 +2451,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Without this, fast dispatcher exits race the broadcast and
         // some peers miss the signal — the symptom is leftover SLURM
         // jobs in CG state for the wrappers whose secondaries didn't
-        // see RunComplete. 500ms is far more than the QUIC delivery
-        // latency of an in-process / podman-bridge mesh; the cost on
-        // happy-path exit is negligible.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // see RunComplete. See `PRIMARY_BROADCAST_SETTLE` for the
+        // rationale (shared with the `RunAborted` path).
+        tokio::time::sleep(super::PRIMARY_BROADCAST_SETTLE).await;
 
         if stranded > 0 {
             tracing::error!(

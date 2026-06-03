@@ -71,6 +71,39 @@ pub struct CollectedFailure {
     pub repeat_count: usize,
 }
 
+impl CollectedFailure {
+    /// Render one detail line for this failure:
+    /// `  - task <id> [<kind>]: <message>( (xN other tasks))?`.
+    ///
+    /// `default_kind` is the label used when the representative carries no
+    /// `error_kind` — the ONE knob that varies between consuming policies
+    /// (the aggregator uses `"<unknown>"`; the invalid-task monitor uses
+    /// `"invalid_task:"`). Everything else — message fallback, repeat
+    /// suffix, layout — is identical across consumers, so it lives here on
+    /// the owning type rather than being copied into each policy.
+    pub fn render_detail_line(&self, default_kind: &str) -> String {
+        let msg = self
+            .representative
+            .last_error
+            .as_deref()
+            .unwrap_or("<no message>");
+        let kind = self
+            .representative
+            .error_kind
+            .as_deref()
+            .unwrap_or(default_kind);
+        let repeat = if self.repeat_count > 0 {
+            format!(" (x{} other tasks)", self.repeat_count)
+        } else {
+            String::new()
+        };
+        format!(
+            "  - task {} [{}]: {}{}",
+            self.representative.task_id, kind, msg, repeat
+        )
+    }
+}
+
 /// The window/filter/action policy a [`WindowedFailureCollector`] is
 /// parameterised by. The primitive owns the window mechanics; the policy
 /// owns WHICH failures count, HOW LONG the window is, and WHAT happens

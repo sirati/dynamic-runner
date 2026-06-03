@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc::unbounded_channel;
 
+use dynrunner_core::IMPORTANT_TARGET;
 use dynrunner_manager_distributed::task_completed::{
     TaskCompletedEvent, run_collector, windowed_failure_collector,
 };
@@ -35,7 +36,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ImportantCapture {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if event.metadata().target() != "dynrunner_important" {
+        if event.metadata().target() != IMPORTANT_TARGET {
             return;
         }
         struct Visitor(String);
