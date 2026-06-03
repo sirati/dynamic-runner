@@ -263,3 +263,72 @@ fn local_id_reflects_constructor_arg() {
         TunneledPeerTransport::<TestId>::new("primary".into());
     assert_eq!(transport.local_id(), "primary");
 }
+
+/// Wrap a payload in a `Relay` envelope as another peer would put it
+/// on the wire toward `target` (originator path = `[sender]`).
+fn relay_envelope(
+    sender: &str,
+    target: &str,
+    inner: DistributedMessage<TestId>,
+) -> DistributedMessage<TestId> {
+    DistributedMessage::Relay {
+        sender_id: sender.into(),
+        timestamp: 1.0,
+        target_id: target.into(),
+        relay_id: 0,
+        path: vec![sender.into()],
+        inner: Box::new(inner),
+    }
+}
+
+/// The submitter behaves as a real relay peer: a `Relay` envelope from
+/// sec-A addressed to sec-B (which the submitter has a direct writer
+/// for) is FORWARDED through the submitter to sec-B and consumed —
+/// never surfaced from `recv_peer`. This is the relay capability the
+/// `Router` wiring grants: the submitter forwards a secondary-A→
+/// secondary-B frame through itself, exactly like `PeerNetwork` does.
+#[tokio::test(flavor = "current_thread")]
+async fn relay_envelope_forwarded_through_submitter_to_target() {
+    let (mut transport, mut sec_a_rx, mut sec_b_rx, tap) = fixture();
+    // sec-A reaches the submitter (via its tunnel) carrying a Relay for
+    // sec-B's writer, then a plain frame addressed at the submitter.
+    tap.send(relay_envelope("sec-A", "sec-B", keepalive("sec-A")))
+        .unwrap();
+    tap.send(keepalive("sec-A")).unwrap();
+    // recv_peer forwards the relay internally (loop, no yield) and then
+    // delivers the trailing direct frame — so the FIRST yield is the
+    // trailing frame, proving the relay was consumed not yielded.
+    // Fully deterministic: no timer, both frames are already queued.
+    let got = transport.recv_peer().await.expect("trailing frame delivers");
+    assert!(
+        matches!(got, DistributedMessage::Keepalive { .. }),
+        "first yielded frame must be the trailing direct keepalive, \
+         not the forwarded relay: {got:?}"
+    );
+    // The inner payload landed on sec-B's writer (the forward target).
+    let forwarded = sec_b_rx
+        .try_recv()
+        .expect("sec-B must receive the forwarded inner");
+    assert_eq!(forwarded.sender_id(), "sec-A");
+    // sec-A (the originator) does not receive its own relay back.
+    assert!(
+        sec_a_rx.try_recv().is_err(),
+        "originator must not receive the forward"
+    );
+}
+
+/// A `Relay` envelope addressed to the submitter ITSELF is unwrapped
+/// and the inner payload is delivered up from `recv_peer` — the
+/// receiver-side of the same `Router` fabric.
+#[tokio::test(flavor = "current_thread")]
+async fn relay_envelope_addressed_to_self_is_unwrapped() {
+    let (mut transport, _sec_a_rx, _sec_b_rx, tap) = fixture();
+    tap.send(relay_envelope("sec-A", "primary", keepalive("sec-A")))
+        .unwrap();
+    let got = transport.recv_peer().await.expect("must deliver unwrapped inner");
+    assert_eq!(got.sender_id(), "sec-A");
+    assert!(
+        matches!(got, DistributedMessage::Keepalive { .. }),
+        "delivered frame must be the unwrapped inner, not the Relay wrapper: {got:?}"
+    );
+}
