@@ -20,7 +20,7 @@ use dynrunner_manager_local::oom::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{Address, PeerTransport, Scope};
+use dynrunner_protocol_primary_secondary::{Destination, PeerId, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::{RunOutcome, SecondaryCoordinator};
@@ -252,15 +252,16 @@ where
                     }
                 } => {
                     if let Some(item) = outbox_item {
-                        let send_result = self
-                            .transport
-                            .send(
-                                dynrunner_protocol_primary_secondary::Address::Role(
-                                    dynrunner_protocol_primary_secondary::Role::Primary,
-                                ),
-                                item.msg,
-                            )
-                            .await;
+                        // Observer holdings update → the primary. Route
+                        // through the `Destination::Primary` egress edge
+                        // (NOT `send_to_primary`, whose failover-health
+                        // probe is for the secondary's own primary-link
+                        // liveness, not an observer announce). The edge
+                        // resolves the concrete primary peer; cache-cold
+                        // is surfaced back through `reply` as `Err`,
+                        // tripping the announcer's retry-with-backoff.
+                        let send_result =
+                            self.send_to(Destination::Primary, item.msg).await;
                         // A dropped `item.reply` receiver means the
                         // announcer task was aborted between
                         // `send_holdings`'s outbox push and the
@@ -319,10 +320,7 @@ where
                     self.repoll_idle_workers().await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
-                        let _ = self
-                            .transport
-                            .send(Address::Broadcast(Scope::Mesh), msg)
-                            .await;
+                        let _ = self.send_to(Destination::All, msg).await;
                     }
                 }
                 _ = oom_sample_interval.tick() => {
@@ -441,9 +439,13 @@ where
                 }
             }
 
-            // Flush any deferred peer messages
+            // Flush any deferred peer messages — each names a concrete
+            // peer secondary by id; the edge resolves `Secondary(id)` to
+            // that host's by-id transport send.
             for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
-                let _ = self.transport.send(Address::Peer(peer_id), msg).await;
+                let _ = self
+                    .send_to(Destination::Secondary(PeerId::from(peer_id)), msg)
+                    .await;
             }
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh

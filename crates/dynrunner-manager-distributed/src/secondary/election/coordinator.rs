@@ -553,13 +553,7 @@ where
             required_setup: false,
         };
         if let Err(e) = self
-            .transport
-            .send(
-                dynrunner_protocol_primary_secondary::Address::Broadcast(
-                    dynrunner_protocol_primary_secondary::Scope::Mesh,
-                ),
-                msg,
-            )
+            .send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
             .await
         {
             tracing::warn!(

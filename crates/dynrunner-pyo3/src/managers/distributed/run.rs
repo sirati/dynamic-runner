@@ -473,12 +473,19 @@ impl PyDistributedManager {
                                  mesh peer reached by id) — owned by the channel→mesh fold leaf, \
                                  not the uplink-deletion leaf"
                             );
-                            SecondaryCoordinator::new(
+                            let mut sec = SecondaryCoordinator::new(
                                 config,
                                 unified,
                                 sec_scheduler_config.build_memory_scheduler(),
                                 estimator,
-                            )
+                            );
+                            // The egress edge resolves `Destination::Primary`
+                            // to the in-process primary's id (`"primary"`)
+                            // while the role table is cold. Unreachable until
+                            // the channel→mesh fold leaf supplies the real
+                            // channel-backed mesh transport above.
+                            sec.set_bootstrap_primary_id("primary".to_string());
+                            sec
                         };
 
                         // Per-secondary panik watcher. One watcher per

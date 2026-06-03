@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, KeepaliveRole, PeerTransport, RemovalCause, Scope,
+    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerId, PeerTransport,
+    RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -102,24 +103,20 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
     ///
-    /// Keepalive rides `self.transport.send(Address::Broadcast(
-    /// Scope::AllSecondaries), msg)` since Step 6 — the Step 5b
-    /// `TunneledPeerTransport` made the primary a real mesh member, so
-    /// the mesh-level broadcast reaches every connected secondary
-    /// (over the same per-secondary tunnel writers the legacy
-    /// `transport.broadcast` previously used directly, just routed via
-    /// the mesh abstraction now). Bug class #3 collapses by virtue of
-    /// the dead per-peer writer to the promoted peer no longer being
-    /// invoked: post-demotion the new primary's writer is gone from
-    /// the shared writer table, so the broadcast iterates over the
-    /// LIVE peers only.
+    /// Keepalive rides `self.send_to(Destination::All, msg)` — the
+    /// single mesh broadcast. The primary is a real mesh member, so the
+    /// fan-out reaches every connected secondary (over the same
+    /// per-secondary tunnel writers the legacy `transport.broadcast`
+    /// used). Bug class #3 collapses by virtue of the dead per-peer
+    /// writer to the promoted peer no longer being invoked: post-demotion
+    /// the new primary's writer is gone from the shared writer table, so
+    /// the broadcast iterates over the LIVE peers only.
     ///
-    /// `Scope::AllSecondaries` is the right scope (not `Scope::Mesh`):
-    /// the primary itself is not in its own writer table — every
-    /// shared-outgoing entry is a secondary — so the two scopes resolve
-    /// identically in the current `TunneledPeerTransport` impl. The
-    /// distinction is semantic: "AllSecondaries" is what F2 actually
-    /// needs, regardless of which `PeerTransport` impl carries it.
+    /// The former `Scope::AllSecondaries` ("exclude the current primary
+    /// from the fan-out") collapses into `Destination::All`: the primary
+    /// is not in its own writer table, so the broadcast already excludes
+    /// it. "Don't send to self" is the implicit loopback rule, not a
+    /// role-flavoured broadcast scope.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
         if self.secondaries.is_empty() {
             return;
@@ -131,11 +128,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
             emitter_role: KeepaliveRole::Primary,
         };
-        if let Err(error) = self
-            .transport
-            .send(Address::Broadcast(Scope::AllSecondaries), msg)
-            .await
-        {
+        if let Err(error) = self.send_to(Destination::All, msg).await {
             // Keepalive failures are debug-level: a secondary mid-
             // disconnect generates one of these per tick until the
             // heartbeat-monitor declares it dead. Surfacing each at
@@ -261,8 +254,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let surviving: Vec<String> = self.secondaries.keys().cloned().collect();
         for peer_id in surviving {
             if let Err(e) = self
-                .transport
-                .send(Address::Peer(peer_id.clone()), timeout_msg.clone())
+                .send_to(
+                    Destination::Secondary(PeerId::from(peer_id.clone())),
+                    timeout_msg.clone(),
+                )
                 .await
             {
                 tracing::warn!(peer = %peer_id, error = %e, "TimeoutDetected delivery failed");

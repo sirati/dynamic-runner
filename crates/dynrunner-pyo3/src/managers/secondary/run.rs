@@ -394,19 +394,14 @@ impl PySecondaryCoordinator {
                 // `"primary"` — the same id baked into the primary's
                 // `PrimaryConfig::node_id` and the cert CN the QUIC dialer
                 // validates against (`NetworkClient::connect(.., "primary",
-                // ..)`), and the value `Address::Role(Role::Primary)`
-                // resolves to once the role cache warms. (The
-                // string→typed-`Destination` migration owns replacing this
-                // literal with the resolved primary host-id.)
-                //
-                // NOTE — cold-cache primary routing is NOT this leaf's
-                // concern: while no `PrimaryChanged` has been applied,
-                // `Address::Role(Role::Primary)` resolves to no holder, so
-                // the trait-default `send` surfaces a no-route `Err`.
-                // Resolving the bootstrap primary's id during the cold
-                // window (so setup `SecondaryWelcome`/`CertExchange` route
-                // before the announcement lands) is owned by the
-                // uniform-primary-announcement / typed-destination leaves.
+                // ..)`), and the host-id `Destination::Primary` resolves
+                // to. The mesh-link registration folds the dialed wire
+                // into `connections["primary"]`; the matching
+                // `set_bootstrap_primary_id("primary")` below tells the
+                // egress edge to resolve `Destination::Primary` to it
+                // while the role table is still cold (pre-`PrimaryChanged`)
+                // — so setup `SecondaryWelcome`/`CertExchange` route to
+                // the dialled primary over that folded connection.
                 peer_network.register_primary_link("primary".to_string(), client);
 
                 // Clone the estimator for the co-located primary BEFORE
@@ -423,6 +418,15 @@ impl PySecondaryCoordinator {
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
+
+                // Tell the egress edge which peer-id the bootstrap wire
+                // reaches (the conventional `"primary"`, the same id the
+                // mesh-link registration keyed the dialed connection
+                // under). The edge resolves `Destination::Primary` to it
+                // while the role table is cold (pre-`PrimaryChanged`), so
+                // setup frames route to the dialled primary before the
+                // self-announcement lands.
+                secondary.set_bootstrap_primary_id("primary".to_string());
 
                 // Swap in the Python-facing command channel so the
                 // `PrimaryHandle` Python is holding talks to the same

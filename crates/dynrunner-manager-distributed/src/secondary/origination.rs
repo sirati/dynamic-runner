@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use dynrunner_core::{BoundedString, Identifier, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
+    ClusterMutation, Destination, DistributedMessage, PeerTransport, RemovalCause,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
@@ -99,7 +99,7 @@ where
     /// `Applied`-vs-`NoOp` filter semantics stay identical), then the
     /// applied subset fans out to the mesh.
     ///
-    /// Fan-out shape: ONE `transport.send(Address::Broadcast(Scope::Mesh))`
+    /// Fan-out shape: ONE `send_to(Destination::All)` mesh broadcast
     /// reaches every mesh member. This node IS the authority here
     /// (promoted-secondary originating its own mutations), so a single
     /// mesh broadcast is the authoritative propagation — the demoted
@@ -150,11 +150,7 @@ where
         // ONE mesh broadcast — every mesh member (peers, the co-located
         // authority, any observer) receives it. Errors are logged, not
         // propagated (see method doc).
-        if let Err(e) = self
-            .transport
-            .send(Address::Broadcast(Scope::Mesh), msg)
-            .await
-        {
+        if let Err(e) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %e,
                 "ClusterMutation mesh broadcast failed"

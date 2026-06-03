@@ -63,6 +63,7 @@ where
         let mut this = Self {
             config,
             transport,
+            bootstrap_primary_id: None,
             scheduler,
             estimator,
             peer_cert_info: None,
@@ -125,17 +126,30 @@ where
         // installation contract.
         this.cluster_state
             .install_task_completed_sender(task_completed_tx);
-        // Attach the transport's write-through role cache to our
-        // authoritative `cluster_state.role_table`. The hook fires
-        // on every applied `PrimaryChanged` mutation; the cache is
-        // THE single source of "who is primary now" and serves the
-        // unified transport's `Address::Role(Role::Primary)` routing
-        // (including the promotion re-route — the role-change hook IS
-        // the re-route). Transports that don't override
-        // `register_with_cluster_state` get the default no-op.
-        this.transport
-            .register_with_cluster_state(&mut this.cluster_state);
+        // NOTE: no transport role-cache attachment. "Who is primary now"
+        // is resolved at THIS edge (`Self::send_to` reads
+        // `cluster_state.current_primary()` / the bootstrap fallback);
+        // the transport is `PeerId`-only and never mirrors the role
+        // table. The former `transport.register_with_cluster_state(..)`
+        // wiring (which subscribed a transport-resident write-through
+        // cache to drive `Address::Role(Primary)` routing) is removed —
+        // resolution moved to the edge.
         this
+    }
+
+    /// Set the bootstrap primary's peer-id — the id this secondary
+    /// dialled at startup, folded into the mesh as a routable peer. The
+    /// edge resolver ([`Self::send_to`]) uses it as the cold-cache
+    /// fallback for [`dynrunner_protocol_primary_secondary::Destination::Primary`]
+    /// before any `PrimaryChanged` warms `cluster_state.current_primary()`.
+    ///
+    /// Pre-run setter (same family as
+    /// [`Self::set_peer_cert_info`]/[`Self::register_panik_signal_rx`]),
+    /// called by the run-mode wiring alongside the transport's
+    /// mesh-link registration so the edge knows which peer-id the
+    /// bootstrap wire reaches.
+    pub fn set_bootstrap_primary_id(&mut self, primary_id: String) {
+        self.bootstrap_primary_id = Some(primary_id);
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
@@ -573,11 +587,11 @@ where
     /// snapshot JSON, the caller deserializes it into a
     /// `ClusterStateSnapshot<I>` and passes it here. Subsequent
     /// `run_until_setup_or_done` calls observe `setup_phase_completed
-    /// = true` and route straight to `process_tasks`. The role-change
-    /// hook the transport registered in `new()` fires from inside
-    /// `cluster_state.restore` so the peer-mesh role-cache is warmed
-    /// (e.g. `current_primary` is now resolvable for
-    /// `Address::Role(Role::Primary)` sends).
+    /// = true` and route straight to `process_tasks`. The
+    /// `cluster_state.restore` populates `current_primary` from the
+    /// snapshot, so the egress edge ([`Self::send_to`]) resolves
+    /// `Destination::Primary` to the live primary immediately (no
+    /// bootstrap link needed — a late-joiner never dialled one).
     pub fn restore_from_snapshot_and_skip_setup(
         &mut self,
         snap: crate::cluster_state::ClusterStateSnapshot<I>,

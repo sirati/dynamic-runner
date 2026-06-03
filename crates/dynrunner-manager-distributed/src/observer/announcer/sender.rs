@@ -43,8 +43,8 @@ pub struct AnnouncerOutboxItem<I: dynrunner_core::Identifier> {
 /// Production [`AnnouncerSender`] impl that forwards every
 /// announcement onto a coordinator-side outbox. The coordinator's
 /// operational `select!` drains the outbox and issues the actual
-/// `peer_transport.send(Address::Role(Role::Primary), msg)` call,
-/// reporting the outcome back via `reply`.
+/// `send_to(Destination::Primary, msg)` egress call, reporting the
+/// outcome back via `reply`.
 ///
 /// # Module boundary
 ///
@@ -75,16 +75,15 @@ pub struct AnnouncerOutboxItem<I: dynrunner_core::Identifier> {
 /// }
 /// ```
 ///
-/// The coordinator sends this with `Address::Role(Role::Primary)`,
-/// which the `PeerTransport::send` default impl wraps in a
-/// `RoleAddressed` envelope and routes through the write-through
-/// `RoleTable` cache (Step 3 / Step 4 of the unification refactor).
-/// Cache-cold `Address::Role` lookups error with a typed message —
-/// that surfaces back through `reply` as `Err`, which trips the
-/// retry-with-backoff loop in
-/// [`run_observer_announcer`](super::task::run_observer_announcer);
-/// the next retry will see a populated cache once `PromotePrimary`
-/// has applied.
+/// The coordinator sends this with `send_to(Destination::Primary, ..)`,
+/// which the egress edge resolves to the current primary's host peer-id
+/// (via `cluster_state.current_primary()`) and dispatches by-id. An
+/// observer never dialled a bootstrap primary, so before any
+/// `PrimaryChanged` is applied the destination is unresolvable and the
+/// send errors with a typed message — that surfaces back through `reply`
+/// as `Err`, which trips the retry-with-backoff loop in
+/// [`run_observer_announcer`](super::task::run_observer_announcer); the
+/// next retry resolves once the role table names a primary.
 pub struct PeerMeshAnnouncerSender<I: dynrunner_core::Identifier> {
     /// Sender-id stamped onto every `DistributedMessage::ClusterMutation`
     /// the announcer emits. Equal to the observer's `secondary_id` —

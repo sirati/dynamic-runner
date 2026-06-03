@@ -26,10 +26,10 @@
 //!   wire reflects the post-`PrimaryChanged` value even if multiple
 //!   role changes coalesced into one trigger.
 //! - **Out**: an [`AnnouncerSender`] trait-bound handle. Production
-//!   wiring routes the call through the observer's `PeerTransport`
-//!   via `Address::Role(Role::Primary)` (after a cross-task hop —
-//!   the transport is owned by the run-loop task, so the impl
-//!   forwards onto a coordinator-side outbox and awaits the
+//!   wiring routes the call through the coordinator's
+//!   `send_to(Destination::Primary, ..)` egress edge (after a
+//!   cross-task hop — the transport is owned by the run-loop task, so
+//!   the impl forwards onto a coordinator-side outbox and awaits the
 //!   delivery outcome). Tests pass a fake whose failure schedule is
 //!   table-driven.
 //!

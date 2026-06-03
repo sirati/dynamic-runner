@@ -93,11 +93,6 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 /// flows through the same `incoming_rx`, and the role-cache stays
 /// cold throughout because no `PromotePrimary` is exercised in this
 /// 1-secondary path).
-#[ignore = "happy path drives setup via Address::Role(Primary), which needs cold-cache primary \
-            role resolution to the bootstrap primary id — owned by the uniform-primary-announcement \
-            / typed-destination leaves, not this uplink-deletion leaf. The secondary now folds the \
-            bootstrap wire into a real PeerNetwork (both directions; no uplink), proving the routing \
-            wiring compiles and the primary is a mesh peer."]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_secondary_over_wss() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -174,6 +169,13 @@ async fn e2e_primary_secondary_over_wss() {
                         ResourceStealingScheduler::memory(),
                         FixedEstimator(100),
                     );
+                // Tell the egress edge which peer-id the dialled bootstrap
+                // wire reaches, so `Destination::Primary` resolves to it
+                // while the role table is cold (the setup window before
+                // any `PrimaryChanged`). This is what makes the primary
+                // reachable cold AND warm — the cold-primary resolution
+                // these tests pin.
+                secondary.set_bootstrap_primary_id("primary".to_string());
                 let mut factory = FakeWorkerFactory;
                 secondary.run(&mut factory).await.unwrap();
                 secondary.completed_count()
@@ -246,11 +248,6 @@ async fn e2e_primary_secondary_over_wss() {
 /// matches the WSS path (the accept loops both register through the
 /// same `new_conn_tx` channel; `drain_new_connections` mirrors into
 /// the shared writer table for both).
-#[ignore = "happy path drives setup via Address::Role(Primary), which needs cold-cache primary \
-            role resolution to the bootstrap primary id — owned by the uniform-primary-announcement \
-            / typed-destination leaves, not this uplink-deletion leaf. The secondary now folds the \
-            bootstrap wire into a real PeerNetwork (both directions; no uplink), proving the routing \
-            wiring compiles and the primary is a mesh peer."]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_secondary_over_quic() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -333,6 +330,13 @@ async fn e2e_primary_secondary_over_quic() {
                         ResourceStealingScheduler::memory(),
                         FixedEstimator(100),
                     );
+                // Tell the egress edge which peer-id the dialled bootstrap
+                // wire reaches, so `Destination::Primary` resolves to it
+                // while the role table is cold (the setup window before
+                // any `PrimaryChanged`). This is what makes the primary
+                // reachable cold AND warm — the cold-primary resolution
+                // these tests pin.
+                secondary.set_bootstrap_primary_id("primary".to_string());
                 let mut factory = FakeWorkerFactory;
                 secondary.run(&mut factory).await.unwrap();
                 secondary.completed_count()

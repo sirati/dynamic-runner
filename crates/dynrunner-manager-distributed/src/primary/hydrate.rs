@@ -453,8 +453,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// pure DERIVED CACHE of the replicated state on failover.
     ///
     /// The promoted primary reaches every secondary over the UNIFIED mesh
-    /// transport (`Address::Broadcast(Scope::AllSecondaries)` /
-    /// `Address::Peer`), NOT the per-`SecondaryConnection` `QuicConnection`
+    /// transport via the egress edge (`Destination::All` /
+    /// `Destination::Secondary(id)`), NOT the per-`SecondaryConnection` `QuicConnection`
     /// handle — that handle is the bootstrap dialer's artifact and cannot
     /// (and need not) be reconstructed here. The three heartbeat methods
     /// read only `is Operational` + the metadata fields (`num_workers`,

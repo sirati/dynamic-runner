@@ -108,28 +108,22 @@ where
         self.send_setup_frame(msg).await
     }
 
-    /// Ship one setup-phase frame to the primary role, opaquely.
+    /// Ship one setup-phase frame to the primary, opaquely.
     ///
     /// Single chokepoint for the two setup-phase sends. Keeps the
     /// narrow-typed `SetupBootstrapMessage` construction at the call
-    /// sites (the compile-time "no runtime frames during setup"
-    /// guard) while routing through the unified transport: convert to
-    /// the wire shape via the lossless `From<SetupBootstrapMessage>`
-    /// and `transport.send(Address::Role(Role::Primary), ..)`. The
-    /// role cache is cold during setup (no `PromotePrimary` yet) so the
-    /// transport resolves `Role::Primary` to the bootstrap uplink — the
-    /// original primary these frames address. No locality branching
-    /// leaks to the manager; setup is just another opaque
-    /// role-addressed send.
+    /// sites (the compile-time "no runtime frames during setup" guard)
+    /// while routing through the [`Destination::Primary`] egress edge:
+    /// convert to the wire shape via the lossless
+    /// `From<SetupBootstrapMessage>` and `send_to(Destination::Primary,
+    /// ..)`. The role table is cold during setup (no `PrimaryChanged`
+    /// yet), so the edge resolver falls back to the bootstrap primary id
+    /// — the dialled primary these frames address. No locality branching
+    /// leaks to the manager; setup is just another destination-addressed
+    /// send.
     async fn send_setup_frame(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         let wire: DistributedMessage<I> = msg.into();
-        self.transport
-            .send(
-                dynrunner_protocol_primary_secondary::Address::Role(
-                    dynrunner_protocol_primary_secondary::Role::Primary,
-                ),
-                wire,
-            )
+        self.send_to(dynrunner_protocol_primary_secondary::Destination::Primary, wire)
             .await
     }
 

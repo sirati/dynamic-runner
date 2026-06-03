@@ -216,6 +216,87 @@ pub enum Destination {
     All,
 }
 
+/// The concrete dispatch a resolved [`Destination`] maps to at the
+/// egress edge — what the coordinator hands the `PeerId`-only transport.
+///
+/// This is the output of [`resolve_destination`]: the role→peer
+/// resolution that used to live *inside* the transport (the
+/// `Address::Role(Primary)` → role-cache lookup arm) now produces one
+/// of these three transport-agnostic outcomes at the coordinator
+/// boundary, so the transport never sees a role.
+///
+/// - [`SendTarget::Peer`] — deliver to this concrete host peer-id via
+///   the transport's by-id send.
+/// - [`SendTarget::Broadcast`] — fan out to the whole mesh via the
+///   transport's broadcast.
+/// - [`SendTarget::Loopback`] — the resolved host id equals the local
+///   id; deliver to the co-located coordinator without a wire hop. The
+///   edge owns the loopback delivery (the implicit "resolved host id ==
+///   local id" rule), NOT the transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendTarget {
+    /// Resolved to the local node — deliver in-process, no wire hop.
+    Loopback,
+    /// Resolved to a concrete remote host peer-id.
+    Peer(PeerId),
+    /// The cluster broadcast.
+    Broadcast,
+}
+
+/// Resolve a typed [`Destination`] to a concrete [`SendTarget`] at the
+/// egress edge.
+///
+/// # Single concern
+///
+/// This is THE role→peer resolution, lifted out of the transport. The
+/// coordinator supplies the role facts it owns — `current_primary` (from
+/// its `ClusterState` role table), `bootstrap_primary` (the id of the
+/// peer dialled at bootstrap, known before any `PrimaryChanged` warms
+/// `current_primary`), and `local_id` (this host's peer-id) — and gets
+/// back a transport-agnostic [`SendTarget`]. The transport then sees
+/// only a `PeerId` (or a broadcast); it never resolves a role.
+///
+/// # Resolution rules
+///
+/// - [`Destination::Primary`] resolves to `current_primary ??
+///   bootstrap_primary` (by-id, cold-cache-safe — before any
+///   `PrimaryChanged` is applied, `current_primary` is `None` and the
+///   bootstrap-dialled primary is the holder). `None` only when BOTH are
+///   absent (a node with no current primary and no bootstrap link — the
+///   honest "no route to primary" the caller surfaces as `Err`, matching
+///   the prior cold-cache hard error).
+/// - [`Destination::Secondary`] / [`Destination::Observer`] resolve to
+///   the carried host peer-id directly (the id IS the host). Egress
+///   resolution is identical for both variants — the secondary/observer
+///   distinction selects the receiving coordinator at the INGRESS edge,
+///   not the outbound target.
+/// - [`Destination::All`] is the broadcast.
+/// - Any resolved host id equal to `local_id` short-circuits to
+///   [`SendTarget::Loopback`] (the implicit loopback rule) so call sites
+///   never special-case "is this me?".
+pub fn resolve_destination(
+    dst: Destination,
+    current_primary: Option<&str>,
+    bootstrap_primary: Option<&str>,
+    local_id: &str,
+) -> Option<SendTarget> {
+    let to_target = |host: &str| {
+        if host == local_id {
+            SendTarget::Loopback
+        } else {
+            SendTarget::Peer(PeerId::from(host))
+        }
+    };
+    match dst {
+        Destination::Primary => {
+            let host = current_primary.or(bootstrap_primary)?;
+            Some(to_target(host))
+        }
+        Destination::Secondary(id) | Destination::Observer(id) => Some(to_target(id.as_str())),
+        Destination::All => Some(SendTarget::Broadcast),
+    }
+}
+
 /// Replicated role bookkeeping. The authoritative owner is the
 /// downstream `ClusterState`; transports keep a write-through cache
 /// populated via [`RoleChangeHookRegistrar::register_role_change_hook`].
@@ -456,6 +537,75 @@ mod tests {
             let back: Destination = serde_json::from_str(&json).expect("deserialize Destination");
             assert_eq!(dest, back);
         }
+    }
+
+    /// `Destination::Primary` resolves to `current_primary` when warm
+    /// (post-`PrimaryChanged`), and to `bootstrap_primary` while the
+    /// role table is still cold — the cold-cache-safe by-id resolution
+    /// that lets a secondary route setup frames to the dialled primary
+    /// before any announcement lands.
+    #[test]
+    fn resolve_primary_warm_then_cold() {
+        // Warm: current_primary wins over bootstrap.
+        assert_eq!(
+            resolve_destination(Destination::Primary, Some("promoted"), Some("boot"), "sec"),
+            Some(SendTarget::Peer(PeerId::from("promoted")))
+        );
+        // Cold: no current_primary → fall back to the bootstrap id.
+        assert_eq!(
+            resolve_destination(Destination::Primary, None, Some("boot"), "sec"),
+            Some(SendTarget::Peer(PeerId::from("boot")))
+        );
+        // Neither known → unresolvable (the honest "no route to primary").
+        assert_eq!(
+            resolve_destination(Destination::Primary, None, None, "sec"),
+            None
+        );
+    }
+
+    /// A `Destination::Primary` (or a directly-addressed peer) that
+    /// resolves to the local id short-circuits to loopback — the
+    /// implicit "resolved host id == local id" rule.
+    #[test]
+    fn resolve_loopback_when_resolved_is_local() {
+        assert_eq!(
+            resolve_destination(Destination::Primary, Some("me"), Some("boot"), "me"),
+            Some(SendTarget::Loopback)
+        );
+        assert_eq!(
+            resolve_destination(
+                Destination::Secondary(PeerId::from("me")),
+                None,
+                None,
+                "me"
+            ),
+            Some(SendTarget::Loopback)
+        );
+    }
+
+    /// `Secondary(id)` and `Observer(id)` resolve identically at egress
+    /// — to the carried host id (the role distinction is an ingress-demux
+    /// concern, not an outbound-target one). `All` is the broadcast.
+    #[test]
+    fn resolve_secondary_observer_and_all() {
+        let s = resolve_destination(
+            Destination::Secondary(PeerId::from("peer-b")),
+            Some("primary"),
+            Some("primary"),
+            "peer-a",
+        );
+        let o = resolve_destination(
+            Destination::Observer(PeerId::from("peer-b")),
+            Some("primary"),
+            Some("primary"),
+            "peer-a",
+        );
+        assert_eq!(s, Some(SendTarget::Peer(PeerId::from("peer-b"))));
+        assert_eq!(s, o, "Secondary and Observer resolve identically at egress");
+        assert_eq!(
+            resolve_destination(Destination::All, Some("primary"), None, "peer-a"),
+            Some(SendTarget::Broadcast)
+        );
     }
 
     /// Distinct `Destination` variants — and same-variant destinations

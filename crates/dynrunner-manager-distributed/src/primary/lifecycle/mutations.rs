@@ -1,6 +1,6 @@
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
+    ClusterMutation, Destination, DistributedMessage, PeerTransport, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -85,21 +85,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        // Route through the unified addressing form, matching the
-        // primary keepalive path (`broadcast_primary_keepalive`):
-        // `Scope::AllSecondaries` is the primary's fan-out scope — every
-        // shared-outgoing peer is a secondary — and the default `send`
-        // impl delegates it to `broadcast`, so the wire effect is
-        // identical. The single mesh transport collapses per-secondary
-        // delivery failures into one `String` (the per-secondary signal
-        // is the heartbeat monitor, not this log line). The CRDT is
-        // idempotent, so a missed mutation is recoverable from the next
-        // snapshot RPC; we never block dispatch on universal delivery.
-        if let Err(error) = self
-            .transport
-            .send(Address::Broadcast(Scope::AllSecondaries), msg)
-            .await
-        {
+        // Route through the `Destination::All` egress edge, matching the
+        // primary keepalive path (`broadcast_primary_keepalive`) — one
+        // mesh broadcast to every member. The single mesh transport
+        // collapses per-secondary delivery failures into one `String`
+        // (the per-secondary signal is the heartbeat monitor, not this
+        // log line). The CRDT is idempotent, so a missed mutation is
+        // recoverable from the next snapshot RPC; we never block dispatch
+        // on universal delivery.
+        if let Err(error) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %error,
                 "ClusterMutation broadcast delivery failed"
@@ -314,14 +308,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             total_files: 0,
             total_bytes: 0,
         };
-        // Uniform addressing form, same `Scope::AllSecondaries` as the
-        // primary keepalive + CRDT-mutation fan-out (delegates to
-        // `broadcast` in the default `send` impl).
-        if let Err(error) = self
-            .transport
-            .send(Address::Broadcast(Scope::AllSecondaries), msg)
-            .await
-        {
+        // Uniform `Destination::All` mesh broadcast, same as the primary
+        // keepalive + CRDT-mutation fan-out.
+        if let Err(error) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %error,
                 "TransferComplete delivery failed"

@@ -6,9 +6,9 @@
 //! `TaskRequest`s per worker, and track the link-health window that
 //! arms a failover election when the primary's transport goes silent.
 //! "Where is the primary / who holds the role" is NOT this module's
-//! concern — that is owned by the transport's `RoleCache` (the single
-//! source of "who is primary") and resolved at send time via
-//! `Address::Role(Role::Primary)` dispatch.
+//! concern — that is owned by `cluster_state.current_primary()` (the
+//! single source of "who is primary") and resolved at the egress edge
+//! via `send_to(Destination::Primary, ..)`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

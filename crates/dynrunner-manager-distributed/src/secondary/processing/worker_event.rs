@@ -7,9 +7,9 @@
 //! secondary holds NO authority — it originates no CRDT mutation and
 //! drives no phase machine. Each terminal worker outcome is reported to
 //! whoever currently holds the primary role via `send_to_primary`
-//! (`Address::Role(Role::Primary)`); the authoritative
-//! `PrimaryCoordinator` owns the `ClusterMutation` origination and the
-//! mesh broadcast.
+//! (`Destination::Primary`, resolved at the egress edge); the
+//! authoritative `PrimaryCoordinator` owns the `ClusterMutation`
+//! origination and the mesh broadcast.
 
 use std::time::Duration;
 
