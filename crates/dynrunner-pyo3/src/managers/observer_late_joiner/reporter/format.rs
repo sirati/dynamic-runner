@@ -20,46 +20,93 @@
 
 use super::stats::StatsSnapshot;
 
-/// One metric's render decision. Carries the human label, the current
-/// total, and the delta versus the previous announcement.
+/// The render shape of a metric — counter, gauge, or occupancy ratio.
+/// Each shape owns its own "currently present", "changed since the last
+/// announcement", and body rendering, so the inclusion rule
+/// ([`MetricLine::render`]) is ONE uniform path (present-AND-changed)
+/// rather than per-line `if` branches.
+enum MetricShape {
+    /// A monotone counter rendered `{total}(+{Δ})` — the success /
+    /// per-failure-type lines. Present iff `total > 0`; changed iff
+    /// `delta > 0`.
+    Counter { total: usize, delta: usize },
+    /// A level gauge rendered as a bare `{total}` — the in-flight /
+    /// waiting / blocked / ready lines (a parenthetical delta on a
+    /// gauge reads as noise). Present iff `total > 0`; changed iff
+    /// `delta > 0`.
+    Gauge { total: usize, delta: usize },
+    /// An occupancy ratio rendered `{busy}/{total}`. Per the spec the
+    /// inclusion rule is: "currently >0" = `busy > 0`; "changed" =
+    /// either `busy` OR `total` differs from the last announcement.
+    Ratio {
+        busy: usize,
+        total: usize,
+        prev_busy: usize,
+        prev_total: usize,
+    },
+}
+
+/// One metric's render decision. Carries the human label and the shape
+/// that drives its inclusion + body.
 struct MetricLine {
     label: &'static str,
-    total: usize,
-    delta: usize,
-    /// `true` for the success / per-failure-type lines that render the
-    /// `{total}(+{Δ})` shape; `false` for the in-flight / waiting /
-    /// blocked / ready lines that render a bare `{total}` (they are
-    /// level gauges, not monotone counters, so a parenthetical delta
-    /// reads as noise).
-    show_delta: bool,
+    shape: MetricShape,
 }
 
 /// Outcome of rendering a single metric.
 enum Rendered {
     /// Render this line.
     Include(String),
-    /// Omit because the value is currently zero. Does NOT trigger the
-    /// footer.
+    /// Omit because the metric is not currently present (its numerator
+    /// is zero). Does NOT trigger the footer.
     OmitZero,
     /// Omit because the value is unchanged since the last announcement.
     /// Triggers the "Omitted unchanged stats." footer.
     OmitUnchanged,
 }
 
+impl MetricShape {
+    /// `true` while the metric is worth reporting at all (numerator
+    /// `> 0`): counter/gauge `total`, ratio `busy`.
+    fn present(&self) -> bool {
+        match self {
+            MetricShape::Counter { total, .. } | MetricShape::Gauge { total, .. } => *total > 0,
+            MetricShape::Ratio { busy, .. } => *busy > 0,
+        }
+    }
+
+    /// `true` if the metric moved since the last announcement: a
+    /// counter/gauge delta, or either component of a ratio.
+    fn changed(&self) -> bool {
+        match self {
+            MetricShape::Counter { delta, .. } | MetricShape::Gauge { delta, .. } => *delta > 0,
+            MetricShape::Ratio {
+                busy,
+                total,
+                prev_busy,
+                prev_total,
+            } => busy != prev_busy || total != prev_total,
+        }
+    }
+
+    fn body(&self, label: &str) -> String {
+        match self {
+            MetricShape::Counter { total, delta } => format!("{label}: {total}(+{delta})"),
+            MetricShape::Gauge { total, .. } => format!("{label}: {total}"),
+            MetricShape::Ratio { busy, total, .. } => format!("{label}: {busy}/{total}"),
+        }
+    }
+}
+
 impl MetricLine {
     fn render(&self) -> Rendered {
-        if self.total == 0 {
+        if !self.shape.present() {
             return Rendered::OmitZero;
         }
-        if self.delta == 0 {
+        if !self.shape.changed() {
             return Rendered::OmitUnchanged;
         }
-        let body = if self.show_delta {
-            format!("{}: {}(+{})", self.label, self.total, self.delta)
-        } else {
-            format!("{}: {}", self.label, self.total)
-        };
-        Rendered::Include(body)
+        Rendered::Include(self.shape.body(self.label))
     }
 }
 
@@ -82,63 +129,91 @@ pub fn render_report(cur: &StatsSnapshot, prev: &StatsSnapshot) -> Option<String
     let lines = [
         MetricLine {
             label: "succeeded",
-            total: cur.succeeded,
-            delta: delta(cur.succeeded, prev.succeeded),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.succeeded,
+                delta: delta(cur.succeeded, prev.succeeded),
+            },
         },
         MetricLine {
             label: "failed (retry)",
-            total: cur.fail_retry,
-            delta: delta(cur.fail_retry, prev.fail_retry),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.fail_retry,
+                delta: delta(cur.fail_retry, prev.fail_retry),
+            },
         },
         MetricLine {
             label: "failed (oom)",
-            total: cur.fail_oom,
-            delta: delta(cur.fail_oom, prev.fail_oom),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.fail_oom,
+                delta: delta(cur.fail_oom, prev.fail_oom),
+            },
         },
         MetricLine {
             label: "failed (final)",
-            total: cur.fail_final,
-            delta: delta(cur.fail_final, prev.fail_final),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.fail_final,
+                delta: delta(cur.fail_final, prev.fail_final),
+            },
         },
         MetricLine {
             label: "unfulfillable",
-            total: cur.unfulfillable,
-            delta: delta(cur.unfulfillable, prev.unfulfillable),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.unfulfillable,
+                delta: delta(cur.unfulfillable, prev.unfulfillable),
+            },
         },
         MetricLine {
             label: "invalid_task",
-            total: cur.invalid_task,
-            delta: delta(cur.invalid_task, prev.invalid_task),
-            show_delta: true,
+            shape: MetricShape::Counter {
+                total: cur.invalid_task,
+                delta: delta(cur.invalid_task, prev.invalid_task),
+            },
         },
         MetricLine {
             label: "in-flight",
-            total: cur.in_flight,
-            delta: delta(cur.in_flight, prev.in_flight),
-            show_delta: false,
+            shape: MetricShape::Gauge {
+                total: cur.in_flight,
+                delta: delta(cur.in_flight, prev.in_flight),
+            },
         },
         MetricLine {
             label: "waiting on deps",
-            total: cur.waiting_on_deps,
-            delta: delta(cur.waiting_on_deps, prev.waiting_on_deps),
-            show_delta: false,
+            shape: MetricShape::Gauge {
+                total: cur.waiting_on_deps,
+                delta: delta(cur.waiting_on_deps, prev.waiting_on_deps),
+            },
         },
         MetricLine {
             label: "blocked (upstream unfulfillable)",
-            total: cur.blocked,
-            delta: delta(cur.blocked, prev.blocked),
-            show_delta: false,
+            shape: MetricShape::Gauge {
+                total: cur.blocked,
+                delta: delta(cur.blocked, prev.blocked),
+            },
         },
         MetricLine {
             label: "ready in queue",
-            total: cur.ready_in_queue,
-            delta: delta(cur.ready_in_queue, prev.ready_in_queue),
-            show_delta: false,
+            shape: MetricShape::Gauge {
+                total: cur.ready_in_queue,
+                delta: delta(cur.ready_in_queue, prev.ready_in_queue),
+            },
+        },
+        MetricLine {
+            label: "busy secondaries",
+            shape: MetricShape::Ratio {
+                busy: cur.busy_secondaries,
+                total: cur.total_secondaries,
+                prev_busy: prev.busy_secondaries,
+                prev_total: prev.total_secondaries,
+            },
+        },
+        MetricLine {
+            label: "busy workers",
+            shape: MetricShape::Ratio {
+                busy: cur.busy_workers,
+                total: cur.total_workers,
+                prev_busy: prev.busy_workers,
+                prev_total: prev.total_workers,
+            },
         },
     ];
 

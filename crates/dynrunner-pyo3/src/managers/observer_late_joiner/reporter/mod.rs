@@ -25,20 +25,19 @@
 //!   * [`idle`]   — the idle-secondary gate state machine (pure).
 //!   * [`run`]    — the two-cadence driver + importance-channel emit.
 //!
-//! # Deferred extension points (left clean, NOT implemented)
+//! # Occupancy stats (Part-C addon, now implemented)
 //!
-//! * **`invalid_task` stat line.** When Part B's `TaskState::InvalidTask`
-//!   lands and `StateCounts` grows an `invalid_task` count, add the
-//!   field to [`StatsSnapshot`] (sourced from `counts().invalid_task`,
-//!   the same trap-avoidance as `unfulfillable`) and add one
-//!   `MetricLine` to `format::render_report`. No other module changes.
-//! * **Occupancy stats** `{secondaries with ≥1 task}/{total}` and
-//!   `{workers with tasks}/{total}`. The NUMERATORS are already
-//!   derivable here (`per_secondary_in_flight` gives distinct busy
-//!   secondaries; a `(secondary, worker)` set gives distinct busy
-//!   workers). The DENOMINATORS need Part D's replicated capacity
-//!   record. When it lands, source the totals through a new
-//!   `CrdtSnapshotSource`-provided field and add two `MetricLine`s.
+//! The two occupancy ratios `{secondaries with ≥1 task}/{total}` and
+//! `{workers with tasks}/{total}` are CRDT-derived in [`stats`]: the
+//! NUMERATORS from the live `TaskState::InFlight` entries
+//! (`per_secondary_in_flight.len()` for busy secondaries; a distinct
+//! `(secondary, worker)` set for busy workers) and the DENOMINATORS
+//! from Part D's replicated capacity accessors
+//! (`ClusterState::known_secondaries().count()` and
+//! `total_worker_count()`). They render in [`format`] as a
+//! `MetricShape::Ratio` `{busy}/{total}`, included only when the
+//! numerator is `> 0` and either component changed since the last
+//! announcement.
 
 pub mod format;
 pub mod idle;
@@ -53,5 +52,5 @@ mod tests;
 // `pub` in `run` (the seam contracts; the test suite + a future live
 // producer name them) but are not re-exported here until an external
 // caller needs them by short name.
-pub use run::{run_reporter, SharedSnapshotSource, TokioClock};
+pub use run::{SharedSnapshotSource, TokioClock, run_reporter};
 pub use stats::StatsSnapshot;

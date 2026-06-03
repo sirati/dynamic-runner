@@ -74,9 +74,27 @@ pub struct StatsSnapshot {
     /// secondary-id → number of `TaskState::InFlight` tasks it is
     /// running. Only secondaries with ≥1 in-flight task appear; the
     /// idle detector folds this against its accumulated known-secondary
-    /// set. Excludes the count's contribution to occupancy denominators
-    /// (those are the deferred Part-D addon).
+    /// set.
     pub per_secondary_in_flight: HashMap<String, usize>,
+    /// Occupancy NUMERATOR: distinct secondaries with ≥1 `InFlight`
+    /// task. Identically `per_secondary_in_flight.len()` (that map keys
+    /// exactly the secondaries with ≥1 in-flight task), surfaced as its
+    /// own field so the reporter need not know the map's "busy" meaning.
+    pub busy_secondaries: usize,
+    /// Occupancy DENOMINATOR: total known secondaries —
+    /// `ClusterState::known_secondaries().count()` (the CRDT roster of
+    /// every secondary with a replicated capacity record).
+    pub total_secondaries: usize,
+    /// Occupancy NUMERATOR: distinct `(secondary, worker)` pairs with an
+    /// `InFlight` task — the count of worker slots currently executing.
+    /// Collected as a set while iterating the `InFlight` entries so a
+    /// secondary running N tasks on N distinct workers contributes N
+    /// (not 1).
+    pub busy_workers: usize,
+    /// Occupancy DENOMINATOR: total advertised worker slots across every
+    /// secondary — `ClusterState::total_worker_count()` (sum of each
+    /// secondary's replicated `worker_count`).
+    pub total_workers: usize,
 }
 
 impl StatsSnapshot {
@@ -135,11 +153,22 @@ impl StatsSnapshot {
         let mut waiting_on_deps = 0usize;
         let mut ready_in_queue = 0usize;
         let mut per_secondary_in_flight: HashMap<String, usize> = HashMap::new();
+        // Distinct `(secondary, worker)` slots currently executing — the
+        // worker-occupancy numerator. A set (not a sum of the per-
+        // secondary counts) so that if the CRDT ever showed two InFlight
+        // entries pinned to the SAME slot mid-reorder the slot still
+        // counts once.
+        let mut busy_worker_slots: HashSet<(&str, dynrunner_core::WorkerId)> = HashSet::new();
 
         for (_, st) in state.tasks_iter() {
             match st {
-                TaskState::InFlight { secondary, .. } => {
-                    *per_secondary_in_flight.entry(secondary.clone()).or_insert(0) += 1;
+                TaskState::InFlight {
+                    secondary, worker, ..
+                } => {
+                    *per_secondary_in_flight
+                        .entry(secondary.clone())
+                        .or_insert(0) += 1;
+                    busy_worker_slots.insert((secondary.as_str(), *worker));
                 }
                 TaskState::Pending { task } => {
                     let deps_satisfied = task
@@ -187,6 +216,15 @@ impl StatsSnapshot {
             waiting_on_deps,
             blocked: counts.blocked,
             ready_in_queue,
+            // Occupancy numerators are derived from the live InFlight
+            // entries collected above; the denominators are read from
+            // the D1 replicated-capacity accessors. Both are pure
+            // functions of the CRDT (D1 capacity × D2 InFlight) — no
+            // authority, no pool, no primary-local state.
+            busy_secondaries: per_secondary_in_flight.len(),
+            total_secondaries: state.known_secondaries().count(),
+            busy_workers: busy_worker_slots.len(),
+            total_workers: state.total_worker_count() as usize,
             per_secondary_in_flight,
         }
     }
