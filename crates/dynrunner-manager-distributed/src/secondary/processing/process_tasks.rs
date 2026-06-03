@@ -49,6 +49,69 @@ where
     ) -> Result<RunOutcome, String> {
         tracing::info!("entering task processing loop");
 
+        // SINGLE `Configuring → Operational` boundary. On the normal path
+        // `wait_for_setup` left the lifecycle in `Configuring` (pool
+        // spawned, got_* trio landed); this transition moves the pool +
+        // the carried-forward config flags + the freshly-populated
+        // `active_tasks` into `OperationalState` and stands up the
+        // operational runtime (election `Normal`, no primary seen yet,
+        // empty peer-keepalives, a fresh `PrimaryLink` from config, empty
+        // pending collections). It is ALSO the single fire-once site where
+        // the take-once runtime latches are surrendered: we build
+        // `OperationalLatches` from the coordinator's `Option` slots and
+        // get the unwrapped handles back to drive the `select!` below.
+        //
+        // A `SetupPending` re-entry (and the late-joiner observer, which
+        // `restore_from_snapshot_and_skip_setup` landed directly in
+        // `Operational`) finds the lifecycle already `Operational`, so the
+        // transition is a no-op on the state — and the `Option::take()`s
+        // yield `None` the second time, so the loop's latch locals re-park
+        // exactly as the pre-typed flat-field flow did across the yield.
+        let latches = super::super::lifecycle::OperationalLatches {
+            lifecycle_rx: self.lifecycle_rx.take(),
+            task_completed_rx: self.task_completed_rx.take(),
+            announcer_outbox_rx: self.announcer_outbox_rx.take(),
+            panik_signal_rx: self.panik_signal_rx.take(),
+            fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
+            command_rx: self.command_rx.take(),
+            on_cluster_state_refresh: self.on_cluster_state_refresh.take(),
+            colocated_loopback_inbound_rx: self.colocated_loopback_inbound_rx.take(),
+        };
+        let primary_link = super::super::primary_link::PrimaryLink::with_failover_threshold(
+            self.config.primary_link_failure_threshold,
+            self.config.primary_link_failure_window,
+        );
+        let lifecycle = std::mem::replace(
+            &mut self.lifecycle,
+            super::super::lifecycle::SecondaryLifecycle::connecting(std::time::Instant::now()),
+        );
+        let (lifecycle, latches) = lifecycle.enter_operational(
+            latches,
+            super::super::election::ElectionState::Normal,
+            None,
+            std::collections::HashMap::new(),
+            primary_link,
+            Vec::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
+        );
+        self.lifecycle = lifecycle;
+        let super::super::lifecycle::OperationalLatches {
+            // `lifecycle_rx` / `task_completed_rx` were already consumed in
+            // `run_until_setup_or_done_inner` to spawn their dispatchers,
+            // so they are `None` here and unused by the loop; `command_rx`
+            // is transferred to the co-located primary via
+            // `take_composed_primary_wiring`, never drained by this loop.
+            lifecycle_rx: _,
+            task_completed_rx: _,
+            command_rx: _,
+            mut announcer_outbox_rx,
+            mut panik_signal_rx,
+            mut fatal_exit_signal_rx,
+            on_cluster_state_refresh,
+            mut colocated_loopback_inbound_rx,
+        } = latches;
+
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Decouple sample cadence (50ms, 20Hz) from decision cadence
         // (config-driven, default 100ms). Pre-extraction the decision
@@ -59,6 +122,7 @@ where
         // `memory.events` path (when the nested workers subgroup was
         // materialised; flat-layout fallback leaves it `None`).
         let workers_memory_events_path = self
+            .op_mut()
             .pool
             .workers_cgroup()
             .map(|h| h.workers_path().join("memory.events"));
@@ -86,65 +150,34 @@ where
         self.report_mesh_ready_if_needed().await;
 
         // Request tasks only for workers that didn't get initial assignments
-        for i in 0..self.pool.workers.len() {
-            if self.pool.workers[i].is_idle_state() {
+        let worker_count = self.op_mut().pool.workers.len();
+        for i in 0..worker_count {
+            if self.op_mut().pool.workers[i].is_idle_state() {
                 self.request_task_for_worker(i as WorkerId).await?;
             }
         }
 
-        // Take the announcer outbox receiver out of `self` for the
-        // duration of the loop so the drain arm's `recv().await` can
-        // borrow it without conflicting with the per-arm `&mut self`
-        // borrows that the other arms (peer_transport, primary_transport)
-        // require. `None` when no observer-mode caller has invoked
-        // `attach_observer_announcer` on this coordinator — the arm
-        // then parks on `pending().await` and is structurally a no-op,
-        // matching the `command_rx` / `matcher_trigger_rx` shape on
-        // the primary. Put back on `self` at loop exit so a future
-        // re-entry (test-driven; the production single-shot path
-        // exits via Done) re-attaches the same channel.
-        let mut announcer_outbox_rx = self.announcer_outbox_rx.take();
-
-        // Same shape for the panik-watcher signal: taken out of `self`
-        // for the duration of the loop so the panik arm's `await` can
-        // own the receiver. `None` when the PyO3 wrapper did not call
-        // `register_panik_signal_rx` (operator passed no `--panik-file`
-        // flags / Rust-only tests skip the watcher); the arm parks on
-        // `pending().await` and never fires in that case. `Some` only
-        // fires once (oneshot); after the signal arrives the receiver
-        // is dropped — subsequent iterations of the loop find the local
-        // `Option` empty and re-park, but the panik handler returns
-        // `RunOutcome::PanikShutdown` immediately so the loop is about
-        // to exit anyway.
+        // `announcer_outbox_rx`, `panik_signal_rx`, `fatal_exit_signal_rx`,
+        // and `on_cluster_state_refresh` were surrendered into the loop's
+        // locals at the single `enter_operational` latch boundary above
+        // (the take-once carrier), so they own their receivers across the
+        // `select!` iterations exactly as the pre-typed flat-field flow
+        // did with per-field `Option::take()`. Each is `None` when its
+        // registration never happened (no observer announcer / no
+        // `--panik-file` / no fatal-exit policy / no refresh consumer) and
+        // the matching arm parks on `pending()`.
         //
-        // Grace for the SIGTERM → SIGKILL escalation on the worker
-        // pool is 5s — same window the SubprocessWorkerFactory uses
-        // for its own teardown ladder, so the framework's two
-        // shutdown paths (clean exit and panik) give workers the
-        // same amount of time to flush.
-        let mut panik_signal_rx = self.panik_signal_rx.take();
+        // Grace for the SIGTERM → SIGKILL escalation on the worker pool is
+        // 5s — same window the SubprocessWorkerFactory uses for its own
+        // teardown ladder.
         const PANIK_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-        // Externally-armed fatal-exit signal (the observer's invalid_task
-        // monitor; see `register_fatal_exit_signal_rx`). Taken out for the
-        // loop duration so the arm's `await` owns the receiver across
-        // iterations, identical discipline to `panik_signal_rx`. `None`
-        // when no such policy was attached → the arm parks on `pending()`.
-        let mut fatal_exit_signal_rx = self.fatal_exit_signal_rx.take();
-
-        // Externally-registered cluster-state refresh callback (the
-        // observer's live-snapshot feed; see
-        // `register_cluster_state_refresh`). Taken out for the loop
-        // duration so its periodic-tick arm owns the closure across
-        // iterations, identical discipline to `fatal_exit_signal_rx`.
-        // `None` when no consumer registered → the tick fires but the
-        // arm's body has no closure to invoke. The matching
-        // `tokio::time::interval` is built here so the first tick lands
-        // one full period in (the just-restored snapshot is already
-        // published by the integration site before the loop starts, so
-        // re-publishing it at t=0 would be redundant); `MissedTickBehavior::Skip`
-        // keeps a stalled loop from bursting catch-up ticks.
-        let on_cluster_state_refresh = self.on_cluster_state_refresh.take();
+        // The cluster-state refresh interval is built here so the first
+        // tick lands one full period in (the just-restored snapshot is
+        // already published by the integration site before the loop
+        // starts, so re-publishing it at t=0 would be redundant);
+        // `MissedTickBehavior::Skip` keeps a stalled loop from bursting
+        // catch-up ticks.
         let mut cluster_state_refresh_interval =
             tokio::time::interval(CLUSTER_STATE_REFRESH_INTERVAL);
         cluster_state_refresh_interval
@@ -178,7 +211,24 @@ where
             // `MessageReceiver` doc and `UnifiedSecondaryTransport`).
             // `interval.tick` is itself cancel-safe per tokio docs.
             tokio::select! {
-                event = self.pool.recv_event() => {
+                // The pool lives inside `OperationalState`. The recv
+                // future is built via the `self.lifecycle.operational_mut()`
+                // FIELD path (a partial borrow of `self.lifecycle`), NOT
+                // the `op_mut()` coordinator method (which borrows ALL of
+                // `self` and would conflict with the sibling
+                // `self.transport.recv_peer()` arm). The two recv futures
+                // then borrow disjoint fields (`self.lifecycle` vs
+                // `self.transport`), and both borrows release the moment
+                // `select!` picks a winner, so the arm BODIES are free to
+                // use `&mut self` methods. The `expect` is sound: this loop
+                // runs only after the `enter_operational` transition above.
+                event = self
+                    .lifecycle
+                    .operational_mut()
+                    .expect("process_tasks loop runs only when Operational")
+                    .pool
+                    .recv_event() =>
+                {
                     if let Some(event) = event {
                         let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
@@ -209,6 +259,36 @@ where
                                  exiting cleanly"
                             );
                             break;
+                        }
+                    }
+                }
+                // Co-located primary LOOPBACK inbound (channel CH1). On a
+                // multi-role host the co-located `PrimaryCoordinator`'s
+                // egress (own-host `TaskAssignment` loopback + its
+                // `Destination::All` broadcast leg) sends into the matching
+                // sender; this arm drains the receiver and feeds each frame
+                // through `handle_inbound` EXACTLY as a wire frame, so a
+                // loopback `TaskAssignment` / `ClusterMutation` /
+                // `RunComplete` is processed identically to a
+                // mesh-delivered one. `None` (no co-located primary
+                // composed — every non-pyo3 path) ⇒ the arm parks on
+                // `pending()` and never fires, same idiom as the announcer
+                // / panik arms. A `Some(None)` (channel closed: the
+                // co-located primary dropped its sender) drops the rx so a
+                // later iteration re-parks. `mpsc::Receiver::recv` is
+                // cancel-safe.
+                loopback = async {
+                    match colocated_loopback_inbound_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match loopback {
+                        Some(frame) => {
+                            self.handle_inbound(frame, factory).await;
+                        }
+                        None => {
+                            colocated_loopback_inbound_rx = None;
                         }
                     }
                 }
@@ -327,7 +407,7 @@ where
                     // Fast sample tick: refresh per-worker RSS, read
                     // host + cgroup state, evaluate structured-log
                     // triggers. No scheduler call.
-                    oom_watcher.on_sample(&mut self.pool);
+                    oom_watcher.on_sample(&mut self.op_mut().pool);
                 }
                 _ = oom_decision_interval.tick() => {
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
@@ -441,8 +521,12 @@ where
 
             // Flush any deferred peer messages — each names a concrete
             // peer secondary by id; the edge resolves `Secondary(id)` to
-            // that host's by-id transport send.
-            for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
+            // that host's by-id transport send. Drain into an owned Vec
+            // (the `OperationalState` accessor `std::mem::take`s the
+            // queue) so the operational borrow ends before the per-message
+            // `send_to` (which re-borrows `self`).
+            let pending = self.op_mut().drain_pending_peer_messages();
+            for (peer_id, msg) in pending {
                 let _ = self
                     .send_to(Destination::Secondary(PeerId::from(peer_id)), msg)
                     .await;
@@ -527,7 +611,13 @@ where
             // finishes — they have no way to distinguish "run is
             // genuinely over" from "primary just crashed", so they
             // hold their SLURM job slots indefinitely.
-            if self.cluster_state.run_complete() && self.active_tasks.is_empty() {
+            // `active_tasks` now lives in `OperationalState`; the loop is
+            // always `Operational` here, so `op_ref()` is `Some`. (Read
+            // `run_complete()` first — it borrows `cluster_state`, a
+            // disjoint field from the operational state.)
+            let run_complete = self.cluster_state.run_complete();
+            let no_active_tasks = self.op_ref().map(|op| op.active_tasks.is_empty()).unwrap_or(true);
+            if run_complete && no_active_tasks {
                 tracing::info!("RunComplete signal received from primary; exiting");
                 break;
             }
@@ -548,7 +638,7 @@ where
             // re-engages the fresh subprocess with the primary's
             // pool.
             let mut restart_set: HashSet<WorkerId> = workers_to_restart.into_iter().collect();
-            restart_set.extend(self.pending_worker_restarts.drain());
+            restart_set.extend(self.op_mut().pending_worker_restarts.drain());
             for wid in restart_set {
                 // Active SIGKILL before restart so a stuck or
                 // otherwise non-responsive worker is dead BEFORE
@@ -563,8 +653,8 @@ where
                 // already decided this slot is going to be
                 // replaced, so the worker doesn't get a chance
                 // to react.
-                self.pool.workers[wid as usize].kill_subprocess();
-                if let Err(e) = self.pool.restart_worker(wid, factory, false).await {
+                self.op_mut().pool.workers[wid as usize].kill_subprocess();
+                if let Err(e) = self.op_mut().pool.restart_worker(wid, factory, false).await {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }

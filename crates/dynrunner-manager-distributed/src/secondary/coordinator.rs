@@ -9,15 +9,13 @@
 //! and the per-arm wire handlers all live in their own modules; this
 //! file is the entry-point catch-all.
 
-use std::collections::{HashMap, HashSet};
-
 use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
-use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
 use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
@@ -36,10 +34,6 @@ where
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
         let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
-        let primary_link = PrimaryLink::with_failover_threshold(
-            config.primary_link_failure_threshold,
-            config.primary_link_failure_window,
-        );
         // Peer-lifecycle dispatcher channel. Built at construction so
         // the `cluster_state` apply path has an installed sender
         // from the first `PeerJoined`/`PeerRemoved` mutation; the
@@ -67,29 +61,25 @@ where
             scheduler,
             estimator,
             peer_cert_info: None,
-            pool: WorkerPool::new(),
-            active_tasks: HashMap::new(),
             #[cfg(test)]
             local_tasks_run: 0,
-            transfer_complete: false,
             extraction_cache,
-            peer_keepalives: HashMap::new(),
-            primary_last_seen: None,
-            election: super::election::ElectionState::Normal,
-            pending_peer_messages: Vec::new(),
-            primary_link,
-            peer_mesh_check_at: None,
-            peer_dial_count: 0,
-            mesh_ready_sent: false,
-            pre_staged_mode: false,
-            setup_discovery_done: false,
-            uses_file_based_items: true,
+            // The lifecycle begins as `Connecting` the moment the
+            // coordinator is built; `since` anchors the long
+            // `unconfigured_deadline` that governs the whole
+            // pre-`Operational` span. The worker pool, election,
+            // keepalive tracking, and primary link do NOT exist yet —
+            // they are constructed at the `AwaitingPrimary → Configuring`
+            // and `Configuring → Operational` transitions, which is what
+            // makes a pre-`Configuring` worker-spawn / task-accept
+            // unrepresentable by construction.
+            lifecycle: SecondaryLifecycle::connecting(std::time::Instant::now()),
+            // The orthogonal peer-mesh sub-concern starts in its resting
+            // pre-dial state, carried across the lifecycle's config states
+            // (it begins forming on the unconfigured peer).
+            mesh: super::lifecycle::MeshFormation::default(),
             fatal_exit: None,
-            peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
-            pending_worker_restarts: HashSet::new(),
-            pending_first_bind: HashMap::new(),
-            setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,
@@ -110,6 +100,12 @@ where
             // post-`initialize_workers` — see the doc on the
             // `sampler` field for the runtime-context rationale.
             sampler: None,
+            // Co-located loopback channels — registered by the pyo3
+            // composition (`register_colocated_*`) only when this host
+            // also runs a parked co-located primary. `None` everywhere
+            // else (the forward / drain become no-ops).
+            colocated_primary_inbound_tx: None,
+            colocated_loopback_inbound_rx: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -150,6 +146,147 @@ where
     /// bootstrap wire reaches.
     pub fn set_bootstrap_primary_id(&mut self, primary_id: String) {
         self.bootstrap_primary_id = Some(primary_id);
+    }
+
+    /// `&mut` access to the operational state. The operational handlers
+    /// (worker dispatch, election, keepalive, the task-completion / OOM
+    /// paths) are reachable ONLY through this accessor — they are
+    /// unrepresentable while the lifecycle is `Connecting` /
+    /// `AwaitingPrimary` / `Configuring` (those variants carry no
+    /// [`super::lifecycle::OperationalState`]).
+    ///
+    /// `expect`-unwrapped rather than `Option`-returning because every
+    /// caller is an operational-loop handler that physically runs only
+    /// after `enter_operational` (the `process_tasks` select! arms, the
+    /// per-frame dispatch reached from `handle_inbound`, the keepalive /
+    /// election / OOM ticks). Reaching it in a pre-`Operational` state is
+    /// a coordinator-internal logic bug, not a runtime condition to
+    /// recover from — the panic is the loud signal the type invariant was
+    /// violated. (The handlers that legitimately run pre-`Operational` —
+    /// `apply_cluster_mutations` from `wait_for_setup`, the setup-frame
+    /// sends — touch only `cluster_state` / `transport` / config, never
+    /// this state.)
+    #[track_caller]
+    pub(in crate::secondary) fn op_mut(
+        &mut self,
+    ) -> &mut super::lifecycle::OperationalState<M, I> {
+        self.lifecycle.operational_mut().expect(
+            "operational handler reached before the lifecycle entered Operational — \
+             type-invariant violation (worker dispatch / election / keepalive are \
+             reachable only from OperationalState)",
+        )
+    }
+
+    /// `&` access to the operational state, iff the lifecycle has reached
+    /// `Operational`. `None` in every pre-`Operational` / terminal state.
+    /// Used by the read-only paths that may run before the loop is fully
+    /// operational (e.g. the mesh watchdog's keepalive-active count).
+    pub(in crate::secondary) fn op_ref(
+        &self,
+    ) -> Option<&super::lifecycle::OperationalState<M, I>> {
+        self.lifecycle.operational_ref()
+    }
+
+    /// `&mut` access to the worker pool from whichever state carries it
+    /// (`Configuring` or `Operational`). `expect`-unwrapped: the
+    /// pool-touching handlers run only after the pool was spawned at the
+    /// `AwaitingPrimary → Configuring` entry. Used by handlers shared
+    /// between the configuration and operational phases (the
+    /// `report_unresolvable_task` fail-loud guard, the initial-assignment
+    /// dispatch).
+    #[track_caller]
+    pub(in crate::secondary) fn pool_mut(
+        &mut self,
+    ) -> &mut dynrunner_manager_local::pool::WorkerPool<M, I> {
+        self.lifecycle.pool_mut().expect(
+            "worker pool reached before the lifecycle entered Configuring — \
+             type-invariant violation (the pool is spawned at the \
+             AwaitingPrimary → Configuring entry)",
+        )
+    }
+
+    /// `&` (shared) sibling of [`Self::pool_mut`]. `None` pre-`Configuring`
+    /// / terminal. Used by the read-only sampler hooks (which fire from
+    /// both the initial-assignment and operational dispatch sites).
+    pub(in crate::secondary) fn pool_ref(
+        &self,
+    ) -> Option<&dynrunner_manager_local::pool::WorkerPool<M, I>> {
+        self.lifecycle.pool_ref()
+    }
+
+    /// `&mut` access to the OWN-worker `active_tasks` map from whichever
+    /// state carries it (`Configuring` or `Operational`). `expect`-
+    /// unwrapped: own-worker tracking runs only after the pool spawned (it
+    /// is first populated by the `InitialAssignment` dispatch in
+    /// `Configuring`). Used by the initial-assignment dispatch site, which
+    /// runs in `Configuring` (`op_mut()` would panic there).
+    #[track_caller]
+    pub(in crate::secondary) fn active_tasks_mut(
+        &mut self,
+    ) -> &mut std::collections::HashMap<String, dynrunner_core::WorkerId> {
+        self.lifecycle.active_tasks_mut().expect(
+            "active_tasks reached before the lifecycle entered Configuring — \
+             type-invariant violation (own-worker tracking starts at the \
+             InitialAssignment dispatch in Configuring)",
+        )
+    }
+
+    /// Whether the peer mesh has latched into its degraded state (the
+    /// watchdog deadline elapsed with zero connected peers). Read
+    /// accessor over the orthogonal [`super::lifecycle::MeshFormation`]
+    /// sub-concern — a degraded mesh is NOT fatal; only the
+    /// peer-mesh-dependent paths (failover election, peer-keepalive
+    /// broadcasts) consult this to fail-loud-or-skip.
+    pub(in crate::secondary) fn is_mesh_degraded(&self) -> bool {
+        self.mesh.degraded
+    }
+
+    /// Register the co-located primary's INBOUND sender (channel CH2).
+    ///
+    /// The composed runtime (pyo3 secondary wrapper) builds both
+    /// coordinators on one host and connects them with two unbounded
+    /// channels. CH2 carries the secondary→primary direction: when this
+    /// host holds the primary role, [`Self::handle_inbound`] forwards
+    /// every `is_primary_facing` frame into this sender (so the
+    /// co-located `PrimaryCoordinator`'s `recv_peer` drains it), and the
+    /// secondary's own-host terminal reports route here via the
+    /// [`Self::send_to`] `Loopback` arm. `None` (no co-located primary
+    /// composed — every non-pyo3 path) leaves the forward a no-op.
+    ///
+    /// Pre-`run_until_setup_or_done` contract, same one-shot shape as
+    /// [`Self::register_promote_activation`]: the slot is `take`-n into
+    /// the operational loop's latches at the `enter_operational`
+    /// boundary.
+    pub fn register_colocated_primary_inbound(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<
+            dynrunner_protocol_primary_secondary::DistributedMessage<I>,
+        >,
+    ) {
+        self.colocated_primary_inbound_tx = Some(tx);
+    }
+
+    /// Register the co-located primary's loopback RECEIVER (channel CH1).
+    ///
+    /// CH1 carries the primary→secondary direction: the co-located
+    /// `PrimaryCoordinator`'s egress (own-host `TaskAssignment` loopback +
+    /// the `Destination::All` broadcast leg) sends into the matching
+    /// sender, and the secondary drains this receiver in its operational
+    /// `select!` loop alongside `transport.recv_peer`, feeding each frame
+    /// through [`Self::handle_inbound`] exactly as a wire frame so a
+    /// loopback `TaskAssignment` / `ClusterMutation` / `RunComplete` is
+    /// processed identically to a mesh-delivered one. `None` outside a
+    /// co-located composition — the drain arm parks on `pending()`.
+    ///
+    /// Pre-`run_until_setup_or_done` contract, one-shot: the receiver is
+    /// `take`-n into the operational loop on first entry.
+    pub fn register_colocated_loopback_inbound(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<
+            dynrunner_protocol_primary_secondary::DistributedMessage<I>,
+        >,
+    ) {
+        self.colocated_loopback_inbound_rx = Some(rx);
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
@@ -424,7 +561,10 @@ where
     /// `InitialAssignment`. The flag is read directly at the resolution
     /// site (`expected_content_hash` selection); no getter is needed.
     pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
-        self.pre_staged_mode = on;
+        // Written from `wait_for_setup`'s `InitialAssignment` handler,
+        // which runs in `Configuring`; the flag is carried forward into
+        // `Operational` at `enter_operational`.
+        self.lifecycle.set_pre_staged_mode(on);
     }
 
     /// Single source of truth for the setup-discovery `SetupPending`
@@ -448,7 +588,9 @@ where
     /// empty discovery never re-yields. Legacy / failover runs leave
     /// `pre_staged_mode` false, so the predicate is always false there.
     pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
-        self.pre_staged_mode && !self.setup_discovery_done && self.cluster_state.task_count() == 0
+        self.lifecycle.pre_staged_mode()
+            && !self.lifecycle.setup_discovery_done()
+            && self.cluster_state.task_count() == 0
     }
 
     /// Whether dispatched task items back to real files (default true).
@@ -457,11 +599,11 @@ where
     /// resolution.
     #[allow(dead_code)]
     pub(in crate::secondary) fn uses_file_based_items(&self) -> bool {
-        self.uses_file_based_items
+        self.lifecycle.uses_file_based_items()
     }
 
     pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
-        self.uses_file_based_items = on;
+        self.lifecycle.set_uses_file_based_items(on);
     }
 
     /// Single source of truth for "given the wire's `local_path`,
@@ -493,14 +635,14 @@ where
         local_path: &str,
         file_hash: &str,
     ) -> Option<std::path::PathBuf> {
-        if !self.uses_file_based_items {
+        if !self.lifecycle.uses_file_based_items() {
             return Some(std::path::PathBuf::from(local_path));
         }
         // In pre-staged mode the primary doesn't compute a content
         // hash (no transfer), so pass None and let the resolver
         // accept by existence. Otherwise hash-verify like the
         // historical path.
-        let expected_content_hash = if self.pre_staged_mode {
+        let expected_content_hash = if self.lifecycle.pre_staged_mode() {
             None
         } else {
             Some(file_hash)
@@ -597,7 +739,31 @@ where
         snap: crate::cluster_state::ClusterStateSnapshot<I>,
     ) {
         self.cluster_state.restore(snap);
-        self.setup_phase_completed = true;
+        // Land the lifecycle directly in `Operational` with an EMPTY pool
+        // (a pure observer / late-joiner runs no workers). This replaces
+        // the old `setup_phase_completed = true` bool poke: the lifecycle
+        // projection `setup_phase_completed()` is true for `Operational`,
+        // so the next `run_until_setup_or_done` skips the
+        // welcome/cert/wait-for-setup handshake and routes straight to
+        // `process_tasks`. Observer non-candidacy is a role capability
+        // gate (the election machine refuses `Candidate` when
+        // `config.is_observer`), NOT a parallel lifecycle variant — hence
+        // a direct `Operational` construction.
+        //
+        // The take-once runtime latches are NOT consumed here: they stay
+        // on the coordinator's `Option` fields and are surrendered at the
+        // SINGLE `process_tasks`-entry boundary (uniform with the normal
+        // path), so this constructs the state shell with an empty
+        // `OperationalLatches` and discards it. The `PrimaryLink` is built
+        // fresh from config, exactly as the normal `Operational` entry
+        // does.
+        let primary_link = PrimaryLink::with_failover_threshold(
+            self.config.primary_link_failure_threshold,
+            self.config.primary_link_failure_window,
+        );
+        let (lifecycle, _empty) =
+            SecondaryLifecycle::operational_observer(OperationalLatches::empty(), primary_link);
+        self.lifecycle = lifecycle;
     }
 
     /// Cluster-wide count of successfully-completed tasks, read off the
@@ -699,7 +865,7 @@ where
         worker_id: dynrunner_core::WorkerId,
         handle: dynrunner_manager_local::cgroup::SubcgroupHandle,
     ) {
-        self.pool.workers[worker_id as usize].subcgroup = Some(handle);
+        self.pool_mut().workers[worker_id as usize].subcgroup = Some(handle);
     }
 
     /// Run the secondary coordination loop:
@@ -853,7 +1019,28 @@ where
             );
             self.task_completed_dispatcher_handle = Some(handle);
         }
-        if !self.setup_phase_completed {
+        // Enter `AwaitingPrimary` (`Connecting → AwaitingPrimary`): the
+        // secondary is now actively trying to reach a primary, but none
+        // has announced yet. The peer mesh keeps forming (the orthogonal
+        // `MeshFormation` sub-concern is untouched by this transition).
+        // No worker pool, no task acceptance, no election, no keepalive in
+        // this state — only the setup handshake below. Idempotent: a no-op
+        // from any state other than `Connecting` (a `SetupPending`
+        // re-entry is already `Operational`, so this leaves it unchanged).
+        self.lifecycle = std::mem::replace(
+            &mut self.lifecycle,
+            SecondaryLifecycle::connecting(std::time::Instant::now()),
+        )
+        .enter_awaiting_primary();
+
+        // Skip the per-secondary setup phase once the lifecycle has
+        // reached `Operational` (or terminal) — the `setup_phase_completed`
+        // projection replaces the old flat bool latch. This gates a
+        // `SetupPending` re-entry (already `Operational`, so workers are
+        // alive and the handshake frames are already consumed) and the
+        // late-joiner observer (which `restore_from_snapshot_and_skip_setup`
+        // landed directly in `Operational`).
+        if !self.lifecycle.setup_phase_completed() {
             tracing::info!(
                 secondary = %self.config.secondary_id,
                 workers = self.config.num_workers,
@@ -861,57 +1048,38 @@ where
                 "secondary starting"
             );
 
-            // Initialize workers (local pool — no network, no deadline).
-            self.initialize_workers(factory).await?;
+            // NOTE: the worker pool and the memprofile sampler are NO
+            // LONGER built here. The typed lifecycle relocates the spawn
+            // to the `AwaitingPrimary → Configuring` entry, fired by
+            // `wait_for_setup` on the FIRST primary-originated setup frame
+            // (the announce). If the primary never announces, the
+            // lifecycle never leaves `AwaitingPrimary` and no worker pool
+            // is ever built. See `enter_configuring_on_first_primary_frame`.
 
-            // Construct the per-task memory-profile sampler if the
-            // operator enabled it via `config.output_dir`. Deferred
-            // to here (and not `SecondaryCoordinator::new`) because
-            // the sampler spawns a background tokio task on the
-            // current runtime — at construction time the caller may
-            // not be inside one. Built AFTER `initialize_workers`
-            // so a failure there returns without leaking a sampler
-            // background task; built BEFORE `wait_for_setup` so the
-            // initial-assignment hook on
-            // `handle_initial_assignment` (the secondary's first
-            // assign site) captures the first batch of tasks too.
-            //
-            // The same `output_dir.is_some()` predicate also drove
-            // `mem_manager_reserved_bytes` to `Some(0)` in
-            // `initialize_workers`, but cgroup setup may still
-            // gracefully return without per-worker leaves on a host
-            // that doesn't expose delegated cgroup-v2. In that case
-            // `WorkerHandle.subcgroup` is `None` and
-            // `notify_sampler_assigned` silently skips per-task
-            // profile creation — operators see the warn emitted at
-            // setup time and no `.jsonl.zst` files appear. We
-            // construct the sampler regardless so its event queue
-            // exists for non-cgroup messages (Disconnected fan-out)
-            // and the secondary-side lifecycle test can pin
-            // construction independently of cgroup-v2 availability.
-            // Mirrors `LocalManager::process_binaries`.
-            if self.sampler.is_none()
-                && let Some(dir) = self.config.output_dir.as_ref()
-            {
-                self.sampler = Some(
-                    dynrunner_manager_local::memprofile::MemProfileSampler::spawn(
-                        dynrunner_manager_local::memprofile::MemProfileConfig::new(dir.clone()),
-                    ),
-                );
-            }
-
-            // Network-touching setup (Phases 1-4) is bounded by
-            // `setup_deadline`. See SecondaryConfig::setup_deadline for
-            // the rationale. The deadline is applied at the orchestration
-            // boundary, NOT inside `wait_for_setup`, because the recv
-            // loop is documented as cancellation-unsafe under inner
-            // select! racing (see setup.rs:79-96). Cancelling the whole
-            // setup future on timeout is safe because we never re-enter
-            // any of these phases — we go straight to cleanup-and-exit.
-            let deadline = self.config.setup_deadline;
+            // The pre-`Operational` span (`AwaitingPrimary` + the
+            // `Configuring` excursion `wait_for_setup` drives) is bounded
+            // by `unconfigured_deadline` (default 10 min) — the long
+            // pre-config horizon that SUPERSEDES the old 60s
+            // `setup_deadline`. It is generous because a slow authority
+            // `discover_items` walk can legitimately delay the first
+            // announcement; the SHORT election deadline is a property of
+            // `Operational` and physically cannot fire here. The deadline
+            // is applied at the orchestration boundary, NOT inside
+            // `wait_for_setup`, because the recv loop is documented as
+            // cancellation-unsafe under inner select! racing. Cancelling
+            // the whole setup future on timeout is safe because we never
+            // re-enter any of these phases — we go straight to
+            // cleanup-and-exit.
+            let deadline = self.config.unconfigured_deadline;
             let setup = async {
-                self.send_welcome().await?;
-                self.send_cert_exchange().await?;
+                // The welcome / cert-exchange handshake is the only
+                // primary-facing action available pre-announce. Gate it on
+                // the `AwaitingPrimary` one-shot so a re-entry never
+                // re-sends (defensive; this branch only runs pre-config).
+                if self.lifecycle.mark_handshake_sent() {
+                    self.send_welcome().await?;
+                    self.send_cert_exchange().await?;
+                }
                 self.wait_for_setup(factory).await?;
                 Ok::<(), String>(())
             };
@@ -972,13 +1140,19 @@ where
                 }
             }
 
-            // Latch BEFORE entering process_tasks so a SetupPending
-            // yield doesn't trigger a redo on re-entry.
-            self.setup_phase_completed = true;
+            // No explicit `setup_phase_completed` latch to set: the
+            // `Configuring → Operational` transition at the top of
+            // `process_tasks` (next) flips the lifecycle to `Operational`,
+            // and the `setup_phase_completed()` projection reads true from
+            // there on. A `SetupPending` re-entry therefore observes
+            // `Operational` and skips this whole block — the same
+            // fire-once re-entry guard the flat bool gave, now derived
+            // from the typed state.
         }
 
-        // Phase 5: Process tasks. May yield with SetupPending or
-        // run to completion.
+        // Phase 5: Process tasks. The first thing it does is drive the
+        // `Configuring → Operational` transition (consuming the take-once
+        // latches). May yield with SetupPending or run to completion.
         let outcome = self.process_tasks(factory).await?;
 
         match &outcome {

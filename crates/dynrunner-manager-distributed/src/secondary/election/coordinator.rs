@@ -36,7 +36,9 @@ where
     /// it writes no routing target, because there is no transitional
     /// routing target anymore (P2).
     pub(in crate::secondary) fn record_primary_message(&mut self) {
-        self.primary_last_seen = Some(Instant::now());
+        let secondary_id = self.config.secondary_id.clone();
+        let op = self.op_mut();
+        op.primary_last_seen = Some(Instant::now());
         // Reset the primary-link health sub-state. A real message
         // arriving on the (possibly-reconnected) transport proves
         // the link is alive again, so any failure-window we'd been
@@ -45,7 +47,7 @@ where
         // after a brief flap recovered, so the second flap would
         // arm faster than the first — confusing semantics. The
         // reset closes that loop. Idempotent on a healthy link.
-        self.primary_link.record_recv_success();
+        op.primary_link.record_recv_success();
         // Cancel a failover election in progress: a primary message
         // proves the original primary is still reachable so the
         // election was a false alarm. Revert to Normal. There is no
@@ -55,7 +57,7 @@ where
         // during the aborted election, per the drop-the-transitional-
         // hint design).
         if matches!(
-            self.election,
+            op.election,
             ElectionState::Suspecting { .. }
                 | ElectionState::Voting { .. }
                 | ElectionState::Candidate { .. }
@@ -69,11 +71,11 @@ where
             // transient blip rather than chase a phantom election
             // failure.
             tracing::info!(
-                secondary = %self.config.secondary_id,
-                from = ?std::mem::discriminant(&self.election),
+                secondary = %secondary_id,
+                from = ?std::mem::discriminant(&op.election),
                 "election recovered: primary message resumed, reverting to Normal"
             );
-            self.election = ElectionState::Normal;
+            op.election = ElectionState::Normal;
         }
     }
 
@@ -91,8 +93,15 @@ where
     /// single source of "who is primary now" (`current_primary()`).
     pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
         let current_primary = self.cluster_state.current_primary();
-        self.peer_keepalives
-            .keys()
+        // `peer_keepalives` now lives in `OperationalState`; outside
+        // `Operational` there are no peer keepalives to enumerate (the
+        // election that calls this only runs `Operational`), so an empty
+        // iterator is the faithful pre-`Operational` answer. Both
+        // borrows (`cluster_state` + the operational state) are shared
+        // `&self` reads of disjoint fields, so they coexist.
+        self.op_ref()
+            .into_iter()
+            .flat_map(|op| op.peer_keepalives.keys())
             .filter(move |id| Some(id.as_str()) != current_primary)
     }
 
@@ -112,9 +121,32 @@ where
         if self.config.is_observer {
             return actions;
         }
-        if matches!(self.election, ElectionState::Promoted) {
+        if matches!(
+            self.op_ref().map(|op| &op.election),
+            Some(ElectionState::Promoted)
+        ) {
             return actions;
         }
+
+        // Snapshot the reads that touch `cluster_state` / `live_peer_ids`
+        // (both `&self`-method/`cluster_state` borrows) up front, BEFORE
+        // binding the `&mut OperationalState` for the state-machine match
+        // below. `election`, `primary_last_seen`, and `peer_keepalives`
+        // now all live inside `OperationalState`; the match needs a `&mut`
+        // borrow of that state, which cannot coexist with the `&self`
+        // borrows `live_peer_ids()` / `cluster_state.role_table()` take.
+        // `peer_keepalives` does not change within a single tick (the
+        // election reads it, never mutates it here), so a single snapshot
+        // of the live-peer set + the observer set is faithful to the
+        // original per-arm re-reads. `current_primary_id` is the silent
+        // primary's diagnostic identity + the `TimeoutQuery` target.
+        let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
+        let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
+        let observers: std::collections::HashSet<String> =
+            self.cluster_state.role_table().observers.iter().cloned().collect();
+        let mesh_degraded = self.mesh.degraded;
+        let secondary_id = self.config.secondary_id.clone();
+        let is_observer = self.config.is_observer;
 
         let deadline = self
             .config
@@ -144,14 +176,24 @@ where
         // land in `peer_keepalives` (it is a live mesh peer), but that
         // entry is excluded from quorum/candidate counts by `live_peer_ids`,
         // so peer liveness and primary liveness stay cleanly separate.
-        let primary_silent = self
+        // Bind the operational state by direct field projection (borrows
+        // only `self.lifecycle`, leaving `self.config` / `self.fatal_exit`
+        // / `self.mesh` reachable as disjoint fields). The
+        // `cluster_state` / `live_peer_ids` reads were already snapshotted
+        // above, so nothing in the match below needs a `&self` method.
+        let op = self
+            .lifecycle
+            .operational_mut()
+            .expect("run_election_tick reached before Operational — type invariant violation");
+
+        let primary_silent = op
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
         let need_election = primary_silent;
 
-        match &self.election {
+        match &op.election {
             ElectionState::Normal if need_election => {
                 // Degraded-mesh failover guard: the election protocol
                 // needs a peer mesh to gather quorum responses
@@ -166,14 +208,12 @@ where
                 // already unsalvageable. Bail with a clear reason
                 // instead of pretending the election succeeded.
                 // Who the silent primary was (co-located or a promoted
-                // peer). Read from the single source of "who is primary
-                // now"; post-uniform-announce this is always `Some` before
-                // any election runs, so it is BOTH the diagnostic identity
-                // and the `TimeoutQuery::query_node_id` the peers reply
-                // about — no separate canonical constant. It drives no
-                // election decision (that is `primary_silent` alone).
-                let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
-                if self.peer_mesh_degraded {
+                // peer), snapshotted above from the single source of "who
+                // is primary now" — BOTH the diagnostic identity and the
+                // `TimeoutQuery::query_node_id` the peers reply about. It
+                // drives no election decision (that is `primary_silent`
+                // alone).
+                if mesh_degraded {
                     let reason = format!(
                         "peer mesh required for failover but not \
                          available: primary went silent (primary_silent={}) \
@@ -182,28 +222,32 @@ where
                         primary_silent,
                     );
                     tracing::error!(
-                        secondary = %self.config.secondary_id,
+                        secondary = %secondary_id,
                         primary_silent,
                         primary = ?current_primary_id,
                         "{reason}"
                     );
+                    // `fatal_exit` is a flat coordinator write-latch (a
+                    // disjoint field from `self.lifecycle`, so writable
+                    // while `op` is borrowed). The loop reads it once per
+                    // iteration and exits non-zero.
                     self.fatal_exit = Some(reason);
                     return actions;
                 }
                 tracing::warn!(
-                    secondary = %self.config.secondary_id,
+                    secondary = %secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
                     primary_silent,
                     primary = ?current_primary_id,
                     "primary missed keepalives; entering Suspecting"
                 );
-                self.election = ElectionState::Suspecting {
+                op.election = ElectionState::Suspecting {
                     since: Instant::now(),
                     responses: HashMap::new(),
                 };
                 if let Some(query_node_id) = current_primary_id {
                     actions.broadcast.push(DistributedMessage::TimeoutQuery {
-                        sender_id: self.config.secondary_id.clone(),
+                        sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
                         query_node_id,
                     });
@@ -216,7 +260,10 @@ where
                 if since.elapsed() < self.config.keepalive_interval {
                     return actions;
                 }
-                let peer_count = self.live_peer_ids().count();
+                // `live_peers` was snapshotted from `live_peer_ids`, which
+                // already excludes the current primary, so its length IS
+                // the live-peer count.
+                let peer_count = live_peers.len();
                 let agreeing = responses
                     .values()
                     .filter(|last| {
@@ -252,21 +299,20 @@ where
                 // `primary/peer_setup.rs::send_peer_lists` and
                 // replicated to every node via the standard CRDT
                 // broadcast path.
-                let observers = &self.cluster_state.role_table().observers;
-                let lowest_alive = self
-                    .live_peer_ids()
+                // `observers` + `live_peers` were snapshotted above (both
+                // were `&self`/`cluster_state` reads that cannot coexist
+                // with the `&mut op` borrow held by this match).
+                let lowest_alive = live_peers
+                    .iter()
                     .filter(|id| !observers.contains(*id))
-                    .chain(
-                        std::iter::once(&self.config.secondary_id)
-                            .filter(|_| !self.config.is_observer),
-                    )
+                    .chain(std::iter::once(&secondary_id).filter(|_| !is_observer))
                     .min()
                     .cloned();
                 let we_lead = lowest_alive
                     .as_ref()
-                    .map(|id| id == &self.config.secondary_id)
+                    .map(|id| id == &secondary_id)
                     .unwrap_or(false);
-                let round = next_round(&self.election);
+                let round = next_round(&op.election);
                 // Observer self-exclusion (#35): even when our id is
                 // the lex-lowest in the alive set, an observer MUST
                 // NOT self-promote. Observers are non-candidates by
@@ -286,10 +332,10 @@ where
                 // waiting for another secondary to come online); the
                 // peer_mesh_degraded guard above catches the
                 // pathological "alone and primary's dead" case.
-                if self.config.is_observer && we_lead {
-                    let next_lowest = self.live_peer_ids().min().cloned();
+                if is_observer && we_lead {
+                    let next_lowest = live_peers.iter().min().cloned();
                     tracing::info!(
-                        observer = %self.config.secondary_id,
+                        observer = %secondary_id,
                         ?next_lowest,
                         round,
                         "observer would have self-promoted by lowest-id but \
@@ -304,7 +350,7 @@ where
                         // `PromotePrimary` it broadcasts after winning),
                         // never by an in-flight Voting transition. See
                         // the P2 drop-the-transitional-hint design.
-                        self.election = ElectionState::Voting { round, candidate };
+                        op.election = ElectionState::Voting { round, candidate };
                     }
                     // No next_lowest = we're the only one alive AND
                     // we're an observer. Don't transition; let the
@@ -312,9 +358,9 @@ where
                     // tick (or a new secondary arrival fixes it).
                 } else if we_lead {
                     tracing::info!(round, "self-promoting");
-                    self.election = ElectionState::Candidate {
+                    op.election = ElectionState::Candidate {
                         round,
-                        confirms: HashSet::from([self.config.secondary_id.clone()]),
+                        confirms: HashSet::from([secondary_id.clone()]),
                         started: Instant::now(),
                     };
                     // No transitional self-as-primary routing target —
@@ -327,15 +373,15 @@ where
                     // runtime's terminal action on that transition, not a
                     // transitional Voting-time hint.
                     actions.broadcast.push(DistributedMessage::PromotionVote {
-                        sender_id: self.config.secondary_id.clone(),
+                        sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
-                        candidate_id: self.config.secondary_id.clone(),
+                        candidate_id: secondary_id.clone(),
                         vote_round: round,
                     });
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
                     // No transitional routing target (see above).
-                    self.election = ElectionState::Voting { round, candidate };
+                    op.election = ElectionState::Voting { round, candidate };
                 }
             }
             ElectionState::Candidate { round, started, .. } => {
@@ -345,15 +391,15 @@ where
                 if started.elapsed() > timeout {
                     let next = round + 1;
                     tracing::warn!(round, "candidate timed out, retrying with round {next}");
-                    self.election = ElectionState::Candidate {
+                    op.election = ElectionState::Candidate {
                         round: next,
-                        confirms: HashSet::from([self.config.secondary_id.clone()]),
+                        confirms: HashSet::from([secondary_id.clone()]),
                         started: Instant::now(),
                     };
                     actions.broadcast.push(DistributedMessage::PromotionVote {
-                        sender_id: self.config.secondary_id.clone(),
+                        sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
-                        candidate_id: self.config.secondary_id.clone(),
+                        candidate_id: secondary_id.clone(),
                         vote_round: next,
                     });
                 }
@@ -371,7 +417,7 @@ where
         peer: String,
         last_keepalive: Option<f64>,
     ) {
-        if let ElectionState::Suspecting { responses, .. } = &mut self.election {
+        if let ElectionState::Suspecting { responses, .. } = &mut self.op_mut().election {
             responses.insert(peer, last_keepalive);
         }
     }
@@ -384,19 +430,21 @@ where
         candidate: String,
         round: u32,
     ) -> Option<DistributedMessage<I>> {
+        let deadline = self
+            .config
+            .keepalive_interval
+            .saturating_mul(self.config.keepalive_miss_threshold);
         let primary_silent = self
-            .primary_last_seen
-            .map(|t| {
-                Instant::now().duration_since(t)
-                    > self
-                        .config
-                        .keepalive_interval
-                        .saturating_mul(self.config.keepalive_miss_threshold)
-            })
+            .op_ref()
+            .and_then(|op| op.primary_last_seen)
+            .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(true);
         if !primary_silent {
             return None;
         }
+        // `live_peer_ids` is a `&self` read (cluster_state + op_ref); take
+        // the `lowest` owned value here, then borrow `op` mutably below
+        // for the election write — the two borrows don't overlap.
         let lowest = self
             .live_peer_ids()
             .chain(std::iter::once(&self.config.secondary_id))
@@ -409,19 +457,21 @@ where
         // Suspecting/Candidate so we don't double-vote. No transitional
         // routing target is written — `Role::Primary` re-points only on
         // the winner's authoritative `PrimaryChanged` (P2).
+        let sender_id = self.config.secondary_id.clone();
+        let op = self.op_mut();
         let already_voting_for_this_round = matches!(
-            &self.election,
+            &op.election,
             ElectionState::Voting { round: r, candidate: c }
                 if *r == round && c == &candidate
         );
         if !already_voting_for_this_round {
-            self.election = ElectionState::Voting {
+            op.election = ElectionState::Voting {
                 round,
                 candidate: candidate.clone(),
             };
         }
         Some(DistributedMessage::PromotionConfirm {
-            sender_id: self.config.secondary_id.clone(),
+            sender_id,
             timestamp: timestamp_now(),
             new_primary_id: candidate,
             vote_round: round,
@@ -440,9 +490,12 @@ where
         if target != self.config.secondary_id {
             return false;
         }
+        // `live_peer_ids` is a `&self` read; take the owned count before
+        // borrowing `op` mutably for the confirm tally + transition.
         let peer_count = self.live_peer_ids().count();
         let quorum = peer_count.div_ceil(2) + 1;
-        let promoted = match &mut self.election {
+        let op = self.op_mut();
+        let promoted = match &mut op.election {
             ElectionState::Candidate {
                 round: r, confirms, ..
             } if *r == round => {
@@ -461,7 +514,7 @@ where
             // terminal action the composed runtime drives off this
             // transition; the secondary carries no self-promotion mirror
             // to flip on here.
-            self.election = ElectionState::Promoted;
+            op.election = ElectionState::Promoted;
         }
         promoted
     }
@@ -566,15 +619,21 @@ where
         }
     }
 
-    /// Whether the secondary has been elected primary in this run.
+    /// Whether the secondary has been elected primary in this run. `false`
+    /// pre-`Operational` (no election state exists yet).
     #[allow(dead_code)]
     pub(in crate::secondary) fn is_promoted(&self) -> bool {
-        matches!(self.election, ElectionState::Promoted)
+        matches!(
+            self.op_ref().map(|op| &op.election),
+            Some(ElectionState::Promoted)
+        )
     }
 
-    /// Whether we're still in the normal pre-election state.
+    /// Whether we're still in the normal pre-election state. `true`
+    /// pre-`Operational` (the election machine defaults to `Normal` and
+    /// has not started).
     #[allow(dead_code)]
     pub(in crate::secondary) fn election_is_normal(&self) -> bool {
-        self.election.is_normal()
+        self.op_ref().map(|op| op.election.is_normal()).unwrap_or(true)
     }
 }

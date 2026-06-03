@@ -71,10 +71,11 @@ where
                 // the snapshots feed the shared memuse writer so
                 // every secondary's `memuse.log` row carries the
                 // same shape as the LocalManager's.
-                let estimated_for_memuse = self.pool.workers[worker_id as usize]
+                let estimated_for_memuse = self.op_mut().pool.workers[worker_id as usize]
                     .estimated_resources
                     .clone();
-                let actual_for_memuse = self.pool.workers[worker_id as usize].actual_usage.clone();
+                let actual_for_memuse =
+                    self.op_mut().pool.workers[worker_id as usize].actual_usage.clone();
                 if let Some(log_path) = self.config.memuse_log_path.as_deref() {
                     dynrunner_manager_local::memuse::log_resource_usage(
                         log_path,
@@ -85,10 +86,10 @@ where
                     );
                 }
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize]
+                self.op_mut().pool.workers[worker_id as usize]
                     .reclaim_protocol()
                     .await;
-                self.pool.workers[worker_id as usize].clear_task();
+                self.op_mut().pool.workers[worker_id as usize].clear_task();
 
                 // Flush the per-task memprofile writer (if any).
                 // Sampler hook is a fire-and-forget mpsc-send;
@@ -104,6 +105,7 @@ where
 
                 // Find the file hash for this worker's task
                 let file_hash = self
+                    .op_mut()
                     .active_tasks
                     .iter()
                     .find(|&(_, &wid)| wid == worker_id)
@@ -111,7 +113,7 @@ where
                 let log_task_hash = file_hash.clone();
 
                 if let Some(hash) = file_hash {
-                    self.active_tasks.remove(&hash);
+                    self.op_mut().active_tasks.remove(&hash);
                     // No per-node terminal set: the authority owns the
                     // CRDT terminal mutation and every replica's
                     // `cluster_state` mirror converges to it. The
@@ -229,13 +231,13 @@ where
                 // (SIGCHLD race), or the child was already reaped by
                 // another path. See WorkerHandle::try_reap_exit for
                 // the full set of None conditions.
-                let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
+                let exit_status = self.op_mut().pool.workers[worker_id as usize].try_reap_exit();
 
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize]
+                self.op_mut().pool.workers[worker_id as usize]
                     .reclaim_protocol()
                     .await;
-                self.pool.workers[worker_id as usize].clear_task();
+                self.op_mut().pool.workers[worker_id as usize].clear_task();
 
                 tracing::warn!(
                     worker_id,
@@ -253,7 +255,7 @@ where
                 // requeues + re-dispatches it. The secondary is never
                 // the authority, so there is exactly ONE recovery: the
                 // own-worker CLASS-1 report.
-                if let Some(pending) = self.pending_first_bind.remove(&worker_id) {
+                if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
                     let pending_hash = pending.file_hash.clone();
                     tracing::warn!(
                         worker_id,
@@ -267,13 +269,14 @@ where
 
                 // Find and report the task as failed
                 let file_hash = self
+                    .op_mut()
                     .active_tasks
                     .iter()
                     .find(|&(_, &wid)| wid == worker_id)
                     .map(|(hash, _)| hash.clone());
 
                 if let Some(hash) = file_hash {
-                    self.active_tasks.remove(&hash);
+                    self.op_mut().active_tasks.remove(&hash);
 
                     // Discriminate two Disconnected-event shapes:
                     //
@@ -414,7 +417,7 @@ where
                 // go through `poll_ready` directly without a
                 // background task, so they hit this arm with
                 // `poll_task = None` and pass through cleanly.
-                self.pool.workers[worker_id as usize]
+                self.op_mut().pool.workers[worker_id as usize]
                     .reclaim_protocol()
                     .await;
                 // Drop the per-worker `TaskRequest` backoff window.
@@ -431,7 +434,7 @@ where
                 // primary-identity flips — the rule is "any
                 // observable transition that revives the slot's
                 // pull semantic resets the rate-limiter".
-                self.primary_link.reset_backoff(worker_id);
+                self.op_mut().primary_link.reset_backoff(worker_id);
                 // Pending first-bind binary (if any): the dispatch
                 // arm in `dispatch/router.rs` (peer-assigned) or
                 // `primary/task_request.rs` (self-assigned)
@@ -447,7 +450,7 @@ where
                 // choice (matters for the
                 // `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
                 // distribution-fairness contract).
-                if let Some(pending) = self.pending_first_bind.remove(&worker_id) {
+                if let Some(pending) = self.op_mut().pending_first_bind.remove(&worker_id) {
                     let super::super::PendingFirstBind {
                         binary,
                         file_hash,
@@ -465,13 +468,13 @@ where
                     // the other secondary assign sites — see
                     // `notify_sampler_assigned` doc.
                     let binary_for_hook = binary.clone();
-                    match self.pool.workers[worker_id as usize]
+                    match self.op_mut().pool.workers[worker_id as usize]
                         .assign_task(binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
                             self.notify_sampler_assigned(worker_id, &binary_for_hook);
-                            self.active_tasks.insert(file_hash, worker_id);
+                            self.op_mut().active_tasks.insert(file_hash, worker_id);
                             tracing::info!(
                                 worker_id,
                                 task_id = ?task_id_log,
@@ -493,7 +496,8 @@ where
                             // never ran, so report it back to the
                             // authority as backpressure so it requeues
                             // + re-dispatches.
-                            let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
+                            let exit_status =
+                                self.op_mut().pool.workers[worker_id as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id,
                                 error = %e,
@@ -502,7 +506,7 @@ where
                                 "pending first-bind assign_task failed; reporting \
                                  deferred task back to the authority"
                             );
-                            self.pending_worker_restarts.insert(worker_id);
+                            self.op_mut().pending_worker_restarts.insert(worker_id);
                             self.report_deferred_task_lost(worker_id, &log_task_hash)
                                 .await?;
                         }

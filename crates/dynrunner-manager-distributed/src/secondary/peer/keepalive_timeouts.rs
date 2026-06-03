@@ -40,7 +40,7 @@ where
         // peer state pre-connection doesn't accidentally make this
         // matter. See `peer_mesh_degraded` field doc on the
         // SecondaryCoordinator for the full set of guarded paths.
-        if self.peer_mesh_degraded {
+        if self.is_mesh_degraded() {
             return;
         }
         let now = timestamp_now();
@@ -57,9 +57,15 @@ where
         // would trip a spurious timeout WARN and prune the entry of an
         // ALIVE primary — a peer-removal of the node we depend on. Reading
         // `current_primary` is the single source of "who is primary now".
-        let current_primary = self.cluster_state.current_primary();
-        for (peer_id, last_seen) in &self.peer_keepalives {
-            if Some(peer_id.as_str()) == current_primary {
+        // Own the current-primary id before borrowing the operational
+        // `peer_keepalives`: `current_primary()` borrows `cluster_state`
+        // (a separate field), and the iteration borrows the pool-state
+        // via `op_mut()` (a full `&mut self`) — taking the id by value
+        // first keeps the two borrows disjoint.
+        let current_primary = self.cluster_state.current_primary().map(str::to_owned);
+        let op = self.op_mut();
+        for (peer_id, last_seen) in &op.peer_keepalives {
+            if Some(peer_id.as_str()) == current_primary.as_deref() {
                 continue;
             }
             if now - last_seen > timeout_secs {
@@ -68,7 +74,7 @@ where
         }
 
         for peer_id in timed_out {
-            let last_seen = self.peer_keepalives.remove(&peer_id).unwrap_or(0.0);
+            let last_seen = self.op_mut().peer_keepalives.remove(&peer_id).unwrap_or(0.0);
             tracing::warn!(
                 peer = %peer_id,
                 last_seen,

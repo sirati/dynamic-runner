@@ -120,13 +120,14 @@ where
                     binary.resolved_path = Some(path);
                 }
                 let estimated = self.estimator.estimate(&binary);
-                let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+                let wid = worker_id.min(self.op_mut().pool.workers.len() as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle
-                let target_wid = if self.pool.workers[wid as usize].is_idle_state() {
+                let target_wid = if self.op_mut().pool.workers[wid as usize].is_idle_state() {
                     wid
                 } else {
-                    self.pool
+                    self.op_mut()
+                        .pool
                         .workers
                         .iter()
                         .position(|w| w.is_idle_state())
@@ -134,7 +135,7 @@ where
                         .unwrap_or(wid)
                 };
 
-                if self.pool.workers[target_wid as usize].is_idle_state() {
+                if self.op_mut().pool.workers[target_wid as usize].is_idle_state() {
                     let estimated_mb =
                         estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     let log_task_hash = file_hash.clone();
@@ -180,6 +181,7 @@ where
                     // via the backpressure marker if the worker
                     // never reaches Ready.
                     let ensure_result: Result<(), String> = match self
+                        .op_mut()
                         .pool
                         .ensure_worker_for_type_async(target_wid, &binary.type_id, factory, false)
                         .await
@@ -208,7 +210,7 @@ where
                                 "type-bind respawn in progress; deferring task until \
                                  worker Ready (respawn-HOLD)"
                             );
-                            self.pending_first_bind.insert(
+                            self.op_mut().pending_first_bind.insert(
                                 target_wid,
                                 super::super::PendingFirstBind {
                                     binary,
@@ -228,7 +230,7 @@ where
                             type_id = %binary.type_id,
                             "ensure_worker_for_type failed for peer-assigned task; queuing respawn"
                         );
-                        self.pending_worker_restarts.insert(target_wid);
+                        self.op_mut().pending_worker_restarts.insert(target_wid);
                         let task_failed = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
@@ -254,15 +256,15 @@ where
                     // whole `TaskInfo` once is cheap relative to
                     // the assignment-write hot path.
                     let binary_for_hook = binary.clone();
-                    let worker = &mut self.pool.workers[target_wid as usize];
+                    let worker = &mut self.op_mut().pool.workers[target_wid as usize];
                     match worker
                         .assign_task(binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
                             self.notify_sampler_assigned(target_wid, &binary_for_hook);
-                            self.active_tasks.insert(file_hash, target_wid);
-                            self.primary_link.reset_backoff(target_wid);
+                            self.op_mut().active_tasks.insert(file_hash, target_wid);
+                            self.op_mut().primary_link.reset_backoff(target_wid);
                             tracing::info!(
                                 worker_id = target_wid,
                                 task_id = ?binary_info.task_id,
@@ -281,7 +283,7 @@ where
                             // `WorkerHandle::try_reap_exit` for None
                             // conditions.
                             let exit_status =
-                                self.pool.workers[target_wid as usize].try_reap_exit();
+                                self.op_mut().pool.workers[target_wid as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id = target_wid,
                                 error = %e,
@@ -294,7 +296,7 @@ where
                             // brings a replacement up; pre-fix the
                             // SLURM-secondary path silently abandoned
                             // the slot.
-                            self.pending_worker_restarts.insert(target_wid);
+                            self.op_mut().pending_worker_restarts.insert(target_wid);
                             // Bug C: the task hasn't been attempted
                             // — the pipe-write never landed. Send
                             // the primary a backpressure-shaped
@@ -448,7 +450,7 @@ where
                 // top of `dispatch_message` already reset the election
                 // to `Normal` (this node is a settled follower).
                 if new_primary_id == self.config.secondary_id {
-                    self.election = super::super::election::ElectionState::Promoted;
+                    self.op_mut().election = super::super::election::ElectionState::Promoted;
                     // Wake the co-located parked primary: this node is
                     // now the authority. Gate-only (no re-broadcast) —
                     // this PromotePrimary IS the broadcast that named
@@ -476,7 +478,7 @@ where
                 // revives the slot's pull semantic and resets the
                 // rate-limiter". Keyed off the backoff maps (not the
                 // pool) so it fires even before `initialize_workers`.
-                self.primary_link.reset_all_backoff();
+                self.op_mut().primary_link.reset_all_backoff();
                 // Immediate repoll: every idle worker re-issues its
                 // pending `TaskRequest` against the freshly-identified
                 // primary (resolved through the transport's RoleCache,
