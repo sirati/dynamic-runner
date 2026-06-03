@@ -139,7 +139,7 @@ if TYPE_CHECKING:
 
 # Type alias for the optional `task_completed_listener` task attribute.
 # Called once per terminal task transition with
-# `(task_id, success, error_kind)`:
+# `(task_id, success, error_kind, last_error)`:
 #   - `task_id`: the consumer-supplied identifier from `TaskInfo.task_id`,
 #     or `None` if the task carried no id.
 #   - `success`: `True` if the apply path transitioned the task to
@@ -147,8 +147,17 @@ if TYPE_CHECKING:
 #     `Unfulfillable`).
 #   - `error_kind`: `None` on success; on failure the wire-stable
 #     `ErrorType.wire_value()` tag (e.g. `"oom"`, `"non_recoverable"`,
-#     `"recoverable"`, `"unfulfillable:<reason>"`).
-TaskCompletedListener = Callable[[Optional[str], bool, Optional[str]], None]
+#     `"recoverable"`, `"unfulfillable:<reason>"`). The carried error
+#     *type* identity.
+#   - `last_error`: `None` on success; on failure the operator-facing
+#     error *message* recorded on the ledger entry. Carried alongside
+#     `error_kind` because a failure is only fully identified by type
+#     AND message (e.g. two `non_recoverable` failures with distinct
+#     messages are distinct events). Forwarded as the trailing
+#     positional argument by the PyO3 bridge.
+TaskCompletedListener = Callable[
+    [Optional[str], bool, Optional[str], Optional[str]], None
+]
 
 
 PhaseId = str
