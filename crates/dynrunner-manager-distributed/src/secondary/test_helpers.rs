@@ -29,13 +29,10 @@ use super::{SecondaryConfig, SecondaryCoordinator};
 /// DIRECTLY — there is no per-role uplink leg and no wrapper. Tests
 /// that drive the coordinator via direct method calls (election state,
 /// resource-probe, mesh-watchdog) construct it from a stub and exercise
-/// the coordinator without any primary inbound. Tests that previously
-/// injected "primary" frames over the channel uplink (full setup +
-/// dispatch against a `fake_primary` / `spawn_real_secondary`) need the
-/// primary to be a mesh peer they can feed — i.e. a channel-backed mesh
-/// stub with the primary registered — which is the secondary-test
-/// harness mesh-migration concern, NOT this uplink-deletion leaf; those
-/// are `#[ignore]`d at their call sites until that leaf lands.
+/// the coordinator without any primary inbound. Tests that inject
+/// "primary" frames (full setup + dispatch against a `fake_primary` /
+/// `spawn_real_secondary`) feed the primary as an ordinary mesh peer via
+/// a channel-backed mesh stub with the primary link folded in.
 pub(super) type TestTransport<P> = P;
 
 /// Build a [`TestTransport`] from a peer-mesh stub. The secondary holds
@@ -72,13 +69,13 @@ pub(super) fn channel_mesh_to_primary(
 /// a single observed peer outbox, returning the transport plus the
 /// observed peer's inbound receiver. The primary link (keyed `"primary"`)
 /// carries the secondary's primary-bound traffic + the inbound setup
-/// frames; the observed peer receives the secondary's mesh `broadcast`s
-/// (the primary is excluded from the fan-out), so a test can drain
-/// `observer_rx` to assert what the secondary fanned out onto the mesh.
+/// frames; both the observed peer AND the folded primary receive the
+/// secondary's mesh `broadcast`s — the role-blind transport fans out to
+/// every member — so a test can drain `observer_rx` to assert what the
+/// secondary fanned out onto the mesh.
 ///
-/// `peer_count()` is 1 (the observed peer; the primary link is excluded),
-/// matching the `RecordingPeer::new(1)` cardinality the broadcast-observer
-/// tests previously used. Pair with `set_bootstrap_primary_id("primary")`.
+/// `peer_count()` is 2 (the observed peer plus the folded primary, an
+/// ordinary role-blind member). Pair with `set_bootstrap_primary_id("primary")`.
 pub(super) fn channel_mesh_with_observed_peer(
     secondary_id: &str,
     to_primary: mpsc::UnboundedSender<DistributedMessage<TestId>>,
@@ -329,10 +326,10 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
     }
 }
 
-/// Construct a SecondaryCoordinator over the unified transport
-/// (channel uplink + `NoPeers` mesh stub) detached from any real
-/// primary or peer; used to drive the election state machine via direct
-/// method calls without a full multi-process harness.
+/// Construct a SecondaryCoordinator holding a `NoPeers` mesh stub
+/// directly, detached from any real primary or peer; used to drive the
+/// election state machine via direct method calls without a full
+/// multi-process harness.
 pub(super) fn make_secondary(
     config: SecondaryConfig,
 ) -> SecondaryCoordinator<

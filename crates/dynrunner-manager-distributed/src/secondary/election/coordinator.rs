@@ -29,12 +29,12 @@ where
     /// path before any other handling.
     ///
     /// Who holds the primary role is NOT tracked here — it lives solely
-    /// in the replicated `cluster_state` (mirrored into the transport's
-    /// `RoleCache` by the `PrimaryChanged` apply hook, which is the
-    /// single source of "who is primary now" and the only re-route).
-    /// This method records liveness and cancels a false-alarm election;
-    /// it writes no routing target, because there is no transitional
-    /// routing target anymore (P2).
+    /// in the replicated `cluster_state` (`current_primary()`, the single
+    /// source of "who is primary now"). Routing reads it at the egress
+    /// edge (`send_to` → `resolve_destination`); a `PrimaryChanged`
+    /// mutation is the only re-point. This method records liveness and
+    /// cancels a false-alarm election; it writes no routing target,
+    /// because there is no transitional routing target anymore (P2).
     pub(in crate::secondary) fn record_primary_message(&mut self) {
         let secondary_id = self.config.secondary_id.clone();
         let op = self.op_mut();
@@ -52,10 +52,10 @@ where
         // proves the original primary is still reachable so the
         // election was a false alarm. Revert to Normal. There is no
         // transitional routing target to clear — routing always
-        // resolves `Role::Primary` through the RoleCache, which still
-        // names the original primary (no `PromotePrimary` committed
-        // during the aborted election, per the drop-the-transitional-
-        // hint design).
+        // resolves `Destination::Primary` at the egress edge over
+        // `cluster_state.current_primary()`, which still names the
+        // original primary (no `PromotePrimary` committed during the
+        // aborted election, per the drop-the-transitional-hint design).
         if matches!(
             op.election,
             ElectionState::Suspecting { .. }
@@ -424,8 +424,8 @@ where
                     // wins quorum (`record_promotion_confirm` reaches
                     // `Promoted`). The failover re-point — broadcasting
                     // `PromotePrimary { new = self }` so surviving
-                    // secondaries' role cache moves off the dead uplink
-                    // onto this winner's mesh peer — is the composed
+                    // secondaries' `cluster_state.current_primary()` moves
+                    // onto this winner's mesh peer-id — is the composed
                     // runtime's terminal action on that transition, not a
                     // transitional Voting-time hint.
                     actions.broadcast.push(DistributedMessage::PromotionVote {
@@ -628,14 +628,13 @@ where
     ///      here, but only the first consumes the sender.
     ///   2. Broadcast `PromotePrimary { new = self, epoch =
     ///      primary_epoch + 1 }` onto the mesh. Surviving secondaries
-    ///      apply it as `ClusterMutation::PrimaryChanged`, whose
-    ///      write-through role-change hook re-points their transport's
-    ///      `Role::Primary` cache off the dead original-primary uplink
-    ///      onto this winner's mesh peer-id — the entire failover
-    ///      re-route, owned by the transport layer. `epoch + 1` strictly
-    ///      supersedes the prior identity (last-writer-wins on epoch),
-    ///      so a delayed lower-epoch broadcast cannot un-elect this
-    ///      winner.
+    ///      apply it as `ClusterMutation::PrimaryChanged`, moving their
+    ///      `cluster_state.current_primary()` onto this winner's mesh
+    ///      peer-id. Their next `Destination::Primary` send then resolves
+    ///      to this winner at the egress edge — the entire failover
+    ///      re-route. `epoch + 1` strictly supersedes the prior identity
+    ///      (last-writer-wins on epoch), so a delayed lower-epoch
+    ///      broadcast cannot un-elect this winner.
     ///
     /// The OLD primary, observing this `PrimaryChanged`, becomes a pure
     /// observer (it no longer holds `Role::Primary`) — R3's observe path.

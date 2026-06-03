@@ -116,10 +116,9 @@ async fn double_failure_election_still_succeeds() {
 
 /// `record_primary_message` resets the failover election state to
 /// Normal — the live primary is alive again, so the secondary stops
-/// suspecting / voting. (Post-unification "who is primary" is the
-/// transport RoleCache, not a PrimaryLink locality field; a live
-/// keepalive resets the ELECTION, never the replicated primary
-/// identity.)
+/// suspecting / voting. ("Who is primary" is the replicated
+/// `cluster_state.current_primary()`; a live keepalive resets the
+/// ELECTION, never that primary identity.)
 #[tokio::test(flavor = "current_thread")]
 async fn primary_recovery_resets_election_state() {
     let mut sec = make_secondary(election_config("sec-a"));
@@ -214,8 +213,8 @@ async fn pre_designated_primary_ignores_silent_local_primary() {
 
     // Receive PromotePrimary naming this node — exercises the
     // dispatch.rs handler that installs the role into the CRDT
-    // (which drives the transport RoleCache write-through hook) AND
-    // flips the election state to Promoted in lockstep.
+    // (so `current_primary()` now names this node) AND flips the
+    // election state to Promoted in lockstep.
     let promote = DistributedMessage::PromotePrimary {
         sender_id: "primary".into(),
         timestamp: 0.0,
