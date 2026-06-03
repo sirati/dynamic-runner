@@ -56,8 +56,10 @@ where
     /// handlers route elsewhere and never enter this dispatcher. A
     /// 0-worker `Operational` node (late-joiner / observer / phase-end
     /// observer) is a VALID state on this path, so the `TaskAssignment`
-    /// arm guards the empty pool explicitly (a no-op, never an index/
-    /// underflow) rather than relying on a non-existent type invariant.
+    /// arm selects the dispatch target as an `Option` (`.get()` /
+    /// `position()`, never bounds arithmetic or an unconditional index):
+    /// an empty pool is simply the degenerate case of "no idle worker",
+    /// reported back to the primary as backpressure like any other.
     pub(in crate::secondary) async fn dispatch_message(
         &mut self,
         msg: DistributedMessage<I>,
@@ -138,46 +140,31 @@ where
                 }
                 let estimated = self.estimator.estimate(&binary);
 
-                // Empty-pool guard, BEFORE any indexing. A 0-worker
-                // `Operational` node is a VALID state (a late-joiner /
-                // observer constructs `Operational` with an empty pool, and
-                // a node can end a phase as a 0-worker observer) and IS on
-                // this dispatch path. With no worker to receive the
-                // assignment there is nothing to dispatch to, so this must
-                // be a graceful no-op — never `pool.workers.len() - 1`
-                // arithmetic (which underflows on `len() == 0` →
-                // debug-panic / release-`u32::MAX`-OOB) and never an index
-                // into an empty slice.
-                let worker_count = self.op_mut().pool.workers.len();
-                if worker_count == 0 {
-                    tracing::warn!(
-                        worker_id,
-                        file_hash = %file_hash,
-                        "TaskAssignment reached a 0-worker node; no worker to \
-                         dispatch to — skipping (no-op)"
-                    );
-                    return Ok(());
-                }
+                // Select the dispatch target worker SAFELY. Prefer the
+                // primary's requested slot IF it is a valid, idle worker;
+                // otherwise fall back to any idle worker. Both `.get()` and
+                // `position()` return `None` for an empty pool, so a
+                // 0-worker `Operational` node (late-joiner / observer /
+                // phase-end observer — a VALID state on this path) is just
+                // the degenerate case of "no idle worker": no out-of-range
+                // `len() - 1` arithmetic, no unconditional index into the
+                // pool. An out-of-range `worker_id` likewise resolves to
+                // `None` on the preference and falls back to an idle worker
+                // — never silently clamped onto the wrong (last) slot.
+                let pool = &self.op_mut().pool;
+                let target_wid: Option<u32> = pool
+                    .workers
+                    .get(worker_id as usize)
+                    .filter(|w| w.is_idle_state())
+                    .map(|_| worker_id)
+                    .or_else(|| {
+                        pool.workers
+                            .iter()
+                            .position(|w| w.is_idle_state())
+                            .map(|i| i as u32)
+                    });
 
-                // Clamp the requested worker into range. `worker_count >= 1`
-                // here (guarded above), so `worker_count - 1` cannot
-                // underflow.
-                let wid = worker_id.min(worker_count as u32 - 1);
-
-                // Find the target worker — prefer the requested one, fall back to any idle
-                let target_wid = if self.op_mut().pool.workers[wid as usize].is_idle_state() {
-                    wid
-                } else {
-                    self.op_mut()
-                        .pool
-                        .workers
-                        .iter()
-                        .position(|w| w.is_idle_state())
-                        .map(|i| i as u32)
-                        .unwrap_or(wid)
-                };
-
-                if self.op_mut().pool.workers[target_wid as usize].is_idle_state() {
+                if let Some(target_wid) = target_wid {
                     let estimated_mb =
                         estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     let log_task_hash = file_hash.clone();
@@ -367,15 +354,21 @@ where
                         }
                     }
                 } else {
+                    // No idle worker to take the task — including the
+                    // degenerate 0-worker pool (a late-joiner / phase-end
+                    // observer), which selected `None` above without any
+                    // bounds arithmetic or index. Report backpressure to
+                    // the primary keyed by the ORIGINAL wire `worker_id`
+                    // (there is no chosen slot).
                     tracing::warn!(
-                        worker_id = target_wid,
+                        worker_id,
                         "no idle worker available for task assignment"
                     );
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
-                        worker_id: target_wid,
+                        worker_id,
                         task_hash: file_hash,
                         error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
