@@ -46,9 +46,10 @@ use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 ///   surface like any other inbound.
 ///
 /// The primary is a routable member (mirrors the `Real` arm): it is
-/// reachable via `send_to_peer` / `has_peer` and counted by `peer_count`
-/// (`1`, role-blind — the transport counts every member). It is excluded
-/// from `broadcast` (a no-op here anyway — no mesh peers). The role-aware
+/// reachable via `send_to_peer` / `has_peer`, counted by `peer_count`
+/// (`1`, role-blind — the transport counts every member), AND it receives
+/// `broadcast` (`Destination::All`) like any member — it is the sole one,
+/// so an `All` fan-out lands on it over the folded wire. The role-aware
 /// "how many alive secondaries" policy is the coordinator edge's
 /// `alive_secondary_count()` over global state, not the transport's.
 ///
@@ -97,11 +98,11 @@ impl<I: Identifier> FirewalledPrimaryLink<I> {
 
     /// Stage a link directly from pre-made channel ends, no real wire —
     /// the test analog of [`Self::fold`] (mirrors how `primary_link.rs`
-    /// stages the `Real` arm's directed link straight into the
-    /// `connections` table and `primary_link_id`). The directed-routing
-    /// and exclusion LOGIC is independent of the wire; the real-wire
-    /// fan-in is covered by the `network/tests.rs` mesh-writer fan-in
-    /// test.
+    /// stages the `Real` arm's link straight into the `connections`
+    /// table). The directed-routing logic — `send_to_peer`/`has_peer`
+    /// resolve the primary, `broadcast` (`All`) reaches it as a member —
+    /// is independent of the wire; the real-wire fan-in is covered by the
+    /// `network/tests.rs` mesh-writer fan-in test.
     #[cfg(test)]
     fn staged(
         primary_id: String,
@@ -220,10 +221,19 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
         match self {
             Self::Real(p) => p.broadcast(msg).await,
             Self::Disabled(p) => PeerTransport::<I>::broadcast(p, msg).await,
-            // The directed primary link is excluded from broadcast
-            // (mirrors the `Real` arm); a firewalled fleet has no mesh
-            // peers, so a mesh broadcast is a silent no-op.
-            Self::DisabledWithPrimary(_) => Ok(()),
+            // Deliver to the sole reachable member (mirrors the `Real`
+            // arm, which fans `broadcast` to EVERY connection — the
+            // folded primary included; it excludes nobody). A firewalled
+            // fleet's only mesh member is the folded primary, so
+            // `Destination::All` must reach it over `link.outbound` —
+            // otherwise every `All` send (keepalive and beyond) would be
+            // silently dropped, starving the primary of a degraded
+            // secondary's keepalives. Role-blind: this delivers to a
+            // member, not "the primary role".
+            Self::DisabledWithPrimary(link) => link
+                .outbound
+                .send(msg)
+                .map_err(|_| "primary bootstrap wire closed".to_string()),
         }
     }
 

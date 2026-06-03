@@ -32,9 +32,9 @@ where
     ///
     /// The failover-health window is opened by the send-side no-route
     /// probe in [`Self::send_to_primary`]: when a primary-bound send
-    /// returns a no-route `Err` (uplink closed AND no peer holds the
-    /// role), `record_recv_failure` anchors the window and bumps the
-    /// count axis. The COUNT axis can saturate (e.g. an idle worker's
+    /// returns a no-route `Err` (no peer in the mesh resolves the
+    /// `Primary` destination), `record_recv_failure` anchors the window
+    /// and bumps the count axis. The COUNT axis can saturate (e.g. an idle worker's
     /// backoff suppresses further `TaskRequest` sends, so no further
     /// probes accrue); this method covers the TIME axis by polling
     /// `should_arm_failover()` on every keepalive tick and backdating
@@ -73,11 +73,21 @@ where
         );
     }
 
-    /// Send keepalive to the current primary and broadcast to peers.
-    /// In degraded-mesh mode (`peer_mesh_degraded`) the peer
-    /// broadcast is skipped — there's nothing to broadcast to. The
-    /// primary→secondary keepalive over WSS still fires so the
-    /// primary keeps seeing us as alive.
+    /// Fan one keepalive out to the whole cluster on the keepalive tick.
+    ///
+    /// Post-fold the primary is just another peer in the one mesh, so a
+    /// single `Destination::All` fan-out reaches EVERY peer — the primary
+    /// included — EXACTLY ONCE (architecture invariant #5). There is no
+    /// separate primary-unicast leg: the old "two distinct liveness
+    /// targets" (primary-link unicast + peer broadcast) collapsed into the
+    /// one mesh when the submitter primary became a first-class peer, and
+    /// keeping both would double-deliver to the now-meshed primary. The
+    /// degraded-mesh early-return is likewise gone: the primary is a
+    /// member of the broadcast set regardless of the role-aware degraded
+    /// latch (the `Real` arm still holds the folded primary in its
+    /// `connections`; the firewalled arm routes `All` to the sole folded
+    /// member), so skipping the broadcast when degraded would starve the
+    /// primary of keepalives and trip a false primary-death.
     ///
     /// Strict-observer suppression: a pure observer (`config.is_observer`)
     /// originates NOTHING — keepalive included. A keepalive is a "my
@@ -109,14 +119,10 @@ where
             active_workers: active_count,
             emitter_role: KeepaliveRole::Secondary,
         };
-        // Two DISTINCT liveness targets (not a redundant fan-out):
-        //   1. the primary role — primary-link liveness, opaque routing.
-        //   2. the peer mesh — so other secondaries refresh this node's
-        //      `peer_keepalives` entry (drives their election timing).
-        let _ = self.send_to_primary(msg.clone()).await;
-        if self.is_mesh_degraded() {
-            return;
-        }
+        // ONE fan-out reaches every peer exactly once: the primary
+        // (a first-class mesh member post-fold) refreshes its view of
+        // this node's liveness, and every other secondary refreshes its
+        // `peer_keepalives` entry — both from the single broadcast.
         let _ = self.send_to(Destination::All, msg).await;
     }
 }
