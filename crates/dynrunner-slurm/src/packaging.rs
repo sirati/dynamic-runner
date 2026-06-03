@@ -117,7 +117,10 @@ mod tests {
             .build_images(&gw, Path::new("/proj"), Path::new("/gateway/images"))
             .await
             .expect("stub never fails");
-        assert_eq!(metadata.remote_path, PathBuf::from("/gateway/images/app.tar.gz"));
+        assert_eq!(
+            metadata.remote_path,
+            PathBuf::from("/gateway/images/app.tar.gz")
+        );
         assert_eq!(metadata.image_hash, "deadbeef");
         assert!(metadata.uploaded);
         assert_eq!(stub.calls.load(Ordering::SeqCst), 1);

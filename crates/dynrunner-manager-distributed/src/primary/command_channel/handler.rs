@@ -5,9 +5,7 @@
 //! co-located with the rest of the coordinator's state.
 
 use dynrunner_core::{ErrorType, Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -15,8 +13,7 @@ use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
-use super::types::{validate_spawn_tasks, PrimaryCommand, SpawnError};
-
+use super::types::{PrimaryCommand, SpawnError, validate_spawn_tasks};
 
 /// Dispatch one received command to its handler. Single line at the
 /// `select!` call site keeps the operational-loop's match arm
@@ -137,9 +134,7 @@ where
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
         let Some((phase_id, task_id)) = self.task_meta_for_hash(&hash) else {
-            return Err(format!(
-                "fail_permanent: unknown task hash {hash}"
-            ));
+            return Err(format!("fail_permanent: unknown task hash {hash}"));
         };
         // Record the failure in the local per-pass ledger so the
         // operational loop's accounting + the per-phase counters match
@@ -161,13 +156,11 @@ where
             let is_unfulfillable = matches!(error, ErrorType::Unfulfillable { .. });
             let mut blocks = Vec::new();
             for cascaded_binary in &cascaded {
-                let cascaded_hash =
-                    crate::primary::wire::compute_task_hash(cascaded_binary);
+                let cascaded_hash = crate::primary::wire::compute_task_hash(cascaded_binary);
                 if is_unfulfillable {
                     blocks.push((cascaded_hash, hash.clone()));
                 } else {
-                    self.failed_tasks
-                        .insert(cascaded_hash, error.clone());
+                    self.failed_tasks.insert(cascaded_hash, error.clone());
                 }
             }
             blocks
@@ -176,7 +169,8 @@ where
         // Phase + lifecycle bookkeeping. Must run AFTER the pool
         // mutation so `process_phase_lifecycle` observes the post-
         // cascade pool state.
-        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx).await;
+        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx)
+            .await;
 
         // Broadcast the terminal state for the originating task plus
         // any cascade-paused dependents (Unfulfillable case only).
@@ -185,9 +179,7 @@ where
         // first means receivers see the prereq's Unfulfillable state
         // before the dependents' Blocked state — the cascade root is
         // visible whenever a dependent's `on` field is consulted.
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(
-            1 + cascaded_blocks.len(),
-        );
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(1 + cascaded_blocks.len());
         mutations.push(ClusterMutation::TaskFailed {
             hash,
             kind: error,
@@ -208,10 +200,7 @@ where
     /// — the operator-resolvable-failure class. Decrements the per-task
     /// budget; on exhaustion the local state stays `Unfulfillable` and
     /// the caller receives `Err`.
-    pub(super) async fn apply_reinject_task(
-        &mut self,
-        hash: String,
-    ) -> Result<(), String> {
+    pub(super) async fn apply_reinject_task(&mut self, hash: String) -> Result<(), String> {
         // Inspect CRDT state first — the local pool isn't indexed by
         // hash, and the discrete-variant gate has to read the
         // authoritative ledger.
@@ -223,9 +212,7 @@ where
                 ));
             }
             None => {
-                return Err(format!(
-                    "reinject_task: unknown task hash {hash}"
-                ));
+                return Err(format!("reinject_task: unknown task hash {hash}"));
             }
         };
 
@@ -263,10 +250,8 @@ where
 
         // Broadcast so every node's CRDT mirror moves the entry off
         // `Failed` synchronously.
-        self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::TaskReinjected { hash },
-        ])
-        .await;
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskReinjected { hash }])
+            .await;
         // The reinjected binary is a pool-entry edge — EMIT a
         // `TasksAdded` so the worker-management recheck picks it up. The
         // matcher auto-fires this command, and a free worker that
@@ -309,9 +294,7 @@ where
         // takes any predicate so it doesn't have to learn about
         // wire-canonical hashing.
         let target_hash = hash.clone();
-        let new_preferences = dynrunner_core::SoftPreferredSecondaries::new(
-            secondaries.clone(),
-        );
+        let new_preferences = dynrunner_core::SoftPreferredSecondaries::new(secondaries.clone());
         let matched = self.pool_mut().update_first_match_in_place(
             |t| crate::primary::wire::compute_task_hash(t) == target_hash,
             |t| t.preferred_secondaries = new_preferences.clone(),
@@ -329,10 +312,7 @@ where
             );
         }
         self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::TaskPreferredSecondariesUpdated {
-                hash,
-                secondaries,
-            },
+            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries },
         ])
         .await;
         Ok(())
@@ -403,9 +383,7 @@ where
         let duplicate_reasons: Vec<String> = errors
             .iter()
             .filter_map(|(_, e)| match e {
-                SpawnError::DuplicateTaskHash(hash) => {
-                    Some(format!("duplicate task hash {hash}"))
-                }
+                SpawnError::DuplicateTaskHash(hash) => Some(format!("duplicate task hash {hash}")),
                 _ => None,
             })
             .collect();
@@ -441,11 +419,9 @@ where
             .map(crate::primary::wire::compute_task_hash)
             .collect();
 
-        self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::TasksSpawned {
-                tasks: valid_tasks,
-            },
-        ])
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TasksSpawned {
+            tasks: valid_tasks,
+        }])
         .await;
 
         // Symmetric with the receive-side mirror in
@@ -519,4 +495,3 @@ where
         Ok(errors)
     }
 }
-

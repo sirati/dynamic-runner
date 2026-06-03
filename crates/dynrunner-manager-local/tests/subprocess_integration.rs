@@ -6,82 +6,89 @@
 
 mod common;
 
-use common::{make_binary, worker_module_dir, FixedEstimator, PythonWorkerFactory, TestId};
+use common::{FixedEstimator, PythonWorkerFactory, TestId, make_binary, worker_module_dir};
 
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_core::{MessageReceiver, MessageSender, TaskInfo, WorkerId};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
 use dynrunner_transport_socket::socketpair::SocketpairManagerEnd;
 
-
 #[tokio::test(flavor = "current_thread")]
 async fn single_worker_subprocess_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join("rust_integ_test_single");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+    local
+        .run_until(async {
+            let worker_dir = worker_module_dir();
+            let tmp_dir = std::env::temp_dir().join("rust_integ_test_single");
+            let _ = std::fs::create_dir_all(&tmp_dir);
 
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
-            always_restart_worker: false,
-            restart_predicate: None,
-            retry_max_attempts: 1,
-            print_pid: false,
-            memuse_log_path: None,
-            stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
-            resource_check_interval: std::time::Duration::from_millis(100),
-            phase_status_log_intervals: Vec::new(),
-            log_oom_watcher: false,
-            output_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-        };
+            let config = LocalManagerConfig {
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                always_restart_worker: false,
+                restart_predicate: None,
+                retry_max_attempts: 1,
+                print_pid: false,
+                memuse_log_path: None,
+                stage_timeouts: std::collections::HashMap::new(),
+                low_resource_thresholds: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    300 * 1024 * 1024,
+                )]),
+                resource_check_interval: std::time::Duration::from_millis(100),
+                phase_status_log_intervals: Vec::new(),
+                log_oom_watcher: false,
+                output_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+            };
 
-        let mut factory = PythonWorkerFactory {
-            worker_module_dir: worker_dir,
-            source_dir: tmp_dir.clone(),
-            output_dir: tmp_dir.clone(),
-            children: Vec::new(),
-        };
+            let mut factory = PythonWorkerFactory {
+                worker_module_dir: worker_dir,
+                source_dir: tmp_dir.clone(),
+                output_dir: tmp_dir.clone(),
+                children: Vec::new(),
+            };
 
-        let binaries = vec![
-            make_binary("a.bin", 100),
-            make_binary("b.bin", 200),
-            make_binary("c.bin", 300),
-        ];
+            let binaries = vec![
+                make_binary("a.bin", 100),
+                make_binary("b.bin", 200),
+                make_binary("c.bin", 300),
+            ];
 
-        let mut manager = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
-        );
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
+            );
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .await;
 }
 
 // ── Named socket integration tests ──
@@ -227,67 +234,75 @@ impl Drop for NamedSocketWorkerFactory {
 async fn single_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join(format!("rin_{}", process::id()));
-        let socket_dir = tmp_dir.join("sockets");
-        let _ = std::fs::create_dir_all(&socket_dir);
+    local
+        .run_until(async {
+            let worker_dir = worker_module_dir();
+            let tmp_dir = std::env::temp_dir().join(format!("rin_{}", process::id()));
+            let socket_dir = tmp_dir.join("sockets");
+            let _ = std::fs::create_dir_all(&socket_dir);
 
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
-            always_restart_worker: false,
-            restart_predicate: None,
-            retry_max_attempts: 1,
-            print_pid: false,
-            memuse_log_path: None,
-            stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
-            resource_check_interval: std::time::Duration::from_millis(100),
-            phase_status_log_intervals: Vec::new(),
-            log_oom_watcher: false,
-            output_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-        };
+            let config = LocalManagerConfig {
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                always_restart_worker: false,
+                restart_predicate: None,
+                retry_max_attempts: 1,
+                print_pid: false,
+                memuse_log_path: None,
+                stage_timeouts: std::collections::HashMap::new(),
+                low_resource_thresholds: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    300 * 1024 * 1024,
+                )]),
+                resource_check_interval: std::time::Duration::from_millis(100),
+                phase_status_log_intervals: Vec::new(),
+                log_oom_watcher: false,
+                output_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+            };
 
-        let mut factory = NamedSocketWorkerFactory {
-            worker_module_dir: worker_dir,
-            source_dir: tmp_dir.clone(),
-            output_dir: tmp_dir.clone(),
-            socket_dir,
-            children: Vec::new(),
-        };
+            let mut factory = NamedSocketWorkerFactory {
+                worker_module_dir: worker_dir,
+                source_dir: tmp_dir.clone(),
+                output_dir: tmp_dir.clone(),
+                socket_dir,
+                children: Vec::new(),
+            };
 
-        let binaries = vec![
-            make_binary("a.bin", 100),
-            make_binary("b.bin", 200),
-            make_binary("c.bin", 300),
-        ];
+            let binaries = vec![
+                make_binary("a.bin", 100),
+                make_binary("b.bin", 200),
+                make_binary("c.bin", 300),
+            ];
 
-        let mut manager = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(50 * 1024 * 1024),
-        );
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(50 * 1024 * 1024),
+            );
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .await;
 }
 
 // Same root cause as `single_worker_named_socket_processes_all` above: every
@@ -299,126 +314,142 @@ async fn single_worker_named_socket_processes_all() {
 async fn multi_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join(format!("rinm_{}", process::id()));
-        let socket_dir = tmp_dir.join("sockets");
-        let _ = std::fs::create_dir_all(&socket_dir);
+    local
+        .run_until(async {
+            let worker_dir = worker_module_dir();
+            let tmp_dir = std::env::temp_dir().join(format!("rinm_{}", process::id()));
+            let socket_dir = tmp_dir.join("sockets");
+            let _ = std::fs::create_dir_all(&socket_dir);
 
-        let config = LocalManagerConfig {
-            num_workers: 3,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
-            always_restart_worker: false,
-            restart_predicate: None,
-            retry_max_attempts: 1,
-            print_pid: false,
-            memuse_log_path: None,
-            stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
-            resource_check_interval: std::time::Duration::from_millis(100),
-            phase_status_log_intervals: Vec::new(),
-            log_oom_watcher: false,
-            output_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-        };
+            let config = LocalManagerConfig {
+                num_workers: 3,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    2 * 1024 * 1024 * 1024,
+                )]),
+                always_restart_worker: false,
+                restart_predicate: None,
+                retry_max_attempts: 1,
+                print_pid: false,
+                memuse_log_path: None,
+                stage_timeouts: std::collections::HashMap::new(),
+                low_resource_thresholds: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    300 * 1024 * 1024,
+                )]),
+                resource_check_interval: std::time::Duration::from_millis(100),
+                phase_status_log_intervals: Vec::new(),
+                log_oom_watcher: false,
+                output_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+            };
 
-        let mut factory = NamedSocketWorkerFactory {
-            worker_module_dir: worker_dir,
-            source_dir: tmp_dir.clone(),
-            output_dir: tmp_dir.clone(),
-            socket_dir,
-            children: Vec::new(),
-        };
+            let mut factory = NamedSocketWorkerFactory {
+                worker_module_dir: worker_dir,
+                source_dir: tmp_dir.clone(),
+                output_dir: tmp_dir.clone(),
+                socket_dir,
+                children: Vec::new(),
+            };
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..8)
-            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
-            .collect();
+            let binaries: Vec<TaskInfo<TestId>> = (0..8)
+                .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
+                .collect();
 
-        let mut manager = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(50 * 1024 * 1024),
-        );
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(50 * 1024 * 1024),
+            );
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 8);
-        assert_eq!(manager.stats().total, 8);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 8);
+            assert_eq!(manager.stats().total, 8);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn multi_worker_subprocess_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join("rust_integ_test_multi");
-        let _ = std::fs::create_dir_all(&tmp_dir);
+    local
+        .run_until(async {
+            let worker_dir = worker_module_dir();
+            let tmp_dir = std::env::temp_dir().join("rust_integ_test_multi");
+            let _ = std::fs::create_dir_all(&tmp_dir);
 
-        let config = LocalManagerConfig {
-            num_workers: 3,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
-            always_restart_worker: false,
-            restart_predicate: None,
-            retry_max_attempts: 1,
-            print_pid: false,
-            memuse_log_path: None,
-            stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
-            resource_check_interval: std::time::Duration::from_millis(100),
-            phase_status_log_intervals: Vec::new(),
-            log_oom_watcher: false,
-            output_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-        };
+            let config = LocalManagerConfig {
+                num_workers: 3,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    2 * 1024 * 1024 * 1024,
+                )]),
+                always_restart_worker: false,
+                restart_predicate: None,
+                retry_max_attempts: 1,
+                print_pid: false,
+                memuse_log_path: None,
+                stage_timeouts: std::collections::HashMap::new(),
+                low_resource_thresholds: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    300 * 1024 * 1024,
+                )]),
+                resource_check_interval: std::time::Duration::from_millis(100),
+                phase_status_log_intervals: Vec::new(),
+                log_oom_watcher: false,
+                output_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+            };
 
-        let mut factory = PythonWorkerFactory {
-            worker_module_dir: worker_dir,
-            source_dir: tmp_dir.clone(),
-            output_dir: tmp_dir.clone(),
-            children: Vec::new(),
-        };
+            let mut factory = PythonWorkerFactory {
+                worker_module_dir: worker_dir,
+                source_dir: tmp_dir.clone(),
+                output_dir: tmp_dir.clone(),
+                children: Vec::new(),
+            };
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..8)
-            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
-            .collect();
+            let binaries: Vec<TaskInfo<TestId>> = (0..8)
+                .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
+                .collect();
 
-        let mut manager = LocalManager::new(
-            config,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(50 * 1024 * 1024),
-        );
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(50 * 1024 * 1024),
+            );
 
-        manager
-            .process_binaries(
-                binaries,
-                std::collections::HashMap::new(),
-                |_phase| {},
-                |_phase, _completed, _failed| {},
-                &mut factory,
-            )
-            .await
-            .unwrap();
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(manager.stats().completed, 8);
-        assert_eq!(manager.stats().total, 8);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.resource_pressure_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 8);
+            assert_eq!(manager.stats().total, 8);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.resource_pressure_tasks().is_empty());
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-    }).await;
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        })
+        .await;
 }

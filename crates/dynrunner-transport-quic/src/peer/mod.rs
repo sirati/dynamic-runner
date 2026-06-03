@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    new_role_cache, seed_self_role, DistributedMessage, PeerConnectionInfo, RoleCache, Router,
+    DistributedMessage, PeerConnectionInfo, RoleCache, Router, new_role_cache, seed_self_role,
 };
 use tokio::sync::mpsc;
 
@@ -198,11 +198,8 @@ impl<I: Identifier> PeerNetwork<I> {
         {
             let tick_tx = reconnect_tick_tx;
             tokio::task::spawn_local(async move {
-                let mut interval =
-                    tokio::time::interval(reconnect::RECONNECT_TICK);
-                interval.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
+                let mut interval = tokio::time::interval(reconnect::RECONNECT_TICK);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 // Skip the first immediate tick: `Interval::tick()`
                 // resolves immediately on first call which would
                 // ping the tracker before any peers are tracked.
@@ -405,8 +402,7 @@ impl<I: Identifier> PeerNetwork<I> {
     /// so this method is safe even if a redial from a prior tick
     /// is still in flight when the next tick fires.
     fn process_reconnect_tick(&mut self) {
-        let cluster_peers: Vec<String> =
-            self.peer_dial_info.keys().cloned().collect();
+        let cluster_peers: Vec<String> = self.peer_dial_info.keys().cloned().collect();
         for peer_id in &cluster_peers {
             if self.connections.contains_key(peer_id) {
                 self.reconnect_tracker.observe_reconnect(peer_id);
@@ -432,9 +428,9 @@ impl<I: Identifier> PeerNetwork<I> {
     fn spawn_redial(&self, peer_id: &str) {
         if self.connections.contains_key(peer_id) {
             return; // already directly connected (mid-heal: prior dial
-                    // landed but the cooldown timestamp is still hot).
-                    // Skipping avoids a duplicate WSS pipe whose sender
-                    // would later be discarded by drain_new_connections.
+            // landed but the cooldown timestamp is still hot).
+            // Skipping avoids a duplicate WSS pipe whose sender
+            // would later be discarded by drain_new_connections.
         }
         let Some(peer_info) = self.peer_dial_info.get(peer_id).cloned() else {
             return; // peer no longer in the authoritative cluster list
@@ -459,11 +455,8 @@ impl<I: Identifier> PeerNetwork<I> {
             let Some(connection) = dial::dial_peer(&peer_id, &peer_info).await else {
                 return;
             };
-            let outgoing_tx = handler::spawn_outgoing_handler(
-                peer_id.clone(),
-                connection,
-                incoming_tx,
-            );
+            let outgoing_tx =
+                handler::spawn_outgoing_handler(peer_id.clone(), connection, incoming_tx);
             let _ = new_conn_tx.send(AcceptedPeer {
                 peer_id,
                 outgoing_tx,
@@ -471,4 +464,3 @@ impl<I: Identifier> PeerNetwork<I> {
         });
     }
 }
-

@@ -11,7 +11,7 @@
 //! the boilerplate without splitting concerns.
 
 use crate::config::SlurmConfig;
-use crate::wrapper_script::{generate_wrapper_script, WrapperScriptConfig};
+use crate::wrapper_script::{WrapperScriptConfig, generate_wrapper_script};
 
 use super::standard_cfg;
 
@@ -51,9 +51,7 @@ fn standard_mode_script_forwards_cores_spec() {
     let port_idx = script
         .find("--secondary-quic-port")
         .expect("--secondary-quic-port must be present");
-    let cores_idx = script
-        .find("--cores=")
-        .expect("--cores= must be present");
+    let cores_idx = script.find("--cores=").expect("--cores= must be present");
     assert!(
         cores_idx > port_idx,
         "--cores must appear after --secondary-quic-port in the secondary's \
@@ -96,9 +94,7 @@ fn standard_mode_script_forwards_max_memory_spec() {
          specs (task #32 argparse-collision fix); render did not contain it"
     );
     // `--max-memory` MUST land AFTER `--cores` (argv-build order).
-    let cores_idx = script
-        .find("--cores=")
-        .expect("--cores= must be present");
+    let cores_idx = script.find("--cores=").expect("--cores= must be present");
     let mem_idx = script
         .find("--max-memory=")
         .expect("--max-memory= must be present");
@@ -370,4 +366,3 @@ fn consumer_nproc_ulimit_lands_after_framework_default() {
          got default at {default_idx} and consumer at {consumer_idx}"
     );
 }
-

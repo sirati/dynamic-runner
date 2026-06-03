@@ -23,14 +23,12 @@
 
 use std::sync::Arc;
 
-use dynrunner_manager_distributed::primary::respawn::{
-    SecondarySpawner, SecondarySpawnSpec,
-};
+use dynrunner_manager_distributed::primary::respawn::{SecondarySpawnSpec, SecondarySpawner};
+use dynrunner_slurm::SlurmJobManager;
+use dynrunner_slurm::preparation::SlurmPreparation;
 use dynrunner_slurm::respawn::{
     SlurmPreparationTunnelEstablisher, SlurmSecondarySpawner, WrapperScriptGenerator,
 };
-use dynrunner_slurm::SlurmJobManager;
-use dynrunner_slurm::preparation::SlurmPreparation;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tokio::sync::Mutex;
@@ -78,13 +76,12 @@ impl PySlurmSpawner {
             preparation,
             info_reader,
         ));
-        let inner: Arc<dyn SecondarySpawner> =
-            Arc::new(SlurmSecondarySpawner::new(
-                job_manager,
-                tunnel_establisher,
-                wrapper_script_generator,
-                run_log_dir,
-            ));
+        let inner: Arc<dyn SecondarySpawner> = Arc::new(SlurmSecondarySpawner::new(
+            job_manager,
+            tunnel_establisher,
+            wrapper_script_generator,
+            run_log_dir,
+        ));
         Self { inner }
     }
 
@@ -200,7 +197,9 @@ mod tests {
             let module = PyModule::from_code(
                 py,
                 std::ffi::CString::new(source).unwrap().as_c_str(),
-                std::ffi::CString::new(filename.as_str()).unwrap().as_c_str(),
+                std::ffi::CString::new(filename.as_str())
+                    .unwrap()
+                    .as_c_str(),
                 std::ffi::CString::new(module_name).unwrap().as_c_str(),
             )
             .expect("compile stub module");
@@ -239,9 +238,8 @@ mod tests {
         let spec = SecondarySpawnSpec {
             new_secondary_id: "secondary-7".to_owned(),
             primary_endpoint: "127.0.0.1:5555".to_owned(),
-            primary_pubkey_pem:
-                "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----\n"
-                    .to_owned(),
+            primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nABC\n-----END PUBLIC KEY-----\n"
+                .to_owned(),
         };
         let body = generator(&spec).expect("closure must render");
         assert!(
@@ -293,7 +291,8 @@ mod tests {
             assert!(argv.contains(&"--source".to_owned()));
             assert!(argv.contains(&"/src".to_owned()));
             assert!(
-                argv.iter().any(|s| s.starts_with("--secondary-primary-pubkey-pem=")),
+                argv.iter()
+                    .any(|s| s.starts_with("--secondary-primary-pubkey-pem=")),
                 "spec.primary_pubkey_pem must be appended to forwarded_argv as \
                  --secondary-primary-pubkey-pem=<pem>; got argv = {argv:?}",
             );
@@ -346,7 +345,9 @@ mod tests {
                 .extract()
                 .unwrap();
             assert!(
-                !argv.iter().any(|s| s.starts_with("--secondary-primary-pubkey-pem")),
+                !argv
+                    .iter()
+                    .any(|s| s.starts_with("--secondary-primary-pubkey-pem")),
                 "empty pem must NOT inject an empty --secondary-primary-pubkey-pem= \
                  argv entry (that would mask the missing-value follow-up); got: {argv:?}",
             );

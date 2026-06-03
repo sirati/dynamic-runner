@@ -13,11 +13,11 @@ use dynrunner_core::Identifier;
 
 use crate::messages::DistributedMessage;
 use crate::relay::channel::OutboundChannel;
-use crate::relay::{handle_backoff, BackoffDecision, RouteDecision};
 use crate::relay::router::dispatcher::Router;
 use crate::relay::router::state::{
-    blacklist_for, Clocks, MSG_DROPPED_AT_ORIGINATOR, RELAY_LOG_TARGET,
+    Clocks, MSG_DROPPED_AT_ORIGINATOR, RELAY_LOG_TARGET, blacklist_for,
 };
+use crate::relay::{BackoffDecision, RouteDecision, handle_backoff};
 
 impl<I: Identifier> Router<I> {
     #[allow(clippy::too_many_arguments)]
@@ -60,8 +60,7 @@ impl<I: Identifier> Router<I> {
                 wrapped,
                 bookkeeping,
             } => {
-                let send_res =
-                    connections.get(&via).map(|chan| chan.dispatch(wrapped));
+                let send_res = connections.get(&via).map(|chan| chan.dispatch(wrapped));
                 match send_res {
                     Some(Ok(())) => {
                         self.outgoing_relays
@@ -149,8 +148,7 @@ impl<I: Identifier> Router<I> {
         // doesn't blacklist it for any other destination.
         self.failed_forwarders
             .insert((state.target.clone(), failed_via.clone()), clocks.now);
-        let blacklist =
-            blacklist_for(&self.failed_forwarders, &state.target, clocks.now);
+        let blacklist = blacklist_for(&self.failed_forwarders, &state.target, clocks.now);
         let decision = handle_backoff(
             state,
             connections,
@@ -162,8 +160,7 @@ impl<I: Identifier> Router<I> {
         );
         match decision {
             BackoffDecision::Retry { via, wrapped } => {
-                let send_res =
-                    connections.get(&via).map(|chan| chan.dispatch(wrapped));
+                let send_res = connections.get(&via).map(|chan| chan.dispatch(wrapped));
                 match send_res {
                     Some(Ok(())) => {}
                     Some(Err(_)) | None => {

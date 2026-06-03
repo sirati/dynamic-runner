@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use tokio::process::Child;
-use tokio::sync::{oneshot, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use super::establish::establish_one_tunnel_inner;
@@ -63,8 +63,7 @@ pub struct SlurmPreparation {
 
 impl SlurmPreparation {
     pub fn new(opts: PreparationOptions) -> Self {
-        let establish_pool =
-            Arc::new(Semaphore::new(opts.establishment.max_concurrent.max(1)));
+        let establish_pool = Arc::new(Semaphore::new(opts.establishment.max_concurrent.max(1)));
         Self {
             opts,
             ssh_tunnels: Arc::new(Mutex::new(Vec::new())),
@@ -131,9 +130,8 @@ impl SlurmPreparation {
         // we return from this function (success OR timeout), JoinSet
         // is dropped and aborts any still-running watcher.
         let mut watchers: JoinSet<()> = JoinSet::new();
-        let mut receivers: Vec<
-            oneshot::Receiver<Result<(String, u16), PrepError>>,
-        > = Vec::with_capacity(num_secondaries);
+        let mut receivers: Vec<oneshot::Receiver<Result<(String, u16), PrepError>>> =
+            Vec::with_capacity(num_secondaries);
 
         for i in 0..num_secondaries {
             let secondary_id = format!("secondary-{i}");
@@ -158,7 +156,8 @@ impl SlurmPreparation {
             let port_map = Arc::clone(&self.secondary_port_map);
             let id_for_task = secondary_id.clone();
             watchers.spawn_local(async move {
-                let spawner = production_spawner(id_for_task.clone(), opts.clone(), primary_quic_port);
+                let spawner =
+                    production_spawner(id_for_task.clone(), opts.clone(), primary_quic_port);
                 let res = establish_one_tunnel_inner(
                     &id_for_task,
                     &info_path,
@@ -393,4 +392,3 @@ pub(super) async fn gather_under_deadline(
         Ok(out)
     }
 }
-

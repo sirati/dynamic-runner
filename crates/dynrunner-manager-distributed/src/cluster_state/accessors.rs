@@ -89,9 +89,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Completed { .. } => o.succeeded += 1,
                 TaskState::Failed { kind, .. } => match kind {
                     ErrorType::Recoverable => o.fail_retry += 1,
-                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
-                        o.fail_oom += 1
-                    }
+                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => o.fail_oom += 1,
                     // Defensive: the apply rule for `TaskFailed` routes
                     // `Unfulfillable` straight to `TaskState::Unfulfillable`
                     // (the discrete state below), so this arm is unreachable

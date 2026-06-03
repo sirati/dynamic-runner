@@ -1,20 +1,18 @@
-
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, Role,
-};
-use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo,
-};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
+use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
-    pub(crate) async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
+    pub(crate) async fn handle_task_request(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
             ref secondary_id,
             worker_id,
@@ -22,7 +20,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             ..
         } = msg
         {
-            let available_res: ResourceMap = available_resources.iter()
+            let available_res: ResourceMap = available_resources
+                .iter()
                 .map(|r| (r.kind.clone(), r.amount))
                 .collect();
             // Find matching worker by its stable secondary-local id.
@@ -175,12 +174,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         // point). After the send so a failure needs no
                         // CRDT compensation (the rollback above runs
                         // before we reach here).
-                        self.originate_task_assigned(
-                            task_hash.clone(),
-                            sec_id.clone(),
-                            worker_id,
-                        )
-                        .await;
+                        self.originate_task_assigned(task_hash.clone(), sec_id.clone(), worker_id)
+                            .await;
 
                         // Operator-facing INFO: which secondary/
                         // worker just took the task. Per-task
@@ -238,10 +233,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // per `feedback_mesh_independent_of_role_and_membership.md`)
             // regardless of who's authoritative.
             if !assigned
-                && let Err(e) = self
-                    .transport
-                    .send(Address::Role(Role::Primary), msg)
-                    .await
+                && let Err(e) = self.transport.send(Address::Role(Role::Primary), msg).await
             {
                 tracing::debug!(
                     error = %e,
@@ -252,5 +244,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
         Ok(())
     }
-
 }

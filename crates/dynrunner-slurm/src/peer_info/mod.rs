@@ -92,5 +92,5 @@ mod types;
 
 pub use builder::Builder;
 pub use parse_impl::{parse, parse_v1_uri};
-pub use read_dir::{read_dir_v2, ReadDirError};
+pub use read_dir::{ReadDirError, read_dir_v2};
 pub use types::{LegacyUri, PeerInfoError, PeerInfoRecord, PeerInfoVersion};

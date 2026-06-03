@@ -15,9 +15,9 @@
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
-use crate::{DistributedMessage, PeerTransport, SecondaryTransport};
 use crate::setup_bootstrap::message::SetupBootstrapMessage;
 use crate::setup_bootstrap::trait_defs::{SetupBootstrap, SetupBootstrapBroadcast};
+use crate::{DistributedMessage, PeerTransport, SecondaryTransport};
 
 /// Secondary-side adapter: wraps a `&mut T` (any
 /// `MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>`)

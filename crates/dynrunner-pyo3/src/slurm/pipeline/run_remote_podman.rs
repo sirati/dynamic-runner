@@ -31,7 +31,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use super::{attr_truthy, CleanupGuard};
+use super::{CleanupGuard, attr_truthy};
 
 /// `bool(getattr(obj, name, default_when_missing))` extractor for
 /// argparse-style booleans where the attribute may be absent on
@@ -158,9 +158,11 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
     gateway.call_method0("connect")?;
     log.call_method1(
         "info",
-        ("Note: the gateway port-probe warning 'GatewayPorts likely disabled' is a \
+        (
+            "Note: the gateway port-probe warning 'GatewayPorts likely disabled' is a \
           false alarm for remote-podman — container --network host reaches the \
-          master's downgraded 127.0.0.1 bind transparently.",),
+          master's downgraded 127.0.0.1 bind transparently.",
+        ),
     )?;
 
     // ---- Slurm config + root-folder validation/creation. ----
@@ -272,10 +274,7 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
     let pipeline_result: PyResult<()> = (|| {
         // ---- Phase 1: gateway-side prep + image staging. ----
         log.call_method1("info", ("Phase 1: directory prep + image staging",))?;
-        let base_log_dir: String = slurm_config
-            .call_method0("get_log_dir")?
-            .str()?
-            .extract()?;
+        let base_log_dir: String = slurm_config.call_method0("get_log_dir")?.str()?.extract()?;
         let run_log_dir = format!("{base_log_dir}/{run_id}");
 
         job_manager.call_method0("prepare_directories")?;
@@ -296,10 +295,7 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             let image_dir_path = pathlib.getattr("Path")?.call1((image_dir,))?;
             let image_tar_basename = deployment.getattr("image_tar_basename")?;
             let image_path = image_dir_path.call_method1("__truediv__", (image_tar_basename,))?;
-            log.call_method1(
-                "info",
-                (format!("Assuming image exists at: {image_path}"),),
-            )?;
+            log.call_method1("info", (format!("Assuming image exists at: {image_path}"),))?;
             let metadata_cls = podman_module.getattr("PodmanImageMetadata")?;
             let metadata_kwargs = PyDict::new(py);
             metadata_kwargs.set_item("remote_path", image_path)?;
@@ -489,15 +485,12 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
         let coord = coord_cls.call(args_tuple, Some(&coord_kwargs))?;
 
         // ---- StageFile gating: same three-way switch as SLURM. ----
-        let coord_uses_file_based: bool =
-            coord.getattr("uses_file_based_items")?.extract()?;
+        let coord_uses_file_based: bool = coord.getattr("uses_file_based_items")?.extract()?;
         if !coord_uses_file_based {
             log.call_method1(
                 "info",
-                (
-                    "TaskDefinition.uses_file_based_items=False; \
-                     skipping primary StageFile pass and starting coordinator",
-                ),
+                ("TaskDefinition.uses_file_based_items=False; \
+                     skipping primary StageFile pass and starting coordinator",),
             )?;
         } else if attr_truthy(args, "source_already_staged") {
             let staged = args.getattr("source_already_staged")?;
@@ -525,8 +518,7 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
         }
 
         // ---- on_run_start / coord.run / on_run_end. ----
-        let on_run_start_source_dir: String =
-            sel_result.getattr("source_dir")?.str()?.extract()?;
+        let on_run_start_source_dir: String = sel_result.getattr("source_dir")?.str()?.extract()?;
         let on_run_start_output_dir: String = slurm_config
             .call_method0("get_output_dir")?
             .str()?

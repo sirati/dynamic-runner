@@ -63,11 +63,7 @@ impl PyRespawnPolicy {
     /// must thread the CLI defaults (`3`, `10`, `30.0`) explicitly —
     /// surfacing them at the call site keeps the wiring auditable.
     #[staticmethod]
-    fn on_secondary_death(
-        max_per_secondary: u32,
-        max_total: u32,
-        cooldown_secs: f64,
-    ) -> Self {
+    fn on_secondary_death(max_per_secondary: u32, max_total: u32, cooldown_secs: f64) -> Self {
         Self {
             inner: PolicyKind::OnSecondaryDeath {
                 budget: RespawnBudget {

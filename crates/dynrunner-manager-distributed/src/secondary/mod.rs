@@ -101,8 +101,7 @@ pub(super) struct PendingFirstBind<I: Identifier> {
     pub(super) binary: TaskInfo<I>,
     pub(super) file_hash: String,
     pub(super) estimated: dynrunner_core::ResourceMap,
-    pub(super) predecessor_outputs:
-        std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
+    pub(super) predecessor_outputs: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.
@@ -385,15 +384,13 @@ where
     /// handed to
     /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] inside
     /// the LocalSet running the secondary's operational loop.
-    pub(super) lifecycle_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>,
-    >,
+    pub(super) lifecycle_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
     /// Consumers of peer-lifecycle events; same single-shot
     /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
     /// `PrimaryCoordinator::peer_lifecycle_listeners` for the
     /// rationale.
-    pub(super) peer_lifecycle_listeners:
-        Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+    pub(super) peer_lifecycle_listeners: Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 
     /// Handle to the peer-lifecycle dispatcher task spawned at
     /// `run_until_setup_or_done`'s first entry. `Some` between spawn
@@ -411,16 +408,14 @@ where
     /// `task_completed_tx` installed on `cluster_state` at
     /// construction. Same single-shot / `mem::take`-at-first-entry
     /// semantics as `lifecycle_rx`.
-    pub(super) task_completed_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>,
-    >,
+    pub(super) task_completed_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>>,
 
     /// Consumers of task-completion events; same single-shot
     /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
     /// `PrimaryCoordinator::task_completed_listeners` for the
     /// rationale.
-    pub(super) task_completed_listeners:
-        Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
+    pub(super) task_completed_listeners: Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
 
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
@@ -443,11 +438,8 @@ where
     /// attached the announcer) never construct the outbox, so the
     /// select arm parks on `pending()` instead of polling a dead
     /// channel.
-    pub(super) announcer_outbox_tx: Option<
-        tokio::sync::mpsc::Sender<
-            crate::observer::announcer::AnnouncerOutboxItem<I>,
-        >,
-    >,
+    pub(super) announcer_outbox_tx:
+        Option<tokio::sync::mpsc::Sender<crate::observer::announcer::AnnouncerOutboxItem<I>>>,
 
     /// Announcer-outbox receiver, paired with `announcer_outbox_tx`.
     /// Built in [`Self::attach_observer_announcer`] (so non-observer
@@ -457,11 +449,8 @@ where
     /// `command_rx`/`matcher_trigger_rx` on the primary. `None`
     /// outside the attached-observer window or once the loop has
     /// taken ownership.
-    pub(super) announcer_outbox_rx: Option<
-        tokio::sync::mpsc::Receiver<
-            crate::observer::announcer::AnnouncerOutboxItem<I>,
-        >,
-    >,
+    pub(super) announcer_outbox_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::observer::announcer::AnnouncerOutboxItem<I>>>,
 
     /// Panik-watcher signal receiver. Installed via
     /// [`Self::register_panik_signal_rx`] before `run_until_setup_or_done`
@@ -572,9 +561,8 @@ where
     /// the legacy single-`run()` callers) — the terminal action is then
     /// a no-op on the gate (the broadcast still fires) and the secondary
     /// runs without a local authority to promote.
-    pub(super) promote_activation_tx: Option<
-        tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
-    >,
+    pub(super) promote_activation_tx:
+        Option<tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>>,
 
     /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
     /// closure calling Python's `task.on_phase_end(phase_id, completed,
@@ -590,14 +578,12 @@ where
     /// via [`SecondaryCoordinator::take_composed_primary_wiring`] before
     /// the primary's `run_parked` enters. That extraction is the in-crate
     /// consumer, so this field carries no `#[allow(dead_code)]`.
-    pub(super) on_phase_end:
-        Option<crate::primary::OnPhaseEnd>,
+    pub(super) on_phase_end: Option<crate::primary::OnPhaseEnd>,
 
     /// Phase-start sibling of `on_phase_end`; same registration-anchor
     /// disposition (transferred to the co-located primary via
     /// `take_composed_primary_wiring`, fired by it, not the secondary).
-    pub(super) on_phase_start:
-        Option<crate::primary::OnPhaseStart>,
+    pub(super) on_phase_start: Option<crate::primary::OnPhaseStart>,
 
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a
@@ -609,15 +595,13 @@ where
     /// ANCHOR keeping the PyO3 `command_sender()` clone a stable type;
     /// the composed runtime hands the receiver to the primary's command
     /// loop via [`SecondaryCoordinator::take_composed_primary_wiring`].
-    pub(super) command_rx:
-        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
+    pub(super) command_rx: Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
     /// consumers via `command_sender()`. Same registration-anchor
     /// disposition as `command_rx` — a clone crosses to the co-located
     /// primary via `take_composed_primary_wiring`.
-    pub(super) command_tx:
-        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
+    pub(super) command_tx: tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
 
     /// Per-task memory-profile sampler. `Some` iff
     /// [`SecondaryConfig::output_dir`] was set when the secondary's

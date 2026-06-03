@@ -120,8 +120,7 @@ where
         // Drain B's accept-loop pending registrations the same
         // way before we look at its incoming inbox.
         peer_b.drain_new_connections();
-        while let Some(msg) =
-            <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(peer_b)
+        while let Some(msg) = <PeerNetwork<TestId> as PeerTransport<TestId>>::try_recv_peer(peer_b)
         {
             // Sanity: the relayed envelope's inner is delivered
             // unwrapped (Router::process_inbound_sync's Relay-for-

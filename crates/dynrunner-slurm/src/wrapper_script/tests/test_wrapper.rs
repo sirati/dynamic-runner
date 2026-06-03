@@ -4,7 +4,7 @@
 
 use crate::config::SlurmConfig;
 use crate::wrapper_script::{
-    generate_test_wrapper_script, generate_wrapper_script, TestWrapperScriptConfig,
+    TestWrapperScriptConfig, generate_test_wrapper_script, generate_wrapper_script,
 };
 
 use super::standard_cfg;

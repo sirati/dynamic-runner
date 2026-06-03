@@ -1,22 +1,17 @@
-
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    RemovalCause,
+    ClusterMutation, DistributedMessage, PeerTransport, RemovalCause,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::apply_locally_for_broadcast;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::{compute_task_hash, timestamp_now};
 use crate::worker_signal::WorkerMgmtSignal;
 
-
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Apply each mutation locally and broadcast the same batch so every
     /// secondary mirrors the change. Per-secondary delivery failures are
     /// logged at warn — the CRDT is idempotent, so a missed mutation is
@@ -165,9 +160,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// `perform_initial_assignment` runs (so the originator's mirror
     /// is non-empty when the first dispatch happens).
     pub(crate) async fn seed_cluster_state(&mut self) {
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(
-            self.all_binaries.len() + 1,
-        );
+        let mut mutations: Vec<ClusterMutation<I>> =
+            Vec::with_capacity(self.all_binaries.len() + 1);
         mutations.push(ClusterMutation::PhaseDepsSet {
             deps: self.phase_deps.clone(),
         });
@@ -259,5 +253,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         tracing::info!("transfer complete sent to all secondaries");
         Ok(())
     }
-
 }

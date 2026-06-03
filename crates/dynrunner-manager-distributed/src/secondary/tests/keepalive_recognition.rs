@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::super::test_helpers::{election_config, make_secondary, FakeWorkerFactory, TestId};
+use super::super::test_helpers::{FakeWorkerFactory, TestId, election_config, make_secondary};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 
 /// Build a runtime `Keepalive` originated by `origin`. The wire shape

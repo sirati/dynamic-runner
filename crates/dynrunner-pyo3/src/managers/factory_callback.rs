@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use dynrunner_core::{ResourceKind, ResourceMap, WorkerId};
-use dynrunner_manager_local::{RestartContext, ResourceMonitor, WorkerFactory};
+use dynrunner_manager_local::{ResourceMonitor, RestartContext, WorkerFactory};
 use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
 use dynrunner_transport_socket::socketpair::create_socketpair;
 
@@ -84,8 +84,8 @@ impl WorkerFactory<EitherManagerEnd> for PyCallbackWorkerFactory {
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         match &self.named_socket_dir {
             None => {
-                let (manager_end, child_fd) = create_socketpair()
-                    .map_err(|e| format!("failed to create socketpair: {e}"))?;
+                let (manager_end, child_fd) =
+                    create_socketpair().map_err(|e| format!("failed to create socketpair: {e}"))?;
                 let pid = self.invoke_spawn(worker_id, Some(child_fd), None)?;
                 // Drop the child fd on the manager side: Python's spawned process
                 // has already inherited it (Python is responsible for using
@@ -157,10 +157,7 @@ impl ResourceMonitor for PyCallbackResourceMonitor {
 /// (`success`, `binary_path`, `binary_size`, `estimated_resources`,
 /// `actual_resources`) and is expected to return a bool. Failures degrade
 /// to "no restart" and are logged.
-pub(crate) fn invoke_restart_predicate(
-    callback: &Py<PyAny>,
-    ctx: &RestartContext<'_>,
-) -> bool {
+pub(crate) fn invoke_restart_predicate(callback: &Py<PyAny>, ctx: &RestartContext<'_>) -> bool {
     let result = Python::attach(|py| -> PyResult<bool> {
         let estimated: HashMap<String, u64> = ctx
             .estimated_resources

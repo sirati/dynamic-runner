@@ -150,8 +150,7 @@ impl<I: Identifier> PendingPool<I> {
             // occurrence from a later collision.
             let dup_in_batch = seen_in_batch.contains(&key);
             let dup_in_pool_full = pool_full.contains(&key);
-            let dup_in_pool_phaseless =
-                known_ids_phaseless.contains(item.task_id.as_str());
+            let dup_in_pool_phaseless = known_ids_phaseless.contains(item.task_id.as_str());
             if dup_in_batch || dup_in_pool_full || dup_in_pool_phaseless {
                 let reason = format!(
                     "duplicate task identity (phase={}, task_id={})",
@@ -171,8 +170,7 @@ impl<I: Identifier> PendingPool<I> {
                 .filter(|dep| {
                     let dep_key = (dep.phase_id.clone(), dep.task_id.clone());
                     let resolves_full = known_full.contains(&dep_key);
-                    let resolves_phaseless =
-                        known_ids_phaseless.contains(dep.task_id.as_str());
+                    let resolves_phaseless = known_ids_phaseless.contains(dep.task_id.as_str());
                     !(resolves_full || resolves_phaseless)
                 })
                 .map(|dep| format!("(phase={}, task_id={})", dep.phase_id, dep.task_id))

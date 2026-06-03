@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, WorkerId, TaskInfo};
+use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, TaskInfo, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::removal_cause::RemovalCause;
@@ -35,12 +35,12 @@ pub struct SecondaryCapacityRecord {
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 pub enum ClusterMutation<I> {
-    TaskAdded { hash: String, task: TaskInfo<I> },
+    TaskAdded {
+        hash: String,
+        task: TaskInfo<I>,
+    },
     TaskAssigned {
         hash: String,
         secondary: String,
@@ -56,7 +56,10 @@ pub enum ClusterMutation<I> {
         kind: ErrorType,
         error: String,
     },
-    PrimaryChanged { new: String, epoch: u64 },
+    PrimaryChanged {
+        new: String,
+        epoch: u64,
+    },
     /// Per-run static phase dependency graph. Emitted once by the
     /// primary at run start (alongside the bulk `TaskAdded` batch);
     /// receivers store it on their `ClusterState` so the post-promotion
@@ -104,7 +107,9 @@ pub enum ClusterMutation<I> {
     /// `RunError` at its own PyO3 boundary. Broadcast over the SAME
     /// `apply_and_broadcast_cluster_mutations` path as `RunComplete`, so
     /// it inherits the identical delivery / settle semantics.
-    RunAborted { reason: String },
+    RunAborted {
+        reason: String,
+    },
     /// External-control reinjection: the primary's
     /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
     /// state is the discrete `TaskState::Unfulfillable { .. }` variant
@@ -120,7 +125,9 @@ pub enum ClusterMutation<I> {
     /// `Unfulfillable`. Carries no reason payload: the entry's
     /// previous `reason` belongs to the pre-reinject Unfulfillable
     /// state and is reset on transition to Pending.
-    TaskReinjected { hash: String },
+    TaskReinjected {
+        hash: String,
+    },
     /// Dead-secondary recovery requeue: the secondary that held
     /// `hash` in `TaskState::InFlight { secondary, .. }` died, so the
     /// authoritative primary takes the task back for re-dispatch and
@@ -150,7 +157,9 @@ pub enum ClusterMutation<I> {
     /// beyond `hash`: the `TaskInfo` preserved on the `InFlight` entry
     /// is moved into the new `Pending` state verbatim so the requeued
     /// task re-dispatches the same binary.
-    TaskRequeued { hash: String },
+    TaskRequeued {
+        hash: String,
+    },
     /// A cascade-paused dependent: `hash`'s prerequisite (identified
     /// by `on`, the prereq's task hash) just transitioned to
     /// `TaskState::Unfulfillable` and the dependent cannot make
@@ -330,5 +339,7 @@ pub enum ClusterMutation<I> {
     /// hash matches — newly-injected Blocked entries participate in
     /// the same auto-resume mechanism as cascade-paused dependents
     /// from `apply_fail_permanent`.
-    TasksSpawned { tasks: Vec<TaskInfo<I>> },
+    TasksSpawned {
+        tasks: Vec<TaskInfo<I>>,
+    },
 }

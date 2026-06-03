@@ -6,27 +6,22 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerTransport,
-};
-use dynrunner_scheduler_api::{
-    PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
+use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
+use super::command_channel::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
 use super::config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 use super::error::RunError;
 use super::preferred_secondaries;
 use super::respawn::{
-    respawn_dispatcher_listener, RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest,
-    SecondarySpawner,
+    RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest, SecondarySpawner,
+    respawn_dispatcher_listener,
 };
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
 use crate::worker_signal::WorkerMgmtSignal;
-
 
 /// Per-secondary state for a deferred mass-death event. Recorded
 /// when a correlated mass-death is detected; each subsequent
@@ -139,12 +134,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
     /// already gated on idleness through the dispatch view / scheduler
     /// decision). Mirrors `WorkerHandle::assign_task`'s
     /// `take_idle().ok_or(...)` contract on the worker-process side.
-    pub(super) fn assign(
-        &mut self,
-        task_hash: String,
-        task: TaskInfo<I>,
-        estimated: ResourceMap,
-    ) {
+    pub(super) fn assign(&mut self, task_hash: String, task: TaskInfo<I>, estimated: ResourceMap) {
         debug_assert!(
             self.state.is_idle(),
             "slot assigned while not Idle (reassignment-before-terminal)"
@@ -243,7 +233,12 @@ pub(crate) struct InFlightEntry<I: Identifier> {
 /// failover authority) — there is no no-op send path and no per-site
 /// "which transport is real" hazard. This mirrors the secondary side's
 /// collapse onto a single `Tr: PeerTransport` (`UnifiedSecondaryTransport`).
-pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
+pub struct PrimaryCoordinator<
+    Tr: PeerTransport<I>,
+    S: Scheduler<I>,
+    E: ResourceEstimator<I>,
+    I: Identifier,
+> {
     pub(super) config: PrimaryConfig,
     /// THE single mesh transport. Owns the write-through `RoleTable`
     /// cache attached to `cluster_state` at construction; drives every
@@ -327,8 +322,7 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// `config.oom_retry_max_passes`. See
     /// [`crate::primary::retry_bucket`] for the surface this is
     /// keyed against.
-    pub(super) retry_passes_used:
-        crate::primary::retry_bucket::RetryPassesUsed,
+    pub(super) retry_passes_used: crate::primary::retry_bucket::RetryPassesUsed,
     /// Currently in-flight count per `TypeId`, against
     /// `config.max_concurrent_per_type`. Incremented on dispatch
     /// (in both `assign_initial` and `assign_normal` paths),
@@ -451,9 +445,8 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] inside
     /// the operational LocalSet so the dispatcher's lifetime tracks
     /// the operational loop's tokio runtime.
-    pub(super) lifecycle_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>,
-    >,
+    pub(super) lifecycle_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
     /// Consumers of peer-lifecycle events. Appended to via
     /// [`Self::register_lifecycle_listener`] before `run()` enters;
     /// `std::mem::take` moves the whole vector into the spawned
@@ -462,8 +455,7 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// silently appending to a dead-letter list (no dispatcher will
     /// see them). The single-shot lifecycle is consistent with the
     /// rest of the coordinator's `run()`-once contract.
-    pub(super) peer_lifecycle_listeners:
-        Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+    pub(super) peer_lifecycle_listeners: Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 
     /// Handle to the peer-lifecycle dispatcher task spawned at
     /// `run()` start. `Some` between the dispatcher's spawn and its
@@ -493,9 +485,8 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// the operational loop's tokio runtime. Mirrors `lifecycle_rx`
     /// exactly; the two dispatchers are independent modules with
     /// independent channels and independent listener vectors.
-    pub(super) task_completed_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>,
-    >,
+    pub(super) task_completed_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>>,
 
     /// Consumers of task-completion events. Appended to via
     /// [`Self::register_task_completed_listener`] before `run()`
@@ -504,8 +495,7 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// empty and any post-run `register_task_completed_listener` calls
     /// are silently appending to a dead-letter list. Mirrors
     /// `peer_lifecycle_listeners`.
-    pub(super) task_completed_listeners:
-        Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
+    pub(super) task_completed_listeners: Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
 
     /// Handle to the task-completion dispatcher task spawned at
     /// `run()` start. Same shape + cleanup discipline as
@@ -521,9 +511,7 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// once the loop has taken ownership; subsequent runs against the
     /// same coordinator are not supported (single-shot lifecycle).
     pub(super) matcher_trigger_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<
-            crate::fulfillability_matcher::MatcherTriggerEvent,
-        >,
+        tokio::sync::mpsc::UnboundedReceiver<crate::fulfillability_matcher::MatcherTriggerEvent>,
     >,
 
     /// Optional consumer-supplied fulfillability matcher. `None`
@@ -538,9 +526,8 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// `register_lifecycle_listener`; the field is `mem::take`-d into
     /// the operational loop at run start so post-run registration is
     /// silently dropped).
-    pub(super) fulfillability_matcher: Option<
-        Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
-    >,
+    pub(super) fulfillability_matcher:
+        Option<Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>>,
 
     /// Monotonic identity allocator for newly spawned secondaries.
     /// Initialised to `config.num_secondaries` so the IDs the
@@ -597,16 +584,14 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// enqueue every death; the total-budget cap on
     /// `RespawnBudget::max_total` is what bounds the memory cost in
     /// practice (the operational loop reject-accepts beyond it).
-    pub(super) respawn_request_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<RespawnRequest>>,
+    pub(super) respawn_request_tx: Option<tokio::sync::mpsc::UnboundedSender<RespawnRequest>>,
 
     /// Receiver side of the dispatcher → operational-loop respawn
     /// request channel. Taken out for the duration of the
     /// operational loop, the same shape as `command_rx` /
     /// `matcher_trigger_rx`. `None` outside an active loop (or
     /// when the respawn policy is disabled).
-    pub(super) respawn_request_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<RespawnRequest>>,
+    pub(super) respawn_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RespawnRequest>>,
 
     /// Construction-time primary endpoint and pubkey snapshot used
     /// to build [`SecondarySpawnSpec`]. The per-provider spawner
@@ -685,9 +670,8 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// Same `take()`/restore lifecycle as `matcher_trigger_rx`. `None`
     /// once a previous loop entry already consumed it AND the local was
     /// dropped (closed-channel gate) — single-shot per channel.
-    pub(super) worker_mgmt_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<crate::worker_signal::WorkerMgmtSignal>,
-    >,
+    pub(super) worker_mgmt_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<crate::worker_signal::WorkerMgmtSignal>>,
 
     /// Set by the operational `select!` loop's worker-management arm
     /// when it drains a [`WorkerMgmtSignal::RunShouldFail`]. Carries the
@@ -753,13 +737,10 @@ pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: Resource
     pub(super) single_worker_mode: bool,
 }
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-    pub fn new(
-        config: PrimaryConfig,
-        transport: Tr,
-        scheduler: S,
-        estimator: E,
-    ) -> Self {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
+    pub fn new(config: PrimaryConfig, transport: Tr, scheduler: S, estimator: E) -> Self {
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         // Peer-lifecycle dispatcher channel: built at construction so
         // the apply path on `cluster_state` has a sender to enqueue
@@ -776,8 +757,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // waits on `self` until `run()` enters the operational
         // `select!` and drains it via
         // `crate::fulfillability_matcher::drain_matcher_batch`.
-        let (matcher_trigger_tx, matcher_trigger_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (matcher_trigger_tx, matcher_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
         // Worker-management signal bus. Built at construction for the
         // same reason as `matcher_trigger_tx`: the phase/task layer's
         // emit calls (`fire_initial_phase_starts` →
@@ -788,8 +768,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // loop takes it and drains coalesced batches via
         // `crate::worker_signal::drain_worker_signal_batch`. No longer
         // test-only: this is the PRODUCTION sender wire-up.
-        let (worker_mgmt_tx, worker_mgmt_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (worker_mgmt_tx, worker_mgmt_rx) = tokio::sync::mpsc::unbounded_channel();
         // Task-completion dispatcher channel. Same construction-time
         // motivation as `lifecycle_tx`: the apply path on
         // `cluster_state` needs a sender ready from the very first
@@ -797,8 +776,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // `self` until `run()` spawns the dispatcher; events emitted
         // in the interim queue on the unbounded channel and drain on
         // the first dispatcher poll.
-        let (task_completed_tx, task_completed_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (task_completed_tx, task_completed_rx) = tokio::sync::mpsc::unbounded_channel();
         // Seed the monotonic id allocator past the IDs the prep phase
         // already minted (`secondary-0..secondary-{num_secondaries - 1}`)
         // so the first respawn lands on `secondary-{num_secondaries}`.
@@ -912,9 +890,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // `target: dynrunner_important`, so the CRDT apply path stays
         // free of any logging coupling. A promoted secondary runs its
         // co-located primary coordinator, so the hook rides promotion.
-        super::important_events::register_primary_changed_important_hook(
-            &mut this.cluster_state,
-        );
+        super::important_events::register_primary_changed_important_hook(&mut this.cluster_state);
         this
     }
 
@@ -1226,11 +1202,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// recomputed against the LIVE Vec on every call, so a positional
     /// index can never be cached past a `self.workers.retain(..)` death
     /// compaction — the desync that a stored `Vec` index suffered.
-    pub(super) fn worker_idx_for(
-        &self,
-        secondary_id: &str,
-        local_worker_id: u32,
-    ) -> Option<usize> {
+    pub(super) fn worker_idx_for(&self, secondary_id: &str, local_worker_id: u32) -> Option<usize> {
         let mut local_idx: u32 = 0;
         for (idx, w) in self.workers.iter().enumerate() {
             if w.secondary_id == secondary_id {
@@ -1358,9 +1330,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ) -> dynrunner_scheduler_api::WorkerView<I> {
         let global_wid = self.workers[worker_idx].worker_id;
         let secondary_id = self.workers[worker_idx].secondary_id.as_str();
-        let soft_predicate = preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
-            secondary_id,
-        );
+        let soft_predicate =
+            preferred_secondaries::apply_preferred_secondaries_predicate::<I>(secondary_id);
         let view = self
             .pool()
             .view_for_worker(global_wid, Some(&soft_predicate));
@@ -1383,9 +1354,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         if !self.single_worker_mode() {
             return view;
         }
-        view.filter(
-            preferred_secondaries::filter_strict_preferred_secondaries::<I>(secondary_id),
-        )
+        view.filter(preferred_secondaries::filter_strict_preferred_secondaries::<I>(secondary_id))
     }
 
     /// Drop the worker view down to the per-type-cap-eligible items.
@@ -1535,9 +1504,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // tracked, the task is not (or no longer) in flight — nothing
         // to free.
         let holder = match self.in_flight.get(task_hash) {
-            Some(e) => e
-                .local_worker_id
-                .map(|lw| (e.secondary_id.clone(), lw)),
+            Some(e) => e.local_worker_id.map(|lw| (e.secondary_id.clone(), lw)),
             None => {
                 tracing::trace!(
                     secondary = %secondary_id,
@@ -1556,9 +1523,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // slot that has moved on to a later task must not be
             // vacated by a stale terminal.
             Some((holder_secondary, holder_local_id)) => {
-                let idx = match self
-                    .worker_idx_for(&holder_secondary, holder_local_id)
-                {
+                let idx = match self.worker_idx_for(&holder_secondary, holder_local_id) {
                     Some(idx) => idx,
                     // The holding worker is gone (its secondary died and
                     // the slot was dropped by the requeue path) yet a
@@ -1835,9 +1800,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// broadcast path (which needs an initialised pool for the
     /// auto-resume re-inject step).
     #[cfg(test)]
-    pub fn cluster_state_mut_for_test(
-        &mut self,
-    ) -> &mut crate::cluster_state::ClusterState<I> {
+    pub fn cluster_state_mut_for_test(&mut self) -> &mut crate::cluster_state::ClusterState<I> {
         &mut self.cluster_state
     }
 
@@ -1857,10 +1820,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// counted as a local-active worker (the double-count hazard).
     #[cfg(test)]
     pub fn active_workers_for_test(&self) -> usize {
-        self.workers
-            .iter()
-            .filter(|w| !w.is_idle())
-            .count()
+        self.workers.iter().filter(|w| !w.is_idle()).count()
     }
 
     /// Test-only count of ALIVE worker slots (idle + busy) — the same
@@ -2066,8 +2026,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // by an item, (2) every phase mentioned as a key or parent in
         // the deps map. The pool's constructor validates that every
         // dep references a known phase.
-        let mut phase_set: HashSet<PhaseId> =
-            binaries.iter().map(|b| b.phase_id.clone()).collect();
+        let mut phase_set: HashSet<PhaseId> = binaries.iter().map(|b| b.phase_id.clone()).collect();
         for (k, v) in &phase_deps {
             phase_set.insert(k.clone());
             for p in v {
@@ -2118,7 +2077,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.ingest_initial_batch(sorted)?;
 
         let total = self.total_tasks;
-        tracing::info!(total, num_secondaries = self.config.num_secondaries, "primary starting");
+        tracing::info!(
+            total,
+            num_secondaries = self.config.num_secondaries,
+            "primary starting"
+        );
 
         // Fire on_phase_start for every phase the pool initialised as
         // Active (zero-deps phases). Subsequent activations triggered
@@ -2349,10 +2312,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// `total` is the run's task count, captured by the caller from
     /// `self.total_tasks` after seeding so the stranded accounting is
     /// identical on both paths.
-    async fn run_operational_and_finalize(
-        &mut self,
-        total: usize,
-    ) -> Result<(), RunError> {
+    async fn run_operational_and_finalize(&mut self, total: usize) -> Result<(), RunError> {
         // Operational loop (main pass).
         self.operational_loop().await?;
 
@@ -2450,7 +2410,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // 50ms quiet-window probe; the longer ceiling covers
         // heavily-pipelined teardowns where a burst of TaskCompletes
         // is still in flight as the loop exits.
-        self.drain_pending_messages(Duration::from_millis(500)).await?;
+        self.drain_pending_messages(Duration::from_millis(500))
+            .await?;
 
         // Final accounting: any task in `total_tasks` that is neither
         // in `completed_tasks` nor in `failed_tasks` is *stranded* —
@@ -2482,7 +2443,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Issued whether or not stranded > 0: even on the cluster-
         // collapse path, any peer still on the mesh deserves the same
         // run-is-over signal so it can release its SLURM slot.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete]).await;
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete])
+            .await;
 
         // Brief settle window so the broadcast lands on every
         // secondary before the dispatcher tears down its transport.
@@ -2591,9 +2553,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// cluster_state snapshot + hydrate_from_cluster_state".
     pub async fn run_parked(
         &mut self,
-        promote_rx: tokio::sync::oneshot::Receiver<
-            crate::cluster_state::ClusterStateSnapshot<I>,
-        >,
+        promote_rx: tokio::sync::oneshot::Receiver<crate::cluster_state::ClusterStateSnapshot<I>>,
     ) -> Result<(), RunError> {
         let result = self.run_parked_pipeline(promote_rx).await;
         self.cleanup_lifecycle_dispatcher().await;
@@ -2606,9 +2566,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// the `run` / `run_pipeline` split).
     async fn run_parked_pipeline(
         &mut self,
-        promote_rx: tokio::sync::oneshot::Receiver<
-            crate::cluster_state::ClusterStateSnapshot<I>,
-        >,
+        promote_rx: tokio::sync::oneshot::Receiver<crate::cluster_state::ClusterStateSnapshot<I>>,
     ) -> Result<(), RunError> {
         // Per-run resets — identical to `run_pipeline`'s, so a parked
         // primary that activates starts every counter from zero.
@@ -2930,11 +2888,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         None => None,
                     };
                     let Some(cmd) = cmd else { break };
-                    Box::pin(
-                        crate::primary::command_channel::handle_primary_command(
-                            self, cmd, command_rx,
-                        ),
-                    )
+                    Box::pin(crate::primary::command_channel::handle_primary_command(
+                        self, cmd, command_rx,
+                    ))
                     .await;
                 }
                 // Per-phase proceed-or-fail decision, evaluated AFTER the
@@ -2957,15 +2913,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 if self.phase_can_proceed(p, completed, failed) {
                     self.pool_mut().mark_phase_done(p);
                 } else {
-                    self.cluster_state.emit_worker_mgmt(
-                        WorkerMgmtSignal::RunShouldFail {
+                    self.cluster_state
+                        .emit_worker_mgmt(WorkerMgmtSignal::RunShouldFail {
                             reason: format!(
                                 "phase {p} reached drain with no terminal \
                                  outcome ({completed} completed, {failed} \
                                  failed) yet still owns residual work"
                             ),
-                        },
-                    );
+                        });
                 }
             }
             // mark_phase_done may have flipped Blocked → Active for

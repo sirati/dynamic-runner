@@ -116,17 +116,10 @@ impl QuicListener {
 
     /// Accept the next incoming connection and open a bi-directional stream.
     pub async fn accept(&self) -> Result<QuicConnection, String> {
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or("endpoint closed")?;
+        let incoming = self.endpoint.accept().await.ok_or("endpoint closed")?;
 
         let connection = incoming.await.map_err(|e| e.to_string())?;
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| e.to_string())?;
+        let (send, recv) = connection.accept_bi().await.map_err(|e| e.to_string())?;
 
         Ok(QuicConnection::from_streams(send, recv))
     }
@@ -161,10 +154,7 @@ pub async fn connect(
         .await
         .map_err(|e| e.to_string())?;
 
-    let (send, recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| e.to_string())?;
+    let (send, recv) = connection.open_bi().await.map_err(|e| e.to_string())?;
 
     Ok(QuicConnection::from_streams(send, recv))
 }
@@ -196,8 +186,11 @@ mod tests {
 
         let server_task = async {
             let mut conn = listener.accept().await.expect("accept failed");
-            let msg: DistributedMessage<TestId> = MessageReceiver::recv(&mut conn).await.expect("no message");
-            MessageSender::send(&mut conn, msg.clone()).await.expect("send failed");
+            let msg: DistributedMessage<TestId> =
+                MessageReceiver::recv(&mut conn).await.expect("no message");
+            MessageSender::send(&mut conn, msg.clone())
+                .await
+                .expect("send failed");
             // Keep connection alive until client is done reading.
             done_rx.await.ok();
             msg
@@ -208,8 +201,11 @@ mod tests {
             let mut client = connect(addr, "localhost", &cert_der)
                 .await
                 .expect("connect failed");
-            MessageSender::send(&mut client, outgoing).await.expect("client send failed");
-            let echoed: DistributedMessage<TestId> = MessageReceiver::recv(&mut client).await.expect("no echo");
+            MessageSender::send(&mut client, outgoing)
+                .await
+                .expect("client send failed");
+            let echoed: DistributedMessage<TestId> =
+                MessageReceiver::recv(&mut client).await.expect("no echo");
             done_tx.send(()).ok();
             echoed
         };
@@ -217,9 +213,7 @@ mod tests {
         let (server_msg, echoed) = tokio::join!(server_task, client_task);
 
         match &echoed {
-            DistributedMessage::Keepalive {
-                active_workers, ..
-            } => {
+            DistributedMessage::Keepalive { active_workers, .. } => {
                 assert_eq!(*active_workers, 2);
             }
             _ => panic!("expected Keepalive"),

@@ -6,8 +6,8 @@
 use crate::config::SlurmConfig;
 use crate::wrapper_script::quote::bash_quote;
 use crate::wrapper_script::{
-    generate_test_wrapper_script, generate_wrapper_script, ConnectionMode,
-    TestWrapperScriptConfig, WrapperScriptConfig,
+    ConnectionMode, TestWrapperScriptConfig, WrapperScriptConfig, generate_test_wrapper_script,
+    generate_wrapper_script,
 };
 
 use super::standard_cfg;
@@ -136,4 +136,3 @@ fn bash_quote_examples() {
     assert_eq!(bash_quote("it's"), "'it'\\''s'");
     assert_eq!(bash_quote("--pids-limit=16384"), "--pids-limit=16384");
 }
-

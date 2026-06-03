@@ -48,11 +48,7 @@ where
     /// accessor returns `None` and this method short-circuits without
     /// firing a sampler command. The sampler's `on_task_assigned`
     /// requires the cgroup leaf path; we don't fabricate one.
-    pub(super) fn notify_sampler_assigned(
-        &self,
-        worker_id: WorkerId,
-        binary: &TaskInfo<I>,
-    ) {
+    pub(super) fn notify_sampler_assigned(&self, worker_id: WorkerId, binary: &TaskInfo<I>) {
         let Some(sampler) = self.sampler.as_ref() else {
             return;
         };

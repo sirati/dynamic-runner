@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
-use dynrunner_transport_channel::{peer_mesh_with_adjacency, ChannelPeerTransport};
+use dynrunner_transport_channel::{ChannelPeerTransport, peer_mesh_with_adjacency};
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
-use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::Registry;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TestId(pub(crate) String);

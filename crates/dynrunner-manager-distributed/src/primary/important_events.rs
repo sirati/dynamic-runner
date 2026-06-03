@@ -76,8 +76,7 @@ pub(crate) fn register_primary_changed_important_hook<I: Identifier>(
     // Seed with the table's current primary so a hook registered after
     // an initial `PrimaryChanged` (none in the bootstrap path, but
     // robust against reuse) does not re-announce an unchanged holder.
-    let last_seen: Mutex<Option<String>> =
-        Mutex::new(cluster_state.role_table().primary.clone());
+    let last_seen: Mutex<Option<String>> = Mutex::new(cluster_state.role_table().primary.clone());
     cluster_state.register_role_change_hook(Box::new(move |table: &RoleTable| {
         let mut guard = last_seen.lock().unwrap_or_else(|e| e.into_inner());
         if *guard != table.primary {
@@ -97,21 +96,20 @@ pub(crate) fn register_primary_changed_important_hook<I: Identifier>(
 mod tests {
     use super::*;
     use crate::cluster_state::ApplyOutcome;
-    use crate::test_capture::{important_only, ImportantCapture};
+    use crate::test_capture::{ImportantCapture, important_only};
     use dynrunner_core::RunnerIdentifier;
     use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
     use tracing::subscriber::with_default;
-    use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Layer;
     use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// The hook fires exactly once per genuine primary transition and
     /// stays silent on observer-set churn and on idempotent re-delivery.
     #[test]
     fn primary_changed_emits_one_important_event_per_transition() {
         let capture = ImportantCapture::default();
-        let subscriber =
-            Registry::default().with(capture.clone().with_filter(important_only()));
+        let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
 
         with_default(subscriber, || {
             let mut state = ClusterState::<RunnerIdentifier>::new();
@@ -165,6 +163,9 @@ mod tests {
             2,
             "expected exactly two primary-changed events, got {msgs:?}"
         );
-        assert!(msgs.iter().all(|m| m.contains("primary changed")), "{msgs:?}");
+        assert!(
+            msgs.iter().all(|m| m.contains("primary changed")),
+            "{msgs:?}"
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::types::{SlurmError, SlurmJobManager};
 use crate::config::SlurmConfig;
@@ -73,7 +73,10 @@ async fn build_and_transfer_images_forwards_to_packager() {
 
     // Returned metadata is forwarded verbatim — the manager owns
     // no normalisation policy.
-    assert_eq!(metadata.remote_path, PathBuf::from("/srv/slurm/image_bin/app.tar.gz"));
+    assert_eq!(
+        metadata.remote_path,
+        PathBuf::from("/srv/slurm/image_bin/app.tar.gz")
+    );
     assert_eq!(metadata.image_hash, "abc123");
     assert!(metadata.uploaded);
 }

@@ -141,7 +141,11 @@ fn verify_tunnel_alive_attributes_per_child_under_concurrency() {
     assert_eq!(outcomes.len(), N);
     for (id, err) in outcomes {
         match err {
-            PrepError::TunnelFailed { secondary_id, stderr, .. } => {
+            PrepError::TunnelFailed {
+                secondary_id,
+                stderr,
+                ..
+            } => {
                 assert_eq!(secondary_id, id);
                 // Each child's stderr MUST contain its own
                 // marker — pre-fix `last_mut()` could pull

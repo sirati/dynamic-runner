@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use dynrunner_core::{ErrorType, Identifier, WorkerId};
-use dynrunner_manager_local::oom::{classify_disconnect, OomWatcher};
+use dynrunner_manager_local::oom::{OomWatcher, classify_disconnect};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
@@ -26,8 +26,8 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 /// worker pipe-EOF observation.
 const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
 
-use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
+use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -71,10 +71,10 @@ where
                 // the snapshots feed the shared memuse writer so
                 // every secondary's `memuse.log` row carries the
                 // same shape as the LocalManager's.
-                let estimated_for_memuse =
-                    self.pool.workers[worker_id as usize].estimated_resources.clone();
-                let actual_for_memuse =
-                    self.pool.workers[worker_id as usize].actual_usage.clone();
+                let estimated_for_memuse = self.pool.workers[worker_id as usize]
+                    .estimated_resources
+                    .clone();
+                let actual_for_memuse = self.pool.workers[worker_id as usize].actual_usage.clone();
                 if let Some(log_path) = self.config.memuse_log_path.as_deref() {
                     dynrunner_manager_local::memuse::log_resource_usage(
                         log_path,
@@ -85,7 +85,9 @@ where
                     );
                 }
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 // Flush the per-task memprofile writer (if any).
@@ -230,7 +232,9 @@ where
                 let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
 
                 // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 self.pool.workers[worker_id as usize].clear_task();
 
                 tracing::warn!(
@@ -257,7 +261,8 @@ where
                         "pending first-bind worker disconnected before Ready; \
                          reporting deferred task back to the authority"
                     );
-                    self.report_deferred_task_lost(worker_id, &pending_hash).await?;
+                    self.report_deferred_task_lost(worker_id, &pending_hash)
+                        .await?;
                 }
 
                 // Find and report the task as failed
@@ -322,15 +327,11 @@ where
                     let kernel_oom_recent =
                         oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
                     let error_type = classify_disconnect(
-                        result
-                            .error_type
-                            .clone()
-                            .unwrap_or(ErrorType::Recoverable),
+                        result.error_type.clone().unwrap_or(ErrorType::Recoverable),
                         exit_status.as_ref(),
                         kernel_oom_recent,
                     );
-                    let is_comm_failure =
-                        matches!(error_type, ErrorType::Recoverable);
+                    let is_comm_failure = matches!(error_type, ErrorType::Recoverable);
 
                     let (wire_error_type, wire_error_message) = if is_comm_failure {
                         (
@@ -413,7 +414,9 @@ where
                 // go through `poll_ready` directly without a
                 // background task, so they hit this arm with
                 // `poll_task = None` and pass through cleanly.
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize]
+                    .reclaim_protocol()
+                    .await;
                 // Drop the per-worker `TaskRequest` backoff window.
                 // The slot just transitioned out of the
                 // type-shift Transitioning state — any backoff
@@ -490,8 +493,7 @@ where
                             // never ran, so report it back to the
                             // authority as backpressure so it requeues
                             // + re-dispatches.
-                            let exit_status =
-                                self.pool.workers[worker_id as usize].try_reap_exit();
+                            let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id,
                                 error = %e,
@@ -501,11 +503,8 @@ where
                                  deferred task back to the authority"
                             );
                             self.pending_worker_restarts.insert(worker_id);
-                            self.report_deferred_task_lost(
-                                worker_id,
-                                &log_task_hash,
-                            )
-                            .await?;
+                            self.report_deferred_task_lost(worker_id, &log_task_hash)
+                                .await?;
                         }
                     }
                     return Ok(None);

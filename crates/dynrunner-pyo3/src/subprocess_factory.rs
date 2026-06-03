@@ -64,7 +64,7 @@ pub(crate) fn terminate_children_with_process_group(
     grace: Duration,
 ) {
     use nix::errno::Errno;
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
     if children.iter().all(Option::is_none) {
@@ -406,10 +406,7 @@ impl SubprocessWorkerFactory {
     /// through. Idempotent; safe to call before exit(137) so the
     /// manager process and every worker pgid go down in one bounded
     /// sweep.
-    pub(crate) fn cleanup_all_process_trees(
-        &mut self,
-        grace: Duration,
-    ) {
+    pub(crate) fn cleanup_all_process_trees(&mut self, grace: Duration) {
         terminate_children_with_process_group(&mut self.child_processes, grace);
     }
 

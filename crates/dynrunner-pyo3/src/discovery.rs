@@ -215,24 +215,25 @@ pub(crate) fn find_items<'py>(
 ) -> PyResult<Bound<'py, PyList>> {
     let visit_method = task_definition.getattr("visit")?.unbind();
 
-    let marked = py.detach(|| -> Result<_, WalkError<PyErr>> {
-        let mut bridge = PyVisitorBridge { visit_method };
-        walk(&root, &mut bridge)
-    })
-    .map_err(|e| match e {
-        WalkError::Visitor(py_err) => py_err,
-        WalkError::Io(io_err) => {
-            pyo3::exceptions::PyOSError::new_err(format!("filesystem: {io_err}"))
-        }
-        WalkError::IndexOutOfBounds {
-            kind,
-            index,
-            len,
-            path,
-        } => pyo3::exceptions::PyIndexError::new_err(format!(
-            "{kind} index {index} (len={len}) at {path}",
-        )),
-    })?;
+    let marked = py
+        .detach(|| -> Result<_, WalkError<PyErr>> {
+            let mut bridge = PyVisitorBridge { visit_method };
+            walk(&root, &mut bridge)
+        })
+        .map_err(|e| match e {
+            WalkError::Visitor(py_err) => py_err,
+            WalkError::Io(io_err) => {
+                pyo3::exceptions::PyOSError::new_err(format!("filesystem: {io_err}"))
+            }
+            WalkError::IndexOutOfBounds {
+                kind,
+                index,
+                len,
+                path,
+            } => pyo3::exceptions::PyIndexError::new_err(format!(
+                "{kind} index {index} (len={len}) at {path}",
+            )),
+        })?;
 
     let out = PyList::empty(py);
     for m in marked {

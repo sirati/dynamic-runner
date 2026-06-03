@@ -211,10 +211,7 @@ impl PyPrimaryCoordinator {
     /// between construction and `run()` because the inner
     /// `PrimaryCoordinator` does not exist yet at the call site —
     /// it's built inside the detached tokio runtime.
-    pub(crate) fn set_slurm_job_manager_from_rust(
-        &mut self,
-        jm: Arc<dyn Any + Send + Sync>,
-    ) {
+    pub(crate) fn set_slurm_job_manager_from_rust(&mut self, jm: Arc<dyn Any + Send + Sync>) {
         self.slurm_job_manager = Some(jm);
     }
 }

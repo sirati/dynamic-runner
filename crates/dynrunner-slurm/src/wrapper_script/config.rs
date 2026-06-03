@@ -162,9 +162,7 @@ pub enum ConnectionMode<'a> {
     /// Primary tunnels to secondary via ProxyJump; secondary writes
     /// connection info into `connection_info_dir` for the primary
     /// to pick up.
-    Reverse {
-        connection_info_dir: &'a str,
-    },
+    Reverse { connection_info_dir: &'a str },
 }
 
 /// In-container bind-mount path for the cluster-wide source-binaries

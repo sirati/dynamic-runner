@@ -99,7 +99,9 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         match self {
-            Self::Real(p) => <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(&mut **p, peers).await,
+            Self::Real(p) => {
+                <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(&mut **p, peers).await
+            }
             Self::Disabled(p) => PeerTransport::<I>::connect_to_peers(p, peers).await,
         }
     }

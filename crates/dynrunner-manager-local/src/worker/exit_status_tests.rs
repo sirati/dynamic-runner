@@ -1,8 +1,7 @@
 //! Unit tests for `WorkerExitStatus` display + `try_reap_subprocess`
 //! reap semantics. Loaded by `mod.rs` only under `#[cfg(test)]`.
 
-use super::exit_status::{try_reap_subprocess, WorkerExitStatus};
-
+use super::exit_status::{WorkerExitStatus, try_reap_subprocess};
 
 // Display tests: pin the exact log-line text downstream operators
 // grep for. Changes to these formats are breaking changes to the
@@ -93,9 +92,7 @@ fn try_reap_picks_up_clean_exit() {
     // `/bin/true` exits with code 0 immediately. Spawn, drop the
     // Child handle (std::process::Child::drop does not reap on
     // unix — the zombie persists), then reap via our path.
-    let child = Command::new("true")
-        .spawn()
-        .expect("spawn `true`");
+    let child = Command::new("true").spawn().expect("spawn `true`");
     let pid = child.id();
     drop(child);
     // Brief wait for the kernel to mark the child as exited.
@@ -112,7 +109,7 @@ fn try_reap_picks_up_clean_exit() {
 #[cfg(unix)]
 #[test]
 fn try_reap_picks_up_sigkill() {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use std::process::Command;
     // Spawn `/bin/sleep 30` and SIGKILL it. The reap must
@@ -139,7 +136,7 @@ fn try_reap_picks_up_sigkill() {
 #[cfg(unix)]
 #[test]
 fn try_reap_picks_up_sigterm_with_name() {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
     use std::process::Command;
     // Pin SIGTERM specifically because the watchdog's graceful

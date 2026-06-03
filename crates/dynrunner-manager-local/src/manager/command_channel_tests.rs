@@ -17,17 +17,15 @@
 
 use std::collections::HashSet;
 
-use dynrunner_core::{
-    compute_task_hash, ErrorType, PrimaryCommand, ResourceMap, TaskInfo,
-};
+use dynrunner_core::{ErrorType, PrimaryCommand, ResourceMap, TaskInfo, compute_task_hash};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 use dynrunner_transport_channel::ChannelManagerEnd;
 use tokio::sync::oneshot;
 
-use super::command_channel::handle_local_command;
-use super::test_helpers::{make_binary, test_config, FixedEstimator, TestId};
 use super::LocalManager;
+use super::command_channel::handle_local_command;
+use super::test_helpers::{FixedEstimator, TestId, make_binary, test_config};
 
 /// Build a manager + install a single-phase pool with `binaries`
 /// pre-extended. Returns the assembled manager ready for command-
@@ -43,16 +41,13 @@ fn manager_with_binaries(
     );
     let mut phase_ids = HashSet::new();
     phase_ids.insert(dynrunner_core::PhaseId::from("default"));
-    let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
-        .expect("pool new");
+    let pool = PendingPool::new(phase_ids, std::collections::HashMap::new()).expect("pool new");
     manager.install_pool_for_test(pool);
     // Mirror `process_binaries`' initial-batch mirror so the
     // command-channel handler can resolve hashes for tasks the
     // pool already holds.
     for t in &binaries {
-        manager
-            .task_by_hash
-            .insert(compute_task_hash(t), t.clone());
+        manager.task_by_hash.insert(compute_task_hash(t), t.clone());
     }
     if !binaries.is_empty() {
         manager.pool_mut().extend(binaries).expect("extend");
@@ -105,9 +100,11 @@ async fn spawn_tasks_duplicate_hash_surfaces_per_task_error() {
         "expected DuplicateTaskHash, got {err:?}"
     );
     // The `fresh` task still made it through.
-    assert!(manager
-        .task_by_hash
-        .contains_key(&compute_task_hash(&make_binary("fresh", 50))));
+    assert!(
+        manager
+            .task_by_hash
+            .contains_key(&compute_task_hash(&make_binary("fresh", 50)))
+    );
 }
 
 /// `FailPermanent` happy path: looked-up task is pushed to
@@ -211,8 +208,7 @@ async fn reinject_task_budget_exhausted_refuses() {
     );
     let mut phase_ids = HashSet::new();
     phase_ids.insert(dynrunner_core::PhaseId::from("default"));
-    let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
-        .expect("pool new");
+    let pool = PendingPool::new(phase_ids, std::collections::HashMap::new()).expect("pool new");
     manager.install_pool_for_test(pool);
     manager.task_by_hash.insert(hash.clone(), binary.clone());
     // Stage two reinject attempts; only the first should succeed.
@@ -299,7 +295,9 @@ async fn update_preferred_secondaries_no_match_replies_ok() {
         },
     )
     .await;
-    rx.await.unwrap().expect("inner Ok on no-match (local mode)");
+    rx.await
+        .unwrap()
+        .expect("inner Ok on no-match (local mode)");
 }
 
 // Silence dead-code warnings for the manager's generic type

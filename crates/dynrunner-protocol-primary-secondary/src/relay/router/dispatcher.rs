@@ -33,11 +33,11 @@ use dynrunner_core::Identifier;
 
 use crate::messages::DistributedMessage;
 use crate::relay::channel::OutboundChannel;
-use crate::relay::{forward_step, route_send, OutgoingRelay, RouteDecision};
 use crate::relay::router::state::{
-    blacklist_for, prune_blacklist, prune_stale, Clocks, InboundOutcome, PeerRouteState,
-    RoutingError, SendOutcome, RELAY_LOG_TARGET,
+    Clocks, InboundOutcome, PeerRouteState, RELAY_LOG_TARGET, RoutingError, SendOutcome,
+    blacklist_for, prune_blacklist, prune_stale,
 };
+use crate::relay::{OutgoingRelay, RouteDecision, forward_step, route_send};
 
 /// Single owner of peer-mesh routing decisions for one node.
 ///
@@ -156,9 +156,7 @@ impl<I: Identifier> Router<I> {
                 let send_res = connections
                     .get(&via)
                     .map(|chan| chan.dispatch(wrapped))
-                    .ok_or_else(|| RoutingError::NoConnection {
-                        peer: via.clone(),
-                    })?;
+                    .ok_or_else(|| RoutingError::NoConnection { peer: via.clone() })?;
                 if send_res.is_err() {
                     connections.remove(&via);
                     return Err(RoutingError::DispatchFailed {
@@ -171,8 +169,7 @@ impl<I: Identifier> Router<I> {
                 self.next_relay_id = self.next_relay_id.wrapping_add(1);
                 self.outgoing_relays
                     .insert((self.self_id.clone(), relay_id), bookkeeping);
-                let redial_target =
-                    self.observe_relay(target, &via, clocks.now);
+                let redial_target = self.observe_relay(target, &via, clocks.now);
                 Ok(SendOutcome::Relayed {
                     forwarder: via,
                     redial_target,
@@ -226,8 +223,7 @@ impl<I: Identifier> Router<I> {
                     // still works. The path argument is unused for
                     // the same reason.
                     let _ = path;
-                    let redial_target =
-                        self.observe_relay_recv(&sender_id, clocks.now);
+                    let redial_target = self.observe_relay_recv(&sender_id, clocks.now);
                     return InboundOutcome::Deliver {
                         // `inner` is already `Box<DistributedMessage<I>>`;
                         // forward the existing allocation.
@@ -235,8 +231,7 @@ impl<I: Identifier> Router<I> {
                         redial_target,
                     };
                 }
-                let blacklist =
-                    blacklist_for(&self.failed_forwarders, &target_id, clocks.now);
+                let blacklist = blacklist_for(&self.failed_forwarders, &target_id, clocks.now);
                 let decision = forward_step(
                     connections,
                     &self.self_id,
@@ -352,5 +347,4 @@ impl<I: Identifier> Router<I> {
     pub fn route_state(&self) -> &HashMap<String, PeerRouteState> {
         &self.route_state
     }
-
 }

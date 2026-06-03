@@ -20,11 +20,7 @@ create_exception!(
 );
 
 #[pyfunction]
-pub(crate) fn publish_one(
-    src: PathBuf,
-    dst: PathBuf,
-    src_root: PathBuf,
-) -> PyResult<()> {
+pub(crate) fn publish_one(src: PathBuf, dst: PathBuf, src_root: PathBuf) -> PyResult<()> {
     dynrunner_publish::publish_one(&src, &dst, &src_root)
         .map_err(|e| PublishError::new_err(e.to_string()))
 }

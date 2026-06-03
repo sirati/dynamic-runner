@@ -1,19 +1,18 @@
-
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, PeerConnectionInfo, PeerTransport, PrimaryPeerSetupBootstrap,
     SetupBootstrapBroadcast, SetupBootstrapMessage,
 };
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::state::SecondaryConnectionState;
 
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
         tracing::info!("sending peer lists");
 
@@ -114,7 +113,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // for `PeerJoined { is_observer: true }` is set-semantics
         // idempotent — a re-application against an already-populated
         // role table is a silent NoOp.
-        self.apply_and_broadcast_cluster_mutations(observer_mutations).await;
+        self.apply_and_broadcast_cluster_mutations(observer_mutations)
+            .await;
 
         // Transition all from CertExchanging -> PeerDiscovery
         for secondary_id in &secondary_ids {
@@ -156,5 +156,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     }
 
     // ── Phase 5: Initial Assignment ──
-
 }

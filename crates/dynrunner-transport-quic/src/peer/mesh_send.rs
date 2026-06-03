@@ -76,11 +76,7 @@ impl<I: Identifier> MeshSendHandle<I> {
     /// Queue a unicast send to `peer_id`. Dispatched (relay-aware) by the
     /// owning network's `recv_peer` drain. `Err` iff the network was
     /// dropped.
-    pub fn send_to_peer(
-        &self,
-        peer_id: &str,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
+    pub fn send_to_peer(&self, peer_id: &str, msg: DistributedMessage<I>) -> Result<(), String> {
         self.proxy_tx
             .send(MeshSend::ToPeer(peer_id.to_string(), msg))
             .map_err(|_| "mesh-send handle: owning PeerNetwork dropped".to_string())

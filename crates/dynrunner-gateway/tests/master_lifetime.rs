@@ -106,10 +106,13 @@ impl AuthorizedKey {
         // ssh-keygen with empty passphrase, ed25519, no comment.
         let out = StdCommand::new("ssh-keygen")
             .args([
-                "-t", "ed25519",
-                "-N", "",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
                 "-q",
-                "-C", "dynrunner-gateway-test",
+                "-C",
+                "dynrunner-gateway-test",
                 "-f",
             ])
             .arg(&private_path)
@@ -128,12 +131,10 @@ impl AuthorizedKey {
             .trim()
             .to_owned();
 
-        let home = std::env::var("HOME")
-            .map_err(|_| "HOME not set".to_string())?;
+        let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
         let authorized_keys = PathBuf::from(home).join(".ssh/authorized_keys");
         // Append (preserve any pre-existing keys).
-        let mut existing = std::fs::read_to_string(&authorized_keys)
-            .unwrap_or_default();
+        let mut existing = std::fs::read_to_string(&authorized_keys).unwrap_or_default();
         if !existing.ends_with('\n') && !existing.is_empty() {
             existing.push('\n');
         }
@@ -176,12 +177,7 @@ fn make_gateway(authorized: &AuthorizedKey) -> SshGateway {
         host: "127.0.0.1".into(),
         port: 22,
         user: std::env::var("USER").ok(),
-        identity_file: Some(
-            authorized
-                .private_path
-                .to_string_lossy()
-                .into_owned(),
-        ),
+        identity_file: Some(authorized.private_path.to_string_lossy().into_owned()),
         // Use a throwaway ssh_config that disables host-key checking
         // for the test loopback host. Otherwise the test would prompt
         // or reject on first contact.
@@ -220,7 +216,10 @@ async fn t3_drop_cleans_master() {
     let pid = gw
         .master_pid()
         .expect("framework-spawned master must report a PID");
-    assert!(pid_alive(pid), "master must be alive immediately after connect");
+    assert!(
+        pid_alive(pid),
+        "master must be alive immediately after connect"
+    );
 
     // Drop the gateway WITHOUT calling disconnect(). Bug (g) was: the
     // master would persist after this drop because the framework had
@@ -398,17 +397,10 @@ async fn master_pid_is_daemon_not_launcher() {
                 .and_then(|s| s.to_str())
                 .is_some_and(|s| s.starts_with("dynrunner-m-") && s.ends_with(".sock"))
         })
-        .max_by_key(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .ok()
-        })
+        .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         .expect("could not locate the gateway's control socket under /tmp");
 
-    let target = format!(
-        "{}@127.0.0.1",
-        std::env::var("USER").expect("USER")
-    );
+    let target = format!("{}@127.0.0.1", std::env::var("USER").expect("USER"));
     let out = StdCommand::new("ssh")
         .args([
             "-i",
@@ -418,7 +410,12 @@ async fn master_pid_is_daemon_not_launcher() {
             "-o",
             "IdentityAgent=none",
             "-F",
-            authorized.key_dir.path().join("ssh_config").to_str().unwrap(),
+            authorized
+                .key_dir
+                .path()
+                .join("ssh_config")
+                .to_str()
+                .unwrap(),
             "-O",
             "check",
             "-o",
@@ -443,11 +440,8 @@ async fn master_pid_is_daemon_not_launcher() {
         .find(marker)
         .expect("ssh -O check output missing `Master running (pid=`");
     let rest = &combined[i + marker.len()..];
-    let pid_str: String =
-        rest.chars().take_while(char::is_ascii_digit).collect();
-    let independent_pid: u32 = pid_str
-        .parse()
-        .expect("ssh -O check pid was non-numeric");
+    let pid_str: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let independent_pid: u32 = pid_str.parse().expect("ssh -O check pid was non-numeric");
 
     assert_eq!(
         reported_pid, independent_pid,

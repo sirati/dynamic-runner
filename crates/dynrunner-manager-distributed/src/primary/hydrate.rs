@@ -35,7 +35,9 @@ use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::secondary::origination::cascade_drain_done;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Build a fresh `PendingPool` for the authoritative primary view
     /// from the replicated `cluster_state` ledger.
     ///
@@ -118,7 +120,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 TaskState::Pending { task } => {
                     items.push(task.clone());
                 }
-                TaskState::InFlight { task, secondary, worker } => {
+                TaskState::InFlight {
+                    task,
+                    secondary,
+                    worker,
+                } => {
                     // The originating dispatcher dispatched the work; this
                     // coordinator inherits it on promotion and will observe
                     // completion via the broadcast path (peer's TaskComplete
@@ -176,8 +182,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // that phase, but `mark_tasks_in_flight` will bump its
         // counter and the phase must exist in `phase_state` for
         // drain transitions to fire.
-        let mut phase_ids: HashSet<PhaseId> =
-            items.iter().map(|i| i.phase_id.clone()).collect();
+        let mut phase_ids: HashSet<PhaseId> = items.iter().map(|i| i.phase_id.clone()).collect();
         for (_, phase_id) in &in_flight_pairs {
             phase_ids.insert(phase_id.clone());
         }
@@ -349,8 +354,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // `worker_idx_for` only need the per-secondary 0-based order,
         // which round-robin preserves; the global id and budgets matter
         // for the dispatch view.)
-        let max_workers_per_secondary =
-            roster.iter().map(|(_, n, _)| *n).max().unwrap_or(0);
+        let max_workers_per_secondary = roster.iter().map(|(_, n, _)| *n).max().unwrap_or(0);
         let mut workers: Vec<crate::primary::RemoteWorkerState<I>> = Vec::new();
         let mut global_worker_id: u32 = 0;
         for round in 0..max_workers_per_secondary {
@@ -378,9 +382,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .cluster_state
             .tasks_iter()
             .filter_map(|(hash, state)| match state {
-                TaskState::InFlight { task, secondary, worker } => {
-                    Some((hash.clone(), secondary.clone(), *worker, task.clone()))
-                }
+                TaskState::InFlight {
+                    task,
+                    secondary,
+                    worker,
+                } => Some((hash.clone(), secondary.clone(), *worker, task.clone())),
                 _ => None,
             })
             .collect();

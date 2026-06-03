@@ -55,9 +55,7 @@ pub fn compute_task_hash<I: Identifier>(binary: &TaskInfo<I>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        AffinityId, PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId,
-    };
+    use crate::types::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId};
     use std::path::PathBuf;
     use std::sync::Arc;
 

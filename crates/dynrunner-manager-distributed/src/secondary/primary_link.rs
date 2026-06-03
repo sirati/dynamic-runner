@@ -61,7 +61,6 @@ pub(super) struct PrimaryLink {
     // `record_primary_message`). The actual failover-arming decision
     // lives at the call site (`processing.rs`), which consults
     // `should_arm_failover` once `record_recv_failure` returns.
-
     /// Wall-clock timestamp of the first observed recv-None event.
     /// `None` while the link is healthy. Used as the anchor for the
     /// time-based half of the threshold.
@@ -190,8 +189,7 @@ impl PrimaryLink {
         match self.first_failure_at {
             None => false,
             Some(at) => {
-                self.failure_count >= self.failure_threshold
-                    || at.elapsed() >= self.failure_window
+                self.failure_count >= self.failure_threshold || at.elapsed() >= self.failure_window
             }
         }
     }
@@ -263,10 +261,7 @@ mod tests {
     /// the link half-armed on the next flap.
     #[test]
     fn record_recv_success_resets_failure_window() {
-        let mut link = PrimaryLink::with_failover_threshold(
-            3,
-            Duration::from_secs(30),
-        );
+        let mut link = PrimaryLink::with_failover_threshold(3, Duration::from_secs(30));
         link.record_recv_failure();
         link.record_recv_failure();
         assert!(link.is_link_failing());
@@ -283,10 +278,7 @@ mod tests {
     /// rely on tick-driven re-checks.
     #[test]
     fn should_arm_failover_is_pure() {
-        let mut link = PrimaryLink::with_failover_threshold(
-            5,
-            Duration::from_secs(3600),
-        );
+        let mut link = PrimaryLink::with_failover_threshold(5, Duration::from_secs(3600));
         assert!(!link.should_arm_failover());
         assert!(!link.should_arm_failover());
         // Still healthy.

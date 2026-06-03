@@ -128,8 +128,7 @@ impl LoadedTopology {
                 depends_on.into_iter().map(PhaseId::from).collect(),
             );
 
-            let types_tuple: Vec<Bound<'_, PyAny>> =
-                phase_spec.getattr("types")?.extract()?;
+            let types_tuple: Vec<Bound<'_, PyAny>> = phase_spec.getattr("types")?.extract()?;
             for tts in &types_tuple {
                 let type_id_str: String = tts.getattr("type_id")?.extract()?;
                 let type_id = TypeId::from(type_id_str);
@@ -171,8 +170,7 @@ impl LoadedTopology {
             }
         }
 
-        let estimator =
-            PyMemoryEstimatorBridge::from_python(task_definition, &estimator_specs)?;
+        let estimator = PyMemoryEstimatorBridge::from_python(task_definition, &estimator_specs)?;
 
         Ok(Self {
             estimator,
@@ -260,7 +258,9 @@ impl LoadedTaskDefinition {
         // managers below read `task.log_path` unconditionally; the
         // None-handling lives here so each call site stays a single
         // boolean-free expression.
-        let log_path = log_dir.map(PathBuf::from).unwrap_or_else(|| output_path.clone());
+        let log_path = log_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| output_path.clone());
         let source_str = source_path.to_str().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "source_dir is not valid UTF-8: {:?}",

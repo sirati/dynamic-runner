@@ -14,14 +14,13 @@ use tokio::net::UnixStream;
 /// to the child process. The caller is responsible for closing it if the child
 /// is not spawned.
 pub fn create_socketpair() -> std::io::Result<(SocketpairManagerEnd, RawFd)> {
-    let (parent_fd, child_fd) =
-        nix::sys::socket::socketpair(
-            nix::sys::socket::AddressFamily::Unix,
-            nix::sys::socket::SockType::Stream,
-            None,
-            nix::sys::socket::SockFlag::empty(),
-        )
-        .map_err(std::io::Error::other)?;
+    let (parent_fd, child_fd) = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Stream,
+        None,
+        nix::sys::socket::SockFlag::empty(),
+    )
+    .map_err(std::io::Error::other)?;
 
     // Convert OwnedFd to RawFd, transferring ownership
     let parent_raw: RawFd = parent_fd.into_raw_fd();
@@ -70,7 +69,6 @@ impl MessageReceiver<Response> for SocketpairManagerEnd {
             Err(_) => None,
         }
     }
-
 }
 
 /// Runner-side transport over a Unix socketpair.
@@ -210,9 +208,7 @@ mod tests {
 
         // Runner sends Done
         runner
-            .send(Response::Done {
-                result_data: None,
-            })
+            .send(Response::Done { result_data: None })
             .await
             .unwrap();
         let resp = manager.recv().await.unwrap();

@@ -63,7 +63,6 @@ pub struct SlurmJobManager<G: Gateway> {
     pub(super) shutdown_manager_remote_path: Option<String>,
 }
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum SlurmError {
     #[error("gateway error: {0}")]
@@ -85,4 +84,3 @@ pub enum SlurmError {
     #[error("shutdown-manager source binary not found: {0}")]
     ShutdownBinaryNotFound(std::path::PathBuf),
 }
-

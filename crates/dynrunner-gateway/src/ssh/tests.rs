@@ -6,10 +6,7 @@ use crate::config::SshConfig;
 use super::SshGateway;
 use super::argv::{build_master_argv, generate_master_control_path, parse_master_pid};
 
-fn ssh_config_with(
-    identity_file: Option<&str>,
-    config_file: Option<&str>,
-) -> SshConfig {
+fn ssh_config_with(identity_file: Option<&str>, config_file: Option<&str>) -> SshConfig {
     SshConfig {
         host: "h".into(),
         port: 22,
@@ -77,18 +74,11 @@ fn auth_options_identity_then_config_file_order() {
 /// must surface in code review and not be a silent override.
 #[test]
 fn master_argv_pins_18h_serveralive_floor() {
-    let argv = build_master_argv(
-        &Vec::new(),
-        "/tmp/dynrunner-m-test.sock",
-        &[],
-        "user@host",
-    );
+    let argv = build_master_argv(&Vec::new(), "/tmp/dynrunner-m-test.sock", &[], "user@host");
     // We assert the *adjacent pair* form: each `-o` must precede
     // its value. `windows(2)` gives us each consecutive pair so we
     // can match `-o ServerAliveInterval=60`.
-    let has_pair = |a: &str, b: &str| {
-        argv.windows(2).any(|w| w[0] == a && w[1] == b)
-    };
+    let has_pair = |a: &str, b: &str| argv.windows(2).any(|w| w[0] == a && w[1] == b);
     assert!(
         has_pair("-o", "ServerAliveInterval=60"),
         "missing `-o ServerAliveInterval=60`; argv={argv:?}"
@@ -104,12 +94,7 @@ fn master_argv_pins_18h_serveralive_floor() {
 
 #[test]
 fn master_argv_includes_master_mode_flags() {
-    let argv = build_master_argv(
-        &Vec::new(),
-        "/tmp/dynrunner-m-test.sock",
-        &[],
-        "user@host",
-    );
+    let argv = build_master_argv(&Vec::new(), "/tmp/dynrunner-m-test.sock", &[], "user@host");
     assert!(argv.contains(&"-M".to_string()));
     assert!(argv.contains(&"-N".to_string()));
     // No `-f`: even though `ControlPersist=yes` causes OpenSSH to
@@ -197,7 +182,10 @@ fn control_path_pessimistic_pid_sequence_still_fits() {
 /// line is embedded in surrounding output.
 #[test]
 fn parse_master_pid_extracts_from_canonical_output() {
-    assert_eq!(parse_master_pid("Master running (pid=12345)\n"), Some(12345));
+    assert_eq!(
+        parse_master_pid("Master running (pid=12345)\n"),
+        Some(12345)
+    );
 }
 
 #[test]

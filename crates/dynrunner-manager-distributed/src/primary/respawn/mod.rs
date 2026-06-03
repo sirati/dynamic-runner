@@ -22,8 +22,8 @@ mod types;
 
 pub use listener::respawn_dispatcher_listener;
 pub use types::{
-    RespawnBudget, RespawnDecision, RespawnEvent, RespawnOutcome, RespawnRequest,
-    SecondarySpawnSpec, SecondarySpawner, SpawnError, RESPAWN_EVENTS_CAP,
+    RESPAWN_EVENTS_CAP, RespawnBudget, RespawnDecision, RespawnEvent, RespawnOutcome,
+    RespawnRequest, SecondarySpawnSpec, SecondarySpawner, SpawnError,
 };
 
 #[cfg(test)]

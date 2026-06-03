@@ -127,14 +127,7 @@ pub(super) fn production_spawner(
         let secondary_id = secondary_id.clone();
         let opts = opts.clone();
         Box::pin(async move {
-            spawn_reverse_tunnel(
-                &secondary_id,
-                &host,
-                tunnel_port,
-                primary_quic_port,
-                &opts,
-            )
-            .await
+            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
         })
     }
 }

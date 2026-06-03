@@ -2,7 +2,9 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use dynrunner_manager_distributed::{PrimaryConfig as RustPrimaryConfig, SecondaryConfig as RustSecondaryConfig};
+use dynrunner_manager_distributed::{
+    PrimaryConfig as RustPrimaryConfig, SecondaryConfig as RustSecondaryConfig,
+};
 
 use super::distributed::DistributedConfig;
 use super::resources::PyResourceMap;
@@ -64,28 +66,28 @@ impl PyPrimaryConfig {
             // reads `TaskDefinition.uses_file_based_items`).
             uses_file_based_items: true,
             required_setup_on_promote: false,
-                    max_concurrent_per_type: std::collections::HashMap::new(),
-                    retry_max_passes: self.distributed_config.retry_max_passes(),
-                    oom_retry_max_passes: self.distributed_config.oom_retry_max_passes(),
-                    fleet_dead_timeout: std::time::Duration::from_secs(30),
-                    mesh_ready_timeout: std::time::Duration::from_secs(60),
-                    mass_death_grace: self.distributed_config.mass_death_grace(),
-                    mass_death_min_count: self.distributed_config.mass_death_min_count(),
-                    // The PyO3 shim doesn't surface the staging
-                    // walk's source root (PyPrimaryCoordinator's
-                    // own constructor takes that kwarg directly
-                    // for the SLURM and network-primary paths).
-                    source_dir: None,
-                    // PyPrimaryCoordinator surfaces this on its own
-                    // `__init__` kwarg (and via the
-                    // `set_unfulfillable_reinject_max_per_task`
-                    // setter). The plain `PyPrimaryConfig` shim,
-                    // which only the in-process distributed
-                    // pipeline routes through, defaults to
-                    // unbounded; consumers that need a cap go via
-                    // `PyPrimaryCoordinator`.
-                    unfulfillable_reinject_max_per_task: None,
-                    setup_promote_deadline: self.distributed_config.setup_promote_deadline(),
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: self.distributed_config.retry_max_passes(),
+            oom_retry_max_passes: self.distributed_config.oom_retry_max_passes(),
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(60),
+            mass_death_grace: self.distributed_config.mass_death_grace(),
+            mass_death_min_count: self.distributed_config.mass_death_min_count(),
+            // The PyO3 shim doesn't surface the staging
+            // walk's source root (PyPrimaryCoordinator's
+            // own constructor takes that kwarg directly
+            // for the SLURM and network-primary paths).
+            source_dir: None,
+            // PyPrimaryCoordinator surfaces this on its own
+            // `__init__` kwarg (and via the
+            // `set_unfulfillable_reinject_max_per_task`
+            // setter). The plain `PyPrimaryConfig` shim,
+            // which only the in-process distributed
+            // pipeline routes through, defaults to
+            // unbounded; consumers that need a cap go via
+            // `PyPrimaryCoordinator`.
+            unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: self.distributed_config.setup_promote_deadline(),
         }
     }
 }
@@ -230,7 +232,12 @@ impl PySecondaryConfig {
             default_secondary_dir(&secondary_id, in_wrapper_container, WRAPPER_SRC_TMP, "src")
         });
         let output_dir = output_dir.unwrap_or_else(|| {
-            default_secondary_dir(&secondary_id, in_wrapper_container, WRAPPER_OUT_NETWORK, "out")
+            default_secondary_dir(
+                &secondary_id,
+                in_wrapper_container,
+                WRAPPER_OUT_NETWORK,
+                "out",
+            )
         });
 
         std::fs::create_dir_all(&src_tmp).map_err(|e| {
@@ -297,7 +304,9 @@ fn default_secondary_dir(
 // shared with the PyO3-exposed `parse_cores` / `parse_memory` /
 // `pick_free_port` so the framework has one source of truth for
 // "what does this machine look like".
-use crate::system_resources::{detect_logical_cpu_count as detect_num_workers, detect_total_memory_bytes};
+use crate::system_resources::{
+    detect_logical_cpu_count as detect_num_workers, detect_total_memory_bytes,
+};
 
 impl PySecondaryConfig {
     /// Build the Rust-side config. Currently unused — the
@@ -326,9 +335,7 @@ impl PySecondaryConfig {
             primary_link_failure_threshold: self
                 .distributed_config
                 .primary_link_failure_threshold(),
-            primary_link_failure_window: self
-                .distributed_config
-                .primary_link_failure_window(),
+            primary_link_failure_window: self.distributed_config.primary_link_failure_window(),
             setup_deadline: self.distributed_config.setup_deadline(),
             is_observer: false,
             resource_check_interval: self.distributed_config.resource_check_interval(),

@@ -78,7 +78,6 @@ pub use channel::OutboundChannel;
 pub use decisions::{BackoffDecision, OutgoingRelay, RouteDecision};
 pub use forwarding::{forward_step, handle_backoff, pick_relay, route_send};
 pub use router::{
-    Clocks, InboundOutcome, PeerRouteState, RouteVia, Router, RoutingError, SendOutcome,
-    MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR, MSG_RELAY_ENGAGED, REDIAL_COOLDOWN,
-    RELAY_LOG_TARGET,
+    Clocks, InboundOutcome, MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR, MSG_RELAY_ENGAGED,
+    PeerRouteState, REDIAL_COOLDOWN, RELAY_LOG_TARGET, RouteVia, Router, RoutingError, SendOutcome,
 };

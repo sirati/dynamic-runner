@@ -3,7 +3,6 @@
 
 use super::*;
 
-
 /// Pin the wire-strip behaviour directly: PrimaryConfig::wire_local_path
 /// returns the absolute path verbatim outside pre-staged mode and the
 /// relative-to-root form inside it. Paths that don't sit under the

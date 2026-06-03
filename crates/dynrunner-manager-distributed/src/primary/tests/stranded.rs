@@ -3,7 +3,6 @@
 
 use super::*;
 
-
 /// Stranded-task accounting: a "happy path" run where every binary
 /// reaches a terminal completion must report `stranded_count() == 0`.
 ///
@@ -15,65 +14,61 @@ use super::*;
 #[tokio::test(flavor = "current_thread")]
 async fn stranded_count_is_zero_on_clean_run() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        for (id, rx, tx) in secondary_ends {
-            tokio::task::spawn_local(fake_secondary(
-                id,
-                2,
-                1024 * 1024 * 1024,
-                rx,
-                tx,
-            ));
-        }
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
+            }
 
-        let (deps, ops, ope) = noop_phase_args();
-        primary.run(binaries, deps, ops, ope).await.unwrap();
+            let (deps, ops, ope) = noop_phase_args();
+            primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        assert_eq!(primary.completed_count(), 3);
-        assert_eq!(primary.failed_count(), 0);
-        assert_eq!(
-            primary.stranded_count(),
-            0,
-            "clean-run stranded must be zero (total - completed - failed)"
-        );
-    }).await;
+            assert_eq!(primary.completed_count(), 3);
+            assert_eq!(primary.failed_count(), 0);
+            assert_eq!(
+                primary.stranded_count(),
+                0,
+                "clean-run stranded must be zero (total - completed - failed)"
+            );
+        })
+        .await;
 }
 
 /// Mid-handshake disconnect helper: the fake sends Welcome + Cert +
@@ -206,101 +201,106 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
     let (log_buf, _log_guard) = capture_logs_thread_local();
 
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(2);
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 2,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            // Long fleet_dead so the operational loop's exit happens
-            // via "transport closed" (recv → None), not via the
-            // fleet-dead timer push-to-failed path. Keeps this test
-            // focused on the stranded-on-recv-None arm; a separate
-            // future test could pin the fleet-dead arm independently.
-            fleet_dead_timeout: std::time::Duration::from_secs(600),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                // Long fleet_dead so the operational loop's exit happens
+                // via "transport closed" (recv → None), not via the
+                // fleet-dead timer push-to-failed path. Keeps this test
+                // focused on the stranded-on-recv-None arm; a separate
+                // future test could pin the fleet-dead arm independently.
+                fleet_dead_timeout: std::time::Duration::from_secs(600),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..6)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
-        let total = binaries.len();
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+            let total = binaries.len();
 
-        for (id, rx, tx) in secondary_ends {
-            tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
-                id,
-                /* num_workers = */ 1,
-                1024 * 1024 * 1024,
-                rx,
-                tx,
-            ));
-        }
-
-        let (deps, ops, ope) = noop_phase_args();
-        let outcome = primary.run(binaries, deps, ops, ope).await;
-
-        match outcome {
-            Err(RunError::ClusterCollapsed { stranded, outcome }) => {
-                assert!(stranded > 0, "stranded must be positive on cluster collapse");
-                assert_eq!(
-                    outcome.total_terminal() + stranded,
-                    total,
-                    "succeeded + fail_retry + fail_oom + fail_final + stranded must equal total"
-                );
-                assert_eq!(outcome.succeeded, primary.completed_count());
-                assert_eq!(
-                    outcome.fail_retry + outcome.fail_oom + outcome.fail_final,
-                    primary.failed_count(),
-                    "per-class fail buckets must sum to total failed_tasks count"
-                );
-                assert_eq!(stranded, primary.stranded_count());
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
+                    id,
+                    /* num_workers = */ 1,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
             }
-            other => panic!(
-                "expected RunError::ClusterCollapsed, got {other:?} (counters: \
-                 succeeded={} failed={} stranded={} total={})",
-                primary.completed_count(),
-                primary.failed_count(),
-                primary.stranded_count(),
-                total,
-            ),
-        }
 
-        // Diagnostic log line must have fired so consumers grepping
-        // for the substring see it. Log emission happens inside
-        // `PrimaryCoordinator::run`, which is awaited directly in
-        // the test scope — the thread-local subscriber installed by
-        // `capture_logs_thread_local` records every error-level event
-        // from the same thread.
-        let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
-        assert!(
-            captured.contains("tasks left unassigned because cluster routing collapsed"),
-            "diagnostic 'tasks left unassigned because cluster routing collapsed' must \
+            let (deps, ops, ope) = noop_phase_args();
+            let outcome = primary.run(binaries, deps, ops, ope).await;
+
+            match outcome {
+                Err(RunError::ClusterCollapsed { stranded, outcome }) => {
+                    assert!(
+                        stranded > 0,
+                        "stranded must be positive on cluster collapse"
+                    );
+                    assert_eq!(
+                        outcome.total_terminal() + stranded,
+                        total,
+                        "succeeded + fail_retry + fail_oom + fail_final + stranded must equal total"
+                    );
+                    assert_eq!(outcome.succeeded, primary.completed_count());
+                    assert_eq!(
+                        outcome.fail_retry + outcome.fail_oom + outcome.fail_final,
+                        primary.failed_count(),
+                        "per-class fail buckets must sum to total failed_tasks count"
+                    );
+                    assert_eq!(stranded, primary.stranded_count());
+                }
+                other => panic!(
+                    "expected RunError::ClusterCollapsed, got {other:?} (counters: \
+                 succeeded={} failed={} stranded={} total={})",
+                    primary.completed_count(),
+                    primary.failed_count(),
+                    primary.stranded_count(),
+                    total,
+                ),
+            }
+
+            // Diagnostic log line must have fired so consumers grepping
+            // for the substring see it. Log emission happens inside
+            // `PrimaryCoordinator::run`, which is awaited directly in
+            // the test scope — the thread-local subscriber installed by
+            // `capture_logs_thread_local` records every error-level event
+            // from the same thread.
+            let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
+            assert!(
+                captured.contains("tasks left unassigned because cluster routing collapsed"),
+                "diagnostic 'tasks left unassigned because cluster routing collapsed' must \
              fire on the cluster-collapse arm so ops scripts can detect it; captured \
              error-level logs:\n{captured}"
-        );
-    }).await;
+            );
+        })
+        .await;
 }
 
 /// Pin Fix-#21 contract: when the operational loop's
@@ -327,104 +327,103 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
     use dynrunner_scheduler_api::PendingPool;
 
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, _ends) = setup_test(0);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 0,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(60),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 0,
-            oom_retry_max_passes: 1,
-            // Zero timeout so the very first loop iteration's
-            // `elapsed >= fleet_dead_timeout` predicate trips, no
-            // wall-clock wait needed in the test.
-            fleet_dead_timeout: std::time::Duration::ZERO,
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(0);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 0,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(60),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 0,
+                oom_retry_max_passes: 1,
+                // Zero timeout so the very first loop iteration's
+                // `elapsed >= fleet_dead_timeout` predicate trips, no
+                // wall-clock wait needed in the test.
+                fleet_dead_timeout: std::time::Duration::ZERO,
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        // Prime: pool with three queued binaries, empty secondaries
-        // map (the fleet-dead predicate is `secondaries.is_empty() &&
-        // !pool.is_empty()`), `total_tasks` set so the run-level
-        // accounting can later compute `stranded = total -
-        // completed - failed`.
-        let phase = dynrunner_core::PhaseId::from("default");
-        let mut pool = PendingPool::<TestId>::new(
-            [phase.clone()],
-            std::collections::HashMap::new(),
-        )
-        .expect("default-phase pool");
-        let binaries: Vec<TaskInfo<TestId>> = (0..3)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
-        pool.extend(binaries.clone()).expect("valid extend");
-        primary.pending = Some(pool);
-        primary.phase_completed.insert(phase.clone(), 0);
-        primary.phase_failed.insert(phase, 0);
-        primary.all_binaries = binaries.clone();
-        primary.total_tasks = binaries.len();
+            // Prime: pool with three queued binaries, empty secondaries
+            // map (the fleet-dead predicate is `secondaries.is_empty() &&
+            // !pool.is_empty()`), `total_tasks` set so the run-level
+            // accounting can later compute `stranded = total -
+            // completed - failed`.
+            let phase = dynrunner_core::PhaseId::from("default");
+            let mut pool =
+                PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
+                    .expect("default-phase pool");
+            let binaries: Vec<TaskInfo<TestId>> = (0..3)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+            pool.extend(binaries.clone()).expect("valid extend");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.all_binaries = binaries.clone();
+            primary.total_tasks = binaries.len();
 
-        // No workers, no secondaries — fleet-dead arm fires
-        // immediately on entry to the operational loop.
-        primary
-            .operational_loop()
-            .await
-            .expect("operational_loop must return Ok on the fleet-dead exit path");
+            // No workers, no secondaries — fleet-dead arm fires
+            // immediately on entry to the operational loop.
+            primary
+                .operational_loop()
+                .await
+                .expect("operational_loop must return Ok on the fleet-dead exit path");
 
-        // Pool must be drained so the loop terminates (both pre and
-        // post fix).
-        assert!(
-            primary.pool().is_empty(),
-            "fleet-dead arm must drain the queued pool"
-        );
-        // Fix-#21 contract: pre-fix this set was populated with the
-        // drained binaries' hashes; post-fix it stays empty so the
-        // `total - completed - failed` accounting downstream
-        // classifies them as stranded.
-        assert!(
-            primary.failed_tasks.is_empty(),
-            "fleet-dead pending must NOT be classified as failed; pre-fix \
+            // Pool must be drained so the loop terminates (both pre and
+            // post fix).
+            assert!(
+                primary.pool().is_empty(),
+                "fleet-dead arm must drain the queued pool"
+            );
+            // Fix-#21 contract: pre-fix this set was populated with the
+            // drained binaries' hashes; post-fix it stays empty so the
+            // `total - completed - failed` accounting downstream
+            // classifies them as stranded.
+            assert!(
+                primary.failed_tasks.is_empty(),
+                "fleet-dead pending must NOT be classified as failed; pre-fix \
              arm pushed pending hashes into failed_tasks, conflating \
              never-dispatched with worker-reported failure (got {:?})",
-            primary.failed_tasks
-        );
-        assert!(
-            primary.completed_tasks.is_empty(),
-            "fleet-dead with un-dispatched tasks must report no completions"
-        );
+                primary.failed_tasks
+            );
+            assert!(
+                primary.completed_tasks.is_empty(),
+                "fleet-dead with un-dispatched tasks must report no completions"
+            );
 
-        // Drive the run-level accounting that `run()` would do post-
-        // operational-loop, end-to-end-equivalent. With failed and
-        // completed both empty, every binary lands in the stranded
-        // bucket — exactly the category Fix-#21 surfaces.
-        let total = primary.total_tasks;
-        let completed = primary.completed_tasks.len();
-        let failed = primary.failed_tasks.len();
-        let stranded = total.saturating_sub(completed + failed);
-        assert_eq!(
-            stranded, total,
-            "every un-dispatched binary must surface as stranded \
+            // Drive the run-level accounting that `run()` would do post-
+            // operational-loop, end-to-end-equivalent. With failed and
+            // completed both empty, every binary lands in the stranded
+            // bucket — exactly the category Fix-#21 surfaces.
+            let total = primary.total_tasks;
+            let completed = primary.completed_tasks.len();
+            let failed = primary.failed_tasks.len();
+            let stranded = total.saturating_sub(completed + failed);
+            assert_eq!(
+                stranded, total,
+                "every un-dispatched binary must surface as stranded \
              (completed={completed} failed={failed} total={total})"
-        );
-    })
-    .await;
+            );
+        })
+        .await;
 }
 
 /// Pin: `drain_pending_messages` processes any `TaskComplete` /
@@ -447,91 +446,92 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
 #[tokio::test(flavor = "current_thread")]
 async fn drain_pending_messages_updates_completed_set() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-
-        // Inject three TaskComplete messages from the fake secondary's
-        // outbound clone (which is what `secondary_ends[i].2` is — the
-        // shared inbound side from the primary's perspective). Closing
-        // the sender at the end ensures `transport.recv()` will yield
-        // `Some` for each queued message and then `None`, exercising
-        // the drain helper's "process until empty" path through both
-        // arms of the recv result.
-        let (sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
-        for hash in ["hash-a", "hash-b", "hash-c"] {
-            incoming_tx
-                .send(DistributedMessage::TaskComplete {
-                    sender_id: sec_id.clone(),
-                    timestamp: 0.0,
-                    secondary_id: sec_id.clone(),
-                    worker_id: 0,
-                    task_hash: hash.into(),
-                    result_data: None,
-                })
-                .unwrap();
-        }
-        // Drop the sender so the recv channel will eventually yield
-        // `None`. The drain helper should treat that as "transport
-        // closed → drain complete" and break.
-        drop(incoming_tx);
-
-        primary
-            .drain_pending_messages(Duration::from_millis(500))
-            .await
-            .expect("drain must succeed on healthy transport");
-
-        // Post-drain the per-hash completed-set has every drained
-        // TaskComplete's hash. We pin the HashSet contents directly
-        // (rather than `completed_count()`) because the test injects
-        // synthesized TaskComplete messages without prior TaskAdded
-        // mutations — `cluster_state.apply(TaskCompleted)` NoOps on
-        // a non-existent ledger entry (CRDT precondition). The drain's
-        // load-bearing job here is to consume the messages through
-        // `handle_task_complete` (line 58: `completed_tasks.insert`),
-        // not to converge the CRDT mirror; the post-fix
-        // `completed_count()` reads through the CRDT and would NOT
-        // observe these synthetic completes.
-        assert_eq!(
-            primary.completed_tasks.len(),
-            3,
-            "drain must have processed all three queued TaskComplete messages \
-             (per-hash set populated by handle_task_complete's direct insert)"
-        );
-        for hash in ["hash-a", "hash-b", "hash-c"] {
-            assert!(
-                primary.completed_tasks.contains(hash),
-                "completed_tasks must contain {hash} after drain"
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
             );
-        }
-    })
-    .await;
+
+            // Inject three TaskComplete messages from the fake secondary's
+            // outbound clone (which is what `secondary_ends[i].2` is — the
+            // shared inbound side from the primary's perspective). Closing
+            // the sender at the end ensures `transport.recv()` will yield
+            // `Some` for each queued message and then `None`, exercising
+            // the drain helper's "process until empty" path through both
+            // arms of the recv result.
+            let (sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
+            for hash in ["hash-a", "hash-b", "hash-c"] {
+                incoming_tx
+                    .send(DistributedMessage::TaskComplete {
+                        sender_id: sec_id.clone(),
+                        timestamp: 0.0,
+                        secondary_id: sec_id.clone(),
+                        worker_id: 0,
+                        task_hash: hash.into(),
+                        result_data: None,
+                    })
+                    .unwrap();
+            }
+            // Drop the sender so the recv channel will eventually yield
+            // `None`. The drain helper should treat that as "transport
+            // closed → drain complete" and break.
+            drop(incoming_tx);
+
+            primary
+                .drain_pending_messages(Duration::from_millis(500))
+                .await
+                .expect("drain must succeed on healthy transport");
+
+            // Post-drain the per-hash completed-set has every drained
+            // TaskComplete's hash. We pin the HashSet contents directly
+            // (rather than `completed_count()`) because the test injects
+            // synthesized TaskComplete messages without prior TaskAdded
+            // mutations — `cluster_state.apply(TaskCompleted)` NoOps on
+            // a non-existent ledger entry (CRDT precondition). The drain's
+            // load-bearing job here is to consume the messages through
+            // `handle_task_complete` (line 58: `completed_tasks.insert`),
+            // not to converge the CRDT mirror; the post-fix
+            // `completed_count()` reads through the CRDT and would NOT
+            // observe these synthetic completes.
+            assert_eq!(
+                primary.completed_tasks.len(),
+                3,
+                "drain must have processed all three queued TaskComplete messages \
+             (per-hash set populated by handle_task_complete's direct insert)"
+            );
+            for hash in ["hash-a", "hash-b", "hash-c"] {
+                assert!(
+                    primary.completed_tasks.contains(hash),
+                    "completed_tasks must contain {hash} after drain"
+                );
+            }
+        })
+        .await;
 }
 
 /// Pin Fix-#23 contract end-to-end: a happy-path run with multiple
@@ -550,76 +550,77 @@ async fn drain_pending_messages_updates_completed_set() {
 #[tokio::test(flavor = "current_thread")]
 async fn clean_run_does_not_false_positive_stranded() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(2);
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 2,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..4)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
-        let total = binaries.len();
+            let binaries: Vec<TaskInfo<TestId>> = (0..4)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+            let total = binaries.len();
 
-        for (id, rx, tx) in secondary_ends {
-            tokio::task::spawn_local(fake_secondary(
-                id,
-                /* num_workers = */ 2,
-                1024 * 1024 * 1024,
-                rx,
-                tx,
-            ));
-        }
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(
+                    id,
+                    /* num_workers = */ 2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
 
-        let (deps, ops, ope) = noop_phase_args();
-        primary
-            .run(binaries, deps, ops, ope)
-            .await
-            .expect("clean multi-secondary run must return Ok");
+            let (deps, ops, ope) = noop_phase_args();
+            primary
+                .run(binaries, deps, ops, ope)
+                .await
+                .expect("clean multi-secondary run must return Ok");
 
-        assert_eq!(
-            primary.completed_count(),
-            total,
-            "every binary must report completed on a clean run"
-        );
-        assert_eq!(
-            primary.failed_count(),
-            0,
-            "no binary should land in failed on a clean run"
-        );
-        assert_eq!(
-            primary.stranded_count(),
-            0,
-            "no binary should be stranded on a clean run — \
+            assert_eq!(
+                primary.completed_count(),
+                total,
+                "every binary must report completed on a clean run"
+            );
+            assert_eq!(
+                primary.failed_count(),
+                0,
+                "no binary should land in failed on a clean run"
+            );
+            assert_eq!(
+                primary.stranded_count(),
+                0,
+                "no binary should be stranded on a clean run — \
              pre-fix the accounting ran before pending TaskCompletes \
              drained, false-positiving successful tasks as stranded"
-        );
-    })
-    .await;
+            );
+        })
+        .await;
 }

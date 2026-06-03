@@ -128,10 +128,8 @@ impl<I: Identifier> PendingPool<I> {
         // Cycle detection via Kahn's algorithm on the induced subgraph
         // of `phase_set`. Indegree is the count of parents per child
         // (each entry in `deps[child]` is one incoming edge).
-        let mut indegree: HashMap<PhaseId, usize> = phase_set
-            .iter()
-            .map(|p| (p.clone(), 0usize))
-            .collect();
+        let mut indegree: HashMap<PhaseId, usize> =
+            phase_set.iter().map(|p| (p.clone(), 0usize)).collect();
         for (child, parents) in &deps {
             *indegree.entry(child.clone()).or_insert(0) += parents.len();
         }
@@ -170,9 +168,7 @@ impl<I: Identifier> PendingPool<I> {
                 .into_iter()
                 .find(|(_, d)| *d != 0)
                 .map(|(p, _)| p)
-                .unwrap_or_else(|| {
-                    phase_set.iter().next().cloned().expect("non-empty phases")
-                });
+                .unwrap_or_else(|| phase_set.iter().next().cloned().expect("non-empty phases"));
             return Err(PendingPoolError::DependencyCycle(culprit));
         }
 
@@ -182,7 +178,11 @@ impl<I: Identifier> PendingPool<I> {
             let blocked = deps.get(p).is_some_and(|v| !v.is_empty());
             phase_state.insert(
                 p.clone(),
-                if blocked { PhaseState::Blocked } else { PhaseState::Active },
+                if blocked {
+                    PhaseState::Blocked
+                } else {
+                    PhaseState::Active
+                },
             );
         }
 
@@ -264,10 +264,7 @@ impl<I: Identifier> PendingPool<I> {
     ///
     /// Idempotent on repeated task_ids. Must be called BEFORE `extend()`
     /// for the seeded ids to participate in dep validation.
-    pub fn mark_tasks_in_flight(
-        &mut self,
-        items: impl IntoIterator<Item = (String, PhaseId)>,
-    ) {
+    pub fn mark_tasks_in_flight(&mut self, items: impl IntoIterator<Item = (String, PhaseId)>) {
         for (task_id, phase_id) in items {
             if self.in_flight_tasks.insert(task_id) {
                 let count = self

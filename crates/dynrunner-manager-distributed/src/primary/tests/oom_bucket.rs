@@ -103,9 +103,10 @@ fn register_secondary_with_workers(
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
-    primary
-        .secondaries
-        .insert(secondary_id.into(), SecondaryConnectionState::Operational(conn));
+    primary.secondaries.insert(
+        secondary_id.into(),
+        SecondaryConnectionState::Operational(conn),
+    );
     let next_global = primary.workers.len() as u32;
     for local in 0..num_workers {
         primary.register_idle_worker_for_test(
@@ -164,11 +165,8 @@ fn make_primed_primary(
         SizeEqualsMemoryEstimator,
     );
     let phase = PhaseId::from("default");
-    let pool = PendingPool::<TestId>::new(
-        [phase.clone()],
-        std::collections::HashMap::new(),
-    )
-    .expect("default-phase pool");
+    let pool = PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
+        .expect("default-phase pool");
     primary.pending = Some(pool);
     primary.phase_completed.insert(phase.clone(), 0);
     primary.phase_failed.insert(phase, 0);
@@ -223,9 +221,8 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
             // incoming receiver from observing a close — this test
             // never sends inbound traffic, but the operational shape
             // expects the channel to stay open across the bucket call.
-            let (_incoming_tx_keepalive, incoming_rx) = tokio_mpsc::unbounded_channel::<
-                DistributedMessage<TestId>,
-            >();
+            let (_incoming_tx_keepalive, incoming_rx) =
+                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             let mut outgoing: HashMap<
                 String,
                 tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
@@ -416,10 +413,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
             // `pool_mut()` mutable borrow doesn't overlap with the
             // immutable read of `all_binaries`.
             let seeded = primary.all_binaries.clone();
-            primary
-                .pool_mut()
-                .extend(seeded)
-                .expect("valid extend");
+            primary.pool_mut().extend(seeded).expect("valid extend");
 
             // Coordinator never entered OOM-bucket mode: flag is
             // off, mask is off everywhere, view contains every task

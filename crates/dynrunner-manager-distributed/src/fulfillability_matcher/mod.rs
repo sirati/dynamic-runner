@@ -28,4 +28,4 @@ pub mod pipeline;
 
 pub use event::MatcherTriggerEvent;
 pub use matcher::FulfillabilityMatcher;
-pub use pipeline::{drain_matcher_batch, MatcherBatch, MATCHER_BATCH_IDLE_WINDOW};
+pub use pipeline::{MATCHER_BATCH_IDLE_WINDOW, MatcherBatch, drain_matcher_batch};

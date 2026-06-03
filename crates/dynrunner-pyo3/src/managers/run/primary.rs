@@ -143,11 +143,9 @@ pub(crate) fn run_primary<'py>(
     // hook is skipped — the call signature would be ill-defined and
     // back-compat with non-CLI callers that don't own a Namespace
     // is preserved.
-    if let (Some(sd), Some(od), Some(ta)) = (
-        source_dir.as_ref(),
-        output_dir.as_ref(),
-        task_args.as_ref(),
-    ) {
+    if let (Some(sd), Some(od), Some(ta)) =
+        (source_dir.as_ref(), output_dir.as_ref(), task_args.as_ref())
+    {
         let primary_handle = coord.call_method0("handle")?.unbind();
         fire_on_run_start(task_definition, sd, od, ta.bind(py), Some(primary_handle))?;
     }

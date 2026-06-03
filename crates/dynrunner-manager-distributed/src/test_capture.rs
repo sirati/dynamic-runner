@@ -55,11 +55,7 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         struct EventVisitor<'a>(&'a mut CapturedEvent);
         impl tracing::field::Visit for EventVisitor<'_> {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 let rendered = format!("{value:?}");
                 if field.name() == "message" {
                     self.0.message = rendered;

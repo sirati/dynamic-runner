@@ -290,5 +290,4 @@ impl<I: Identifier> ClusterState<I> {
     pub fn task_count(&self) -> usize {
         self.tasks.len()
     }
-
 }

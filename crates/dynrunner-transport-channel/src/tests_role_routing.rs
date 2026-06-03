@@ -8,10 +8,12 @@
 //! `TestRegistrar` fixture and partitioning would scatter the
 //! per-case invariants.
 
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport, RoleChangeHookRegistrar};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerTransport, RoleChangeHookRegistrar,
+};
 
 use crate::mesh::peer_mesh;
-use crate::tests_peer_basics::{keepalive, SendTestId};
+use crate::tests_peer_basics::{SendTestId, keepalive};
 
 // ── Step 2: role-table write-through cache tests ──
 //
@@ -28,9 +30,8 @@ use crate::tests_peer_basics::{keepalive, SendTestId};
 /// driving it against an arbitrary `RoleTable`. Strictly enough
 /// to test the transport's cache plumbing without taking a
 /// dev-dep on the cluster-state crate.
-type RoleTableHook = Box<
-    dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
->;
+type RoleTableHook =
+    Box<dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct TestRegistrar {
@@ -468,9 +469,7 @@ async fn role_addressed_case_c_no_holder_drops() {
 /// direct send carries whatever envelope we wrap manually.
 #[tokio::test]
 async fn role_addressed_case_d_max_attempts_drops() {
-    use dynrunner_protocol_primary_secondary::{
-        Role, RoleTable, MAX_ROLE_RELAY_ATTEMPTS,
-    };
+    use dynrunner_protocol_primary_secondary::{MAX_ROLE_RELAY_ATTEMPTS, Role, RoleTable};
 
     let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
     let mut transports = peer_mesh::<SendTestId>(&ids);

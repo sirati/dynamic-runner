@@ -98,9 +98,7 @@ impl From<&PyBinaryIdentifier> for RunnerIdentifier {
 /// any callable that returns a string) and falls back to the explicit
 /// 5-field `BinaryIdentifier` shape (`binary_name`, `platform`, `compiler`,
 /// `version`, `opt_level`).
-pub(crate) fn identifier_from_pyobj(
-    obj: &Bound<'_, PyAny>,
-) -> PyResult<RunnerIdentifier> {
+pub(crate) fn identifier_from_pyobj(obj: &Bound<'_, PyAny>) -> PyResult<RunnerIdentifier> {
     if let Ok(key_attr) = obj.getattr("identifier_key") {
         let key: String = key_attr.call0()?.extract()?;
         return Ok(Arc::from(key.as_str()));

@@ -17,11 +17,15 @@ fn view_for_worker_orders_typed_then_free_pool() {
     p.extend([
         t("P", "T", "", 9),       // free-pool item
         t("P", "T", "alpha", 10), // typed
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     let view = p.view_for_worker(1, None);
     assert_eq!(view.len(), 2);
     // First entry is from the typed bucket (step 2 wins over step 3).
-    assert_eq!(view.as_slice()[0].affinity_id.as_ref().unwrap().as_str(), "alpha");
+    assert_eq!(
+        view.as_slice()[0].affinity_id.as_ref().unwrap().as_str(),
+        "alpha"
+    );
     // Second is the free-pool item.
     assert!(view.as_slice()[1].affinity_id.is_none());
 }
@@ -35,7 +39,8 @@ fn take_from_view_commits_chosen_index() {
         t("P", "T", "alpha", 1),
         t("P", "T", "alpha", 2),
         t("P", "T", "beta", 3),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
     // Worker 1 sees both typed buckets.
     let view = p.view_for_worker(1, None);
     // Find the beta entry (BTreeMap key order: alpha < beta).
@@ -71,7 +76,8 @@ fn view_for_worker_orders_pinned_then_typed_then_free_then_copin() {
         t("P", "T", "beta", 3),
         // free pool
         t("P", "T", "", 4),
-    ]).expect("valid extend");
+    ])
+    .expect("valid extend");
 
     // First, worker 1 grabs alpha (Step 2). After this, the view for
     // worker 1 should put alpha first (Step 1: pinned), then beta
@@ -87,10 +93,8 @@ fn view_for_worker_orders_pinned_then_typed_then_free_then_copin() {
 #[test]
 fn view_for_worker_skips_blocked_phases() {
     let mut p = pool_with(&["A", "B"], &[("B", &["A"])]);
-    p.extend([
-        t("A", "T", "", 1),
-        t("B", "T", "", 2),
-    ]).expect("valid extend");
+    p.extend([t("A", "T", "", 1), t("B", "T", "", 2)])
+        .expect("valid extend");
     let view = p.view_for_worker(1, None);
     // Only A's item is visible; B is Blocked.
     assert_eq!(view.len(), 1);
@@ -100,10 +104,8 @@ fn view_for_worker_skips_blocked_phases() {
 #[test]
 fn take_from_view_removes_chosen_item_and_records_affinity() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([
-        t("P", "T", "alpha", 1),
-        t("P", "T", "beta", 2),
-    ]).expect("valid extend");
+    p.extend([t("P", "T", "alpha", 1), t("P", "T", "beta", 2)])
+        .expect("valid extend");
     let view = p.view_for_worker(1, None);
     // View order: alpha (BTreeMap "alpha" < "beta") then beta. Pick beta
     // to verify non-zero index removal.

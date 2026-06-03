@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tracing::subscriber::set_default;
 use tracing::Metadata;
+use tracing::subscriber::set_default;
+use tracing_subscriber::Registry;
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-use tracing_subscriber::Registry;
 
 use crate::config::SlurmConfig;
 use crate::job_manager::types::SlurmJobManager;
@@ -35,11 +35,7 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         struct MsgVisitor<'a>(&'a mut Option<String>);
         impl tracing::field::Visit for MsgVisitor<'_> {
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     *self.0 = Some(format!("{value:?}"));
                 }

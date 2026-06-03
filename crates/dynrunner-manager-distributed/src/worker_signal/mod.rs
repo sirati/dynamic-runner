@@ -25,7 +25,5 @@
 pub mod pipeline;
 pub mod signal;
 
-pub use pipeline::{
-    drain_worker_signal_batch, WorkerSignalBatch, WORKER_SIGNAL_BATCH_IDLE_WINDOW,
-};
+pub use pipeline::{WORKER_SIGNAL_BATCH_IDLE_WINDOW, WorkerSignalBatch, drain_worker_signal_batch};
 pub use signal::WorkerMgmtSignal;

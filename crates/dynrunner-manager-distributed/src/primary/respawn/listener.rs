@@ -1,11 +1,8 @@
 //! Peer-lifecycle dispatcher listener that enqueues respawn requests.
 
-
-
 use crate::peer_lifecycle::{LifecycleListener, PeerLifecycleEvent};
 
 use super::types::RespawnRequest;
-
 
 /// [`LifecycleListener`] that converts `PeerLifecycleEvent::Removed`
 /// into a [`RespawnRequest`] on the supplied sender.

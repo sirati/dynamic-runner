@@ -80,10 +80,7 @@ where
     /// forget; the caller has no acknowledgement to wait on). Safe
     /// under bursts that interleave a manual reinject and a
     /// matcher-true on the same hash.
-    pub(super) async fn invoke_fulfillability_matcher_batch(
-        &mut self,
-        batch: MatcherBatch,
-    ) {
+    pub(super) async fn invoke_fulfillability_matcher_batch(&mut self, batch: MatcherBatch) {
         // No matcher installed → nothing to do. The select! arm
         // should not be enabled in this case, but the guard is
         // defensive: `set_fulfillability_matcher` is a setter, not a
@@ -170,4 +167,3 @@ where
         }
     }
 }
-

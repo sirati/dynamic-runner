@@ -10,8 +10,8 @@
 use crate::UnifiedSecondaryTransport;
 use dynrunner_core::{MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    install_role_change_hook, new_role_cache, Address, DistributedMessage, PeerConnectionInfo,
-    PeerTransport, Role, RoleCache, RoleChangeHookRegistrar, RoleTable, Scope,
+    Address, DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleCache,
+    RoleChangeHookRegistrar, RoleTable, Scope, install_role_change_hook, new_role_cache,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -127,10 +127,7 @@ impl TestRegistrar {
 }
 
 impl RoleChangeHookRegistrar for TestRegistrar {
-    fn register_role_change_hook(
-        &mut self,
-        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
-    ) {
+    fn register_role_change_hook(&mut self, hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>) {
         self.hooks.push(hook);
     }
 }
@@ -214,7 +211,10 @@ async fn role_primary_cold_cache_routes_to_uplink() {
         .await
         .expect("cold-cache Role::Primary must route to the healthy uplink");
     // The uplink received it.
-    let got = fx.uplink_sent_rx.try_recv().expect("uplink should have the frame");
+    let got = fx
+        .uplink_sent_rx
+        .try_recv()
+        .expect("uplink should have the frame");
     assert!(matches!(got, DistributedMessage::Keepalive { .. }));
     // The mesh did NOT broadcast and no peer received it.
     assert!(fx.mesh_broadcast_rx.try_recv().is_err());
@@ -440,23 +440,27 @@ fn task_request(sender: &str) -> DistributedMessage<TestId> {
 #[test]
 fn is_primary_facing_classification() {
     assert!(task_request("sec-B").is_primary_facing());
-    assert!(DistributedMessage::<TestId>::MeshReady {
-        sender_id: "sec-B".into(),
-        timestamp: 1.0,
-        secondary_id: "sec-B".into(),
-        peer_count: 0,
-    }
-    .is_primary_facing());
+    assert!(
+        DistributedMessage::<TestId>::MeshReady {
+            sender_id: "sec-B".into(),
+            timestamp: 1.0,
+            secondary_id: "sec-B".into(),
+            peer_count: 0,
+        }
+        .is_primary_facing()
+    );
     // Keepalive is consumed by both roles → NOT primary-facing (it
     // stays with the follower secondary, which mirrors for every node).
     assert!(!keepalive("sec-B").is_primary_facing());
     // CRDT mutation is mirrored by every node → NOT primary-facing.
-    assert!(!DistributedMessage::<TestId>::ClusterMutation {
-        sender_id: "sec-B".into(),
-        timestamp: 1.0,
-        mutations: vec![],
-    }
-    .is_primary_facing());
+    assert!(
+        !DistributedMessage::<TestId>::ClusterMutation {
+            sender_id: "sec-B".into(),
+            timestamp: 1.0,
+            mutations: vec![],
+        }
+        .is_primary_facing()
+    );
 }
 
 /// With a co-located-primary tap attached AND this node holding

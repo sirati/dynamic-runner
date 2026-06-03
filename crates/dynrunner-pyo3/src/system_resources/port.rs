@@ -15,9 +15,7 @@ pub(crate) fn pick_free_port() -> PyResult<u16> {
     let port = listener
         .local_addr()
         .map_err(|e| {
-            pyo3::exceptions::PyOSError::new_err(format!(
-                "pick_free_port: local_addr failed: {e}"
-            ))
+            pyo3::exceptions::PyOSError::new_err(format!("pick_free_port: local_addr failed: {e}"))
         })?
         .port();
     drop(listener);

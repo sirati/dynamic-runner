@@ -26,8 +26,7 @@ impl PyPrimaryCoordinator {
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_keepalive = self.distributed_config.keepalive_interval();
-        let dist_keepalive_miss_threshold =
-            self.distributed_config.keepalive_miss_threshold();
+        let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
@@ -52,18 +51,16 @@ impl PyPrimaryCoordinator {
         // `as_arc()` method that clones their internal `Arc`.
         let respawn_budget = self.respawn_policy.to_budget();
         let respawn_spawner_arc: Option<
-            std::sync::Arc<
-                dyn dynrunner_manager_distributed::primary::respawn::SecondarySpawner,
-            >,
+            std::sync::Arc<dyn dynrunner_manager_distributed::primary::respawn::SecondarySpawner>,
         > = match (&self.respawn_spawner, &respawn_budget) {
             (Some(spawner_py), Some(_)) => {
                 let bound = spawner_py.bind(py);
-                if let Ok(mp) = bound
-                    .cast::<crate::managers::multi_process_respawner::PyMultiProcessSpawner>()
+                if let Ok(mp) =
+                    bound.cast::<crate::managers::multi_process_respawner::PyMultiProcessSpawner>()
                 {
                     Some(mp.borrow().as_arc())
-                } else if let Ok(slurm) = bound
-                    .cast::<crate::slurm::respawn_bridge::PySlurmSpawner>()
+                } else if let Ok(slurm) =
+                    bound.cast::<crate::slurm::respawn_bridge::PySlurmSpawner>()
                 {
                     Some(slurm.borrow().as_arc())
                 } else {
@@ -106,9 +103,8 @@ impl PyPrimaryCoordinator {
         // owns its own copy. Empty paths yields a no-op watcher and
         // the operational-loop arm parks on `pending().await`.
         let panik_watcher_paths = self.panik_watcher_paths.clone();
-        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
-            self.panik_watcher_poll_interval_secs,
-        );
+        let panik_watcher_poll_interval =
+            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
         // owns the single-shot guard and the snapshot ordering; the
@@ -140,14 +136,10 @@ impl PyPrimaryCoordinator {
         // methods. Each closure owns its own ref-bumped `Py<PyAny>` so
         // the manager owns the lifetime independent of `self`.
         let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
-            crate::managers::lifecycle::make_on_phase_start(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
         );
         let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(
-                self.task_definition.clone_ref(py),
-            ),
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
         );
 
         // Take the Python peer-lifecycle listener (if any) out of
@@ -156,10 +148,10 @@ impl PyPrimaryCoordinator {
         // `Box<dyn LifecycleListener>` at the boundary so the
         // manager-distributed registration API stays
         // PyO3-agnostic.
-        let peer_lifecycle_listener =
-            self.peer_lifecycle_listener
-                .take()
-                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+        let peer_lifecycle_listener = self
+            .peer_lifecycle_listener
+            .take()
+            .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Same shape as the peer-lifecycle listener: take the Python
         // callable out of `self`, wrap it as a `Box<dyn
@@ -169,20 +161,20 @@ impl PyPrimaryCoordinator {
         // `PrimaryCoordinator::run_pipeline` -> `mem::take` on
         // `task_completed_listeners`), so registration must happen
         // pre-run.
-        let task_completed_listener =
-            self.task_completed_listener
-                .take()
-                .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
+        let task_completed_listener = self
+            .task_completed_listener
+            .take()
+            .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
         // Same shape for the fulfillability matcher kwarg: take the
         // Python callable out of `self`, wrap it as a
         // `Box<dyn FulfillabilityMatcher<RunnerIdentifier>>` at the
         // bridge boundary, and install it on the inner coordinator
         // BEFORE `run()` enters.
-        let fulfillability_matcher =
-            self.fulfillability_matcher
-                .take()
-                .map(crate::fulfillability_matcher_bridge::PyFulfillabilityMatcher::new);
+        let fulfillability_matcher = self
+            .fulfillability_matcher
+            .take()
+            .map(crate::fulfillability_matcher_bridge::PyFulfillabilityMatcher::new);
 
         // Resolve the bind port. When the caller (e.g. the SLURM
         // packaging pipeline) pre-supplied `listen_port`, honour it
@@ -222,10 +214,9 @@ impl PyPrimaryCoordinator {
         let mut child_processes: Vec<std::process::Child> = Vec::new();
         for i in 0..num_secondaries {
             let secondary_id = format!("secondary-{i}");
-            let spec_obj = self.spawn_secondary.call1(
-                py,
-                (&primary_url, &secondary_id, 0u16),
-            )?;
+            let spec_obj = self
+                .spawn_secondary
+                .call1(py, (&primary_url, &secondary_id, 0u16))?;
             // `None` → SLURM no-op path (`_slurm_already_spawned`).
             // Anything else MUST be a `SubprocessSpec`-shaped object
             // (the Python `dynamic_runner.SubprocessSpec` dataclass);
@@ -238,9 +229,8 @@ impl PyPrimaryCoordinator {
                 );
                 continue;
             }
-            let spec = crate::managers::subprocess_spec::SubprocessSpec::from_pyany(
-                spec_obj.bind(py),
-            )?;
+            let spec =
+                crate::managers::subprocess_spec::SubprocessSpec::from_pyany(spec_obj.bind(py))?;
             let child = spec.spawn().map_err(|e| {
                 pyo3::exceptions::PyOSError::new_err(format!(
                     "failed to spawn secondary {secondary_id}: {e}"
@@ -316,21 +306,17 @@ impl PyPrimaryCoordinator {
                 // call site (it stays valid on the SECONDARY side for
                 // the `disable_peer_overlay` firewalled-fabric path).
                 let (peer_transport, _shared_outgoing, inbound, registration) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<
-                        RunnerIdentifier,
-                    >::new("primary".into());
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
+                        "primary".into(),
+                    );
 
                 // Bind the network server to the port we already picked,
                 // wiring its accept loops to the transport's sinks.
                 let bind_addr: std::net::SocketAddr =
                     format!("127.0.0.1:{}", port).parse().unwrap();
                 let server: NetworkServer =
-                    match NetworkServer::bind::<RunnerIdentifier>(
-                        bind_addr,
-                        inbound,
-                        registration,
-                    )
-                    .await
+                    match NetworkServer::bind::<RunnerIdentifier>(bind_addr, inbound, registration)
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
@@ -435,9 +421,7 @@ impl PyPrimaryCoordinator {
                 // the ONLY call site that touches the respawn
                 // wiring; no downstream `if policy_enabled` checks
                 // live on the hot path.
-                if let (Some(spawner), Some(budget)) =
-                    (respawn_spawner_arc, respawn_budget)
-                {
+                if let (Some(spawner), Some(budget)) = (respawn_spawner_arc, respawn_budget) {
                     primary.enable_respawn(
                         spawner,
                         budget,
@@ -480,20 +464,21 @@ impl PyPrimaryCoordinator {
                 // Held in scope so its `Drop::abort()` runs at loop
                 // exit and cleans up the polling task on every
                 // termination path.
-                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
-                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
-                        paths: panik_watcher_paths,
-                        poll_interval: panik_watcher_poll_interval,
-                        // PRIMARY-role spawner: SIGTERM listening
-                        // OFF. SLURM-driven SIGTERM is forwarded
-                        // by the host shutdown-manager only into
-                        // secondary containers — primaries are
-                        // outside that path. Sentinel-file panik
-                        // and cluster-wide panik broadcast remain
-                        // the primary's emergency-stop sources.
-                        listen_for_sigterm: false,
-                    },
-                );
+                let mut panik_watcher =
+                    dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                        dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                            paths: panik_watcher_paths,
+                            poll_interval: panik_watcher_poll_interval,
+                            // PRIMARY-role spawner: SIGTERM listening
+                            // OFF. SLURM-driven SIGTERM is forwarded
+                            // by the host shutdown-manager only into
+                            // secondary containers — primaries are
+                            // outside that path. Sentinel-file panik
+                            // and cluster-wide panik broadcast remain
+                            // the primary's emergency-stop sources.
+                            listen_for_sigterm: false,
+                        },
+                    );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     primary.register_panik_signal_rx(rx);
                 }

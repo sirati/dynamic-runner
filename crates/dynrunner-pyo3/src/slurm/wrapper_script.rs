@@ -18,9 +18,9 @@ use pyo3::prelude::*;
 
 use dynrunner_slurm::config::SlurmConfig;
 use dynrunner_slurm::wrapper_script::{
+    ConnectionMode, TestWrapperScriptConfig, WrapperScriptConfig,
     generate_test_wrapper_script as rust_generate_test_wrapper_script,
-    generate_wrapper_script as rust_generate_wrapper_script, ConnectionMode,
-    TestWrapperScriptConfig, WrapperScriptConfig,
+    generate_wrapper_script as rust_generate_wrapper_script,
 };
 
 /// Build a `SlurmConfig` from just the `root_folder` — that's the
@@ -102,9 +102,7 @@ pub fn generate_wrapper_script(
     // wrong combination instead of silently defaulting.
     let connection = if reverse_connection {
         let dir = connection_info_dir.ok_or_else(|| {
-            PyValueError::new_err(
-                "reverse_connection=True requires `connection_info_dir`",
-            )
+            PyValueError::new_err("reverse_connection=True requires `connection_info_dir`")
         })?;
         ConnectionMode::Reverse {
             connection_info_dir: dir,

@@ -21,8 +21,7 @@ fn process_inbound_forwards_relay_via_next_hop() {
         path: vec!["a".into()],
         inner: Box::new(keepalive("a")),
     };
-    let outcome =
-        router.process_inbound(inbound, &mut conns, clocks_at(Instant::now(), 1.0));
+    let outcome = router.process_inbound(inbound, &mut conns, clocks_at(Instant::now(), 1.0));
     assert!(matches!(
         outcome,
         InboundOutcome::Handled {
@@ -48,9 +47,7 @@ fn process_inbound_forwards_relay_via_next_hop() {
         other => panic!("expected forwarded Relay: {other:?}"),
     }
     // Forwarder bookkeeping recorded for backoff.
-    assert!(router
-        .outgoing_relays
-        .contains_key(&("a".to_string(), 7)));
+    assert!(router.outgoing_relays.contains_key(&("a".to_string(), 7)));
 }
 
 // ── process_inbound: receiver-side relay observation ──
@@ -105,7 +102,12 @@ fn process_inbound_relay_for_self_preserves_existing_direct_via() {
     let mut router = Router::<()>::new("a".into());
     // Establish a Direct route to d via a real send.
     let _ = router
-        .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(Instant::now(), 1.0))
+        .send_to_peer(
+            "d",
+            keepalive("a"),
+            &mut conns,
+            clocks_at(Instant::now(), 1.0),
+        )
         .unwrap();
     match &router.route_state.get("d").expect("route_state for d").via {
         RouteVia::Direct => {}
@@ -125,15 +127,15 @@ fn process_inbound_relay_for_self_preserves_existing_direct_via() {
     // nothing about our outbound.
     match &router.route_state.get("d").expect("route_state for d").via {
         RouteVia::Direct => {}
-        other => panic!(
-            "via should remain Direct after recv-relay-for-self, got {other:?}"
-        ),
+        other => panic!("via should remain Direct after recv-relay-for-self, got {other:?}"),
     }
-    assert!(router
-        .route_state
-        .get("d")
-        .and_then(|s| s.last_observed_relay_at)
-        .is_some());
+    assert!(
+        router
+            .route_state
+            .get("d")
+            .and_then(|s| s.last_observed_relay_at)
+            .is_some()
+    );
 }
 
 #[test]
@@ -174,7 +176,12 @@ fn process_inbound_backoff_retries_via_next_candidate() {
     let mut conns = conns_with_log(&["b", "c"], &log);
     let mut router = Router::<()>::new("a".into());
     let _ = router
-        .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(Instant::now(), 1.0))
+        .send_to_peer(
+            "d",
+            keepalive("a"),
+            &mut conns,
+            clocks_at(Instant::now(), 1.0),
+        )
         .unwrap();
     log.borrow_mut().clear();
     let backoff = DistributedMessage::RelayBackoff {
@@ -183,8 +190,7 @@ fn process_inbound_backoff_retries_via_next_candidate() {
         original_sender: "a".into(),
         relay_id: 0,
     };
-    let outcome =
-        router.process_inbound(backoff, &mut conns, clocks_at(Instant::now(), 2.0));
+    let outcome = router.process_inbound(backoff, &mut conns, clocks_at(Instant::now(), 2.0));
     assert!(matches!(
         outcome,
         InboundOutcome::Handled {
@@ -196,9 +202,11 @@ fn process_inbound_backoff_retries_via_next_candidate() {
     assert_eq!(entries[0].addressee, "c", "retry went to next candidate");
     assert!(matches!(entries[0].msg, DistributedMessage::Relay { .. }));
     // Failed_via b is now blacklisted for target d.
-    assert!(router
-        .failed_forwarders
-        .contains_key(&("d".to_string(), "b".to_string())));
+    assert!(
+        router
+            .failed_forwarders
+            .contains_key(&("d".to_string(), "b".to_string()))
+    );
 }
 
 #[test]
@@ -226,8 +234,7 @@ fn process_inbound_backoff_propagates_when_forwarder_exhausted() {
         original_sender: "a".into(),
         relay_id: 9,
     };
-    let outcome =
-        router.process_inbound(backoff, &mut conns, clocks_at(Instant::now(), 2.0));
+    let outcome = router.process_inbound(backoff, &mut conns, clocks_at(Instant::now(), 2.0));
     assert!(matches!(
         outcome,
         InboundOutcome::Handled {
@@ -236,7 +243,10 @@ fn process_inbound_backoff_propagates_when_forwarder_exhausted() {
     ));
     let entries = log.borrow();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].addressee, "a", "backoff propagated to predecessor");
+    assert_eq!(
+        entries[0].addressee, "a",
+        "backoff propagated to predecessor"
+    );
     match &entries[0].msg {
         DistributedMessage::RelayBackoff {
             sender_id,
@@ -251,9 +261,7 @@ fn process_inbound_backoff_propagates_when_forwarder_exhausted() {
         other => panic!("expected RelayBackoff: {other:?}"),
     }
     // Local state for the relay we propagated must be removed.
-    assert!(!router
-        .outgoing_relays
-        .contains_key(&("a".to_string(), 9)));
+    assert!(!router.outgoing_relays.contains_key(&("a".to_string(), 9)));
 }
 
 #[test]
@@ -265,7 +273,12 @@ fn process_inbound_backoff_drops_when_originator_exhausted() {
     let mut conns = conns_with_log(&["b"], &log);
     let mut router = Router::<()>::new("a".into());
     let _ = router
-        .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(Instant::now(), 1.0))
+        .send_to_peer(
+            "d",
+            keepalive("a"),
+            &mut conns,
+            clocks_at(Instant::now(), 1.0),
+        )
         .unwrap();
     log.borrow_mut().clear();
     let backoff = DistributedMessage::RelayBackoff {
@@ -276,9 +289,7 @@ fn process_inbound_backoff_drops_when_originator_exhausted() {
     };
     let _ = router.process_inbound(backoff, &mut conns, clocks_at(Instant::now(), 2.0));
     assert!(log.borrow().is_empty(), "originator drop emits nothing");
-    assert!(!router
-        .outgoing_relays
-        .contains_key(&("a".to_string(), 0)));
+    assert!(!router.outgoing_relays.contains_key(&("a".to_string(), 0)));
 }
 
 // ── process_inbound: non-routing pass-through ──
@@ -288,11 +299,8 @@ fn process_inbound_non_routing_delivers() {
     let log = new_log::<()>();
     let mut conns: HashMap<String, RecordingChannel<()>> = HashMap::new();
     let mut router = Router::<()>::new("a".into());
-    let outcome = router.process_inbound(
-        keepalive("b"),
-        &mut conns,
-        clocks_at(Instant::now(), 1.0),
-    );
+    let outcome =
+        router.process_inbound(keepalive("b"), &mut conns, clocks_at(Instant::now(), 1.0));
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
             assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
@@ -302,4 +310,3 @@ fn process_inbound_non_routing_delivers() {
     }
     assert!(log.borrow().is_empty());
 }
-

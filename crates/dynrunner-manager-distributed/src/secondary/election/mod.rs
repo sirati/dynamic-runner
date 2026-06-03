@@ -50,10 +50,7 @@ pub(super) enum ElectionState {
     },
     /// A peer with lower id is candidate. Waiting for the take-over to
     /// happen (we'll see the new primary start sending messages).
-    Voting {
-        round: u32,
-        candidate: String,
-    },
+    Voting { round: u32, candidate: String },
     /// We've taken over and are now acting as the primary. Stops further
     /// election ticks.
     Promoted,
@@ -92,4 +89,3 @@ pub(super) fn next_round(state: &ElectionState) -> u32 {
         _ => 1,
     }
 }
-

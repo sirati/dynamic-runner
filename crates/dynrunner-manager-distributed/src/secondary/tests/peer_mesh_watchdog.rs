@@ -6,14 +6,14 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    make_transport, FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport,
+    FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport, make_transport,
 };
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
-use std::time::Duration;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 // Helper: build a no-peer secondary with the watchdog already armed
@@ -153,7 +153,10 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
             DistributedMessage::SecondaryFatalError { .. } => {
                 panic!("watchdog must NOT send SecondaryFatalError in graceful-degrade mode");
             }
-            other => panic!("unexpected message on primary channel: {:?}", other.msg_type()),
+            other => panic!(
+                "unexpected message on primary channel: {:?}",
+                other.msg_type()
+            ),
         }
     }
     assert!(
@@ -371,8 +374,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
 /// to vote with.
 #[tokio::test(flavor = "current_thread")]
 async fn degraded_failover_fails_loud_instead_of_self_promoting() {
-    use super::super::test_helpers::{election_config, make_secondary};
     use super::super::election::ElectionState;
+    use super::super::test_helpers::{election_config, make_secondary};
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = make_secondary(election_config("sec-a"));
@@ -496,7 +499,10 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
                 assert_eq!(peer_count, 3, "healthy mesh reports the live peer count");
                 saw_mesh_ready = true;
             }
-            other => panic!("unexpected message on primary channel: {:?}", other.msg_type()),
+            other => panic!(
+                "unexpected message on primary channel: {:?}",
+                other.msg_type()
+            ),
         }
     }
     assert!(saw_mesh_ready, "MeshReady must be sent on the healthy path");

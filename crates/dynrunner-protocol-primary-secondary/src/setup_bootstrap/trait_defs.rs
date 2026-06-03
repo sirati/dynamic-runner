@@ -38,9 +38,7 @@ pub trait SetupBootstrap<I: Identifier> {
     /// `warn` and skipped; the next call returns the next setup-eligible
     /// frame. The caller does not see operational traffic through this
     /// surface — that's the structural guarantee Step 10 enforces.
-    fn recv(
-        &mut self,
-    ) -> impl std::future::Future<Output = Option<SetupBootstrapMessage>>;
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<SetupBootstrapMessage>>;
 }
 
 /// Primary-side bootstrap channel: a 1:N fan-out to every connected
@@ -72,7 +70,5 @@ pub trait SetupBootstrapBroadcast<I: Identifier> {
     /// or `None` if the underlying wire closed. Non-setup frames are
     /// logged at `warn` and skipped (same semantics as
     /// [`SetupBootstrap::recv`]).
-    fn recv(
-        &mut self,
-    ) -> impl std::future::Future<Output = Option<SetupBootstrapMessage>>;
+    fn recv(&mut self) -> impl std::future::Future<Output = Option<SetupBootstrapMessage>>;
 }

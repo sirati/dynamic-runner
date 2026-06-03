@@ -43,11 +43,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn apply(&mut self, m: ClusterMutation<I>) -> ApplyOutcome {
         let mut _resumed_scratch: Vec<TaskInfo<I>> = Vec::new();
         let mut _newly_pending_scratch: Vec<TaskInfo<I>> = Vec::new();
-        self.apply_with_resumed_blocked(
-            m,
-            &mut _resumed_scratch,
-            &mut _newly_pending_scratch,
-        )
+        self.apply_with_resumed_blocked(m, &mut _resumed_scratch, &mut _newly_pending_scratch)
     }
 
     /// Apply a single `ClusterMutation<I>` and, in addition to the
@@ -82,9 +78,7 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.tasks.entry(hash)
-                {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
                     e.insert(TaskState::Pending { task });
                     ApplyOutcome::Applied
                 } else {
@@ -264,18 +258,14 @@ impl<I: Identifier> ClusterState<I> {
                         emit_payload =
                             Some((task.task_id.clone(), kind.wire_value(), error.clone()));
                         *state = match kind {
-                            ErrorType::Unfulfillable { reason } => {
-                                TaskState::Unfulfillable {
-                                    task,
-                                    reason: reason.to_string(),
-                                }
-                            }
-                            ErrorType::InvalidTask { reason } => {
-                                TaskState::InvalidTask {
-                                    task,
-                                    reason: reason.to_string(),
-                                }
-                            }
+                            ErrorType::Unfulfillable { reason } => TaskState::Unfulfillable {
+                                task,
+                                reason: reason.to_string(),
+                            },
+                            ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
+                                task,
+                                reason: reason.to_string(),
+                            },
                             other => TaskState::Failed {
                                 task,
                                 kind: other,
@@ -427,7 +417,9 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Unfulfillable { .. }
                     | TaskState::InvalidTask { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
-                    TaskState::Blocked { on: existing_on, .. } => {
+                    TaskState::Blocked {
+                        on: existing_on, ..
+                    } => {
                         if existing_on == &on {
                             ApplyOutcome::NoOp
                         } else {
@@ -464,9 +456,7 @@ impl<I: Identifier> ClusterState<I> {
                 peer_id,
                 is_observer,
             } => self.apply_peer_joined(peer_id, is_observer),
-            ClusterMutation::PeerRemoved { id, cause } => {
-                self.apply_peer_removed(id, cause)
-            }
+            ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,
                 holdings,

@@ -1,20 +1,15 @@
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier};
-use dynrunner_protocol_primary_secondary::{
-    PeerTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::compute_task_hash;
 
-
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Run-completion exit decision for one operational-loop iteration.
     ///
     /// Returns `true` iff the loop should break this iteration on a
@@ -116,8 +111,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     pub(crate) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
 
-        let mut heartbeat_tick =
-            tokio::time::interval(self.config.keepalive_interval);
+        let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
         // Skip the immediate first tick — secondaries might not have sent
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
@@ -817,10 +811,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// loop knew how to handle is handled identically here — no parallel
     /// switch-statement, no special-cased subset. The drain is a
     /// post-loop continuation, not a different code path.
-    pub(crate) async fn drain_pending_messages(
-        &mut self,
-        budget: Duration,
-    ) -> Result<(), String> {
+    pub(crate) async fn drain_pending_messages(&mut self, budget: Duration) -> Result<(), String> {
         let deadline = Instant::now() + budget;
         let quiet_window = Duration::from_millis(50);
         let mut drained = 0usize;
@@ -870,5 +861,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
         Ok(())
     }
-
 }

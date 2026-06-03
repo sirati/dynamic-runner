@@ -12,8 +12,8 @@ use dynrunner_core::Identifier;
 
 use crate::relay::router::dispatcher::Router;
 use crate::relay::router::state::{
-    PeerRouteState, RouteVia, MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED, REDIAL_COOLDOWN,
-    RELAY_LOG_TARGET,
+    MSG_DIRECT_RESTORED, MSG_RELAY_ENGAGED, PeerRouteState, REDIAL_COOLDOWN, RELAY_LOG_TARGET,
+    RouteVia,
 };
 
 impl<I: Identifier> Router<I> {
@@ -37,8 +37,7 @@ impl<I: Identifier> Router<I> {
             }
         }
         // Keep last_observed_relay_at — Direct doesn't touch it.
-        let last_observed_relay_at =
-            prev.and_then(|s| s.last_observed_relay_at);
+        let last_observed_relay_at = prev.and_then(|s| s.last_observed_relay_at);
         self.route_state.insert(
             target.to_string(),
             PeerRouteState {
@@ -93,11 +92,7 @@ impl<I: Identifier> Router<I> {
             None => true,
             Some(t) => now.duration_since(t) >= REDIAL_COOLDOWN,
         };
-        let redial_target = if trip {
-            Some(target.to_string())
-        } else {
-            None
-        };
+        let redial_target = if trip { Some(target.to_string()) } else { None };
         self.route_state.insert(
             target.to_string(),
             PeerRouteState {
@@ -123,11 +118,7 @@ impl<I: Identifier> Router<I> {
             None => true,
             Some(t) => now.duration_since(t) >= REDIAL_COOLDOWN,
         };
-        let redial_target = if trip {
-            Some(peer.to_string())
-        } else {
-            None
-        };
+        let redial_target = if trip { Some(peer.to_string()) } else { None };
         let via = prev
             .as_ref()
             .map(|s| s.via.clone())

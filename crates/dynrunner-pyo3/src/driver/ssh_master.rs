@@ -24,10 +24,7 @@ use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyType};
 
-use dynrunner_driver::{
-    SshConfig, SshMaster, SshMasterError, SshTarget,
-    cluster, identity,
-};
+use dynrunner_driver::{SshConfig, SshMaster, SshMasterError, SshTarget, cluster, identity};
 
 /// Map [`SshMasterError`] to a Python exception. We surface every
 /// adopt/spawn failure as `OSError` (preserving the underlying I/O
@@ -192,10 +189,7 @@ impl PySshMaster {
     #[getter]
     fn is_invalidated(&self) -> bool {
         let guard = self.inner.lock().expect("ssh master mutex poisoned");
-        guard
-            .as_ref()
-            .map(|m| m.is_invalidated())
-            .unwrap_or(true)
+        guard.as_ref().map(|m| m.is_invalidated()).unwrap_or(true)
     }
 
     /// True if constructed via `spawn()` (vs `adopt()`).

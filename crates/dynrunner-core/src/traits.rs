@@ -30,10 +30,7 @@
 /// observes the writer task has drained the queue up to and including
 /// any messages enqueued before the `flush` call.
 pub trait MessageSender<M> {
-    fn send(
-        &mut self,
-        msg: M,
-    ) -> impl std::future::Future<Output = Result<(), String>>;
+    fn send(&mut self, msg: M) -> impl std::future::Future<Output = Result<(), String>>;
 
     /// Block until every previously-enqueued send has reached the
     /// underlying wire (or wire-equivalent for in-process transports).

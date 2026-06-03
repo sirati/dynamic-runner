@@ -3,84 +3,90 @@
 
 use super::*;
 
-
-
 /// End-to-end: 1 real primary + 1 real secondary (2 workers), 5 tasks.
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_and_secondary_single_node() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let secondary_id = "sec-0".to_string();
-        let max_res = dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+    local
+        .run_until(async {
+            let secondary_id = "sec-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
 
-        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-            spawn_real_secondary(secondary_id.clone(), 2, max_res);
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+                spawn_real_secondary(secondary_id.clone(), 2, max_res);
 
-        // Build primary transport wired to the real secondary
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+            // Build primary transport wired to the real secondary
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
 
-        // Forward secondary→primary messages into the primary's incoming channel
-        tokio::task::spawn_local(async move {
-            let mut rx = sec_to_pri_rx;
-            while let Some(msg) = rx.recv().await {
-                if incoming_tx.send(msg).is_err() {
-                    break;
+            // Forward secondary→primary messages into the primary's incoming channel
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+            });
 
-        let transport =
-            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-                    keepalive_interval: Duration::from_secs(5),
-                    keepalive_miss_threshold: 3,
-                    source_pre_staged_root: None,
-                    uses_file_based_items: true,
-                    required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let binaries: Vec<TaskInfo<TestId>> = (0..5)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
+            let binaries: Vec<TaskInfo<TestId>> = (0..5)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
 
-        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
+            {
+                let (deps, ops, ope) = noop_phase_args();
+                primary.run(binaries, deps, ops, ope).await.unwrap()
+            };
 
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
 
-        // Drop primary to close transport channels, allowing secondaries to exit
-        drop(primary);
+            // Drop primary to close transport channels, allowing secondaries to exit
+            drop(primary);
 
-        let sec_completed = sec_handle.await.unwrap();
+            let sec_completed = sec_handle.await.unwrap();
 
-        assert_eq!(completed, 5);
-        assert_eq!(failed, 0);
-        assert_eq!(sec_completed, 5);
-    }).await;
+            assert_eq!(completed, 5);
+            assert_eq!(failed, 0);
+            assert_eq!(sec_completed, 5);
+        })
+        .await;
 }
 
 /// End-to-end: 1 real primary + 2 real secondaries (2 workers each), 10 tasks.
@@ -88,109 +94,117 @@ async fn e2e_primary_and_secondary_single_node() {
 async fn e2e_primary_and_two_secondaries() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let max_res = dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024u64)]);
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        let mut sec_handles = Vec::new();
+    local
+        .run_until(async {
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                2 * 1024 * 1024 * 1024u64,
+            )]);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            let mut sec_handles = Vec::new();
 
-        for i in 0..2u32 {
-            let secondary_id = format!("sec-{i}");
-            let (pri_to_sec_tx, sec_to_pri_rx, handle) =
-                spawn_real_secondary(secondary_id.clone(), 2, max_res.clone());
+            for i in 0..2u32 {
+                let secondary_id = format!("sec-{i}");
+                let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+                    spawn_real_secondary(secondary_id.clone(), 2, max_res.clone());
 
-            outgoing.insert(secondary_id, pri_to_sec_tx);
-            sec_handles.push(handle);
+                outgoing.insert(secondary_id, pri_to_sec_tx);
+                sec_handles.push(handle);
 
-            // Forward secondary→primary
-            let tx = incoming_tx.clone();
-            tokio::task::spawn_local(async move {
-                let mut rx = sec_to_pri_rx;
-                while let Some(msg) = rx.recv().await {
-                    if tx.send(msg).is_err() {
-                        break;
+                // Forward secondary→primary
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = sec_to_pri_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
                     }
-                }
-            });
-        }
-        drop(incoming_tx); // Only forwarding tasks hold senders now
+                });
+            }
+            drop(incoming_tx); // Only forwarding tasks hold senders now
 
-        let transport =
-            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 2,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-                    keepalive_interval: Duration::from_secs(5),
-                    keepalive_miss_threshold: 3,
-                    source_pre_staged_root: None,
-                    uses_file_based_items: true,
-                    required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-
-        let binaries: Vec<TaskInfo<TestId>> = (0..10)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
-
-        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
-
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
-
-        // Drop primary to close transport channels, allowing secondaries to exit
-        drop(primary);
-
-        let mut per_sec_completed = Vec::new();
-        for handle in sec_handles {
-            per_sec_completed.push(handle.await.unwrap());
-        }
-
-        assert_eq!(completed, 10);
-        assert_eq!(failed, 0);
-        // `spawn_real_secondary`'s handle returns each secondary's
-        // OWN-worker run count (`local_tasks_run_for_test`). In the
-        // unified model a secondary is a worker host, not an authority
-        // mirror — it does NOT keep a cluster-wide `completed_tasks`
-        // set (that was the demolished demoted-primary mirror). Every
-        // task runs on exactly one secondary's worker, so the per-
-        // secondary own-work counts partition the 10 tasks: their SUM
-        // is the total and each secondary ran at least one (the fleet
-        // genuinely shared the load, not all on one node). The
-        // cluster-wide convergence invariant (every node's replicated
-        // CRDT observes all 10 terminals) is asserted at the CRDT layer
-        // in `cluster_state_converges_on_primary_and_secondary`.
-        let total_own: usize = per_sec_completed.iter().sum();
-        assert_eq!(
-            total_own, 10,
-            "every task must run on exactly one secondary's worker; the \
-             own-work counts {per_sec_completed:?} must partition all 10 tasks"
-        );
-        for (i, count) in per_sec_completed.iter().enumerate() {
-            assert!(
-                *count >= 1,
-                "secondary {i} should have run at least one task (load shared \
-                 across the fleet), got {count}"
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
             );
-        }
-    }).await;
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..10)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            {
+                let (deps, ops, ope) = noop_phase_args();
+                primary.run(binaries, deps, ops, ope).await.unwrap()
+            };
+
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+
+            // Drop primary to close transport channels, allowing secondaries to exit
+            drop(primary);
+
+            let mut per_sec_completed = Vec::new();
+            for handle in sec_handles {
+                per_sec_completed.push(handle.await.unwrap());
+            }
+
+            assert_eq!(completed, 10);
+            assert_eq!(failed, 0);
+            // `spawn_real_secondary`'s handle returns each secondary's
+            // OWN-worker run count (`local_tasks_run_for_test`). In the
+            // unified model a secondary is a worker host, not an authority
+            // mirror — it does NOT keep a cluster-wide `completed_tasks`
+            // set (that was the demolished demoted-primary mirror). Every
+            // task runs on exactly one secondary's worker, so the per-
+            // secondary own-work counts partition the 10 tasks: their SUM
+            // is the total and each secondary ran at least one (the fleet
+            // genuinely shared the load, not all on one node). The
+            // cluster-wide convergence invariant (every node's replicated
+            // CRDT observes all 10 terminals) is asserted at the CRDT layer
+            // in `cluster_state_converges_on_primary_and_secondary`.
+            let total_own: usize = per_sec_completed.iter().sum();
+            assert_eq!(
+                total_own, 10,
+                "every task must run on exactly one secondary's worker; the \
+             own-work counts {per_sec_completed:?} must partition all 10 tasks"
+            );
+            for (i, count) in per_sec_completed.iter().enumerate() {
+                assert!(
+                    *count >= 1,
+                    "secondary {i} should have run at least one task (load shared \
+                 across the fleet), got {count}"
+                );
+            }
+        })
+        .await;
 }
 
 /// Pin that `notify_stage_file` actually emits a `StageFile` wire
@@ -201,74 +215,75 @@ async fn e2e_primary_and_two_secondaries() {
 #[tokio::test(flavor = "current_thread")]
 async fn notify_stage_file_emits_wire_message() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, mut secondary_ends) = setup_test(1);
+    local
+        .run_until(async {
+            let (transport, mut secondary_ends) = setup_test(1);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-                    uses_file_based_items: true,
-                    required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-            PrimaryCoordinator::new(
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 config,
                 transport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
-        // Send directly via inherent method (skips the queue + run loop).
-        primary
-            .notify_stage_file(
-                "sec-0",
-                "deadbeefcafebabe".to_string(),
-                "deadbeef".repeat(8),
-                "rel/binary".to_string(),
-                "scratch/binary".to_string(),
-            )
-            .await
-            .expect("notify_stage_file should succeed");
+            // Send directly via inherent method (skips the queue + run loop).
+            primary
+                .notify_stage_file(
+                    "sec-0",
+                    "deadbeefcafebabe".to_string(),
+                    "deadbeef".repeat(8),
+                    "rel/binary".to_string(),
+                    "scratch/binary".to_string(),
+                )
+                .await
+                .expect("notify_stage_file should succeed");
 
-        // Pull the message out of the targeted secondary's channel.
-        let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
-        assert_eq!(id, "sec-0");
-        let msg = to_sec_rx
-            .recv()
-            .await
-            .expect("StageFile should be delivered to sec-0");
-        match msg {
-            DistributedMessage::StageFile {
-                secondary_id,
-                file_hash,
-                src_path,
-                dest_path,
-                ..
-            } => {
-                assert_eq!(secondary_id, "sec-0");
-                assert_eq!(file_hash, "deadbeefcafebabe");
-                assert_eq!(src_path, "rel/binary");
-                assert_eq!(dest_path, "scratch/binary");
+            // Pull the message out of the targeted secondary's channel.
+            let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+            assert_eq!(id, "sec-0");
+            let msg = to_sec_rx
+                .recv()
+                .await
+                .expect("StageFile should be delivered to sec-0");
+            match msg {
+                DistributedMessage::StageFile {
+                    secondary_id,
+                    file_hash,
+                    src_path,
+                    dest_path,
+                    ..
+                } => {
+                    assert_eq!(secondary_id, "sec-0");
+                    assert_eq!(file_hash, "deadbeefcafebabe");
+                    assert_eq!(src_path, "rel/binary");
+                    assert_eq!(dest_path, "scratch/binary");
+                }
+                other => panic!("expected StageFile, got {:?}", other.msg_type()),
             }
-            other => panic!("expected StageFile, got {:?}", other.msg_type()),
-        }
-    }).await;
+        })
+        .await;
 }
 
 /// Phase S — replicated cluster ledger convergence: after a real
@@ -325,11 +340,8 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     output_dir: None,
                     memuse_log_path: None,
                 };
-                let unified = UnifiedSecondaryTransport::new(
-                    config.secondary_id.clone(),
-                    uplink,
-                    NoPeers,
-                );
+                let unified =
+                    UnifiedSecondaryTransport::new(config.secondary_id.clone(), uplink, NoPeers);
                 let mut secondary = SecondaryCoordinator::new(
                     config,
                     unified,
@@ -491,13 +503,12 @@ async fn e2e_pre_staged_source_mode() {
                 1024 * 1024 * 1024u64,
             )]);
 
-            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-                spawn_real_secondary_with_src_network(
-                    secondary_id.clone(),
-                    2,
-                    max_res,
-                    Some(container_path.clone()),
-                );
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) = spawn_real_secondary_with_src_network(
+                secondary_id.clone(),
+                2,
+                max_res,
+                Some(container_path.clone()),
+            );
 
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
             let mut outgoing = HashMap::new();
@@ -524,16 +535,16 @@ async fn e2e_pre_staged_source_mode() {
                 source_pre_staged_root: Some(gateway_path.clone()),
                 uses_file_based_items: true,
                 required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -553,9 +564,15 @@ async fn e2e_pre_staged_source_mode() {
 
             let sec_completed = sec_handle.await.unwrap();
 
-            assert_eq!(completed, 5, "primary should see 5 completed in pre-staged mode");
+            assert_eq!(
+                completed, 5,
+                "primary should see 5 completed in pre-staged mode"
+            );
             assert_eq!(failed, 0, "no failures expected");
-            assert_eq!(sec_completed, 5, "secondary should resolve all 5 via src_network");
+            assert_eq!(
+                sec_completed, 5,
+                "secondary should resolve all 5 via src_network"
+            );
         })
         .await;
 }
@@ -614,11 +631,11 @@ async fn e2e_uses_file_based_items_false() {
                 oom_retry_max_passes: 1,
                 fleet_dead_timeout: std::time::Duration::from_secs(30),
                 mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -717,11 +734,11 @@ async fn e2e_per_type_max_concurrent() {
                 oom_retry_max_passes: 1,
                 fleet_dead_timeout: std::time::Duration::from_secs(30),
                 mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -776,109 +793,112 @@ async fn e2e_per_type_max_concurrent() {
 async fn run_without_stage_file_queue_fails_all_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let secondary_id = "secondary-0".to_string();
-        let max_res = dynrunner_core::ResourceMap::from(
-            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
-        );
+    local
+        .run_until(async {
+            let secondary_id = "secondary-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
 
-        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-            spawn_real_secondary(secondary_id.clone(), 1, max_res);
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+                spawn_real_secondary(secondary_id.clone(), 1, max_res);
 
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
-        tokio::task::spawn_local(async move {
-            let mut rx = sec_to_pri_rx;
-            while let Some(msg) = rx.recv().await {
-                if incoming_tx.send(msg).is_err() {
-                    break;
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                // `retry_max_passes = 0` so a Recoverable failure becomes
+                // permanent on the first pass — the regression we're
+                // pinning produces NonRecoverable failures (the unresolvable
+                // task guard sends `ErrorType::NonRecoverable`), so the
+                // budget is moot, but keeping it at 0 avoids any chance of
+                // a retry pass masking the assertion.
+                retry_max_passes: 0,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
+
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Relative path → wire `local_path` is relative → secondary's
+            // `report_unresolvable_task` sees `src_network=None` AND
+            // `local_path_is_relative=true` → fires the StageFile-error
+            // failure path under test.
+            let binaries = vec![make_relative_binary("missing/binary", 50)];
+
+            let (deps, ops, ope) = noop_phase_args();
+            primary.run(binaries, deps, ops, ope).await.unwrap();
+
+            // Failure mode reached: 0 completed, 1 permanent failure.
+            assert_eq!(
+                primary.completed_count(),
+                0,
+                "no task should complete when staging is omitted"
+            );
+            assert_eq!(
+                primary.failed_count(),
+                1,
+                "the single task must land in failed_tasks"
+            );
+
+            // Pin the canonical error substring so a future refactor that
+            // changes the wording surfaces here (a deliberate breakage,
+            // not a silent drift). Consumers (asm-tokenizer's e2e check)
+            // grep for this string.
+            let cs = primary.cluster_state_for_test();
+            let mut saw_expected = false;
+            for (_hash, state) in cs.tasks_iter() {
+                if let crate::cluster_state::TaskState::Failed { last_error, .. } = state {
+                    assert!(
+                        last_error.contains("expected StageFile notification first"),
+                        "failed task's last_error must carry the canonical \
+                     regression substring; got: {last_error}"
+                    );
+                    saw_expected = true;
                 }
             }
-        });
-        let transport =
-            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+            assert!(
+                saw_expected,
+                "cluster_state must record at least one Failed task"
+            );
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-            keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            // `retry_max_passes = 0` so a Recoverable failure becomes
-            // permanent on the first pass — the regression we're
-            // pinning produces NonRecoverable failures (the unresolvable
-            // task guard sends `ErrorType::NonRecoverable`), so the
-            // budget is moot, but keeping it at 0 avoids any chance of
-            // a retry pass masking the assertion.
-            retry_max_passes: 0,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
-
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-
-        // Relative path → wire `local_path` is relative → secondary's
-        // `report_unresolvable_task` sees `src_network=None` AND
-        // `local_path_is_relative=true` → fires the StageFile-error
-        // failure path under test.
-        let binaries = vec![make_relative_binary("missing/binary", 50)];
-
-        let (deps, ops, ope) = noop_phase_args();
-        primary.run(binaries, deps, ops, ope).await.unwrap();
-
-        // Failure mode reached: 0 completed, 1 permanent failure.
-        assert_eq!(
-            primary.completed_count(),
-            0,
-            "no task should complete when staging is omitted"
-        );
-        assert_eq!(
-            primary.failed_count(),
-            1,
-            "the single task must land in failed_tasks"
-        );
-
-        // Pin the canonical error substring so a future refactor that
-        // changes the wording surfaces here (a deliberate breakage,
-        // not a silent drift). Consumers (asm-tokenizer's e2e check)
-        // grep for this string.
-        let cs = primary.cluster_state_for_test();
-        let mut saw_expected = false;
-        for (_hash, state) in cs.tasks_iter() {
-            if let crate::cluster_state::TaskState::Failed { last_error, .. } = state {
-                assert!(
-                    last_error.contains("expected StageFile notification first"),
-                    "failed task's last_error must carry the canonical \
-                     regression substring; got: {last_error}"
-                );
-                saw_expected = true;
-            }
-        }
-        assert!(
-            saw_expected,
-            "cluster_state must record at least one Failed task"
-        );
-
-        drop(primary);
-        let _ = sec_handle.await;
-    }).await;
+            drop(primary);
+            let _ = sec_handle.await;
+        })
+        .await;
 }
 
 /// T2 — fix validation. Same setup as T1, but `queue_initial_staging_from_binaries`
@@ -892,123 +912,121 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
 async fn run_with_initial_staging_succeeds() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // Materialise a real source tree so `compute_file_hash` can
-        // succeed: the staging walk reads the file from disk to hash
-        // the contents. Single binary keeps the test fast and the
-        // assertion surface tight.
-        let source_root = std::env::temp_dir().join(format!(
-            "stage_init_t2_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let bin_rel = std::path::PathBuf::from("missing/binary");
-        let on_disk = source_root.join(&bin_rel);
-        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
-        std::fs::write(&on_disk, b"t2-staging-payload").unwrap();
+    local
+        .run_until(async {
+            // Materialise a real source tree so `compute_file_hash` can
+            // succeed: the staging walk reads the file from disk to hash
+            // the contents. Single binary keeps the test fast and the
+            // assertion surface tight.
+            let source_root = std::env::temp_dir().join(format!(
+                "stage_init_t2_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let bin_rel = std::path::PathBuf::from("missing/binary");
+            let on_disk = source_root.join(&bin_rel);
+            std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+            std::fs::write(&on_disk, b"t2-staging-payload").unwrap();
 
-        let secondary_id = "secondary-0".to_string();
-        let max_res = dynrunner_core::ResourceMap::from(
-            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
-        );
+            let secondary_id = "secondary-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
 
-        // Secondary needs `src_network` pointing at the source tree
-        // so its `stage_file` step can copy the file into the cache —
-        // mirrors the real in-process pipeline, where the secondary
-        // shares filesystem visibility with the primary. Without
-        // `src_network` set the staging copy fails (no source root)
-        // and the task still falls through to the unresolvable
-        // guard, which would mask the fix.
-        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-            spawn_real_secondary_with_src_network(
+            // Secondary needs `src_network` pointing at the source tree
+            // so its `stage_file` step can copy the file into the cache —
+            // mirrors the real in-process pipeline, where the secondary
+            // shares filesystem visibility with the primary. Without
+            // `src_network` set the staging copy fails (no source root)
+            // and the task still falls through to the unresolvable
+            // guard, which would mask the fix.
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) = spawn_real_secondary_with_src_network(
                 secondary_id.clone(),
                 1,
                 max_res,
                 Some(source_root.clone()),
             );
 
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
-        tokio::task::spawn_local(async move {
-            let mut rx = sec_to_pri_rx;
-            while let Some(msg) = rx.recv().await {
-                if incoming_tx.send(msg).is_err() {
-                    break;
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-        let transport =
-            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+            });
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-            keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 0,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_millis(50),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 0,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        let binaries = vec![make_relative_binary(
-            bin_rel.to_str().unwrap(),
-            18, // matches payload length above; size is informational
-        )];
+            let binaries = vec![make_relative_binary(
+                bin_rel.to_str().unwrap(),
+                18, // matches payload length above; size is informational
+            )];
 
-        // The fix under test: lift-to-Rust staging walk. The single
-        // secondary's id matches `spawn_real_secondary_with_src_network`'s
-        // welcome message, so its `pending_stage_files` entry routes
-        // correctly through `staged_per_secondary`.
-        let secondary_ids = vec![secondary_id.clone()];
-        primary
-            .queue_initial_staging_from_binaries(
-                &binaries,
-                &secondary_ids,
-                &source_root,
-            )
-            .expect("staging walk should succeed for a present, readable file");
+            // The fix under test: lift-to-Rust staging walk. The single
+            // secondary's id matches `spawn_real_secondary_with_src_network`'s
+            // welcome message, so its `pending_stage_files` entry routes
+            // correctly through `staged_per_secondary`.
+            let secondary_ids = vec![secondary_id.clone()];
+            primary
+                .queue_initial_staging_from_binaries(&binaries, &secondary_ids, &source_root)
+                .expect("staging walk should succeed for a present, readable file");
 
-        let (deps, ops, ope) = noop_phase_args();
-        primary.run(binaries, deps, ops, ope).await.unwrap();
+            let (deps, ops, ope) = noop_phase_args();
+            primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        assert_eq!(
-            primary.completed_count(),
-            1,
-            "task should complete when staging is queued"
-        );
-        assert_eq!(
-            primary.failed_count(),
-            0,
-            "no task should fail when staging is queued"
-        );
+            assert_eq!(
+                primary.completed_count(),
+                1,
+                "task should complete when staging is queued"
+            );
+            assert_eq!(
+                primary.failed_count(),
+                0,
+                "no task should fail when staging is queued"
+            );
 
-        drop(primary);
-        let _ = sec_handle.await;
+            drop(primary);
+            let _ = sec_handle.await;
 
-        // Best-effort cleanup; `tempdir`-style teardown.
-        let _ = std::fs::remove_dir_all(&source_root);
-    }).await;
+            // Best-effort cleanup; `tempdir`-style teardown.
+            let _ = std::fs::remove_dir_all(&source_root);
+        })
+        .await;
 }

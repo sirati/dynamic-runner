@@ -25,9 +25,9 @@
 
 mod assignment;
 mod command_channel;
+mod config;
 mod connect;
 mod coordinator;
-mod config;
 mod error;
 mod fulfillability_matcher;
 mod heartbeat;
@@ -50,7 +50,7 @@ mod test_helpers;
 mod tests;
 
 pub use command_channel::{
-    validate_spawn_tasks, PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
 pub use config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 pub use coordinator::PrimaryCoordinator;

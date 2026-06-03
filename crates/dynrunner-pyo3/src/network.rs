@@ -168,7 +168,9 @@ mod tests {
             let prev = std::env::var(key).ok();
             // SAFETY: tests holding ENV_LOCK serialize all access to
             // these vars; no other thread observes the mutation mid-flight.
-            unsafe { std::env::set_var(key, value); }
+            unsafe {
+                std::env::set_var(key, value);
+            }
             Self { key, prev }
         }
     }

@@ -6,10 +6,8 @@
 use std::sync::Arc;
 
 use super::types::{
-    push_event, RespawnDecision, RespawnEvent, RespawnOutcome, RespawnRequest,
-    SecondarySpawnSpec,
+    RespawnDecision, RespawnEvent, RespawnOutcome, RespawnRequest, SecondarySpawnSpec, push_event,
 };
-
 
 // ── Operational-loop entry points ─────────────────────────────────
 //
@@ -42,10 +40,8 @@ where
     /// budget-rejection record on the ring so downstream forensics
     /// can see why a death didn't lead to a respawn.
     pub(crate) fn dispatch_respawn_request(&mut self, request: RespawnRequest) {
-        let (spawner, budget) = match (
-            self.respawn_spawner.as_ref(),
-            self.respawn_budget.as_ref(),
-        ) {
+        let (spawner, budget) = match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref())
+        {
             (Some(s), Some(b)) => (Arc::clone(s), b.clone()),
             // Defensive: the listener is only registered when
             // `enable_respawn` was called, which always installs
@@ -62,11 +58,7 @@ where
         };
 
         let now = std::time::SystemTime::now();
-        let decision = budget.should_respawn(
-            &request.original_id,
-            &self.respawn_events,
-            now,
-        );
+        let decision = budget.should_respawn(&request.original_id, &self.respawn_events, now);
         match decision {
             RespawnDecision::Accept => {}
             RespawnDecision::RejectFamilyBudget

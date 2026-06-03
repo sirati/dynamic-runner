@@ -33,10 +33,7 @@ use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 /// be boxed), not for size containment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
+#[serde(bound(serialize = "I: Serialize", deserialize = "I: for<'a> Deserialize<'a>",))]
 #[allow(clippy::large_enum_variant)]
 pub enum DistributedMessage<I> {
     SecondaryWelcome {
@@ -459,4 +456,3 @@ pub enum DistributedMessage<I> {
         holder_id: String,
     },
 }
-

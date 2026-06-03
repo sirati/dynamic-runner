@@ -48,7 +48,12 @@ pub(crate) fn run_secondary<'py>(
     // Legacy positional `ram_bytes` retained for back-compat; the typed
     // path passes the full multi-resource map via the `max_resources`
     // kwarg, which the legacy class prefers when present.
-    let ram_bytes = config.max_resources.inner.get("memory").copied().unwrap_or(0);
+    let ram_bytes = config
+        .max_resources
+        .inner
+        .get("memory")
+        .copied()
+        .unwrap_or(0);
     let kwargs = PyDict::new(py);
     kwargs.set_item("skip_existing", skip_existing)?;
     if let Some(lp) = log_paths {

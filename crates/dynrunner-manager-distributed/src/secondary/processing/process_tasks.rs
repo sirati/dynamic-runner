@@ -15,10 +15,10 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, WorkerId};
-use dynrunner_manager_local::oom::{
-    OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL,
-};
 use dynrunner_manager_local::WorkerFactory;
+use dynrunner_manager_local::oom::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
+};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{Address, PeerTransport, Scope};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -33,8 +33,7 @@ use super::super::{RunOutcome, SecondaryCoordinator};
 /// between reporter reads while the per-tick `O(ledger)` projection cost
 /// stays negligible. Deliberately NOT per-`ClusterMutation` (which would
 /// make the projection `O(ledger × mutations)`).
-const CLUSTER_STATE_REFRESH_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(30);
+const CLUSTER_STATE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -124,8 +123,7 @@ where
         // shutdown paths (clean exit and panik) give workers the
         // same amount of time to flush.
         let mut panik_signal_rx = self.panik_signal_rx.take();
-        const PANIK_KILL_GRACE: std::time::Duration =
-            std::time::Duration::from_secs(5);
+        const PANIK_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
         // Externally-armed fatal-exit signal (the observer's invalid_task
         // monitor; see `register_fatal_exit_signal_rx`). Taken out for the
@@ -445,10 +443,7 @@ where
 
             // Flush any deferred peer messages
             for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
-                let _ = self
-                    .transport
-                    .send(Address::Peer(peer_id), msg)
-                    .await;
+                let _ = self.transport.send(Address::Peer(peer_id), msg).await;
             }
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh
@@ -530,12 +525,8 @@ where
             // finishes — they have no way to distinguish "run is
             // genuinely over" from "primary just crashed", so they
             // hold their SLURM job slots indefinitely.
-            if self.cluster_state.run_complete()
-                && self.active_tasks.is_empty()
-            {
-                tracing::info!(
-                    "RunComplete signal received from primary; exiting"
-                );
+            if self.cluster_state.run_complete() && self.active_tasks.is_empty() {
+                tracing::info!("RunComplete signal received from primary; exiting");
                 break;
             }
 
@@ -554,8 +545,7 @@ where
             // respawn happens here, BEFORE `request_task_for_worker`
             // re-engages the fresh subprocess with the primary's
             // pool.
-            let mut restart_set: HashSet<WorkerId> =
-                workers_to_restart.into_iter().collect();
+            let mut restart_set: HashSet<WorkerId> = workers_to_restart.into_iter().collect();
             restart_set.extend(self.pending_worker_restarts.drain());
             for wid in restart_set {
                 // Active SIGKILL before restart so a stuck or

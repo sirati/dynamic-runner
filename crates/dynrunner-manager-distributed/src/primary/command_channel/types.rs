@@ -14,5 +14,5 @@
 //!     `dynrunner_core::spawn_tasks_validator`.
 
 pub use dynrunner_core::{
-    validate_spawn_tasks, PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY,
+    COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };

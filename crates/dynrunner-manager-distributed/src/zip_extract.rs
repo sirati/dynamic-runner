@@ -106,10 +106,7 @@ impl ExtractionCache {
                     return Some(base_in_net);
                 }
                 let full_in_net = net.join(path_str);
-                if full_in_net != base_in_net
-                    && full_in_net.exists()
-                    && verify(&full_in_net)
-                {
+                if full_in_net != base_in_net && full_in_net.exists() && verify(&full_in_net) {
                     self.extracted
                         .insert(lookup_key.to_string(), full_in_net.clone());
                     return Some(full_in_net);
@@ -217,7 +214,8 @@ impl ExtractionCache {
             return None;
         }
 
-        self.extracted.insert(file_hash.to_string(), extracted_path.clone());
+        self.extracted
+            .insert(file_hash.to_string(), extracted_path.clone());
         tracing::debug!(
             zip = zip_name,
             entry = local_path,
@@ -260,11 +258,7 @@ impl ExtractionCache {
     ) -> Option<PathBuf> {
         // File-ready mode: zip_name is empty or None
         if zip_name.is_none_or(|z| z.is_empty()) {
-            return self.get_file_by_hash(
-                file_hash,
-                Some(local_path),
-                expected_content_hash,
-            );
+            return self.get_file_by_hash(file_hash, Some(local_path), expected_content_hash);
         }
 
         // ZIP mode (always content-verified — extraction touches
@@ -290,10 +284,7 @@ pub fn compute_file_hash(path: &Path) -> Option<String> {
 }
 
 /// Compute task hash from binary metadata (matches Python's _compute_task_hash).
-pub fn compute_task_hash_from_parts(
-    path: &str,
-    fields: &[&str],
-) -> String {
+pub fn compute_task_hash_from_parts(path: &str, fields: &[&str]) -> String {
     let hash_input = std::iter::once(path)
         .chain(fields.iter().copied())
         .collect::<Vec<_>>()
@@ -316,14 +307,18 @@ mod tests {
 
         let hash = compute_file_hash(&file_path).unwrap();
         // SHA256 of "hello world"
-        assert_eq!(hash, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9");
+        assert_eq!(
+            hash,
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn task_hash_from_parts() {
-        let hash = compute_task_hash_from_parts("path/to/bin", &["binname", "x64", "gcc", "5", "O0"]);
+        let hash =
+            compute_task_hash_from_parts("path/to/bin", &["binname", "x64", "gcc", "5", "O0"]);
         assert_eq!(hash.len(), 16);
     }
 
@@ -340,11 +335,7 @@ mod tests {
         let mut cache = ExtractionCache::new(tmp, None);
 
         // Should find by direct path (with content verification)
-        let result = cache.get_file_by_hash(
-            &hash,
-            Some(test_file.to_str().unwrap()),
-            Some(&hash),
-        );
+        let result = cache.get_file_by_hash(&hash, Some(test_file.to_str().unwrap()), Some(&hash));
         assert!(result.is_some());
 
         // Should be cached now (no path needed)
@@ -394,8 +385,7 @@ mod tests {
 
     #[test]
     fn resolve_via_src_network_basename() {
-        let dir = std::env::temp_dir()
-            .join(format!("net_basename_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("net_basename_test_{}", std::process::id()));
         let tmp = dir.join("tmp");
         let net = dir.join("src_network");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -412,7 +402,10 @@ mod tests {
         // here; resolution must fall through to src_network/<basename>.
         let primary_view = format!("/nonexistent/dir/{}", basename);
         let result = cache.resolve_binary(None, &primary_view, &hash, Some(&hash));
-        assert!(result.is_some(), "expected resolution via src_network/<basename>");
+        assert!(
+            result.is_some(),
+            "expected resolution via src_network/<basename>"
+        );
         assert_eq!(result.unwrap(), staged);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -420,8 +413,7 @@ mod tests {
 
     #[test]
     fn resolve_via_src_network_local_path() {
-        let dir = std::env::temp_dir()
-            .join(format!("net_localpath_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("net_localpath_test_{}", std::process::id()));
         let tmp = dir.join("tmp");
         let net = dir.join("src_network");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -438,7 +430,10 @@ mod tests {
 
         let mut cache = ExtractionCache::new(tmp, Some(net));
         let result = cache.resolve_binary(None, rel, &hash, Some(&hash));
-        assert!(result.is_some(), "expected resolution via src_network/<full local_path>");
+        assert!(
+            result.is_some(),
+            "expected resolution via src_network/<full local_path>"
+        );
         assert_eq!(result.unwrap(), staged);
 
         let _ = std::fs::remove_dir_all(&dir);

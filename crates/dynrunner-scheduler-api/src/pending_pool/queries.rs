@@ -41,11 +41,7 @@ impl<I: Identifier> PendingPool<I> {
     /// task-level prereqs resolve.
     pub fn len(&self) -> usize {
         let queued: usize = self.buckets.values().map(|b| b.items.len()).sum();
-        let in_flight: usize = self
-            .in_flight_per_phase
-            .values()
-            .map(|c| *c as usize)
-            .sum();
+        let in_flight: usize = self.in_flight_per_phase.values().map(|c| *c as usize).sum();
         let blocked: usize = self.blocked.len();
         queued + in_flight + blocked
     }
@@ -229,9 +225,7 @@ impl<I: Identifier> PendingPool<I> {
     pub fn ready_in_active_phase(&self) -> usize {
         self.buckets
             .iter()
-            .filter(|(key, _)| {
-                matches!(self.phase_state.get(&key.0), Some(PhaseState::Active))
-            })
+            .filter(|(key, _)| matches!(self.phase_state.get(&key.0), Some(PhaseState::Active)))
             .map(|(_, bucket)| bucket.items.len())
             .sum()
     }

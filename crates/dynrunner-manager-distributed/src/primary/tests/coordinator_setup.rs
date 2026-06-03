@@ -3,7 +3,6 @@
 
 use super::*;
 
-
 /// `handle_welcome` originates `ClusterMutation::PeerJoined` for every
 /// secondary it admits, in addition to the existing connection-state
 /// bookkeeping. The mutation rides the canonical
@@ -199,175 +198,177 @@ fn drain_secondary_capacity(
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, mut secondary_ends) = setup_test(1);
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-            PrimaryCoordinator::new(
+    local
+        .run_until(async {
+            let (transport, mut secondary_ends) = setup_test(1);
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 make_test_primary_config(1),
                 transport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
-        let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+            let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
 
-        // A welcome advertising a non-default worker count + a memory
-        // resource, so the assertion pins that the ORIGINATED capacity
-        // carries the welcome's values, not a default.
-        let welcome = DistributedMessage::SecondaryWelcome {
-            sender_id: id.clone(),
-            timestamp: 0.0,
-            secondary_id: id.clone(),
-            resources: vec![dynrunner_core::ResourceAmount {
-                kind: dynrunner_core::ResourceKind::memory(),
-                amount: 8 * 1024 * 1024 * 1024,
-            }],
-            worker_count: 6,
-            hostname: "test".into(),
-            is_observer: false,
-        };
-        primary.handle_welcome(welcome).await;
-
-        // Surface 1: the capacity record is broadcast over the mesh
-        // carrying the welcome's worker_count + resources.
-        let observed = drain_secondary_capacity(&mut to_sec_rx);
-        assert_eq!(
-            observed,
-            vec![(
-                id.clone(),
-                6,
-                vec![dynrunner_core::ResourceAmount {
+            // A welcome advertising a non-default worker count + a memory
+            // resource, so the assertion pins that the ORIGINATED capacity
+            // carries the welcome's values, not a default.
+            let welcome = DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(),
+                timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
                     kind: dynrunner_core::ResourceKind::memory(),
                     amount: 8 * 1024 * 1024 * 1024,
-                }]
-            )],
-            "handle_welcome must originate exactly one SecondaryCapacity \
-             carrying the welcome's worker_count + resources; got {:?}",
-            observed
-        );
+                }],
+                worker_count: 6,
+                hostname: "test".into(),
+                is_observer: false,
+            };
+            primary.handle_welcome(welcome).await;
 
-        // Surface 2: the local apply recorded the capacity into the
-        // replicated ledger — the roster + totals are CRDT-derivable.
-        let cs = primary.cluster_state_for_test();
-        let cap = cs
-            .secondary_capacity(&id)
-            .expect("SecondaryCapacity must be applied locally on the primary");
-        assert_eq!(cap.worker_count, 6);
-        assert_eq!(cs.total_worker_count(), 6);
-        assert_eq!(
-            cs.known_secondaries().collect::<Vec<_>>(),
-            vec![id.as_str()]
-        );
-    }).await;
+            // Surface 1: the capacity record is broadcast over the mesh
+            // carrying the welcome's worker_count + resources.
+            let observed = drain_secondary_capacity(&mut to_sec_rx);
+            assert_eq!(
+                observed,
+                vec![(
+                    id.clone(),
+                    6,
+                    vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: 8 * 1024 * 1024 * 1024,
+                    }]
+                )],
+                "handle_welcome must originate exactly one SecondaryCapacity \
+             carrying the welcome's worker_count + resources; got {:?}",
+                observed
+            );
+
+            // Surface 2: the local apply recorded the capacity into the
+            // replicated ledger — the roster + totals are CRDT-derivable.
+            let cs = primary.cluster_state_for_test();
+            let cap = cs
+                .secondary_capacity(&id)
+                .expect("SecondaryCapacity must be applied locally on the primary");
+            assert_eq!(cap.worker_count, 6);
+            assert_eq!(cs.total_worker_count(), 6);
+            assert_eq!(
+                cs.known_secondaries().collect::<Vec<_>>(),
+                vec![id.as_str()]
+            );
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, mut secondary_ends) = setup_test(1);
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-            PrimaryCoordinator::new(
+    local
+        .run_until(async {
+            let (transport, mut secondary_ends) = setup_test(1);
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 make_test_primary_config(1),
                 transport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
-        let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
-        assert_eq!(id, "sec-0");
-
-        // Drive the handler directly — no run-loop indirection so the
-        // assertion is on the handler itself, not the surrounding setup
-        // pipeline.
-        primary.handle_welcome(welcome_msg(&id, false)).await;
-
-        let observed = drain_peer_joined(&mut to_sec_rx);
-        assert_eq!(
-            observed,
-            vec![(id.clone(), false)],
-            "handle_welcome must originate exactly one PeerJoined \
-             carrying the welcomed secondary's id; got {:?}",
-            observed
-        );
-    }).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
-    let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        // Branch 1: is_observer = true. The widened apply rule must
-        // both broadcast the mutation AND project the welcomed id into
-        // `role_table.observers` locally.
-        {
-            let (transport, mut secondary_ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    make_test_primary_config(1),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
             let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
-            primary.handle_welcome(welcome_msg(&id, true)).await;
+            assert_eq!(id, "sec-0");
 
-            let observed = drain_peer_joined(&mut to_sec_rx);
-            assert_eq!(
-                observed,
-                vec![(id.clone(), true)],
-                "observer welcome must carry is_observer=true on the \
-                 originated PeerJoined; got {:?}",
-                observed
-            );
-            assert!(
-                primary
-                    .cluster_state_for_test()
-                    .role_table()
-                    .observers
-                    .contains(&id),
-                "is_observer=true welcome must project into role_table.observers \
-                 via the local apply path; observers={:?}",
-                primary.cluster_state_for_test().role_table().observers
-            );
-        }
-
-        // Branch 2: is_observer = false. The broadcast still goes out
-        // (the apply rule inserts a non-observer peer_state entry and
-        // returns Applied — the broadcast batch keeps it), but the
-        // observer projection must stay empty.
-        {
-            let (transport, mut secondary_ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
-                PrimaryCoordinator::new(
-                    make_test_primary_config(1),
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
-            let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+            // Drive the handler directly — no run-loop indirection so the
+            // assertion is on the handler itself, not the surrounding setup
+            // pipeline.
             primary.handle_welcome(welcome_msg(&id, false)).await;
 
             let observed = drain_peer_joined(&mut to_sec_rx);
             assert_eq!(
                 observed,
                 vec![(id.clone(), false)],
-                "non-observer welcome must carry is_observer=false on \
-                 the originated PeerJoined; got {:?}",
+                "handle_welcome must originate exactly one PeerJoined \
+             carrying the welcomed secondary's id; got {:?}",
                 observed
             );
-            assert!(
-                !primary
-                    .cluster_state_for_test()
-                    .role_table()
-                    .observers
-                    .contains(&id),
-                "is_observer=false welcome must NOT populate \
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Branch 1: is_observer = true. The widened apply rule must
+            // both broadcast the mutation AND project the welcomed id into
+            // `role_table.observers` locally.
+            {
+                let (transport, mut secondary_ends) = setup_test(1);
+                let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                    make_test_primary_config(1),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+                primary.handle_welcome(welcome_msg(&id, true)).await;
+
+                let observed = drain_peer_joined(&mut to_sec_rx);
+                assert_eq!(
+                    observed,
+                    vec![(id.clone(), true)],
+                    "observer welcome must carry is_observer=true on the \
+                 originated PeerJoined; got {:?}",
+                    observed
+                );
+                assert!(
+                    primary
+                        .cluster_state_for_test()
+                        .role_table()
+                        .observers
+                        .contains(&id),
+                    "is_observer=true welcome must project into role_table.observers \
+                 via the local apply path; observers={:?}",
+                    primary.cluster_state_for_test().role_table().observers
+                );
+            }
+
+            // Branch 2: is_observer = false. The broadcast still goes out
+            // (the apply rule inserts a non-observer peer_state entry and
+            // returns Applied — the broadcast batch keeps it), but the
+            // observer projection must stay empty.
+            {
+                let (transport, mut secondary_ends) = setup_test(1);
+                let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                    make_test_primary_config(1),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+                primary.handle_welcome(welcome_msg(&id, false)).await;
+
+                let observed = drain_peer_joined(&mut to_sec_rx);
+                assert_eq!(
+                    observed,
+                    vec![(id.clone(), false)],
+                    "non-observer welcome must carry is_observer=false on \
+                 the originated PeerJoined; got {:?}",
+                    observed
+                );
+                assert!(
+                    !primary
+                        .cluster_state_for_test()
+                        .role_table()
+                        .observers
+                        .contains(&id),
+                    "is_observer=false welcome must NOT populate \
                  role_table.observers (ratchet-up-only rule); observers={:?}",
-                primary.cluster_state_for_test().role_table().observers
-            );
-        }
-    }).await;
+                    primary.cluster_state_for_test().role_table().observers
+                );
+            }
+        })
+        .await;
 }
 
 /// Pins the peer-lifecycle dispatcher cleanup contract: every `run()`
@@ -385,61 +386,63 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
 #[tokio::test(flavor = "current_thread")]
 async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
     let local = tokio::task::LocalSet::new();
-    local.run_until(async {
-        let (transport, secondary_ends) = setup_test(1);
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
-            required_setup_on_promote: false,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                required_setup_on_promote: false,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+                source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
-        // Pre-run: no dispatcher spawned yet.
-        assert!(
-            !primary.lifecycle_dispatcher_handle_present_for_test(),
-            "dispatcher handle must be None before run() spawns it"
-        );
+            // Pre-run: no dispatcher spawned yet.
+            assert!(
+                !primary.lifecycle_dispatcher_handle_present_for_test(),
+                "dispatcher handle must be None before run() spawns it"
+            );
 
-        let binaries = vec![make_binary("a", 50)];
-        for (id, rx, tx) in secondary_ends {
-            tokio::task::spawn_local(fake_secondary(id, 1, 1024 * 1024 * 1024, rx, tx));
-        }
+            let binaries = vec![make_binary("a", 50)];
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 1, 1024 * 1024 * 1024, rx, tx));
+            }
 
-        let (deps, ops, ope) = noop_phase_args();
-        primary.run(binaries, deps, ops, ope).await.unwrap();
+            let (deps, ops, ope) = noop_phase_args();
+            primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        // Post-run: cleanup_lifecycle_dispatcher must have taken the
-        // handle out of `self`. A surviving `Some` would mean the
-        // dispatcher was not aborted+joined and is leaking against
-        // the still-alive `cluster_state` sender.
-        assert!(
-            !primary.lifecycle_dispatcher_handle_present_for_test(),
-            "lifecycle_dispatcher_handle must be None after run() exits — \
+            // Post-run: cleanup_lifecycle_dispatcher must have taken the
+            // handle out of `self`. A surviving `Some` would mean the
+            // dispatcher was not aborted+joined and is leaking against
+            // the still-alive `cluster_state` sender.
+            assert!(
+                !primary.lifecycle_dispatcher_handle_present_for_test(),
+                "lifecycle_dispatcher_handle must be None after run() exits — \
              cleanup_lifecycle_dispatcher should have taken + aborted + \
              joined the handle"
-        );
-    }).await;
+            );
+        })
+        .await;
 }

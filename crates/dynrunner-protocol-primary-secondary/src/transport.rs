@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver};
 
+use crate::DistributedMessage;
 use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
 use crate::messages::timestamp_now;
-use crate::DistributedMessage;
 
 /// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
 ///
@@ -88,9 +88,7 @@ impl std::error::Error for JoinError {}
 /// `MessageSender`/`MessageReceiver` shape; the trait keeps it as a
 /// protocol-level addition without leaking the transport-level
 /// `connections: HashMap` into call sites.
-pub trait SecondaryTransport<I: Identifier>:
-    MessageReceiver<DistributedMessage<I>>
-{
+pub trait SecondaryTransport<I: Identifier>: MessageReceiver<DistributedMessage<I>> {
     /// Send a message to a specific secondary.
     fn send_to(
         &mut self,
@@ -190,8 +188,9 @@ pub trait PeerTransport<I: Identifier> {
         async move {
             match addr {
                 Address::Peer(id) => self.send_to_peer(&id, msg).await,
-                Address::Broadcast(Scope::Mesh)
-                | Address::Broadcast(Scope::AllSecondaries) => self.broadcast(msg).await,
+                Address::Broadcast(Scope::Mesh) | Address::Broadcast(Scope::AllSecondaries) => {
+                    self.broadcast(msg).await
+                }
                 Address::Role(role) => {
                     // Resolve via the write-through cache (Step 2).
                     // Cache-cold is a hard error here: Step 4 lands

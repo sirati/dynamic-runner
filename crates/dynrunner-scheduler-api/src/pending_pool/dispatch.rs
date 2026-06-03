@@ -99,8 +99,7 @@ impl<I: Identifier> PendingPool<I> {
         let mut emitted: HashSet<BucketKey> = HashSet::new();
         // Per-class chunks of paired (item, locator) entries. The four
         // chunks correspond, in order, to: pin, typed, free-pool, co-pin.
-        let mut chunks: [Vec<Paired<I>>; 4] =
-            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut chunks: [Vec<Paired<I>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
         let collect_bucket = |key: &BucketKey,
                               bucket: &Bucket<I>,
@@ -118,9 +117,8 @@ impl<I: Identifier> PendingPool<I> {
                 Some(PhaseState::Active | PhaseState::Draining)
             )
         };
-        let phase_active = |phase: &PhaseId| {
-            self.phase_state.get(phase) == Some(&PhaseState::Active)
-        };
+        let phase_active =
+            |phase: &PhaseId| self.phase_state.get(phase) == Some(&PhaseState::Active);
 
         // Class 0 (pin): worker's pinned bucket if eligible.
         if let Some(Some(key)) = self.worker_affinity.get(&worker_id)
@@ -209,11 +207,7 @@ impl<I: Identifier> PendingPool<I> {
     /// has shrunk (debug builds only) since the view was constructed —
     /// callers are required to consume the view before any other pool
     /// mutation. See [`view_for_worker`].
-    pub fn take_from_view(
-        &mut self,
-        view: WorkerView<I>,
-        slice_idx: usize,
-    ) -> TaskInfo<I> {
+    pub fn take_from_view(&mut self, view: WorkerView<I>, slice_idx: usize) -> TaskInfo<I> {
         let (bucket_key, item_idx) = view
             .locators
             .get(slice_idx)
@@ -266,10 +260,7 @@ impl<I: Identifier> PendingPool<I> {
             self.worker_affinity.entry(worker_id).or_insert(None);
         }
 
-        let in_flight_count = self
-            .in_flight_per_phase
-            .entry(key.0.clone())
-            .or_insert(0);
+        let in_flight_count = self.in_flight_per_phase.entry(key.0.clone()).or_insert(0);
         *in_flight_count += 1;
         tracing::debug!(
             phase = %key.0,

@@ -23,13 +23,18 @@ fn send_to_peer_direct_when_target_reachable() {
     let entries = log.borrow();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].addressee, "b");
-    assert!(matches!(entries[0].msg, DistributedMessage::Keepalive { .. }));
+    assert!(matches!(
+        entries[0].msg,
+        DistributedMessage::Keepalive { .. }
+    ));
     // Direct path must NOT have set last_observed_relay_at.
-    assert!(router
-        .route_state
-        .get("b")
-        .and_then(|s| s.last_observed_relay_at)
-        .is_none());
+    assert!(
+        router
+            .route_state
+            .get("b")
+            .and_then(|s| s.last_observed_relay_at)
+            .is_none()
+    );
 }
 
 #[test]
@@ -130,9 +135,7 @@ fn relay_redial_signal_suppressed_within_cooldown() {
     let out1 = router
         .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(t0, 1.0))
         .unwrap();
-    assert!(
-        matches!(out1, SendOutcome::Relayed { redial_target: Some(ref id), .. } if id == "d")
-    );
+    assert!(matches!(out1, SendOutcome::Relayed { redial_target: Some(ref id), .. } if id == "d"));
     // Second observation 5s later → gate suppresses.
     let out2 = router
         .send_to_peer(
@@ -143,7 +146,13 @@ fn relay_redial_signal_suppressed_within_cooldown() {
         )
         .unwrap();
     assert!(
-        matches!(out2, SendOutcome::Relayed { redial_target: None, .. }),
+        matches!(
+            out2,
+            SendOutcome::Relayed {
+                redial_target: None,
+                ..
+            }
+        ),
         "second relay within cooldown emits no redial: {out2:?}"
     );
 }
@@ -166,8 +175,5 @@ fn relay_redial_signal_re_fires_after_cooldown() {
             clocks_at(t0 + REDIAL_COOLDOWN + Duration::from_secs(1), 2.0),
         )
         .unwrap();
-    assert!(
-        matches!(out, SendOutcome::Relayed { redial_target: Some(ref id), .. } if id == "d")
-    );
+    assert!(matches!(out, SendOutcome::Relayed { redial_target: Some(ref id), .. } if id == "d"));
 }
-

@@ -62,10 +62,13 @@ impl Gateway for ShutdownBinaryRecordingGateway {
         })
     }
     async fn transfer_file(&self, local: &Path, remote: &str) -> Result<(), GatewayError> {
-        self.events.lock().unwrap().push(GatewayEvent::TransferFile {
-            local: local.to_path_buf(),
-            remote: remote.to_string(),
-        });
+        self.events
+            .lock()
+            .unwrap()
+            .push(GatewayEvent::TransferFile {
+                local: local.to_path_buf(),
+                remote: remote.to_string(),
+            });
         Ok(())
     }
     async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
@@ -162,7 +165,10 @@ async fn upload_shutdown_manager_binary_surfaces_missing_source() {
         .expect_err("missing source must surface as Err");
     match err {
         SlurmError::ShutdownBinaryNotFound(path) => {
-            assert_eq!(path, missing, "error must carry the offending path verbatim");
+            assert_eq!(
+                path, missing,
+                "error must carry the offending path verbatim"
+            );
         }
         other => panic!("expected ShutdownBinaryNotFound, got {other:?}"),
     }
@@ -191,9 +197,7 @@ async fn upload_shutdown_manager_binary_surfaces_missing_source() {
 /// path) trips this assertion.
 #[test]
 fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
-    use crate::wrapper_script::{
-        generate_wrapper_script, ConnectionMode, WrapperScriptConfig,
-    };
+    use crate::wrapper_script::{ConnectionMode, WrapperScriptConfig, generate_wrapper_script};
 
     let remote = "/srv/slurm/dynrunner-slurm-shutdown";
     let config = SlurmConfig {

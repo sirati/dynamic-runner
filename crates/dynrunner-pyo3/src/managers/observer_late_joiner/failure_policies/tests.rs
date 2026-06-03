@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
 use dynrunner_manager_distributed::task_completed::{
-    run_collector, windowed_failure_collector, TaskCompletedEvent,
+    TaskCompletedEvent, run_collector, windowed_failure_collector,
 };
 
 use super::aggregation::ErrorAggregationPolicy;
@@ -45,11 +45,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ImportantCapture {
                     self.0 = value.to_string();
                 }
             }
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     self.0 = format!("{value:?}");
                 }
@@ -134,7 +130,10 @@ async fn policy_b_arms_one_minute_then_signals_fatal_exit() {
     let reason = exit_rx
         .try_recv()
         .expect("fatal-exit signal must fire after the 1-minute window");
-    assert!(reason.contains("invalid task"), "reason names the cause: {reason}");
+    assert!(
+        reason.contains("invalid task"),
+        "reason names the cause: {reason}"
+    );
     assert!(
         reason.contains("2 invalid task"),
         "two distinct invalid-task messages collected: {reason}"
@@ -263,8 +262,16 @@ async fn policy_c_resets_dedup_each_rolling_window() {
 
     {
         let r = records.lock().unwrap();
-        assert_eq!(r.len(), 2, "boom re-reported in the new rolling window: {r:?}");
-        assert!(r[1].contains("boom"), "re-report carries the message: {}", r[1]);
+        assert_eq!(
+            r.len(),
+            2,
+            "boom re-reported in the new rolling window: {r:?}"
+        );
+        assert!(
+            r[1].contains("boom"),
+            "re-report carries the message: {}",
+            r[1]
+        );
     }
 
     drop(cancel.0);

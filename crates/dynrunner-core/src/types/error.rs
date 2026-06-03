@@ -22,7 +22,9 @@ pub enum ErrorType {
     /// move the task back to a pending state instead of terminal-fail.
     /// `reason` is a free-form diagnostic capped at 2 KiB so a buggy or
     /// malicious peer cannot inflate per-message memory cost.
-    Unfulfillable { reason: BoundedString<2048> },
+    Unfulfillable {
+        reason: BoundedString<2048>,
+    },
     /// A task is structurally invalid and can NEVER run — e.g. it names
     /// a dependency that does not exist in the run, or a duplicate
     /// `(phase_id, task_id)` was submitted. Unlike `Unfulfillable`
@@ -32,7 +34,9 @@ pub enum ErrorType {
     /// 2 KiB (same bound + same no-newline framing contract as
     /// `Unfulfillable`, see `wire_value` below) so a buggy or malicious
     /// peer cannot inflate per-message memory cost.
-    InvalidTask { reason: BoundedString<2048> },
+    InvalidTask {
+        reason: BoundedString<2048>,
+    },
 }
 
 impl ErrorType {

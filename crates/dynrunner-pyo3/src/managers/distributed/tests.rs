@@ -74,7 +74,9 @@ task_args = SimpleNamespace()
     PyModule::from_code(
         py,
         std::ffi::CString::new(source).unwrap().as_c_str(),
-        std::ffi::CString::new("stub_task_def.py").unwrap().as_c_str(),
+        std::ffi::CString::new("stub_task_def.py")
+            .unwrap()
+            .as_c_str(),
         std::ffi::CString::new("stub_task_def").unwrap().as_c_str(),
     )
     .expect("compile stub TaskDefinition module")
@@ -130,11 +132,10 @@ fn handle_returns_pyprimaryhandle_before_run() {
         // Downcast to the concrete pyclass — proves the type
         // contract independent of any Python-side getattr name
         // collision.
-        let _handle: pyo3::PyRef<'_, crate::managers::primary_handle::PyPrimaryHandle> =
-            handle_obj
-                .cast::<crate::managers::primary_handle::PyPrimaryHandle>()
-                .expect("handle() must return a PrimaryHandle pyclass")
-                .borrow();
+        let _handle: pyo3::PyRef<'_, crate::managers::primary_handle::PyPrimaryHandle> = handle_obj
+            .cast::<crate::managers::primary_handle::PyPrimaryHandle>()
+            .expect("handle() must return a PrimaryHandle pyclass")
+            .borrow();
     });
 }
 
@@ -171,10 +172,7 @@ fn handle_clones_share_same_command_channel() {
     Python::attach(|py| {
         let mgr = build_manager(py, None).expect("manager constructs");
         let h1 = mgr.bind(py).call_method0("handle").expect("first handle");
-        let h2 = mgr
-            .bind(py)
-            .call_method0("handle")
-            .expect("second handle");
+        let h2 = mgr.bind(py).call_method0("handle").expect("second handle");
         // Both downcasts must succeed (factory returns the same
         // pyclass); after that, the manager's control-plane
         // helper exposes a `same_command_channel` accessor that
@@ -190,11 +188,15 @@ fn handle_clones_share_same_command_channel() {
             .unwrap();
         let mgr_ref = mgr.borrow(py);
         assert!(
-            mgr_ref.control_plane.same_command_channel(&r1.borrow().sender),
+            mgr_ref
+                .control_plane
+                .same_command_channel(&r1.borrow().sender),
             "first handle must share the manager's command channel"
         );
         assert!(
-            mgr_ref.control_plane.same_command_channel(&r2.borrow().sender),
+            mgr_ref
+                .control_plane
+                .same_command_channel(&r2.borrow().sender),
             "second handle must share the manager's command channel"
         );
     });

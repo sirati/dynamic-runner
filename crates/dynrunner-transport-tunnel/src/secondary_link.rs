@@ -73,10 +73,10 @@
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    new_role_cache, read_role_cache, seed_self_role, Address, DistributedMessage,
-    PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction, RoleCache,
-    RoleChangeHookRegistrar, Scope,
+    Address, DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction,
+    RoleCache, RoleChangeHookRegistrar, Scope, apply_role_misaddress_hint,
+    decide_role_addressed_with_cache, install_role_change_hook, new_role_cache, read_role_cache,
+    seed_self_role,
 };
 use tokio::sync::mpsc;
 
@@ -166,8 +166,7 @@ where
     /// `PrimaryCoordinator` reads its frames via its own
     /// `SecondaryTransport::recv` (fed by this queue's receiver), the
     /// `SecondaryCoordinator` reads the rest via `recv_peer`.
-    colocated_primary_inbound_tx:
-        Option<mpsc::UnboundedSender<DistributedMessage<I>>>,
+    colocated_primary_inbound_tx: Option<mpsc::UnboundedSender<DistributedMessage<I>>>,
 }
 
 impl<U, P, I> UnifiedSecondaryTransport<U, P, I>
@@ -235,9 +234,7 @@ where
     /// Returns a clone of the loopback sender; the receiver stays owned
     /// here, so the injected frames surface through the secondary's
     /// normal inbound fan-in. Sends are synchronous (`UnboundedSender`).
-    pub fn loopback_injector(
-        &self,
-    ) -> mpsc::UnboundedSender<DistributedMessage<I>> {
+    pub fn loopback_injector(&self) -> mpsc::UnboundedSender<DistributedMessage<I>> {
         self.loopback_tx.clone()
     }
 
@@ -399,11 +396,7 @@ where
     /// owned here, not the trait-default "wrap in RoleAddressed + ship
     /// to the cached holder via send_to_peer". `Role::Self_` loops
     /// back. Everything else delegates to the per-primitive methods.
-    async fn send(
-        &mut self,
-        addr: Address,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
+    async fn send(&mut self, addr: Address, msg: DistributedMessage<I>) -> Result<(), String> {
         match addr {
             Address::Role(Role::Primary) => self.send_to_primary(msg).await,
             Address::Role(Role::Self_) => self.loopback(msg),

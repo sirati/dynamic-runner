@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use super::super::{EitherPeerTransport, NoPeerTransport, PeerNetwork};
 use super::TestId;
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 
 #[tokio::test(flavor = "current_thread")]
 async fn no_peer_transport_never_receives() {
@@ -34,8 +32,7 @@ async fn either_peer_transport_disabled_acts_like_no_peer() {
     // bare `NoPeerTransport`: zero peers, broadcasts succeed silently,
     // try_recv_peer returns None. This is the contract the secondary
     // relies on when `--disable-peer-overlay` is set.
-    let mut either: EitherPeerTransport<TestId> =
-        EitherPeerTransport::Disabled(NoPeerTransport);
+    let mut either: EitherPeerTransport<TestId> = EitherPeerTransport::Disabled(NoPeerTransport);
 
     either
         .broadcast(DistributedMessage::Keepalive {

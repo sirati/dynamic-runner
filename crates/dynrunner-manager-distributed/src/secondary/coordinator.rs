@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::Identifier;
-use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
+use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -31,12 +31,7 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub fn new(
-        config: SecondaryConfig,
-        transport: Tr,
-        scheduler: S,
-        estimator: E,
-    ) -> Self {
+    pub fn new(config: SecondaryConfig, transport: Tr, scheduler: S, estimator: E) -> Self {
         let tmp_dir = config.src_tmp.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
@@ -55,8 +50,7 @@ where
         let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
         // Task-completion dispatcher channel; same construction-time
         // installation rationale as `lifecycle_tx`.
-        let (task_completed_tx, task_completed_rx) =
-            tokio::sync::mpsc::unbounded_channel();
+        let (task_completed_tx, task_completed_rx) = tokio::sync::mpsc::unbounded_channel();
         // Command channel for the PyO3 `PrimaryHandle` surface.
         // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
         // sized so a noisy caller can't OOM the secondary, but with
@@ -235,10 +229,7 @@ where
     /// the PyO3 layer); the callback is the clean boundary. The tick is
     /// periodic — NOT per-`ClusterMutation` — so the projection cost is
     /// `O(ledger)` per tick rather than `O(ledger × mutations)`.
-    pub fn register_cluster_state_refresh(
-        &mut self,
-        callback: super::ClusterStateRefreshFn<I>,
-    ) {
+    pub fn register_cluster_state_refresh(&mut self, callback: super::ClusterStateRefreshFn<I>) {
         self.on_cluster_state_refresh = Some(callback);
     }
 
@@ -406,15 +397,12 @@ where
         // to the announcer task (which would deadlock against the
         // drain arm if both ran on the same LocalSet).
         const ANNOUNCER_OUTBOX_CAPACITY: usize = 32;
-        let (outbox_tx, outbox_rx) =
-            tokio::sync::mpsc::channel::<crate::observer::announcer::AnnouncerOutboxItem<I>>(
-                ANNOUNCER_OUTBOX_CAPACITY,
-            );
+        let (outbox_tx, outbox_rx) = tokio::sync::mpsc::channel::<
+            crate::observer::announcer::AnnouncerOutboxItem<I>,
+        >(ANNOUNCER_OUTBOX_CAPACITY);
         self.announcer_outbox_rx = Some(outbox_rx);
         self.announcer_outbox_tx = Some(outbox_tx.clone());
-        let sender = crate::observer::announcer::PeerMeshAnnouncerSender::new(
-            peer_id, outbox_tx,
-        );
+        let sender = crate::observer::announcer::PeerMeshAnnouncerSender::new(peer_id, outbox_tx);
         (handle, sender)
     }
 
@@ -446,9 +434,7 @@ where
     /// empty discovery never re-yields. Legacy / failover runs leave
     /// `pre_staged_mode` false, so the predicate is always false there.
     pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
-        self.pre_staged_mode
-            && !self.setup_discovery_done
-            && self.cluster_state.task_count() == 0
+        self.pre_staged_mode && !self.setup_discovery_done && self.cluster_state.task_count() == 0
     }
 
     /// Whether dispatched task items back to real files (default true).
@@ -523,9 +509,7 @@ where
     /// The sender itself is `Clone` and `Send` so the returned handle
     /// is freely passable across threads / async runtimes. Mirrors
     /// `PrimaryCoordinator::command_sender` exactly.
-    pub fn command_sender(
-        &self,
-    ) -> tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>> {
+    pub fn command_sender(&self) -> tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>> {
         self.command_tx.clone()
     }
 
@@ -749,9 +733,7 @@ where
             // directly and calls `std::process::exit(1)`; the legacy
             // wrapper has no such side-effect channel, so the abort
             // surfaces as a normal error return carrying the reason.
-            RunOutcome::Aborted { reason } => {
-                Err(format!("run aborted by primary: {reason}"))
-            }
+            RunOutcome::Aborted { reason } => Err(format!("run aborted by primary: {reason}")),
         }
     }
 
@@ -899,9 +881,7 @@ where
             {
                 self.sampler = Some(
                     dynrunner_manager_local::memprofile::MemProfileSampler::spawn(
-                        dynrunner_manager_local::memprofile::MemProfileConfig::new(
-                            dir.clone(),
-                        ),
+                        dynrunner_manager_local::memprofile::MemProfileConfig::new(dir.clone()),
                     ),
                 );
             }

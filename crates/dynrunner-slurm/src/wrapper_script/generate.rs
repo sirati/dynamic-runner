@@ -21,7 +21,7 @@
 //! addressed by name via `systemctl --user kill` from the wrapper's
 //! signal trap. See [`WrapperScriptConfig::shutdown_manager_bin_path`].
 
-use super::config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
+use super::config::{ConnectionMode, WRAPPER_SRC_NETWORK_CONTAINER_PATH, WrapperScriptConfig};
 use super::quote::{bash_quote, rand_hex8};
 
 /// Generate the bash wrapper script for a SLURM job.
@@ -211,11 +211,12 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // setsid path DOES inherit the wrapper's PATH (no new session
     // PATH reset), but threading the same arg keeps both branches
     // exercising the identical CLI contract.
-    let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
-        match cfg.shutdown_manager_bin_path {
-            Some(path) => {
-                let bin_q = bash_quote(&path.display().to_string());
-                (
+    let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) = match cfg
+        .shutdown_manager_bin_path
+    {
+        Some(path) => {
+            let bin_q = bash_quote(&path.display().to_string());
+            (
                     format!(
                         r##"SHUTDOWN_MODE=""
 SHUTDOWN_SCOPE=""
@@ -310,9 +311,9 @@ fi
                      fi\n"
                         .to_string(),
                 )
-            }
-            None => (String::new(), String::new()),
-        };
+        }
+        None => (String::new(), String::new()),
+    };
 
     let mut script = format!(
         r##"#!/usr/bin/env bash
@@ -591,7 +592,9 @@ echo ""
 
     // Connection-mode-specific port allocation
     match &cfg.connection {
-        ConnectionMode::Reverse { connection_info_dir } => {
+        ConnectionMode::Reverse {
+            connection_info_dir,
+        } => {
             let sid = cfg.secondary_id;
             let is_observer = if cfg.is_observer { "true" } else { "false" };
             script.push_str(&format!(
@@ -774,8 +777,7 @@ echo "  Secondary ID: {secondary_id}"
         .collect();
     let (mode_banner, secondary_url) = match &cfg.connection {
         ConnectionMode::Reverse { .. } => (
-            "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\""
-                .to_string(),
+            "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\"".to_string(),
             "tcp://localhost:$TUNNEL_PORT".to_string(),
         ),
         ConnectionMode::Standard {

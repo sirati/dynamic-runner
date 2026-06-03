@@ -146,5 +146,4 @@ impl<G: Gateway> SlurmJobManager<G> {
         );
         Ok(())
     }
-
 }

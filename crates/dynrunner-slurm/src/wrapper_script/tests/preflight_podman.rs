@@ -22,9 +22,7 @@ fn preflight_walks_orphan_per_job_storage_roots() {
     );
     // The per-orphan operation must pair `--root` + `--runroot` so
     // podman addresses the orphan's metadata, not the current job's.
-    assert!(
-        script.contains("podman --root \"$orphan_storage\" --runroot \"$orphan_runroot\"")
-    );
+    assert!(script.contains("podman --root \"$orphan_storage\" --runroot \"$orphan_runroot\""));
 }
 
 /// Graceful stop with the 10s grace window — user spec ("podman stop"

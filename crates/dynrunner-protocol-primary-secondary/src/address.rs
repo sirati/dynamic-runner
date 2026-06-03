@@ -133,10 +133,7 @@ pub trait RoleChangeHookRegistrar {
     /// Hooks accumulate; implementers must NOT clear prior
     /// registrants. Today the only registrant is the `PeerTransport`
     /// write-through cache (one per node).
-    fn register_role_change_hook(
-        &mut self,
-        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
-    );
+    fn register_role_change_hook(&mut self, hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>);
 }
 
 // ── Shared write-through cache plumbing for PeerTransport impls ──
@@ -258,10 +255,7 @@ mod tests {
     #[test]
     fn role_primary_ne_self() {
         assert_ne!(Role::Primary, Role::Self_);
-        assert_ne!(
-            Address::Role(Role::Primary),
-            Address::Role(Role::Self_)
-        );
+        assert_ne!(Address::Role(Role::Primary), Address::Role(Role::Self_));
     }
 
     /// Distinct peer ids must produce distinct addresses; this is the

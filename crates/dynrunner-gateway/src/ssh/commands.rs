@@ -100,11 +100,7 @@ impl Gateway for SshGateway {
         self.ssh_command(cmd, cwd).await
     }
 
-    async fn transfer_file(
-        &self,
-        local: &Path,
-        remote: &str,
-    ) -> Result<(), GatewayError> {
+    async fn transfer_file(&self, local: &Path, remote: &str) -> Result<(), GatewayError> {
         if !self.connected {
             return Err(GatewayError::NotConnected);
         }
@@ -145,11 +141,7 @@ impl Gateway for SshGateway {
         Ok(())
     }
 
-    async fn download_file(
-        &self,
-        remote: &str,
-        local: &Path,
-    ) -> Result<(), GatewayError> {
+    async fn download_file(&self, remote: &str, local: &Path) -> Result<(), GatewayError> {
         if !self.connected {
             return Err(GatewayError::NotConnected);
         }

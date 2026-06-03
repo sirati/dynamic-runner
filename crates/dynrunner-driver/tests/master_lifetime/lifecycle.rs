@@ -35,7 +35,10 @@ async fn t3_drop_cleans_master() {
     let pid = master
         .master_pid()
         .expect("framework-spawned master must report a PID");
-    assert!(pid_alive(pid), "master must be alive immediately after spawn");
+    assert!(
+        pid_alive(pid),
+        "master must be alive immediately after spawn"
+    );
 
     drop(master);
 

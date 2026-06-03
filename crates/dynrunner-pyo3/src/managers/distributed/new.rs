@@ -85,9 +85,7 @@ impl PyDistributedManager {
         // from the legacy scalar `ram_per_secondary` if no map given.
         let max_resources_per_secondary = max_resources_per_secondary
             .map(|m| m.to_rust())
-            .unwrap_or_else(|| {
-                ResourceMap::from([(ResourceKind::memory(), ram_per_secondary)])
-            });
+            .unwrap_or_else(|| ResourceMap::from([(ResourceKind::memory(), ram_per_secondary)]));
 
         // Build the command-channel + reinject-cap bundle. Same
         // helper as `PyPrimaryCoordinator`; see
@@ -139,5 +137,4 @@ impl PyDistributedManager {
     fn handle(&self) -> PyResult<crate::managers::primary_handle::PyPrimaryHandle> {
         self.control_plane.to_handle()
     }
-
 }

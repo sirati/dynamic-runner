@@ -1,18 +1,13 @@
-
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-};
-use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
-
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
-
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
+{
     /// Apply a replicated `DistributedMessage::ClusterMutation` batch.
     ///
     /// Single concern: keep the demoted primary's CRDT mirror — and the
@@ -52,8 +47,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let has_task_added = mutations.iter().any(|m| {
                 matches!(
                     m,
-                    ClusterMutation::TaskAdded { .. }
-                        | ClusterMutation::TasksSpawned { .. }
+                    ClusterMutation::TaskAdded { .. } | ClusterMutation::TasksSpawned { .. }
                 )
             });
             // Collect any PeerJoined ids riding in the batch BEFORE
@@ -66,9 +60,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let joined_peer_ids: Vec<String> = mutations
                 .iter()
                 .filter_map(|m| match m {
-                    ClusterMutation::PeerJoined { peer_id, .. } => {
-                        Some(peer_id.clone())
-                    }
+                    ClusterMutation::PeerJoined { peer_id, .. } => Some(peer_id.clone()),
                     _ => None,
                 })
                 .collect();
@@ -97,11 +89,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let mut resumed: Vec<TaskInfo<I>> = Vec::new();
             let mut newly_pending: Vec<TaskInfo<I>> = Vec::new();
             for m in mutations {
-                self.cluster_state.apply_with_resumed_blocked(
-                    m,
-                    &mut resumed,
-                    &mut newly_pending,
-                );
+                self.cluster_state
+                    .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
             }
             if self.pending.is_some() {
                 let reinjected_any = !newly_pending.is_empty();
@@ -158,5 +147,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             }
         }
     }
-
 }

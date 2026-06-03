@@ -158,10 +158,7 @@ pub enum WalkError<E> {
 ///
 /// Returns the full list of marked files in visit order (parents before
 /// children, alphabetical among siblings).
-pub fn walk<V>(
-    root: &Path,
-    visitor: &mut V,
-) -> Result<Vec<Marked<V::Payload>>, WalkError<V::Error>>
+pub fn walk<V>(root: &Path, visitor: &mut V) -> Result<Vec<Marked<V::Payload>>, WalkError<V::Error>>
 where
     V: Visitor,
 {
@@ -186,14 +183,12 @@ where
             .map_err(WalkError::Visitor)?;
 
         for (idx, payload) in outcome.mark {
-            let f = files
-                .get(idx)
-                .ok_or_else(|| WalkError::IndexOutOfBounds {
-                    kind: "file",
-                    index: idx,
-                    len: files.len(),
-                    path: abs.display().to_string(),
-                })?;
+            let f = files.get(idx).ok_or_else(|| WalkError::IndexOutOfBounds {
+                kind: "file",
+                index: idx,
+                len: files.len(),
+                path: abs.display().to_string(),
+            })?;
             marked.push(Marked {
                 relative_path: rel.join(&f.name),
                 size: f.size,

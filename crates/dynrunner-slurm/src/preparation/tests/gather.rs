@@ -81,9 +81,12 @@ async fn partial_fleet_succeeds_with_warning() {
     receivers.push(rx3);
     let _held = [tx2, tx3];
 
-    let result =
-        gather_under_deadline(receivers, /*num_secondaries=*/ 4, Duration::from_millis(500))
-            .await;
+    let result = gather_under_deadline(
+        receivers,
+        /*num_secondaries=*/ 4,
+        Duration::from_millis(500),
+    )
+    .await;
 
     let map = result.expect("partial fleet must succeed, not error");
     assert_eq!(
@@ -172,9 +175,12 @@ async fn fail_fast_on_explicit_inner_error() {
     let _held = [tx1];
 
     let start = std::time::Instant::now();
-    let result =
-        gather_under_deadline(vec![rx0, rx1], /*num_secondaries=*/ 2, Duration::from_secs(30))
-            .await;
+    let result = gather_under_deadline(
+        vec![rx0, rx1],
+        /*num_secondaries=*/ 2,
+        Duration::from_secs(30),
+    )
+    .await;
     let elapsed = start.elapsed();
 
     // Must return quickly — well under the 30s deadline. Generous
@@ -186,7 +192,10 @@ async fn fail_fast_on_explicit_inner_error() {
     );
 
     match result {
-        Err(PrepError::InfoRead { secondary_id, message }) => {
+        Err(PrepError::InfoRead {
+            secondary_id,
+            message,
+        }) => {
             assert_eq!(secondary_id, "secondary-0");
             assert_eq!(message, "synthetic");
         }
@@ -213,9 +222,12 @@ async fn dropped_sender_surfaces_watcher_lost() {
         Ok(("secondary-1".to_string(), 60001)),
     );
 
-    let result =
-        gather_under_deadline(vec![rx0, rx1], /*num_secondaries=*/ 2, Duration::from_secs(5))
-            .await;
+    let result = gather_under_deadline(
+        vec![rx0, rx1],
+        /*num_secondaries=*/ 2,
+        Duration::from_secs(5),
+    )
+    .await;
 
     match result {
         Err(PrepError::WatcherLost(_)) => {}

@@ -49,7 +49,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Instant;
 
 use super::event::TaskCompletedEvent;
@@ -217,7 +217,12 @@ impl<P: CollectorPolicy> TaskCompletedListener for CollectorListener<P> {
         }
         // Consult the filter (e.g. invalid_task-only) before touching the
         // window state.
-        if !self.policy.lock().unwrap_or_else(|p| p.into_inner()).matches(event) {
+        if !self
+            .policy
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .matches(event)
+        {
             return;
         }
         let now = Instant::now();
@@ -464,7 +469,10 @@ mod tests {
         assert_eq!(window[0].representative.last_error.as_deref(), Some("boom"));
         assert_eq!(window[0].representative.task_id, "a", "first-seen rep");
         assert_eq!(window[0].repeat_count, 1, "boom repeated once (task c)");
-        assert_eq!(window[1].representative.last_error.as_deref(), Some("splat"));
+        assert_eq!(
+            window[1].representative.last_error.as_deref(),
+            Some("splat")
+        );
         assert_eq!(window[1].repeat_count, 0);
         assert_eq!(
             window[2].representative.last_error.as_deref(),
@@ -590,7 +598,10 @@ mod tests {
         let got = fires.lock().unwrap().clone();
         assert_eq!(got.len(), 2, "rolling policy armed a second window");
         assert_eq!(got[1].len(), 1);
-        assert_eq!(got[1][0].representative.last_error.as_deref(), Some("splat"));
+        assert_eq!(
+            got[1][0].representative.last_error.as_deref(),
+            Some("splat")
+        );
 
         drop(cancel.0);
         let _ = driver_task.await;

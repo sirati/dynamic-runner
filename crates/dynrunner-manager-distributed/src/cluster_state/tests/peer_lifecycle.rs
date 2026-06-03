@@ -53,11 +53,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
                     self.0 = value.to_string();
                 }
             }
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 if field.name() == "message" {
                     self.0 = format!("{value:?}");
                 }
@@ -78,8 +74,7 @@ where
     F: FnOnce() -> R,
 {
     use tracing_subscriber::layer::SubscriberExt;
-    let records: Arc<std::sync::Mutex<Vec<String>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let records: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let layer = WarnCapture {
         records: Arc::clone(&records),
     };
@@ -119,7 +114,6 @@ fn peer_removed_is_sticky() {
     );
 }
 
-
 /// Sticky-per-id under the cross-direction race: once a peer is
 /// Dead, a late `PeerJoined` for the same id is a NoOp and emits
 /// a warn log. Respawn requires a fresh id.
@@ -149,7 +143,9 @@ fn peer_joined_dead_is_noop() {
         );
     });
     assert!(
-        records.iter().any(|m| m.contains("PeerJoined for dead id ignored")),
+        records
+            .iter()
+            .any(|m| m.contains("PeerJoined for dead id ignored")),
         "expected warn log on PeerJoined for dead id, captured: {records:?}",
     );
 }

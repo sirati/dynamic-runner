@@ -11,15 +11,8 @@ use super::probe::parse_master_pid;
 /// must surface in code review and not be a silent override.
 #[test]
 fn master_argv_pins_18h_serveralive_floor() {
-    let argv = build_master_argv(
-        &Vec::new(),
-        "/tmp/dynrunner-m-test.sock",
-        &[],
-        "user@host",
-    );
-    let has_pair = |a: &str, b: &str| {
-        argv.windows(2).any(|w| w[0] == a && w[1] == b)
-    };
+    let argv = build_master_argv(&Vec::new(), "/tmp/dynrunner-m-test.sock", &[], "user@host");
+    let has_pair = |a: &str, b: &str| argv.windows(2).any(|w| w[0] == a && w[1] == b);
     assert!(
         has_pair("-o", "ServerAliveInterval=60"),
         "missing `-o ServerAliveInterval=60`; argv={argv:?}"
@@ -33,12 +26,7 @@ fn master_argv_pins_18h_serveralive_floor() {
 
 #[test]
 fn master_argv_includes_master_mode_flags() {
-    let argv = build_master_argv(
-        &Vec::new(),
-        "/tmp/dynrunner-m-test.sock",
-        &[],
-        "user@host",
-    );
+    let argv = build_master_argv(&Vec::new(), "/tmp/dynrunner-m-test.sock", &[], "user@host");
     assert!(argv.contains(&"-M".to_string()));
     assert!(argv.contains(&"-N".to_string()));
     assert!(
@@ -96,7 +84,10 @@ fn control_path_pessimistic_pid_sequence_still_fits() {
 
 #[test]
 fn parse_master_pid_extracts_from_canonical_output() {
-    assert_eq!(parse_master_pid("Master running (pid=12345)\n"), Some(12345));
+    assert_eq!(
+        parse_master_pid("Master running (pid=12345)\n"),
+        Some(12345)
+    );
 }
 
 #[test]

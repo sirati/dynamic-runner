@@ -72,15 +72,21 @@ pub(super) fn decode_b64(s: &str) -> Result<String, PeerInfoError> {
                 "misplaced padding at index {i}"
             )));
         }
-        let a = val(q[0])
-            .ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {i}")))?;
+        let a =
+            val(q[0]).ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {i}")))?;
         let b = val(q[1])
             .ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {}", i + 1)))?;
-        let c = if q[2] == b'=' { 0 } else {
-            val(q[2]).ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {}", i + 2)))?
+        let c = if q[2] == b'=' {
+            0
+        } else {
+            val(q[2])
+                .ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {}", i + 2)))?
         };
-        let d = if q[3] == b'=' { 0 } else {
-            val(q[3]).ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {}", i + 3)))?
+        let d = if q[3] == b'=' {
+            0
+        } else {
+            val(q[3])
+                .ok_or_else(|| PeerInfoError::InvalidCert(format!("invalid char at {}", i + 3)))?
         };
         let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
         out.push(((n >> 16) & 0xff) as u8);

@@ -31,7 +31,7 @@ pub mod event;
 pub mod listener;
 
 pub use collector::{
-    run_collector, windowed_failure_collector, CollectedFailure, CollectorDriver, CollectorPolicy,
+    CollectedFailure, CollectorDriver, CollectorPolicy, run_collector, windowed_failure_collector,
 };
 pub use dispatcher::run_task_completed_dispatcher;
 pub use event::TaskCompletedEvent;

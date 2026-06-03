@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Role,
+    RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
     apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
-    read_role_cache, Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport,
-    Role, RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
+    read_role_cache,
 };
 use tokio::sync::mpsc;
 
@@ -104,10 +105,7 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
             let msg = self.incoming_rx.recv().await?;
             clocks = now_clocks();
             self.router.prune(clocks.now);
-            let delivered = match self
-                .router
-                .process_inbound(msg, &mut self.outgoing, clocks)
-            {
+            let delivered = match self.router.process_inbound(msg, &mut self.outgoing, clocks) {
                 // `msg` is `Box<DistributedMessage<I>>`; unbox to feed
                 // the by-value role-layer entry point.
                 InboundOutcome::Deliver { msg, .. } => *msg,
