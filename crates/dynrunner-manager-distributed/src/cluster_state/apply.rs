@@ -417,17 +417,12 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Unfulfillable { .. }
                     | TaskState::InvalidTask { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
-                    TaskState::Blocked {
-                        on: existing_on, ..
-                    } => {
-                        if existing_on == &on {
-                            ApplyOutcome::NoOp
-                        } else {
-                            // First observed cascade root wins; a
-                            // divergent re-cascade against the same
-                            // dependent is silent.
-                            ApplyOutcome::NoOp
-                        }
+                    TaskState::Blocked { .. } => {
+                        // Already blocked: idempotent on a matching `on`,
+                        // and the first observed cascade root wins on a
+                        // divergent one — a re-cascade against the same
+                        // dependent is silent either way.
+                        ApplyOutcome::NoOp
                     }
                     TaskState::Pending { task } => {
                         let task = task.clone();
