@@ -12,7 +12,7 @@ use dynrunner_manager_distributed::{
 };
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_slurm::read_peer_info_dir_v2;
-use dynrunner_transport_quic::{NoPrimaryTransport, PeerNetwork};
+use dynrunner_transport_quic::PeerNetwork;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
@@ -257,25 +257,17 @@ impl PyObserverLateJoiner {
                         child_processes: Vec::new(),
                     };
 
-                    // Compose the opaque secondary transport. A late-joining
-                    // observer never dialled an original primary, so the
-                    // uplink is the `NoPrimaryTransport` stub (its `recv`
-                    // pends forever — there is no setup-phase frame to read);
-                    // the `peer_network` is the mesh it bootstrapped onto via
-                    // the snapshot RPC. `Address::Role(Role::Primary)`
-                    // resolves to a mesh peer once the role cache warms from
-                    // the replicated `PrimaryChanged`; until then the
-                    // observer originates nothing and routes nowhere. See
-                    // `UnifiedSecondaryTransport`.
-                    let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
-                        observer_id.clone(),
-                        NoPrimaryTransport,
-                        peer_network,
-                    );
+                    // The observer holds its mesh `PeerTransport`
+                    // (`PeerNetwork`) DIRECTLY. A late-joining observer
+                    // never dialled an original primary, so there is no
+                    // bootstrap wire to fold in (and never was an `uplink`
+                    // leg): it bootstrapped onto the mesh via the snapshot
+                    // RPC and reaches the primary as a mesh peer once the
+                    // role cache warms from the replicated `PrimaryChanged`.
                     let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
                         SecondaryCoordinator::new(
                             config,
-                            unified,
+                            peer_network,
                             scheduler_config.build_memory_scheduler(),
                             estimator,
                         );

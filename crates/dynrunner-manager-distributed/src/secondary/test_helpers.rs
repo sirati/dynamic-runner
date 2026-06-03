@@ -13,30 +13,33 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::ResourceEstimator;
-use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPrimaryTransportEnd, channel_pair};
-use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
+use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc as tokio_mpsc;
 
 use super::{SecondaryConfig, SecondaryCoordinator};
 
-/// The single opaque transport type secondary tests construct: the
-/// production `UnifiedSecondaryTransport` over a channel uplink + a
-/// peer-mesh stub. `P` lets a test pick the peer stub (`NoPeers`,
-/// `FixedPeerCount(n)`, `RecordingPeer`); the uplink is always the
-/// channel end so tests can inject inbound frames / observe sends.
-pub(super) type TestTransport<P> =
-    UnifiedSecondaryTransport<ChannelPrimaryTransportEnd<TestId>, P, TestId>;
+/// The single `Tr: PeerTransport` secondary tests construct: the
+/// peer-mesh stub itself. `P` lets a test pick the stub (`NoPeers`,
+/// `FixedPeerCount(n)`, `RecordingPeer`).
+///
+/// Post-uplink-deletion the secondary holds its mesh `PeerTransport`
+/// DIRECTLY — there is no per-role uplink leg and no wrapper. Tests
+/// that drive the coordinator via direct method calls (election state,
+/// resource-probe, mesh-watchdog) construct it from a stub and exercise
+/// the coordinator without any primary inbound. Tests that previously
+/// injected "primary" frames over the channel uplink (full setup +
+/// dispatch against a `fake_primary` / `spawn_real_secondary`) need the
+/// primary to be a mesh peer they can feed — i.e. a channel-backed mesh
+/// stub with the primary registered — which is the secondary-test
+/// harness mesh-migration concern, NOT this uplink-deletion leaf; those
+/// are `#[ignore]`d at their call sites until that leaf lands.
+pub(super) type TestTransport<P> = P;
 
-/// Build a [`TestTransport`] from a local id, a channel uplink end, and
-/// a peer-mesh stub. Mirrors the production composition (uplink picked
-/// by topology + mesh handle), but with test channel/stub handles.
-pub(super) fn make_transport<P: PeerTransport<TestId>>(
-    local_id: &str,
-    uplink: ChannelPrimaryTransportEnd<TestId>,
-    peer: P,
-) -> TestTransport<P> {
-    UnifiedSecondaryTransport::new(local_id.to_string(), uplink, peer)
+/// Build a [`TestTransport`] from a peer-mesh stub. The secondary holds
+/// the stub directly as its `Tr: PeerTransport` (the primary is a mesh
+/// peer reached by id, not a wrapped uplink).
+pub(super) fn make_transport<P: PeerTransport<TestId>>(peer: P) -> TestTransport<P> {
+    peer
 }
 
 /// Minimal serializable identifier used by every secondary test.
@@ -290,16 +293,9 @@ pub(super) fn make_secondary(
     FixedEstimator,
     TestId,
 > {
-    let secondary_id = config.secondary_id.clone();
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     SecondaryCoordinator::new(
         config,
-        make_transport(&secondary_id, uplink, NoPeers),
+        make_transport(NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -325,18 +321,11 @@ pub(super) fn make_secondary_recording(
     >,
     Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
-    let secondary_id = config.secondary_id.clone();
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     let recorder = RecordingPeer::<TestId>::new(peer_count);
     let log = recorder.log_handle();
     let coord = SecondaryCoordinator::new(
         config,
-        make_transport(&secondary_id, uplink, recorder),
+        make_transport(recorder),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

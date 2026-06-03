@@ -145,6 +145,10 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
 }
 
 /// PeerTransport that drops every message and never produces input.
+// Retained for the channel→mesh fold leaf: the `spawn_real_secondary*`
+// helpers that constructed it are `unimplemented!()` until that leaf
+// rebuilds the channel-backed mesh harness.
+#[allow(dead_code)]
 pub(super) struct NoPeers;
 
 impl<I: Identifier> PeerTransport<I> for NoPeers {
@@ -176,6 +180,8 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
 }
 
 /// Factory that spawns fake workers via channel transport.
+// Retained for the channel→mesh fold leaf (see `NoPeers`).
+#[allow(dead_code)]
 pub(super) struct FakeWorkerFactory;
 
 impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
@@ -213,11 +219,14 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 /// style fixture names with no extra plumbing into the wire shape.
 ///
 /// Single-threaded (`Rc`); only safe inside a `tokio::task::LocalSet`.
+// Retained for the channel→mesh fold leaf (see `NoPeers`).
+#[allow(dead_code)]
 #[derive(Clone)]
 pub(super) struct SlowFakeWorkerFactory {
     slow_markers: std::rc::Rc<Vec<(String, std::time::Duration)>>,
 }
 
+#[allow(dead_code)]
 impl SlowFakeWorkerFactory {
     pub(super) fn with_markers(slow_markers: Vec<(String, std::time::Duration)>) -> Self {
         Self {

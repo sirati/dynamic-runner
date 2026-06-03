@@ -6,12 +6,11 @@ use super::super::test_helpers::{
 use super::super::*;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
 
-/// Build a SecondaryCoordinator over the unified transport (channel
-/// uplink + a `RecordingPeer` mesh stub) so the test can inspect what
-/// got broadcast over the peer mesh on the late-joiner accept path.
+/// Build a SecondaryCoordinator over a `RecordingPeer` mesh stub so the
+/// test can inspect what got broadcast over the peer mesh on the
+/// late-joiner accept path.
 #[allow(clippy::type_complexity)]
 fn make_secondary_with_recording_peer(
     secondary_id: &str,
@@ -26,18 +25,20 @@ fn make_secondary_with_recording_peer(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
-    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
+    // `sec_to_pri_rx` is returned by this helper's signature; its sender
+    // was the (now removed) channel uplink. These tests drive
+    // `dispatch_message` directly and assert on the `RecordingPeer` mesh
+    // log (the `PeerJoined` broadcast / snapshot-reply land there), not
+    // on `sec_to_pri_rx`, so dropping the uplink does not change what
+    // they exercise. The secondary holds the `RecordingPeer` mesh stub
+    // directly.
+    let (_sec_to_pri_tx, sec_to_pri_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
     let recorder = RecordingPeer::<TestId>::new(1);
     let peer_log = recorder.log_handle();
     let sec = SecondaryCoordinator::new(
         election_config(secondary_id),
-        make_transport(secondary_id, uplink, recorder),
+        make_transport(recorder),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

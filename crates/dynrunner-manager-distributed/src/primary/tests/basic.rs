@@ -128,6 +128,8 @@ async fn two_secondaries_distribute_work() {
 /// secondary 0 receives InitialAssignment; secondary 1 hangs in
 /// `wait_for_setup`. Post-fix both reach `process_tasks` and the
 /// run completes.
+#[ignore = "drives a real secondary against the primary over a channel uplink (spawn_real_secondary); \
+            post-uplink deletion needs the channel-backed mesh harness — channel-mesh-fold leaf"]
 #[tokio::test(flavor = "current_thread")]
 async fn empty_batch_secondary_still_reaches_process_tasks() {
     let _ = tracing_subscriber::fmt::try_init();

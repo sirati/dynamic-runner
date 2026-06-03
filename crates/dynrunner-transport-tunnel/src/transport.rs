@@ -131,8 +131,7 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// select! gates the registration arm off after that so its
     /// perpetually-ready closed-channel future can't be selected and
     /// stall the demux (a closed mpsc `recv()` resolves immediately,
-    /// so an ungated arm would starve `incoming_rx`). Mirrors the
-    /// `uplink_open` latch in `UnifiedSecondaryTransport::recv_peer`.
+    /// so an ungated arm would starve `incoming_rx`).
     registrations_open: bool,
     /// Write-through cache of `Role → peer_id` populated by the hook
     /// registered via [`PeerTransport::register_with_cluster_state`].

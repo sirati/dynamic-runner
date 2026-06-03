@@ -5,12 +5,9 @@ use super::super::test_helpers::{
 };
 use super::super::*;
 use dynrunner_core::TaskInfo;
-use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use tokio::sync::mpsc as tokio_mpsc;
 
 /// Construct a 3-node-mesh-analogous joiner: a single
 /// `SecondaryCoordinator` configured as observer
@@ -30,19 +27,17 @@ fn make_observer_secondary(
     FixedEstimator,
     TestId,
 > {
-    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-    let (_pri_to_sec_tx, pri_to_sec_rx) =
-        tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let uplink = ChannelPrimaryTransportEnd {
-        tx: sec_to_pri_tx,
-        rx: pri_to_sec_rx,
-    };
+    // The observer holds the `NoPeers` mesh stub directly; it restores
+    // from a snapshot, skips setup, and reads its terminal cue from
+    // `cluster_state` (RunComplete applied directly) — it never needs a
+    // primary uplink inbound, so dropping the uplink does not change what
+    // the late-joiner-observer test exercises.
     let mut config = election_config(observer_id);
     config.is_observer = true;
     config.num_workers = 0;
     SecondaryCoordinator::new(
         config,
-        make_transport(observer_id, uplink, NoPeers),
+        make_transport(NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
