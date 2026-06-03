@@ -478,9 +478,20 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             self.task_by_hash
                 .insert(compute_task_hash(task), task.clone());
         }
-        self.pool_mut()
-            .extend(binaries)
-            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
+        // #2 dependency-existence validation (local parity with the
+        // distributed primary). Run the pool's non-mutating
+        // `partition_ingest` keyed on `(phase_id, task_id)`: tasks whose
+        // `task_depends_on` names a literally-absent `(phase_id,
+        // task_id)` are recorded as terminal `invalid_task` failures
+        // (the manager keeps running on the rest) instead of failing the
+        // whole `extend` as a hard `UnknownTaskDep`. The valid subset is
+        // extended; `extend`'s atomic contract is preserved there (a
+        // cycle among valid tasks is still a hard error). 3a/3b
+        // duplicate-id semantics are distributed-only (no peer/cluster
+        // concept here); a within-batch / against-pool duplicate stays
+        // the hard `extend`-side `DuplicateTaskId` it always was, so the
+        // `duplicates` partition is left to `extend` to reject.
+        self.ingest_partition_local(binaries)?;
 
         // Fire on_phase_start for any phase that started life Active.
         self.fire_on_phase_start_for_newly_active();
@@ -636,6 +647,78 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.pending
             .as_mut()
             .expect("pending pool not initialised; called outside process_binaries")
+    }
+
+    /// Initial-batch ingest with #2 dependency-existence validation —
+    /// the local-manager parity of the distributed primary's
+    /// `ingest_initial_batch` (minus the distributed-only 3a/3b
+    /// duplicate-abort split).
+    ///
+    /// Runs the pool's non-mutating `partition_ingest` keyed on
+    /// `(phase_id, task_id)`:
+    ///   * **duplicates** → hard error, preserving the pre-feature
+    ///     behaviour (the local `extend` rejected a duplicate `task_id`
+    ///     with `PendingPoolError::DuplicateTaskId`). Local mode has no
+    ///     cluster to abort; a duplicate in the single ingest is a
+    ///     producer bug surfaced as a `process_binaries` error.
+    ///   * **invalid_deps** (#2 missing-dep) → recorded as terminal
+    ///     `FailedTask { error_type: InvalidTask }` (surfaced to Python
+    ///     via `manager.failed_tasks()` with the `invalid_task` kind) +
+    ///     `stats.errored` bumped; their `task_id` is pre-seeded into
+    ///     the pool's failed set so a valid dependent's `extend`
+    ///     resolves + cascade-drops (matching the runtime cascade).
+    ///   * **valid** → handed to `extend`, preserving its atomic
+    ///     contract (a cycle among valid tasks is still a hard error).
+    fn ingest_partition_local(
+        &mut self,
+        binaries: Vec<TaskInfo<I>>,
+    ) -> Result<(), String> {
+        let partition = self.pool_ref().partition_ingest(binaries);
+
+        // Duplicates: hard error (no cluster-abort concept in local
+        // mode). Surface the first colliding identity in the message —
+        // same diagnostic shape `extend`'s `DuplicateTaskId` produced.
+        if let Some((task, reason)) = partition.duplicates.first() {
+            return Err(format!(
+                "duplicate task identity rejected at ingest: {reason} \
+                 (task_id={}, phase={})",
+                task.task_id, task.phase_id
+            ));
+        }
+
+        // Pre-seed the pool's failed set with the missing-dep ids so the
+        // valid survivors' dep-existence + extend-time cascade stay
+        // correct.
+        let invalid_ids: Vec<String> = partition
+            .invalid_deps
+            .iter()
+            .map(|(task, _)| task.task_id.clone())
+            .collect();
+        self.pool_mut().mark_tasks_failed(invalid_ids);
+
+        // Record each missing-dep task as a terminal invalid_task
+        // failure so it surfaces to Python and counts as errored.
+        for (task, reason) in &partition.invalid_deps {
+            tracing::warn!(
+                task_id = %task.task_id,
+                phase = %task.phase_id,
+                reason = %reason,
+                "task has a missing dependency; marking invalid_task"
+            );
+            self.failed_tasks.push(FailedTask {
+                binary: task.clone(),
+                error_type: dynrunner_core::ErrorType::InvalidTask {
+                    reason: dynrunner_core::BoundedString::from(reason.clone()),
+                },
+                error_message: reason.clone(),
+                retry_count: 0,
+            });
+            self.stats.errored += 1;
+        }
+
+        self.pool_mut()
+            .extend(partition.valid)
+            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))
     }
 
     /// Test seam: install a pre-built [`PendingPool`] so unit tests

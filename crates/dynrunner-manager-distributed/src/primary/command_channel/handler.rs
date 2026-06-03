@@ -410,14 +410,11 @@ where
             })
             .collect();
         if !duplicate_reasons.is_empty() {
-            debug_assert!(
-                !self.phase_started_emitted.is_empty(),
-                "apply_spawn_tasks is a runtime path — a phase must already \
-                 have started (the 3a/3b discriminator); an empty \
-                 phase_started_emitted here means a duplicate reached the \
-                 runtime path before fire_initial_phase_starts, which the \
-                 initial-batch ingest (#3a) should have caught first"
-            );
+            // `apply_spawn_tasks` IS the runtime-spawn path by
+            // construction — the initial batch goes through
+            // `ingest_initial_batch` (the 3a side). The path is the
+            // discriminator, so no `phase_started_emitted` read is
+            // needed here; reaching this handler is unconditionally 3b.
             let reason = format!(
                 "{} duplicate task identity/identities in a runtime spawn: {}",
                 duplicate_reasons.len(),

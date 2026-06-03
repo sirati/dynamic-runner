@@ -163,6 +163,89 @@ async fn no_binaries_completes_immediately() {
     }).await;
 }
 
+/// #2 dependency-existence parity (local manager): a task whose
+/// `task_depends_on` names a literally-absent `(phase, task_id)` is
+/// recorded as a terminal `invalid_task` failure (surfaced via
+/// `failed_tasks()` with the `InvalidTask` error_type, counted in
+/// `errored`) WITHOUT failing the whole `process_binaries` — the valid
+/// task still runs to completion.
+#[tokio::test(flavor = "current_thread")]
+async fn missing_dep_marks_invalid_task_and_run_continues() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let config = test_config(1);
+        let mut manager =
+            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+
+        let good = make_binary("good", 50);
+        let mut bad = make_binary("bad", 60);
+        bad.task_depends_on = vec![dynrunner_core::TaskDep {
+            task_id: "ghost".into(),
+            phase_id: PhaseId::from("default"),
+            inherit_outputs: false,
+        }];
+
+        manager
+            .process_binaries(
+                vec![good, bad],
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .expect("missing dep must NOT fail the whole run (it's a soft invalid_task)");
+
+        // The valid task completed; the missing-dep task is a terminal
+        // invalid_task failure (run continued).
+        assert_eq!(manager.stats().completed, 1, "the valid task ran");
+        assert_eq!(manager.stats().errored, 1, "the missing-dep task is errored");
+        let failed = manager.failed_tasks();
+        assert_eq!(failed.len(), 1, "exactly one failed task");
+        assert_eq!(failed[0].binary.task_id, "bad");
+        assert!(
+            matches!(failed[0].error_type, ErrorType::InvalidTask { .. }),
+            "missing-dep task carries the invalid_task error type, got {:?}",
+            failed[0].error_type
+        );
+    }).await;
+}
+
+/// #2 parity: a within-batch duplicate `(phase, task_id)` stays a HARD
+/// `process_binaries` error in local mode (no cluster-abort concept;
+/// preserving the pre-feature `extend`-side `DuplicateTaskId` rejection).
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_task_id_is_hard_error_local() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let config = test_config(1);
+        let mut manager =
+            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+
+        let mut a = make_binary("a", 50);
+        a.task_id = "dup".into();
+        let mut b = make_binary("b", 60);
+        b.task_id = "dup".into();
+
+        let result = manager
+            .process_binaries(
+                vec![a, b],
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await;
+        assert!(result.is_err(), "a duplicate task identity is a hard error in local mode");
+    }).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn always_restart_worker_respawns_after_success() {
     use std::sync::atomic::{AtomicU32, Ordering};

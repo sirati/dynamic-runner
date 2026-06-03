@@ -203,7 +203,24 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 break;
             }
 
-            let retry_tasks: Vec<FailedTask<I>> = self.failed_tasks.drain(..).collect();
+            // `InvalidTask` is a TERMINAL, non-reinjectable failure
+            // (missing dep / duplicate id — no future state makes the
+            // task runnable). It must NOT be retried: partition it out
+            // and leave it in `failed_tasks` so it stays the run's
+            // surfaced terminal result. Every other class in
+            // `failed_tasks` is retry-eligible and drained for
+            // reinjection. (Mirrors the distributed side's exclusion of
+            // `InvalidTask` from the reinject gate / terminal lockout.)
+            let (retry_tasks, terminal_invalid): (Vec<FailedTask<I>>, Vec<FailedTask<I>>) = self
+                .failed_tasks
+                .drain(..)
+                .partition(|t| !matches!(t.error_type, ErrorType::InvalidTask { .. }));
+            self.failed_tasks = terminal_invalid;
+            if retry_tasks.is_empty() {
+                // Nothing retry-eligible left (only terminal
+                // invalid_tasks remain) — stop the passes.
+                break;
+            }
             tracing::info!(
                 pass = pass + 1,
                 count = retry_tasks.len(),
