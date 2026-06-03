@@ -2282,15 +2282,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready(&mut command_rx).await?;
 
-        // Activate THIS node's co-located primary as the sole
-        // authority. In the unified model the authority is the node the
-        // secondaries dialled (their transport uplink), so there is no
-        // remote `PromotePrimary` hand-off and no role re-point — every
-        // secondary keeps routing `Role::Primary` to its uplink (this
-        // node). The continuously-replicated ledger is the only source
-        // of truth; `wait_for_mesh_ready` above already held until the
-        // peer mesh settled so cross-node dispatch never routes into a
-        // still-forming mesh. See `activate_local_primary`.
+        // Activate THIS node's co-located primary. It originates the
+        // uniform `PrimaryChanged { new = self }` announcement so every
+        // replica resolves `Role::Primary` to this now-routable mesh
+        // peer. `wait_for_mesh_ready` above already held until the peer
+        // mesh settled, so the announce warms each replica's role cache
+        // to a real connection and cross-node dispatch never routes into
+        // a still-forming mesh. See `activate_local_primary`.
         self.activate_local_primary().await?;
 
         // Put the command-channel receiver back on `self` so

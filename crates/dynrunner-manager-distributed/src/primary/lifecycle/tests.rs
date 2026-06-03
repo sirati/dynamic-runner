@@ -213,13 +213,22 @@ async fn activate_local_primary_emits_a_keepalive() {
         .await;
 }
 
-/// Initial-setup-done / first-operational important event: the single
-/// bootstrap+failover convergence point (`activate_local_primary`) emits
-/// exactly one "co-located primary activated" line on the importance
-/// marker target so the dual-sink can surface it on stdio under
-/// `--important-stdio-only`.
+/// Uniform primary announcement: the single bootstrap+failover
+/// convergence point (`activate_local_primary`) originates
+/// `ClusterMutation::PrimaryChanged { new = self }` over the one mesh, so
+/// `current_primary()` resolves to this host cluster-wide. The replicated
+/// apply drives the primary-changed important-event hook (registered at
+/// construction), so the LLM-wake milestone is emitted uniformly on the
+/// genuine holder transition — no hand-written "sole authority" line.
+///
+/// Asserts BOTH the wire announce (the broadcast `PrimaryChanged{new:
+/// "primary", epoch: 1}` in the recorded log — `epoch: 1` is the
+/// non-default value that proves the originator ran, not a zeroed
+/// default) AND the single uniform "primary changed" important event.
 #[tokio::test(flavor = "current_thread")]
-async fn activate_local_primary_emits_initial_setup_done_important_event() {
+async fn activate_local_primary_announces_primary_changed() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
+
     use crate::test_capture::{ImportantCapture, important_only};
     use tracing::subscriber::set_default;
     use tracing_subscriber::layer::SubscriberExt;
@@ -228,7 +237,7 @@ async fn activate_local_primary_emits_initial_setup_done_important_event() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut coordinator, _log, _ends) =
+            let (mut coordinator, log, _ends) =
                 make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
             seed_secondary(&mut coordinator, "sec-0");
 
@@ -244,13 +253,41 @@ async fn activate_local_primary_emits_initial_setup_done_important_event() {
                 .await
                 .expect("activation succeeds");
 
+            // Wire announce: exactly one broadcast carries a
+            // `PrimaryChanged { new = "primary", epoch = 1 }`. `epoch: 1`
+            // (= primary_epoch() + 1 on the bootstrap cluster_state) is
+            // the non-default value confirming the originator computed it
+            // rather than shipping a zeroed default.
+            let primary_changes: Vec<(String, u64)> = log
+                .borrow()
+                .iter()
+                .filter_map(|m| match m {
+                    DistributedMessage::ClusterMutation { mutations, .. } => Some(mutations.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|mutation| match mutation {
+                    ClusterMutation::PrimaryChanged { new, epoch } => Some((new, epoch)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                primary_changes,
+                vec![("primary".to_string(), 1)],
+                "activate_local_primary must broadcast exactly one \
+                 PrimaryChanged naming self at epoch 1"
+            );
+
+            // Uniform milestone: the replicated apply fires the
+            // primary-changed important-event hook exactly once on the
+            // genuine None → "primary" holder transition.
             let msgs = capture.messages();
             assert_eq!(
                 msgs.len(),
                 1,
-                "exactly one initial-setup-done important event: {msgs:?}"
+                "exactly one primary-changed important event: {msgs:?}"
             );
-            assert!(msgs[0].contains("activated as sole authority"), "{msgs:?}");
+            assert!(msgs[0].contains("primary changed"), "{msgs:?}");
         })
         .await;
 }
