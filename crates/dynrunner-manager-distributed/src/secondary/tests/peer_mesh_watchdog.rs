@@ -12,7 +12,6 @@ use super::super::*;
 use super::processing::{fake_primary, make_binary};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -42,7 +41,9 @@ fn arm_watchdog_no_peers(
     // Channel-backed mesh with the primary folded in (so `send_to_primary`
     // — the watchdog's `MeshReady` emit — delivers onto `sec_to_pri_rx`,
     // which the direct-method tests drain to observe what the secondary
-    // sent) and NO peers (so `peer_count() == 0` arms the degraded path).
+    // sent) and NO alive secondaries in global state (no `PeerJoined`/
+    // `SecondaryCapacity` applied, no peer keepalives), so the role-aware
+    // `alive_secondary_count()` reads 0 and arms the degraded path.
     // Inbound is never fed: these tests drive the watchdog/election via
     // direct method calls and never inject primary inbound.
     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
@@ -420,33 +421,27 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
 
 /// T-B1-quorum-survives: sanity check that the watchdog's
 /// healthy-mesh path is unaffected by the degrade refactor. With
-/// `FixedPeerCount(3)` reporting a non-empty peer set before the
-/// deadline, the watchdog clears `peer_mesh_check_at`, sends
-/// `MeshReady(peer_count=3)`, and leaves `peer_mesh_degraded`
-/// false.
+/// three alive peer-secondaries in GLOBAL STATE (their `Secondary`
+/// keepalives recorded — the operational signal the watchdog reads)
+/// before the deadline, the watchdog clears `peer_mesh_check_at`,
+/// sends `MeshReady(peer_count=3)`, and leaves `peer_mesh_degraded`
+/// false. The role-aware count is over global state, NOT the
+/// transport's role-blind `peer_count()`.
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
+    use super::super::wire::timestamp_now;
     use std::time::Instant;
     let _ = tracing_subscriber::fmt::try_init();
 
     let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    // Channel-backed mesh: 3 peer outboxes (healthy mesh → `peer_count()
-    // == 3`) plus the primary folded in (so the watchdog's `MeshReady`
-    // emit lands on `sec_to_pri_rx`). The peer receivers are dropped —
-    // only their sender presence (what `peer_count` measures) matters.
-    let mut outgoing = HashMap::new();
-    for i in 0..3u32 {
-        let (peer_tx, _peer_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-        outgoing.insert(format!("peer-{i}"), peer_tx);
-    }
-    let mut unified = dynrunner_transport_channel::ChannelPeerTransport::from_raw_channels(
-        "sec-quo".to_string(),
-        outgoing,
-        pri_to_sec_rx,
-    );
-    unified.register_primary_link("primary".into(), sec_to_pri_tx);
+    // Channel-backed mesh with ONLY the primary folded in (so the
+    // watchdog's `MeshReady` emit lands on `sec_to_pri_rx`). The three
+    // healthy peer-secondaries are set up as GLOBAL STATE below (recorded
+    // `Secondary` keepalives), since the watchdog's role-aware
+    // `alive_secondary_count()` reads global state, never the transport.
+    let unified = channel_mesh_to_primary("sec-quo", sec_to_pri_tx, pri_to_sec_rx);
     let config = SecondaryConfig {
         secondary_id: "sec-quo".into(),
         num_workers: 1,
@@ -488,12 +483,20 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         FixedEstimator(100),
     );
     secondary.set_bootstrap_primary_id("primary".to_string());
-    // 3 peers attempted AND all 3 reported by the transport — a
-    // fully-formed healthy mesh. Deadline still in the future; the
-    // typed-lifecycle watchdog's pre-deadline early-clear fires when
-    // EVERY expected peer is connected (`real_peer_count() ==
-    // peer_dial_count`), which SUPERSEDES the old `connected > 0`
-    // early-clear. With 3 == 3 the full-formed branch disarms early.
+    // Drive the coordinator Operational (the regime in which the watchdog
+    // ticks in production, where `peer_keepalives` is the alive-secondary
+    // signal) and record 3 alive peer-secondaries — a fully-formed healthy
+    // mesh in GLOBAL STATE. Deadline still in the future; the
+    // typed-lifecycle watchdog's pre-deadline early-clear fires when EVERY
+    // expected secondary is alive (`alive_secondary_count() ==
+    // peer_dial_count`). With 3 == 3 the full-formed branch disarms early.
+    secondary.enter_operational_for_test();
+    for i in 0..3u32 {
+        secondary
+            .op_mut()
+            .peer_keepalives
+            .insert(format!("peer-{i}"), timestamp_now());
+    }
     secondary.mesh.peer_dial_count = 3;
     secondary.mesh.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));
 

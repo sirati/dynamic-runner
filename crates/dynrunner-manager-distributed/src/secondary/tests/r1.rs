@@ -13,7 +13,6 @@ use super::super::*;
 use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -410,8 +409,13 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             let (_pri_to_sec_tx, pri_to_sec_rx) =
                 tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
             // Channel-backed mesh with the (silent) primary folded in as a
-            // mesh peer and NO other peers — so `peer_count() == 0` drives
-            // the "no primary, no peers" cold-start branch.
+            // mesh peer and NO other peers. NO `PeerJoined`/`SecondaryCapacity`
+            // is applied, so the coordinator's role-aware
+            // `alive_secondary_count()` (membership branch, pre-Operational)
+            // reads 0 — driving the "no primary, no peers" cold-start branch.
+            // (The transport's role-blind `peer_count()` would read 1 here
+            // post-de-role — the folded primary — which is exactly why the
+            // cold-start branch must NOT consult the transport.)
             let unified = channel_mesh_to_primary("sec-cold", sec_to_pri_tx, pri_to_sec_rx);
 
             let config = SecondaryConfig {
@@ -507,24 +511,17 @@ async fn cold_start_with_peers_emits_distinct_error() {
             // for the primary that never speaks.
             let (_pri_to_sec_tx, pri_to_sec_rx) =
                 tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-            // Channel-backed mesh: the (silent) primary is folded in AND
-            // two peer outboxes are registered, so `peer_count() == 2`
+            // Channel-backed mesh: the (silent) primary is folded in. The
+            // "peers reachable" branch is now driven by GLOBAL STATE, not
+            // the transport: two peer-secondaries are recorded as alive
+            // members below (via the same `PeerJoined` + `SecondaryCapacity`
+            // CRDT pair the primary originates on welcome and the setup recv
+            // loop applies). The coordinator's role-aware
+            // `alive_secondary_count()` reads 2 from that membership and
             // routes the setup-deadline expiry to the "peers reachable"
-            // branch (distinct from the no-peers cold-start). The two
-            // peer receivers are dropped — only the sender presence (what
-            // `peer_count` measures) matters.
-            let mut outgoing = HashMap::new();
-            for i in 0..2u32 {
-                let (peer_tx, _peer_rx) =
-                    tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-                outgoing.insert(format!("peer-{i}"), peer_tx);
-            }
-            let mut unified = dynrunner_transport_channel::ChannelPeerTransport::from_raw_channels(
-                "sec-cold-with-peers".to_string(),
-                outgoing,
-                pri_to_sec_rx,
-            );
-            unified.register_primary_link("primary".into(), sec_to_pri_tx);
+            // branch (distinct from the no-peers cold-start).
+            let unified =
+                channel_mesh_to_primary("sec-cold-with-peers", sec_to_pri_tx, pri_to_sec_rx);
 
             let config = SecondaryConfig {
                 secondary_id: "sec-cold-with-peers".into(),
@@ -566,6 +563,30 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 FixedEstimator(100),
             );
             secondary.set_bootstrap_primary_id("primary".to_string());
+
+            // Two peer-secondaries are alive members in the replicated
+            // ledger — the global-state the cold-start branch reads. Each
+            // gets the `PeerJoined` + `SecondaryCapacity { worker_count > 0 }`
+            // pair the primary originates on welcome (connect.rs), so
+            // `alive_secondary_count()` reads 2 and the "peers reachable"
+            // branch fires. (No transport peer outboxes — the transport is
+            // role-blind and is NOT consulted for this role decision.)
+            for i in 0..2u32 {
+                let peer_id = format!("peer-{i}");
+                secondary.cluster_state.apply(
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::PeerJoined {
+                        peer_id: peer_id.clone(),
+                        is_observer: false,
+                    },
+                );
+                secondary.cluster_state.apply(
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::SecondaryCapacity {
+                        secondary: peer_id,
+                        worker_count: 1,
+                        resources: vec![],
+                    },
+                );
+            }
 
             let mut factory = FakeWorkerFactory;
             let result = secondary.run(&mut factory).await;

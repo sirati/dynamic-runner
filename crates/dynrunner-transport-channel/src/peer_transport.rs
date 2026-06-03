@@ -13,9 +13,9 @@
 //! of the QUIC `PeerNetwork::register_primary_link` — so
 //! `send_to_peer(primary)` / `has_peer(primary)` resolve over it. The
 //! transport is role-blind: it counts and broadcasts to the folded
-//! primary like any peer; the primary-exclusion mesh-health policy lives
-//! at the coordinator edge (`real_peer_count`), exactly as the QUIC
-//! transport does.
+//! primary like any peer; the role-aware "how many alive secondaries"
+//! policy lives at the coordinator edge (`alive_secondary_count`, over
+//! global state), exactly as the QUIC transport does.
 
 use std::collections::HashMap;
 
@@ -71,8 +71,9 @@ pub struct ChannelPeerTransport<I: Identifier> {
     ///
     /// The transport treats it as an ordinary mesh member (counted in
     /// [`PeerTransport::peer_count`] and reached by [`PeerTransport::broadcast`],
-    /// role-blind); the primary-exclusion mesh-health policy is the
-    /// coordinator edge's concern (`real_peer_count`), NOT the transport's.
+    /// role-blind); the role-aware "how many alive secondaries" policy is
+    /// the coordinator edge's concern (`alive_secondary_count`, over global
+    /// state), NOT the transport's.
     /// Symmetric with `PeerNetwork::primary_link_id` on the QUIC side.
     pub(crate) primary_link_id: Option<String>,
 }
@@ -148,12 +149,11 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     fn peer_count(&self) -> usize {
         // Pure membership cardinality (role-blind): all connections incl
         // the folded primary. The transport must NOT special-case the
-        // primary (TRANSPORT⊥ROLES) — the "exclude the primary"
-        // mesh-health policy is the coordinator edge's single
-        // authoritative concern (`real_peer_count() = peer_count() -
-        // has_peer(current_primary)`); excluding here too would
-        // double-exclude (off-by-one). Mirrors the QUIC `PeerNetwork`
-        // Real arm.
+        // primary (TRANSPORT⊥ROLES) — the role-aware "how many alive
+        // secondaries" question is the coordinator edge's single
+        // authoritative concern (`alive_secondary_count`, computed over
+        // global state, NOT transport arithmetic). Mirrors the QUIC
+        // `PeerNetwork` Real arm.
         self.outgoing.len()
     }
 
