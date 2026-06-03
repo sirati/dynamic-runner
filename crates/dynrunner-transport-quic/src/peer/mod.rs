@@ -10,9 +10,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, RoleCache, Router, new_role_cache, seed_self_role,
-};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, Router};
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;
@@ -115,19 +113,6 @@ pub struct PeerNetwork<I: Identifier> {
     /// the tracker stays an implementation detail; callers don't
     /// see (or depend on) the milestone schedule directly.
     pub(super) reconnect_tracker: reconnect::ReconnectTracker,
-    /// Write-through cache of `Role → peer_id` populated by the
-    /// hook registered via
-    /// [`dynrunner_protocol_primary_secondary::PeerTransport::register_with_cluster_state`].
-    /// Read on the send hot path by `peer_for_role`. `Arc<RwLock<_>>`
-    /// so the hook (`'static` closure stored on `ClusterState`)
-    /// shares mutation with the transport's reads; see
-    /// `dynrunner_protocol_primary_secondary::install_role_change_hook`
-    /// for the lock-poisoning recovery rationale.
-    ///
-    /// Visibility is `pub(super)` because the `transport_impl.rs`
-    /// `PeerTransport` impl needs to read it; production callers
-    /// reach the same value through `PeerTransport::peer_for_role`.
-    pub(super) role_cache: RoleCache,
 
     /// Receiver for the cloneable mesh-send proxy (see
     /// [`MeshSendHandle`]). A co-located parked `PrimaryCoordinator`
@@ -146,23 +131,6 @@ pub struct PeerNetwork<I: Identifier> {
     /// dropped — e.g. a never-promoted parked primary — without closing
     /// the drain).
     mesh_send_tx: mpsc::UnboundedSender<MeshSend<I>>,
-
-    /// Id of the bootstrap-primary's DIRECTED mesh link, if registered
-    /// via [`Self::register_primary_link`]. The secondary registers its
-    /// dialed primary connection here so `send_to_peer(primary)` /
-    /// `has_peer(primary)` resolve over the existing bootstrap wire —
-    /// the primary becomes a routable mesh member from the secondary's
-    /// side.
-    ///
-    /// It is a DIRECTED-only member, NOT yet a full mesh peer: it is
-    /// excluded from the [`Self::broadcast`] fan-out and from the
-    /// [`Self::peer_count`] mesh-health cardinality, so this transient
-    /// registration does not change broadcast topology or mesh-watchdog
-    /// behaviour. Folding the primary into the broadcast fan-out
-    /// (deliver-once) and into the peer-liveness counts is the job of
-    /// the later broadcast-unification / role-tagged-keepalive leaves;
-    /// this field is the seam they remove.
-    primary_link_id: Option<String>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -232,13 +200,6 @@ impl<I: Identifier> PeerNetwork<I> {
 
         tracing::info!(peer_id, port, "peer network listening (QUIC/UDP + WSS/TCP)");
 
-        let role_cache = new_role_cache();
-        // Self_ is a strictly local fact — the role-table hook
-        // populates Primary only. Seeding at construction so the
-        // receiver-side RoleAddressed handling (Step 4) treats
-        // `intended_role == Self_` envelopes as Case A (local
-        // unwrap) rather than Case C (no cached holder → drop).
-        seed_self_role(&role_cache, peer_id);
         let (mesh_send_tx, proxy_rx) = mpsc::unbounded_channel();
         Ok(Self {
             peer_id: peer_id.to_string(),
@@ -255,18 +216,16 @@ impl<I: Identifier> PeerNetwork<I> {
             #[cfg(test)]
             reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),
-            role_cache,
             proxy_rx,
             mesh_send_tx,
-            primary_link_id: None,
         })
     }
 
     /// Fold the secondary's dialed primary connection — the bootstrap
-    /// wire — into THIS mesh as a DIRECTED-routable member keyed by
-    /// `primary_id`, in BOTH directions. After this call the bootstrap
-    /// wire is just another mesh connection: "the tunnel is just a way
-    /// of joining the mesh".
+    /// wire — into THIS mesh as a routable member keyed by `primary_id`,
+    /// in BOTH directions. After this call the bootstrap wire is just
+    /// another mesh connection: "the tunnel is just a way of joining the
+    /// mesh".
     ///
     /// Takes the whole [`crate::NetworkClient`] by value (the mesh now
     /// owns the wire; there is no separate `uplink` leg). Both
@@ -285,16 +244,13 @@ impl<I: Identifier> PeerNetwork<I> {
     ///   `None`) or `incoming_tx` is dropped. It lives on the same
     ///   `LocalSet` as the rest of the mesh's reader/writer tasks.
     ///
-    /// The primary is registered as a DIRECTED-only member: it is
-    /// recorded in [`Self::primary_link_id`] and excluded from
-    /// [`PeerTransport::broadcast`] and [`PeerTransport::peer_count`],
-    /// so this registration does not prematurely make the primary a
-    /// broadcast/peer-count mesh peer (preserving the bootstrap
-    /// behaviour where the secondary's mesh broadcast and mesh-health
-    /// count never include the primary). The connection itself goes in
-    /// the same [`Self::connections`] table every directed send + the
-    /// router read from, so routing to the primary uses the one uniform
-    /// path.
+    /// The connection goes in the same [`Self::connections`] table every
+    /// directed send + the router read from, so routing to the primary
+    /// uses the one uniform path. The transport keeps no notion of
+    /// "which connection is the primary": the primary is a plain mesh
+    /// peer here, indistinguishable from any other. Any "exclude the
+    /// primary" policy (quorum, mesh-health) is a role concern resolved
+    /// at the coordinator edge, not in the transport.
     pub fn register_primary_link(&mut self, primary_id: String, client: crate::NetworkClient<I>) {
         use dynrunner_core::MessageReceiver;
 
@@ -302,7 +258,6 @@ impl<I: Identifier> PeerNetwork<I> {
         // Outbound: fan-in send handle into the existing wire.
         self.connections
             .insert(primary_id.clone(), client.mesh_writer());
-        self.primary_link_id = Some(primary_id);
 
         // Inbound: drive the wire's inbound into the mesh's single
         // fan-in, so the primary's frames arrive via `recv_peer` like

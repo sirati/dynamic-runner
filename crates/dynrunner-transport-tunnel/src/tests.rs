@@ -132,6 +132,7 @@ async fn try_recv_peer_empty_returns_none() {
 /// transport's `peer_for_role(Role::Primary)` returns that id.
 /// Mirror of the channel-transport test
 /// `peer_transport_role_cache_populates_via_hook`.
+#[ignore = "transport role-cache removed (de-role); trait peer_for_role/register_with_cluster_state stub + this test removed by de-role-trait #136"]
 #[tokio::test(flavor = "current_thread")]
 async fn role_cache_populates_via_hook() {
     let (transport, _outgoing, _tap, _reg_sink) =
@@ -158,6 +159,7 @@ async fn role_cache_populates_via_hook() {
 /// tests). The seed lets the receiver-side Case-A unwrap treat a
 /// hypothetical inbound `RoleAddressed { intended_role: Self_ }`
 /// envelope as "local" rather than dropping it.
+#[ignore = "transport role-cache removed (de-role); Role::Self_ loopback is an edge concern now — de-role-trait #136"]
 #[tokio::test(flavor = "current_thread")]
 async fn role_self_cache_populated_at_init() {
     let (transport, _outgoing, _tap, _reg_sink) =
@@ -173,6 +175,7 @@ async fn role_self_cache_populated_at_init() {
 /// unwrap happens at the receiver (which this transport's local
 /// view never observes); here we assert that the wire-side
 /// envelope reaches the expected secondary's writer.
+#[ignore = "transport role-cache removed (de-role); Address::Role resolution moved to coordinator edge (A0) — de-role-trait #136"]
 #[tokio::test(flavor = "current_thread")]
 async fn send_role_primary_routes_via_cache() {
     let (mut transport, mut sec_a_rx, mut sec_b_rx, _tap) = fixture();
@@ -199,6 +202,7 @@ async fn send_role_primary_routes_via_cache() {
 /// Cold-cache `Address::Role(_)` send returns the contract Err
 /// the trait documents — "Role" and "cache" both appear in the
 /// message. Same shape as the channel-transport equivalent.
+#[ignore = "transport role-cache removed (de-role); Address::Role resolution moved to coordinator edge (A0) — de-role-trait #136"]
 #[tokio::test(flavor = "current_thread")]
 async fn send_role_unresolved_returns_err() {
     let (mut transport, _sec_a_rx, _sec_b_rx, _tap) = fixture();
@@ -257,6 +261,7 @@ async fn peer_count_reflects_outgoing_table() {
 /// because the Step-3 `send` default-impl uses this to stamp
 /// `RoleAddressed.sender_id`; the wire path's `decide_role_addressed`
 /// at the receiver matches against THIS id.
+#[ignore = "transport local_id() override removed (de-role); local id is Router-internal now — de-role-trait #136 removes the trait method + this test"]
 #[test]
 fn local_id_reflects_constructor_arg() {
     let (transport, _outgoing, _tap, _reg_sink) =
