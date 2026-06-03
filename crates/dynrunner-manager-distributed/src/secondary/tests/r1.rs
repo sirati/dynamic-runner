@@ -374,7 +374,7 @@ async fn r1_no_mesh_rebuild_during_arming() {
 /// in. Pre-fix, the secondary hung in `wait_for_setup`'s blocking
 /// recv for ~6min (transport retries) before SLURM container
 /// teardown reaped it. Post-fix, the orchestration-level
-/// `setup_deadline` cancels the setup future and the secondary
+/// `unconfigured_deadline` cancels the setup future and the secondary
 /// exits cold with a clear error.
 ///
 /// Test shape: drop the primary tx end immediately and use
@@ -404,7 +404,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             // simulating the asm-dataset-nix T7 scenario where the primary
             // is unreachable and never speaks. Returning None hits
             // `wait_for_setup`'s existing `primary disconnected during
-            // setup` arm in milliseconds, well before setup_deadline
+            // setup` arm in milliseconds, well before unconfigured_deadline
             // fires; we want to exercise the deadline path.
             let (_pri_to_sec_tx, pri_to_sec_rx) =
                 tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
@@ -479,7 +479,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 "expected cold-start identifier in error, got: {err}"
             );
 
-            // Should reap promptly — at most setup_deadline + slack
+            // Should reap promptly — at most unconfigured_deadline + slack
             // (worker init, log emission, future cancellation cost).
             // 2s is generous; the actual elapsed is typically <250ms.
             assert!(
@@ -492,7 +492,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
 
 /// T-cold-start-with-peers (#25 negative branch):
 /// When the primary URL is unreachable BUT peers HAVE dialled in,
-/// the secondary still exits on setup_deadline — but with a
+/// the secondary still exits on unconfigured_deadline — but with a
 /// different error class than the no-peers branch. This is the
 /// "primary unresponsive but mesh formed" scenario, which is
 /// distinct from "everyone is gone" and should be operator-

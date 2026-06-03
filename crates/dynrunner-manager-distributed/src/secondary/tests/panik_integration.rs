@@ -3,7 +3,8 @@
 //!
 //! Single concern of this file: pin the pipeline
 //! "watcher signal arrives → coordinator reacts (announce departure or
-//! not, per source) → coordinator returns `RunOutcome::PanikShutdown`".
+//! not, per source) → coordinator returns `RunOutcome::Terminal`
+//! projecting to `SecondaryTerminal::Panik`".
 //!
 //! A node observing its OWN panik signal announces its departure from
 //! the mesh via a self-authored
@@ -11,19 +12,22 @@
 //! SelfDeparture(reason) }`. That announcement is observability-only —
 //! peers LOG it and mark the node Dead; it does NOT cancel cluster work
 //! or terminate the run on peers. The departing node tears down its own
-//! workers and exits locally with `RunOutcome::PanikShutdown`.
+//! workers and exits locally with `RunOutcome::Terminal` (projecting to
+//! `SecondaryTerminal::Panik`).
 //!
 //! Two source-paths are covered, mirroring the watcher's two trigger
 //! sources (`panik_watcher::PanikWatcherConfig::paths` and
 //! `::listen_for_sigterm`):
-//!   - **File source** — `panik_file_source_broadcasts_and_returns_panik_shutdown`
+//!   - **File source** — `panik_file_source_broadcasts_and_returns_terminal_panik`
 //!     pins "matched filesystem path → self-authored
 //!     `ClusterMutation::PeerRemoved { SelfDeparture }` reaches the
-//!     primary wire, `RunOutcome::PanikShutdown` returned".
-//!   - **SIGTERM source** — `panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown`
+//!     primary wire, `RunOutcome::Terminal` (projecting to
+//!     `SecondaryTerminal::Panik`) returned".
+//!   - **SIGTERM source** — `panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik`
 //!     pins "SIGTERM sentinel path → NO departure announcement on the
-//!     wire, local-only teardown, `RunOutcome::PanikShutdown` still
-//!     returned with the SIGTERM sentinel path and per-host reason".
+//!     wire, local-only teardown, `RunOutcome::Terminal` (projecting to
+//!     `SecondaryTerminal::Panik`) still returned with the SIGTERM
+//!     sentinel path and per-host reason".
 //!     A single host's SIGTERM is a purely local event and the mesh
 //!     stays free to continue / re-elect.
 //!
@@ -54,13 +58,14 @@ use super::super::*;
 ///   1. the secondary emits a `ClusterMutation` carrying a
 ///      self-authored `PeerRemoved { SelfDeparture }` on the primary
 ///      transport,
-///   2. `run_until_setup_or_done` returns `RunOutcome::PanikShutdown`
-///      with the matched path the watcher carried.
+///   2. `run_until_setup_or_done` returns `RunOutcome::Terminal`
+///      (projecting to `SecondaryTerminal::Panik`) with the matched path
+///      the watcher carried.
 ///
 /// SIGTERM source has the inverted assertion shape (NO announcement)
 /// and is covered by the sibling test below.
 #[tokio::test(flavor = "current_thread")]
-async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
+async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -302,9 +307,9 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
 /// [`crate::panik_watcher::SIGTERM_SENTINEL_PATH`] (the documented
 /// sentinel the watcher's SIGTERM arm emits). Assertions are
 /// inverted relative to the file-source test:
-///   1. `run_until_setup_or_done` STILL returns
-///      `RunOutcome::PanikShutdown` (the local-teardown side of the
-///      panik contract is unchanged), with `matched_path == <SIGTERM>`
+///   1. `run_until_setup_or_done` STILL returns `RunOutcome::Terminal`
+///      (projecting to `SecondaryTerminal::Panik`; the local-teardown side
+///      of the panik contract is unchanged), with `matched_path == <SIGTERM>`
 ///      and the per-host reason string `"panik SIGTERM (per-host)"`.
 ///   2. NO self-authored `ClusterMutation::PeerRemoved { SelfDeparture }`
 ///      appears on the primary wire — `handle_panik_signal` skips
@@ -319,7 +324,7 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
 /// so the primary-wire absence is sufficient evidence that the call
 /// did not fire (rather than fired with a different transport).
 #[tokio::test(flavor = "current_thread")]
-async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
+async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local

@@ -101,7 +101,8 @@ pub enum ClusterMutation<I> {
     /// Receivers set a sticky `run_aborted: Option<String>` ledger
     /// field (mirroring `run_complete`). The secondary's
     /// `process_tasks` loop checks `run_aborted()` BEFORE the
-    /// `run_complete()` break and returns `RunOutcome::Aborted`, which
+    /// `run_complete()` break and returns `RunOutcome::Terminal`
+    /// (projecting to `SecondaryTerminal::Aborted`), which
     /// the secondary / observer PyO3 wrappers translate to
     /// `std::process::exit(1)`. The primary itself surfaces a structured
     /// `RunError` at its own PyO3 boundary. Broadcast over the SAME

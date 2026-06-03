@@ -287,7 +287,8 @@ impl<I: Identifier> ClusterState<I> {
     /// failure twin of [`Self::run_complete`]: sticky monotonic — once
     /// `Some`, never clears. Secondaries check this BEFORE the
     /// `run_complete` break in `process_tasks` and exit non-zero
-    /// (`RunOutcome::Aborted`); the `mesh_watchdog` disarms on it too.
+    /// (`RunOutcome::Terminal` projecting to `SecondaryTerminal::Aborted`);
+    /// the `mesh_watchdog` disarms on it too.
     pub fn run_aborted(&self) -> Option<&str> {
         self.run_aborted.as_deref()
     }

@@ -658,7 +658,8 @@ async fn fake_primary_abort(
     // a channel-closed recv — production-faithful (dropping the uplink
     // alone is NOT the run-over signal; the CRDT flag is). The task
     // returns (dropping `to_secondary`) only once the secondary has
-    // gone quiet, which happens after it returns `RunOutcome::Aborted`.
+    // gone quiet, which happens after it returns `RunOutcome::Terminal`
+    // (projecting to `SecondaryTerminal::Aborted`).
     to_secondary
         .send(DistributedMessage::ClusterMutation {
             sender_id: "primary".into(),
@@ -676,10 +677,11 @@ async fn fake_primary_abort(
 }
 
 /// `RunAborted` apply → `run_aborted()` set → `process_tasks` returns
-/// `RunOutcome::Aborted` (checked BEFORE the `run_complete()` break, and
-/// without waiting for any task drain — a hard shutdown).
+/// `RunOutcome::Terminal` (projecting to `SecondaryTerminal::Aborted`),
+/// checked BEFORE the `run_complete()` break, and without waiting for any
+/// task drain — a hard shutdown.
 #[tokio::test(flavor = "current_thread")]
-async fn run_aborted_yields_run_outcome_aborted() {
+async fn run_aborted_yields_terminal_aborted() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {

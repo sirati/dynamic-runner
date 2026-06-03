@@ -24,7 +24,8 @@
 //!    [`SecondaryCoordinator::restore_from_snapshot_and_skip_setup`]
 //!    to install the snapshot AND latch `setup_phase_completed=true`,
 //!    then run [`SecondaryCoordinator::run_until_setup_or_done`]
-//!    until it returns `RunOutcome::Done`.
+//!    until it returns `RunOutcome::Terminal` (the clean-finish case
+//!    projecting to `SecondaryTerminal::Done`).
 //!
 //! # Module boundary
 //!
