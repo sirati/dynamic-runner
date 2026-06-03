@@ -3,7 +3,9 @@ use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
+use dynrunner_protocol_primary_secondary::{
+    Destination, DistributedMessage, PeerTransport, SendTarget, resolve_destination,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 /// Wire marker used when a secondary's worker is killed by a no-fault
@@ -28,43 +30,94 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// THE egress edge: resolve a typed [`Destination`] to a concrete
+    /// transport target by reading this coordinator's own role facts,
+    /// then dispatch the `PeerId`-only transport. The transport never
+    /// resolves a role.
+    ///
+    /// Resolution reads `cluster_state.current_primary()` (warm after a
+    /// `PrimaryChanged`) with the bootstrap-primary id as the cold-cache
+    /// fallback — exactly the by-id `Destination::Primary` resolution
+    /// that supersedes the deleted transport-resident
+    /// `Address::Role(Primary)` lookup. `Secondary`/`Observer`
+    /// destinations resolve to their carried host id; `All` is the mesh
+    /// broadcast. A resolved host id equal to this node's own id is
+    /// [`SendTarget::Loopback`].
+    pub(in crate::secondary) async fn send_to(
+        &mut self,
+        dst: Destination,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        let target = resolve_destination(
+            dst,
+            self.cluster_state.current_primary(),
+            self.bootstrap_primary_id.as_deref(),
+            &self.config.secondary_id,
+        )
+        .ok_or_else(|| {
+            "Destination::Primary unresolvable: no current primary in the role table and no \
+             bootstrap primary link — no route to the primary"
+                .to_string()
+        })?;
+        match target {
+            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
+            SendTarget::Broadcast => self.transport.broadcast(msg).await,
+            // Loopback: the resolved primary host id == this node's id —
+            // a self-promoted secondary that transiently still addresses
+            // `Destination::Primary` while handing off to its co-located
+            // primary. REAL in-process delivery to that co-located
+            // primary coordinator is the multi-role-host single-transport
+            // concern (A8); until it lands, the parked-primary
+            // composition is itself gated off (the A8 `unimplemented!()`
+            // in `activate_co_located_primary`'s wiring), so there is no
+            // local primary coordinator to receive this frame. A no-op
+            // is faithful — the authoritative terminal/ledger state this
+            // frame would carry is reconciled via the CRDT broadcast the
+            // promoted primary originates, not this self-report. Do NOT
+            // fall back to `send_to_peer(self_id)` (NoRoute — a node has
+            // no self-connection).
+            SendTarget::Loopback => {
+                tracing::debug!(
+                    "Destination::Primary resolved to self; in-process loopback delivery to a \
+                     co-located primary is owned by the multi-role-host single-transport leaf — \
+                     dropping (no co-located primary composed yet)"
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Send an operational frame to whoever currently holds the
     /// primary role, feeding the failover-health probe on a no-route
     /// result.
     ///
     /// This is the single chokepoint for every primary-bound
     /// operational send (TaskRequest, terminal TaskComplete/TaskFailed,
-    /// Keepalive, MeshReady). Routing is fully opaque: the unified
-    /// transport resolves `Address::Role(Role::Primary)` to loopback /
-    /// uplink / a promoted peer; the manager never inspects which.
+    /// Keepalive, MeshReady). It addresses [`Destination::Primary`] and
+    /// the edge resolver ([`Self::send_to`]) picks the concrete peer —
+    /// the current primary, the bootstrap primary while cold, or
+    /// loopback for a promoted self; the manager never inspects which.
     ///
     /// # Failover-health probe (the fast path)
     ///
-    /// A clean `Err` from `send` means "no route to the primary":
-    /// the bootstrap uplink has closed AND no peer holds `Role::Primary`
-    /// (cache cold). That is the fast-failover signal — it arms the
-    /// count-axis of `PrimaryLink` immediately, well before the
-    /// keepalive time-axis would. The probe is transport-AGNOSTIC: the
-    /// manager reacts only to a send RESULT, never to `peer_count()` or
-    /// a recv-None branch or any locality inspection. A successful send
-    /// (loopback, healthy uplink, or a reachable promoted peer) resets
-    /// the health window via the normal `record_primary_message`
-    /// path when the primary's reply / keepalive arrives.
+    /// A clean `Err` from the send means "no route to the primary": the
+    /// role table has no current primary AND no bootstrap link resolves.
+    /// That is the fast-failover signal — it arms the count-axis of
+    /// `PrimaryLink` immediately, well before the keepalive time-axis
+    /// would. The probe is transport-AGNOSTIC: the manager reacts only
+    /// to a send RESULT, never to `peer_count()` or a recv-None branch
+    /// or any locality inspection. A successful send resets the health
+    /// window via the normal `record_primary_message` path when the
+    /// primary's reply / keepalive arrives.
     ///
     /// On a breach the same arming the deleted recv-None branch used is
     /// applied: backdate `primary_last_seen` so the next
     /// `run_election_tick` enters Suspecting.
-    ///
-    /// Note the deliberate name: this carries NO locality logic (unlike
-    /// the removed `send_to_current_primary` router, which branched
-    /// loopback-vs-wire on the old `PrimaryLink.current_primary`). It
-    /// just sends to the primary role opaquely and notes a
-    /// failover-health breach if the role is unreachable.
     pub(in crate::secondary) async fn send_to_primary(
         &mut self,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        let result = self.transport.send(Address::Role(Role::Primary), msg).await;
+        let result = self.send_to(Destination::Primary, msg).await;
         if let Err(ref e) = result {
             // No route to the primary — feed the failover-health
             // probe. `record_recv_failure` anchors the failure window
@@ -74,8 +127,8 @@ where
             if armed {
                 tracing::warn!(
                     error = %e,
-                    "no route to primary (uplink closed, no promoted peer); \
-                     failover-health threshold breached — arming election"
+                    "no route to primary (resolved primary peer unreachable / no primary \
+                     resolvable); failover-health threshold breached — arming election"
                 );
                 let backdate = self
                     .config
@@ -227,13 +280,13 @@ where
     /// role.
     ///
     /// A pure capacity hint: rate-limited per worker by `primary_link.
-    /// should_request_now`, then dispatched as a single
-    /// `Address::Role(Role::Primary)` send through the opaque transport
-    /// (the request routes to the uplink, a promoted peer, or loopback
-    /// depending on the role cache — the manager never branches on
-    /// locality). Since the P2 transport collapse this no longer needs a
-    /// `WorkerFactory`: the request never spawns or restarts a worker, it
-    /// only advertises the worker's available capacity to the authority.
+    /// should_request_now`, then dispatched through `send_to_primary`
+    /// (the [`Destination::Primary`] egress edge resolves the concrete
+    /// primary peer — current or bootstrap — and the manager never
+    /// branches on locality). Since the P2 transport collapse this no
+    /// longer needs a `WorkerFactory`: the request never spawns or
+    /// restarts a worker, it only advertises the worker's available
+    /// capacity to the authority.
     pub(super) async fn request_task_for_worker(
         &mut self,
         worker_id: WorkerId,

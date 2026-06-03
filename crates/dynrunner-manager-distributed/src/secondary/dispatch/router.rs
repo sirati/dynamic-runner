@@ -18,7 +18,7 @@ use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport,
+    ClusterMutation, Destination, DistributedMessage, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -336,13 +336,14 @@ where
                         error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
                     };
-                    // Report to the primary role only — the authority
-                    // owns mesh propagation. Routing across a primary
-                    // changeover is opaque: `Address::Role(Role::Primary)`
-                    // resolves to whichever node currently holds the
-                    // role. The promoted peer's
-                    // `handle_primary_peer_rejection` recovery is
-                    // hash-keyed, so the single report suffices.
+                    // Report to the primary only — the authority owns
+                    // mesh propagation. Routing across a primary
+                    // changeover is opaque: `send_to_primary`
+                    // (`Destination::Primary`) resolves at the egress
+                    // edge to whichever node currently holds the role.
+                    // The promoted peer's `handle_primary_peer_rejection`
+                    // recovery is hash-keyed, so the single report
+                    // suffices.
                     self.send_to_primary(msg).await?;
                 }
                 Ok(())
@@ -538,8 +539,10 @@ where
                     snapshot_json,
                 };
                 if let Err(e) = self
-                    .transport
-                    .send(Address::Peer(sender_id.clone()), response)
+                    .send_to(
+                        Destination::Secondary(PeerId::from(sender_id.clone())),
+                        response,
+                    )
                     .await
                 {
                     tracing::warn!(

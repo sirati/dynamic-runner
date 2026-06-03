@@ -222,17 +222,18 @@ pub(crate) struct InFlightEntry<I: Identifier> {
 
 /// The primary coordinator: orchestrates work across secondaries.
 ///
-/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send/recv
-/// crosses this single mesh-transport boundary — `Address::Peer(id)`
+/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send goes
+/// through the [`Self::send_to`] egress edge, which resolves a typed
+/// `Destination` to a concrete peer-id — `Destination::Secondary(id)`
 /// for per-secondary writes (initial assignment, task fan-out),
-/// `Address::Broadcast(Scope::AllSecondaries)` for the keepalive +
-/// CRDT fan-out, `recv_peer()` for the unified inbound. The transport
-/// is real-by-construction in every primary construction path
+/// `Destination::All` for the keepalive + CRDT fan-out — then calls the
+/// `PeerId`-only transport; `recv_peer()` is the unified inbound. The
+/// transport is real-by-construction in every primary construction path
 /// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
 /// in-process / tests, `ColocatedPrimaryTransport` for the parked
 /// failover authority) — there is no no-op send path and no per-site
 /// "which transport is real" hazard. This mirrors the secondary side's
-/// collapse onto a single `Tr: PeerTransport` (`UnifiedSecondaryTransport`).
+/// collapse onto a single `Tr: PeerTransport`.
 pub struct PrimaryCoordinator<
     Tr: PeerTransport<I>,
     S: Scheduler<I>,
@@ -869,20 +870,13 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // through the dispatcher channel from this point onward.
         this.cluster_state
             .install_task_completed_sender(task_completed_tx);
-        // Mirror `SecondaryCoordinator::new`'s registration: attach the
-        // peer transport's write-through `RoleTable` cache to the
-        // authoritative `cluster_state.role_table`. The hook fires on
-        // every applied `PrimaryChanged` mutation; the cache serves
-        // Step 3's `Address::Role(_)` dispatch on the send hot path.
-        // Transports that don't override `register_with_cluster_state`
-        // (`NoPeerTransport`, the `NoPeers` test stub) get the default
-        // no-op — safe by construction. `Role::Self_` is seeded by
-        // the transport's own constructor (`new_role_cache` +
-        // `seed_self_role` for `ChannelPeerTransport` and
-        // `PeerNetwork`), not here, because that's a strictly
-        // transport-local fact.
-        this.transport
-            .register_with_cluster_state(&mut this.cluster_state);
+        // NOTE: no transport role-cache attachment (mirrors
+        // `SecondaryCoordinator::new`). `Destination::Primary` is
+        // resolved at THIS edge (`Self::send_to` reads
+        // `cluster_state.current_primary()` with the primary's own
+        // `node_id` as the bootstrap fallback); the transport is
+        // `PeerId`-only and never mirrors the role table. The former
+        // `transport.register_with_cluster_state(..)` wiring is removed.
         // Subscribe the primary-side "important" (LLM-wake-worthy)
         // emission for `PrimaryChanged` to the same role-change hook
         // fabric. Self-contained observability concern: it reads only
@@ -892,6 +886,59 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // co-located primary coordinator, so the hook rides promotion.
         super::important_events::register_primary_changed_important_hook(&mut this.cluster_state);
         this
+    }
+
+    /// THE egress edge: resolve a typed
+    /// [`dynrunner_protocol_primary_secondary::Destination`] to a
+    /// concrete transport target by reading this coordinator's own role
+    /// facts, then dispatch the `PeerId`-only transport. The transport
+    /// never resolves a role.
+    ///
+    /// Resolution reads `cluster_state.current_primary()` with this
+    /// primary's own `config.node_id` as the bootstrap fallback (the
+    /// submitter primary IS the bootstrap primary), so
+    /// `Destination::Primary` is always resolvable on the primary.
+    /// `Secondary`/`Observer` destinations resolve to their carried host
+    /// id; `All` is the mesh broadcast. A resolved host id equal to this
+    /// node's own id is [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`].
+    pub(super) async fn send_to(
+        &mut self,
+        dst: dynrunner_protocol_primary_secondary::Destination,
+        msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
+    ) -> Result<(), String> {
+        use dynrunner_protocol_primary_secondary::{SendTarget, resolve_destination};
+        let target = resolve_destination(
+            dst,
+            self.cluster_state.current_primary(),
+            Some(&self.config.node_id),
+            &self.config.node_id,
+        )
+        .ok_or_else(|| {
+            "Destination unresolvable: no current primary in the role table".to_string()
+        })?;
+        match target {
+            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
+            SendTarget::Broadcast => self.transport.broadcast(msg).await,
+            // Loopback: the resolved primary host id == this primary's
+            // own id. The one reachable case is the demoted-vs-live relay
+            // arm (`task/request.rs`): a LIVE primary that couldn't
+            // assign a `TaskRequest` locally falls through to relay it to
+            // `Destination::Primary` — which is itself. Re-delivering the
+            // request to the node already holding (and unable to assign)
+            // it is a benign no-op: the task stays in this primary's pool
+            // and the secondary retries on its next backoff tick. This is
+            // faithful to the prior behaviour, where the same self-relay
+            // resolved to `send_to_peer(own_id)` → NoRoute → swallowed.
+            // Real in-process loopback to a co-located own-secondary is
+            // the multi-role-host single-transport concern (A8).
+            SendTarget::Loopback => {
+                tracing::debug!(
+                    "Destination::Primary resolved to self (live-primary self-relay); no-op — \
+                     the message is already at this host"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be

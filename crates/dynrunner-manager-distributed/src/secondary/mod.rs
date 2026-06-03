@@ -112,11 +112,15 @@ pub(super) struct PendingFirstBind<I: Identifier> {
 /// workers. It reports completions back and requests more work.
 ///
 /// Generic over:
-/// - `Tr`: the unified transport (a `PeerTransport<I>`). One opaque
-///   handle: the manager addresses by [`Address`] and never branches
-///   on transport locality. Routing (local-vs-remote primary AND the
-///   promotion re-route) lives entirely inside the transport — see
-///   `dynrunner_transport_tunnel::UnifiedSecondaryTransport`.
+/// - `Tr`: the single `PeerId`-keyed mesh transport (a
+///   `PeerTransport<I>`). One opaque handle: the manager addresses by
+///   typed `Destination` and the egress edge ([`Self::send_to`])
+///   resolves it to a concrete peer-id (current/bootstrap primary,
+///   addressed secondary/observer, or broadcast). The transport never
+///   resolves a role — it is delivered a `PeerId`. The promotion
+///   re-route is implicit: `current_primary()` updates on every
+///   `PrimaryChanged`, so the next `Destination::Primary` resolves to
+///   the new holder.
 /// - `M`: manager endpoint for worker communication
 /// - `S`: scheduler
 /// - `E`: memory estimator
@@ -131,14 +135,28 @@ where
 {
     config: SecondaryConfig,
 
-    /// The single opaque transport handle. Every operational send is
-    /// an [`Address`]-addressed `transport.send(..)`; every inbound
-    /// frame arrives via `transport.recv_peer()` (which merges the
-    /// uplink + mesh streams internally). The manager never names a
-    /// `primary_transport`/`peer_transport`, never reads
-    /// `peer_count()` for routing, and never branches on
-    /// transport-locality — the unified transport owns all of that.
+    /// The single opaque `PeerId`-keyed mesh transport handle. Every
+    /// operational send goes through the [`Self::send_to`] egress edge,
+    /// which resolves a typed [`dynrunner_protocol_primary_secondary::Destination`]
+    /// to a concrete peer-id (or broadcast/loopback) by reading this
+    /// coordinator's own role facts, then calls the transport purely
+    /// by-id — the transport never resolves a role. Every inbound frame
+    /// arrives via `transport.recv_peer()`. The manager never names a
+    /// `primary_transport`/`peer_transport`, never reads `peer_count()`
+    /// for routing, and never branches on transport-locality.
     transport: Tr,
+
+    /// The peer-id of the primary this secondary dialled at bootstrap
+    /// (the conventional `"primary"`), set via
+    /// [`Self::set_bootstrap_primary_id`] alongside the mesh-link
+    /// registration. It is the edge's cold-cache fallback when resolving
+    /// [`dynrunner_protocol_primary_secondary::Destination::Primary`]
+    /// before any `PrimaryChanged` warms `cluster_state.current_primary()`
+    /// — the by-id resolution that lets setup frames route to the
+    /// dialled primary during the pre-announcement window. `None` for a
+    /// secondary with no bootstrap primary link (e.g. channel-only unit
+    /// fixtures that never send to the primary before a `PrimaryChanged`).
+    bootstrap_primary_id: Option<String>,
 
     scheduler: S,
     estimator: E,
@@ -430,9 +448,8 @@ where
     /// by the spawned announcer task. The matching receiver is
     /// drained by the operational `select!` arm in `process_tasks`,
     /// which dequeues each [`crate::observer::announcer::AnnouncerOutboxItem`]
-    /// and forwards it onto `transport.send(Address::Role(Role::Primary),
-    /// msg)`, returning the outcome through the item's `reply`
-    /// oneshot.
+    /// and forwards it onto `send_to(Destination::Primary, msg)`,
+    /// returning the outcome through the item's `reply` oneshot.
     ///
     /// `None` outside an active observer wiring — non-observer
     /// secondaries (and observer coordinators whose caller hasn't

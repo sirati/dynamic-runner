@@ -1,5 +1,7 @@
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Role};
+use dynrunner_protocol_primary_secondary::{
+    Destination, DistributedMessage, PeerId, PeerTransport,
+};
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 
 use crate::primary::PrimaryCoordinator;
@@ -141,8 +143,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         // the operator-facing symptom of cumulative
                         // leaks from this and the sibling path.
                         if let Err(send_err) = self
-                            .transport
-                            .send(Address::Peer(sec_id.clone()), assignment_msg)
+                            .send_to(Destination::Secondary(PeerId::from(sec_id.clone())), assignment_msg)
                             .await
                         {
                             tracing::warn!(
@@ -214,30 +215,29 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // re-issues on its next backoff tick, but until then the
             // request is silently dropped.
             //
-            // Step 5 collapses the guard structurally: addressing by
-            // role (`Address::Role(Role::Primary)`) resolves through
-            // the single `transport`'s write-through `RoleTable` cache,
-            // which `cluster_state` updates on every `PrimaryChanged`
-            // apply (post-promotion the cache points at the promoted
-            // peer's id; pre-promotion it's cold and `send` returns
-            // Err, which we silently swallow — same observable
+            // The guard collapses structurally: addressing
+            // `Destination::Primary` resolves at the egress edge
+            // (`Self::send_to`) through `cluster_state.current_primary()`
+            // — which every `PrimaryChanged` apply updates. Post-promotion
+            // it resolves to the promoted peer's id (a routable mesh peer
+            // reached by-id); pre-promotion it resolves to this node's
+            // own `node_id` (this IS the live primary, so a live primary
+            // assigns locally above and never reaches this relay arm).
+            // The Err path is silently swallowed — same observable
             // behaviour as the pre-Step-5 `self.primary_id.is_none()`
-            // skip). The wire frame is `RoleAddressed { intended_role:
-            // Primary, payload: msg, .. }`; the receiver's Step-4
-            // relay-and-hint absorbs the rare case where THIS sender's
-            // cache is stale relative to the receiver's view.
+            // skip.
             //
             // The demoted-primary path stays correct without a
-            // `self.demoted` special case: role addressing routes via
-            // the mesh-level peer link (still alive across promotion
-            // per `feedback_mesh_independent_of_role_and_membership.md`)
+            // `self.demoted` special case: by-id routing rides the
+            // mesh-level peer link (still alive across promotion per
+            // `feedback_mesh_independent_of_role_and_membership.md`)
             // regardless of who's authoritative.
             if !assigned
-                && let Err(e) = self.transport.send(Address::Role(Role::Primary), msg).await
+                && let Err(e) = self.send_to(Destination::Primary, msg).await
             {
                 tracing::debug!(
                     error = %e,
-                    "primary-bound relay via Address::Role(Primary) dropped; \
+                    "primary-bound relay via Destination::Primary dropped; \
                      secondary will retry on its next backoff tick"
                 );
             }

@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
-    ZipFileAssignment,
+    Destination, DistributedMessage, PeerId, PeerTransport, StagedFileRecord, WorkerReadyInfo,
+    ZipBinaryEntry, ZipFileAssignment,
 };
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler};
 
@@ -259,8 +259,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport
-                .send(Address::Peer(secondary_id.clone()), msg)
+            self.send_to(Destination::Secondary(PeerId::from(secondary_id.clone())), msg)
                 .await?;
 
             // Send succeeded: originate the CRDT `Pending → InFlight`
@@ -359,8 +358,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 pre_staged_mode: true,
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport
-                .send(Address::Peer(secondary_id.clone()), msg)
+            self.send_to(Destination::Secondary(PeerId::from(secondary_id.clone())), msg)
                 .await?;
         }
 

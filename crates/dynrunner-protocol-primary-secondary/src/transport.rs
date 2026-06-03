@@ -418,14 +418,16 @@ pub trait PeerTransport<I: Identifier> {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
 
-            // Step 3+4: send the request. We use Address::Peer
-            // (unicast to a reachable seed) rather than Address::Role
-            // (Role::Primary) — see method-doc rationale (cold-start
-            // role cache is empty). Iterate seed in order; the first
-            // send_to_peer that returns Ok stops the loop. Send-side
-            // errors (`no route`, `outgoing channel closed`) are
-            // tolerated and we move on to the next candidate so a
-            // partially-stale seed (one of the peers retired between
+            // Step 3+4: send the request. Unicast by-id to a reachable
+            // seed — the joiner's cold-start role table can't resolve
+            // `Destination::Primary` yet (no `PrimaryChanged` observed),
+            // and any peer can answer per dispatch.rs's snapshot handler.
+            // We address the transport directly by peer-id (no role
+            // resolution needed — the id IS the host). Iterate seed in
+            // order; the first `send_to_peer` that returns Ok stops the
+            // loop. Send-side errors (`no route`, `outgoing channel
+            // closed`) are tolerated and we move on to the next candidate
+            // so a partially-stale seed (one of the peers retired between
             // file-write and this dial) still bootstraps via the
             // remaining live peers.
             let mut send_err: Option<String> = None;
@@ -443,7 +445,7 @@ pub trait PeerTransport<I: Identifier> {
                     is_observer,
                 };
                 match self
-                    .send(Address::Peer(peer.secondary_id.clone()), request)
+                    .send_to_peer(&peer.secondary_id, request)
                     .await
                 {
                     Ok(()) => {

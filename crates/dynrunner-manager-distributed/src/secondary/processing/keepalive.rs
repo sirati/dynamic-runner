@@ -12,7 +12,7 @@ use std::time::Instant;
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, KeepaliveRole, PeerTransport, Scope,
+    Destination, DistributedMessage, KeepaliveRole, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -115,9 +115,6 @@ where
         if self.peer_mesh_degraded {
             return;
         }
-        let _ = self
-            .transport
-            .send(Address::Broadcast(Scope::Mesh), msg)
-            .await;
+        let _ = self.send_to(Destination::All, msg).await;
     }
 }
