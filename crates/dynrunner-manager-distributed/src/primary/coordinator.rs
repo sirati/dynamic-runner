@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerId, PeerTransport,
+    ClusterMutation, DistributedMessage, MessageType, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -15,6 +15,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use super::command_channel::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
 use super::config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 use super::error::RunError;
+use super::lifecycle::RelocationOutcome;
 use super::preferred_secondaries;
 use super::respawn::{
     RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest, SecondarySpawner,
@@ -2459,31 +2460,53 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready(&mut command_rx).await?;
 
-        // Activate THIS node's co-located primary. It originates the
-        // uniform `PrimaryChanged { new = self }` announcement so every
-        // replica resolves `Role::Primary` to this now-routable mesh
-        // peer. `wait_for_mesh_ready` above already held until the peer
-        // mesh settled, so the announce warms each replica's role cache
-        // to a real connection and cross-node dispatch never routes into
-        // a still-forming mesh. See `activate_local_primary`.
-        self.activate_local_primary().await?;
-
         // Put the command-channel receiver back on `self` so
         // `operational_loop`'s own `self.command_rx.take()` picks
-        // it up again. Symmetric with the take at the top of the
-        // pre-loop chain.
+        // it up again (on the paths that run it). Symmetric with the
+        // take at the top of the pre-loop chain. The observer tail does
+        // not consult `command_rx`; restoring it here keeps the field's
+        // ownership symmetric across every fork branch.
         self.command_rx = command_rx;
 
-        // Hand off to the shared operational-loop-and-finalize tail.
-        // Bootstrap (this path) and failover (`run_parked`) converge
-        // here: both run the same operational loop + retry passes +
-        // accounting + RunComplete broadcast. The only difference is
-        // the seeding that precedes it (bootstrap built the pool from
-        // `binaries`; the parked path hydrates from the replicated
-        // CRDT at activation) — `total` is captured from
-        // `self.total_tasks` so the accounting is identical regardless
-        // of which path seeded the pool.
-        self.run_operational_and_finalize(total).await
+        // Bootstrap hand-off fork. The submitter bootstrapped the mesh as
+        // the temporary epoch-1 primary; now it relocates FULL authority
+        // to a chosen compute peer and becomes an observer, so the cluster
+        // never splits primary work across two hosts and is never pinned
+        // to the submitter (invariant 4). The fork is on
+        // `select_bootstrap_primary` (the deterministic lowest-id
+        // candidate policy):
+        //
+        //   * `None` (degenerate single-node / all-observer fleet) — there
+        //     is no peer to hand off to, so the submitter STAYS the full
+        //     primary: `activate_local_primary` (asserts epoch-2 self,
+        //     warms the role cache, emits a keepalive) then the shared
+        //     operational-loop-and-finalize tail, UNCHANGED from the
+        //     pre-fork bootstrap behaviour. This is the ONLY path that
+        //     keeps `activate_local_primary` on the submitter.
+        //   * `Some(chosen)` — relocate authority onto `chosen`
+        //     (`relocate_primary_to` originates epoch-2 PrimaryChanged{
+        //     chosen}; the submitter's own apply drops `Role::Primary`).
+        //     On a successful relocation the submitter enters the observer
+        //     tail (`run_as_observer`), which watches the replicated
+        //     `cluster_state` for `RunComplete` and never runs the pool /
+        //     operational loop. If `chosen` evaporated between selection
+        //     and origination, `relocate_primary_to` falls back to local
+        //     primary and the submitter runs the normal operational path
+        //     so it never strands on a vanished candidate.
+        //
+        // `wait_for_mesh_ready` above already held until the peer mesh
+        // settled, so every PrimaryChanged announce (self or chosen) warms
+        // each replica's role cache to a real connection.
+        match self.select_bootstrap_primary() {
+            None => {
+                self.activate_local_primary().await?;
+                self.run_operational_and_finalize(total).await
+            }
+            Some(chosen) => match self.relocate_primary_to(chosen).await? {
+                RelocationOutcome::Relocated => self.run_as_observer().await.map_err(RunError::from),
+                RelocationOutcome::FellBackToLocal => self.run_operational_and_finalize(total).await,
+            },
+        }
     }
 
     /// Shared operational-loop-and-finalize tail. The single mechanism
@@ -2669,6 +2692,198 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         );
 
         Ok(())
+    }
+
+    /// The submitter's observer tail, entered after `relocate_primary_to`
+    /// has handed full primary authority off to a chosen compute peer.
+    ///
+    /// # Concern
+    ///
+    /// Observer-ness is a CAPABILITY set, not a fourth role/FSM
+    /// (invariant 2): post-relocation the submitter holds no
+    /// `Role::Primary`, runs no dispatch pool, and drives no phase
+    /// machine — it only WATCHES the replicated `cluster_state` for the
+    /// authoritative primary's `RunComplete` and returns. It is NOT the
+    /// full-SecondaryCoordinator observer late-joiner
+    /// (`managers/observer_late_joiner/run.rs`); the submitter is
+    /// primary-only with no composed secondary, so this is a thin
+    /// purpose-built select-loop on the PrimaryCoordinator.
+    ///
+    /// # The select
+    ///
+    ///   * `recv_peer` — every inbound frame. ONLY `ClusterMutation`
+    ///     batches are acted on, through the existing RECEIVE-apply path
+    ///     (`handle_cluster_mutation`): apply-only, NEVER re-broadcast,
+    ///     because the observer is not the authority. Any other wire shape
+    ///     (TaskRequest etc.) is ignored — the observer must not assign or
+    ///     coordinate. A `None` (transport inbound closed) ends the watch:
+    ///     no further mutation can arrive, so the run's outcome is frozen.
+    ///   * `setup_promote_deadline` — copied verbatim from the operational
+    ///     loop, gated on `self.setup_pending()`. A hung discovery on the
+    ///     chosen peer (no `TaskAdded` / `TasksSpawned` / `RunComplete`
+    ///     within `config.setup_promote_deadline`) must still terminate the
+    ///     observer rather than hang forever; non-setup-promote relinquish
+    ///     never arms it (the gate is permanently false).
+    ///   * `fleet_dead_timeout` grace — a dead-fleet backstop. The
+    ///     operational loop's fleet-dead arm reads pool/authority state the
+    ///     relinquished observer no longer owns, so it is NOT copied here
+    ///     (RESIDUAL-RISK-#3). Instead the observer's dead-fleet grace is
+    ///     gated purely on the Phase-A role-blind `transport.peer_count()`
+    ///     reaching zero: with every peer gone there is no authority left
+    ///     to ever broadcast `RunComplete`, so after `config.
+    ///     fleet_dead_timeout` of continuous emptiness the observer exits
+    ///     with a stranded-fleet error (reusing the existing grace value,
+    ///     not a new timer).
+    ///
+    /// # Termination
+    ///
+    /// `cluster_state.run_complete()` is checked at the TOP of every
+    /// iteration, so a `RunComplete` the submitter already applied (e.g.
+    /// during the hand-off window) returns `Ok(())` immediately without
+    /// blocking on a recv. The check is epoch-agnostic — a chosen primary
+    /// that died and was superseded by a re-elected epoch-≥3 primary still
+    /// produces the same `RunComplete` the observer watches for.
+    pub(crate) async fn run_as_observer(&mut self) -> Result<(), String> {
+        // `setup_promote_loop_start` is captured locally so the deadline
+        // measures from observer-tail entry — the same shape the
+        // operational loop's deadline arm uses (see `operational_loop`).
+        let setup_promote_loop_start = Instant::now();
+        let setup_promote_deadline_at =
+            setup_promote_loop_start + self.config.setup_promote_deadline;
+        // One-shot gate so the setup-promote arm fires at most once.
+        let mut setup_promote_deadline_consumed = false;
+
+        // Dead-fleet grace clock: the first moment `peer_count()` is
+        // observed at zero. Cleared the moment a peer is present again
+        // (partial fleet survival / re-handshake). Mirrors the operational
+        // loop's `fleet_dead_since` discipline but is gated on the
+        // role-blind transport peer-count, never a pool read.
+        let mut fleet_dead_since: Option<Instant> = None;
+
+        // Inbound-closed latch: once `recv_peer` returns `None` the arm is
+        // disabled (so the select! does not hot-poll a resolved future)
+        // and the loop exits at the top of the next iteration. Mirrors the
+        // operational loop's `transport_closed` shape.
+        let mut transport_closed = false;
+
+        // Dead-fleet poll tick. The dead-fleet grace is accumulated at the
+        // TOP of the loop, but when every peer is gone there is no recv
+        // traffic to re-iterate the loop and re-evaluate it. This tick is
+        // the wake source: it fires on the `fleet_dead_timeout` cadence so
+        // a fully-silent observer still re-checks (and exits) within one
+        // grace window. Cadence-only — it carries no work itself; the
+        // exit decision stays at the top-of-loop check. The immediate
+        // first tick is consumed so the cadence starts one interval out.
+        let mut fleet_dead_poll = tokio::time::interval(self.config.fleet_dead_timeout);
+        fleet_dead_poll.tick().await;
+
+        loop {
+            // Happy-path exit: the authoritative primary declared the run
+            // over (sticky monotonic flag). Checked first so a RunComplete
+            // applied before this loop even entered returns immediately.
+            if self.cluster_state.run_complete() {
+                tracing::info!(
+                    "observer tail: cluster_state.run_complete() — run is over, \
+                     submitter observer exiting"
+                );
+                return Ok(());
+            }
+
+            // Inbound closed: no further mutation can arrive, so the run's
+            // outcome is frozen and the watch cannot make progress. Exit.
+            if transport_closed {
+                tracing::info!(
+                    "observer tail: transport inbound closed; submitter observer exiting"
+                );
+                return Ok(());
+            }
+
+            // Dead-fleet grace (RESIDUAL-RISK-#3): gated purely on the
+            // role-blind `peer_count()`, NOT on the pool the observer
+            // relinquished. With every peer gone, no authority remains to
+            // ever broadcast `RunComplete`.
+            if self.transport.peer_count() == 0 {
+                let now = Instant::now();
+                let since = *fleet_dead_since.get_or_insert(now);
+                let elapsed = now.duration_since(since);
+                if elapsed >= self.config.fleet_dead_timeout {
+                    tracing::error!(
+                        elapsed_s = elapsed.as_secs_f64(),
+                        timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
+                        "observer tail: every peer gone with no RunComplete; \
+                         exiting on the fleet-dead grace"
+                    );
+                    return Err(format!(
+                        "observer fleet-dead: every peer left the mesh and no \
+                         RunComplete was broadcast within {:.1}s",
+                        self.config.fleet_dead_timeout.as_secs_f64()
+                    ));
+                }
+            } else {
+                // Fleet present (or recovered); reset the grace clock so a
+                // later emptiness measures from its own start.
+                fleet_dead_since = None;
+            }
+
+            tokio::select! {
+                msg = self.transport.recv_peer(), if !transport_closed => {
+                    match msg {
+                        Some(m) => {
+                            // Apply-only RECEIVE path: the observer is NOT
+                            // the authority, so it mirrors `ClusterMutation`
+                            // batches into its `cluster_state` (the source
+                            // for `run_complete()` and the replicated result
+                            // ledger) and NEVER re-broadcasts. Every other
+                            // wire shape is ignored — the observer assigns
+                            // no tasks and coordinates nothing.
+                            if let MessageType::ClusterMutation = m.msg_type() {
+                                self.handle_cluster_mutation(m).await;
+                            } else {
+                                tracing::trace!(
+                                    msg_type = ?m.msg_type(),
+                                    "observer tail: ignoring non-ClusterMutation frame"
+                                );
+                            }
+                        }
+                        None => {
+                            transport_closed = true;
+                            tracing::debug!(
+                                "observer tail: transport.recv_peer() returned None; \
+                                 disabling the inbound arm"
+                            );
+                        }
+                    }
+                }
+                // Setup-promote-deadline arm. Copied from the operational
+                // loop (`operational_loop`): gated on `self.setup_pending()
+                // && !setup_promote_deadline_consumed` so it is disabled the
+                // moment discovery seeds the ledger, and re-checked at fire
+                // time so a TaskAdded landing in the same tick is not raced.
+                // The submitter no longer runs the operational loop, so the
+                // backstop against a hung setup-defer discovery must live
+                // here.
+                _ = tokio::time::sleep_until(setup_promote_deadline_at.into()),
+                    if self.setup_pending() && !setup_promote_deadline_consumed => {
+                    setup_promote_deadline_consumed = true;
+                    if self.setup_pending() {
+                        let elapsed = setup_promote_loop_start.elapsed();
+                        tracing::error!(
+                            elapsed_s = elapsed.as_secs_f64(),
+                            deadline_s = self.config.setup_promote_deadline.as_secs_f64(),
+                            "observer tail: setup-promote deadline expired — the \
+                             chosen primary's discovery feed never seeded the ledger \
+                             (no TaskAdded / TasksSpawned / RunComplete)"
+                        );
+                        self.setup_deadline_outcome = Some(elapsed);
+                        return Err(RunError::SetupDeadlineExpired { elapsed }.to_string());
+                    }
+                }
+                // Dead-fleet poll wake. Carries no work — it only re-drives
+                // the loop so the top-of-loop dead-fleet grace check
+                // re-evaluates when there is no recv traffic to do so.
+                _ = fleet_dead_poll.tick() => {}
+            }
+        }
     }
 
     /// Spawn the peer-lifecycle + task-completion dispatcher tasks.
