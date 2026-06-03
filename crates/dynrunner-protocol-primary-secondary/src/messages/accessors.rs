@@ -33,9 +33,7 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { sender_id, .. }
             | Self::ClusterMutation { sender_id, .. }
             | Self::Relay { sender_id, .. }
-            | Self::RelayBackoff { sender_id, .. }
-            | Self::RoleAddressed { sender_id, .. }
-            | Self::RoleMisaddressHint { sender_id, .. } => sender_id,
+            | Self::RelayBackoff { sender_id, .. } => sender_id,
         }
     }
 
@@ -65,9 +63,7 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { timestamp, .. }
             | Self::ClusterMutation { timestamp, .. }
             | Self::Relay { timestamp, .. }
-            | Self::RelayBackoff { timestamp, .. }
-            | Self::RoleAddressed { timestamp, .. }
-            | Self::RoleMisaddressHint { timestamp, .. } => *timestamp,
+            | Self::RelayBackoff { timestamp, .. } => *timestamp,
         }
     }
 
@@ -98,8 +94,6 @@ impl<I> DistributedMessage<I> {
             Self::ClusterMutation { .. } => MessageType::ClusterMutation,
             Self::Relay { .. } => MessageType::RelayMessage,
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
-            Self::RoleAddressed { .. } => MessageType::RoleAddressed,
-            Self::RoleMisaddressHint { .. } => MessageType::RoleMisaddressHint,
         }
     }
 

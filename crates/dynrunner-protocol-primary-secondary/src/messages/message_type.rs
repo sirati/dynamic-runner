@@ -58,18 +58,4 @@ pub enum MessageType {
     /// "I couldn't forward your relay; mark me tried and pick
     /// another." Identified by `(original_sender, relay_id)`.
     RelayBackoff,
-    /// Wire envelope produced by `PeerTransport::send(Address::Role(_), _)`:
-    /// the sender resolved `intended_role` via its local role-table
-    /// cache and shipped the wrapped `payload` to whoever the cache
-    /// pointed at. Receivers cross-check their own cache; agreement
-    /// means unwrap and process, disagreement means relay-and-hint
-    /// (Step 4). The receiver-side handling is wired in a subsequent
-    /// step; this variant is the sender-side wire shape only.
-    RoleAddressed,
-    /// Wire envelope produced by a receiver who got a `RoleAddressed`
-    /// envelope addressed to a role it doesn't hold. Sent back to the
-    /// original sender to warm its role-table cache — purely cache-
-    /// warming, no payload re-send (the relaying receiver already
-    /// forwarded the inner payload to the actual holder).
-    RoleMisaddressHint,
 }

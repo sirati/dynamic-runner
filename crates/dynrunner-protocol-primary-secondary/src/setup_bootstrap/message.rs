@@ -77,8 +77,9 @@ pub enum SetupBootstrapMessage {
         peers: Vec<PeerConnectionInfo>,
     },
     // NOTE: Do NOT add a fourth variant. Runtime messaging belongs on
-    // `PeerTransport` (Address::Peer / Address::Role / Address::Broadcast).
-    // The very narrowness of this enum is the architectural guarantee.
+    // `PeerTransport` (`send_to_peer` / `broadcast`, addressed by the
+    // typed `Destination` at the coordinator edge). The very narrowness
+    // of this enum is the architectural guarantee.
 }
 
 /// Conversion to the existing wire-shape. Total — every

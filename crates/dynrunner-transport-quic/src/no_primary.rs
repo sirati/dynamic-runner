@@ -9,10 +9,9 @@
 //! need a peer overlay, `NoPrimaryTransport` is for late-joining
 //! observer dispatchers that join the mesh via
 //! [`dynrunner_protocol_primary_secondary::PeerTransport::join_running_cluster`]
-//! and rely exclusively on the peer mesh (including
-//! `Address::Role(Role::Primary)` over a Step-5b
-//! `TunneledPeerTransport`) for outbound, plus the snapshot RPC for
-//! initial state.
+//! and rely exclusively on the peer mesh (the edge resolves
+//! `Destination::Primary` to the host peer-id and the transport sends
+//! by id) for outbound, plus the snapshot RPC for initial state.
 //!
 //! # Why a stub (not a real `NetworkClient`)
 //!

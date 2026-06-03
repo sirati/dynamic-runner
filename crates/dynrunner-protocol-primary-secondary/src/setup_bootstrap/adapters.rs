@@ -88,12 +88,12 @@ where
 ///
 /// Same constructional / lifetime trade-off as the other two adapters:
 /// build briefly, drop after the setup send/recv, let the operational
-/// path keep using the underlying transport. The fan-out is
-/// `Address::Broadcast(Scope::AllSecondaries)` (every peer of the
-/// primary is a secondary, so this reaches the full fleet), and the
-/// peer transport already collapses per-secondary delivery failures
-/// into one `String` at the trait boundary (the per-secondary signal is
-/// the heartbeat monitor, not the setup broadcast result).
+/// path keep using the underlying transport. The fan-out is the mesh
+/// [`PeerTransport::broadcast`] (every peer of the primary is a
+/// secondary, so this reaches the full fleet), and the peer transport
+/// already collapses per-secondary delivery failures into one `String`
+/// at the trait boundary (the per-secondary signal is the heartbeat
+/// monitor, not the setup broadcast result).
 pub struct PrimaryPeerSetupBootstrap<'a, Tr> {
     transport: &'a mut Tr,
 }
@@ -111,18 +111,12 @@ where
 {
     async fn broadcast(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         let wire: DistributedMessage<I> = msg.into();
-        // `Scope::AllSecondaries` is the right scope for the primary's
-        // PeerInfo fan-out: every shared-outgoing entry is a secondary
-        // (the primary is not its own peer), and F2 needs exactly the
-        // all-secondaries set. The peer transport's `send` default-impl
-        // routes this to `broadcast`, whose `Result<(), String>` IS the
-        // narrow trait shape — no partial-failure list to fold.
-        self.transport
-            .send(
-                crate::Address::Broadcast(crate::Scope::AllSecondaries),
-                wire,
-            )
-            .await
+        // Mesh broadcast is the right fan-out for the primary's PeerInfo
+        // distribution: every mesh member is a secondary (the primary is
+        // not its own peer), and F2 needs exactly that set. The peer
+        // transport's `broadcast` returns `Result<(), String>` — which IS
+        // the narrow trait shape, no partial-failure list to fold.
+        self.transport.broadcast(wire).await
     }
 
     async fn recv(&mut self) -> Option<SetupBootstrapMessage> {

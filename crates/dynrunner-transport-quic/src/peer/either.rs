@@ -45,10 +45,12 @@ use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 ///   [`PeerTransport::try_recv_peer`] read, so the primary's frames
 ///   surface like any other inbound.
 ///
-/// The primary is a DIRECTED-only member (mirrors the `Real` arm): it is
-/// reachable via `send_to_peer` / `has_peer` but EXCLUDED from
-/// `broadcast` (a no-op here — no mesh peers) and from `peer_count`
-/// (`0` — a firewalled fleet is never "mesh-formed").
+/// The primary is a routable member (mirrors the `Real` arm): it is
+/// reachable via `send_to_peer` / `has_peer` and counted by `peer_count`
+/// (`1`, role-blind — the transport counts every member). It is excluded
+/// from `broadcast` (a no-op here anyway — no mesh peers). The
+/// "exclude the primary from mesh-health" policy is the edge's
+/// `real_peer_count()`, not the transport's.
 ///
 /// `pub` only so it can be the payload of the `pub`
 /// [`EitherPeerTransport::DisabledWithPrimary`] variant (the same
@@ -272,10 +274,15 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
             // before boxing.
             Self::Real(p) => PeerTransport::<I>::peer_count(&**p),
             Self::Disabled(p) => PeerTransport::<I>::peer_count(p),
-            // The directed primary link is excluded from the mesh-health
-            // cardinality (mirrors the `Real` arm), so a firewalled fleet
-            // is never falsely reported as "mesh-formed".
-            Self::DisabledWithPrimary(_) => 0,
+            // Pure membership cardinality, role-blind (transport ⊥
+            // roles): the folded bootstrap-primary link is a member, so
+            // it is counted — exactly as the `Real` arm counts the
+            // primary folded into its `connections` table. The
+            // "exclude the primary" mesh-health policy is the edge's:
+            // the secondary's `real_peer_count()` subtracts the primary
+            // when `has_peer(current_primary)`, the single authoritative
+            // exclusion. The transport must not double-exclude it.
+            Self::DisabledWithPrimary(_) => 1,
         }
     }
 
@@ -302,11 +309,4 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
             Self::DisabledWithPrimary(_) => {}
         }
     }
-
-    // Role methods (`register_with_cluster_state`, `peer_for_role`,
-    // `local_id`) intentionally NOT overridden: TRANSPORT⊥ROLES — the
-    // transport routes by peer-id only and knows nothing of roles. The
-    // trait defaults (no-op / `None` / `""`) stand for every arm; role
-    // resolution and the `RoleAddressed` envelope live at the coordinator
-    // egress edge, not here. // [de-role-trait #136]
 }

@@ -6,8 +6,9 @@
 //!   secondary `SecondaryTransport` end + matching primary-end on
 //!   the secondary side.
 //! - [`peer_transport`][crate::peer_transport]: `PeerTransport` over
-//!   a mesh of in-process peers with the same `Router` + role-cache
-//!   machinery the QUIC transport uses.
+//!   a mesh of in-process peers backed by the same `Router` the QUIC
+//!   transport uses. Role-blind (transport ⊥ roles) — it routes by
+//!   `PeerId` only.
 //! - [`mesh`][crate::mesh]: builders that wire up either a full or
 //!   partial peer mesh in one call.
 //!
