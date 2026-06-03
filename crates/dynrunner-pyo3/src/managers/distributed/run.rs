@@ -14,6 +14,7 @@ use dynrunner_manager_distributed::{
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
@@ -253,22 +254,21 @@ impl PyDistributedManager {
                 let mut sec_handles = Vec::new();
                 let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
-                // Build the primary's single `Tr: TunneledPeerTransport`.
-                // Post-collapse this is the ONE transport the coordinator
-                // holds. `shared_outgoing` is the writer table the
-                // in-process path registers each per-secondary writer
-                // into directly (no accept loops here, so the
-                // registration sink goes unused); `inbound` is the sink
-                // the per-secondary forwarder feeds — it is the
-                // transport's real, single inbound stream (no fan-out
-                // tap, no separate legacy `ChannelSecondaryTransportEnd`
-                // consumer). Role-addressed / `Address::Peer` sends and
-                // the unified `recv_peer()` both run over this one
-                // transport.
-                let (peer_transport, shared_outgoing, inbound, _registration) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
-                        "primary".into(),
-                    );
+                // Build the in-process primary's single mesh transport
+                // through the backend-opaque factory. Post-collapse this
+                // is the ONE transport the coordinator holds.
+                // `shared_outgoing` is the writer table the in-process
+                // path registers each per-secondary writer into directly
+                // (no accept loops here); `inbound` is the sink the
+                // per-secondary forwarder feeds — the transport's real,
+                // single inbound stream (no fan-out tap). `Destination`
+                // sends and the unified `recv_peer()` both run over this
+                // one transport.
+                let primary_bundle =
+                    transport_factory::inprocess_primary_mesh::<RunnerIdentifier>();
+                let peer_transport = primary_bundle.transport;
+                let shared_outgoing = primary_bundle.shared_outgoing;
+                let inbound = primary_bundle.inbound;
 
                 for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
                     sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
@@ -320,18 +320,20 @@ impl PyDistributedManager {
                     let sec_memuse_log_path = memuse_log_path.clone();
 
                     let handle = tokio::task::spawn_local(async move {
-                        // Channel-backed mesh: the in-process primary is
+                        // Channel-backed mesh built through the
+                        // backend-opaque factory: the in-process primary is
                         // folded in as an ordinary mesh peer keyed by
                         // `"primary"` (no per-role uplink leg). Inbound is
                         // the primary→secondary channel; the outbound
                         // primary link is the secondary→primary channel.
-                        let mut transport =
-                            dynrunner_transport_channel::ChannelPeerTransport::<RunnerIdentifier>::from_raw_channels(
-                                secondary_id.clone(),
-                                std::collections::HashMap::new(),
-                                pri_to_sec_rx,
-                            );
-                        transport.register_primary_link("primary".to_string(), sec_to_pri_tx);
+                        let transport = transport_factory::inprocess_secondary_mesh::<
+                            RunnerIdentifier,
+                        >(
+                            secondary_id.clone(),
+                            "primary".to_string(),
+                            pri_to_sec_rx,
+                            sec_to_pri_tx,
+                        );
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
