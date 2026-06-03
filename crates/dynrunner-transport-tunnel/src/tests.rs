@@ -6,10 +6,10 @@
 //! `crates/dynrunner-manager-distributed/tests/network_integration.rs`
 //! actually uses; here we exercise the transport in isolation
 //! with no manager coordinator wrapped around it.
-use crate::{InboundTap, TunneledPeerTransport};
+use crate::{InboundTap, PeerRegistration, RegistrationSink, TunneledPeerTransport};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, KeepaliveRole, PeerTransport, Role, RoleChangeHookRegistrar,
-    RoleTable, Scope,
+    Address, ClusterMutation, DistributedMessage, KeepaliveRole, PeerId, PeerTransport, Role,
+    RoleChangeHookRegistrar, RoleTable, Scope,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -330,5 +330,143 @@ async fn relay_envelope_addressed_to_self_is_unwrapped() {
     assert!(
         matches!(got, DistributedMessage::Keepalive { .. }),
         "delivered frame must be the unwrapped inner, not the Relay wrapper: {got:?}"
+    );
+}
+
+/// A global-state (CRDT) broadcast frame: a `ClusterMutation` carrying
+/// one `PrimaryChanged` — the canonical bootstrap global-state mutation
+/// (the plan's exactly-once subject). The submitter fans this out over
+/// `Destination::All` / `broadcast`.
+fn cluster_mutation(epoch: u64) -> DistributedMessage<TestId> {
+    DistributedMessage::ClusterMutation {
+        sender_id: "primary".into(),
+        timestamp: 1.0,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "primary".into(),
+            epoch,
+        }],
+    }
+}
+
+/// Count every frame currently queued on `rx` (non-blocking). The
+/// exactly-once assertion is at the recv/wire layer: COUNT deliveries
+/// per peer == 1 — NOT merely that the idempotent CRDT apply is a
+/// no-op (a double-send would still leave count == 2 here, which an
+/// apply-idempotency check would never catch).
+fn drain_count(rx: &mut mpsc::UnboundedReceiver<DistributedMessage<TestId>>) -> usize {
+    let mut n = 0;
+    while rx.try_recv().is_ok() {
+        n += 1;
+    }
+    n
+}
+
+/// EXACTLY-ONCE at the wire layer: a `Destination::All` global-state
+/// (CRDT) broadcast lands on each peer's writer EXACTLY ONCE. The
+/// guarantee is structural — `broadcast` is a single direct fan-out
+/// over the Router-backed `outgoing` table (one `msg.clone()` per
+/// connection, not a relayed `Relay` envelope), so no peer is reached
+/// both directly and via relay. Asserting the per-peer delivery COUNT
+/// is what catches a double-send; an idempotent-apply check would not.
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_global_state_delivered_exactly_once_per_peer() {
+    let (mut transport, mut sec_a_rx, mut sec_b_rx, _tap) = fixture();
+    transport.broadcast(cluster_mutation(1)).await.unwrap();
+    assert_eq!(
+        drain_count(&mut sec_a_rx),
+        1,
+        "sec-A must receive the CRDT broadcast EXACTLY once"
+    );
+    assert_eq!(
+        drain_count(&mut sec_b_rx),
+        1,
+        "sec-B must receive the CRDT broadcast EXACTLY once"
+    );
+}
+
+/// A peer that handshaked since the last `recv_peer` poll — its writer
+/// still queued on the registration sink (`new_conn_rx`), NOT yet in
+/// `outgoing` — is NOT silently skipped by a broadcast, and still
+/// receives it EXACTLY once. `broadcast` drains pending registrations
+/// first (mirror of `PeerNetwork::broadcast`'s leading
+/// `drain_new_connections`), so the freshly-joined peer is part of the
+/// one fan-out. Without the drain this peer's count would be 0 (missed
+/// delivery); a naive double-drain would make it 2.
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_includes_freshly_registered_peer_exactly_once() {
+    // Hold the registration sink this time (the standard fixture drops
+    // it). sec-A is pre-registered directly into `outgoing`; sec-C
+    // arrives ONLY as a pending registration on the sink and is never
+    // drained before the broadcast call.
+    let (mut transport, outgoing, _inbound_tap, reg_sink): (
+        TunneledPeerTransport<TestId>,
+        _,
+        InboundTap<TestId>,
+        RegistrationSink<TestId>,
+    ) = TunneledPeerTransport::<TestId>::new("primary".into());
+    let (sec_a_tx, mut sec_a_rx) = mpsc::unbounded_channel();
+    outgoing.borrow_mut().insert("sec-A".into(), sec_a_tx);
+
+    let (sec_c_tx, mut sec_c_rx) = mpsc::unbounded_channel();
+    reg_sink
+        .send(PeerRegistration {
+            peer_id: "sec-C".into(),
+            outgoing_tx: sec_c_tx,
+        })
+        .expect("registration sink must accept");
+
+    // No `recv_peer` / `try_recv_peer` ran, so sec-C is still only on
+    // the sink — broadcast must drain it in before fanning out.
+    transport.broadcast(cluster_mutation(1)).await.unwrap();
+
+    assert_eq!(
+        drain_count(&mut sec_a_rx),
+        1,
+        "already-registered sec-A must receive EXACTLY once"
+    );
+    assert_eq!(
+        drain_count(&mut sec_c_rx),
+        1,
+        "freshly-registered sec-C must receive EXACTLY once (drained in, not skipped)"
+    );
+    assert_eq!(
+        transport.peer_count(),
+        2,
+        "broadcast drained the pending registration into the writer table"
+    );
+}
+
+/// A dead writer (the secondary went away) is pruned from the table on
+/// broadcast detection — keeping membership (`peer_count` / `has_peer`)
+/// accurate and ensuring a later broadcast does not re-attempt it. The
+/// submitter has no dial path, so removal is the whole disposition (no
+/// redial, unlike `PeerNetwork::broadcast`).
+#[tokio::test(flavor = "current_thread")]
+async fn broadcast_prunes_dead_writer() {
+    let (mut transport, sec_a_rx, mut sec_b_rx, _tap) = fixture();
+    // Drop sec-A's receiver: its writer is now closed.
+    drop(sec_a_rx);
+    assert_eq!(transport.peer_count(), 2, "both registered pre-broadcast");
+
+    transport.broadcast(cluster_mutation(1)).await.unwrap();
+
+    assert_eq!(
+        transport.peer_count(),
+        1,
+        "dead sec-A writer pruned; live sec-B retained"
+    );
+    assert!(
+        !transport.has_peer(&PeerId::from("sec-A")),
+        "dead sec-A no longer a member"
+    );
+    assert!(
+        transport.has_peer(&PeerId::from("sec-B")),
+        "live sec-B still a member"
+    );
+    // The live peer still got exactly one frame despite the dead peer.
+    assert_eq!(
+        drain_count(&mut sec_b_rx),
+        1,
+        "live sec-B receives the broadcast EXACTLY once"
     );
 }
