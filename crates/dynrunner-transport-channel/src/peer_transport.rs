@@ -62,20 +62,6 @@ pub struct ChannelPeerTransport<I: Identifier> {
     /// assertions per `M5` of the relay-routing plan. Not part of the
     /// stable public API; production callers should ignore it.
     pub last_outcome: Option<SendOutcome>,
-    /// Id of the bootstrap-primary's DIRECTED mesh link, if registered
-    /// via [`Self::register_primary_link`]. The secondary registers its
-    /// channel link to the in-process primary here so
-    /// `send_to_peer(primary)` / `has_peer(primary)` resolve over the
-    /// folded wire — the primary becomes a routable mesh member from the
-    /// secondary's side.
-    ///
-    /// The transport treats it as an ordinary mesh member (counted in
-    /// [`PeerTransport::peer_count`] and reached by [`PeerTransport::broadcast`],
-    /// role-blind); the role-aware "how many alive secondaries" policy is
-    /// the coordinator edge's concern (`alive_secondary_count`, over global
-    /// state), NOT the transport's.
-    /// Symmetric with `PeerNetwork::primary_link_id` on the QUIC side.
-    pub(crate) primary_link_id: Option<String>,
 }
 
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
@@ -159,10 +145,9 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
 
     fn has_peer(&self, id: &PeerId) -> bool {
         // Real per-id membership: a peer is a member iff it has a direct
-        // outbox in `outgoing`. The bootstrap-primary directed link IS
-        // such an entry, so `has_peer(primary)` is `true` once registered
-        // — it is excluded only from the broadcast fan-out and the
-        // mesh-health `peer_count`, not from per-id reachability.
+        // outbox in `outgoing`. The folded bootstrap-primary link IS such
+        // an entry, so `has_peer(primary)` is `true` once registered — it
+        // is an ordinary member, no different from any peer (role-blind).
         // Partition tests that `disconnect_from` / `connect_to` a peer
         // flip this predicate.
         self.outgoing.contains_key(id.as_str())
@@ -210,7 +195,6 @@ impl<I: Identifier> ChannelPeerTransport<I> {
             incoming_rx,
             outgoing,
             last_outcome: None,
-            primary_link_id: None,
         }
     }
 
@@ -228,20 +212,22 @@ impl<I: Identifier> ChannelPeerTransport<I> {
     ///   run-mode wiring), so primary frames surface through
     ///   [`PeerTransport::recv_peer`] like any other peer's.
     ///
-    /// The primary is a DIRECTED-only member: it is recorded in
-    /// [`Self::primary_link_id`] and excluded from
-    /// [`PeerTransport::broadcast`] and the [`PeerTransport::peer_count`]
-    /// mesh-health cardinality, preserving the bootstrap behaviour where
-    /// the secondary's mesh broadcast and mesh-health count never include
-    /// the primary. Symmetric with the QUIC side.
+    /// The folded primary is an ORDINARY mesh member: its outbox lands in
+    /// [`Self::outgoing`] like any peer's, so it is counted by
+    /// [`PeerTransport::peer_count`] and reached by
+    /// [`PeerTransport::broadcast`] (role-blind, TRANSPORT⊥ROLES). The
+    /// role-aware "how many alive secondaries" policy is the coordinator
+    /// edge's concern (`alive_secondary_count`, over global state), not the
+    /// transport's. Mirrors the QUIC `PeerNetwork::register_primary_link`,
+    /// which likewise inserts the primary into its role-blind `connections`
+    /// table.
     pub fn register_primary_link(
         &mut self,
         primary_id: String,
         to_primary: mpsc::UnboundedSender<DistributedMessage<I>>,
     ) {
         tracing::debug!(primary = %primary_id, "folded primary channel link into the mesh");
-        self.outgoing.insert(primary_id.clone(), to_primary);
-        self.primary_link_id = Some(primary_id);
+        self.outgoing.insert(primary_id, to_primary);
     }
 
     /// Remove a peer's outbox so a subsequent send finds no direct

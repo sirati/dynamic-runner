@@ -124,7 +124,6 @@ pub fn peer_mesh_with_adjacency<I: Identifier>(
             outgoing: outgoing_for_peer,
             router: Router::new(id.clone()),
             last_outcome: None,
-            primary_link_id: None,
         });
     }
     transports
