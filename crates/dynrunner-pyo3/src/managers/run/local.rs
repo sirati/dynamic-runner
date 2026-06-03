@@ -63,7 +63,7 @@ pub(crate) fn run_local<'py>(
 
     let kwargs = PyDict::new(py);
     kwargs.set_item("skip_existing", skip_existing)?;
-    kwargs.set_item("always_restart_worker", config.always_restart_worker)?;
+    kwargs.set_item("reuse_workers", config.reuse_workers)?;
     if let Some(cb) = config.restart_predicate.as_ref() {
         kwargs.set_item("restart_predicate", cb.clone_ref(py))?;
     }

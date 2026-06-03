@@ -99,7 +99,7 @@ fn test_config(num_workers: u32) -> LocalManagerConfig {
     LocalManagerConfig {
         num_workers,
         max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
-        always_restart_worker: false,
+        reuse_workers: true,
         restart_predicate: None,
         retry_max_attempts: 1,
         print_pid: false,

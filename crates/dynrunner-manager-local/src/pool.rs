@@ -241,7 +241,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     /// fresh subprocess's argv matches. Without this, the next
     /// `ensure_worker_for_type` would see `loaded_type_id == None`,
     /// pessimistically assume mismatch, and trigger a redundant
-    /// kill+respawn — turning every always_restart-driven cycle into
+    /// kill+respawn — turning every per-task-restart cycle into
     /// two spawns instead of one. The fallback to `spawn_worker`
     /// preserves the legacy initial-spawn semantic for slots that
     /// were never bound (e.g. a restart triggered before any
