@@ -30,6 +30,7 @@ mod preferred_secondaries;
 mod promotion;
 mod result_data_plumbing;
 mod retry;
+mod select_bootstrap;
 mod setup_promote;
 mod stranded;
 mod wire;

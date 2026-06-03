@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, DistributedMessage, PeerId, PeerTransport,
+};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -1890,6 +1892,52 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     pub fn secondary_count(&self) -> usize {
         self.secondaries.len()
+    }
+
+    /// Bootstrap primary-selection policy: which compute peer the
+    /// submitter hands full primary authority off to once the mesh is
+    /// warm. A pure `&self` accessor — no mutation, no side effects.
+    ///
+    /// # Policy
+    ///
+    /// Deterministic lowest-id among the candidate set, matching the
+    /// failover election tie-break so bootstrap and failover share one
+    /// selection *concept* (every replica that re-derives the choice gets
+    /// the same answer; only the submitter actually originates the
+    /// epoch-2 hand-off, but determinism removes any race ambiguity).
+    ///
+    /// # Candidate set
+    ///
+    /// A peer is eligible IFF it is, all positively:
+    /// - an **alive worker-secondary** ([`alive_secondary_members`] —
+    ///   already filters `worker_count > 0`, which structurally excludes
+    ///   observers by capacity, AND `is_peer_alive`), AND
+    /// - **mesh-ready** (it has reported `MeshReady`, recorded in
+    ///   `mesh_ready_secondaries`), AND
+    /// - a **confirmed mesh peer** ([`PeerTransport::has_peer`] — the
+    ///   transport holds a live connection to it right now),
+    ///
+    /// and is NOT in the `RoleTable::observers` set (a defensive cut even
+    /// though `worker_count > 0` already excludes observers — selection
+    /// must never name an observer, mirroring the election's own guard).
+    ///
+    /// # Degenerate topologies
+    ///
+    /// Returns `None` when the candidate set is empty — single-node /
+    /// submitter-only fleets and all-observer fleets. The caller stays
+    /// primary (`activate_local_primary`) in that case; "primary fully on
+    /// one peer" holds trivially on the sole host.
+    ///
+    /// [`alive_secondary_members`]: crate::cluster_state::ClusterState::alive_secondary_members
+    pub fn select_bootstrap_primary(&self) -> Option<PeerId> {
+        let observers = &self.cluster_state.role_table().observers;
+        self.cluster_state
+            .alive_secondary_members()
+            .filter(|id| self.mesh_ready_secondaries.contains(*id))
+            .filter(|id| self.transport.has_peer(&PeerId::from(*id)))
+            .filter(|id| !observers.contains(*id))
+            .min()
+            .map(PeerId::from)
     }
 
     /// Test-only inspector for the primary's replicated cluster
