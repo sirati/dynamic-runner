@@ -374,11 +374,12 @@ impl PySecondaryCoordinator {
                 };
 
                 // Cloneable mesh-send capability for the co-located
-                // parked primary's send-proxy (`Some` only when a real
-                // peer mesh exists — `Disabled` overlays have no remote
-                // secondaries and thus no failover, so no co-located
-                // primary is composed). Taken BEFORE `peer_network` moves
-                // into the coordinator. See `MeshSendHandle`.
+                // parked primary's role-blind `MeshHandleTransport`
+                // (`Some` only when a real peer mesh exists — `Disabled`
+                // overlays have no remote secondaries and thus no
+                // failover, so no co-located primary is composed). Taken
+                // BEFORE `peer_network` moves into the coordinator. See
+                // `MeshSendHandle`.
                 let mesh_send_handle = peer_network.mesh_send_handle();
 
                 // Fold the dialed primary bootstrap wire into the mesh as
@@ -409,6 +410,55 @@ impl PySecondaryCoordinator {
                 // dispatch needs its own resource estimator.
                 let primary_estimator = estimator.clone();
 
+                // ── Co-located primary↔secondary loopback channels ──
+                //
+                // Composed ONLY when a real mesh exists (a `Disabled`
+                // overlay has no remote secondaries to fail over among, so
+                // no co-located primary is built). Two in-process channels
+                // wire the two coordinators on this one host WITHOUT any
+                // per-role transport leg — the multi-role host runs the
+                // SINGLE mesh transport (held by the secondary) and the
+                // role-vs-locality split lives at the coordinator egress
+                // edges, not inside a transport:
+                //
+                //   * CH1 loopback_to_secondary: the co-located primary's
+                //     egress (`SendTarget::Loopback` unicast + the
+                //     `Destination::All` broadcast leg) delivers own-host
+                //     frames into the SECONDARY's inbound. The secondary
+                //     drains the matching receiver as if it were a wire
+                //     frame.
+                //   * CH2 primary_inbound: the secondary's ingress demux
+                //     forwards every primary-facing frame
+                //     (`is_primary_facing`) it drains off the host mesh —
+                //     plus its own-host terminal reports (its egress
+                //     `SendTarget::Loopback` arm) — into the co-located
+                //     PRIMARY's inbound. The primary's role-blind
+                //     `MeshHandleTransport::recv_peer` drains it.
+                //
+                // Both are unbounded `tokio::sync::mpsc`; the message type
+                // is `DistributedMessage<RunnerIdentifier>` on both legs.
+                // The four ends are held as `Option` so a `Disabled`
+                // overlay (no real mesh → no co-located primary) leaves
+                // every slot `None` and the registrations / composition
+                // below are no-ops.
+                let (
+                    loopback_to_secondary_tx,
+                    loopback_to_secondary_rx,
+                    primary_inbound_tx,
+                    primary_inbound_rx,
+                ): (
+                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
+                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
+                ) = if mesh_send_handle.is_some() {
+                    let (lb_tx, lb_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let (pin_tx, pin_rx) = tokio::sync::mpsc::unbounded_channel();
+                    (Some(lb_tx), Some(lb_rx), Some(pin_tx), Some(pin_rx))
+                } else {
+                    (None, None, None, None)
+                };
+
                 // The secondary holds the mesh `PeerTransport`
                 // (`EitherPeerTransport`) DIRECTLY — the primary is a mesh
                 // peer reached by id, not a wrapped per-role leg.
@@ -418,6 +468,20 @@ impl PySecondaryCoordinator {
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
+
+                // Wire the secondary side of the co-located loopback
+                // channels (when composed). Pre-run, one-shot — same
+                // contract as `register_promote_activation`. The secondary
+                // drains CH1 (`loopback_to_secondary_rx`) into its inbound
+                // and forwards primary-facing frames into CH2
+                // (`primary_inbound_tx`). Both registrations are skipped on
+                // every non-co-located path (the `Disabled` overlay).
+                if let Some(rx) = loopback_to_secondary_rx {
+                    secondary.register_colocated_loopback_inbound(rx);
+                }
+                if let Some(tx) = primary_inbound_tx {
+                    secondary.register_colocated_primary_inbound(tx);
+                }
 
                 // Tell the egress edge which peer-id the bootstrap wire
                 // reaches (the conventional `"primary"`, the same id the
@@ -515,32 +579,130 @@ impl PySecondaryCoordinator {
 
                 // ── Two-coordinators-on-one-LocalSet composition ──
                 //
-                // The co-located parked `PrimaryCoordinator` (a surviving
-                // SLURM secondary becoming primary in-place on failover)
-                // is composed via `ColocatedPrimaryTransport` + the
-                // role-aware inbound tap + own-secondary loopback — all of
-                // which lived on the now-deleted secondary-side per-role
-                // wrapper. Collapsing that composition onto the host's
-                // single shared mesh transport (loopback = resolved host
-                // id == local id; inbound role-demux = the typed
-                // `Destination`) is the multi-role-host-onto-one-transport
-                // concern, NOT this uplink-deletion leaf. Left
-                // unimplemented so the owning leaf supplies the real-API
-                // composition rather than this one papering it over.
+                // Build a PARKED co-located `PrimaryCoordinator` and spawn
+                // it on the SAME `LocalSet` as this secondary, behind
+                // `run_parked`'s promotion gate. The failover headline: a
+                // surviving SLURM secondary becomes primary in-place by
+                // waking its parked primary on the election's terminal
+                // `Promoted` transition — the secondary's
+                // `record_promotion_confirm` → `fire_local_promotion`
+                // fires the gate (handing over a `cluster_state` snapshot)
+                // and broadcasts `PromotePrimary { new = self }` so
+                // surviving peers re-point onto this winner.
                 //
-                // `mesh_send_handle` (the cloneable mesh-send capability
-                // the parked primary's send-proxy would hold) is taken
-                // above and consumed here; `primary_estimator` is the
-                // primary's own resource estimator the composition needs.
+                // Composed ONLY when a REAL mesh exists
+                // (`mesh_send_handle.is_some()`): a `Disabled` overlay has
+                // no remote secondaries to fail over among. The parked
+                // primary holds the ROLE-BLIND `MeshHandleTransport` over
+                // the host's shared mesh (`mesh_send_handle` for remote
+                // send/broadcast, `primary_inbound_rx` for the demuxed
+                // inbound the secondary forwards). Its own-secondary
+                // loopback is NOT a transport leg: the egress edge delivers
+                // `SendTarget::Loopback` + the `Destination::All` broadcast
+                // leg through `loopback_to_secondary_tx`, registered via
+                // `register_colocated_loopback`.
                 let parked_primary_handle: Option<tokio::task::JoinHandle<()>> =
-                    if mesh_send_handle.is_some() {
-                        let _ = &primary_estimator;
-                        unimplemented!(
-                            "co-located parked-primary composition: rebuilding it on the host's \
-                             single shared mesh transport (no per-role ColocatedPrimaryTransport / \
-                             tap / loopback) is owned by the multi-role-host transport-collapse \
-                             leaf, not the uplink-deletion leaf"
-                        )
+                    if let (Some(mesh), Some(loopback_tx), Some(inbound_rx)) =
+                        (mesh_send_handle, loopback_to_secondary_tx, primary_inbound_rx)
+                    {
+                        // Promotion-activation gate: the secondary fires it
+                        // (with a `cluster_state` snapshot) on reaching
+                        // `Promoted`; the parked primary `restore`s +
+                        // hydrates and takes authority.
+                        let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
+                        secondary.register_promote_activation(promote_tx);
+
+                        // Transfer the lifecycle/command wiring the PyO3
+                        // surface minted on the secondary onto the
+                        // co-located PRIMARY — the real authority that owns
+                        // the phase machine and the externally-issued
+                        // `PrimaryCommand` ingress. The secondary keeps its
+                        // own `command_tx` clone for any handle minted off
+                        // it.
+                        let (
+                            p_command_tx,
+                            p_command_rx,
+                            p_on_phase_start,
+                            p_on_phase_end,
+                        ) = secondary.take_composed_primary_wiring();
+
+                        // The parked primary's role-blind `PeerTransport`:
+                        // every remote peer over the shared mesh, recv via
+                        // the demuxed inbound the secondary feeds. No
+                        // own-id / loopback branch — the egress edge owns
+                        // that (see `register_colocated_loopback` below).
+                        let primary_transport =
+                            dynrunner_transport_quic::MeshHandleTransport::new(
+                                mesh,
+                                inbound_rx,
+                            );
+
+                        // `PrimaryConfig` for the parked failover authority.
+                        // Most fields are bootstrap-phase concerns the
+                        // seeded resume bypasses; the load-bearing ones are
+                        // `node_id` (own id, so `Destination::Primary`
+                        // resolves to self) and the retry knobs (mirrored
+                        // from the secondary's config). The CRDT snapshot
+                        // the gate delivers seeds `phase_deps` /
+                        // `total_tasks` at activation, so the config's
+                        // task-graph fields stay at their defaults.
+                        let primary_config = dynrunner_manager_distributed::PrimaryConfig {
+                            node_id: secondary_id.clone(),
+                            keepalive_interval: dist_keepalive,
+                            peer_timeout: dist_peer_timeout,
+                            keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                            retry_max_passes: dist_retry_max_passes,
+                            oom_retry_max_passes: dist_oom_retry_max_passes,
+                            ..dynrunner_manager_distributed::PrimaryConfig::default()
+                        };
+
+                        let mut parked_primary =
+                            dynrunner_manager_distributed::PrimaryCoordinator::new(
+                                primary_config,
+                                primary_transport,
+                                scheduler_config.build_memory_scheduler(),
+                                primary_estimator,
+                            );
+
+                        // Register the own-secondary loopback sender on the
+                        // primary's egress edge: a `Destination::Secondary
+                        // (own_id)` `TaskAssignment` (resolved to
+                        // `SendTarget::Loopback`) and every
+                        // `Destination::All` broadcast reach the co-located
+                        // secondary through this leg — the co-located
+                        // secondary is not a mesh peer of itself.
+                        parked_primary.register_colocated_loopback(loopback_tx);
+
+                        // Transfer the command channel onto the primary so
+                        // a Python-minted `PrimaryHandle` (cloned off the
+                        // secondary's `command_sender()`) reaches the
+                        // authority's command loop. `p_command_rx` is
+                        // `Some` on the first (only)
+                        // `take_composed_primary_wiring` call; if it were
+                        // `None` (defensive — a double take), the primary
+                        // keeps the receiver its own `new()` minted and the
+                        // transferred `tx` simply feeds a different
+                        // receiver, so we skip the swap.
+                        if let Some(rx) = p_command_rx {
+                            parked_primary.replace_command_channel(p_command_tx, rx);
+                        }
+                        if let (Some(on_start), Some(on_end)) =
+                            (p_on_phase_start, p_on_phase_end)
+                        {
+                            parked_primary.register_phase_lifecycle_callbacks(
+                                on_start, on_end,
+                            );
+                        }
+
+                        Some(tokio::task::spawn_local(async move {
+                            if let Err(e) = parked_primary.run_parked(promote_rx).await {
+                                tracing::error!(
+                                    error = %e,
+                                    "co-located parked primary failed after \
+                                     promotion"
+                                );
+                            }
+                        }))
                     } else {
                         // No real mesh → no failover → no co-located
                         // primary. The secondary keeps its own
