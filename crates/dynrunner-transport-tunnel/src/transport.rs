@@ -9,14 +9,31 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role, RoleAddressedAction,
-    RoleCache, RoleChangeHookRegistrar, apply_role_misaddress_hint, decide_role_addressed_with_cache,
-    install_role_change_hook, new_role_cache, read_role_cache, seed_self_role,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Role,
+    RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
+    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
+    new_role_cache, read_role_cache, seed_self_role,
 };
 use tokio::sync::mpsc;
+
+/// Snapshot the [`Clocks`] pair the [`Router`] consumes on every entry
+/// point: monotonic `now` for its TTL/cooldown arithmetic, unix-epoch
+/// `wire` for the timestamps it stamps on outgoing relay envelopes.
+/// Mirrors `PeerNetwork`'s `now_clocks` so the relay state machine sees
+/// the same clock shape regardless of which transport drives it.
+fn now_clocks() -> Clocks {
+    Clocks {
+        now: Instant::now(),
+        wire: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    }
+}
 
 /// Shared per-secondary writer table. The submitter primary's accept
 /// loops populate this map when a secondary completes its
@@ -122,6 +139,24 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// Same shape as `PeerNetwork.role_cache` and
     /// `ChannelPeerTransport.role_cache`.
     role_cache: RoleCache,
+    /// Peer-mesh routing dispatcher. Owns ALL routing state (in-flight
+    /// relays, blacklist, per-peer route observation, monotonic relay-id
+    /// counter) over the SAME `outgoing` connection table — so the
+    /// submitter primary can forward a secondary-A→secondary-B frame
+    /// through itself and behave as a real mesh peer, instead of being
+    /// reachable only as a direct hop. The exact `Router<I>` the
+    /// `PeerNetwork` QUIC transport uses; this transport supplies it the
+    /// shared writer table on every entry point and never inspects its
+    /// state directly.
+    ///
+    /// Redial signal: the `Router` emits a `redial_target` when an
+    /// active relay relationship is first observed. `PeerNetwork` acts
+    /// on it via `spawn_redial`; the submitter primary has NO dial path
+    /// (dial direction is secondary-to-primary in production, and
+    /// `connect_to_peers` is a no-op here), so the signal is
+    /// deliberately dropped — there is nothing for the submitter to dial
+    /// out to.
+    router: Router<I>,
 }
 
 impl<I: Identifier> TunneledPeerTransport<I> {
@@ -163,6 +198,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
         let role_cache = new_role_cache();
         seed_self_role(&role_cache, &local_id);
+        let router = Router::new(local_id.clone());
         let transport = Self {
             local_id,
             outgoing: Rc::clone(&outgoing),
@@ -170,6 +206,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
             new_conn_rx,
             registrations_open: true,
             role_cache,
+            router,
         };
         (transport, outgoing, inbound_tap, new_conn_tx)
     }
@@ -187,14 +224,20 @@ impl<I: Identifier> TunneledPeerTransport<I> {
     }
 
     /// Role-layer interceptor — mirrors
-    /// `ChannelPeerTransport::handle_role_layer`. The
+    /// `PeerNetwork::handle_role_layer`. The
     /// `decide_role_addressed_with_cache` decision is the single
     /// source of truth for the four cases (A/B/C/D); the relay-send
-    /// dispatch path here just uses `send_to_peer` rather than
-    /// reaching into a [`Router`] because the tunneled transport has
-    /// no router state (no relay-via-peer at the submitter — every
-    /// secondary is directly addressable via its own tunnel).
-    fn handle_role_layer(&mut self, msg: DistributedMessage<I>) -> Option<DistributedMessage<I>> {
+    /// dispatch path goes through the [`Router`] (same as
+    /// `PeerNetwork`) so a role-resolved forward that has no DIRECT
+    /// writer can still be relayed through another peer rather than
+    /// dropped. `clocks` is threaded from the `recv_peer` /
+    /// `try_recv_peer` entry point so the Router's send-side state uses
+    /// the same monotonic clock as inbound dispatch.
+    fn handle_role_layer(
+        &mut self,
+        msg: DistributedMessage<I>,
+        clocks: Clocks,
+    ) -> Option<DistributedMessage<I>> {
         match msg {
             DistributedMessage::RoleAddressed {
                 sender_id,
@@ -219,21 +262,23 @@ impl<I: Identifier> TunneledPeerTransport<I> {
                         hint_to,
                         hint,
                     } => {
-                        // Both sends are fire-and-forget. We bypass
-                        // the `PeerTransport::send_to_peer` body
-                        // (which would re-check the writer table and
-                        // surface no-route errors to caller) and go
-                        // straight at the table — the role-layer is
-                        // transport-internal bookkeeping, not an
-                        // application-layer send.
-                        if let Err(e) = self.send_direct(&forward_to, forwarded) {
+                        // Both sends are fire-and-forget transport-
+                        // internal bookkeeping. They go through the
+                        // Router's send path (NOT the trait's
+                        // `send_to_peer`, whose NoRoute → Err contract
+                        // is wrong for an internal hint) so a forward
+                        // with no direct writer relays through a peer
+                        // instead of erroring — same contract as
+                        // `PeerNetwork::handle_role_layer`.
+                        if let Err(e) = self.router_send(&forward_to, forwarded, clocks) {
                             tracing::warn!(
                                 forward_to = %forward_to,
                                 error = %e,
                                 "RoleAddressed relay forward failed (tunneled)",
                             );
                         }
-                        if let Err(e) = self.send_direct(&hint_to, *hint) {
+                        // Unbox once at the dispatch boundary.
+                        if let Err(e) = self.router_send(&hint_to, *hint, clocks) {
                             tracing::warn!(
                                 hint_to = %hint_to,
                                 error = %e,
@@ -262,26 +307,74 @@ impl<I: Identifier> TunneledPeerTransport<I> {
         }
     }
 
-    /// Internal send helper. Clones the sender out of the shared
-    /// writer table behind a SHORT borrow window (no `.await` while
-    /// the borrow is live, so the workspace's
-    /// `await_holding_refcell_ref = "deny"` lint is satisfied), then
-    /// dispatches on the cloned sender.
-    fn send_direct(&self, peer_id: &str, msg: DistributedMessage<I>) -> Result<(), String> {
-        let tx_opt = self.outgoing.borrow().get(peer_id).cloned();
-        match tx_opt {
-            Some(tx) => tx.send(msg).map_err(|e| e.to_string()),
-            None => Err(format!(
-                "no tunneled writer for peer '{peer_id}': either the secondary \
-                 hasn't completed handshake yet, or its writer task has exited \
-                 (e.g. the per-secondary channel was closed after demotion)."
+    /// Originate a send to `peer_id` through the [`Router`] over the
+    /// shared `outgoing` table. The single place that bridges the
+    /// `Rc<RefCell<_>>` writer table to the Router's `&mut HashMap`
+    /// contract: borrow the table mutably for the duration of the
+    /// (synchronous) Router call, map [`SendOutcome`] to the
+    /// transport's `Result<(), String>` contract, then drop the borrow.
+    ///
+    /// The `RefCell` borrow never spans an `.await` (the Router call is
+    /// synchronous), so the workspace's
+    /// `await_holding_refcell_ref = "deny"` lint is satisfied without a
+    /// clone-out dance. `SendOutcome::Relayed::redial_target` is dropped
+    /// — see the `router` field doc (the submitter has no dial path).
+    fn router_send(
+        &mut self,
+        peer_id: &str,
+        msg: DistributedMessage<I>,
+        clocks: Clocks,
+    ) -> Result<(), String> {
+        let mut outgoing = self.outgoing.borrow_mut();
+        self.router.prune(clocks.now);
+        let outcome = self
+            .router
+            .send_to_peer(peer_id, msg, &mut outgoing, clocks)
+            .map_err(|e| e.to_string())?;
+        match outcome {
+            SendOutcome::Direct | SendOutcome::Relayed { .. } => Ok(()),
+            // Preserve the pre-Router no-writer mapping: a target with
+            // neither a direct writer nor any forwarder is a fatal "no
+            // route", surfaced to the caller as `Err` (the
+            // keepalive/relay arms match on `Err`) rather than a silent
+            // success.
+            SendOutcome::NoRoute => Err(format!(
+                "no route to peer '{peer_id}': no tunneled writer and no \
+                 forwarder available (either the secondary hasn't completed \
+                 handshake yet, or its writer task has exited)."
             )),
+        }
+    }
+
+    /// Drive one inbound frame through the [`Router`] over the shared
+    /// `outgoing` table, returning the frame to deliver to the role
+    /// layer (or `None` when the Router consumed it as a relay /
+    /// backoff / stale-drop). Bridges the `Rc<RefCell<_>>` table to the
+    /// Router's `&mut HashMap` contract, same borrow discipline as
+    /// [`Self::router_send`]. `redial_target` is dropped (no dial path).
+    fn router_inbound(
+        &mut self,
+        msg: DistributedMessage<I>,
+        clocks: Clocks,
+    ) -> Option<DistributedMessage<I>> {
+        let mut outgoing = self.outgoing.borrow_mut();
+        self.router.prune(clocks.now);
+        match self.router.process_inbound(msg, &mut outgoing, clocks) {
+            InboundOutcome::Deliver { msg, .. } => Some(*msg),
+            InboundOutcome::Handled { .. } => None,
         }
     }
 }
 
 impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        // Memory hygiene: even when this node only broadcasts (no
+        // `send_to_peer` / `recv_peer` traffic), relay routing state
+        // accumulated by past forwarding needs sweeping — mirrors
+        // `PeerNetwork::broadcast`. The per-secondary fan-out topology
+        // is unchanged here (that unification is a separate concern);
+        // this only sweeps the relay state added with the Router.
+        self.router.prune(Instant::now());
         // Snapshot the senders out of the shared map behind a
         // bounded borrow, then iterate the clones without holding
         // the RefCell across `.await`. `UnboundedSender::send` is
@@ -305,9 +398,12 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         peer_id: &str,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        // Sync delegation — see `send_direct` comment for the
-        // borrow-vs-await rationale.
-        self.send_direct(peer_id, msg)
+        // Route through the Router over the shared `outgoing` table so
+        // a target with no DIRECT writer can be relayed through another
+        // peer (the relay capability this transport gained). The Router
+        // call is synchronous, so the `RefCell` borrow inside
+        // `router_send` never spans an await.
+        self.router_send(peer_id, msg, now_clocks())
     }
 
     async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
@@ -368,7 +464,18 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
                     }
                 }
             };
-            match self.handle_role_layer(raw) {
+            // Route the raw frame through the Router first: a `Relay`
+            // envelope addressed elsewhere is forwarded (or bounced)
+            // through the `outgoing` table and consumed here; a `Relay`
+            // for us is unwrapped; everything else passes through. Only
+            // a delivered frame reaches the role layer. Mirrors
+            // `PeerNetwork::recv_peer`'s `process_inbound` → role-layer
+            // ordering.
+            let clocks = now_clocks();
+            let Some(delivered) = self.router_inbound(raw, clocks) else {
+                continue;
+            };
+            match self.handle_role_layer(delivered, clocks) {
                 Some(payload) => return Some(payload),
                 None => continue,
             }
@@ -382,9 +489,21 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         while let Ok(reg) = self.new_conn_rx.try_recv() {
             self.register_peer(reg);
         }
+        let clocks = now_clocks();
+        self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
-            match self.handle_role_layer(msg) {
+            // Sync Router dispatch: unwraps a `Relay` addressed to us,
+            // drops a `Relay` addressed elsewhere (forwarding needs the
+            // async path — same constraint as
+            // `PeerNetwork::try_recv_peer`), passes everything else
+            // through. No `outgoing` borrow needed:
+            // `process_inbound_sync` is pure state mutation.
+            let delivered = match self.router.process_inbound_sync(msg, clocks) {
+                InboundOutcome::Deliver { msg, .. } => *msg,
+                InboundOutcome::Handled { .. } => continue,
+            };
+            match self.handle_role_layer(delivered, clocks) {
                 Some(payload) => return Some(payload),
                 None => continue,
             }
