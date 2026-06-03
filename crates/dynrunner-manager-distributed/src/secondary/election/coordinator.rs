@@ -575,40 +575,109 @@ where
         promoted
     }
 
-    /// Fire the promotion-activation gate for the co-located parked
-    /// primary (fire-once). Wakes `PrimaryCoordinator::run_parked` into
-    /// its seeded resume (`activate_local_primary` → hydrate-from-CRDT →
-    /// operational loop).
+    /// Build + start the co-located [`crate::primary::PrimaryCoordinator`]
+    /// ON DEMAND, the moment this node becomes the primary. The single
+    /// activation mechanism BOTH handoff sides converge on: a failover-self
+    /// election win (the apply hook on a `PrimaryChanged { reason:
+    /// Election, new = self }`) and a bootstrap transfer naming this node
+    /// (the setup-FSM Transferred transition). There is NO pre-parked
+    /// object and NO gate — the coordinator does not exist until this runs.
     ///
-    /// `take()` makes this idempotent across the paths that name this
-    /// node primary: winning this node's OWN election
-    /// (`record_promotion_confirm` → true → `fire_local_promotion`, which
-    /// applies `PrimaryChanged { new = self }` locally) and being NAMED
-    /// primary by a `PrimaryChanged` broadcast applied through the
-    /// `apply_cluster_mutations` hook. Only the first consumes the sender;
-    /// any later apply of the same frame is a no-op on the gate. No-op
-    /// entirely when no co-located primary was composed
-    /// (`promote_activation_tx` is `None`).
-    pub(in crate::secondary) fn activate_co_located_primary(&mut self) {
-        if let Some(tx) = self.promote_activation_tx.take() {
-            // Hand the parked primary a SNAPSHOT of this secondary's
-            // continuously-mirrored cluster_state — the seed it
-            // `restore`s before `hydrate_from_cluster_state`. The parked
-            // primary's own cluster_state is empty (the role-aware tap
-            // does not feed it CRDT mirror frames), so this snapshot IS
-            // the ledger it resumes from.
-            let snapshot = self.cluster_state.snapshot();
-            if tx.send(snapshot).is_err() {
-                tracing::warn!(
-                    secondary = %self.config.secondary_id,
-                    "promotion-activation gate receiver dropped before firing \
-                     — the parked co-located primary is gone"
-                );
-            } else {
+    /// Capability is the explicit replicated marker, read here, never
+    /// inferred: the build proceeds ONLY when
+    /// `cluster_state.can_be_primary(self)` is true. That marker is the
+    /// single source of truth (set by the peer at join, updatable by a
+    /// client via `SetCanBePrimary`), so the selection / election guarantee
+    /// "this node can host a primary" is checked against global state, not
+    /// re-derived from membership.
+    ///
+    /// On a capable node the activator closure
+    /// ([`super::super::PrimaryActivator`], registered by the runtime) is
+    /// `take()`-n — making activation fire-once across the paths that name
+    /// this node (an own-election self-apply and a peer-echoed re-announce
+    /// converge on one build) — and invoked with a SNAPSHOT of this
+    /// secondary's continuously-mirrored `cluster_state` (the freshly-built
+    /// primary's own ledger is empty, so this snapshot IS the seeded resume
+    /// it `restore`s). The returned `JoinHandle` is stored for the runtime
+    /// to join at wind-down.
+    ///
+    /// The build forks on `(can_be_primary(self), activator registered?)`,
+    /// LOUD on a genuine contract violation (never a silent no-op — the
+    /// failure mode that produced THE HANG is deleted by construction):
+    ///   * `(true, Some)` — capable + wired ⇒ BUILD.
+    ///   * `(true, None)` — marked capable but the runtime registered no
+    ///     activator: a programmer wiring error. Latch `fatal_exit` + log
+    ///     loud so the run aborts rather than stranding with no primary.
+    ///   * `(false, Some)` — the node was NAMED primary yet its replicated
+    ///     marker says it cannot host one (against selection's guarantee —
+    ///     e.g. a client cleared the marker after wiring). Latch
+    ///     `fatal_exit` + log loud; refuse to build an unmarked authority.
+    ///   * `(false, None)` — never marked AND never wired: a Rust-only test
+    ///     / legacy single-`run()` caller / `disable_peer_overlay` host that
+    ///     was never selected as a hand-off target and runs no on-demand
+    ///     authority. A BENIGN no-op — the `PrimaryChanged` broadcast still
+    ///     fires uncontested; this is NOT a violation.
+    pub(in crate::secondary) fn activate_co_located_primary_on_demand(&mut self) {
+        // Idempotency: a second apply of the same naming finds the build
+        // already done — a clean no-op, never a double-build.
+        if self.activated_primary_handle.is_some() {
+            tracing::debug!(
+                secondary = %self.config.secondary_id,
+                "co-located primary already activated on demand; ignoring \
+                 repeat activation"
+            );
+            return;
+        }
+
+        let capable = self.cluster_state.can_be_primary(&self.config.secondary_id);
+        match (capable, self.primary_activator.take()) {
+            (true, Some(activator)) => {
+                // Capable + wired: build. Hand the freshly-built primary a
+                // SNAPSHOT of this secondary's continuously-mirrored
+                // cluster_state — the seed it `restore`s before
+                // `hydrate_from_cluster_state`.
+                let snapshot = self.cluster_state.snapshot();
+                let handle = activator(snapshot);
+                self.activated_primary_handle = Some(handle);
                 tracing::info!(
                     secondary = %self.config.secondary_id,
-                    "fired promotion-activation gate with cluster_state snapshot; \
-                     co-located primary will restore + hydrate and take authority"
+                    "built + started co-located primary on demand with \
+                     cluster_state snapshot; it will restore + hydrate and \
+                     take authority"
+                );
+            }
+            (true, None) => {
+                let reason = format!(
+                    "node {} is marked can_be_primary but no primary-activator \
+                     was registered — the runtime failed to wire on-demand \
+                     construction; cannot build the co-located primary",
+                    self.config.secondary_id
+                );
+                tracing::error!(secondary = %self.config.secondary_id, "{reason}");
+                self.fatal_exit = Some(reason);
+            }
+            (false, Some(_)) => {
+                // Activator was wired but the marker says incapable (a
+                // client cleared it): refuse to build an unmarked authority.
+                let reason = format!(
+                    "node {} was named primary but cluster_state.can_be_primary \
+                     is unset — selection/election must never name a peer whose \
+                     capability marker is cleared; refusing to build to avoid \
+                     a silent split-brain",
+                    self.config.secondary_id
+                );
+                tracing::error!(secondary = %self.config.secondary_id, "{reason}");
+                self.fatal_exit = Some(reason);
+            }
+            (false, None) => {
+                // Never marked, never wired — a legacy / Rust-only / no-mesh
+                // path that runs no on-demand authority. Benign: the
+                // `PrimaryChanged` broadcast still fires uncontested.
+                tracing::debug!(
+                    secondary = %self.config.secondary_id,
+                    "named primary but no on-demand activator wired and \
+                     can_be_primary unset (legacy / no-mesh path); not building \
+                     a co-located primary"
                 );
             }
         }
@@ -625,15 +694,15 @@ where
     /// separate role-flip wire frame and no separate direct activation
     /// call — the single `PrimaryChanged` frame carries both. The flow:
     ///   1. **Local apply** via `apply_cluster_mutations` — the winner's
-    ///      own apply hook runs, firing the co-located parked primary's
-    ///      activation gate (fire-once via `promote_activation_tx.take()`)
-    ///      and resetting this node's election to `Normal` (a primary now
-    ///      exists on this host — no lingering `Promoted`). `take()` makes
-    ///      this self-apply idempotent if the broadcast is later echoed
-    ///      back through the mesh receive path. No-op on the gate when no
-    ///      co-located primary was composed (Rust-only tests / legacy
-    ///      callers): the broadcast still fires so the mesh learns the new
-    ///      authority.
+    ///      own apply hook runs, BUILDING the co-located primary on demand
+    ///      (`activate_co_located_primary_on_demand`, fire-once via the
+    ///      activator `take()`) and resetting this node's election to
+    ///      `Normal` (a primary now exists on this host — no lingering
+    ///      `Promoted`). The fire-once is idempotent if the broadcast is
+    ///      later echoed back through the mesh receive path. No build when
+    ///      the node's `can_be_primary` marker is unset (Rust-only tests /
+    ///      legacy callers, which never set it): the broadcast still fires
+    ///      so the mesh learns the new authority.
     ///   2. **Broadcast** the same `PrimaryChanged` onto the mesh
     ///      (`Destination::All`). Surviving secondaries apply it via the
     ///      SAME hook, moving their `cluster_state.current_primary()` onto

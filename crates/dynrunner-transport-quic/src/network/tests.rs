@@ -51,6 +51,7 @@ async fn server_accepts_wss_bidirectional() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 };
                 MessageSender::send(&mut client, welcome).await.unwrap();
 
@@ -237,6 +238,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 };
                 MessageSender::send(&mut client, welcome).await.unwrap();
                 let cert: DistributedMessage<TestId> = DistributedMessage::CertExchange {
@@ -320,6 +322,7 @@ async fn mesh_writer_fans_into_the_same_wire() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 };
                 MessageSender::send(&mut client, welcome).await.unwrap();
 

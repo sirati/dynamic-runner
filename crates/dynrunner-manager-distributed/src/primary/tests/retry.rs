@@ -322,6 +322,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
@@ -448,6 +449,7 @@ async fn retry_max_passes_zero_disables_retry() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
@@ -577,6 +579,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
@@ -856,6 +859,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     worker_count: 1,
                     hostname: "test".into(),
                     is_observer: false,
+                    can_be_primary: false,
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {

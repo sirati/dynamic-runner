@@ -131,6 +131,9 @@ fn welcome_msg(secondary_id: &str, is_observer: bool) -> DistributedMessage<Test
         worker_count: 1,
         hostname: "test".into(),
         is_observer,
+        // A non-observer compute secondary advertises primary-capability;
+        // an observer never can.
+        can_be_primary: !is_observer,
     }
 }
 
@@ -225,6 +228,7 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
                 worker_count: 6,
                 hostname: "test".into(),
                 is_observer: false,
+                can_be_primary: true,
             };
             primary.handle_welcome(welcome).await;
 

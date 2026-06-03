@@ -53,6 +53,9 @@ pub enum SetupBootstrapMessage {
         worker_count: u32,
         hostname: String,
         is_observer: bool,
+        /// Primary-capability marker — twin of `is_observer`. See
+        /// [`DistributedMessage::SecondaryWelcome::can_be_primary`].
+        can_be_primary: bool,
     },
     /// Secondary → primary: "Here is my peer-mesh public cert + the
     /// addresses I'm reachable on." Sent immediately after
@@ -99,6 +102,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 worker_count,
                 hostname,
                 is_observer,
+                can_be_primary,
             } => DistributedMessage::SecondaryWelcome {
                 sender_id,
                 timestamp,
@@ -107,6 +111,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 worker_count,
                 hostname,
                 is_observer,
+                can_be_primary,
             },
             SetupBootstrapMessage::CertExchange {
                 sender_id,
@@ -163,6 +168,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 worker_count,
                 hostname,
                 is_observer,
+                can_be_primary,
             } => Ok(SetupBootstrapMessage::SecondaryWelcome {
                 sender_id,
                 timestamp,
@@ -171,6 +177,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 worker_count,
                 hostname,
                 is_observer,
+                can_be_primary,
             }),
             DistributedMessage::CertExchange {
                 sender_id,

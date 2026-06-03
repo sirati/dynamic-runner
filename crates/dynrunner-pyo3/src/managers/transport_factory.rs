@@ -20,8 +20,8 @@
 //! manager back an **opaque** `impl PeerTransport` plus the
 //! backend-derived values the manager still needs (the respawn trust
 //! anchor, the `PeerCertInfo` a secondary/observer ships in its
-//! `CertExchange`, and the optional mesh-send capability a co-located
-//! parked primary borrows). No caller of this module names a backend.
+//! `CertExchange`, and the optional mesh-send capability an on-demand
+//! co-located primary borrows). No caller of this module names a backend.
 //!
 //! # What is NOT this module's concern
 //!
@@ -120,10 +120,10 @@ pub(crate) struct SecondaryMeshBundle<I: Identifier> {
     /// built from the backend's cert PEM + QUIC port (so the manager
     /// never reads `.cert_pem()` / `.port()` itself).
     pub peer_cert_info: PeerCertInfo,
-    /// Cloneable mesh-send capability for the co-located parked
+    /// Cloneable mesh-send capability for the on-demand co-located
     /// primary's role-blind transport — `Some` only when a REAL peer
     /// mesh exists (a `Disabled` overlay has no remote secondaries and
-    /// thus no failover). Threaded into [`parked_primary_transport`].
+    /// thus no failover). Threaded into [`colocated_primary_transport`].
     pub mesh_send: Option<MeshSendHandle<I>>,
 }
 
@@ -245,7 +245,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
             (EitherPeerTransport::Real(Box::new(pn)), cert_pem, port)
         };
 
-    // Cloneable mesh-send capability for the co-located parked primary's
+    // Cloneable mesh-send capability for the on-demand co-located primary's
     // role-blind `MeshHandleTransport` (`Some` only when a real peer mesh
     // exists). Taken BEFORE the bootstrap wire fold so the handle reflects
     // the live `PeerNetwork`.
@@ -312,15 +312,16 @@ pub(crate) async fn observer_mesh<I: Identifier>(
     })
 }
 
-/// Build a co-located parked primary's role-blind mesh transport over
+/// Build an on-demand co-located primary's role-blind mesh transport over
 /// the host's single peer mesh.
 ///
 /// The mesh-send capability (`mesh`) reaches every remote peer; the
 /// `inbound_rx` is the demuxed inbound the co-located secondary forwards.
 /// The own-secondary loopback is NOT a transport leg — it is the egress
 /// edge's `SendTarget::Loopback` arm (see `register_colocated_loopback`).
-/// Keeps `MeshHandleTransport` named only inside this factory.
-pub(crate) fn parked_primary_transport<I: Identifier>(
+/// Keeps `MeshHandleTransport` named only inside this factory. Called from
+/// inside the primary-activator closure when a peer becomes primary.
+pub(crate) fn colocated_primary_transport<I: Identifier>(
     mesh: MeshSendHandle<I>,
     inbound_rx: tokio::sync::mpsc::UnboundedReceiver<
         dynrunner_protocol_primary_secondary::DistributedMessage<I>,

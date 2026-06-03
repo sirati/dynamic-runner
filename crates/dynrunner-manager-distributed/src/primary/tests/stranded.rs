@@ -103,6 +103,7 @@ async fn fake_secondary_dies_post_mesh_ready(
             worker_count: num_workers,
             hostname: "test-host".into(),
             is_observer: false,
+            can_be_primary: false,
         })
         .unwrap();
     outgoing_to_primary

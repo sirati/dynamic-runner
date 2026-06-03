@@ -164,8 +164,8 @@ impl PyDistributedManager {
         // `TaskDefinition` instance the live primary's callback already
         // targets. Each spawned in-process secondary registers these
         // callbacks and, under composition, transfers them to its
-        // co-located parked primary (which owns the phase machine and
-        // fires the cascade once activated). Each per-secondary closure
+        // co-located primary built on demand (which owns the phase machine
+        // and fires the cascade once activated). Each per-secondary closure
         // pair is pushed in the order the secondaries are spawned below;
         // the spawn loop pops one pair off this vec per iteration so each
         // closure captures its own `Py<PyAny>` ref-bump.
@@ -369,6 +369,13 @@ impl PyDistributedManager {
                             primary_link_failure_window: dist_primary_link_failure_window,
                             unconfigured_deadline: dist_unconfigured_deadline,
                             is_observer: false,
+                            // In-process distributed manager: secondaries
+                            // hold a channel mesh with ONLY the primary
+                            // folded in (no peer-to-peer mesh among
+                            // secondaries), so none registers an on-demand
+                            // primary-activator and none can host the
+                            // primary. `false` keeps the submitter primary.
+                            can_be_primary: false,
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
@@ -506,13 +513,13 @@ impl PyDistributedManager {
                         // which fires `on_phase_*` directly; these
                         // in-process secondaries hold a channel-backed mesh
                         // with only the primary folded in (no peer-to-peer
-                        // mesh among the secondaries) and therefore compose
-                        // NO co-located parked primary, so their registered
-                        // callbacks stay dormant (no transfer, no promotion
-                        // in-process) and never call into Python. They are
-                        // registered for shape-parity with the SLURM
-                        // secondary path (which DOES transfer them to a
-                        // co-located parked primary); the closures target
+                        // mesh among the secondaries) and therefore register
+                        // NO on-demand primary-activator, so their registered
+                        // callbacks stay dormant (no transfer, no on-demand
+                        // build in-process) and never call into Python. They
+                        // are registered for shape-parity with the SLURM
+                        // secondary path (which DOES transfer them into the
+                        // on-demand primary-activator); the closures target
                         // the SAME single process-wide Python
                         // `TaskDefinition` instance the in-process primary's
                         // callbacks already use.

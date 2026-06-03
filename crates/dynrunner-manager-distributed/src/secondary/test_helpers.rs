@@ -307,6 +307,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // fire, so the 10-min default is well outside any test budget.
         unconfigured_deadline: Duration::from_secs(600),
         is_observer: false,
+        can_be_primary: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,
         // Short grace so promotion-gated tests can drive the
@@ -344,6 +345,53 @@ pub(super) fn make_secondary(
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
+}
+
+/// Arm the on-demand primary-activator on a test secondary and mark the
+/// node `can_be_primary` in its replicated `cluster_state`, returning a
+/// shared flag the registered activator sets when invoked. The test probe
+/// for the on-demand activation mechanism: a test asserts the activator
+/// CLOSURE ran (the on-demand build was attempted) rather than observing a
+/// channel signal.
+///
+/// The activator returns a no-op `tokio::spawn`'d future as its
+/// `JoinHandle` (the test never drives a real primary coordinator — that
+/// is the manager-layer `run_activated` test's concern); it only records
+/// that the activation site invoked it. Marking `can_be_primary` via the
+/// real `PeerJoined` apply path is REQUIRED: the activation site gates the
+/// build on `cluster_state.can_be_primary(self)`.
+pub(super) fn arm_primary_activator<Tr, M, S, E>(
+    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+) -> Rc<std::cell::Cell<bool>>
+where
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
+    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
+    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
+    E: dynrunner_scheduler_api::ResourceEstimator<TestId> + Clone,
+{
+    // Mark the node primary-capable through the real CRDT apply path.
+    let self_id = coord.config.secondary_id.clone();
+    coord
+        .cluster_state
+        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
+            peer_id: self_id,
+            is_observer: false,
+            can_be_primary: true,
+        });
+    let fired = Rc::new(std::cell::Cell::new(false));
+    let fired_for_closure = fired.clone();
+    coord.register_primary_activator(Box::new(move |_snapshot| {
+        fired_for_closure.set(true);
+        // `tokio::spawn` (not `spawn_local`): the probe future is trivially
+        // `Send`, and using the global spawner lets these election unit
+        // tests run on a bare `current_thread` runtime WITHOUT a
+        // surrounding `LocalSet` (the real PyO3 activator `spawn_local`s a
+        // genuine coordinator onto the host's shared `LocalSet`; that
+        // runtime path is the manager-layer `run_activated` test's
+        // concern). The handle is immediately complete.
+        tokio::spawn(async {})
+    }));
+    fired
 }
 
 /// Construct a SecondaryCoordinator over the unified transport with a

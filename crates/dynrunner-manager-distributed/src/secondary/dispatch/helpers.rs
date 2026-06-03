@@ -45,11 +45,12 @@ where
     /// its CRDT mirror; it never decides what to dispatch from it.
     ///
     /// `PrimaryChanged` is the SINGLE primary-activation frame. Applying
-    /// it is also the ONE wake path: this hook runs
+    /// it is also the ONE activation path: this hook runs
     /// [`Self::apply_primary_changed`] per such mutation so a
     /// `PrimaryChanged { new = self }` arriving over ANY receive path
-    /// (operational dispatch, peer relay, or setup-time) wakes the
-    /// co-located parked primary and resets the failover election. It
+    /// (operational dispatch, peer relay, or setup-time) BUILDS the
+    /// co-located primary on demand (or, for a bootstrap `Transferred`,
+    /// latches the setup-FSM build) and resets the failover election. It
     /// keys on identity, not on election history — a node that never
     /// suspected/voted still activates when named.
     ///
@@ -71,12 +72,13 @@ where
         let mut primary_changed = false;
         for m in mutations {
             match m {
-                // `reason` is advisory routing metadata; the activation
-                // hook does not branch on it yet (Leaf 3 wires the
-                // Transferred-vs-Election fork). Ignore it here so the
-                // apply stays reason-blind.
-                ClusterMutation::PrimaryChanged { new, epoch, .. } => {
-                    primary_changed |= self.apply_primary_changed(new, epoch);
+                // `reason` routes the activation fork: a failover-self
+                // `Election` builds the co-located primary inline here; a
+                // bootstrap `Transferred` naming this node defers the build
+                // to the setup FSM (see `apply_primary_changed`). The
+                // central CRDT epoch-LWW apply itself stays reason-blind.
+                ClusterMutation::PrimaryChanged { new, epoch, reason } => {
+                    primary_changed |= self.apply_primary_changed(new, epoch, reason);
                 }
                 other => {
                     self.cluster_state.apply(other);
@@ -109,14 +111,27 @@ where
     ///      higher epoch. Every side effect below is gated on the apply
     ///      actually advancing state (`Applied`), so a no-op announcement
     ///      neither wakes nor resets.
-    ///   3. **Self-named → activate + reset.** When `new` is THIS node and
-    ///      this node is primary-capable (a `promote_activation_tx` is
-    ///      registered) and not an observer, fire the co-located parked
-    ///      primary's activation gate (fire-once via `take()`, so the
-    ///      own-election-win self-apply and a peer-echoed re-announce
-    ///      converge on one activation) and reset the failover election to
-    ///      `Normal` (a primary now exists on this host — there is no
-    ///      lingering Promoted state to name).
+    ///   3. **Self-named → activate-on-demand + reset.** When `new` is THIS
+    ///      node and not an observer, BUILD the co-located primary on
+    ///      demand and reset the failover election to `Normal` (a primary
+    ///      now exists on this host — no lingering Promoted to name). The
+    ///      build forks on `reason`:
+    ///        * `Election` (failover-self): build inline here via
+    ///          [`Self::activate_co_located_primary_on_demand`] — this node
+    ///          is `Operational` and stays a follower of its own primary.
+    ///        * `Transferred` (bootstrap hand-off): the submitter sends the
+    ///          setup frames before it relocates, so the common case is
+    ///          this node is ALREADY `Operational` — build inline. If the
+    ///          relocate raced ahead of TransferComplete and this node is
+    ///          still in setup, DEFER the build to the setup FSM by latching
+    ///          `pending_transfer_activation`; `wait_for_setup` reads the
+    ///          latch and runs the Transferred transition (build, then
+    ///          advance to Operational together), keeping the build
+    ///          co-located with the setup→operational advance.
+    ///
+    ///      Both build paths are capability-gated and loud-on-violation
+    ///      inside `activate_co_located_primary_on_demand`; the "silent
+    ///      no-op on a missing gate" failure mode is gone by construction.
     ///   4. **Peer-named → reset.** When `new` is a PEER, a primary now
     ///      exists, so any in-flight failover election on this node is
     ///      stale: reset it to `Normal`.
@@ -125,7 +140,12 @@ where
     /// identity (`Applied`); `false` on an observer rejection or a
     /// stale-epoch NoOp. The worker-pull revive is the caller's concern
     /// (see [`Self::apply_cluster_mutations`]).
-    fn apply_primary_changed(&mut self, new: String, epoch: u64) -> bool {
+    fn apply_primary_changed(
+        &mut self,
+        new: String,
+        epoch: u64,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason,
+    ) -> bool {
         // (1) Observer guard — reject naming an observer before the apply
         // moves `current_primary`.
         let observers = &self.cluster_state.role_table().observers;
@@ -165,12 +185,41 @@ where
         }
 
         if new == self.config.secondary_id {
-            // (3) This node is the new primary. Wake the co-located parked
-            // primary (fire-once; no-op when none was composed or the gate
-            // was already consumed by the own-election-win self-apply) and
-            // reset the election: a primary now exists on this host, so
-            // there is no lingering Promoted state.
-            self.activate_co_located_primary();
+            // (3) This node is the new primary. Fork on `reason`:
+            //   * Election (failover-self): build the co-located primary on
+            //     demand inline (fire-once; capability-gated + loud inside
+            //     the builder). This node is Operational.
+            //   * Transferred (bootstrap hand-off): build inline if already
+            //     Operational (the common case — TransferComplete drove it
+            //     there before the relocate); else (still in setup) defer to
+            //     the setup FSM by latching the pending flag, which
+            //     `wait_for_setup` reads to build + advance together.
+            // Then reset the election: a primary now exists on this host,
+            // so there is no lingering Promoted state.
+            match reason {
+                dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election => {
+                    // Failover-self: this node is `Operational`. Build the
+                    // co-located primary on demand inline.
+                    self.activate_co_located_primary_on_demand();
+                }
+                dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred => {
+                    // Bootstrap hand-off. The submitter broadcasts the
+                    // setup frames (PeerInfo/InitialAssignment/Transfer
+                    // Complete) BEFORE it relocates, so the common case is
+                    // that this node already advanced to `Operational` —
+                    // build inline. If instead the relocate raced ahead of
+                    // TransferComplete and this node is still in setup,
+                    // latch the pending flag so the setup FSM transition
+                    // (`wait_for_setup`) builds + advances the lifecycle to
+                    // Operational together, keeping the build co-located
+                    // with the setup→operational advance.
+                    if self.lifecycle.operational_mut().is_some() {
+                        self.activate_co_located_primary_on_demand();
+                    } else {
+                        self.pending_transfer_activation = true;
+                    }
+                }
+            }
             self.reset_election_to_normal();
         } else {
             // (4) A peer is the new primary, so any in-flight election on

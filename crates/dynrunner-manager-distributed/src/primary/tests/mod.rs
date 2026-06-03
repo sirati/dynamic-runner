@@ -28,6 +28,7 @@ mod phase_decision;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
+mod relocate_observe;
 mod result_data_plumbing;
 mod retry;
 mod select_bootstrap;
@@ -152,6 +153,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             primary_link_failure_window: Duration::from_secs(30),
             unconfigured_deadline: Duration::from_secs(600),
             is_observer: false,
+            can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             promoted_primary_quiesce_grace: Duration::from_millis(100),
@@ -212,6 +214,7 @@ pub(super) fn spawn_real_secondary_slow(
             primary_link_failure_window: Duration::from_secs(30),
             unconfigured_deadline: Duration::from_secs(600),
             is_observer: false,
+            can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             promoted_primary_quiesce_grace: Duration::from_millis(100),
@@ -280,6 +283,7 @@ pub(super) fn spawn_real_secondary_flaky(
             primary_link_failure_window: Duration::from_secs(30),
             unconfigured_deadline: Duration::from_secs(600),
             is_observer: false,
+            can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             promoted_primary_quiesce_grace: Duration::from_millis(100),

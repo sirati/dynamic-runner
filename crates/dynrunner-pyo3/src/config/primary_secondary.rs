@@ -338,6 +338,11 @@ impl PySecondaryConfig {
             primary_link_failure_window: self.distributed_config.primary_link_failure_window(),
             unconfigured_deadline: self.distributed_config.unconfigured_deadline(),
             is_observer: false,
+            // Conservative default for this (unused) one-step builder: the
+            // live secondary-construction site sets `can_be_primary` from
+            // its actual mesh presence (`mesh_send_handle.is_some()`); this
+            // wrapper has no transport, so the safe value is `false`.
+            can_be_primary: false,
             resource_check_interval: self.distributed_config.resource_check_interval(),
             log_oom_watcher: self.distributed_config.log_oom_watcher(),
             // Hardcoded to the SecondaryConfig::default() value (2 s).

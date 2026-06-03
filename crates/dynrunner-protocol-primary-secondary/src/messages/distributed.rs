@@ -50,6 +50,19 @@ pub enum DistributedMessage<I> {
         /// senders wire-compatible.
         #[serde(default)]
         is_observer: bool,
+        /// Whether this secondary can host the primary role on demand —
+        /// it is an overlay-enabled (real peer mesh present), non-observer
+        /// compute secondary, so it can construct a `PrimaryCoordinator`
+        /// the moment it is named primary. The primary translates this
+        /// into the secondary's replicated `RoleTable.can_be_primary`
+        /// entry (the `PeerJoined { can_be_primary }` it originates on
+        /// welcome-accept), which `select_bootstrap_primary` reads as the
+        /// single authoritative capability marker. Mirrors the
+        /// `is_observer` advertisement exactly. `#[serde(default)]` keeps
+        /// pre-field senders wire-compatible (they decode as `false` — the
+        /// conservative "submitter stays primary" value).
+        #[serde(default)]
+        can_be_primary: bool,
     },
     Entropy {
         sender_id: String,
@@ -221,6 +234,16 @@ pub enum DistributedMessage<I> {
         /// non-ratcheting default).
         #[serde(default)]
         is_observer: bool,
+        /// The joiner's own primary-capability marker — twin of
+        /// `is_observer`. A late-joining compute secondary that can host
+        /// the primary on demand declares `true`; an observer late-joiner
+        /// declares `false`. The snapshot responder broadcasts a
+        /// `ClusterMutation::PeerJoined { can_be_primary }` carrying this
+        /// truth so the replicated `RoleTable.can_be_primary` records the
+        /// joiner's capability. `#[serde(default)]` keeps pre-field
+        /// senders wire-compatible (decode as `false`).
+        #[serde(default)]
+        can_be_primary: bool,
     },
     /// Response carrying a full `ClusterStateSnapshot` the receiver
     /// merges into its local mirror via `ClusterState::restore`. The

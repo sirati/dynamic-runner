@@ -495,19 +495,21 @@ async fn activate_local_primary_does_not_hydrate_on_bootstrap() {
         .await;
 }
 
-/// (5) FAILOVER-TRIGGERED activation through the full `run_parked` path.
+/// (5) ON-DEMAND activation through the full `run_activated` path.
 ///
-/// A parked co-located primary builds up front with an empty pool
-/// (`total_tasks == 0`), parks behind the promote gate, and only on the
-/// gate firing enters the seeded resume: `activate_local_primary`
-/// hydrates from the replicated CRDT, then the shared
-/// operational-loop-and-finalize tail runs. With every CRDT task already
-/// terminal, `run_complete_check` trips on the loop's first iteration so
-/// the run finalizes cleanly — no transport traffic needed. This pins
-/// the gate→activate→hydrate→finalize wiring end-to-end at the manager
-/// layer (the two-coordinator RUNTIME composition is e2e-only).
+/// A co-located primary built ON DEMAND (the moment a peer is named
+/// primary) starts with NO local pool AND an empty cluster_state. It is
+/// driven directly via `run_activated(snapshot)` — there is no pre-parked
+/// object and no promotion gate. `run_activated` restores the snapshot,
+/// enters the seeded resume (`activate_local_primary` hydrates from the
+/// restored CRDT), then the shared operational-loop-and-finalize tail
+/// runs. With every CRDT task already terminal, `run_complete_check` trips
+/// on the loop's first iteration so the run finalizes cleanly — no
+/// transport traffic needed. This pins the restore→activate→hydrate→
+/// finalize wiring end-to-end at the manager layer (the two-coordinator
+/// RUNTIME composition is e2e-only).
 #[tokio::test(flavor = "current_thread")]
-async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
+async fn run_activated_finalizes_from_crdt() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -522,18 +524,17 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
                 FixedEstimator(100),
             );
 
-            // Parked primary starts with NO local pool AND an empty
-            // cluster_state (the role-aware tap does not feed it CRDT
-            // mirror frames). The promotion gate carries a SNAPSHOT of
-            // the secondary's continuously-mirrored ledger; build that
-            // snapshot from a separate ClusterState holding two tasks,
-            // both already Completed (the rest of the cluster finished
-            // them before this node was promoted).
+            // An on-demand-built primary starts with NO local pool AND an
+            // empty cluster_state. The activator hands it a SNAPSHOT of the
+            // secondary's continuously-mirrored ledger; build that snapshot
+            // from a separate ClusterState holding two tasks, both already
+            // Completed (the rest of the cluster finished them before this
+            // node was named primary).
             assert_eq!(primary.total_tasks, 0);
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 0,
-                "parked primary's own ledger is empty until the restore"
+                "on-demand primary's own ledger is empty until the restore"
             );
             let snapshot = {
                 let mut seed = crate::cluster_state::ClusterState::<TestId>::new();
@@ -550,17 +551,12 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
                 seed.snapshot()
             };
 
-            // Wire + fire the promote gate with the snapshot, then drive
-            // run_parked (restore → activate → hydrate → finalize).
-            let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
-            promote_tx
-                .send(snapshot)
-                .expect("gate receiver must be live on the parked future");
-
+            // Drive run_activated with the snapshot directly (restore →
+            // activate → hydrate → finalize). No gate.
             primary
-                .run_parked(promote_rx)
+                .run_activated(snapshot)
                 .await
-                .expect("parked failover run must finalize cleanly");
+                .expect("on-demand activation run must finalize cleanly");
 
             // The seeded resume restored the snapshot into the primary's
             // own ledger, then hydrated total_tasks from it (the
@@ -569,7 +565,7 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
             assert_eq!(
                 primary.cluster_state_for_test().task_count(),
                 2,
-                "the gate snapshot must be restored into the primary's ledger"
+                "the activation snapshot must be restored into the primary's ledger"
             );
             assert_eq!(
                 primary.total_tasks, 2,
@@ -584,49 +580,6 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
                 primary.stranded_count(),
                 0,
                 "no stranded tasks — the run finalized on a fully-terminal ledger"
-            );
-        })
-        .await;
-}
-
-/// (6) The parked primary that is NEVER promoted: the gate sender is
-/// dropped without firing (the common case for every non-winning
-/// secondary's co-located primary). `run_parked` must return `Ok(())`
-/// without ever touching the pool, and run dispatcher cleanup.
-#[tokio::test(flavor = "current_thread")]
-async fn run_parked_exits_clean_when_gate_dropped() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-                PrimaryConfig::default(),
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-            // Drop the gate sender WITHOUT firing — this node is never
-            // promoted, so no snapshot is delivered and the seeded
-            // resume never runs.
-            let (promote_tx, promote_rx) = tokio::sync::oneshot::channel::<
-                crate::cluster_state::ClusterStateSnapshot<TestId>,
-            >();
-            drop(promote_tx);
-
-            primary
-                .run_parked(promote_rx)
-                .await
-                .expect("a never-promoted parked primary exits cleanly");
-
-            assert_eq!(
-                primary.total_tasks, 0,
-                "no activation: the pool/ledger hydration never ran on the \
-                 never-promoted path"
-            );
-            assert_eq!(
-                primary.completed_count(),
-                0,
-                "no work was processed on the never-promoted path"
             );
         })
         .await;

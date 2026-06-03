@@ -121,10 +121,11 @@ use super::primary_link::PrimaryLink;
 /// per-secondary terminal payload (see the module docs).
 ///
 /// **No promotion state.** A secondary is never promoted: when its host
-/// wins the election the host's co-located primary coordinator is woken
-/// (the coordinator-level `promote_activation_tx` + the election
-/// sub-machine), while this secondary stays `Operational`. There is no
-/// `Operational → Promoted` lifecycle transition.
+/// becomes the primary the host's co-located primary coordinator is BUILT
+/// ON DEMAND (the coordinator-level `primary_activator`, invoked from the
+/// apply hook for a failover-self election win and from the setup FSM for a
+/// bootstrap transfer), while this secondary stays `Operational`. There is
+/// no `Operational → Promoted` lifecycle transition.
 ///
 /// **Observer is a role, not a state.** A pure observer / late-joiner
 /// constructs [`Operational`](SecondaryLifecycle::Operational) directly
@@ -412,10 +413,10 @@ impl Default for MeshFormation {
 /// the operational loop, not part of the resumable state data — exactly as
 /// the skeleton scoped [`OperationalState`].
 ///
-/// `promote_activation_tx` is deliberately NOT here: it stays a
-/// coordinator-level channel, consumed when the election sub-machine wakes
-/// the co-located primary coordinator (the secondary itself never leaves
-/// `Operational`), not at this boundary.
+/// `primary_activator` is deliberately NOT here: it stays a
+/// coordinator-level slot, `take()`-n at the activation site when this node
+/// is named primary and the co-located primary is built on demand (the
+/// secondary itself never leaves `Operational`), not at this boundary.
 pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// Observer-announcer outbox receiver. `None` outside an attached
     /// observer wiring.

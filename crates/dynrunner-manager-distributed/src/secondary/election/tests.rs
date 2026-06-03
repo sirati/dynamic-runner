@@ -10,7 +10,9 @@
 //! Scenario (a) — secondary dies → primary requeues — is covered in
 //! `crate::primary::heartbeat::tests`.
 
-use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
+use super::super::test_helpers::{
+    FakeWorkerFactory, arm_primary_activator, election_config, make_secondary,
+};
 use super::super::wire::timestamp_now;
 use super::*;
 use dynrunner_protocol_primary_secondary::KeepaliveRole;
@@ -466,8 +468,7 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     // peer_count = 2 → quorum = 2 (self + one confirm).
     let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 2);
     sec.enter_operational_for_test();
-    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    let activated = arm_primary_activator(&mut sec);
 
     // Drive sec-a into Candidate(round=1) so the confirm tally has a
     // matching round to credit.
@@ -489,15 +490,15 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
     sec.fire_local_promotion().await;
 
-    // (1) The local self-apply of `PrimaryChanged { new = self }` fired
-    // the activation gate exactly once, carrying the cluster-state
-    // snapshot the parked primary restores, AND installed self as the
-    // current primary AND reset the election to Normal (no lingering
-    // Promoted — the host now runs a primary coordinator).
+    // (1) The local self-apply of `PrimaryChanged { new = self }` BUILT
+    // the co-located primary on demand (the activator closure ran),
+    // installed self as the current primary, AND reset the election to
+    // Normal (no lingering Promoted — the host now runs a primary
+    // coordinator).
     assert!(
-        promote_rx.await.is_ok(),
-        "fire_local_promotion must wake the parked co-located primary \
-             with a cluster_state snapshot",
+        activated.get(),
+        "fire_local_promotion must build the co-located primary on demand \
+             (the activator closure must run)",
     );
     assert_eq!(
         sec.cluster_state.current_primary(),
@@ -530,57 +531,64 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     );
 }
 
-/// The activation gate is FIRE-ONCE across the paths that name this
+/// The on-demand build is FIRE-ONCE across the paths that name this
 /// node primary: winning the own election AND being named by a
 /// `PrimaryChanged` applied through the hook. A second
-/// `fire_local_promotion` (or a second apply of the same frame via
-/// `activate_co_located_primary`) must NOT panic or double-send on the
-/// already-consumed gate. The `oneshot::Sender` `take()` guarantees
-/// this; the test asserts the second call is a clean no-op.
+/// `activate_co_located_primary_on_demand` (or a second apply of the same
+/// frame) must NOT panic or double-build — the activator is `take()`-n on
+/// the first build and the stored handle short-circuits the rest.
 #[tokio::test(flavor = "current_thread")]
-async fn activation_gate_is_fire_once() {
+async fn activation_is_fire_once() {
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
-    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    let build_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    // Mark the node capable + register a counting activator (the standard
+    // arming probe records a bool; here we need a count to prove fire-once).
+    sec.cluster_state
+        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
+            peer_id: "sec-a".into(),
+            is_observer: false,
+            can_be_primary: true,
+        });
+    {
+        let bc = build_count.clone();
+        sec.register_primary_activator(Box::new(move |_snap| {
+            bc.set(bc.get() + 1);
+            tokio::spawn(async {})
+        }));
+    }
 
-    // First activation consumes the gate (delivering a snapshot).
-    sec.activate_co_located_primary();
-    assert!(
-        promote_rx.try_recv().is_ok(),
-        "first activation must deliver the gate signal (snapshot)",
-    );
+    // First activation builds (the activator runs, the handle is stored).
+    sec.activate_co_located_primary_on_demand();
+    assert_eq!(build_count.get(), 1, "first activation must build once");
 
     // Second activation (e.g. the own broadcast echoed back through the
-    // `apply_cluster_mutations` hook) is a clean no-op — the sender was
-    // already taken, so nothing is sent and nothing panics.
-    sec.activate_co_located_primary();
+    // `apply_cluster_mutations` hook) is a clean no-op — the handle is
+    // already set, so the activator is never invoked again.
+    sec.activate_co_located_primary_on_demand();
     sec.fire_local_promotion().await;
-    assert!(
-        matches!(
-            promote_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ),
-        "no second gate signal; the sender was consumed and dropped",
+    assert_eq!(
+        build_count.get(),
+        1,
+        "no second build; the activator was consumed on the first activation",
     );
 }
 
 // ── The unified wake frame: `apply_cluster_mutations` apply hook ──
 
 /// The highest-value wake-frame unit test. A primary-capable secondary
-/// with a registered `promote_activation_tx`, applying
-/// `ClusterMutation::PrimaryChanged { new = self }` through the unified
-/// `apply_cluster_mutations` hook:
-///   (a) fires `activate_co_located_primary` (gate consumed) AND resets
-///       the failover election to `Normal` afterwards;
+/// with a registered on-demand activator, applying
+/// `ClusterMutation::PrimaryChanged { reason: Election, new = self }`
+/// through the unified `apply_cluster_mutations` hook:
+///   (a) BUILDS the co-located primary on demand (the activator runs) AND
+///       resets the failover election to `Normal` afterwards;
 ///   (b) NEVER went through Suspecting/Candidate first — the hook keys on
 ///       identity, not election history.
 #[tokio::test(flavor = "current_thread")]
-async fn wake_frame_self_named_fires_gate_and_resets_to_normal() {
+async fn wake_frame_self_named_builds_on_demand_and_resets_to_normal() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
     sec.enter_operational_for_test();
-    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    let activated = arm_primary_activator(&mut sec);
 
     // No prior election excursion — the node has never suspected/voted.
     assert!(matches!(sec.op_mut().election, ElectionState::Normal));
@@ -593,8 +601,9 @@ async fn wake_frame_self_named_fires_gate_and_resets_to_normal() {
 
     assert!(changed, "a genuine PrimaryChanged advance returns true");
     assert!(
-        promote_rx.try_recv().is_ok(),
-        "self-named PrimaryChanged must fire the co-located primary's gate",
+        activated.get(),
+        "self-named PrimaryChanged (Election) must build the co-located \
+         primary on demand",
     );
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
     assert!(
@@ -604,15 +613,14 @@ async fn wake_frame_self_named_fires_gate_and_resets_to_normal() {
 }
 
 /// `PrimaryChanged { new = other }` applied through the hook installs
-/// the peer as primary but does NOT fire this node's activation gate —
-/// the gate is consumed ONLY when the frame names self.
+/// the peer as primary but does NOT build this node's co-located primary —
+/// the on-demand build runs ONLY when the frame names self.
 #[tokio::test(flavor = "current_thread")]
-async fn wake_frame_peer_named_does_not_fire_gate() {
+async fn wake_frame_peer_named_does_not_build() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
     sec.enter_operational_for_test();
-    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    let activated = arm_primary_activator(&mut sec);
 
     let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-b".into(),
@@ -623,16 +631,13 @@ async fn wake_frame_peer_named_does_not_fire_gate() {
     assert!(changed, "a peer-named PrimaryChanged still advances the identity");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-b"));
     assert!(
-        matches!(
-            promote_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ),
-        "the gate must NOT fire when a PEER is named primary",
+        !activated.get(),
+        "the on-demand build must NOT run when a PEER is named primary",
     );
 }
 
 /// Applying `PrimaryChanged { new = self }` TWICE is fire-once: the
-/// second apply consumes nothing (the gate was already taken on the
+/// second apply builds nothing (the activator was already taken on the
 /// first) and does not panic. The second is also a stale-epoch NoOp at
 /// the CRDT level (same epoch+id), so it reports `false`.
 #[tokio::test(flavor = "current_thread")]
@@ -640,8 +645,20 @@ async fn wake_frame_double_apply_is_fire_once() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
     sec.enter_operational_for_test();
-    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    let build_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    sec.cluster_state
+        .apply(ClusterMutation::PeerJoined {
+            peer_id: "sec-a".into(),
+            is_observer: false,
+            can_be_primary: true,
+        });
+    {
+        let bc = build_count.clone();
+        sec.register_primary_activator(Box::new(move |_snap| {
+            bc.set(bc.get() + 1);
+            tokio::spawn(async {})
+        }));
+    }
 
     let first = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
@@ -649,29 +666,28 @@ async fn wake_frame_double_apply_is_fire_once() {
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
     assert!(first, "first apply advances the identity");
-    assert!(promote_rx.try_recv().is_ok(), "first apply fires the gate");
+    assert_eq!(build_count.get(), 1, "first apply builds the primary once");
 
-    // Second apply of the identical frame: fire-once gate (already
-    // taken) + CRDT NoOp (same epoch+id). No panic, no second signal.
+    // Second apply of the identical frame: fire-once (activator already
+    // taken on the first) + CRDT NoOp (same epoch+id). No panic, no second
+    // build.
     let second = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "sec-a".into(),
         epoch: 1,
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
     assert!(!second, "a re-applied identical PrimaryChanged is a NoOp");
-    assert!(
-        matches!(
-            promote_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        ),
-        "no second gate signal; the sender was consumed and dropped on the first apply",
+    assert_eq!(
+        build_count.get(),
+        1,
+        "no second build; the activator was consumed on the first apply",
     );
 }
 
 /// The observer-not-primary guard moved into the apply hook: applying
 /// `PrimaryChanged` naming an observer (here, self when `is_observer`)
-/// is REJECTED — `current_primary` is NOT installed and the gate does
-/// not fire. The hook returns `false` (no genuine advance).
+/// is REJECTED — `current_primary` is NOT installed and the on-demand
+/// build does not run. The hook returns `false` (no genuine advance).
 #[tokio::test(flavor = "current_thread")]
 async fn wake_frame_self_observer_is_rejected() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
@@ -679,8 +695,17 @@ async fn wake_frame_self_observer_is_rejected() {
     cfg.is_observer = true;
     let (mut sec, _log) = make_secondary_recording(cfg, 1);
     sec.enter_operational_for_test();
-    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
-    sec.register_promote_activation(promote_tx);
+    // Register a build-recording activator (without `arm_primary_activator`,
+    // which would mark the node non-observer/capable — contradicting this
+    // observer fixture). The observer guard must reject before any build.
+    let built = std::rc::Rc::new(std::cell::Cell::new(false));
+    {
+        let b = built.clone();
+        sec.register_primary_activator(Box::new(move |_snap| {
+            b.set(true);
+            tokio::spawn(async {})
+        }));
+    }
 
     let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
         new: "obs-a".into(),
@@ -694,23 +719,22 @@ async fn wake_frame_self_observer_is_rejected() {
         "an observer must NOT be installed as current primary",
     );
     assert!(
-        matches!(
-            promote_rx.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ),
-        "the gate must NOT fire for a rejected observer naming",
+        !built.get(),
+        "the on-demand build must NOT run for a rejected observer naming",
     );
 }
 
-/// With no co-located primary composed (Rust-only / legacy callers),
-/// the terminal action must not panic on the absent gate: the
-/// `PrimaryChanged` broadcast still fires so the mesh records the new
-/// authority.
+/// With no on-demand activator wired AND no `can_be_primary` marker
+/// (Rust-only / legacy / no-mesh callers), the terminal action's
+/// build-on-demand is a BENIGN no-op (the `(false, None)` fork — never a
+/// fatal): the `PrimaryChanged` broadcast still fires so the mesh records
+/// the new authority.
 #[tokio::test(flavor = "current_thread")]
-async fn promotion_without_composed_primary_still_broadcasts() {
+async fn promotion_without_activator_still_broadcasts() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
-    // No `register_promote_activation` — promote_activation_tx stays None.
+    // No `register_primary_activator` and no `can_be_primary` marker —
+    // the `(false, None)` benign no-op fork.
     sec.fire_local_promotion().await;
     assert!(
         log.borrow().iter().any(|m| matches!(

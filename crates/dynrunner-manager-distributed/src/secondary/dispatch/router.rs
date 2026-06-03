@@ -437,6 +437,7 @@ where
             DistributedMessage::RequestClusterSnapshot {
                 sender_id,
                 is_observer,
+                can_be_primary,
                 ..
             } => {
                 // Any peer can answer — `cluster_state` is replicated,
@@ -498,9 +499,12 @@ where
                     .apply_and_broadcast_mutations(vec![ClusterMutation::PeerJoined {
                         peer_id: sender_id,
                         is_observer,
-                        // Foundation leaf: capability stays `false` here;
-                        // Leaf 3 wires the relayed peer's capability.
-                        can_be_primary: false,
+                        // The late-joiner declared its own primary-capability
+                        // on the snapshot request (twin of `is_observer`); a
+                        // re-bootstrapping compute secondary carries `true`,
+                        // an observer late-joiner `false`. Record that truth
+                        // in the replicated `RoleTable.can_be_primary`.
+                        can_be_primary,
                     }])
                     .await;
                 Ok(())

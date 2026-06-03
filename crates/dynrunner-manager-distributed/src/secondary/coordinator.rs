@@ -96,7 +96,9 @@ where
             panik_signal_rx: None,
             fatal_exit_signal_rx: None,
             on_cluster_state_refresh: None,
-            promote_activation_tx: None,
+            primary_activator: None,
+            activated_primary_handle: None,
+            pending_transfer_activation: false,
             on_phase_end: None,
             on_phase_start: None,
             command_rx: Some(command_rx),
@@ -259,7 +261,7 @@ where
     /// composed — every non-pyo3 path) leaves the forward a no-op.
     ///
     /// Pre-`run_until_setup_or_done` contract, same one-shot shape as
-    /// [`Self::register_promote_activation`]: the slot is `take`-n into
+    /// [`Self::register_primary_activator`]: the slot is `take`-n into
     /// the operational loop's latches at the `enter_operational`
     /// boundary.
     pub fn register_colocated_primary_inbound(
@@ -390,26 +392,36 @@ where
         self.on_cluster_state_refresh = Some(callback);
     }
 
-    /// Register the promotion-activation gate sender for the co-located
-    /// parked [`crate::primary::PrimaryCoordinator`].
+    /// Register the ON-DEMAND primary-activator closure: the
+    /// construction-on-demand of a co-located
+    /// [`crate::primary::PrimaryCoordinator`].
     ///
-    /// The composed runtime builds both coordinators on one `LocalSet`,
-    /// parks the primary behind `PrimaryCoordinator::run_parked`'s
-    /// oneshot gate, and hands the matching sender here. When this
-    /// node's election reaches its terminal `Promoted` transition,
-    /// [`Self::fire_local_promotion`] fires the gate to wake the parked
-    /// primary into its seeded resume. Pre-`run_until_setup_or_done`
-    /// contract, same single-shot shape as the other `register_*`
-    /// setters. Absent registration (Rust-only tests / legacy single-
-    /// `run()` callers) leaves the gate `None`; the terminal action then
-    /// only broadcasts `PrimaryChanged { new = self }`. The gate carries
-    /// a [`crate::cluster_state::ClusterStateSnapshot`] — the seed for
-    /// the parked primary's `restore` + `hydrate_from_cluster_state`.
-    pub fn register_promote_activation(
-        &mut self,
-        tx: tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
-    ) {
-        self.promote_activation_tx = Some(tx);
+    /// The runtime layer captures the primary's construction inputs (the
+    /// host's mesh transport handle, the loopback/demux channels, config,
+    /// scheduler, estimator, command/phase wiring) into this closure and
+    /// hands it here. There is NO pre-built coordinator — when this node is
+    /// named primary (failover-self election win OR a bootstrap transfer
+    /// naming it), [`Self::activate_co_located_primary_on_demand`]
+    /// `take()`s this closure, snapshots `cluster_state`, and invokes it to
+    /// build and spawn the primary into its seeded resume. Pre-
+    /// `run_until_setup_or_done` contract, same single-shot shape as the
+    /// other `register_*` setters. Absent registration (Rust-only tests /
+    /// legacy single-`run()` callers / a `disable_peer_overlay` host)
+    /// leaves the activator `None`; a node whose replicated
+    /// `can_be_primary` marker is unset never reaches the build, so the
+    /// `None` is benign there and the `PrimaryChanged` broadcast still
+    /// fires. See [`super::PrimaryActivator`].
+    pub fn register_primary_activator(&mut self, activator: super::PrimaryActivator<I>) {
+        self.primary_activator = Some(activator);
+    }
+
+    /// Take the `JoinHandle` of the co-located primary this node activated
+    /// on demand (if any), for the runtime to join at wind-down so the
+    /// activated-primary future is never leaked. `None` on every node that
+    /// was never named primary (no build ever ran). Single-shot: the
+    /// handle is moved out, leaving `None`.
+    pub fn take_activated_primary_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.activated_primary_handle.take()
     }
 
     /// Extract the composed-primary wiring — the lifecycle/command
@@ -467,13 +479,14 @@ where
     /// Must be called before `run_until_setup_or_done` enters.
     ///
     /// The secondary holds NO phase machine and never fires these
-    /// itself. It is a registration ANCHOR: under the unified
-    /// composition the runtime moves the closures onto the co-located
-    /// parked `PrimaryCoordinator` (the authority that owns the phase
-    /// machine) via [`Self::take_composed_primary_wiring`]; that primary
-    /// fires them once activated. On a node that composes no co-located
-    /// primary (in-process distributed secondaries on a `NoPeerTransport`
-    /// mesh) the closures stay dormant and are never invoked.
+    /// itself. It is a registration ANCHOR: the runtime moves the closures
+    /// into the on-demand primary-activator closure (the authority that
+    /// owns the phase machine is built from them via
+    /// [`Self::take_composed_primary_wiring`]); the co-located primary
+    /// fires them once it is activated on demand. On a node that registers
+    /// no activator (in-process distributed secondaries on a
+    /// `NoPeerTransport` mesh) the closures stay dormant and are never
+    /// invoked.
     ///
     /// Single concern: accept ownership of the boxed GIL-reacquiring
     /// closures from the PyO3 wrapper and hold them until the

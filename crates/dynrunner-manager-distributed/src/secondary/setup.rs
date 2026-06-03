@@ -121,6 +121,15 @@ where
             // letting OTHER secondaries filter observers from their
             // `lowest_alive` candidate selection in election.
             is_observer: self.config.is_observer,
+            // Advertise primary-capability (twin of `is_observer`): an
+            // overlay-enabled compute secondary that can construct a
+            // primary on demand declares `true`, so the submitter's
+            // `select_bootstrap_primary` may relocate authority to it. A
+            // no-mesh / observer host declares `false` and the submitter
+            // stays primary. The primary records this in the replicated
+            // `RoleTable.can_be_primary` via the `PeerJoined` it
+            // originates on welcome-accept.
+            can_be_primary: self.config.can_be_primary,
         };
         self.send_setup_frame(msg).await
     }
@@ -317,12 +326,78 @@ where
                         tracing::debug!(?other, "unexpected message during setup");
                     }
                     }
+
+                    // Setup-FSM Transferred transition: a `PrimaryChanged
+                    // { reason: Transferred, new = self }` that landed
+                    // while this node was still in setup latched
+                    // `pending_transfer_activation` (see
+                    // `apply_primary_changed`). The submitter handed FULL
+                    // authority to this peer before the setup trio
+                    // completed (a relocate racing ahead of
+                    // TransferComplete), so abandon the wait-for-setup
+                    // handshake and build the co-located primary on demand
+                    // now — it takes over discovery/dispatch as the
+                    // authority. Returning `Ok(())` lets `process_tasks`
+                    // pick this node up as the follower of its OWN
+                    // co-located primary.
+                    if self.pending_transfer_activation
+                        && self.enter_operational_on_transfer(factory).await?
+                    {
+                        return Ok(());
+                    }
                 }
                 None => return Err("primary disconnected during setup".into()),
             }
         }
 
         Ok(())
+    }
+
+    /// Setup-FSM transition: "the setup primary handed authority to me."
+    ///
+    /// The `AwaitingPrimary→Configuring→Operational` fork's Transferred
+    /// branch, beside `enter_configuring` / `enter_operational`. Fired when
+    /// a bootstrap `PrimaryChanged { reason: Transferred, new = self }`
+    /// landed while this node was still in setup (latched by
+    /// `apply_primary_changed` as `pending_transfer_activation`). It:
+    ///   1. Ensures the worker pool exists — `Configuring`
+    ///      (`enter_configuring_on_first_primary_frame` is idempotent and a
+    ///      no-op once past `AwaitingPrimary`), since the co-located primary
+    ///      built next dispatches to this node's own workers via loopback.
+    ///   2. Builds the co-located primary ON DEMAND
+    ///      (`activate_co_located_primary_on_demand`): capability-gated on
+    ///      the explicit `can_be_primary(self)` marker + loud-on-violation
+    ///      (a Transferred to an incapable node — against selection's
+    ///      guarantee — latches `fatal_exit`, never a silent hang).
+    ///
+    /// Returns `true` iff the build was attempted (so `wait_for_setup`
+    /// abandons its handshake and returns, letting `process_tasks` run this
+    /// node as the follower of its own co-located primary). The pending
+    /// flag is cleared so a re-applied frame does not re-enter. `false`
+    /// only on the defensive no-flag path (never reached given the caller
+    /// guard).
+    async fn enter_operational_on_transfer(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<bool, String> {
+        if !self.pending_transfer_activation {
+            return Ok(false);
+        }
+        self.pending_transfer_activation = false;
+        tracing::info!(
+            secondary = %self.config.secondary_id,
+            "bootstrap hand-off (Transferred) named this node primary during \
+             setup; spawning workers (if needed) and building the co-located \
+             primary on demand"
+        );
+        // Spawn the pool if still `AwaitingPrimary` (idempotent no-op once
+        // `Configuring`/`Operational`). The on-demand primary dispatches to
+        // these workers via the co-located loopback.
+        self.enter_configuring_on_first_primary_frame(factory).await?;
+        // Build + start the co-located primary from the setup-seeded CRDT
+        // snapshot. Capability-gated + loud inside the builder.
+        self.activate_co_located_primary_on_demand();
+        Ok(true)
     }
 
     /// `AwaitingPrimary → Configuring` entry action, fired on the FIRST

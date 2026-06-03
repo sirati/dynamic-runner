@@ -148,8 +148,10 @@ impl PyObserverLateJoiner {
                     // replicated `PeerJoined` (R3's responder-carries-real-
                     // role fix), rather than every late-joiner being
                     // hardcoded as an observer.
+                    // `can_be_primary = false`: an observer can never host
+                    // the primary role (no workers, no dispatch authority).
                     let snapshot_json = peer_network
-                        .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true)
+                        .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true, false)
                         .await
                         .map_err(|e| {
                             pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -203,6 +205,9 @@ impl PyObserverLateJoiner {
                         primary_link_failure_window: dist_primary_link_failure_window,
                         unconfigured_deadline: dist_unconfigured_deadline,
                         is_observer: true,
+                        // An observer can never host the primary role (no
+                        // workers, no dispatch authority): `false`.
+                        can_be_primary: false,
                         // Observer has zero workers — the watcher's
                         // decision arm short-circuits on an empty pool
                         // and the sample arm reports the host reading
