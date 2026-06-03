@@ -11,9 +11,11 @@
 //! in as an ordinary directed-routable member via
 //! [`ChannelPeerTransport::register_primary_link`] — the channel analog
 //! of the QUIC `PeerNetwork::register_primary_link` — so
-//! `send_to_peer(primary)` / `has_peer(primary)` resolve over it while it
-//! is excluded from the `broadcast` fan-out and the `peer_count`
-//! mesh-health cardinality, exactly as the QUIC transport does.
+//! `send_to_peer(primary)` / `has_peer(primary)` resolve over it. The
+//! transport is role-blind: it counts and broadcasts to the folded
+//! primary like any peer; the primary-exclusion mesh-health policy lives
+//! at the coordinator edge (`real_peer_count`), exactly as the QUIC
+//! transport does.
 
 use std::collections::HashMap;
 
@@ -67,26 +69,24 @@ pub struct ChannelPeerTransport<I: Identifier> {
     /// folded wire — the primary becomes a routable mesh member from the
     /// secondary's side.
     ///
-    /// It is a DIRECTED-only member, NOT a full broadcast/health peer: it
-    /// is excluded from the [`PeerTransport::broadcast`] fan-out and from
-    /// the [`PeerTransport::peer_count`] mesh-health cardinality, so this
-    /// registration does not change broadcast topology or mesh-watchdog
-    /// behaviour. Symmetric with `PeerNetwork::primary_link_id` on the
-    /// QUIC side.
+    /// The transport treats it as an ordinary mesh member (counted in
+    /// [`PeerTransport::peer_count`] and reached by [`PeerTransport::broadcast`],
+    /// role-blind); the primary-exclusion mesh-health policy is the
+    /// coordinator edge's concern (`real_peer_count`), NOT the transport's.
+    /// Symmetric with `PeerNetwork::primary_link_id` on the QUIC side.
     pub(crate) primary_link_id: Option<String>,
 }
 
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
-        for (peer_id, tx) in &self.outgoing {
-            // The bootstrap-primary directed link is routable
-            // (`send_to_peer` / `has_peer`) but NOT a broadcast member:
-            // the secondary's mesh broadcast reaches peers only, exactly
-            // as before the primary was folded in. Folding the primary
-            // into the (deliver-once) broadcast fan-out is a later leaf.
-            if self.primary_link_id.as_deref() == Some(peer_id.as_str()) {
-                continue;
-            }
+        // Role-blind fan-out to every connection incl the folded primary
+        // (mirrors the QUIC `PeerNetwork` Real arm post de-role). The
+        // primary also receiving the secondary's broadcast keepalive/CRDT
+        // is a benign idempotent double (it also arrives via
+        // `send_to_primary`); excluding it would be a role concern the
+        // transport must not encode (TRANSPORT⊥ROLES) — the single
+        // authoritative exclusion lives at the coordinator edge.
+        for tx in self.outgoing.values() {
             // Closed senders are tolerated — the peer simply went away.
             let _ = tx.send(msg.clone());
         }
@@ -146,19 +146,15 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     }
 
     fn peer_count(&self) -> usize {
-        // Mesh-health cardinality: the count of real peer secondaries.
-        // The bootstrap-primary directed link (if registered) is routable
-        // but is NOT a mesh peer for health purposes — it must not inflate
-        // the count the mesh-watchdog / MeshReady report read, or a fleet
-        // reaching only the primary would falsely look "mesh-formed".
-        // Excluded symmetrically with `broadcast`.
-        let direct = self.outgoing.len();
-        let primary_link = usize::from(
-            self.primary_link_id
-                .as_deref()
-                .is_some_and(|id| self.outgoing.contains_key(id)),
-        );
-        direct - primary_link
+        // Pure membership cardinality (role-blind): all connections incl
+        // the folded primary. The transport must NOT special-case the
+        // primary (TRANSPORT⊥ROLES) — the "exclude the primary"
+        // mesh-health policy is the coordinator edge's single
+        // authoritative concern (`real_peer_count() = peer_count() -
+        // has_peer(current_primary)`); excluding here too would
+        // double-exclude (off-by-one). Mirrors the QUIC `PeerNetwork`
+        // Real arm.
+        self.outgoing.len()
     }
 
     fn has_peer(&self, id: &PeerId) -> bool {
