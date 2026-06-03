@@ -20,6 +20,7 @@ use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role, RoleChangeHookRegistrar,
 };
+use tokio::sync::mpsc;
 
 use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
 
@@ -50,6 +51,26 @@ impl<I: Identifier> EitherPeerTransport<I> {
         match self {
             Self::Real(p) => Some(p.mesh_send_handle()),
             Self::Disabled(_) => None,
+        }
+    }
+
+    /// Register the secondary's dialed primary connection as a
+    /// directed-routable mesh member keyed by `primary_id`.
+    ///
+    /// Forwards to [`PeerNetwork::register_primary_link`] on the `Real`
+    /// arm so `send_to_peer(primary)` / `has_peer(primary)` resolve over
+    /// the existing bootstrap wire. No-op on `Disabled`: a firewalled /
+    /// single-secondary deployment has no mesh `connections` table to
+    /// register into — the bootstrap uplink remains the only path to the
+    /// primary there, exactly as before.
+    pub fn register_primary_link(
+        &mut self,
+        primary_id: String,
+        writer: mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        match self {
+            Self::Real(p) => p.register_primary_link(primary_id, writer),
+            Self::Disabled(_) => {}
         }
     }
 }

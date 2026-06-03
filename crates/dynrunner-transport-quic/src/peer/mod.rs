@@ -146,6 +146,23 @@ pub struct PeerNetwork<I: Identifier> {
     /// dropped — e.g. a never-promoted parked primary — without closing
     /// the drain).
     mesh_send_tx: mpsc::UnboundedSender<MeshSend<I>>,
+
+    /// Id of the bootstrap-primary's DIRECTED mesh link, if registered
+    /// via [`Self::register_primary_link`]. The secondary registers its
+    /// dialed primary connection here so `send_to_peer(primary)` /
+    /// `has_peer(primary)` resolve over the existing bootstrap wire —
+    /// the primary becomes a routable mesh member from the secondary's
+    /// side.
+    ///
+    /// It is a DIRECTED-only member, NOT yet a full mesh peer: it is
+    /// excluded from the [`Self::broadcast`] fan-out and from the
+    /// [`Self::peer_count`] mesh-health cardinality, so this transient
+    /// registration does not change broadcast topology or mesh-watchdog
+    /// behaviour. Folding the primary into the broadcast fan-out
+    /// (deliver-once) and into the peer-liveness counts is the job of
+    /// the later broadcast-unification / role-tagged-keepalive leaves;
+    /// this field is the seam they remove.
+    primary_link_id: Option<String>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -241,7 +258,39 @@ impl<I: Identifier> PeerNetwork<I> {
             role_cache,
             proxy_rx,
             mesh_send_tx,
+            primary_link_id: None,
         })
+    }
+
+    /// Register the secondary's dialed primary connection as a
+    /// DIRECTED-routable mesh member keyed by `primary_id`.
+    ///
+    /// `writer` is a send handle into the existing bootstrap wire (see
+    /// [`crate::NetworkClient::mesh_writer`]) — registering it makes the
+    /// primary reachable via [`PeerTransport::send_to_peer`] /
+    /// observable via [`PeerTransport::has_peer`] over the SAME
+    /// connection the bootstrap uplink already owns, so no second wire
+    /// is opened and inbound primary frames keep arriving on the uplink
+    /// leg.
+    ///
+    /// The primary is registered as a DIRECTED-only member: it is
+    /// recorded in [`Self::primary_link_id`] and excluded from
+    /// [`PeerTransport::broadcast`] and [`PeerTransport::peer_count`],
+    /// so this registration does not prematurely make the primary a
+    /// broadcast/peer-count mesh peer (preserving the bootstrap
+    /// behaviour where the secondary's mesh broadcast and mesh-health
+    /// count never include the primary). The connection itself goes in
+    /// the same [`Self::connections`] table every directed send + the
+    /// router read from, so routing to the primary uses the one uniform
+    /// path.
+    pub fn register_primary_link(
+        &mut self,
+        primary_id: String,
+        writer: mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        tracing::info!(primary = %primary_id, "registered primary as directed mesh link");
+        self.connections.insert(primary_id.clone(), writer);
+        self.primary_link_id = Some(primary_id);
     }
 
     /// Mint a cloneable [`MeshSendHandle`] over this network's mesh.
