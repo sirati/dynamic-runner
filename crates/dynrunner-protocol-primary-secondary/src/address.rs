@@ -99,6 +99,123 @@ pub enum Address {
     Broadcast(Scope),
 }
 
+/// Opaque peer identifier — the host peer-id of a node in the mesh.
+///
+/// A newtype over the existing peer-id string representation (the same
+/// `String` carried today by [`Address::Peer`] and
+/// [`RoleTable::primary`]). It exists so the typed [`Destination`]
+/// vocabulary never traffics in bare `String`s: a peer-id is a distinct
+/// domain value, not "any string", and the type system should say so.
+///
+/// # Why a newtype rather than `String`
+///
+/// The mesh addresses hosts by id, and several distinct string-shaped
+/// concepts coexist in this protocol (peer ids, role names, message
+/// types). A newtype makes "this is a peer-id" unambiguous at every API
+/// boundary and lets a misuse (passing, say, a role name where a host id
+/// is expected) fail to compile rather than mis-route at runtime.
+///
+/// # Contract
+///
+/// - Cheap to clone (`String` inside); usable directly as a `HashMap`
+///   key (`Hash + Eq`), which the mesh connection/keepalive tables need.
+/// - `Display` / [`PeerId::as_str`] / `AsRef<str>` expose the underlying
+///   id for logging and for transports that still key tables by `&str`
+///   during the transient coexistence with [`Address`].
+/// - `From<String>` / `From<&str>` make migrating a call site that holds
+///   a raw id a zero-friction wrap.
+/// - **Serde transparent**: the wire/JSON form is exactly the inner
+///   string, so a `PeerId` is interchangeable on the wire with the bare
+///   id strings the protocol carries today — no envelope churn when call
+///   sites migrate from `String` to `PeerId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PeerId(String);
+
+impl PeerId {
+    /// Borrow the underlying peer-id string. The escape hatch for
+    /// transports that still key their tables by `&str` while `Address`
+    /// and `Destination` coexist.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume into the underlying `String`.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PeerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for PeerId {
+    fn from(s: String) -> Self {
+        PeerId(s)
+    }
+}
+
+impl From<&str> for PeerId {
+    fn from(s: &str) -> Self {
+        PeerId(s.to_string())
+    }
+}
+
+impl AsRef<str> for PeerId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Typed destination for a mesh send — the one addressing vocabulary
+/// the transport/router layer will resolve against.
+///
+/// # Resolution contract (honored later by the transport/router layer)
+///
+/// This enum is **pure data**: it names *who* a frame is for. It does
+/// **not** resolve anything itself — resolution (id lookup, role demux,
+/// loopback short-circuit, broadcast fan-out) is the transport/router
+/// layer's job and lands in a later leaf. The contract that layer must
+/// honor:
+///
+/// - [`Destination::Primary`] resolves via `current_primary()` / the
+///   role table to the **host peer-id** the primary runs on, and the
+///   `Router` routes to that host. The primary is *this variant* — there
+///   is no `"primary"` string literal; the literal id is never spoken.
+/// - [`Destination::Secondary`] / [`Destination::Observer`] carry the
+///   target **host peer-id** AND, on a multi-role host (one peer running
+///   several coordinators), select **which receiving coordinator** the
+///   frame is demuxed to by its role — replacing the ad-hoc
+///   primary-facing check. The id selects the host; the variant selects
+///   the role at that host.
+/// - [`Destination::All`] is the cluster broadcast — fan out to every
+///   peer (subsuming the legacy mesh / all-secondaries scopes).
+/// - **Loopback is implicit**: when a resolved host id equals the local
+///   peer-id, the transport delivers locally rather than over the wire.
+///   Call sites never special-case "is this me?" — they address by
+///   destination and the resolver short-circuits.
+///
+/// Serde derives carry `Destination` for any frame that needs to record
+/// an intended destination; resolution remains a send-time decision, not
+/// a wire-format concern.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Destination {
+    /// Whichever host currently holds the primary role, resolved via
+    /// `current_primary()` / the role table to that host's peer-id.
+    Primary,
+    /// The secondary coordinator on the host with this peer-id (role
+    /// demux selects the secondary at a multi-role host).
+    Secondary(PeerId),
+    /// The observer coordinator on the host with this peer-id (role
+    /// demux selects the observer at a multi-role host).
+    Observer(PeerId),
+    /// Cluster broadcast — every peer.
+    All,
+}
+
 /// Replicated role bookkeeping. The authoritative owner is the
 /// downstream `ClusterState`; transports keep a write-through cache
 /// populated via [`RoleChangeHookRegistrar::register_role_change_hook`].
@@ -276,6 +393,88 @@ mod tests {
         assert_ne!(
             Address::Broadcast(Scope::Mesh),
             Address::Broadcast(Scope::AllSecondaries)
+        );
+    }
+
+    /// `PeerId` serializes transparently (as the bare inner string) and
+    /// round-trips through serde unchanged. The transparent form is the
+    /// contract that lets a `PeerId` replace a raw id `String` on the
+    /// wire with no envelope churn — pin it so a future derive change
+    /// that adds a wrapper object trips this test.
+    #[test]
+    fn peer_id_serde_round_trip_is_transparent() {
+        let id = PeerId::from("node-3");
+        let json = serde_json::to_string(&id).expect("serialize PeerId");
+        assert_eq!(json, "\"node-3\"", "PeerId must serialize as a bare string");
+        let back: PeerId = serde_json::from_str(&json).expect("deserialize PeerId");
+        assert_eq!(id, back);
+    }
+
+    /// `PeerId` is usable as a `HashMap` key — the mesh
+    /// connection/keepalive tables depend on `Hash + Eq`. Distinct ids
+    /// occupy distinct slots; equal ids collide as expected.
+    #[test]
+    fn peer_id_is_hash_map_key() {
+        use std::collections::HashMap;
+        let mut map: HashMap<PeerId, u32> = HashMap::new();
+        map.insert(PeerId::from("a"), 1);
+        map.insert(PeerId::from("b"), 2);
+        // Re-inserting an equal key overwrites rather than adding.
+        map.insert(PeerId::from("a".to_string()), 10);
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&PeerId::from("a")), Some(&10));
+        assert_eq!(map.get(&PeerId::from("b")), Some(&2));
+        assert_eq!(map.get(&PeerId::from("missing")), None);
+    }
+
+    /// `PeerId` exposes its inner string via `as_str` / `AsRef` /
+    /// `Display` identically, and the `From` conversions agree.
+    #[test]
+    fn peer_id_accessors_agree() {
+        let id = PeerId::from("worker-9");
+        assert_eq!(id.as_str(), "worker-9");
+        assert_eq!(AsRef::<str>::as_ref(&id), "worker-9");
+        assert_eq!(id.to_string(), "worker-9");
+        assert_eq!(PeerId::from("worker-9".to_string()), id);
+        assert_eq!(id.clone().into_string(), "worker-9");
+    }
+
+    /// `Destination` round-trips through serde for every variant and
+    /// preserves structural equality. Pins the `Serialize/Deserialize`
+    /// + `PartialEq` derives the transport/router layer will rely on.
+    #[test]
+    fn destination_serde_round_trip() {
+        let cases = [
+            Destination::Primary,
+            Destination::Secondary(PeerId::from("sec-1")),
+            Destination::Observer(PeerId::from("obs-1")),
+            Destination::All,
+        ];
+        for dest in cases {
+            let json = serde_json::to_string(&dest).expect("serialize Destination");
+            let back: Destination = serde_json::from_str(&json).expect("deserialize Destination");
+            assert_eq!(dest, back);
+        }
+    }
+
+    /// Distinct `Destination` variants — and same-variant destinations
+    /// carrying different peer-ids — compare unequal; the resolver and
+    /// any dedup logic downstream relies on this.
+    #[test]
+    fn destination_variants_distinct() {
+        assert_ne!(Destination::Primary, Destination::All);
+        assert_ne!(
+            Destination::Secondary(PeerId::from("a")),
+            Destination::Observer(PeerId::from("a"))
+        );
+        assert_ne!(
+            Destination::Secondary(PeerId::from("a")),
+            Destination::Secondary(PeerId::from("b"))
+        );
+        assert_eq!(
+            Destination::Secondary(PeerId::from("a")),
+            Destination::Secondary(PeerId::from("a"))
         );
     }
 }
