@@ -96,7 +96,7 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
     // catches "the field was already true / non-empty before
     // restore" regressions that would otherwise silently make
     // the post-condition asserts pass for the wrong reason.
-    assert!(!sec.setup_phase_completed);
+    assert!(!sec.lifecycle.setup_phase_completed());
     assert_eq!(sec.cluster_state.task_count(), 0);
     assert!(sec.cluster_state.current_primary().is_none());
     assert!(sec.cluster_state.role_table().observers.is_empty());
@@ -106,7 +106,7 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
     // Latch is set — `run_until_setup_or_done` will skip the
     // entire `!setup_phase_completed` setup block on its next
     // call.
-    assert!(sec.setup_phase_completed);
+    assert!(sec.lifecycle.setup_phase_completed());
 
     // Task ledger merged in: two pending tasks survive.
     assert_eq!(sec.cluster_state.task_count(), 2);
@@ -180,7 +180,7 @@ fn restore_is_idempotent_on_second_call() {
     // "only when local empty" gate) make this a no-op.
     sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
 
-    assert!(sec.setup_phase_completed, "latch stays true");
+    assert!(sec.lifecycle.setup_phase_completed(), "latch stays true");
     assert_eq!(sec.cluster_state.task_count(), tasks_after_first);
     assert_eq!(sec.cluster_state.primary_epoch(), epoch_after_first);
 }

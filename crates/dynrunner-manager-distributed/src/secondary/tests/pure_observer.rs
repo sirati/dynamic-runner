@@ -227,7 +227,7 @@ fn late_joining_observer_gets_full_snapshot_with_observer_role() {
         "observer role must survive the snapshot restore"
     );
     // Setup-skip latched.
-    assert!(sec.setup_phase_completed);
+    assert!(sec.lifecycle.setup_phase_completed());
 }
 
 /// (4b): a late-joining WORKER restores the same full snapshot but is
@@ -336,6 +336,7 @@ async fn malformed_cluster_snapshot_latches_fatal_exit() {
         .run_until(async {
             let (mut observer, _peer_log, _uplink_rx) =
                 make_observer_with_recorder("obs-malformed");
+            observer.enter_operational_for_test();
 
             // Precondition: nothing restored yet.
             assert_eq!(

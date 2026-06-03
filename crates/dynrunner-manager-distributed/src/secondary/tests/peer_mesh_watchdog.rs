@@ -89,8 +89,8 @@ fn arm_watchdog_no_peers(
         FixedEstimator(100),
     );
     secondary.set_bootstrap_primary_id("primary".to_string());
-    secondary.peer_dial_count = dial_count;
-    secondary.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
+    secondary.mesh.peer_dial_count = dial_count;
+    secondary.mesh.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
     (secondary, sec_to_pri_rx)
 }
 
@@ -118,7 +118,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
 
     // Pre-fault: nothing on the wire, no exit flag, not degraded.
     assert!(secondary.fatal_exit.is_none());
-    assert!(!secondary.peer_mesh_degraded);
+    assert!(!secondary.is_mesh_degraded());
     assert!(sec_to_pri_rx.try_recv().is_err());
 
     secondary.check_peer_mesh_watchdog().await;
@@ -126,7 +126,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
     // Post-fault: degraded latched true, watchdog disarmed, NO
     // fatal_exit (the run continues over WSS).
     assert!(
-        secondary.peer_mesh_degraded,
+        secondary.is_mesh_degraded(),
         "peer_mesh_degraded must latch true after deadline-elapsed-zero-peers"
     );
     assert!(
@@ -134,7 +134,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
         "watchdog must NOT set fatal_exit in graceful-degrade mode"
     );
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "watchdog must disarm after firing"
     );
 
@@ -199,9 +199,9 @@ async fn watchdog_silent_after_run_complete() {
     // Pre-condition: degraded latch off, no fatal exit, deadline
     // armed past the elapsed point so the watchdog WOULD fire
     // without the run-complete short-circuit.
-    assert!(!secondary.peer_mesh_degraded);
+    assert!(!secondary.is_mesh_degraded());
     assert!(secondary.fatal_exit.is_none());
-    assert!(secondary.peer_mesh_check_at.is_some());
+    assert!(secondary.mesh.peer_mesh_check_at.is_some());
 
     // Simulate the primary's run-complete broadcast landing on the
     // local cluster mirror — same code path as the production
@@ -215,12 +215,12 @@ async fn watchdog_silent_after_run_complete() {
     // Post-fire: degraded NOT latched, watchdog disarmed silently,
     // no `MeshReady` and no `SecondaryFatalError` on the wire.
     assert!(
-        !secondary.peer_mesh_degraded,
+        !secondary.is_mesh_degraded(),
         "run-complete short-circuit must NOT enter degraded mode"
     );
     assert!(secondary.fatal_exit.is_none());
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "run-complete short-circuit must disarm the watchdog"
     );
     assert!(
@@ -256,10 +256,10 @@ async fn watchdog_still_fires_pre_run_complete() {
     // #15 contract is preserved: degraded latched, watchdog
     // disarmed, MeshReady(peer_count=0) emitted to the primary.
     assert!(
-        secondary.peer_mesh_degraded,
+        secondary.is_mesh_degraded(),
         "pre-RunComplete watchdog must still enter degraded mode"
     );
-    assert!(secondary.peer_mesh_check_at.is_none());
+    assert!(secondary.mesh.peer_mesh_check_at.is_none());
     assert!(secondary.fatal_exit.is_none());
 
     let mut saw_mesh_ready = false;
@@ -349,8 +349,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             // Pre-latch degraded mode so the run starts in the
             // post-watchdog-fire state. The watchdog's actual fire
             // path is covered by `peer_mesh_watchdog_enters_degraded_mode_when_no_peers`.
-            secondary.peer_mesh_degraded = true;
-            secondary.peer_dial_count = 2;
+            secondary.mesh.degraded = true;
+            secondary.mesh.peer_dial_count = 2;
 
             let mut factory = FakeWorkerFactory;
             secondary
@@ -364,7 +364,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 "WSS dispatch must keep flowing after peer-mesh degraded mode"
             );
             assert!(
-                secondary.peer_mesh_degraded,
+                secondary.is_mesh_degraded(),
                 "degraded latch must persist for the duration of the run"
             );
             primary_handle.await.unwrap();
@@ -385,10 +385,11 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
     // Latch degraded mode (skip running the watchdog — the prior
     // test covers that path; this one only exercises the consumer).
-    sec.peer_mesh_degraded = true;
-    sec.peer_dial_count = 4;
+    sec.mesh.degraded = true;
+    sec.mesh.peer_dial_count = 4;
     // Mark the primary as silent past the death deadline. With
     // peer_keepalives empty (no mesh), `run_election_tick` would
     // otherwise enter Suspecting and then self-promote on
@@ -407,7 +408,7 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
         "fatal reason should explain the degraded-failover bail, got: {reason}"
     );
     assert!(
-        matches!(sec.election, ElectionState::Normal),
+        matches!(sec.op_mut().election, ElectionState::Normal),
         "degraded failover bail must NOT transition the election state \
          (no Suspecting, no Candidate, no Promoted)"
     );
@@ -487,21 +488,24 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         FixedEstimator(100),
     );
     secondary.set_bootstrap_primary_id("primary".to_string());
-    // 4 peers attempted, 3 reported by the transport — healthy
-    // multi-peer config. Deadline still in the future; the
-    // pre-deadline `peer_count > 0` branch is the one that fires.
-    secondary.peer_dial_count = 4;
-    secondary.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));
+    // 3 peers attempted AND all 3 reported by the transport — a
+    // fully-formed healthy mesh. Deadline still in the future; the
+    // typed-lifecycle watchdog's pre-deadline early-clear fires when
+    // EVERY expected peer is connected (`real_peer_count() ==
+    // peer_dial_count`), which SUPERSEDES the old `connected > 0`
+    // early-clear. With 3 == 3 the full-formed branch disarms early.
+    secondary.mesh.peer_dial_count = 3;
+    secondary.mesh.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));
 
     secondary.check_peer_mesh_watchdog().await;
 
     assert!(
-        !secondary.peer_mesh_degraded,
+        !secondary.is_mesh_degraded(),
         "healthy mesh path must NOT touch peer_mesh_degraded"
     );
     assert!(secondary.fatal_exit.is_none());
     assert!(
-        secondary.peer_mesh_check_at.is_none(),
+        secondary.mesh.peer_mesh_check_at.is_none(),
         "watchdog disarms once the mesh is observed healthy"
     );
 

@@ -124,10 +124,19 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
             // skips real cgroup setup (the in-process channel
             // factory ignores its `_subcgroup` argument).
             let mut factory = super::super::test_helpers::FakeWorkerFactory;
-            secondary
+            // `initialize_workers` returns the spawned pool; the typed
+            // lifecycle holds the pool only inside Configuring/Operational,
+            // so land Operational and install the pool there (the same
+            // place the production `enter_configuring → enter_operational`
+            // flow moves it). `install_worker_subcgroup_for_test` /
+            // `notify_sampler_*` reach the pool via `pool_mut()`, which is
+            // only resolvable once the lifecycle carries a pool.
+            let pool = secondary
                 .initialize_workers(&mut factory)
                 .await
                 .expect("worker init");
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
 
             // Inject the fake subcgroup onto worker 0 — production
             // would materialise this via `prepare_worker_subgroup`

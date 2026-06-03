@@ -30,8 +30,9 @@ const ONE_INTERVAL: Duration = Duration::from_millis(60);
 async fn primary_dies_lowest_id_promotes() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-a"));
-    sec.peer_keepalives.insert("sec-b".into(), 0.0);
-    sec.peer_keepalives.insert("sec-c".into(), 0.0);
+    sec.enter_operational_for_test();
+    sec.op_mut().peer_keepalives.insert("sec-b".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-c".into(), 0.0);
     // Post-uniform-announce a secondary always knows the primary's
     // identity before it can suspect that primary's death; the
     // Suspecting `TimeoutQuery` names it. Install it via the real apply
@@ -46,7 +47,7 @@ async fn primary_dies_lowest_id_promotes() {
 
     // First tick: enter Suspecting and broadcast TimeoutQuery.
     let actions = sec.run_election_tick();
-    assert!(matches!(sec.election, ElectionState::Suspecting { .. }));
+    assert!(matches!(sec.op_mut().election, ElectionState::Suspecting { .. }));
     assert!(
         actions
             .broadcast
@@ -64,7 +65,7 @@ async fn primary_dies_lowest_id_promotes() {
     // Second tick: tally quorum, transition Suspecting → Candidate
     // (sec-a is the lowest id), and broadcast PromotionVote.
     let actions = sec.run_election_tick();
-    assert!(matches!(sec.election, ElectionState::Candidate { .. }));
+    assert!(matches!(sec.op_mut().election, ElectionState::Candidate { .. }));
     assert!(
         actions
             .broadcast
@@ -76,7 +77,7 @@ async fn primary_dies_lowest_id_promotes() {
     // is the quorum (peer_count=2 → quorum=2).
     let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
     assert!(promoted, "majority confirm should promote");
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
 }
 
 /// Scenario (c): with four peers including self, one peer is dead at
@@ -85,9 +86,10 @@ async fn primary_dies_lowest_id_promotes() {
 #[tokio::test(flavor = "current_thread")]
 async fn double_failure_election_still_succeeds() {
     let mut sec = make_secondary(election_config("sec-a"));
-    sec.peer_keepalives.insert("sec-b".into(), 0.0);
-    sec.peer_keepalives.insert("sec-c".into(), 0.0);
-    sec.peer_keepalives.insert("sec-d".into(), 0.0); // will not respond
+    sec.enter_operational_for_test();
+    sec.op_mut().peer_keepalives.insert("sec-b".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-c".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-d".into(), 0.0); // will not respond
     sec.record_primary_message();
 
     tokio::time::sleep(PAST_DEATH).await;
@@ -100,7 +102,7 @@ async fn double_failure_election_still_succeeds() {
 
     sec.run_election_tick();
     assert!(
-        matches!(sec.election, ElectionState::Candidate { .. }),
+        matches!(sec.op_mut().election, ElectionState::Candidate { .. }),
         "quorum (3 of 4) reached even with one peer dead"
     );
 
@@ -109,7 +111,7 @@ async fn double_failure_election_still_succeeds() {
     sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
     let promoted = sec.record_promotion_confirm("sec-c".into(), "sec-a".into(), 1);
     assert!(promoted, "two peer confirms + self = quorum");
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
 }
 
 /// `record_primary_message` resets the failover election state to
@@ -121,12 +123,13 @@ async fn double_failure_election_still_succeeds() {
 #[tokio::test(flavor = "current_thread")]
 async fn primary_recovery_resets_election_state() {
     let mut sec = make_secondary(election_config("sec-a"));
-    sec.election = ElectionState::Voting {
+    sec.enter_operational_for_test();
+    sec.op_mut().election = ElectionState::Voting {
         round: 1,
         candidate: "sec-c".into(),
     };
     sec.record_primary_message();
-    assert!(matches!(sec.election, ElectionState::Normal));
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
 }
 
 /// `Promoted` state survives a `record_primary_message`: once we've
@@ -135,10 +138,11 @@ async fn primary_recovery_resets_election_state() {
 #[tokio::test(flavor = "current_thread")]
 async fn promoted_state_survives_late_primary_message() {
     let mut sec = make_secondary(election_config("sec-a"));
-    sec.election = ElectionState::Promoted;
+    sec.enter_operational_for_test();
+    sec.op_mut().election = ElectionState::Promoted;
 
     sec.record_primary_message();
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
 }
 
 /// Regression: PromotePrimary's routing target survives
@@ -160,6 +164,7 @@ async fn promoted_state_survives_late_primary_message() {
 #[tokio::test(flavor = "current_thread")]
 async fn promote_primary_routing_survives_keepalive() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // Receive PromotePrimary naming a peer (sec-a) as the
     // SLURM-primary; sec-b is a regular peer.
     let promote = DistributedMessage::PromotePrimary {
@@ -202,8 +207,9 @@ async fn promote_primary_routing_survives_keepalive() {
 #[tokio::test(flavor = "current_thread")]
 async fn pre_designated_primary_ignores_silent_local_primary() {
     let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
     // Pre-promotion: Normal state, this node is not yet primary.
-    assert!(matches!(sec.election, ElectionState::Normal));
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
     assert!(sec.cluster_state.current_primary().is_none());
 
     // Receive PromotePrimary naming this node — exercises the
@@ -221,17 +227,18 @@ async fn pre_designated_primary_ignores_silent_local_primary() {
         .await
         .expect("PromotePrimary handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
 
     // Local primary stops sending keepalives — its observer-mode
     // demotion is benign post-promotion.
-    sec.primary_last_seen = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
 
     // Pre-fix this would have entered Suspecting and started a
     // self-re-promotion cascade. Post-fix the early-return fires.
     let actions = sec.run_election_tick();
     assert!(actions.broadcast.is_empty());
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 }
 
@@ -243,11 +250,12 @@ async fn pre_designated_primary_ignores_silent_local_primary() {
 #[tokio::test(flavor = "current_thread")]
 async fn promote_primary_clears_per_worker_backoff() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // Simulate per-worker backoff accrued against the old primary.
-    sec.primary_link.note_request_sent(0);
-    sec.primary_link.note_request_sent(1);
-    assert!(!sec.primary_link.should_request_now(0));
-    assert!(!sec.primary_link.should_request_now(1));
+    sec.op_mut().primary_link.note_request_sent(0);
+    sec.op_mut().primary_link.note_request_sent(1);
+    assert!(!sec.op_mut().primary_link.should_request_now(0));
+    assert!(!sec.op_mut().primary_link.should_request_now(1));
 
     let promote = DistributedMessage::PromotePrimary {
         sender_id: "primary".into(),
@@ -262,8 +270,8 @@ async fn promote_primary_clears_per_worker_backoff() {
 
     // Both workers can fire a fresh request immediately at the
     // new primary.
-    assert!(sec.primary_link.should_request_now(0));
-    assert!(sec.primary_link.should_request_now(1));
+    assert!(sec.op_mut().primary_link.should_request_now(0));
+    assert!(sec.op_mut().primary_link.should_request_now(1));
 }
 
 /// Phase P: PromotePrimary feeds (epoch, primary) into the
@@ -273,6 +281,7 @@ async fn promote_primary_clears_per_worker_backoff() {
 #[tokio::test(flavor = "current_thread")]
 async fn promote_primary_applies_primary_changed_with_epoch() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
 
     let high = DistributedMessage::PromotePrimary {
         sender_id: "primary".into(),
@@ -315,13 +324,15 @@ async fn promote_primary_applies_primary_changed_with_epoch() {
 #[tokio::test(flavor = "current_thread")]
 async fn split_brain_lowest_id_wins() {
     let mut sec_a = make_secondary(election_config("sec-a"));
-    sec_a.peer_keepalives.insert("sec-b".into(), 0.0);
-    sec_a.peer_keepalives.insert("sec-c".into(), 0.0);
+    sec_a.enter_operational_for_test();
+    sec_a.op_mut().peer_keepalives.insert("sec-b".into(), 0.0);
+    sec_a.op_mut().peer_keepalives.insert("sec-c".into(), 0.0);
     sec_a.record_primary_message();
 
     let mut sec_b = make_secondary(election_config("sec-b"));
-    sec_b.peer_keepalives.insert("sec-a".into(), 0.0);
-    sec_b.peer_keepalives.insert("sec-c".into(), 0.0);
+    sec_b.enter_operational_for_test();
+    sec_b.op_mut().peer_keepalives.insert("sec-a".into(), 0.0);
+    sec_b.op_mut().peer_keepalives.insert("sec-c".into(), 0.0);
     sec_b.record_primary_message();
 
     tokio::time::sleep(PAST_DEATH).await;
@@ -344,10 +355,10 @@ async fn split_brain_lowest_id_wins() {
     sec_b.run_election_tick();
 
     assert!(
-        matches!(sec_a.election, ElectionState::Candidate { .. }),
+        matches!(sec_a.op_mut().election, ElectionState::Candidate { .. }),
         "sec-a (lowest id) should self-promote"
     );
-    match &sec_b.election {
+    match &sec_b.op_mut().election {
         ElectionState::Voting { candidate, .. } => assert_eq!(candidate, "sec-a"),
         other => panic!(
             "sec-b should defer to sec-a, got {:?}",
@@ -358,9 +369,9 @@ async fn split_brain_lowest_id_wins() {
     // sec-b confirms sec-a; quorum 2 (peer_count=2). sec-a + sec-b = 2.
     let promoted = sec_a.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
     assert!(promoted);
-    assert!(matches!(sec_a.election, ElectionState::Promoted));
+    assert!(matches!(sec_a.op_mut().election, ElectionState::Promoted));
     assert!(
-        !matches!(sec_b.election, ElectionState::Promoted),
+        !matches!(sec_b.op_mut().election, ElectionState::Promoted),
         "sec-b must NOT also promote — split-brain prevented"
     );
 }
@@ -383,11 +394,12 @@ async fn observer_election_tick_is_a_no_op_even_when_lowest_id() {
     let mut cfg = election_config("obs-a");
     cfg.is_observer = true;
     let mut sec = make_secondary(cfg);
+    sec.enter_operational_for_test();
 
     // obs-a is lex-lowest in the alive set (obs-a < sec-b). Under
     // the OLD model this would drive an election; under the
     // pure-observer model it originates nothing.
-    sec.peer_keepalives.insert("sec-b".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("sec-b".into(), timestamp_now());
     sec.record_primary_message();
 
     // Primary goes silent — a worker secondary would suspect here.
@@ -400,9 +412,9 @@ async fn observer_election_tick_is_a_no_op_even_when_lowest_id() {
     // The observer stayed Normal across both ticks and originated
     // NOTHING.
     assert!(
-        matches!(sec.election, ElectionState::Normal),
+        matches!(sec.op_mut().election, ElectionState::Normal),
         "observer must stay Normal (no failover participation); got {:?}",
-        std::mem::discriminant(&sec.election),
+        std::mem::discriminant(&sec.op_mut().election),
     );
     assert!(
         actions_1.broadcast.is_empty() && actions_2.broadcast.is_empty(),
@@ -425,13 +437,14 @@ use super::super::test_helpers::make_secondary_recording;
 async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     // peer_count = 2 → quorum = 2 (self + one confirm).
     let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 2);
+    sec.enter_operational_for_test();
     let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
     sec.register_promote_activation(promote_tx);
 
     // Drive sec-a into Candidate(round=1) so the confirm tally has a
     // matching round to credit.
-    sec.peer_keepalives.insert("sec-b".into(), 0.0);
-    sec.peer_keepalives.insert("sec-c".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-b".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-c".into(), 0.0);
     sec.record_primary_message();
     tokio::time::sleep(PAST_DEATH).await;
     sec.run_election_tick(); // → Suspecting
@@ -439,13 +452,13 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     sec.record_timeout_response("sec-b".into(), None);
     sec.record_timeout_response("sec-c".into(), None);
     sec.run_election_tick(); // → Candidate { round: 1 }
-    assert!(matches!(sec.election, ElectionState::Candidate { .. }));
+    assert!(matches!(sec.op_mut().election, ElectionState::Candidate { .. }));
 
     // One peer confirms — self + sec-b = quorum (2). The terminal
     // action mirrors the message-handler arm: on `true`, fire.
     let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
     assert!(promoted, "quorum confirm must promote");
-    assert!(matches!(sec.election, ElectionState::Promoted));
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
     sec.fire_local_promotion().await;
 
     // (1) The activation gate fired exactly once, carrying the
@@ -576,9 +589,10 @@ fn keepalive_from(
 #[tokio::test(flavor = "current_thread")]
 async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // A surviving mesh peer so the election path is non-degraded and
     // can actually broadcast `TimeoutQuery` when the primary dies.
-    sec.peer_keepalives.insert("sec-c".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("sec-c".into(), timestamp_now());
 
     // A peer (sec-a) is promoted to primary via the real apply path.
     let promote = DistributedMessage::PromotePrimary {
@@ -606,9 +620,9 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
         .await;
         let actions = sec.run_election_tick();
         assert!(
-            matches!(sec.election, ElectionState::Normal),
+            matches!(sec.op_mut().election, ElectionState::Normal),
             "healthy promoted primary must keep us Normal; got {:?}",
-            std::mem::discriminant(&sec.election),
+            std::mem::discriminant(&sec.op_mut().election),
         );
         assert!(
             !actions
@@ -624,12 +638,13 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     // (keepalive_interval * miss_threshold) — the next tick must enter
     // Suspecting and broadcast a `TimeoutQuery`. The genuinely-dead
     // promoted primary IS detected, via `primary_silent`.
-    sec.primary_last_seen = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
     let actions = sec.run_election_tick();
     assert!(
-        matches!(sec.election, ElectionState::Suspecting { .. }),
+        matches!(sec.op_mut().election, ElectionState::Suspecting { .. }),
         "a dead promoted primary must trigger the election (Suspecting); got {:?}",
-        std::mem::discriminant(&sec.election),
+        std::mem::discriminant(&sec.op_mut().election),
     );
     assert!(
         actions
@@ -648,11 +663,12 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
 #[tokio::test(flavor = "current_thread")]
 async fn check_peer_timeouts_skips_alive_promoted_primary() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // Both entries are unconditionally stale (epoch timestamp ≪ the
     // 120s peer_timeout), so the only thing that can spare one is the
     // current-primary skip.
-    sec.peer_keepalives.insert("sec-a".into(), 0.0);
-    sec.peer_keepalives.insert("sec-z".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-a".into(), 0.0);
+    sec.op_mut().peer_keepalives.insert("sec-z".into(), 0.0);
 
     // sec-a is promoted to primary via the real apply path. Its
     // pre-promotion `peer_keepalives` entry is now stale-but-alive.
@@ -671,12 +687,12 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
     sec.check_peer_timeouts();
 
     assert!(
-        sec.peer_keepalives.contains_key("sec-a"),
+        sec.op_mut().peer_keepalives.contains_key("sec-a"),
         "the ALIVE promoted primary's entry must NOT be pruned — \
              it is not a peer for liveness purposes",
     );
     assert!(
-        !sec.peer_keepalives.contains_key("sec-z"),
+        !sec.op_mut().peer_keepalives.contains_key("sec-z"),
         "a genuinely-stale regular peer is still pruned (skip is \
              scoped to the current primary, not a blanket disable)",
     );
