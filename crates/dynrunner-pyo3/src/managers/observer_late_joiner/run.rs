@@ -104,6 +104,7 @@ impl PyObserverLateJoiner {
         enum ObserverRunOutcome {
             Done(u32),
             Panik(std::path::PathBuf),
+            Aborted(String),
         }
         let result: Result<ObserverRunOutcome, PyErr> =
             py.detach(|| -> Result<ObserverRunOutcome, PyErr> {
@@ -595,6 +596,20 @@ impl PyObserverLateJoiner {
                                 );
                                 return Ok(ObserverRunOutcome::Panik(matched_path));
                             }
+                            RunOutcome::Aborted { reason } => {
+                                // The primary broadcast `RunAborted`
+                                // (#3a pre-phase duplicate). Propagate
+                                // to the PyO3 boundary for exit(1) — an
+                                // observer exits non-zero on a
+                                // cluster-wide abort, same as the
+                                // secondary.
+                                tracing::error!(
+                                    reason = %reason,
+                                    "observer run aborted by primary; propagating \
+                                     to PyO3 boundary for exit(1)"
+                                );
+                                return Ok(ObserverRunOutcome::Aborted(reason));
+                            }
                             RunOutcome::SetupPending => {
                                 // Defensive: a late-joiner observer
                                 // should never see SetupPending — that
@@ -682,6 +697,17 @@ impl PyObserverLateJoiner {
                     "panik shutdown: observer exiting with code 137"
                 );
                 std::process::exit(137);
+            }
+            ObserverRunOutcome::Aborted(reason) => {
+                // GIL re-acquired. The primary aborted the run
+                // cluster-wide (#3a pre-phase duplicate). Log then
+                // exit(1) — same exit-on-terminal shape as the
+                // secondary's `RunOutcome::Aborted` arm.
+                tracing::error!(
+                    reason = %reason,
+                    "run aborted by primary: observer exiting with code 1"
+                );
+                std::process::exit(1);
             }
         }
     }

@@ -185,6 +185,7 @@ impl PySecondaryCoordinator {
         enum SecondaryRunOutcome {
             Done(u32),
             Panik(std::path::PathBuf),
+            Aborted(String),
         }
         let result: Result<SecondaryRunOutcome, PyErr> =
             py.detach(|| -> Result<SecondaryRunOutcome, PyErr> {
@@ -688,6 +689,7 @@ impl PySecondaryCoordinator {
                     Ok(()),
                     Err(PyErr),
                     Panik(std::path::PathBuf),
+                    Aborted(String),
                 }
                 let loop_result: LoopResult = loop {
                     let outcome = match secondary
@@ -728,6 +730,21 @@ impl PySecondaryCoordinator {
                                  to PyO3 boundary for exit(137)"
                             );
                             break LoopResult::Panik(matched_path);
+                        }
+                        RunOutcome::Aborted { reason } => {
+                            // The primary broadcast `RunAborted` (#3a
+                            // pre-phase duplicate). The coordinator's
+                            // `Done`-shaped teardown already ran in
+                            // `run_until_setup_or_done`. The PyO3 outer
+                            // scope owns the `exit(1)` call; this arm
+                            // propagates the reason through the typed
+                            // loop result.
+                            tracing::error!(
+                                reason = %reason,
+                                "secondary run aborted by primary; propagating \
+                                 to PyO3 boundary for exit(1)"
+                            );
+                            break LoopResult::Aborted(reason);
                         }
                         RunOutcome::SetupPending => {
                             // Re-acquire the GIL ONLY for the duration
@@ -906,6 +923,9 @@ impl PySecondaryCoordinator {
                     LoopResult::Panik(matched_path) => {
                         Ok(SecondaryRunOutcome::Panik(matched_path))
                     }
+                    LoopResult::Aborted(reason) => {
+                        Ok(SecondaryRunOutcome::Aborted(reason))
+                    }
                 }
             }))
         });
@@ -929,6 +949,19 @@ impl PySecondaryCoordinator {
                     "panik shutdown: secondary exiting with code 137"
                 );
                 std::process::exit(137);
+            }
+            SecondaryRunOutcome::Aborted(reason) => {
+                // GIL re-acquired. The primary aborted the run
+                // cluster-wide (#3a pre-phase duplicate). Log the
+                // cause then exit(1) so the SLURM wrapper / Python
+                // caller observes a non-zero exit. Same exit-on-
+                // terminal shape as the panik arm, code 1 (a clean
+                // process-level failure, not the SIGKILL-mapped 137).
+                tracing::error!(
+                    reason = %reason,
+                    "run aborted by primary: secondary exiting with code 1"
+                );
+                std::process::exit(1);
             }
         }
     }

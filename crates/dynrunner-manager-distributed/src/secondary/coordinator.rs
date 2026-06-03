@@ -743,6 +743,15 @@ where
                 "secondary panik shutdown: {reason} (matched_path={})",
                 matched_path.display()
             )),
+            // Surface RunAborted as a String error on the legacy
+            // `run()` path, same disposition as PanikShutdown: the PyO3
+            // wrapper takes the structured `RunOutcome::Aborted`
+            // directly and calls `std::process::exit(1)`; the legacy
+            // wrapper has no such side-effect channel, so the abort
+            // surfaces as a normal error return carrying the reason.
+            RunOutcome::Aborted { reason } => {
+                Err(format!("run aborted by primary: {reason}"))
+            }
         }
     }
 
@@ -1018,6 +1027,21 @@ where
                     matched_path = %matched_path.display(),
                     reason = %reason,
                     "secondary panik shutdown"
+                );
+            }
+            RunOutcome::Aborted { reason } => {
+                // Run aborted cluster-wide. The run is over, so tear
+                // down workers the same way as `Done` (drain the
+                // sampler before `stop_all_workers`); the PyO3 wrapper
+                // will call `std::process::exit(1)` once it sees this
+                // variant. Logged at error level — an abort is a
+                // failure outcome, not a clean finish.
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    reason = %reason,
+                    "secondary exiting: run aborted by primary"
                 );
             }
         }

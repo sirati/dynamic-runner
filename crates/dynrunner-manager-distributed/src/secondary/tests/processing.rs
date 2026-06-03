@@ -599,3 +599,161 @@ async fn stage_file_then_assign_task_succeeds() {
         })
         .await;
 }
+
+/// A fake primary that completes the setup handshake then immediately
+/// broadcasts `ClusterMutation::RunAborted` — the #3a hard-shutdown cue.
+/// No tasks are ever assigned: the abort is the run-over signal.
+async fn fake_primary_abort(
+    secondary_id: String,
+    mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    // Welcome + cert exchange.
+    let (mut got_welcome, mut got_cert) = (false, false);
+    while !got_welcome || !got_cert {
+        if let Some(msg) = from_secondary.recv().await {
+            match msg.msg_type() {
+                MessageType::SecondaryWelcome => got_welcome = true,
+                MessageType::CertExchange => got_cert = true,
+                _ => {}
+            }
+        } else {
+            return;
+        }
+    }
+    to_secondary
+        .send(DistributedMessage::PeerInfo {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            peers: vec![],
+        })
+        .unwrap();
+    to_secondary
+        .send(DistributedMessage::InitialAssignment {
+            pre_staged_mode: false,
+            uses_file_based_items: true,
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            secondary_id,
+            zip_files: vec![],
+            workers_ready: vec![],
+            staged_files: vec![],
+        })
+        .unwrap();
+    to_secondary
+        .send(DistributedMessage::TransferComplete {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            total_files: 0,
+            total_bytes: 0,
+        })
+        .unwrap();
+    // The abort cue: broadcast RunAborted. Keep the uplink ALIVE
+    // afterwards (drain the secondary's outbound) so the secondary's
+    // `process_tasks` exits on the `run_aborted()` check rather than on
+    // a channel-closed recv — production-faithful (dropping the uplink
+    // alone is NOT the run-over signal; the CRDT flag is). The task
+    // returns (dropping `to_secondary`) only once the secondary has
+    // gone quiet, which happens after it returns `RunOutcome::Aborted`.
+    to_secondary
+        .send(DistributedMessage::ClusterMutation {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
+                reason: "duplicate task identity in the initial batch".into(),
+            }],
+        })
+        .unwrap();
+    // Drain until the secondary drops its end (it has exited on the
+    // abort), holding `to_secondary` open in the meantime.
+    while from_secondary.recv().await.is_some() {}
+}
+
+/// `RunAborted` apply → `run_aborted()` set → `process_tasks` returns
+/// `RunOutcome::Aborted` (checked BEFORE the `run_complete()` break, and
+/// without waiting for any task drain — a hard shutdown).
+#[tokio::test(flavor = "current_thread")]
+async fn run_aborted_yields_run_outcome_aborted() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-0".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
+                is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
+                output_dir: None,
+                memuse_log_path: None,
+            };
+
+            let secondary_id = config.secondary_id.clone();
+            let primary_handle = tokio::task::spawn_local(fake_primary_abort(
+                secondary_id,
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                unified,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mut factory = FakeWorkerFactory;
+            let outcome = secondary
+                .run_until_setup_or_done(&mut factory)
+                .await
+                .expect("run_until_setup_or_done returns Ok(RunOutcome::Aborted)");
+            match outcome {
+                RunOutcome::Aborted { reason } => {
+                    assert!(
+                        reason.contains("duplicate task identity"),
+                        "Aborted carries the broadcast reason: {reason}"
+                    );
+                }
+                other => panic!("expected RunOutcome::Aborted, got {other:?}"),
+            }
+            assert!(
+                secondary.cluster_state().run_aborted().is_some(),
+                "run_aborted() is latched after the RunAborted apply"
+            );
+
+            // The fake primary holds the uplink open (draining the
+            // secondary's outbound) so the secondary exits on the
+            // `run_aborted()` cue rather than a channel-closed recv; it
+            // only returns once the secondary drops its end, which won't
+            // happen while `secondary` is still owned here. Abort it now
+            // that the outcome is asserted.
+            primary_handle.abort();
+        })
+        .await;
+}

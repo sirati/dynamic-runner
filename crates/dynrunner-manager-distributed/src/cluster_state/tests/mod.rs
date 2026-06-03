@@ -21,6 +21,7 @@ mod panik;
 mod peer_lifecycle;
 mod peer_resources;
 mod role_table;
+mod run_aborted;
 mod secondary_capacity;
 mod snapshot;
 mod task_outputs;

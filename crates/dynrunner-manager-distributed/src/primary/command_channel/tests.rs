@@ -1126,20 +1126,110 @@ async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
             super::SpawnError::DuplicateTaskHash(h) => assert_eq!(h, &dup_hash),
             other => panic!("expected DuplicateTaskHash, got {other:?}"),
         }
-        // The other two land normally.
+        // #3b: a duplicate `(phase_id, task_id)` in a RUNTIME spawn
+        // invalidates the run-wide not-yet-terminal set (the cluster
+        // CONTINUES — no RunAborted) and does NOT apply the batch. The
+        // pre-seeded `dup` (Pending) is now InvalidTask; the fresh
+        // a / c were never applied (the run's task set is ambiguous, so
+        // adding survivors only to immediately invalidate them is
+        // pointless).
         assert!(
-            matches!(
-                coordinator.cluster_state.task_state(&compute_task_hash(&a)),
-                Some(TaskState::Pending { .. })
-            ),
-            "task a must land in Pending"
+            coordinator.cluster_state.run_aborted().is_none(),
+            "3b does not abort the run — the cluster continues"
         );
         assert!(
             matches!(
-                coordinator.cluster_state.task_state(&compute_task_hash(&c)),
-                Some(TaskState::Pending { .. })
+                coordinator.cluster_state.task_state(&dup_hash),
+                Some(TaskState::InvalidTask { .. })
             ),
-            "task c must land in Pending"
+            "the pre-existing Pending task is invalidated run-wide"
+        );
+        assert!(
+            coordinator.cluster_state.task_state(&compute_task_hash(&a)).is_none(),
+            "fresh task a was NOT applied (batch dropped on 3b)"
+        );
+        assert!(
+            coordinator.cluster_state.task_state(&compute_task_hash(&c)).is_none(),
+            "fresh task c was NOT applied (batch dropped on 3b)"
+        );
+    })
+    .await;
+}
+
+/// #3b: a runtime duplicate invalidates EVERY not-yet-terminal task
+/// run-wide. Seed three tasks — one already `Completed` (terminal,
+/// must survive), two `Pending` (must flip to InvalidTask) — then
+/// spawn a batch re-using one of the Pending ids. The run continues
+/// (`run_aborted()` stays `None`).
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_runtime_duplicate_invalidates_all_pending_run_wide() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let mut coordinator = make_coordinator();
+
+        let mut done = make_binary("done", 100);
+        done.task_id = "done_id".into();
+        let done_hash = compute_task_hash(&done);
+        coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: done_hash.clone(),
+            task: done.clone(),
+        });
+        coordinator.cluster_state.apply(ClusterMutation::TaskCompleted {
+            hash: done_hash.clone(),
+            result_data: None,
+        });
+
+        let mut p1 = make_binary("p1", 100);
+        p1.task_id = "p1_id".into();
+        let p1_hash = compute_task_hash(&p1);
+        coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: p1_hash.clone(),
+            task: p1.clone(),
+        });
+
+        let mut dup = make_binary("dup", 100);
+        dup.task_id = "dup_id".into();
+        let dup_hash = compute_task_hash(&dup);
+        coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: dup_hash.clone(),
+            task: dup.clone(),
+        });
+
+        seed_pool(&mut coordinator, &[&dup.phase_id]);
+
+        // Spawn a batch re-using `dup`'s identity → runtime duplicate.
+        let errors = spawn_via_handler(&mut coordinator, vec![dup.clone()])
+            .await
+            .expect("spawn_tasks succeeds (per-task failures are not vec-level)");
+        assert_eq!(errors.len(), 1, "the duplicate surfaces a per-index error");
+
+        // Cluster continues — no RunAborted on the 3b path.
+        assert!(
+            coordinator.cluster_state.run_aborted().is_none(),
+            "3b does not abort the run"
+        );
+        // Every not-yet-terminal entry is now InvalidTask…
+        assert!(
+            matches!(
+                coordinator.cluster_state.task_state(&p1_hash),
+                Some(TaskState::InvalidTask { .. })
+            ),
+            "pending p1 invalidated run-wide"
+        );
+        assert!(
+            matches!(
+                coordinator.cluster_state.task_state(&dup_hash),
+                Some(TaskState::InvalidTask { .. })
+            ),
+            "pending dup invalidated run-wide"
+        );
+        // …but the already-Completed task is untouched (terminal wins).
+        assert!(
+            matches!(
+                coordinator.cluster_state.task_state(&done_hash),
+                Some(TaskState::Completed { .. })
+            ),
+            "completed task is terminal and must survive run-wide invalidation"
         );
     })
     .await;

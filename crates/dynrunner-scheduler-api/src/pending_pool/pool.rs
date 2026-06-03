@@ -223,6 +223,30 @@ impl<I: Identifier> PendingPool<I> {
         self.completed_tasks.extend(ids);
     }
 
+    /// Pre-seed `failed_tasks` with task ids that have terminated
+    /// permanently (or are about to — e.g. the manager classified them
+    /// `invalid_task` during ingest). Sibling of `mark_tasks_completed`
+    /// for the failure side of the pre-seed contract.
+    ///
+    /// Two coupled effects on a SUBSEQUENT `extend`:
+    ///   * The seeded ids count as "known", so a survivor whose
+    ///     `task_depends_on` references one of them passes
+    ///     dep-existence validation instead of failing `UnknownTaskDep`.
+    ///   * `commit_item`'s extend-time cascade fires: any survivor whose
+    ///     `task_depends_on` references a seeded id is itself recorded as
+    ///     failed and dropped (it can never satisfy a prereq that has
+    ///     already failed). Same semantics as the runtime
+    ///     `on_item_failed_permanent` cascade, applied at ingest.
+    ///
+    /// Used by the manager's ingest path: tasks the dependency-existence
+    /// partition flagged `invalid_deps` are seeded here BEFORE
+    /// `extend(valid)` so their dependents cascade-drop locally (the
+    /// manager broadcasts the terminal `InvalidTask` + the cascade into
+    /// the CRDT separately). Idempotent on repeated ids.
+    pub fn mark_tasks_failed(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.failed_tasks.extend(ids);
+    }
+
     /// Pre-seed `in_flight_tasks` (and bump `in_flight_per_phase`) with
     /// task ids the cluster ledger reports as in flight on OTHER nodes.
     /// Used by the post-promotion path: when a secondary becomes primary,

@@ -82,6 +82,29 @@ pub enum ClusterMutation<I> {
     /// drained` so the post-promotion residual peers all exit
     /// shortly after the primary returns.
     RunComplete,
+    /// "The run was ABORTED — every secondary and observer should exit
+    /// non-zero." The failure twin of [`Self::RunComplete`].
+    ///
+    /// Emitted exactly once by the primary when an unrecoverable
+    /// cluster-wide fault is detected BEFORE any phase has started —
+    /// today the only originator is the pre-phase duplicate-task-id
+    /// case (#3a): a `(phase_id, task_id)` collision in the INITIAL
+    /// batch is a producer-side bug that would silently mask one of the
+    /// colliding tasks, so the whole run is torn down rather than
+    /// proceeding on an ambiguous task set. (A duplicate detected AFTER
+    /// a phase started — #3b — does NOT abort: it invalidates the
+    /// not-yet-terminal tasks run-wide and the cluster CONTINUES.)
+    ///
+    /// Receivers set a sticky `run_aborted: Option<String>` ledger
+    /// field (mirroring `run_complete`). The secondary's
+    /// `process_tasks` loop checks `run_aborted()` BEFORE the
+    /// `run_complete()` break and returns `RunOutcome::Aborted`, which
+    /// the secondary / observer PyO3 wrappers translate to
+    /// `std::process::exit(1)`. The primary itself surfaces a structured
+    /// `RunError` at its own PyO3 boundary. Broadcast over the SAME
+    /// `apply_and_broadcast_cluster_mutations` path as `RunComplete`, so
+    /// it inherits the identical delivery / settle semantics.
+    RunAborted { reason: String },
     /// External-control reinjection: the primary's
     /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
     /// state is the discrete `TaskState::Unfulfillable { .. }` variant

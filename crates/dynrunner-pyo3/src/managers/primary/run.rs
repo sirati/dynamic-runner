@@ -284,6 +284,15 @@ impl PyPrimaryCoordinator {
         // a clean exception instead of returning exit 0 with empty
         // counters.
         let mut setup_deadline_expired: Option<RunError> = None;
+        // Pre-phase duplicate-task-id carried out of the detached tokio
+        // runtime. `Some(RunError::DuplicateTaskIdPrePhase { .. })` iff
+        // the inner `PrimaryCoordinator::run` aborted because the
+        // INITIAL batch had a `(phase_id, task_id)` duplicate (#3a) —
+        // the primary already broadcast `ClusterMutation::RunAborted`
+        // so secondaries/observers exit non-zero; the GIL-side tail
+        // translates this into a `PyRuntimeError` so the primary's
+        // Python wrapper raises instead of returning exit 0.
+        let mut duplicate_task_id_pre_phase: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -515,6 +524,9 @@ impl PyPrimaryCoordinator {
                     Err(e @ RunError::SetupDeadlineExpired { .. }) => {
                         setup_deadline_expired = Some(e);
                     }
+                    Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
+                        duplicate_task_id_pre_phase = Some(e);
+                    }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow behaviour for
                         // non-structured errors is preserved here:
@@ -583,6 +595,19 @@ impl PyPrimaryCoordinator {
             // instead of letting the run trickle through to a
             // `ClusterCollapsed { stranded = 0 }` shape that's
             // technically correct but operationally misleading.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = duplicate_task_id_pre_phase {
+            // GIL is back. The primary aborted the run before any phase
+            // started because the initial batch had a duplicate
+            // `(phase_id, task_id)`. It already broadcast `RunAborted`
+            // (secondaries/observers exit 1); surface the structured
+            // Display as a `PyRuntimeError` so the primary's Python
+            // wrapper raises a clean exception instead of returning
+            // exit 0. Sequenced alongside `setup_deadline_expired` (both
+            // are structured pre-dispatch terminals with no per-task
+            // breakdown) and BEFORE `cluster_collapsed`.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

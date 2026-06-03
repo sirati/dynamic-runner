@@ -245,8 +245,11 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Return the union of every task_id the pool currently knows
     /// about (queued in any bucket, blocked waiting on prereqs,
-    /// completed, or failed). Used by `extend`'s duplicate-id check.
-    fn collect_known_task_ids(&self) -> HashSet<String> {
+    /// completed, or failed). Used by `extend`'s duplicate-id check
+    /// and by the sibling `partition_ingest` (`partition.rs`) for its
+    /// phase-less terminal/in-flight fallback — `pub(super)` so the two
+    /// well-formedness policies share one collector.
+    pub(super) fn collect_known_task_ids(&self) -> HashSet<String> {
         let mut out: HashSet<String> = HashSet::new();
         for bucket in self.buckets.values() {
             for item in &bucket.items {
@@ -264,6 +267,31 @@ impl<I: Identifier> PendingPool<I> {
         }
         for id in &self.in_flight_tasks {
             out.insert(id.clone());
+        }
+        out
+    }
+
+    /// The pool's phase-RESOLVABLE entries as full `(phase_id, task_id)`
+    /// identities — every queued bucket item and every blocked item.
+    /// Sibling of [`Self::collect_known_task_ids`] for the callers that
+    /// need the phase (the `(phase_id, task_id)`-keyed duplicate +
+    /// dep-resolution rules in `partition_ingest`).
+    ///
+    /// The terminal (completed / failed) and in-flight sets are NOT
+    /// included: the pool retains only their `task_id`, not their phase,
+    /// so they cannot be expressed as a full identity. Callers that need
+    /// those fall back to the phase-less `collect_known_task_ids`.
+    pub(super) fn collect_known_phase_task_ids(
+        &self,
+    ) -> Vec<(dynrunner_core::PhaseId, String)> {
+        let mut out: Vec<(dynrunner_core::PhaseId, String)> = Vec::new();
+        for bucket in self.buckets.values() {
+            for item in &bucket.items {
+                out.push((item.phase_id.clone(), item.task_id.clone()));
+            }
+        }
+        for item in self.blocked.values() {
+            out.push((item.phase_id.clone(), item.task_id.clone()));
         }
         out
     }

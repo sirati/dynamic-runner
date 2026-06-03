@@ -33,6 +33,7 @@ mod fulfillability_matcher;
 mod heartbeat;
 mod hydrate;
 mod important_events;
+mod ingest;
 mod lifecycle;
 mod peer_setup;
 pub mod preferred_secondaries;

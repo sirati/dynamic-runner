@@ -75,9 +75,15 @@ where
             Some(d) => d,
             None => return,
         };
-        if self.cluster_state.run_complete() {
-            // Run is over; the mesh fault has nothing to report.
-            // Disarm so subsequent ticks are no-ops.
+        if self.cluster_state.run_complete() || self.cluster_state.run_aborted().is_some() {
+            // Run is over — completed cleanly OR aborted cluster-wide.
+            // Either way the mesh fault has nothing to report:
+            // failover and inter-secondary keepalive paths have nothing
+            // left to guard once the run is terminating. Disarm so
+            // subsequent ticks are no-ops. (`run_aborted` is the
+            // failure twin of `run_complete`; both terminate the run,
+            // so both disarm the watchdog — single source of truth here
+            // rather than at every apply site.)
             self.peer_mesh_check_at = None;
             return;
         }

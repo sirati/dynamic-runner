@@ -192,6 +192,58 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
 }
 
 
+/// A fresh `TasksSpawned` whose dep is an EXISTING `InvalidTask`
+/// cascade-fails as `Failed { NonRecoverable, last_error:
+/// "upstream-failed" }` — NOT as a fresh `invalid_task`. This keeps the
+/// `invalid_task` reason space accurate: only a literally-absent dep
+/// mints a fresh `InvalidTask`; an existing-but-invalid dep cascades
+/// through the same `Failed { NonRecoverable }` shape as any other
+/// upstream terminal. (The dep classifier in `apply_tasks_spawned`.)
+#[test]
+fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // Prereq `x` exists in the ledger and is InvalidTask.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "x_hash".into(),
+        task: mk_task("x"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "x_hash".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "missing dep".to_string().into(),
+        },
+        error: "missing dependency".into(),
+    });
+    assert_eq!(s.counts().invalid_task, 1);
+
+    // Spawn a dependent V naming (p0, x) — the classifier resolves the
+    // dep to x's ledger hash, sees InvalidTask, cascade-fails V.
+    let mut v = mk_task("v");
+    v.task_depends_on = vec![dynrunner_core::TaskDep {
+        task_id: "x".into(),
+        phase_id: PhaseId::from("p0"),
+        inherit_outputs: false,
+    }];
+    let v_hash = crate::primary::wire::compute_task_hash(&v);
+    s.apply(ClusterMutation::TasksSpawned { tasks: vec![v] });
+
+    match s.task_state(&v_hash) {
+        Some(TaskState::Failed { kind, last_error, .. }) => {
+            assert_eq!(*kind, ErrorType::NonRecoverable, "cascades as NonRecoverable");
+            assert_eq!(last_error, "upstream-failed", "upstream-invalid cascade shape");
+        }
+        other => panic!("expected Failed{{NonRecoverable}} cascade, got {other:?}"),
+    }
+    // The dependent did NOT become a fresh invalid_task — the count is
+    // still just the original prereq.
+    assert_eq!(
+        s.counts().invalid_task,
+        1,
+        "the dependent cascaded as NonRecoverable, NOT a fresh invalid_task"
+    );
+}
+
+
 /// `TaskCompleted` apply arm auto-resumes every Blocked dependent
 /// whose `on` matches the completing hash back to `Pending`.
 /// Event-driven: the same broadcast that converges the prereq to

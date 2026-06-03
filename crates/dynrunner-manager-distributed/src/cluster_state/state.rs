@@ -53,6 +53,15 @@ pub struct ClusterState<I> {
     /// exit. Read by the secondary's operational loop to break out
     /// even when peers haven't disconnected.
     pub(super) run_complete: bool,
+    /// Set by `ClusterMutation::RunAborted { reason }`. The failure
+    /// twin of `run_complete`: sticky monotonic — once `Some`, the run
+    /// has been aborted cluster-wide and every node should exit
+    /// non-zero. `None` until the first abort lands. The secondary's
+    /// `process_tasks` loop checks this BEFORE the `run_complete` break
+    /// and returns `RunOutcome::Aborted`; the `mesh_watchdog` disarms
+    /// on it too (failover has nothing left to guard once the run is
+    /// aborting). Carries the abort reason for the PyO3-boundary log.
+    pub(super) run_aborted: Option<String>,
     /// Replicated role bookkeeping. Updated in lockstep with
     /// `current_primary` on every `PrimaryChanged` apply so the
     /// transport-layer cache (registered via `role_change_hooks`)
@@ -199,6 +208,7 @@ where
             primary_epoch_mirror: Arc::clone(&self.primary_epoch_mirror),
             phase_deps: self.phase_deps.clone(),
             run_complete: self.run_complete,
+            run_aborted: self.run_aborted.clone(),
             role_table: self.role_table.clone(),
             // Deliberately not cloned — see field doc.
             role_change_hooks: Vec::new(),
@@ -233,6 +243,7 @@ where
             .field("primary_epoch", &self.primary_epoch)
             .field("phase_deps", &self.phase_deps)
             .field("run_complete", &self.run_complete)
+            .field("run_aborted", &self.run_aborted)
             .field("role_table", &self.role_table)
             .field("role_change_hooks", &self.role_change_hooks.len())
             .field("peer_state", &self.peer_state)
@@ -256,6 +267,7 @@ impl<I> Default for ClusterState<I> {
             primary_epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             phase_deps: HashMap::new(),
             run_complete: false,
+            run_aborted: None,
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),
