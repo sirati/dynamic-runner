@@ -8,7 +8,9 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport,
+};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPrimaryTransportEnd, channel_pair};
@@ -75,6 +77,11 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
     fn peer_count(&self) -> usize {
         0
     }
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // Models no peers — every id is a non-member. Consistent with
+        // `peer_count == 0`.
+        false
+    }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
@@ -103,6 +110,16 @@ impl<I: Identifier> PeerTransport<I> for FixedPeerCount {
     }
     fn peer_count(&self) -> usize {
         self.0
+    }
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // This stub models a peer CARDINALITY (`self.0`), not specific
+        // identities — it is identity-blind by construction (the
+        // watchdog tests it serves only key off `peer_count > 0`). The
+        // only internally-consistent boolean it can give is derived
+        // from that count: a non-empty mesh has peers, an empty one
+        // does not. So `has_peer` mirrors `peer_count > 0` rather than
+        // fabricating a per-id set the stub never tracked.
+        self.0 > 0
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
@@ -166,6 +183,14 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     }
     fn peer_count(&self) -> usize {
         self.peer_count
+    }
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        // Identity-blind recorder: it models a configurable peer
+        // CARDINALITY (`self.peer_count`) for the "healthy mesh vs no
+        // peers" branches but records sends keyed by nothing. The
+        // count-consistent answer is `peer_count > 0`; see
+        // `FixedPeerCount::has_peer` for the same rationale.
+        self.peer_count > 0
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }

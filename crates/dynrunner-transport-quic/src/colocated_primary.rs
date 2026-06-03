@@ -48,7 +48,7 @@
 
 use dynrunner_core::{Identifier, MessageReceiver};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport, SecondaryTransport,
+    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, SecondaryTransport,
 };
 use tokio::sync::mpsc;
 
@@ -213,6 +213,22 @@ impl<I: Identifier> PeerTransport<I> for ColocatedPrimaryTransport<I> {
     /// the SECONDARY's transport).
     fn peer_count(&self) -> usize {
         0
+    }
+
+    /// Same rationale as [`Self::peer_count`]: this co-located view
+    /// holds NO peer table of its own. The shared mesh it sends through
+    /// is reached via a [`MeshSendHandle`] — a write-only send proxy
+    /// (`mpsc::UnboundedSender<MeshSend>`) that cannot be queried for
+    /// membership; the real connection table lives on the co-located
+    /// SECONDARY's `UnifiedSecondaryTransport`/`PeerNetwork`, not here.
+    /// The faithful answer this state can give is `false` for every id,
+    /// exactly mirroring the `peer_count == 0` contract: the parked
+    /// primary reads peer membership off `self.secondaries` /
+    /// `cluster_state`, never off this transport. (Delegating would
+    /// require a new query channel on `MeshSendHandle` — new
+    /// bookkeeping, out of scope for this leaf; recorded in the report.)
+    fn has_peer(&self, _id: &PeerId) -> bool {
+        false
     }
 
     /// No-op: the mesh this transport sends through is dialed and owned

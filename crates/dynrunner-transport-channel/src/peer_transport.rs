@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Role,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerId, PeerTransport, Role,
     RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Router, SendOutcome,
     apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
     read_role_cache,
@@ -136,6 +136,14 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
 
     fn peer_count(&self) -> usize {
         self.outgoing.len()
+    }
+
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Real per-id membership: a peer is a member iff it has a direct
+        // outbox in `outgoing` (the same table `peer_count` measures).
+        // Partition tests that `disconnect_from` / `connect_to` a peer
+        // flip this predicate, exactly as they flip `peer_count`.
+        self.outgoing.contains_key(id.as_str())
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {

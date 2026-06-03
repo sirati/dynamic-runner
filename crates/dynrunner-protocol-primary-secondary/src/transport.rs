@@ -3,7 +3,7 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, MessageReceiver};
 
 use crate::DistributedMessage;
-use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
+use crate::address::{Address, PeerId, Role, RoleChangeHookRegistrar, Scope};
 use crate::messages::timestamp_now;
 
 /// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
@@ -145,6 +145,24 @@ pub trait PeerTransport<I: Identifier> {
 
     /// The number of connected peers.
     fn peer_count(&self) -> usize;
+
+    /// Whether `id` is currently a member of this transport's mesh —
+    /// i.e. the transport holds a connection (or the equivalent
+    /// addressable entry) keyed by that peer-id right now.
+    ///
+    /// This is the per-id companion to [`Self::peer_count`] (the
+    /// cardinality): `peer_count` answers "how many peers", `has_peer`
+    /// answers "is THIS peer one of them". The membership predicate is
+    /// what the rendezvous / cutover work needs so it can rest on
+    /// "the primary is a connected peer" rather than on the
+    /// always-present uplink leg.
+    ///
+    /// REQUIRED (no default). A blanket default would have to pick a
+    /// constant answer that ignores the connection map, which is
+    /// silently wrong for every real transport — a membership predicate
+    /// that never reflects membership is a bug waiting to happen. Each
+    /// impl answers from its own real connection/writer table.
+    fn has_peer(&self, id: &PeerId) -> bool;
 
     /// Connect to peers from the peer list received from primary.
     fn connect_to_peers(

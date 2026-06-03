@@ -18,7 +18,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleChangeHookRegistrar,
+    DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role, RoleChangeHookRegistrar,
 };
 
 use super::{MeshSendHandle, NoPeerTransport, PeerNetwork};
@@ -94,6 +94,16 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
             // before boxing.
             Self::Real(p) => PeerTransport::<I>::peer_count(&**p),
             Self::Disabled(p) => PeerTransport::<I>::peer_count(p),
+        }
+    }
+
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Delegate to the active arm: the real mesh answers from its
+        // QUIC connection table; the disabled arm is always `false`.
+        // Symmetric with `peer_count`'s delegation.
+        match self {
+            Self::Real(p) => PeerTransport::<I>::has_peer(&**p, id),
+            Self::Disabled(p) => PeerTransport::<I>::has_peer(p, id),
         }
     }
 

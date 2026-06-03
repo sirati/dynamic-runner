@@ -91,6 +91,39 @@ pub(crate) fn keepalive(sender: &str) -> DistributedMessage<SendTestId> {
     }
 }
 
+/// `has_peer` reports REAL per-id membership against the `outgoing`
+/// writer table — not a constant. In a pre-wired all-to-all mesh
+/// every other id is a member and a never-registered id is not;
+/// `connect_to` flips a fresh id false→true and `disconnect_from`
+/// flips it true→false. Pinning both flips proves the predicate
+/// tracks the table rather than returning a fixed answer.
+#[tokio::test]
+async fn has_peer_tracks_outgoing_membership() {
+    use dynrunner_protocol_primary_secondary::PeerId;
+
+    let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let mut transports = peer_mesh::<SendTestId>(&ids);
+
+    // Pre-wired mesh: peer `a` knows `b` and `c`, not itself, not a
+    // stranger.
+    assert!(transports[0].has_peer(&PeerId::from("b")));
+    assert!(transports[0].has_peer(&PeerId::from("c")));
+    assert!(!transports[0].has_peer(&PeerId::from("a")));
+    assert!(!transports[0].has_peer(&PeerId::from("d")));
+
+    // A fresh id is not a member until a writer is registered for it…
+    assert!(!transports[0].has_peer(&PeerId::from("d")));
+    let (d_tx, _d_rx) = tokio::sync::mpsc::unbounded_channel::<DistributedMessage<SendTestId>>();
+    transports[0].connect_to("d".to_string(), d_tx);
+    // …then `has_peer` flips false → true.
+    assert!(transports[0].has_peer(&PeerId::from("d")));
+
+    // Removing the writer flips it back true → false (the partition
+    // path the relay tests use).
+    transports[0].disconnect_from("b");
+    assert!(!transports[0].has_peer(&PeerId::from("b")));
+}
+
 /// `send(Address::Peer(id), msg)` routes through the default impl
 /// to `send_to_peer` and reaches exactly that peer.
 #[tokio::test]

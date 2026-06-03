@@ -73,8 +73,8 @@
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction,
-    RoleCache, RoleChangeHookRegistrar, Scope, apply_role_misaddress_hint,
+    Address, DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport, Role,
+    RoleAddressedAction, RoleCache, RoleChangeHookRegistrar, Scope, apply_role_misaddress_hint,
     decide_role_addressed_with_cache, install_role_change_hook, new_role_cache, read_role_cache,
     seed_self_role,
 };
@@ -569,6 +569,19 @@ where
         // Mesh-health cardinality (NOT a routing input). The uplink is
         // not a "peer"; failover/watchdog readers want the mesh count.
         self.mesh.peer_count()
+    }
+
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Delegate to the mesh leg ONLY — symmetric with `peer_count`.
+        // The uplink-reached primary is deliberately NOT yet a mesh
+        // peer (it is reached over the dedicated uplink leg, not via a
+        // mesh connection keyed by its id), so `has_peer(primary_id)`
+        // returning false here is the CORRECT current-state answer:
+        // membership reflects the mesh, and the primary has not joined
+        // it. The later rendezvous/cutover leaves register the primary
+        // as a mesh peer and this flips true without changing this
+        // delegation.
+        self.mesh.has_peer(id)
     }
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
