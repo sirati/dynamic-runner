@@ -32,6 +32,9 @@
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
+//! - [`keepalive_emission`] — `send_keepalive` fans ONE keepalive out
+//!   exactly once (reaching the meshed primary once, not twice), fires
+//!   even when the mesh is degraded, and is suppressed for observers.
 //! - [`late_joiner_observer`] — late-joiner observer-mode scenario.
 //! - [`late_joiner_accept_emits_peer_joined`] — receive-side
 //!   PeerJoined emission contract for the late-joiner accept path,
@@ -52,6 +55,7 @@
 #![cfg(test)]
 
 mod cluster_state_refresh;
+mod keepalive_emission;
 mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;
 mod late_joiner_observer;

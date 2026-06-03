@@ -221,21 +221,33 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
         "a firewalled fleet has no route to a non-primary peer",
     );
 
-    // `broadcast` is a silent no-op — the directed primary is excluded
-    // and there are no mesh peers — so it must NOT reach the primary.
+    // `broadcast` (`Destination::All`) reaches the folded primary — the
+    // sole reachable member — EXACTLY ONCE, mirroring the `Real` arm
+    // where the folded primary is a plain `connections` entry the
+    // fan-out hits. This is what makes a firewalled secondary's keepalive
+    // reach the primary; a no-op here would starve it and trip false
+    // primary-death.
     either
         .broadcast(DistributedMessage::Keepalive {
             sender_id: "sec-0".into(),
             timestamp: 1.0,
             secondary_id: "sec-0".into(),
-            active_workers: 0,
+            active_workers: 5,
             emitter_role: KeepaliveRole::Secondary,
         })
         .await
         .unwrap();
+    match outbound_rx
+        .try_recv()
+        .expect("the folded primary MUST receive the mesh broadcast (sole member)")
+    {
+        DistributedMessage::Keepalive { active_workers, .. } => assert_eq!(active_workers, 5),
+        _ => panic!("expected Keepalive"),
+    }
+    // EXACTLY once — no second copy on the wire (no double-fan-out).
     assert!(
         outbound_rx.try_recv().is_err(),
-        "the primary must NOT receive a mesh broadcast (directed-only member)",
+        "a single broadcast must deliver to the folded primary exactly once",
     );
 
     // Inbound: a primary frame arriving on the folded wire surfaces via
