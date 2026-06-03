@@ -212,17 +212,21 @@ impl<I: Identifier> ClusterState<I> {
         &self.role_table
     }
 
-    /// Resolve a task_id to its wire-canonical hash via a linear scan
-    /// over `self.tasks`. Returns `None` if no entry in the ledger
-    /// carries that `task_id`.
+    /// Resolve a dependency's full `(phase_id, task_id)` identity to its
+    /// wire-canonical hash via a linear scan over `self.tasks`. Returns
+    /// `None` if no entry in the ledger carries that exact identity.
     ///
-    /// O(n) over the ledger; the CRDT does not maintain a task_id →
-    /// hash reverse index (the live `PendingPool` does, but it's
-    /// task_id-keyed by design and lives only on the primary;
+    /// The match is on BOTH phase and task_id: the same `task_id` in
+    /// two different phases is a distinct task with a distinct hash, so
+    /// a dep resolves only against the ledger entry whose phase AND
+    /// task_id agree with the dep.
+    ///
+    /// O(n) over the ledger; the CRDT does not maintain a reverse index
+    /// (the live `PendingPool` does, but it lives only on the primary;
     /// every replica must resolve locally to converge on dependency
     /// states). The scan keeps the dependency-tracking concern
     /// self-contained inside cluster_state.
-    pub fn task_hash_for_task_id(&self, task_id: &str) -> Option<&str> {
+    pub fn task_hash_for_dep(&self, phase_id: &PhaseId, task_id: &str) -> Option<&str> {
         self.tasks.iter().find_map(|(h, s)| {
             let task = match s {
                 TaskState::Pending { task }
@@ -233,25 +237,30 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::InvalidTask { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
-            (task.task_id == task_id).then_some(h.as_str())
+            (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
         })
     }
 
-    /// Borrow a completed task's cached [`TaskOutputs`] by `task_id`.
-    /// Returns `None` if no task with that `task_id` has reached
-    /// `Completed` with a non-empty `result_data` payload yet (the
-    /// task is still in-flight, never published outputs, was anonymous,
-    /// or the payload failed to decode and dependents that need a
+    /// Borrow a completed dependency's cached [`TaskOutputs`] by its
+    /// full `(phase_id, task_id)` identity. Returns `None` if no task
+    /// with that identity has reached `Completed` with a non-empty
+    /// `result_data` payload yet (the task is still in-flight, never
+    /// published outputs, the dep names an identity the ledger does not
+    /// know, or the payload failed to decode and dependents that need a
     /// non-empty view should treat the empty `TaskOutputs` insert as
     /// their answer — see the cache-populate helper).
     ///
-    /// The dispatch-time predecessor-outputs assembler reads this
-    /// accessor to attach each dependent's predecessor outputs to its
-    /// `TaskAssignment`. The borrow is invalidated by the next
-    /// `&mut self` apply call; callers that need ownership across an
-    /// apply boundary must `.clone()` the returned reference.
-    pub fn outputs_for(&self, task_id: &str) -> Option<&TaskOutputs> {
-        self.task_outputs.get(task_id)
+    /// Resolution is phase-aware: the dep's `(phase_id, task_id)` is
+    /// resolved to the unique ledger hash (so the same `task_id` in two
+    /// phases reads two distinct output entries), then the hash-keyed
+    /// cache is read. The dispatch-time predecessor-outputs assembler
+    /// reads this accessor to attach each dependent's predecessor
+    /// outputs to its `TaskAssignment`. The borrow is invalidated by
+    /// the next `&mut self` apply call; callers that need ownership
+    /// across an apply boundary must `.clone()` the returned reference.
+    pub fn outputs_for(&self, phase_id: &PhaseId, task_id: &str) -> Option<&TaskOutputs> {
+        let hash = self.task_hash_for_dep(phase_id, task_id)?;
+        self.task_outputs.get(hash)
     }
 
     /// Whether the run has been declared finished by the primary.

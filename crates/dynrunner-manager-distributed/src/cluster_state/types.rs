@@ -107,6 +107,24 @@ pub enum TaskState<I> {
     },
 }
 
+impl<I> TaskState<I> {
+    /// Mutable borrow of the carried `TaskInfo`, regardless of variant.
+    /// One canonical accessor so callers that need to mutate the task
+    /// payload (e.g. the snapshot migration shim filling phase-less
+    /// deps) do not each re-spell the all-variants match.
+    pub(crate) fn task_mut(&mut self) -> &mut TaskInfo<I> {
+        match self {
+            TaskState::Pending { task }
+            | TaskState::InFlight { task, .. }
+            | TaskState::Completed { task }
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::InvalidTask { task, .. }
+            | TaskState::Blocked { task, .. } => task,
+        }
+    }
+}
+
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge
 /// case (duplicate, late delivery, terminal-locked); not an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

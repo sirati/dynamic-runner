@@ -122,9 +122,18 @@ pub struct TaskInfo<I> {
 
 pub type TaskInput<I> = TaskInfo<I>;
 
-/// One edge in the per-task dep graph: the prerequisite's `task_id`
-/// plus a per-edge opt-in to receive the predecessor's transitive
-/// ancestors' outputs (not just the direct predecessor's).
+/// One edge in the per-task dep graph: the full `(phase_id, task_id)`
+/// identity of the prerequisite, plus a per-edge opt-in to receive the
+/// predecessor's transitive ancestors' outputs (not just the direct
+/// predecessor's).
+///
+/// Identity is the FULL `(phase_id, task_id)` — every dependency names
+/// its phase explicitly. The same `task_id` in two different phases is
+/// a DISTINCT prerequisite; there is no implicit same-phase default at
+/// runtime. New deps always carry an explicit `phase_id`; the only
+/// producer of a phase-less dep is a legacy persisted snapshot, which
+/// the migration shim ([`TaskDep::is_unphased`] +
+/// [`TaskDep::fill_phase`]) reconciles on restore.
 ///
 /// `inherit_outputs = false` (the default, and the only shape legacy
 /// `Vec<String>` payloads decode to) means "wait for this task; read
@@ -132,23 +141,68 @@ pub type TaskInput<I> = TaskInfo<I>;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct TaskDep {
     pub task_id: String,
+    /// The prerequisite's phase. Part of the dependency's full
+    /// `(phase_id, task_id)` identity. A legacy un-phased dep decodes
+    /// with the migration sentinel (an empty `PhaseId`); the snapshot
+    /// migration shim replaces that sentinel with the enclosing task's
+    /// phase on restore. A new dep always carries a real phase, so it
+    /// is never the sentinel and is left untouched by the shim.
+    pub phase_id: PhaseId,
     #[serde(default)]
     pub inherit_outputs: bool,
 }
 
+impl TaskDep {
+    /// Whether this dep is a legacy un-phased entry (carries the
+    /// migration sentinel: an empty `PhaseId`). True ONLY for deps
+    /// decoded from a legacy snapshot that predates the
+    /// `(phase_id, task_id)` identity. A new dep always names its
+    /// phase, so this is always `false` for runtime-originated deps —
+    /// which is why the migration shim leaves new deps unaffected.
+    pub fn is_unphased(&self) -> bool {
+        self.phase_id.as_str().is_empty()
+    }
+
+    /// Migration-ONLY: fill the enclosing task's phase into a legacy
+    /// un-phased dep. A no-op for any dep that already names its phase
+    /// (the common runtime case), so applying it to a snapshot that
+    /// mixes legacy and new deps touches only the legacy entries. This
+    /// is NEVER a runtime default — it runs exclusively on the
+    /// snapshot-restore path, where the enclosing task's `phase_id` is
+    /// the unambiguous source of the missing phase (a legacy snapshot
+    /// only ever expressed same-phase deps implicitly).
+    pub fn fill_phase(&mut self, enclosing: &PhaseId) {
+        if self.is_unphased() {
+            self.phase_id = enclosing.clone();
+        }
+    }
+}
+
 // Untagged wire shape: a single `Vec<TaskDep>` JSON array may mix bare
-// strings (legacy) and full structs (new). serde's derive can't express
-// "accept either shape" on a single struct, so the canonical idiom is
-// to deserialise into a private untagged enum and then map. Without
-// this back-compat decoder, every existing snapshot / ledger / wire
-// fixture that serialises `task_depends_on` as `["foo", "bar"]` would
-// fail to load.
+// strings (legacy, un-phased) and full structs. serde's derive can't
+// express "accept either shape" on a single struct, so the canonical
+// idiom is to deserialise into a private untagged enum and then map.
+// Without this decoder, every existing snapshot / ledger / wire fixture
+// that serialises `task_depends_on` as `["foo", "bar"]` would fail to
+// load.
+//
+// A legacy bare-string or a legacy struct without `phase_id` decodes to
+// the migration sentinel (an empty `PhaseId`). New senders always emit
+// the explicit `phase_id`, so they decode to a real phase. The decode
+// is intentionally lenient about a missing phase so a LEGACY PERSISTED
+// SNAPSHOT loads — runtime correctness is enforced by the migration
+// shim (snapshot restore) and by the fact that no new sender ever omits
+// the phase under the coordinated-restart deployment model. The
+// sentinel is never a runtime default: a phase-less dep that reaches
+// dispatch/hash without the shim resolves no task and surfaces loudly.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum TaskDepWire {
     Bare(String),
     Full {
         task_id: String,
+        #[serde(default)]
+        phase_id: PhaseId,
         #[serde(default)]
         inherit_outputs: bool,
     },
@@ -159,13 +213,16 @@ impl<'de> Deserialize<'de> for TaskDep {
         Ok(match TaskDepWire::deserialize(d)? {
             TaskDepWire::Bare(task_id) => TaskDep {
                 task_id,
+                phase_id: PhaseId::default(),
                 inherit_outputs: false,
             },
             TaskDepWire::Full {
                 task_id,
+                phase_id,
                 inherit_outputs,
             } => TaskDep {
                 task_id,
+                phase_id,
                 inherit_outputs,
             },
         })
@@ -177,39 +234,67 @@ mod task_dep_tests {
     use super::*;
 
     #[test]
-    fn task_dep_bare_string_decodes_as_false() {
+    fn task_dep_bare_string_decodes_to_migration_sentinel() {
+        // A legacy bare-string dep carries no phase; it decodes to the
+        // migration sentinel (empty PhaseId) so a legacy snapshot loads.
         let dep: TaskDep = serde_json::from_str("\"foo\"").expect("bare string");
         assert_eq!(
             dep,
             TaskDep {
                 task_id: "foo".to_string(),
+                phase_id: PhaseId::default(),
                 inherit_outputs: false,
             }
         );
+        assert!(dep.is_unphased());
     }
 
     #[test]
-    fn task_dep_struct_decodes_inherit_outputs() {
+    fn task_dep_struct_round_trips_phase_and_inherit() {
+        // The canonical new shape carries the full (phase_id, task_id)
+        // identity. Round-trip it on the wire.
+        let dep = TaskDep {
+            task_id: "foo".to_string(),
+            phase_id: PhaseId::from("phase-A"),
+            inherit_outputs: true,
+        };
+        let json = serde_json::to_value(&dep).expect("to_value");
+        assert_eq!(json["task_id"], "foo");
+        assert_eq!(json["phase_id"], "phase-A");
+        assert_eq!(json["inherit_outputs"], true);
+        let back: TaskDep = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(back, dep);
+        assert!(!back.is_unphased());
+    }
+
+    #[test]
+    fn task_dep_legacy_struct_without_phase_is_unphased() {
+        // A legacy struct that predates phased identity omits phase_id;
+        // it decodes to the sentinel, not a runtime default.
         let dep: TaskDep = serde_json::from_str("{\"task_id\":\"foo\",\"inherit_outputs\":true}")
-            .expect("struct with flag");
+            .expect("legacy struct");
         assert_eq!(
             dep,
             TaskDep {
                 task_id: "foo".to_string(),
+                phase_id: PhaseId::default(),
                 inherit_outputs: true,
             }
         );
+        assert!(dep.is_unphased());
     }
 
     #[test]
     fn task_dep_struct_default_inherit_outputs_false() {
         // The `inherit_outputs` key may be omitted from the struct shape.
         let dep: TaskDep =
-            serde_json::from_str("{\"task_id\":\"foo\"}").expect("struct without flag");
+            serde_json::from_str("{\"task_id\":\"foo\",\"phase_id\":\"p\"}")
+                .expect("struct without flag");
         assert_eq!(
             dep,
             TaskDep {
                 task_id: "foo".to_string(),
+                phase_id: PhaseId::from("p"),
                 inherit_outputs: false,
             }
         );
@@ -217,25 +302,37 @@ mod task_dep_tests {
 
     #[test]
     fn vec_task_dep_mixed_array_decodes() {
-        let v: Vec<TaskDep> =
-            serde_json::from_str("[\"a\", {\"task_id\":\"b\",\"inherit_outputs\":true}]")
-                .expect("mixed array");
+        let v: Vec<TaskDep> = serde_json::from_str(
+            "[\"a\", {\"task_id\":\"b\",\"phase_id\":\"p1\",\"inherit_outputs\":true}]",
+        )
+        .expect("mixed array");
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].task_id, "a");
+        assert!(v[0].is_unphased());
         assert!(!v[0].inherit_outputs);
         assert_eq!(v[1].task_id, "b");
+        assert_eq!(v[1].phase_id, PhaseId::from("p1"));
         assert!(v[1].inherit_outputs);
     }
 
     #[test]
-    fn task_dep_serialises_to_struct_shape() {
-        // Forward shape is canonical: bare-string is decode-only.
-        let dep = TaskDep {
-            task_id: "foo".to_string(),
-            inherit_outputs: true,
+    fn fill_phase_migrates_sentinel_but_leaves_new_dep_untouched() {
+        // The migration shim primitive: a sentinel dep takes the
+        // enclosing phase; an explicit dep is unaffected.
+        let mut legacy = TaskDep {
+            task_id: "x".into(),
+            phase_id: PhaseId::default(),
+            inherit_outputs: false,
         };
-        let json = serde_json::to_value(&dep).expect("to_value");
-        assert_eq!(json["task_id"], "foo");
-        assert_eq!(json["inherit_outputs"], true);
+        legacy.fill_phase(&PhaseId::from("enclosing"));
+        assert_eq!(legacy.phase_id, PhaseId::from("enclosing"));
+
+        let mut explicit = TaskDep {
+            task_id: "y".into(),
+            phase_id: PhaseId::from("other"),
+            inherit_outputs: false,
+        };
+        explicit.fill_phase(&PhaseId::from("enclosing"));
+        assert_eq!(explicit.phase_id, PhaseId::from("other"), "new dep untouched");
     }
 }

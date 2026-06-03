@@ -33,6 +33,7 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
             .into_iter()
             .map(|d| TaskDep {
                 task_id: d.to_string(),
+                phase_id: PhaseId::from("p"),
                 inherit_outputs: false,
             })
             .collect(),

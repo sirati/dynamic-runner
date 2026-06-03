@@ -259,7 +259,12 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// `predecessor_outputs` directly into `TaskAssignment` and the
     /// secondary forwards it verbatim. The cache population in
     /// distributed mode is cheap-but-unused; no conditional gate.
-    pub(crate) task_outputs_cache: HashMap<String, TaskOutputs>,
+    /// Keyed by the predecessor's full `(phase_id, task_id)` identity
+    /// so the same `task_id` in two different phases caches two distinct
+    /// output entries (no cross-phase collision) — mirrors the
+    /// distributed primary's hash-keyed CRDT output cache, which folds
+    /// `phase_id` into the hash.
+    pub(crate) task_outputs_cache: HashMap<(PhaseId, String), TaskOutputs>,
     /// Per-task memory-profile sampler. `Some` iff
     /// [`LocalManagerConfig::output_dir`] was set when
     /// `process_binaries` started — sampler construction defers to

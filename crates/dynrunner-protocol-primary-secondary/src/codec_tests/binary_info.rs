@@ -161,14 +161,17 @@ fn distributed_binary_info_missing_task_id_fails_decode() {
     );
 }
 
-/// Wire backcompat for the `task_depends_on` upgrade from `Vec<String>`
-/// to `Vec<TaskDep>`: a `DistributedBinaryInfo` payload emitted by a
-/// pre-keyed-outputs sender carries bare-string elements
+/// Wire-decode tolerance for legacy `task_depends_on` shapes: a
+/// `DistributedBinaryInfo` payload that predates the
+/// `(phase_id, task_id)` dep identity carries bare-string elements
 /// (`["a", "b"]`). `TaskDep`'s `#[serde(untagged)]` deserializer must
-/// accept those without an explicit `inherit_outputs` key and decode
-/// each as `TaskDep { task_id, inherit_outputs: false }`. Without the
-/// nested untagged decoder, rolling upgrades would refuse legacy
-/// assignment frames.
+/// accept those (no `inherit_outputs`, no `phase_id` key) and decode
+/// each as `TaskDep { task_id, phase_id: <sentinel>, inherit_outputs:
+/// false }` — the migration sentinel (empty phase) that the
+/// snapshot-restore shim later fills with the enclosing task's phase.
+/// Coordinated restart means new senders always emit the explicit
+/// phase; this tolerance exists so a LEGACY PERSISTED snapshot still
+/// loads.
 #[test]
 fn distributed_binary_info_task_depends_on_decodes_bare_strings() {
     let legacy = serde_json::json!({
@@ -201,8 +204,12 @@ fn distributed_binary_info_task_depends_on_decodes_bare_strings() {
             assert_eq!(binary_info.task_depends_on.len(), 2);
             assert_eq!(binary_info.task_depends_on[0].task_id, "a");
             assert!(!binary_info.task_depends_on[0].inherit_outputs);
+            // Legacy bare strings carry no phase → the migration
+            // sentinel, to be filled by the snapshot-restore shim.
+            assert!(binary_info.task_depends_on[0].is_unphased());
             assert_eq!(binary_info.task_depends_on[1].task_id, "b");
             assert!(!binary_info.task_depends_on[1].inherit_outputs);
+            assert!(binary_info.task_depends_on[1].is_unphased());
         }
         _ => panic!("expected TaskAssignment"),
     }

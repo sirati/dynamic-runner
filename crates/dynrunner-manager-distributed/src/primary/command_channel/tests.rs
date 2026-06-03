@@ -2,7 +2,7 @@ use super::*;
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dynrunner_core::{ErrorType, TaskDep};
+use dynrunner_core::{ErrorType, PhaseId, TaskDep};
 use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use tokio::sync::oneshot;
@@ -441,7 +441,7 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
         // Dependent declares task_depends_on for the cascade walk.
         let mut dep = make_binary("dep", 100);
         dep.task_id = "dep_id".into();
-        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
+        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
         // Seed CRDT for both.
@@ -537,7 +537,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
 
         let mut dep = make_binary("dep", 100);
         dep.task_id = "dep_id".into();
-        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
+        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
         // Seed CRDT and pool with both items.
@@ -678,7 +678,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
 
         let mut dep = make_binary("dep", 100);
         dep.task_id = "dep_id".into();
-        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
+        dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
@@ -974,7 +974,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
 
         let mut a = make_binary("a", 100);
         a.task_id = "a_id".into();
-        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
+        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
             .await
@@ -1018,7 +1018,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
 
         let mut a = make_binary("a", 100);
         a.task_id = "a_id".into();
-        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
+        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
             .await
@@ -1068,7 +1068,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
 
         let mut a = make_binary("a", 100);
         a.task_id = "a_id".into();
-        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
+        a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
             .await
@@ -1158,7 +1158,7 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
         seed_pool(&mut coordinator, &[&a.phase_id]);
         let mut bad = make_binary("bad", 100);
         bad.task_id = "bad_id".into();
-        bad.task_depends_on = vec![TaskDep { task_id: "nope".into(), inherit_outputs: false }];
+        bad.task_depends_on = vec![TaskDep { task_id: "nope".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
         let mut c = make_binary("c", 100);
         c.task_id = "c_id".into();
 
@@ -1341,7 +1341,7 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
     a.task_id = "a_id".into();
     let mut b = make_binary("b", 100);
     b.task_id = "b_id".into();
-    b.task_depends_on = vec![TaskDep { task_id: "a_id".into(), inherit_outputs: false }];
+    b.task_depends_on = vec![TaskDep { task_id: "a_id".into(), phase_id: PhaseId::from("default"), inherit_outputs: false }];
     let m: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
         tasks: vec![a.clone(), b.clone()],
     };
@@ -1355,7 +1355,7 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
             assert_eq!(tasks[1].task_id, "b_id");
             assert_eq!(
                 tasks[1].task_depends_on,
-                vec![TaskDep { task_id: "a_id".to_string(), inherit_outputs: false }]
+                vec![TaskDep { task_id: "a_id".to_string(), phase_id: PhaseId::from("default"), inherit_outputs: false }]
             );
         }
         other => panic!("variant lost in round-trip: {other:?}"),

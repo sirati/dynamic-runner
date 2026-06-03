@@ -5,7 +5,7 @@
 //! permanent-failure cascade, and the `update_first_match_in_place`
 //! primitive (which scans both queued buckets and the blocked map).
 
-use dynrunner_core::{SoftPreferredSecondaries, TaskDep, TaskInfo};
+use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo};
 
 use super::{PendingPoolError, phase, pool_with, t};
 
@@ -26,6 +26,7 @@ fn t_with_id(
         .iter()
         .map(|d| TaskDep {
             task_id: d.to_string(),
+            phase_id: PhaseId::from(phase),
             inherit_outputs: false,
         })
         .collect();

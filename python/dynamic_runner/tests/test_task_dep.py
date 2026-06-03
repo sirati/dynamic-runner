@@ -47,6 +47,17 @@ class TestTaskDepShape:
         dep = TaskDep(task_id="B", inherit_outputs=True)
         assert dep.inherit_outputs is True
 
+    def test_default_phase_id_is_empty(self) -> None:
+        # Empty phase_id == "same phase as the declaring task" (resolved
+        # at the PyO3 boundary); a non-empty value names a cross-phase
+        # prerequisite explicitly.
+        dep = TaskDep(task_id="A")
+        assert dep.phase_id == ""
+
+    def test_explicit_cross_phase_phase_id(self) -> None:
+        dep = TaskDep(task_id="A", phase_id="other-phase")
+        assert dep.phase_id == "other-phase"
+
     def test_frozen_dataclass_rejects_mutation(self) -> None:
         # Frozen dataclasses must raise FrozenInstanceError on attempted
         # mutation; otherwise ``TaskDep`` could not safely be a hashable
@@ -139,7 +150,7 @@ class TestTaskInfoTaskDependsOnShape:
         as_dict = info.to_dict()
         assert as_dict["task_depends_on"] == [
             "A",
-            {"task_id": "B", "inherit_outputs": True},
+            {"task_id": "B", "phase_id": "", "inherit_outputs": True},
         ]
 
     def test_to_dict_default_inherit_outputs_still_renders(self) -> None:
@@ -152,5 +163,5 @@ class TestTaskInfoTaskDependsOnShape:
         info = self._make((TaskDep("A"),))
         as_dict = info.to_dict()
         assert as_dict["task_depends_on"] == [
-            {"task_id": "A", "inherit_outputs": False},
+            {"task_id": "A", "phase_id": "", "inherit_outputs": False},
         ]

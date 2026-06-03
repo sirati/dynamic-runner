@@ -64,6 +64,7 @@ fn excludes_task_dep_blocked_items() {
         task.task_id = "child".to_string();
         task.task_depends_on = vec![dynrunner_core::TaskDep {
             task_id: "dep".to_string(),
+            phase_id: dynrunner_core::PhaseId::from("P"),
             inherit_outputs: false,
         }];
         task

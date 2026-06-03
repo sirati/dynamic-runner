@@ -51,6 +51,7 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
         .iter()
         .map(|d| TaskDep {
             task_id: (*d).to_string(),
+            phase_id: PhaseId::from(phase),
             inherit_outputs: false,
         })
         .collect();

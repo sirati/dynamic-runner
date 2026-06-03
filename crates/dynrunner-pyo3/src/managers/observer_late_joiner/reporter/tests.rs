@@ -36,6 +36,7 @@ fn task(task_id: &str, phase: &str, deps: &[&str]) -> TaskInfo<()> {
             .iter()
             .map(|d| TaskDep {
                 task_id: d.to_string(),
+                phase_id: PhaseId::from(phase),
                 inherit_outputs: false,
             })
             .collect(),

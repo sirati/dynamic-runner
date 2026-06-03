@@ -72,23 +72,24 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     // an empty entry so dependents can rely on key
                     // presence.
                     if let Some(bytes) = &result_data {
-                        // `task_id` is non-optional by the framework's
-                        // boundary contract.
-                        let task_id = &b.task_id;
+                        // The cache key is the predecessor's full
+                        // `(phase_id, task_id)` identity; `task_id` is
+                        // non-optional by the framework's boundary
+                        // contract.
+                        let key = (b.phase_id.clone(), b.task_id.clone());
                         match serde_json::from_slice::<dynrunner_core::DonePayload>(bytes) {
                             Ok(body) => {
-                                self.task_outputs_cache
-                                    .insert(task_id.clone(), body.outputs);
+                                self.task_outputs_cache.insert(key, body.outputs);
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    task_id = %task_id,
+                                    task_id = %b.task_id,
                                     "TaskCompleted result_data failed to decode as DonePayload in local manager; \
                                      storing empty entry",
                                 );
                                 self.task_outputs_cache
-                                    .insert(task_id.clone(), dynrunner_core::TaskOutputs::default());
+                                    .insert(key, dynrunner_core::TaskOutputs::default());
                             }
                         }
                     }
