@@ -8,10 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
-use dynrunner_transport_quic::NetworkClient;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
@@ -223,115 +223,60 @@ impl PySecondaryCoordinator {
                     }
                 };
 
-                // Connect to primary via WSS, retrying until the configured timeout.
-                let connect_timeout = dist_connect_timeout;
-                let retry_delay = dist_connect_retry_delay;
-                let start = std::time::Instant::now();
-                let mut attempt = 0u32;
-                let client = loop {
-                    attempt += 1;
-                    let elapsed = start.elapsed();
-                    if elapsed > connect_timeout {
-                        tracing::error!(
-                            addr = %addr,
-                            attempts = attempt,
-                            "failed to connect to primary after {:.0}s",
-                            connect_timeout.as_secs_f64()
-                        );
-                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "failed to connect to primary at {addr} after {:.0}s ({attempt} attempts)",
-                            connect_timeout.as_secs_f64()
-                        )));
-                    }
-                    match NetworkClient::connect_wss_only(addr).await {
-                        Ok(c) => {
-                            tracing::info!(
-                                addr = %addr,
-                                elapsed_s = elapsed.as_secs_f64(),
-                                attempts = attempt,
-                                "connected to primary"
-                            );
-                            break c;
-                        }
-                        Err(e) => {
-                            let remaining = connect_timeout.saturating_sub(elapsed);
-                            if remaining > retry_delay {
-                                tracing::info!(
-                                    attempt,
-                                    error = %e,
-                                    "connection failed, retrying in {:.0}s...",
-                                    retry_delay.as_secs_f64()
-                                );
-                                tokio::time::sleep(retry_delay).await;
-                            } else {
-                                tracing::error!(addr = %addr, error = %e, "failed to connect to primary");
-                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "failed to connect to primary at {addr}: {e}"
-                                )));
-                            }
-                        }
-                    }
-                };
-
-                // Start peer network for peer-to-peer communication. The
-                // identity passed to `PeerNetwork::start` is BOTH the
-                // CN baked into this secondary's QUIC certificate AND
-                // the `peer_id` other secondaries will pass to quinn's
-                // `connect(addr, server_name)` to validate that cert.
-                // The primary distributes peer info keyed by
-                // `secondary_id` (the logical id, e.g. "secondary-0")
-                // — so the cert CN must match the logical id, not
-                // the SLURM hostname or any worker count. The previous
-                // value `format!("sec-{}", num_workers)` produced a
-                // CN like "sec-14" (one per cpus_per_task value) that
-                // never matched anything quinn expected; QUIC dials
-                // failed CN validation on every peer pair and fell
-                // back to WSS, eating the 10s-per-peer timeout budget.
-                // Pick the peer transport at runtime: real `PeerNetwork`
-                // for normal clusters, `NoPeerTransport` for clusters
-                // that firewall inter-compute-node networking (LMU
-                // SLURM, etc.) where every peer dial would time out
-                // anyway. Selection comes from `DistributedConfig
-                // .disable_peer_overlay` — see the CLI flag's help
-                // text for the failover-incompat caveat. The
-                // `EitherPeerTransport` enum lives one level down in
-                // dynrunner-transport-quic because the `PeerTransport`
-                // trait uses RPIT-in-trait and isn't object-safe;
-                // a sum-type is the only way to pick at runtime.
-                let (mut peer_network, peer_cert_pem, peer_port): (
-                    dynrunner_transport_quic::EitherPeerTransport<RunnerIdentifier>,
-                    String,
-                    u16,
-                ) = if dist_disable_peer_overlay {
-                    tracing::info!("peer overlay disabled by config; using NoPeerTransport");
-                    (
-                        dynrunner_transport_quic::EitherPeerTransport::Disabled(
-                            dynrunner_transport_quic::NoPeerTransport,
-                        ),
-                        String::new(),
-                        0,
-                    )
-                } else {
-                    let pn = dynrunner_transport_quic::PeerNetwork::<RunnerIdentifier>::start(
-                        &secondary_id,
-                    )
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::error!(error = %e, "failed to start peer network");
-                        // PeerNetwork::start only fails on cert
-                        // generation or bind errors; treat as fatal —
-                        // there's no useful fallback here that keeps
-                        // peer functionality.
-                        panic!("peer network start failed: {e}");
-                    });
-                    let cert_pem = pn.cert_pem().to_string();
-                    let port = pn.port();
-                    (
-                        dynrunner_transport_quic::EitherPeerTransport::Real(Box::new(pn)),
-                        cert_pem,
-                        port,
-                    )
-                };
+                // Stand up the secondary's mesh transport through the
+                // backend-opaque factory. It owns every backend-naming
+                // step: the WSS dial + retry loop, the peer-overlay
+                // selection (real peer mesh for normal clusters vs the
+                // firewalled no-overlay path for clusters that firewall
+                // inter-compute-node networking — selection comes from
+                // `DistributedConfig.disable_peer_overlay`, see the CLI
+                // flag's help text for the failover-incompat caveat),
+                // reading the backend's cert + QUIC port into the
+                // `PeerCertInfo` the `CertExchange` ships, extracting the
+                // mesh-send capability for the co-located parked primary,
+                // and folding the dialed bootstrap wire into the mesh
+                // under the primary's peer-id ("the tunnel is just a way
+                // of joining the mesh").
+                //
+                // The identity passed to the peer mesh is BOTH the CN
+                // baked into this secondary's QUIC certificate AND the
+                // `peer_id` other secondaries pass to quinn's
+                // `connect(addr, server_name)` to validate that cert. The
+                // primary distributes peer info keyed by `secondary_id`
+                // (the logical id, e.g. "secondary-0") — so the cert CN
+                // must match the logical id, not the SLURM hostname or
+                // any worker count.
+                //
+                // The bootstrap primary's peer-id is the conventional
+                // `"primary"` — the same id baked into the primary's
+                // `PrimaryConfig::node_id`, the cert CN the QUIC dialer
+                // validates against, and the host-id `Destination::Primary`
+                // resolves to. The matching `set_bootstrap_primary_id`
+                // below tells the egress edge to resolve
+                // `Destination::Primary` to it while the role table is
+                // still cold (pre-`PrimaryChanged`).
+                let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
+                    transport_factory::SecondaryDialParams {
+                        addr,
+                        connect_timeout: dist_connect_timeout,
+                        retry_delay: dist_connect_retry_delay,
+                        disable_peer_overlay: dist_disable_peer_overlay,
+                        secondary_id: &secondary_id,
+                        bootstrap_primary_id: "primary".to_string(),
+                        ipv4_address: Some(detect_ipv4(None)),
+                        ipv6_address: detect_ipv6(None),
+                    },
+                )
+                .await
+                .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                let peer_network = mesh_bundle.transport;
+                let secondary_cert_info = mesh_bundle.peer_cert_info;
+                // Cloneable mesh-send capability for the co-located parked
+                // primary's role-blind `MeshHandleTransport` (`Some` only
+                // when a real peer mesh exists — `Disabled` overlays have
+                // no remote secondaries and thus no failover, so no
+                // co-located primary is composed). See `MeshSendHandle`.
+                let mesh_send_handle = mesh_bundle.mesh_send;
 
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
@@ -372,38 +317,6 @@ impl PySecondaryCoordinator {
                     worker_spec,
                     child_processes: Vec::new(),
                 };
-
-                // Cloneable mesh-send capability for the co-located
-                // parked primary's role-blind `MeshHandleTransport`
-                // (`Some` only when a real peer mesh exists — `Disabled`
-                // overlays have no remote secondaries and thus no
-                // failover, so no co-located primary is composed). Taken
-                // BEFORE `peer_network` moves into the coordinator. See
-                // `MeshSendHandle`.
-                let mesh_send_handle = peer_network.mesh_send_handle();
-
-                // Fold the dialed primary bootstrap wire into the mesh as
-                // a directed-routable member keyed by the primary's
-                // peer-id: BOTH the outbound fan-in writer AND the wire's
-                // inbound (forwarded into the mesh's single fan-in) move
-                // onto the one uniform mesh path, so the primary's frames
-                // arrive via `recv_peer` like every other peer's — there
-                // is no separate `uplink` leg. "The tunnel is just a way
-                // of joining the mesh."
-                //
-                // The bootstrap primary's peer-id is the conventional
-                // `"primary"` — the same id baked into the primary's
-                // `PrimaryConfig::node_id` and the cert CN the QUIC dialer
-                // validates against (`NetworkClient::connect(.., "primary",
-                // ..)`), and the host-id `Destination::Primary` resolves
-                // to. The mesh-link registration folds the dialed wire
-                // into `connections["primary"]`; the matching
-                // `set_bootstrap_primary_id("primary")` below tells the
-                // egress edge to resolve `Destination::Primary` to it
-                // while the role table is still cold (pre-`PrimaryChanged`)
-                // — so setup `SecondaryWelcome`/`CertExchange` route to
-                // the dialled primary over that folded connection.
-                peer_network.register_primary_link("primary".to_string(), client);
 
                 // Clone the estimator for the co-located primary BEFORE
                 // the secondary consumes it; the primary's seeded-resume
@@ -509,25 +422,18 @@ impl PySecondaryCoordinator {
                     secondary.register_lifecycle_listener(listener);
                 }
 
-                // Set peer cert info so the CertExchange message
-                // includes our QUIC details. Both families are
-                // detected by `network::detect_ipv4` / `detect_ipv6`
-                // (env-var hint first, `hostname -I` fallback); the
-                // resulting `PeerCertInfo` is what the
-                // `send_cert_exchange` step ships on the wire and the
-                // primary then re-broadcasts via `PeerInfo`. The
-                // dialer (peer/dial.rs) consumes both families and
-                // happy-eyeballs-races them, so a host that has only
-                // one family configured is fine — the missing one is
+                // Set peer cert info so the CertExchange message includes
+                // our connection details. The `PeerCertInfo` was built by
+                // the transport factory from the backend's cert PEM + port
+                // plus both detected address families (`network::detect_ipv4`
+                // / `detect_ipv6` — env-var hint first, `hostname -I`
+                // fallback). It is what the `send_cert_exchange` step ships
+                // on the wire and the primary then re-broadcasts via
+                // `PeerInfo`. The dialer (peer/dial.rs) consumes both
+                // families and happy-eyeballs-races them, so a host that has
+                // only one family configured is fine — the missing one is
                 // simply absent from the candidate set.
-                secondary.set_peer_cert_info(
-                    dynrunner_manager_distributed::PeerCertInfo {
-                        public_cert_pem: peer_cert_pem,
-                        ipv4_address: Some(detect_ipv4(None)),
-                        ipv6_address: detect_ipv6(None),
-                        quic_port: peer_port,
-                    },
-                );
+                secondary.set_peer_cert_info(secondary_cert_info);
 
                 // Spawn the panik watcher and register its signal
                 // receiver on the coordinator BEFORE entering the
@@ -626,15 +532,15 @@ impl PySecondaryCoordinator {
                             p_on_phase_end,
                         ) = secondary.take_composed_primary_wiring();
 
-                        // The parked primary's role-blind `PeerTransport`:
-                        // every remote peer over the shared mesh, recv via
-                        // the demuxed inbound the secondary feeds. No
-                        // own-id / loopback branch — the egress edge owns
-                        // that (see `register_colocated_loopback` below).
+                        // The parked primary's role-blind `PeerTransport`,
+                        // built through the backend-opaque factory: every
+                        // remote peer over the shared mesh, recv via the
+                        // demuxed inbound the secondary feeds. No own-id /
+                        // loopback branch — the egress edge owns that (see
+                        // `register_colocated_loopback` below).
                         let primary_transport =
-                            dynrunner_transport_quic::MeshHandleTransport::new(
-                                mesh,
-                                inbound_rx,
+                            transport_factory::parked_primary_transport::<RunnerIdentifier>(
+                                mesh, inbound_rx,
                             );
 
                         // `PrimaryConfig` for the parked failover authority.

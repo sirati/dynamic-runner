@@ -7,9 +7,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
-use dynrunner_transport_quic::NetworkServer;
 
 use crate::identifier::RunnerIdentifier;
+use crate::managers::transport_factory;
 use crate::pytypes::extract_binaries;
 
 use super::PyPrimaryCoordinator;
@@ -85,12 +85,10 @@ impl PyPrimaryCoordinator {
         // The primary's listen endpoint + pubkey are bound inside the
         // detached tokio runtime (see the `py.detach(|| { … })` block
         // below). Snapshotting them here on the GIL thread is not
-        // possible (NetworkServer::bind is async and consumes the
-        // port); the detached-runtime block reads them off the bound
-        // server and supplies them to `primary.enable_respawn(...)`
-        // directly. These placeholders are no longer used past this
-        // point — kept as `None` so any future GIL-side caller has a
-        // single source-of-truth they cannot accidentally re-derive.
+        // possible (the mesh bind is async and consumes the port); the
+        // detached-runtime block reads them off the bundle the
+        // transport factory returns and supplies them to
+        // `primary.enable_respawn(...)` directly.
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         // Capture the scheduler-tuning snapshot here on the GIL thread so
@@ -292,65 +290,41 @@ impl PyPrimaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                // Build the unified `TunneledPeerTransport` FIRST so its
-                // inbound + registration sinks can be handed to the
-                // network server's accept loops. Post-collapse the
-                // transport OWNS the real inbound demux (the relocated
-                // `NetworkServer::recv` `select!`), so the accept loops
-                // feed it directly — there is no separate legacy
-                // inbound consumer and no fan-out tap. The
-                // `shared_outgoing` handle is unused here: the QUIC/WSS
-                // accept loops register each secondary's writer via the
-                // registration sink (drained in `recv_peer`), not by a
-                // direct insert. `NoPeerTransport` disappears from this
-                // call site (it stays valid on the SECONDARY side for
-                // the `disable_peer_overlay` firewalled-fabric path).
-                let (peer_transport, _shared_outgoing, inbound, registration) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<RunnerIdentifier>::new(
-                        "primary".into(),
-                    );
-
-                // Bind the network server to the port we already picked,
-                // wiring its accept loops to the transport's sinks.
-                let bind_addr: std::net::SocketAddr =
-                    format!("127.0.0.1:{}", port).parse().unwrap();
-                let server: NetworkServer =
-                    match NetworkServer::bind::<RunnerIdentifier>(bind_addr, inbound, registration)
-                        .await
-                    {
-                        Ok(s) => s,
+                // Stand up the submitter primary's mesh-join transport
+                // through the backend-opaque factory: it builds the mesh
+                // transport, binds the listener wiring its accept loops to
+                // the transport's inbound + registration sinks, and reads
+                // the respawn trust anchors (endpoint + cert PEM) off the
+                // bound listener. No backend type is named here.
+                //
+                // The trust anchors are surfaced to each respawned
+                // secondary via `SecondarySpawnSpec` (per-spawn, so a
+                // future cert rotation reaches downstream respawns). In
+                // SLURM mode the secondary dials `localhost:<gateway_port>`
+                // via the per-secondary reverse tunnel — the gateway-facing
+                // port differs but the same PEM authenticates either path.
+                // In multi-process local mode the submitter and the spawned
+                // subprocess share the same loopback, so this endpoint is
+                // already the dial-able address.
+                let mesh_bundle =
+                    match transport_factory::bind_primary_mesh::<RunnerIdentifier>(port).await {
+                        Ok(b) => b,
                         Err(e) => {
-                            tracing::error!(error = %e, "failed to start network server");
+                            tracing::error!(error = %e, "failed to start primary mesh transport");
                             return;
                         }
                     };
                 tracing::info!(port, "primary network server listening");
 
-                // Capture the primary's listen endpoint + cert PEM from
-                // the server handle. These are the trust anchors threaded
-                // through `enable_respawn` and surfaced to each respawned
-                // secondary via `SecondarySpawnSpec` (per-spawn, so a
-                // future cert rotation reaches downstream respawns). The
-                // server handle is kept alive past these reads only to
-                // hold the cert/port; its accept loops were spawned
-                // (`spawn_local`) inside `bind` and run independently for
-                // the lifetime of the `LocalSet`.
-                //
-                // Endpoint format mirrors the QUIC-listen surface in
-                // `NetworkServer::bind`: `127.0.0.1:<port>`. In SLURM
-                // mode the secondary dials `localhost:<gateway_port>`
-                // via the per-secondary reverse tunnel — the gateway-
-                // facing port differs but the same PEM authenticates
-                // either path. In multi-process local mode the
-                // submitter and the spawned subprocess share the same
-                // loopback, so this endpoint is already the dial-able
-                // address.
-                let respawn_primary_endpoint = format!("127.0.0.1:{}", server.port());
-                let respawn_primary_pubkey_pem = server.cert_pem().to_string();
-
-                // Secondaries retry-connect on their own; the accept loop
-                // (spawned in `bind`) handles connections that arrive
-                // after we hand control to the coordinator.
+                let peer_transport = mesh_bundle.transport;
+                let respawn_primary_endpoint = mesh_bundle.respawn_endpoint;
+                let respawn_primary_pubkey_pem = mesh_bundle.respawn_pubkey_pem;
+                // The factory's listener handle is kept alive for the
+                // `LocalSet`'s lifetime so its accept loops stay up;
+                // secondaries retry-connect on their own and connections
+                // that arrive after we hand control to the coordinator are
+                // accepted by those loops.
+                let _mesh_server_guard = mesh_bundle.listener_guard;
 
                 // Run the primary coordinator with the network server transport.
                 let config = PrimaryConfig {
@@ -385,11 +359,10 @@ impl PyPrimaryCoordinator {
                     setup_promote_deadline: dist_setup_promote_deadline,
                 };
 
-                // The server handle has done its job (port/cert captured,
-                // accept loops spawned + feeding the transport). Keep it
-                // bound to the LocalSet's lifetime so the listeners stay
-                // up; the coordinator now holds the single `Tr` transport.
-                let _server = server;
+                // The mesh listener (held in `_mesh_server_guard` above)
+                // stays bound to the LocalSet's lifetime so its accept
+                // loops keep feeding the transport; the coordinator now
+                // holds the single `Tr` transport.
                 let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
