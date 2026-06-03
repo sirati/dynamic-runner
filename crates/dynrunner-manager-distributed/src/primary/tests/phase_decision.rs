@@ -52,6 +52,61 @@ fn make_primary() -> PrimaryCoordinator<
     )
 }
 
+/// Build a task with an explicit phase + caller-chosen `task_id` and a
+/// list of fully-qualified `(dep_phase, dep_task_id)` deps so
+/// cross-phase identity can be expressed.
+fn cross_binary(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId> {
+    let mut t = make_binary(id, 100);
+    t.phase_id = PhaseId::from(phase);
+    t.task_id = id.to_string();
+    t.task_depends_on = deps
+        .iter()
+        .map(|(dp, dt)| TaskDep {
+            task_id: (*dt).to_string(),
+            phase_id: PhaseId::from(*dp),
+            inherit_outputs: false,
+        })
+        .collect();
+    t
+}
+
+/// SITE A (distributed ingest): the initial batch carrying the SAME
+/// `task_id` in two DIFFERENT phases is valid per `partition_ingest`
+/// (full `(phase_id, task_id)` identity) and `ingest_initial_batch` must
+/// NOT false-abort the run. Pre-fix `extend`'s bare-`task_id` dedup
+/// rejected the batch, surfacing a false `RunError` from the otherwise-
+/// successful `ingest_initial_batch`.
+#[test]
+fn ingest_initial_batch_cross_phase_same_task_id_is_not_a_duplicate() {
+    let mut primary = make_primary();
+    // Two phases, no deps. Install the pool the way `process_binaries`
+    // would, so `ingest_initial_batch` runs against a real pool.
+    let mut phase_set = std::collections::HashSet::new();
+    phase_set.insert(PhaseId::from("phaseA"));
+    phase_set.insert(PhaseId::from("phaseB"));
+    primary.pending = Some(
+        dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new()).expect("pool init"),
+    );
+
+    let batch = vec![
+        cross_binary("phaseA", "shared", &[]),
+        cross_binary("phaseB", "shared", &[]),
+    ];
+    primary
+        .ingest_initial_batch(batch)
+        .expect("cross-phase same task_id must NOT abort ingest");
+
+    assert!(
+        primary.pending_run_abort.is_none(),
+        "no #3a duplicate abort should be recorded for a cross-phase same task_id"
+    );
+    assert_eq!(
+        primary.total_tasks, 2,
+        "both cross-phase tasks counted as valid"
+    );
+    assert_eq!(primary.pool().len(), 2, "both tasks landed in the pool");
+}
+
 /// PROCEED when the phase produced at least one completed item, even if
 /// some siblings failed.
 #[test]
