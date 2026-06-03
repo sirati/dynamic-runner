@@ -455,3 +455,220 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
         })
         .await;
 }
+
+/// A `TaskInfo` carrying a RELATIVE `path` — the wire `local_path` that
+/// `report_unresolvable_task` cannot resolve when the secondary has no
+/// staging dir (`src_network=None`, the test default). Reaching the
+/// fail-loud guard requires `resolved_path.is_none() && local_path is
+/// relative`, which a relative path produces (the extraction cache has no
+/// entry for it).
+fn make_relative_path_binary(name: &str) -> TaskInfo<TestId> {
+    TaskInfo {
+        path: PathBuf::from(format!("relative/{name}")),
+        size: 50,
+        identifier: TestId(name.into()),
+        phase_id: dynrunner_core::PhaseId::from("default"),
+        type_id: dynrunner_core::TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: name.into(),
+        task_depends_on: vec![],
+        preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    }
+}
+
+/// Regression (helpers.rs `report_unresolvable_task`): an UNRESOLVABLE
+/// relative-path `TaskAssignment` reaching a 0-worker `Operational` node
+/// MUST (1) NOT panic / `u32`-underflow, AND (2) report the task back to
+/// the primary as the fail-loud `TaskFailed { NonRecoverable }` keyed by
+/// the ORIGINAL wire `worker_id`.
+///
+/// This exercises the SECOND of the two sibling underflow sites missed by
+/// the original router fix. `report_unresolvable_task` echoed the worker
+/// id back through `worker_id.min(pool.workers.len() as u32 - 1)` purely
+/// to "correct" the reported id; on a 0-worker pool that was `0u32 - 1`
+/// (panic in debug / wrap in release) before the guard ever produced a
+/// frame. The root-cause fix reports the un-clamped wire `worker_id`
+/// directly (the value never indexes the pool), so the 0-worker case is a
+/// clean fail-loud report with no pool arithmetic at all.
+///
+/// Distinct from the absolute-path 0-worker test above: an ABSOLUTE
+/// `local_path` makes `report_unresolvable_task` return `Ok(false)`
+/// (plausibly resolvable at the worker), so it reaches the router's
+/// "no idle worker" backpressure. Only a RELATIVE path drives the
+/// fail-loud guard whose clamp this test pins.
+#[tokio::test(flavor = "current_thread")]
+async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) =
+                super::super::test_helpers::make_secondary_recording(
+                    election_config("zero-worker-unresolvable"),
+                    1,
+                );
+            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.enter_operational_for_test();
+            assert_eq!(
+                sec.op_mut().pool.workers.len(),
+                0,
+                "precondition: the operational node has a 0-worker pool",
+            );
+
+            // Relative `local_path` + no `src_network` (election_config
+            // default) ⇒ `report_unresolvable_task` fires.
+            let binary = make_relative_path_binary("unresolvable-task");
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            let assignment = DistributedMessage::TaskAssignment {
+                sender_id: "primary".into(),
+                timestamp: 0.0,
+                secondary_id: "zero-worker-unresolvable".into(),
+                // A non-zero wire id to ALSO prove the reported id is the
+                // wire value, never a pool-clamped one.
+                worker_id: 3,
+                zip_file: None,
+                binary_info:
+                    dynrunner_protocol_primary_secondary::DistributedBinaryInfo::from_task_info(
+                        &binary,
+                    ),
+                local_path: binary.path.to_string_lossy().into_owned(),
+                file_hash: file_hash.clone(),
+                predecessor_outputs: std::collections::BTreeMap::new(),
+            };
+
+            let mut factory = super::super::test_helpers::FakeWorkerFactory;
+            let result = sec.dispatch_message(assignment, &mut factory).await;
+            assert!(
+                result.is_ok(),
+                "unresolvable TaskAssignment to a 0-worker node must not \
+                 panic / underflow, got {result:?}",
+            );
+
+            assert!(
+                sec.op_mut().active_tasks.is_empty(),
+                "an unresolvable task must not be tracked as active; \
+                 active_tasks={:?}",
+                sec.op_mut().active_tasks,
+            );
+
+            // The fail-loud guard sends `NonRecoverable` keyed by the
+            // ORIGINAL wire `worker_id` (3), not a clamped value.
+            let reported = log.borrow().iter().any(|m| {
+                matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        error_type: dynrunner_core::ErrorType::NonRecoverable,
+                        task_hash,
+                        worker_id,
+                        ..
+                    } if *task_hash == file_hash && *worker_id == 3
+                )
+            });
+            assert!(
+                reported,
+                "a 0-worker node must fail-loud-report the unresolvable task \
+                 (NonRecoverable, wire worker_id=3); captured sends: {:?}",
+                log.borrow(),
+            );
+        })
+        .await;
+}
+
+/// Regression (setup.rs `handle_initial_assignment`): an
+/// `InitialAssignment` naming a worker on a 0-worker pool MUST NOT
+/// underflow, and an unresolvable relative-path entry in it MUST be
+/// fail-loud-reported (NOT silently assigned to a non-existent slot).
+///
+/// `handle_initial_assignment` indexed the pool through the identical
+/// `worker_id.min(pool.workers.len() as u32 - 1)` clamp — the THIRD
+/// sibling of the router site. On a 0-worker pool that underflowed before
+/// any task was even examined. The root-cause fix selects the dispatch
+/// target as an `Option` (`.get()` / `position()`), so a 0-worker pool
+/// yields `None` (no slot, the task is left for the authority) and the
+/// unresolvable guard is keyed by the un-clamped wire `worker_id`.
+///
+/// Driven from an `Operational` 0-worker node: `handle_initial_assignment`
+/// reaches the pool / `active_tasks` / `report_unresolvable_task` through
+/// the same accessors that resolve in both `Configuring` and
+/// `Operational`, so `enter_operational_for_test`'s empty pool is a
+/// faithful stand-in for the production "spawned 0 workers" pool.
+#[tokio::test(flavor = "current_thread")]
+async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, log) =
+                super::super::test_helpers::make_secondary_recording(
+                    election_config("zero-worker-initial"),
+                    1,
+                );
+            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.enter_operational_for_test();
+            assert_eq!(
+                sec.op_mut().pool.workers.len(),
+                0,
+                "precondition: the node has a 0-worker pool",
+            );
+
+            // One zip entry with a relative `local_path` ⇒ unresolvable,
+            // so it reaches `report_unresolvable_task`. `worker_id: 5`
+            // names a slot that does not exist on the empty pool — pre-fix
+            // the clamp `5.min(0u32 - 1)` underflowed here.
+            let binary = make_relative_path_binary("initial-orphan");
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            let zip_files = vec![dynrunner_protocol_primary_secondary::ZipFileAssignment {
+                zip_name: String::new(),
+                binaries: vec![dynrunner_protocol_primary_secondary::ZipBinaryEntry {
+                    local_path: binary.path.to_string_lossy().into_owned(),
+                    binary_info:
+                        dynrunner_protocol_primary_secondary::DistributedBinaryInfo::from_task_info(
+                            &binary,
+                        ),
+                    hash: file_hash.clone(),
+                }],
+            }];
+            let workers_ready = vec![dynrunner_protocol_primary_secondary::WorkerReadyInfo {
+                worker_id: 5,
+                resource_budgets: vec![],
+            }];
+
+            let mut factory = super::super::test_helpers::FakeWorkerFactory;
+            // The critical call: pre-fix this underflowed on the empty pool
+            // before examining any task. Post-fix it completes.
+            sec.handle_initial_assignment(zip_files, workers_ready, vec![], &mut factory)
+                .await;
+
+            // No worker exists, so nothing is tracked as active.
+            assert!(
+                sec.op_mut().active_tasks.is_empty(),
+                "a 0-worker pool must not track any initial task as active; \
+                 active_tasks={:?}",
+                sec.op_mut().active_tasks,
+            );
+
+            // The unresolvable entry was fail-loud-reported keyed by the
+            // wire `worker_id` (5), proving the guard ran with the
+            // un-clamped id rather than panicking.
+            let reported = log.borrow().iter().any(|m| {
+                matches!(
+                    m,
+                    DistributedMessage::TaskFailed {
+                        error_type: dynrunner_core::ErrorType::NonRecoverable,
+                        task_hash,
+                        worker_id,
+                        ..
+                    } if *task_hash == file_hash && *worker_id == 5
+                )
+            });
+            assert!(
+                reported,
+                "the unresolvable initial-assignment task must be fail-loud \
+                 reported (NonRecoverable, wire worker_id=5); captured sends: {:?}",
+                log.borrow(),
+            );
+        })
+        .await;
+}

@@ -272,12 +272,21 @@ where
         let local_path_is_relative = std::path::Path::new(local_path).is_relative();
         if resolved_path.is_none() && (self.config.src_network.is_some() || local_path_is_relative)
         {
-            let wid = worker_id.min(self.pool_mut().workers.len() as u32 - 1);
+            // Report against the ORIGINAL wire `worker_id`: this value is
+            // only echoed back to the primary in the `TaskFailed` frame, it
+            // never indexes the pool here. The prior
+            // `worker_id.min(pool.workers.len() - 1)` clamp touched the pool
+            // purely to "correct" the reported id — which (a) underflowed on
+            // a 0-worker `Operational`/`Configuring` node (`0u32 - 1`) and
+            // (b) silently retargeted an out-of-range id onto the last slot.
+            // The wire id is the faithful thing to report (the router's
+            // backpressure path reports the same un-clamped wire id), so
+            // drop the clamp and the pool touch entirely.
             let msg = DistributedMessage::TaskFailed {
                 sender_id: self.config.secondary_id.clone(),
                 timestamp: timestamp_now(),
                 secondary_id: self.config.secondary_id.clone(),
-                worker_id: wid,
+                worker_id,
                 task_hash: file_hash.into(),
                 error_type: ErrorType::NonRecoverable,
                 error_message: format!(
