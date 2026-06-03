@@ -151,6 +151,41 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         .await;
     }
 
+    /// Register the primary's own host as a first-class cluster member.
+    ///
+    /// Single concern: the primary is a peer, so its host-id must land
+    /// in every replica's `peer_state` / `RoleTable` / relay membership
+    /// exactly as every secondary's does. This mirrors the secondary
+    /// accept path (`primary::connect::handle_welcome`), which originates
+    /// `PeerJoined { peer_id: <secondary_id> }` the moment a secondary is
+    /// recorded as connected — here the originator records ITSELF.
+    /// `is_observer: false`: the primary is never an observer (the
+    /// observer projection ratchets up only from `is_observer: true`
+    /// joins, so this entry never touches `RoleTable.observers`).
+    ///
+    /// This is MEMBERSHIP only — it does NOT originate `PrimaryChanged`
+    /// and does NOT warm the primary ROLE cache (uniform primary
+    /// announcement is a separate concern). It also does NOT add the
+    /// primary to the `PeerInfo` dial-list (`send_peer_lists`): that list
+    /// is consumed as a dial target by secondaries' `connect_to_peers`,
+    /// and the submitter is reachable only over the already-registered
+    /// reverse-tunnel mesh link, never by a fresh direct dial to its raw
+    /// address. Membership rides the CRDT `PeerJoined` path, which is the
+    /// single writer to peer membership post-observer-refactor (the
+    /// runtime `PeerInfo` arm is a receiver NoOp).
+    ///
+    /// Idempotent: `apply_peer_joined` short-circuits NoOp on re-applies
+    /// for an already-Alive id whose observer projection is unchanged, so
+    /// running this in both the seed-and-assign and the setup-defer
+    /// bootstrap paths is safe.
+    pub(crate) async fn originate_primary_membership(&mut self) {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
+            peer_id: self.config.node_id.clone(),
+            is_observer: false,
+        }])
+        .await;
+    }
+
     /// Phase-S/B: seed the replicated cluster ledger with the run's
     /// task graph and phase-dependency graph. Emits one
     /// `PhaseDepsSet` (carrying the canonical per-run dep graph)

@@ -2218,6 +2218,17 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Phase 4: Wait for peer connections (skip for single secondary)
         self.wait_for_peer_connections().await?;
 
+        // The primary is a first-class mesh member: register its own
+        // host-id in every replica's `peer_state` / `RoleTable` / relay
+        // membership via a self-authored `PeerJoined`, the same CRDT path
+        // the secondary accept site uses for each secondary. Originated
+        // here — after the fleet is connected (so the broadcast reaches
+        // every secondary) and BEFORE the seed/setup-defer branch below
+        // (so membership is recorded uniformly in both modes). Membership
+        // only: this does NOT announce `PrimaryChanged` and does NOT add
+        // the primary to the `PeerInfo` dial-list.
+        self.originate_primary_membership().await;
+
         // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
         // perform the initial per-secondary assignment. Both steps are
         // skipped when this primary is operating in setup-defer mode
