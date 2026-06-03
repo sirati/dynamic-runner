@@ -115,7 +115,7 @@ pub struct PeerNetwork<I: Identifier> {
     pub(super) reconnect_tracker: reconnect::ReconnectTracker,
 
     /// Receiver for the cloneable mesh-send proxy (see
-    /// [`MeshSendHandle`]). A co-located parked `PrimaryCoordinator`
+    /// [`MeshSendHandle`]). An on-demand co-located `PrimaryCoordinator`
     /// holds a clone of the matching sender and queues its remote sends
     /// here; `recv_peer`'s drain arm forwards each through this
     /// network's own relay-aware `send_to_peer` / `broadcast` so the
@@ -128,8 +128,8 @@ pub struct PeerNetwork<I: Identifier> {
     /// [`Self::mesh_send_handle`] can mint additional cloneable handles
     /// at any time AND so `proxy_rx` never observes a spurious close
     /// while the network is alive (the handed-out handles may all be
-    /// dropped — e.g. a never-promoted parked primary — without closing
-    /// the drain).
+    /// dropped — e.g. a host that is never promoted, so no co-located
+    /// primary is ever constructed — without closing the drain).
     mesh_send_tx: mpsc::UnboundedSender<MeshSend<I>>,
 }
 
@@ -276,7 +276,7 @@ impl<I: Identifier> PeerNetwork<I> {
 
     /// Mint a cloneable [`MeshSendHandle`] over this network's mesh.
     ///
-    /// The co-located parked `PrimaryCoordinator`'s send-proxy holds the
+    /// The on-demand co-located `PrimaryCoordinator`'s send-proxy holds the
     /// returned handle to reach remote secondaries over the SAME mesh
     /// this `PeerNetwork` owns (the secondary's `EitherPeerTransport::Real`
     /// arm) — without aliasing this network's `connections` ownership.
