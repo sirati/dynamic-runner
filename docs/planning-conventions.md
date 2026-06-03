@@ -150,9 +150,6 @@ Additional rules:
 - **Wrap every cargo invocation in `timeout --signal=KILL N`.** Separate the
   build step (`--no-run`) from the test run so a hang is attributable to the
   right phase.
-- **Run the `dynrunner-manager-distributed` lib tests with
-  `-- --test-threads=1`.** Some tests share global state and wedge under
-  parallelism. This is a temporary crutch (see Test discipline below).
 - **Exit 137 means the process was KILLed by the timeout.** Stop and diagnose —
   never blindly retry. A killed cargo is evidence of a hang or resource
   exhaustion, not a transient fault.
@@ -208,9 +205,14 @@ contains "and", the design is wrong; split it first.
 Tests are **deterministic**. Time-dependent tests use paused-clock advance and
 synchronous predicate assertions rather than real loops and wall-clock races.
 
-The `--test-threads=1` default for the `dynrunner-manager-distributed` lib
-suite is a **temporary crutch** that masks tests sharing global state. It is to
-be removed once the suite is parallel-safe; the offending tests are
-root-caused, their shared state isolated, and any wall-clock-raced tests
-converted to deterministic form, so that `cargo test --workspace` is green at
-default parallelism as CI runs it.
+The whole workspace, including the `dynrunner-manager-distributed` lib suite,
+is parallel-safe: `cargo test --workspace` is green at default parallelism, as
+CI runs it. Tests that assert on emitted log records install a per-test
+subscriber via `tracing::subscriber::with_default` (a scoped, thread-local
+subscriber) so they neither race nor depend on the process-global default.
+Tests that merely enable logging for debugging use
+`let _ = tracing_subscriber::fmt::try_init()`, whose `Err` (a global default is
+already installed) is benign and ignored. Tests that mutate shared host state
+(e.g. the gateway's `~/.ssh/authorized_keys` integration tests) serialise
+themselves through an in-test async mutex rather than relying on a global
+single-thread flag.
