@@ -29,7 +29,12 @@ use super::processing::make_binary;
 /// is the gate's first axis; legacy / failover runs leave it false.
 #[tokio::test(flavor = "current_thread")]
 async fn non_pre_staged_never_pending() {
-    let (sec, _log) = make_secondary_recording(election_config("sec-a"), 0);
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 0);
+    // `pre_staged_mode` / `setup_discovery_done` are carried on the typed
+    // lifecycle's `Configuring`/`Operational` state; the predicate is
+    // evaluated against the configured state, so land Operational first
+    // (matching the production point where the discriminator is read).
+    sec.enter_operational_for_test();
     assert!(
         !sec.setup_discovery_pending(),
         "default (non-pre-staged) secondary must never be setup-discovery pending",
@@ -40,6 +45,7 @@ async fn non_pre_staged_never_pending() {
 #[tokio::test(flavor = "current_thread")]
 async fn pre_staged_empty_ledger_is_pending() {
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 0);
+    sec.enter_operational_for_test();
     sec.set_pre_staged_mode(true);
     assert!(
         sec.setup_discovery_pending(),
@@ -57,6 +63,7 @@ async fn ingest_with_items_clears_pending_and_broadcasts() {
     local
         .run_until(async {
             let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
+            sec.enter_operational_for_test();
             sec.set_pre_staged_mode(true);
             assert!(sec.setup_discovery_pending());
 
@@ -112,6 +119,7 @@ async fn empty_discovery_latches_without_reyield() {
     local
         .run_until(async {
             let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
+            sec.enter_operational_for_test();
             sec.set_pre_staged_mode(true);
             assert!(sec.setup_discovery_pending());
 

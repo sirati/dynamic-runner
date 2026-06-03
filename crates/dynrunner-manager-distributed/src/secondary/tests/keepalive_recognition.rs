@@ -50,6 +50,7 @@ fn promote(primary_id: &str) -> DistributedMessage<TestId> {
 #[tokio::test(flavor = "current_thread")]
 async fn primary_keepalive_refreshes_primary_last_seen() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
         .expect("PromotePrimary handler succeeds");
@@ -60,17 +61,17 @@ async fn primary_keepalive_refreshes_primary_last_seen() {
     // (`PromotePrimary` is itself a primary-facing frame whose dispatch
     // refreshes liveness, so we re-baseline rather than assume `None`.)
     let stale = Instant::now() - Duration::from_secs(60);
-    sec.primary_last_seen = Some(stale);
+    sec.op_mut().primary_last_seen = Some(stale);
 
     sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Primary), &mut FakeWorkerFactory)
         .await;
 
     assert!(
-        sec.primary_last_seen.expect("primary_last_seen set") > stale,
+        sec.op_mut().primary_last_seen.expect("primary_last_seen set") > stale,
         "a Primary keepalive from the current primary must advance primary_last_seen"
     );
     assert!(
-        !sec.peer_keepalives.contains_key("sec-a"),
+        !sec.op_mut().peer_keepalives.contains_key("sec-a"),
         "a Primary keepalive must NOT be filed as a peer keepalive"
     );
 }
@@ -80,25 +81,26 @@ async fn primary_keepalive_refreshes_primary_last_seen() {
 #[tokio::test(flavor = "current_thread")]
 async fn peer_keepalive_does_not_touch_primary_last_seen() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
         .expect("PromotePrimary handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     let baseline = Instant::now() - Duration::from_secs(60);
-    sec.primary_last_seen = Some(baseline);
+    sec.op_mut().primary_last_seen = Some(baseline);
 
     // sec-c is a regular peer, not the current primary.
     sec.handle_inbound(keepalive("sec-c", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
         .await;
 
     assert_eq!(
-        sec.peer_keepalives.get("sec-c").copied(),
+        sec.op_mut().peer_keepalives.get("sec-c").copied(),
         Some(1.0),
         "a non-primary peer keepalive must be filed in peer_keepalives"
     );
     assert_eq!(
-        sec.primary_last_seen,
+        sec.op_mut().primary_last_seen,
         Some(baseline),
         "a non-primary peer keepalive must NOT touch primary_last_seen"
     );
@@ -112,13 +114,14 @@ async fn peer_keepalive_does_not_touch_primary_last_seen() {
 #[tokio::test(flavor = "current_thread")]
 async fn colocated_host_tracked_as_both_primary_and_peer() {
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
         .expect("PromotePrimary handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     let stale = Instant::now() - Duration::from_secs(60);
-    sec.primary_last_seen = Some(stale);
+    sec.op_mut().primary_last_seen = Some(stale);
 
     // The co-located host emits its secondary-capability keepalive: it is
     // a live mesh peer and MUST land in peer_keepalives despite its id
@@ -126,13 +129,13 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
         .await;
     assert_eq!(
-        sec.peer_keepalives.get("sec-a").copied(),
+        sec.op_mut().peer_keepalives.get("sec-a").copied(),
         Some(1.0),
         "a Secondary keepalive from the primary's host MUST land in peer_keepalives \
          (multi-role host is a live mesh peer)"
     );
     assert_eq!(
-        sec.primary_last_seen,
+        sec.op_mut().primary_last_seen,
         Some(stale),
         "a Secondary keepalive must NOT refresh primary_last_seen, even from the primary's id"
     );
@@ -142,11 +145,11 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Primary), &mut FakeWorkerFactory)
         .await;
     assert!(
-        sec.primary_last_seen.expect("primary_last_seen set") > stale,
+        sec.op_mut().primary_last_seen.expect("primary_last_seen set") > stale,
         "a Primary keepalive from the current primary refreshes primary_last_seen"
     );
     assert!(
-        sec.peer_keepalives.contains_key("sec-a"),
+        sec.op_mut().peer_keepalives.contains_key("sec-a"),
         "the earlier peer entry survives — the two liveness signals are independent"
     );
 

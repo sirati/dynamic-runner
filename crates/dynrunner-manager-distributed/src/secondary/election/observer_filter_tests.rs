@@ -23,8 +23,9 @@ const ONE_INTERVAL: Duration = Duration::from_millis(60);
 async fn non_observer_filters_observer_from_lowest_alive() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // obs-a is registered as a peer AND marked observer.
-    sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("obs-a".into(), timestamp_now());
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
@@ -54,10 +55,10 @@ async fn non_observer_filters_observer_from_lowest_alive() {
     // (after dropping obs-a) so sec-b is the lex-lowest and
     // self-promotes.
     assert!(
-        matches!(sec.election, ElectionState::Candidate { .. }),
+        matches!(sec.op_mut().election, ElectionState::Candidate { .. }),
         "non-observer sec-b should self-promote (peer-filter dropped \
              obs-a from lowest_alive); got state={:?}",
-        std::mem::discriminant(&sec.election)
+        std::mem::discriminant(&sec.op_mut().election)
     );
     assert!(
         actions
@@ -80,6 +81,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
 async fn promote_primary_naming_observer_is_rejected() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
@@ -139,13 +141,14 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
 
     let mut sec = make_secondary(election_config("sec-b"));
+    sec.enter_operational_for_test();
     // Production path: `PeerJoined { is_observer: true }` apply
     // populates the role table.
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
     });
-    sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("obs-a".into(), timestamp_now());
     sec.record_primary_message();
 
     // (a) Role-table read sees the observer.
@@ -160,7 +163,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
     sec.record_timeout_response("obs-a".into(), None);
     let actions = sec.run_election_tick();
     assert!(
-        matches!(sec.election, ElectionState::Candidate { .. }),
+        matches!(sec.op_mut().election, ElectionState::Candidate { .. }),
         "sec-b should self-promote (lowest_alive filter dropped obs-a)"
     );
     assert!(

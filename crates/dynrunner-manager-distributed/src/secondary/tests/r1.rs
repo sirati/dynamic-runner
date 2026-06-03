@@ -128,9 +128,12 @@ async fn r1_promotion_on_no_route_count_axis() {
     // Healthy peer mesh: 2 peers visible so the election takes the
     // elect-via-mesh branch (not the no-peer fatal bail).
     let mut sec = r1_helpers::make_with_peers("sec-a", 2);
-    sec.peer_keepalives
+    sec.enter_operational_for_test();
+    sec.op_mut()
+        .peer_keepalives
         .insert("sec-b".into(), r1_helpers::timestamp_now());
-    sec.peer_keepalives
+    sec.op_mut()
+        .peer_keepalives
         .insert("sec-c".into(), r1_helpers::timestamp_now());
     // Post-uniform-announce a secondary knows the primary's identity
     // before it can suspect its death; the Suspecting `TimeoutQuery`
@@ -152,13 +155,13 @@ async fn r1_promotion_on_no_route_count_axis() {
             .await
             .is_err()
     );
-    assert!(!sec.primary_link.should_arm_failover());
+    assert!(!sec.op_mut().primary_link.should_arm_failover());
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
             .is_err()
     );
-    assert!(!sec.primary_link.should_arm_failover());
+    assert!(!sec.op_mut().primary_link.should_arm_failover());
     // Third no-route send breaches the threshold and backdates
     // primary_last_seen (done inside send_to_primary on the breach).
     assert!(
@@ -167,7 +170,7 @@ async fn r1_promotion_on_no_route_count_axis() {
             .is_err()
     );
     assert!(
-        sec.primary_link.should_arm_failover(),
+        sec.op_mut().primary_link.should_arm_failover(),
         "third no-route send must arm the failover-health probe (threshold=3)"
     );
 
@@ -176,9 +179,9 @@ async fn r1_promotion_on_no_route_count_axis() {
     // degraded-mesh guard does NOT fire.
     let actions = sec.run_election_tick();
     assert!(
-        matches!(sec.election, ElectionState::Suspecting { .. }),
+        matches!(sec.op_mut().election, ElectionState::Suspecting { .. }),
         "election must enter Suspecting on probe-armed failover; got {:?}",
-        std::mem::discriminant(&sec.election)
+        std::mem::discriminant(&sec.op_mut().election)
     );
     assert!(
         actions
@@ -203,7 +206,9 @@ async fn r1_recover_on_primary_back() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = r1_helpers::make_with_peers("sec-a", 1);
-    sec.peer_keepalives
+    sec.enter_operational_for_test();
+    sec.op_mut()
+        .peer_keepalives
         .insert("sec-b".into(), r1_helpers::timestamp_now());
     sec.record_primary_message();
 
@@ -213,26 +218,26 @@ async fn r1_recover_on_primary_back() {
             .await
             .is_err()
     );
-    assert!(sec.primary_link.is_link_failing());
+    assert!(sec.op_mut().primary_link.is_link_failing());
 
     // Primary comes back: `record_primary_message` resets the window.
     sec.record_primary_message();
     assert!(
-        !sec.primary_link.is_link_failing(),
+        !sec.op_mut().primary_link.is_link_failing(),
         "primary-back must reset the health sub-state"
     );
-    assert!(!sec.primary_link.should_arm_failover());
+    assert!(!sec.op_mut().primary_link.should_arm_failover());
 
     // Tick re-check is a no-op now that the link is healthy.
     sec.check_primary_link_threshold();
     assert!(
-        !sec.primary_link.should_arm_failover(),
+        !sec.op_mut().primary_link.should_arm_failover(),
         "no arming on healthy link"
     );
 
     // Election stays in Normal — no Suspecting.
     let actions = sec.run_election_tick();
-    assert!(matches!(sec.election, ElectionState::Normal));
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
     assert!(actions.broadcast.is_empty());
 }
 
@@ -255,8 +260,9 @@ async fn r1_respects_degraded_guard() {
     // still flow through `check_primary_link_threshold`, then the
     // election tick should fatal-exit.
     let mut sec = r1_helpers::make_with_peers("sec-a", 0);
-    sec.peer_mesh_degraded = true;
-    sec.peer_dial_count = 4;
+    sec.enter_operational_for_test();
+    sec.mesh.degraded = true;
+    sec.mesh.peer_dial_count = 4;
     sec.record_primary_message();
 
     // Drive the count-axis past threshold via the send-side probe;
@@ -276,7 +282,7 @@ async fn r1_respects_degraded_guard() {
             .await
             .is_err()
     );
-    assert!(sec.primary_link.should_arm_failover());
+    assert!(sec.op_mut().primary_link.should_arm_failover());
 
     // Election tick observes degraded mesh + primary-silent and
     // sets fatal_exit per the #15 contract.
@@ -290,7 +296,7 @@ async fn r1_respects_degraded_guard() {
         "fatal reason should explain the degraded-failover bail, got: {reason}"
     );
     assert!(
-        matches!(sec.election, ElectionState::Normal),
+        matches!(sec.op_mut().election, ElectionState::Normal),
         "degraded failover bail must NOT transition the election state"
     );
 }
@@ -311,16 +317,19 @@ async fn r1_no_mesh_rebuild_during_arming() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let mut sec = r1_helpers::make_with_peers("sec-a", 2);
-    sec.peer_keepalives
+    sec.enter_operational_for_test();
+    sec.op_mut()
+        .peer_keepalives
         .insert("sec-b".into(), r1_helpers::timestamp_now());
-    sec.peer_keepalives
+    sec.op_mut()
+        .peer_keepalives
         .insert("sec-c".into(), r1_helpers::timestamp_now());
     sec.record_primary_message();
 
     // Snapshot the peer-mesh view before arming so we can assert
     // it's preserved across the probe path.
     let peers_before: std::collections::HashSet<String> =
-        sec.peer_keepalives.keys().cloned().collect();
+        sec.op_mut().peer_keepalives.keys().cloned().collect();
     assert_eq!(peers_before.len(), 2);
 
     // Drive the failover-health probe past threshold via no-route
@@ -341,11 +350,11 @@ async fn r1_no_mesh_rebuild_during_arming() {
             .await
             .is_err()
     );
-    assert!(sec.primary_link.should_arm_failover());
+    assert!(sec.op_mut().primary_link.should_arm_failover());
 
     // Peer-mesh view unchanged.
     let peers_after: std::collections::HashSet<String> =
-        sec.peer_keepalives.keys().cloned().collect();
+        sec.op_mut().peer_keepalives.keys().cloned().collect();
     assert_eq!(
         peers_before, peers_after,
         "arming must not mutate peer keepalives"
@@ -422,9 +431,13 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                // Tight deadline so the test reaps in ~200ms.
                 setup_deadline: Duration::from_millis(200),
-                unconfigured_deadline: Duration::from_secs(600),
+                // The typed lifecycle bounds the pre-config span
+                // (AwaitingPrimary + the Configuring excursion) by
+                // `unconfigured_deadline`, which SUPERSEDES the old
+                // `setup_deadline` as the setup-phase horizon. Tight (200ms)
+                // so the cold-start setup-deadline path reaps in ~200ms.
+                unconfigured_deadline: Duration::from_millis(200),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -531,7 +544,11 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_millis(200),
-                unconfigured_deadline: Duration::from_secs(600),
+                // The typed lifecycle bounds the pre-config span by
+                // `unconfigured_deadline` (it SUPERSEDES `setup_deadline` as
+                // the setup-phase horizon); tight (200ms) so the
+                // peers-reachable setup-deadline branch reaps fast.
+                unconfigured_deadline: Duration::from_millis(200),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -623,9 +640,16 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 FixedEstimator(100),
             );
 
-            // Initialise workers so `assign_task` has a target.
+            // Initialise workers so `assign_task` has a target, then
+            // land the lifecycle in Operational with that pool installed
+            // — `dispatch_message`'s TaskAssignment arm reaches the pool
+            // via `op_mut()`, so the worker must live in the operational
+            // state (the same place the production
+            // `enter_configuring → enter_operational` flow moves it).
             let mut factory = FakeWorkerFactory;
-            secondary.initialize_workers(&mut factory).await.unwrap();
+            let pool = secondary.initialize_workers(&mut factory).await.unwrap();
+            secondary.enter_operational_for_test();
+            *secondary.pool_mut() = pool;
 
             // Fabricate the wire shape the promoted-peer-primary would
             // send. file_hash is the key we'll later assert against in
@@ -642,7 +666,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
             // and `singleton_typed_phase_chain_completes_on_secondary`
             // tests).
-            secondary.pool.workers[0].loaded_type_id = Some(binary.type_id.clone());
+            secondary.pool_mut().workers[0].loaded_type_id = Some(binary.type_id.clone());
             let assignment = DistributedMessage::TaskAssignment {
                 sender_id: "sec-0".into(), // promoted peer-primary
                 timestamp: 0.0,
@@ -667,10 +691,10 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // success path; the FakeWorkerFactory's runner always
             // accepts assignments.)
             assert!(
-                secondary.active_tasks.contains_key(&file_hash),
+                secondary.op_mut().active_tasks.contains_key(&file_hash),
                 "TaskAssignment via peer_transport must reach the worker; \
                  active_tasks={:?}",
-                secondary.active_tasks
+                secondary.op_mut().active_tasks
             );
         })
         .await;

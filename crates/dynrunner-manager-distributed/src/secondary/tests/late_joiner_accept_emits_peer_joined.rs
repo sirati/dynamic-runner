@@ -78,6 +78,7 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
     local
         .run_until(async {
             let (mut sec, _pri_rx, peer_log) = make_secondary_with_recording_peer("responder");
+            sec.enter_operational_for_test();
 
             assert!(
                 sec.cluster_state.role_table().observers.is_empty(),
@@ -136,6 +137,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
     local
         .run_until(async {
             let (mut sec, _pri_rx, peer_log) = make_secondary_with_recording_peer("responder");
+            sec.enter_operational_for_test();
 
             let req = DistributedMessage::RequestClusterSnapshot {
                 sender_id: "late-worker-1".into(),

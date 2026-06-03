@@ -8,7 +8,7 @@ use super::super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary,
 };
 use super::super::*;
-use dynrunner_core::TaskInfo;
+use dynrunner_core::{TaskInfo, WorkerId};
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use std::time::Duration;
