@@ -110,7 +110,6 @@ impl PyDistributedManager {
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
-        let dist_setup_deadline = self.distributed_config.setup_deadline();
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
@@ -368,7 +367,6 @@ impl PyDistributedManager {
                             oom_retry_max_passes: dist_oom_retry_max_passes,
                             primary_link_failure_threshold: dist_primary_link_failure_threshold,
                             primary_link_failure_window: dist_primary_link_failure_window,
-                            setup_deadline: dist_setup_deadline,
                             unconfigured_deadline: dist_unconfigured_deadline,
                             is_observer: false,
                             resource_check_interval: dist_resource_check_interval,

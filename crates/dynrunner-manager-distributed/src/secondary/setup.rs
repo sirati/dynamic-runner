@@ -101,11 +101,11 @@ where
         // Setup-phase frame. Construction stays narrow-typed
         // (`SetupBootstrapMessage` accepts only the three setup
         // variants, so a runtime frame here fails at compile time),
-        // but routing is OPAQUE: the frame ships via the unified
-        // transport addressed to `Role::Primary`. The role cache is
-        // cold this early (no `PromotePrimary` observed), so it
-        // resolves to the bootstrap uplink — exactly the original
-        // primary this welcome is for. Wire bytes are identical (the
+        // but routing is OPAQUE: the frame ships over the one mesh
+        // addressed to `Destination::Primary`. The role cache is cold
+        // this early (no `PromotePrimary` observed), so it resolves to
+        // the bootstrap primary host — exactly the primary this welcome
+        // is for. Wire bytes are identical (the
         // `From<SetupBootstrapMessage>` conversion is lossless).
         let msg = SetupBootstrapMessage::SecondaryWelcome {
             sender_id: self.config.secondary_id.clone(),
@@ -199,11 +199,11 @@ where
         let mut got_transfer = false;
 
         while !got_peer_info || !got_assignment || !got_transfer {
-            // Opaque inbound: the unified transport merges the uplink
-            // and (not-yet-formed) mesh streams. During setup the mesh
-            // hasn't formed, so this yields the original primary's
-            // setup frames over the uplink. The role-layer passes
-            // non-`RoleAddressed` setup frames through untouched.
+            // Opaque inbound: the one mesh inbound stream. During setup
+            // the mesh is still forming, so this yields the primary's
+            // setup frames as the primary host dials/accepts; the
+            // manager addresses peers by id and never sees a transport
+            // role split.
             match self.transport.recv_peer().await {
                 Some(msg) => {
                     // FIRST primary-originated frame = the announce. This
@@ -252,9 +252,8 @@ where
                             // `RoleTable.observers`.
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
-                            // `connect_to_peers` on the unified transport
-                            // dials the mesh overlay (the uplink is
-                            // already connected).
+                            // `connect_to_peers` dials the rest of the one
+                            // mesh (the primary link is already connected).
                             self.transport.connect_to_peers(peers).await;
                             // Arm the peer-mesh watchdog. 30s = 10s
                             // QUIC timeout + 10s WSS fallback timeout
@@ -295,16 +294,11 @@ where
                         tracing::info!("received initial assignment");
                     }
                     MessageType::TransferComplete => {
+                        // The `got_peer_info / got_assignment / got_transfer`
+                        // trio (local to this loop) is the SINGLE
+                        // `Configuring → Operational` gate — there is no
+                        // parallel tracking on `ConfiguringState`.
                         got_transfer = true;
-                        // `transfer_complete` is now a `ConfiguringState`
-                        // field (the pool was spawned + the lifecycle
-                        // entered `Configuring` on the first primary frame
-                        // above, so `configuring_mut()` is `Some` here).
-                        // It is the `got_*` config signal the
-                        // `Configuring → Operational` transition gates on.
-                        if let Some(cfg) = self.lifecycle.configuring_mut() {
-                            cfg.mark_transfer_complete();
-                        }
                         tracing::info!("received transfer complete");
                     }
                     MessageType::ClusterMutation => {
@@ -345,7 +339,7 @@ where
     /// carried-forward config flags (`pre_staged_mode` /
     /// `uses_file_based_items`) start at their historical defaults
     /// (`false` / `true`) and are updated by the `InitialAssignment`
-    /// handler via `configuring_mut`.
+    /// handler via `set_pre_staged_mode` / `set_uses_file_based_items`.
     async fn enter_configuring_on_first_primary_frame(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
@@ -365,7 +359,7 @@ where
         let pool = self.initialize_workers(factory).await?;
         let lifecycle = std::mem::replace(
             &mut self.lifecycle,
-            super::lifecycle::SecondaryLifecycle::connecting(std::time::Instant::now()),
+            super::lifecycle::SecondaryLifecycle::connecting(),
         );
         // `pre_staged_mode` / `uses_file_based_items` default to the
         // historical pre-InitialAssignment values; the InitialAssignment

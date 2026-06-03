@@ -3,7 +3,8 @@
 //!
 //! # Sub-module layout
 //!
-//! - [`types`] — public boundary types: `RunOutcome`,
+//! - [`types`] — public boundary types: `RunOutcome` (per-run control
+//!   signal), `SecondaryTerminal` (per-secondary terminal projection),
 //!   `SecondaryConfig`, `PeerCertInfo`.
 //! - [`coordinator`] — inherent-impl methods on
 //!   `SecondaryCoordinator` (constructor, listener registration,
@@ -56,7 +57,7 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
-pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
+pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal};
 
 /// The shape of the cluster-state refresh callback registered via
 /// [`SecondaryCoordinator::register_cluster_state_refresh`]: invoked from

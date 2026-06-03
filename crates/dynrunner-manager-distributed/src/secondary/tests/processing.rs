@@ -191,7 +191,6 @@ async fn secondary_with_real_workers_processes_tasks() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -271,7 +270,6 @@ async fn secondary_multi_worker_processes_tasks() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -349,7 +347,6 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -455,7 +452,6 @@ async fn stage_file_then_assign_task_succeeds() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -707,7 +703,6 @@ async fn run_aborted_yields_run_outcome_aborted() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
-                setup_deadline: Duration::from_secs(60),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
@@ -743,15 +738,19 @@ async fn run_aborted_yields_run_outcome_aborted() {
             let outcome = secondary
                 .run_until_setup_or_done(&mut factory)
                 .await
-                .expect("run_until_setup_or_done returns Ok(RunOutcome::Aborted)");
-            match outcome {
-                RunOutcome::Aborted { reason } => {
+                .expect("run_until_setup_or_done returns Ok(RunOutcome::Terminal)");
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal, got {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Aborted { reason }) => {
                     assert!(
                         reason.contains("duplicate task identity"),
                         "Aborted carries the broadcast reason: {reason}"
                     );
                 }
-                other => panic!("expected RunOutcome::Aborted, got {other:?}"),
+                other => panic!("expected SecondaryTerminal::Aborted, got {other:?}"),
             }
             assert!(
                 secondary.cluster_state().run_aborted().is_some(),

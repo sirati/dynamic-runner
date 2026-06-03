@@ -17,7 +17,9 @@ mod test_capture;
 pub use primary::staging::{StagingEntry, StagingError, compute_initial_staging_entries};
 pub use primary::wire::compute_task_hash;
 pub use primary::{PrimaryConfig, PrimaryCoordinator, RunError};
-pub use secondary::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
+pub use secondary::{
+    PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
+};
 pub use zip_extract::compute_file_hash;
 // Re-export transport traits from the comm API crate for convenience.
 pub use cluster_state::{

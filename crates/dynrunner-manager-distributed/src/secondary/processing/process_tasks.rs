@@ -67,13 +67,15 @@ where
         // transition is a no-op on the state — and the `Option::take()`s
         // yield `None` the second time, so the loop's latch locals re-park
         // exactly as the pre-typed flat-field flow did across the yield.
+        // The carrier ferries only the receivers the operational `select!`
+        // actually polls. `lifecycle_rx` / `task_completed_rx` were already
+        // taken in `run_until_setup_or_done_inner` to spawn their
+        // dispatchers, and `command_rx` is transferred to the co-located
+        // primary — none is drained here, so none rides this carrier.
         let latches = super::super::lifecycle::OperationalLatches {
-            lifecycle_rx: self.lifecycle_rx.take(),
-            task_completed_rx: self.task_completed_rx.take(),
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
             panik_signal_rx: self.panik_signal_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
-            command_rx: self.command_rx.take(),
             on_cluster_state_refresh: self.on_cluster_state_refresh.take(),
             colocated_loopback_inbound_rx: self.colocated_loopback_inbound_rx.take(),
         };
@@ -83,7 +85,7 @@ where
         );
         let lifecycle = std::mem::replace(
             &mut self.lifecycle,
-            super::super::lifecycle::SecondaryLifecycle::connecting(std::time::Instant::now()),
+            super::super::lifecycle::SecondaryLifecycle::connecting(),
         );
         let (lifecycle, latches) = lifecycle.enter_operational(
             latches,
@@ -97,14 +99,6 @@ where
         );
         self.lifecycle = lifecycle;
         let super::super::lifecycle::OperationalLatches {
-            // `lifecycle_rx` / `task_completed_rx` were already consumed in
-            // `run_until_setup_or_done_inner` to spawn their dispatchers,
-            // so they are `None` here and unused by the loop; `command_rx`
-            // is transferred to the co-located primary via
-            // `take_composed_primary_wiring`, never drained by this loop.
-            lifecycle_rx: _,
-            task_completed_rx: _,
-            command_rx: _,
             mut announcer_outbox_rx,
             mut panik_signal_rx,
             mut fatal_exit_signal_rx,
@@ -205,10 +199,9 @@ where
             // cancel-safe because the periodic ticks (keepalive, oom)
             // will cancel the in-flight recv/event futures whenever
             // they fire. `pool.recv_event` is `mpsc::Receiver::recv`
-            // (documented cancel-safe). `transport.recv_peer` merges
-            // the uplink + mesh inbound streams internally, each backed
-            // by a per-connection bridge-task mpsc (cancel-safe; see
-            // `MessageReceiver` doc and `UnifiedSecondaryTransport`).
+            // (documented cancel-safe). `transport.recv_peer` is the one
+            // mesh inbound stream, backed by a per-connection bridge-task
+            // mpsc (cancel-safe; see `MessageReceiver` doc).
             // `interval.tick` is itself cancel-safe per tokio docs.
             tokio::select! {
                 // The pool lives inside `OperationalState`. The recv
@@ -236,18 +229,14 @@ where
                         }
                     }
                 }
-                // Single opaque inbound arm. The unified transport
-                // merges the uplink and mesh streams; the manager never
-                // sees which delivered a frame, and uplink-close is an
-                // INTERNAL transport event (it latches inside the
-                // transport and re-routes `Role::Primary`) — there is no
-                // recv-None failover cascade here. Failover-health is
-                // driven by the send-side no-route probe in
-                // `send_to_primary` plus the keepalive time-axis in
-                // `check_primary_link_threshold`. A `None` here means
-                // EVERY inbound source closed (uplink AND mesh): no more
-                // frames can ever arrive, so exit cleanly — the
-                // historical "all inbound closed = end of run" contract.
+                // Single mesh inbound arm. There is one mesh inbound
+                // stream — the manager addresses peers by id and the mesh
+                // relays. Failover-health is driven by the send-side
+                // no-route probe plus the keepalive time-axis in
+                // `check_primary_link_threshold`. A `None` here means the
+                // mesh inbound stream closed: no more frames can ever
+                // arrive, so exit cleanly — the historical "inbound
+                // closed = end of run" contract.
                 msg = self.transport.recv_peer() => {
                     match msg {
                         Some(m) => {
@@ -255,8 +244,7 @@ where
                         }
                         None => {
                             tracing::info!(
-                                "all inbound streams closed (uplink and mesh); \
-                                 exiting cleanly"
+                                "mesh inbound stream closed; exiting cleanly"
                             );
                             break;
                         }
@@ -448,10 +436,11 @@ where
                                 PANIK_KILL_GRACE,
                             )
                             .await;
-                        return Ok(crate::secondary::RunOutcome::PanikShutdown {
-                            matched_path,
-                            reason,
-                        });
+                        // Record the per-secondary terminal on the lifecycle
+                        // (single source of truth); the PyO3 boundary reads
+                        // it back via `coordinator.terminal()` for exit(137).
+                        self.enter_terminal_panik(matched_path, reason);
+                        return Ok(RunOutcome::Terminal);
                     }
                     // Err(_) from the receiver — the watcher's sender
                     // dropped before firing. This is the normal
@@ -543,6 +532,11 @@ where
             // call `break` directly.
             if let Some(reason) = self.fatal_exit.take() {
                 tracing::error!(reason = %reason, "secondary exiting with fatal error");
+                // Record the per-secondary `Failed` terminal on the
+                // lifecycle (single source of truth) before propagating the
+                // reason as the run loop's `Err` — the Err is what the
+                // boundary acts on; the terminal is the recorded outcome.
+                self.enter_terminal_failed(reason.clone());
                 return Err(reason);
             }
 
@@ -567,7 +561,7 @@ where
             // only reads the predicate. Placed AFTER `fatal_exit`
             // (genuine errors take priority) but BEFORE the run-complete
             // / drain checks, which would all be no-ops here anyway (the
-            // ledger is empty, the uplink is alive, nothing to drain).
+            // ledger is empty, the mesh is alive, nothing to drain).
             //
             // Cancel-safety: every awaiting arm in the `select!` above is
             // cancel-safe (mpsc recv + tokio interval ticks), so breaking
@@ -598,7 +592,11 @@ where
                     reason = %reason,
                     "RunAborted signal received from primary; exiting non-zero"
                 );
-                return Ok(crate::secondary::RunOutcome::Aborted { reason });
+                // Record the per-secondary `Aborted` terminal on the
+                // lifecycle (single source of truth); the PyO3 boundary
+                // reads it back via `coordinator.terminal()` for exit(1).
+                self.enter_terminal_aborted(reason);
+                return Ok(RunOutcome::Terminal);
             }
 
             // Run-complete exit: the primary broadcast
@@ -666,7 +664,10 @@ where
         // (RunComplete observed, drain-down complete after primary
         // disconnect, single-secondary clean shutdown). The
         // SetupPending yield uses `return Ok(RunOutcome::SetupPending)`
-        // directly, so reaching here means we're done.
-        Ok(RunOutcome::Done)
+        // directly, so reaching here means we're done. Record the `Done`
+        // terminal on the lifecycle (single source of truth) and report
+        // the `Terminal` control signal.
+        self.enter_terminal_done();
+        Ok(RunOutcome::Terminal)
     }
 }

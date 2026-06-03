@@ -242,8 +242,14 @@ async fn observer_skips_setup_and_exits_on_run_complete() {
                          against the dead uplink",
             );
             assert!(
-                matches!(outcome, RunOutcome::Done),
-                "observer must reach Done on run_complete(); got {outcome:?}",
+                matches!(outcome, RunOutcome::Terminal),
+                "observer must reach a terminal on run_complete(); got {outcome:?}",
+            );
+            assert!(
+                matches!(sec.terminal(), Some(SecondaryTerminal::Done)),
+                "observer's per-secondary terminal must be Done on run_complete(); \
+                 got {:?}",
+                sec.terminal(),
             );
         })
         .await;

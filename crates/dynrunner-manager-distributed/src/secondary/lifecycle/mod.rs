@@ -1,25 +1,33 @@
-//! Typed secondary lifecycle state machine (skeleton — UNWIRED).
+//! Typed secondary lifecycle state machine.
 //!
 //! This module owns the [`SecondaryLifecycle`] type: the explicit,
 //! type-level encoding of a secondary's progression from "just a peer on
 //! the mesh, no primary contact yet" to "operational task-runner" to a
-//! terminal outcome. It exists to replace the ~15 scattered bools/Options
-//! on [`super::SecondaryCoordinator`] with one state value whose variants
-//! make the system's capability invariants *unrepresentable to violate*.
+//! terminal outcome. It replaces the scattered bools/Options on
+//! [`super::SecondaryCoordinator`] with one state value whose variants
+//! make the system's capability invariants hard to violate.
 //!
-//! # Status: defined but not yet wired
+//! # Single source of truth for the per-secondary terminal
 //!
-//! Every type here is currently `#[allow(dead_code)]`. This leaf only
-//! introduces the shapes; a later leaf moves the coordinator's flat
-//! fields into these states and routes handlers through the enum. Until
-//! then nothing constructs or reads a `SecondaryLifecycle` value, so the
-//! behaviour of the running coordinator is byte-for-byte unchanged.
+//! The terminal variants [`Done`](SecondaryLifecycle::Done) /
+//! [`Aborted`](SecondaryLifecycle::Aborted) /
+//! [`Panik`](SecondaryLifecycle::Panik) /
+//! [`Failed`](SecondaryLifecycle::Failed) carry the per-secondary terminal
+//! payload (the abort/panik reason, the panik `matched_path`). They are
+//! the ONE place that records how *this secondary* ended; the coordinator
+//! drives the matching `enter_*` transition at each terminal site in
+//! `process_tasks`, and both the run-loop teardown and the PyO3 boundary
+//! read the terminal back via [`SecondaryLifecycle::terminal`] (projected
+//! to the public [`super::SecondaryTerminal`]). The per-run control signal
+//! `run_until_setup_or_done` returns ([`super::RunOutcome`]) is the
+//! orthogonal yield-vs-reached-terminal axis and carries no terminal
+//! payload — it never duplicates the terminal semantics that live here.
 //!
-//! # Capability invariants (the WHY — enforced by construction once wired)
+//! # Capability invariants (the WHY — enforced by construction)
 //!
 //! The states form a forward progression `Connecting → AwaitingPrimary →
-//! Configuring → Operational`, with five terminal absorbing states. The
-//! invariant each state encodes:
+//! Configuring → Operational`, with four terminal absorbing states
+//! (`Done`/`Aborted`/`Panik`/`Failed`). The invariant each state encodes:
 //!
 //! - **`AwaitingPrimary` cannot spawn workers and cannot accept a
 //!   `TaskAssignment`** — by construction, in a later wiring leaf: the
@@ -36,11 +44,15 @@
 //!   `AwaitingPrimary` and no worker pool is ever built.
 //! - **Election and keepalive live ONLY in `Operational`.** The
 //!   [`super::election::ElectionState`] sub-machine and the
-//!   primary-liveness keepalive are fields of [`OperationalState`], so a
-//!   `run_election_tick` / `send_keepalive` written as `impl
-//!   OperationalState` cannot fire before the lifecycle reaches
-//!   `Operational`. A `Configuring` secondary advancing past the short
-//!   election deadline therefore stays election-quiet by construction.
+//!   primary-liveness tracking (`primary_last_seen`, `peer_keepalives`,
+//!   `primary_link`) are fields of [`OperationalState`]. The election and
+//!   keepalive BEHAVIOUR stays on the coordinator (it needs coordinator-
+//!   level `cluster_state`/transport, not just `OperationalState` data),
+//!   but it reaches that state through `op_mut()`, which is `None` in every
+//!   pre-`Operational` variant — so an election tick / keepalive emission
+//!   cannot fire before the lifecycle reaches `Operational`. A
+//!   `Configuring` secondary advancing past the short election deadline
+//!   therefore stays election-quiet by construction.
 //! - **Two timeout horizons, owned by the states they govern.** The long
 //!   `unconfigured_deadline` governs the pre-`Operational` span
 //!   (`AwaitingPrimary` + `Configuring`); the short election deadline
@@ -77,6 +89,7 @@
 //! none of the fields migrated into a state is typed over them.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use dynrunner_core::{Identifier, WorkerId};
@@ -86,7 +99,8 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 
 use super::ClusterStateRefreshFn;
 use super::PendingFirstBind;
-use super::election::{ElectionState, ElectionTickActions};
+use super::SecondaryTerminal;
+use super::election::ElectionState;
 use super::primary_link::PrimaryLink;
 
 /// The typed secondary lifecycle.
@@ -98,7 +112,15 @@ use super::primary_link::PrimaryLink;
 /// Operational`; `Operational` is resumable across a `SetupPending`
 /// excursion (the caller re-enters and finds the lifecycle already
 /// `Operational`, preserving the fire-once consumption of the take-once
-/// channels). The five terminal variants are absorbing.
+/// channels). The four terminal variants
+/// (`Done`/`Aborted`/`Panik`/`Failed`) are absorbing and carry the
+/// per-secondary terminal payload (see the module docs).
+///
+/// **No promotion state.** A secondary is never promoted: when its host
+/// wins the election the host's co-located primary coordinator is woken
+/// (the coordinator-level `promote_activation_tx` + the election
+/// sub-machine), while this secondary stays `Operational`. There is no
+/// `Operational → Promoted` lifecycle transition.
 ///
 /// **Observer is a role, not a state.** A pure observer / late-joiner
 /// constructs [`Operational`](SecondaryLifecycle::Operational) directly
@@ -110,28 +132,24 @@ use super::primary_link::PrimaryLink;
 /// encodes (no worker-spawn / no `TaskAssignment` before `Configuring`;
 /// election + keepalive only in `Operational`; the long vs short timeout
 /// horizons).
-#[allow(dead_code)]
 pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifier> {
     /// Just starting: no primary peer known and no `PrimaryChanged`
     /// applied yet. The peer mesh IS being established here (see
     /// [`MeshFormation`], carried alongside this variant in the wired
     /// coordinator) — only worker-spawn, task-acceptance, election, and
-    /// keepalive are unavailable.
-    Connecting {
-        /// When this secondary entered the lifecycle. Governs the long
-        /// `unconfigured_deadline` (a property of the pre-`Operational`
-        /// span), never the short election deadline.
-        since: Instant,
-    },
+    /// keepalive are unavailable. The long `unconfigured_deadline` that
+    /// bounds the pre-`Operational` span is applied as a relative
+    /// `tokio::time::timeout` at the `run_until_setup_or_done` orchestration
+    /// boundary, so this variant carries no entry-instant anchor.
+    Connecting,
 
     /// Mesh-joining as far as it can, handshake in flight, but no primary
     /// has announced itself yet. **Cannot spawn workers, cannot accept a
     /// `TaskAssignment`, runs no election, sends no keepalive** — there is
     /// no pool in this variant and no Operational state data to write to.
-    /// Bounded by the long `unconfigured_deadline`.
+    /// Bounded by the long `unconfigured_deadline` (applied relatively at
+    /// the orchestration boundary).
     AwaitingPrimary {
-        /// Entry instant; subject to `unconfigured_deadline`.
-        since: Instant,
         /// Whether the setup handshake (`send_welcome` /
         /// `send_cert_exchange`) has been emitted to the (now-known) mesh
         /// primary peer. A one-shot guard so re-entry does not re-send.
@@ -162,28 +180,40 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
     /// largest state-data variant is kept behind an indirection.
     Operational(Box<OperationalState<M, I>>),
 
-    /// Terminal: this node won (or was named in) a promotion and is now
-    /// the primary; the co-located parked `PrimaryCoordinator` has been
-    /// activated. (`promote_activation_tx` is consumed at the
-    /// `Operational → Promoted` transition.)
-    Promoted,
-
     /// Terminal: the run reached a normal completion (RunComplete observed
-    /// / clean drain-down). Maps the old `RunOutcome::Done`.
+    /// / clean drain-down). Projects to [`SecondaryTerminal::Done`].
     Done,
 
-    /// Terminal: the replicated ledger recorded `RunAborted`. Maps the old
-    /// `RunOutcome::Aborted`.
-    Aborted,
+    /// Terminal: the replicated ledger recorded `RunAborted` (the failure
+    /// twin of RunComplete). Carries the abort `reason` for the boundary
+    /// log; projects to [`SecondaryTerminal::Aborted`], which the PyO3
+    /// boundary maps to `exit(1)`.
+    Aborted {
+        /// The cluster-wide abort reason carried from the broadcast.
+        reason: String,
+    },
 
-    /// Terminal: the panik watcher fired (sentinel file / SIGTERM); workers
-    /// have been hard-killed. Maps the old `RunOutcome::PanikShutdown`.
-    Panik,
+    /// Terminal: the panik watcher fired (sentinel file / SIGTERM) and
+    /// workers have been hard-killed. Carries the first matched panik file
+    /// path and the human-readable reason; projects to
+    /// [`SecondaryTerminal::Panik`], which the PyO3 boundary maps to
+    /// `exit(137)`.
+    Panik {
+        /// The first panik file that existed (PyO3 boundary shutdown-cause
+        /// log).
+        matched_path: PathBuf,
+        /// The human-readable reason (`"panik file: <path>"` shape).
+        reason: String,
+    },
 
     /// Terminal: an unrecoverable local fault was latched (the read of the
-    /// old `fatal_exit` write-latch transitions here). The run exits
-    /// non-zero.
-    Failed,
+    /// `fatal_exit` write-latch transitions here). The run loop returns
+    /// `Err(reason)`; this terminal records the per-secondary
+    /// internal-failure outcome and carries the same `reason`.
+    Failed {
+        /// The fatal-exit reason the run loop propagates as its `Err`.
+        reason: String,
+    },
 }
 
 /// State data for [`SecondaryLifecycle::Configuring`].
@@ -195,18 +225,12 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
 /// "Configuring → Operational data" in the plan's migration map), so the
 /// resolver and the `SetupPending` discriminator keep their values across
 /// the `enter_operational()` boundary.
-#[allow(dead_code)]
 pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifier> {
     /// The local worker pool, built by `initialize_workers` on entry to
     /// this state. Real [`WorkerPool<M, I>`] — there is no pool in any
     /// earlier state, which is what makes a pre-`Configuring` worker-spawn
     /// unrepresentable.
     pub(in crate::secondary) pool: WorkerPool<M, I>,
-
-    /// Mirrors the coordinator's `transfer_complete` latch — set when the
-    /// primary's `TransferComplete` arrives. One of the "got_*" config
-    /// signals that gate the `Configuring → Operational` transition.
-    pub(in crate::secondary) transfer_complete: bool,
 
     /// Pre-staged source mode, from `InitialAssignment.pre_staged_mode`.
     /// Carried forward into [`OperationalState`] (it feeds the
@@ -240,7 +264,6 @@ pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifi
 /// (election can only run here); the short election deadline is computed
 /// from `primary_last_seen` + the keepalive config that lives alongside it,
 /// so it cannot fire before this state is reached.
-#[allow(dead_code)]
 pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifier> {
     /// The local worker pool, carried in from [`ConfiguringState`] (or
     /// constructed empty for a pure observer / late-joiner that lands here
@@ -313,7 +336,6 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
 /// `Operational`. Worker-spawn, task-acceptance, election, and keepalive
 /// are the config/`Operational`-gated capabilities; "form/maintain the
 /// mesh" is not among them.
-#[allow(dead_code)]
 pub(in crate::secondary) struct MeshFormation {
     /// One-shot watchdog deadline for "did the peer mesh form?". Set to
     /// `now + watchdog` when the per-peer dials kick off with ≥1 peer;
@@ -362,13 +384,20 @@ impl Default for MeshFormation {
 /// These are the `Option<Receiver>` / `Option<callback>` slots the
 /// coordinator builds at construction and `take()`s once when it first
 /// reaches `process_tasks` (see the matching fields on
-/// [`super::SecondaryCoordinator`]: `lifecycle_rx`, `task_completed_rx`,
-/// `announcer_outbox_rx`, `panik_signal_rx`, `fatal_exit_signal_rx`,
-/// `command_rx`, `on_cluster_state_refresh`). The plan's migration map
-/// makes the `Configuring → Operational` transition the ONE place they
-/// are consumed: the coordinator fills this carrier by `take()`-ing each
-/// `Option`, hands it to `enter_operational`, and gets the unwrapped
-/// values back to drive the operational `select!` loop.
+/// [`super::SecondaryCoordinator`]: `announcer_outbox_rx`,
+/// `panik_signal_rx`, `fatal_exit_signal_rx`, `on_cluster_state_refresh`,
+/// `colocated_loopback_inbound_rx`). The `Configuring → Operational`
+/// transition is the ONE place they are consumed: the coordinator fills
+/// this carrier by `take()`-ing each `Option`, hands it to
+/// `enter_operational`, and gets the unwrapped values back to drive the
+/// operational `select!` loop.
+///
+/// The `lifecycle_rx` / `task_completed_rx` receivers are deliberately NOT
+/// here: they were already `take()`-n earlier (in
+/// `run_until_setup_or_done_inner`) to spawn their dispatcher tasks, and
+/// `command_rx` is transferred to the co-located primary — none of the
+/// three is ever drained by this loop, so the carrier only ferries the
+/// receivers the operational `select!` actually polls.
 ///
 /// **Fire-once by construction.** A `SetupPending` excursion re-enters
 /// `run_until_setup_or_done` and finds the lifecycle already
@@ -379,19 +408,11 @@ impl Default for MeshFormation {
 /// the operational loop, not part of the resumable state data — exactly as
 /// the skeleton scoped [`OperationalState`].
 ///
-/// `promote_activation_tx` is deliberately NOT here: it is consumed at the
-/// later `Operational → Promoted` transition (see
-/// [`SecondaryLifecycle::enter_promoted`]), not at this boundary.
-#[allow(dead_code)]
+/// `promote_activation_tx` is deliberately NOT here: it stays a
+/// coordinator-level channel, consumed when the election sub-machine wakes
+/// the co-located primary coordinator (the secondary itself never leaves
+/// `Operational`), not at this boundary.
 pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
-    /// Peer-lifecycle dispatcher receiver (`PeerJoined`/`PeerRemoved`).
-    pub(in crate::secondary) lifecycle_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>>,
-
-    /// Task-completion dispatcher receiver.
-    pub(in crate::secondary) task_completed_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>>,
-
     /// Observer-announcer outbox receiver. `None` outside an attached
     /// observer wiring.
     pub(in crate::secondary) announcer_outbox_rx:
@@ -405,11 +426,6 @@ pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// run-loop-external policy was attached.
     pub(in crate::secondary) fatal_exit_signal_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-
-    /// PyO3 `PrimaryHandle` command-channel receiver (transferred to the
-    /// co-located primary, never drained by the secondary itself).
-    pub(in crate::secondary) command_rx:
-        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Periodic cluster-state refresh callback. `None` when no consumer
     /// registered.
@@ -441,52 +457,46 @@ impl<I: Identifier> OperationalLatches<I> {
     /// coordinator for that single consumption site.
     pub(in crate::secondary) fn empty() -> Self {
         Self {
-            lifecycle_rx: None,
-            task_completed_rx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
             fatal_exit_signal_rx: None,
-            command_rx: None,
             on_cluster_state_refresh: None,
             colocated_loopback_inbound_rx: None,
         }
     }
 }
 
-#[allow(dead_code)]
 // `M: 'static` mirrors the bound on `WorkerPool::new()` (and on the
 // `SecondaryCoordinator` impl): the empty-pool late-joiner construction in
 // `operational_observer` calls it, and the carried `WorkerPool<M, I>`
 // requires it anyway.
 impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
-    /// Construct the initial state. The lifecycle begins as `Connecting`
-    /// the moment the coordinator starts; `since` anchors the long
-    /// `unconfigured_deadline` that governs the whole pre-`Operational`
-    /// span (`Connecting` + `AwaitingPrimary` + `Configuring`).
-    pub(in crate::secondary) fn connecting(now: Instant) -> Self {
-        SecondaryLifecycle::Connecting { since: now }
+    /// Construct the initial state: the lifecycle begins as `Connecting`
+    /// the moment the coordinator starts. The long `unconfigured_deadline`
+    /// that governs the pre-`Operational` span is applied relatively at the
+    /// orchestration boundary, so no entry-instant is carried.
+    pub(in crate::secondary) fn connecting() -> Self {
+        SecondaryLifecycle::Connecting
     }
 
     /// `Connecting → AwaitingPrimary`. The peer mesh keeps forming (the
     /// orthogonal [`MeshFormation`] sub-concern is unaffected by this
     /// transition); the secondary is now actively trying to reach a
-    /// primary but none has announced itself yet. The pre-config deadline
-    /// anchor (`since`) is carried forward unchanged — `AwaitingPrimary`
-    /// shares the long `unconfigured_deadline` horizon with `Connecting`,
-    /// it does not restart it. `handshake_sent` starts `false`; the
-    /// capability to actually emit the welcome/cert-exchange handshake is
-    /// gated on this state (see [`Self::mark_handshake_sent`]).
+    /// primary but none has announced itself yet. `handshake_sent` starts
+    /// `false`; the capability to actually emit the welcome/cert-exchange
+    /// handshake is gated on this state (see [`Self::mark_handshake_sent`]).
     ///
     /// Returns `self` unchanged if called from any other variant: the
-    /// transition is only valid out of `Connecting`. A future wiring leaf
-    /// calls this exactly once, so the identity arm is defensive rather than
-    /// a reachable path.
+    /// transition is only valid out of `Connecting`. The coordinator calls
+    /// this exactly once (at the top of `run_until_setup_or_done`), so the
+    /// identity arm is defensive rather than a reachable path.
     pub(in crate::secondary) fn enter_awaiting_primary(self) -> Self {
         match self {
-            SecondaryLifecycle::Connecting { since } => SecondaryLifecycle::AwaitingPrimary {
-                since,
-                handshake_sent: false,
-            },
+            SecondaryLifecycle::Connecting => {
+                SecondaryLifecycle::AwaitingPrimary {
+                    handshake_sent: false,
+                }
+            }
             other => other,
         }
     }
@@ -505,9 +515,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     ///
     /// `pre_staged_mode` / `uses_file_based_items` are seeded from the
     /// primary's `InitialAssignment` and carried forward into
-    /// [`OperationalState`] at the next boundary. `transfer_complete` and
-    /// `setup_discovery_done` start `false` — they are the `got_*` config
-    /// signals that gate the `Configuring → Operational` transition.
+    /// [`OperationalState`] at the next boundary. `setup_discovery_done`
+    /// starts `false`. The real `Configuring → Operational` gate is the
+    /// local `got_peer_info / got_assignment / got_transfer` trio tracked
+    /// in `wait_for_setup` — the single source of truth, not a field on
+    /// this state.
     pub(in crate::secondary) fn enter_configuring(
         self,
         pool: WorkerPool<M, I>,
@@ -518,7 +530,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             SecondaryLifecycle::AwaitingPrimary { .. } => {
                 SecondaryLifecycle::Configuring(Box::new(ConfiguringState {
                     pool,
-                    transfer_complete: false,
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done: false,
@@ -547,9 +558,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// [`ElectionState`] sub-machine, `primary_last_seen`,
     /// `peer_keepalives`, the [`PrimaryLink`], `active_tasks`, and the
     /// pending collections — are moved in alongside. Only once they live in
-    /// `OperationalState` are `run_election_tick` / `send_keepalive`
-    /// reachable (they are `impl OperationalState`), so neither can fire
-    /// pre-`Operational`.
+    /// `OperationalState` can the coordinator's election-tick / keepalive
+    /// behaviour reach them (via `op_mut()`, which is `None` pre-
+    /// `Operational`), so neither can fire pre-`Operational`.
     ///
     /// Returns `self` unchanged (passing the latches straight back) if
     /// called from any non-`Configuring` variant: the transition is only
@@ -570,7 +581,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             SecondaryLifecycle::Configuring(cfg) => {
                 let ConfiguringState {
                     pool,
-                    transfer_complete: _,
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done,
@@ -637,61 +647,38 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         (state, latches)
     }
 
-    /// `Operational → Promoted` (terminal): this node won (or was named in)
-    /// a promotion and is now the primary.
-    ///
-    /// `promote_activation_tx` — the one-shot gate to the co-located parked
-    /// [`crate::primary::PrimaryCoordinator`] — is consumed HERE, at this
-    /// transition (NOT at [`Self::enter_operational`]). Firing it wakes the
-    /// parked primary into its seeded resume with the secondary's
-    /// continuously-mirrored cluster snapshot. The two promotion paths that
-    /// reach `Promoted` (own-election win + peer-named) both route through
-    /// this single `take()`-and-fire boundary, so activation is fire-once.
-    /// `None` when no co-located primary was composed (Rust-only tests,
-    /// legacy single-`run()` callers): the gate is then a no-op and only
-    /// the `PromotePrimary { new = self }` broadcast fires (the caller owns
-    /// that broadcast — it is not this transition's concern).
-    ///
-    /// Returns the `Promoted` terminal plus the (taken) activation gate so
-    /// the caller can fire it; modelling the gate as move-out keeps the
-    /// fire-once `take()` at this one boundary.
-    pub(in crate::secondary) fn enter_promoted(
-        self,
-        promote_activation_tx: Option<
-            tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
-        >,
-    ) -> (
-        Self,
-        Option<tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>>,
-    ) {
-        (SecondaryLifecycle::Promoted, promote_activation_tx)
-    }
-
     /// `* → Done` (terminal): the run reached a normal completion
-    /// (RunComplete observed / clean drain-down). Maps the old
-    /// `RunOutcome::Done`.
+    /// (RunComplete observed / clean drain-down). The single site that
+    /// records a normal per-secondary finish; projects to
+    /// [`SecondaryTerminal::Done`].
     pub(in crate::secondary) fn enter_done(self) -> Self {
         SecondaryLifecycle::Done
     }
 
     /// `* → Aborted` (terminal): the replicated ledger recorded
-    /// `RunAborted`. Maps the old `RunOutcome::Aborted`.
-    pub(in crate::secondary) fn enter_aborted(self) -> Self {
-        SecondaryLifecycle::Aborted
+    /// `RunAborted`. Carries the cluster-wide abort `reason`; projects to
+    /// [`SecondaryTerminal::Aborted`] (`exit(1)` at the PyO3 boundary).
+    pub(in crate::secondary) fn enter_aborted(self, reason: String) -> Self {
+        SecondaryLifecycle::Aborted { reason }
     }
 
     /// `* → Panik` (terminal): the panik watcher fired (sentinel file /
-    /// SIGTERM) and workers have been hard-killed. Maps the old
-    /// `RunOutcome::PanikShutdown`.
-    pub(in crate::secondary) fn enter_panik(self) -> Self {
-        SecondaryLifecycle::Panik
+    /// SIGTERM) and workers have been hard-killed. Carries the matched
+    /// panik file path and the reason; projects to
+    /// [`SecondaryTerminal::Panik`] (`exit(137)` at the PyO3 boundary).
+    pub(in crate::secondary) fn enter_panik(self, matched_path: PathBuf, reason: String) -> Self {
+        SecondaryLifecycle::Panik {
+            matched_path,
+            reason,
+        }
     }
 
     /// `* → Failed` (terminal): an unrecoverable local fault was latched
-    /// (the read of the old `fatal_exit` write-latch transitions here). The
-    /// run exits non-zero.
-    pub(in crate::secondary) fn enter_failed(self) -> Self {
-        SecondaryLifecycle::Failed
+    /// (the read of the `fatal_exit` write-latch transitions here). The run
+    /// loop returns `Err(reason)`; this terminal records the per-secondary
+    /// internal-failure outcome with the same `reason`.
+    pub(in crate::secondary) fn enter_failed(self, reason: String) -> Self {
+        SecondaryLifecycle::Failed { reason }
     }
 
     /// Whether the lifecycle has reached `Operational` or a terminal
@@ -701,22 +688,38 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     pub(in crate::secondary) fn setup_phase_completed(&self) -> bool {
         !matches!(
             self,
-            SecondaryLifecycle::Connecting { .. }
+            SecondaryLifecycle::Connecting
                 | SecondaryLifecycle::AwaitingPrimary { .. }
                 | SecondaryLifecycle::Configuring(_)
         )
     }
 
-    /// Whether the lifecycle is in a terminal (absorbing) variant.
-    pub(in crate::secondary) fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            SecondaryLifecycle::Promoted
-                | SecondaryLifecycle::Done
-                | SecondaryLifecycle::Aborted
-                | SecondaryLifecycle::Panik
-                | SecondaryLifecycle::Failed
-        )
+    /// Project the terminal variant to the public [`SecondaryTerminal`]
+    /// boundary type, or `None` if the lifecycle has not reached a terminal.
+    ///
+    /// This is the SINGLE crossing point from the module-private lifecycle
+    /// terminal to the public boundary: the run-loop teardown and the PyO3
+    /// exit-code decision both read the per-secondary outcome through here,
+    /// so the terminal semantics are defined once (on the lifecycle) and
+    /// merely projected — never duplicated onto `RunOutcome`.
+    pub(in crate::secondary) fn terminal(&self) -> Option<SecondaryTerminal> {
+        match self {
+            SecondaryLifecycle::Done => Some(SecondaryTerminal::Done),
+            SecondaryLifecycle::Aborted { reason } => Some(SecondaryTerminal::Aborted {
+                reason: reason.clone(),
+            }),
+            SecondaryLifecycle::Panik {
+                matched_path,
+                reason,
+            } => Some(SecondaryTerminal::Panik {
+                matched_path: matched_path.clone(),
+                reason: reason.clone(),
+            }),
+            SecondaryLifecycle::Failed { reason } => Some(SecondaryTerminal::Failed {
+                reason: reason.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// `&mut` access to the operational state, iff the lifecycle has
@@ -742,18 +745,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     pub(in crate::secondary) fn operational_ref(&self) -> Option<&OperationalState<M, I>> {
         match self {
             SecondaryLifecycle::Operational(state) => Some(state),
-            _ => None,
-        }
-    }
-
-    /// `&mut` access to the configuring state, iff the lifecycle is
-    /// `Configuring`. The config-phase handlers (`InitialAssignment` /
-    /// `TransferComplete` ingestion) are written against this and are thus
-    /// unrepresentable before the primary announces (in `Connecting` /
-    /// `AwaitingPrimary`).
-    pub(in crate::secondary) fn configuring_mut(&mut self) -> Option<&mut ConfiguringState<M, I>> {
-        match self {
-            SecondaryLifecycle::Configuring(state) => Some(state),
             _ => None,
         }
     }
@@ -876,7 +867,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
 /// only capability available pre-announce (beyond mesh formation, which is
 /// the orthogonal [`MeshFormation`] sub-concern) is emitting the setup
 /// handshake exactly once.
-#[allow(dead_code)]
 impl<M: ManagerEndpoint, I: Identifier> SecondaryLifecycle<M, I> {
     /// One-shot guard for the setup handshake (`send_welcome` /
     /// `send_cert_exchange`). Returns `true` and flips the latch the first
@@ -896,89 +886,15 @@ impl<M: ManagerEndpoint, I: Identifier> SecondaryLifecycle<M, I> {
     }
 }
 
-#[allow(dead_code)]
-impl<M: ManagerEndpoint, I: Identifier> ConfiguringState<M, I> {
-    /// Record the primary's `TransferComplete`. One of the `got_*` config
-    /// signals the `Configuring → Operational` transition gates on; this is
-    /// the WRITE site, the transition is the READ site.
-    pub(in crate::secondary) fn mark_transfer_complete(&mut self) {
-        self.transfer_complete = true;
-    }
-
-    /// Whether the config-completion signal has landed. Read by the
-    /// `Configuring → Operational` transition decision.
-    pub(in crate::secondary) fn is_transfer_complete(&self) -> bool {
-        self.transfer_complete
-    }
-
-    /// Borrow the worker pool. The pool exists ONLY from `Configuring`
-    /// onward — this accessor is the structural reason a pre-`Configuring`
-    /// worker operation cannot be expressed.
-    pub(in crate::secondary) fn pool_mut(&mut self) -> &mut WorkerPool<M, I> {
-        &mut self.pool
-    }
-}
-
-/// Capability invariants that exist ONLY in `Operational`.
+/// The one operational-only capability whose state lives entirely on
+/// [`OperationalState`].
 ///
-/// Election and keepalive are `impl OperationalState` — they read state
-/// (`election`, `primary_last_seen`, `peer_keepalives`, `primary_link`)
-/// that lives only here, so a `run_election_tick` / `send_keepalive`
-/// written against `&mut OperationalState` is physically unreachable
-/// before the lifecycle reaches `Operational`. A `Configuring` secondary
-/// advancing past the short election deadline therefore stays
-/// election-quiet by construction.
-#[allow(dead_code)]
+/// Election and keepalive BEHAVIOUR stays on the coordinator (it needs
+/// coordinator-level `cluster_state`/transport, not just `OperationalState`
+/// data), so there are no election/keepalive methods here — only the
+/// deferred-peer-message queue, which is owned wholly by `OperationalState`
+/// and so is unreachable before the lifecycle reaches `Operational`.
 impl<M: ManagerEndpoint, I: Identifier> OperationalState<M, I> {
-    /// Borrow the worker pool for task dispatch. The `TaskAssignment`
-    /// handler is written against `&mut OperationalState`, so it is
-    /// unrepresentable in any pre-`Operational` variant (none of which
-    /// carry an `OperationalState`).
-    pub(in crate::secondary) fn pool_mut(&mut self) -> &mut WorkerPool<M, I> {
-        &mut self.pool
-    }
-
-    /// Record that a primary-side message was just seen (the canonical
-    /// "primary is alive" signal): refresh `primary_last_seen` and reset
-    /// the [`PrimaryLink`] health window. This is the primary-liveness half
-    /// of the role-tagged keepalive split — distinct from peer-liveness,
-    /// which is recorded into `peer_keepalives`.
-    pub(in crate::secondary) fn record_primary_message(&mut self, now: Instant) {
-        self.primary_last_seen = Some(now);
-        self.primary_link.record_recv_success();
-    }
-
-    /// Record peer-liveness for `peer_id` (peer-keepalive tracking). The
-    /// peer-liveness half of the role-tagged split: a `Secondary`-tagged
-    /// keepalive always lands here, even when its id matches the current
-    /// primary, so a multi-role host is tracked both as the primary and as
-    /// a live peer without collision.
-    pub(in crate::secondary) fn record_peer_keepalive(&mut self, peer_id: String, at: f64) {
-        self.peer_keepalives.insert(peer_id, at);
-    }
-
-    /// The short election deadline horizon — computed from the keepalive
-    /// cadence the caller passes (`keepalive_interval ×
-    /// keepalive_miss_threshold`). It is defined as a method ON
-    /// `OperationalState` precisely so it cannot be evaluated, and thus
-    /// cannot fire, before the lifecycle reaches `Operational`; the long
-    /// `unconfigured_deadline` is the only horizon that governs the
-    /// pre-`Operational` span.
-    pub(in crate::secondary) fn election_deadline(
-        &self,
-        keepalive_interval: std::time::Duration,
-        keepalive_miss_threshold: u32,
-    ) -> std::time::Duration {
-        keepalive_interval * keepalive_miss_threshold
-    }
-
-    /// Whether the failover election is in its quiescent `Normal` state.
-    /// Election ticks only advance from here; this is the entry predicate
-    /// the operational tick consults.
-    pub(in crate::secondary) fn election_is_normal(&self) -> bool {
-        self.election.is_normal()
-    }
-
     /// Take the queued deferred peer messages, leaving the field empty.
     /// Flushed onto the transport at the top of each operational loop
     /// iteration — a capability that exists only here because the queue
@@ -987,27 +903,5 @@ impl<M: ManagerEndpoint, I: Identifier> OperationalState<M, I> {
         &mut self,
     ) -> Vec<(String, DistributedMessage<I>)> {
         std::mem::take(&mut self.pending_peer_messages)
-    }
-
-    /// The local-build half of one election tick: advance the failover
-    /// state machine and collect the peer messages to flush, with NO
-    /// transport contact. This is the part of `run_election_tick` that
-    /// reads/writes only `OperationalState`-resident data (`election`,
-    /// `peer_keepalives`, `primary_last_seen`, `primary_link`). It lives on
-    /// `impl OperationalState` — and so is unreachable before the lifecycle
-    /// is `Operational` — exactly as the plan requires of `run_election_tick`.
-    ///
-    /// The transport-coupled remainder (resolving destinations, actually
-    /// sending the returned [`ElectionTickActions`]) couples to the
-    /// coordinator's `Tr` and is owned by the wiring leaf (D-#124, which
-    /// owns `coordinator.rs`); this additive leaf does not touch it. Today
-    /// the failover decision logic still lives on the coordinator, so this
-    /// method returns the empty action set — the wiring leaf relocates the
-    /// decision body here when it migrates `election/coordinator.rs`.
-    pub(in crate::secondary) fn collect_election_actions(&mut self) -> ElectionTickActions<I> {
-        // Decision body relocated by the wiring leaf (D-#124). Until then
-        // an Operational tick produces no election traffic — the same
-        // election-quiet default the `Normal` state has always had.
-        ElectionTickActions::default()
     }
 }

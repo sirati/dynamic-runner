@@ -190,8 +190,13 @@ async fn observer_exits_only_on_run_complete() {
                 .await
                 .expect("observer run loop must not Err");
             assert!(
-                matches!(outcome, RunOutcome::Done),
-                "observer exits Done on run_complete(); got {outcome:?}"
+                matches!(outcome, RunOutcome::Terminal),
+                "observer exits via a terminal on run_complete(); got {outcome:?}"
+            );
+            assert!(
+                matches!(sec.terminal(), Some(SecondaryTerminal::Done)),
+                "observer's per-secondary terminal is Done on run_complete(); got {:?}",
+                sec.terminal(),
             );
             // Even across the full run, the observer originated nothing.
             assert!(

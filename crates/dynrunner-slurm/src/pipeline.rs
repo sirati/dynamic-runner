@@ -188,12 +188,12 @@ pub trait CleanupSteps: Send + 'static {
 /// `max(60, num_secondaries * 15)` that the SLURM pipeline applies
 /// when the operator did not pass `--slurm-setup-deadline-secs`.
 ///
-/// Why a scale-aware default at all: the secondary's setup phase
-/// (welcome + cert exchange + wait-for-setup) is bounded by
-/// `SecondaryConfig.setup_deadline`. The primary today waits for ALL
+/// Why a scale-aware default at all: the secondary's pre-`Operational`
+/// span (welcome + cert exchange + wait-for-setup) is bounded by
+/// `SecondaryConfig.unconfigured_deadline`. The primary today waits for ALL
 /// secondaries to connect before broadcasting the setup-bootstrap;
 /// when a slow cluster takes >60s to schedule + boot every node, the
-/// first-arriving secondaries hit the (default 60s) deadline and
+/// first-arriving secondaries hit the deadline and
 /// cold-exit BEFORE the late ones have connected, by which point the
 /// primary's broadcast lands on closed channels and the cluster
 /// collapses with `channel closed`. The architectural fix (primary
