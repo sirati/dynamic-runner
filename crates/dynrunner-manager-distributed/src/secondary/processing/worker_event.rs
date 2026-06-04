@@ -397,9 +397,10 @@ where
             }
             WorkerEvent::Ready { worker_id } => {
                 // Reclaim the protocol state from the background
-                // `wait_ready` watcher task that
-                // `WorkerPool::ensure_worker_for_type_async` spawned
-                // when it issued the type-shift respawn. The
+                // `wait_ready` watcher task that either
+                // `WorkerPool::ensure_worker_for_type_async` (type-shift
+                // respawn) or `restart_worker_async` (worker restart)
+                // spawned. The
                 // watcher already wrote the Ready event (this
                 // arm) to the channel before returning the new
                 // `RunnerProtocolState::Idle`; `reclaim_protocol`
