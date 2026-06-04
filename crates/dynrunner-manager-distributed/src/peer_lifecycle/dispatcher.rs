@@ -201,7 +201,7 @@ mod tests {
         .unwrap();
         tx.send(PeerLifecycleEvent::Removed {
             id: "peer-a".into(),
-            cause: RemovalCause::MassDeathEscalation,
+            cause: RemovalCause::KeepaliveMiss,
         })
         .unwrap();
 

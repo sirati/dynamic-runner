@@ -104,8 +104,6 @@ impl PyDistributedManager {
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
-        let dist_mass_death_grace = self.distributed_config.mass_death_grace();
-        let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
         let dist_primary_link_failure_threshold =
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
@@ -582,8 +580,6 @@ impl PyDistributedManager {
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
-                    mass_death_grace: dist_mass_death_grace,
-                    mass_death_min_count: dist_mass_death_min_count,
                     // Threaded into PrimaryConfig so the manager's
                     // run() has the local source root needed for the
                     // initial staging walk's content-hash + per-
@@ -606,6 +602,9 @@ impl PyDistributedManager {
                     // single source of truth for the inner loop.
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // Staged silence schedule: keepalive-interval-relative
+                    // defaults (not surfaced on the Python config today).
+                    ..PrimaryConfig::default()
                 };
 
                 let mut primary = PrimaryCoordinator::new(

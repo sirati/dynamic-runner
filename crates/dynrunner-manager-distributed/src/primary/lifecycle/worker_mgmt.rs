@@ -74,7 +74,42 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // `.ok()` swallows the transient so the reaction can't abort
             // the loop.
             self.dispatch_to_idle_workers(true).await.ok();
+            // Lazy on-demand dead-secondary requeue. AFTER the dispatch
+            // pass returns (NEVER inside the per-worker loop:
+            // `requeue_dead_secondary` runs `self.workers.retain(..)`,
+            // which would invalidate the `dispatch_order` indices the loop
+            // iterates — a use-after-free hazard). If the pass left an idle
+            // worker with nothing to dispatch and the only remaining work
+            // is in-flight on silent secondaries, declare those holders
+            // dead so their tasks return to the pool. The declaration
+            // re-emits `TasksAdded` (inside `requeue_dead_secondary`),
+            // which the NEXT loop iteration drains and re-dispatches — bus,
+            // not synchronous recursion. Consulted as the two boundary
+            // methods only; dispatch never learns the silence policy.
+            self.maybe_requeue_silent_held_work().await;
         }
+    }
+
+    /// The dispatch-altitude consult of the starvation oracle + command.
+    /// Single concern: translate "only silent-held work remains" into a
+    /// dead-secondary declaration. Pure consumer of the liveness module's
+    /// two boundary methods — it neither computes the silent set nor
+    /// touches the worker-management bus (the wrapped
+    /// `requeue_dead_secondary` re-nudges `TasksAdded`).
+    async fn maybe_requeue_silent_held_work(&mut self) {
+        if !self.only_silent_held_work_remains() {
+            return;
+        }
+        let dead = self.silent_held_dead_declarations();
+        // Reuse the keepalive-miss cause: a silent secondary whose only
+        // remaining role is sitting on un-dispatchable in-flight work is a
+        // missed-keepalive outage by the consumer-facing semantic.
+        self.declare_silent_secondaries_dead(
+            dead,
+            dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+        )
+        .await
+        .ok();
     }
 
     /// Liveness check for a started phase that needs workers. The phase

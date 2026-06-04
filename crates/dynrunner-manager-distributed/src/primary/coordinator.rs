@@ -26,26 +26,6 @@ use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
 use crate::worker_signal::WorkerMgmtSignal;
 
-/// Per-secondary state for a deferred mass-death event. Recorded
-/// when a correlated mass-death is detected; each subsequent
-/// heartbeat tick consults it to decide whether the secondary has
-/// recovered (its keepalive timestamp advanced past the
-/// defer-moment one) or the grace window has expired (escalate to
-/// actual death). See `PrimaryConfig.mass_death_grace`.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingMassDeath {
-    /// Wall-clock instant when we deferred this secondary. Compared
-    /// against `mass_death_grace` to decide whether grace has
-    /// expired without recovery.
-    pub(super) deferred_at: Instant,
-    /// The secondary's `last_keepalive` value at the moment we
-    /// deferred. The recovery test is "current keepalive
-    /// timestamp > this value" — recovered means a new keepalive
-    /// arrived AFTER we deferred, not just that the old one is
-    /// still around.
-    pub(super) last_keepalive_at_defer: Instant,
-}
-
 /// The single-task lifecycle typestate of a remote worker slot.
 ///
 /// Replaces the removed `(current_task: Option<TaskInfo>, is_idle:
@@ -351,6 +331,16 @@ pub struct PrimaryCoordinator<
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
 
+    /// Per-secondary count of staged silence WARN stages already logged
+    /// for the secondary's CURRENT silence streak. Owned by the liveness
+    /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
+    /// each WARN stage at most once, and clears the entry on keepalive
+    /// recovery, welcome, and requeue so a fresh streak re-warns from the
+    /// first stage. Absent entry == zero stages warned. Private to the
+    /// liveness concern: dispatch never reads it (the silent-id set is the
+    /// only liveness fact dispatch consumes, via the two boundary methods).
+    pub(super) silence_warn_stage: HashMap<String, usize>,
+
     /// Per-secondary backoff timestamps. When a secondary returns
     /// "No idle worker available" Recoverable (its dispatch.rs
     /// `is_idle_state()` check found every worker non-idle —
@@ -383,17 +373,6 @@ pub struct PrimaryCoordinator<
     /// nowhere. Recorded by `handle_mesh_ready`; consumed by
     /// `wait_for_mesh_ready`.
     pub(super) mesh_ready_secondaries: HashSet<String>,
-
-    /// Secondaries currently in mass-death deferred state. Populated
-    /// by the heartbeat tick when a correlated mass-death event is
-    /// detected (every connected secondary appears dead at the
-    /// same tick). Each entry's value records the moment we
-    /// deferred plus the keepalive timestamp seen at that moment;
-    /// each subsequent tick checks whether the live keepalive has
-    /// advanced past the defer-time keepalive (= secondary
-    /// recovered) or the `mass_death_grace` window has elapsed
-    /// (= escalate to actual death via `requeue_dead_secondary`).
-    pub(super) pending_mass_death: HashMap<String, PendingMassDeath>,
 
     // primary promotion
     pub(super) primary_id: Option<String>,
@@ -834,10 +813,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             on_phase_end: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
+            silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
-            pending_mass_death: HashMap::new(),
             primary_id: None,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
@@ -1742,6 +1721,76 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         requeue_mutations
     }
 
+    /// Starvation oracle for the lazy on-demand dead-secondary requeue.
+    /// True IFF the ONLY outstanding work is in-flight on silent
+    /// secondaries — i.e. an idle worker has nothing it could dispatch,
+    /// and the only reason the run isn't done is that silent holders are
+    /// sitting on inherited/dispatched in-flight tasks.
+    ///
+    /// Composed of single-concern reads — no liveness/dispatch policy
+    /// `if`-hacks:
+    ///   1. `∃ silent secondary` — the liveness module's silent-id set
+    ///      ([`Self::silent_secondary_ids`]); empty ⇒ false.
+    ///   2. `no queued dispatchable work for active phases` —
+    ///      [`PendingPool::has_queued_dispatchable`]. (`is_empty()`/`len()`
+    ///      are NOT usable: they fold in-flight + blocked, so they would be
+    ///      false/`>0` precisely when silent in-flight work exists.)
+    ///   3. `blocked == 0` — [`PendingPool::blocked_len`]. A blocked item
+    ///      will become dispatchable once its prereq resolves, so evicting
+    ///      a holder now would be premature.
+    ///   4. `in_flight non-empty` — there is something to recover (and the
+    ///      guard against evicting a healthy secondary near run completion,
+    ///      paired with blocked==0).
+    ///   5. `every in_flight entry's secondary is silent` — so a non-silent
+    ///      secondary making progress is never evicted; if any in-flight
+    ///      task is held by a live secondary, the run is still advancing.
+    ///
+    /// The boundary the dispatch consumer sees is this predicate plus
+    /// [`Self::declare_silent_secondaries_dead`]; it never learns how
+    /// "silent" or "dispatchable" are computed.
+    pub(super) fn only_silent_held_work_remains(&self) -> bool {
+        let silent = self.silent_secondary_ids();
+        if silent.is_empty() {
+            return false;
+        }
+        if self.pool().has_queued_dispatchable() {
+            return false;
+        }
+        if self.pool().blocked_len() != 0 {
+            return false;
+        }
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        self.in_flight
+            .values()
+            .all(|e| silent.contains(&e.secondary_id))
+    }
+
+    /// The silent secondaries currently holding the only remaining work,
+    /// packaged as [`DeadSecondary`] declarations for
+    /// [`Self::declare_silent_secondaries_dead`]. Pairs with
+    /// [`Self::only_silent_held_work_remains`]: the oracle gates whether to
+    /// declare; this enumerates WHOM, reusing the liveness silent-id set
+    /// and the recorded keepalive timestamps.
+    pub(super) fn silent_held_dead_declarations(&self) -> Vec<super::heartbeat::DeadSecondary> {
+        let now = Instant::now();
+        self.silent_secondary_ids()
+            .into_iter()
+            .map(|id| {
+                let last_keepalive = self
+                    .secondary_keepalives
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(now);
+                super::heartbeat::DeadSecondary {
+                    secondary_id: id,
+                    last_keepalive,
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn cap_filter_view(
         &self,
         view: dynrunner_scheduler_api::WorkerView<I>,
@@ -2025,6 +2074,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     #[cfg(test)]
     pub fn alive_worker_count_for_test(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Test-only inspector for the per-secondary staged-WARN counter
+    /// (number of WARN stages already logged this silence streak). `None`
+    /// when no stage has fired (or the streak was reset). Used by the
+    /// fire-once / reset-on-recovery policy test.
+    #[cfg(test)]
+    pub fn silence_warn_stage_for_test(&self, secondary_id: &str) -> Option<usize> {
+        self.silence_warn_stage.get(secondary_id).copied()
     }
 
     /// Test-only length of the hash-keyed in-flight ledger. Replaces

@@ -38,8 +38,7 @@ pub(super) const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
 /// haven't accrued — covers slow-tick configurations where the
 /// keepalive interval is long enough that 5 probes would exceed the
 /// SLURM time budget). Thirty seconds is the SSH ControlMaster
-/// reconnect window plus slack — see `mass_death_grace_secs` in
-/// pyo3 config for the parallel choice on the primary side.
+/// reconnect window plus slack.
 pub(super) const DEFAULT_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Default patient backstop for `SecondaryConfig::primary_silence_backstop`

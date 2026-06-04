@@ -825,10 +825,15 @@ async fn promoted_primary_detects_dead_secondary_and_requeues_inherited_inflight
         .run_until(async {
             let (transport, mut ends) = setup_test(1);
             // Short keepalive deadline so the test crosses it with a brief
-            // real sleep; everything else is the production default.
+            // real sleep; everything else is the production default. The
+            // staged silence schedule is shrunk to keepalive-interval-
+            // relative tiny multiples (HARD backstop at 2x = 100ms) so the
+            // 200ms sleep below trips the hard declaration.
             let config = PrimaryConfig {
                 keepalive_interval: Duration::from_millis(50),
                 keepalive_miss_threshold: 2,
+                silence_warn_multiples: vec![1],
+                silence_hard_multiple: 2,
                 ..PrimaryConfig::default()
             };
             let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(

@@ -191,6 +191,30 @@ impl<I: Identifier> PendingPool<I> {
             .collect()
     }
 
+    /// True iff at least one QUEUED item sits in a bucket whose phase is
+    /// currently `Active` — i.e. there is dispatchable work an idle worker
+    /// could be assigned right now.
+    ///
+    /// Distinct from `is_empty()` / `len()`, which fold in-flight and
+    /// blocked items (so they stay `false`/`>0` whenever any task is still
+    /// outstanding, even if every remaining task is in-flight on a silent
+    /// secondary or blocked on an unresolved prereq). This predicate reads
+    /// ONLY the queued, dispatchable portion, reusing `active_phases()` for
+    /// the dispatchable-phase set — the same `Active` gate the dispatch
+    /// view (`view_for_worker`) applies for its non-pin classes.
+    ///
+    /// Single concern: a queued-side dispatchability read. Callers that
+    /// must distinguish "nothing left to hand out" from "everything left is
+    /// in-flight/blocked" (the starvation oracle) compose this with their
+    /// own in-flight/blocked reads.
+    pub fn has_queued_dispatchable(&self) -> bool {
+        let active: std::collections::HashSet<PhaseId> =
+            self.active_phases().into_iter().collect();
+        self.buckets
+            .iter()
+            .any(|(key, bucket)| !bucket.items.is_empty() && active.contains(&key.0))
+    }
+
     /// State of one phase. Useful for tests and diagnostic logging.
     pub fn phase_state(&self, phase_id: &PhaseId) -> Option<PhaseState> {
         self.phase_state.get(phase_id).copied()
@@ -199,5 +223,15 @@ impl<I: Identifier> PendingPool<I> {
     /// Number of in-flight items for a phase. Useful for tests.
     pub fn in_flight(&self, phase_id: &PhaseId) -> u32 {
         self.in_flight_per_phase.get(phase_id).copied().unwrap_or(0)
+    }
+
+    /// Total items currently `blocked` (waiting on an unresolved
+    /// task-level prereq), across all phases. These are neither queued
+    /// nor in-flight; a caller deciding whether the only outstanding work
+    /// is in-flight on silent secondaries must confirm none are blocked
+    /// (a blocked item will become dispatchable once its prereq resolves,
+    /// so evicting a holder would be premature).
+    pub fn blocked_len(&self) -> usize {
+        self.blocked.len()
     }
 }

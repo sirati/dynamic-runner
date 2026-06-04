@@ -186,7 +186,6 @@ async fn e2e_primary_secondary_over_wss() {
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
-                mass_death_grace: std::time::Duration::ZERO,
                 ..PrimaryConfig::default()
             };
 
@@ -333,7 +332,6 @@ async fn e2e_primary_secondary_over_quic() {
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
-                mass_death_grace: std::time::Duration::ZERO,
                 ..PrimaryConfig::default()
             };
 

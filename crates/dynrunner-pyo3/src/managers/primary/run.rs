@@ -29,8 +29,6 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
-        let dist_mass_death_grace = self.distributed_config.mass_death_grace();
-        let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
         let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
@@ -342,8 +340,6 @@ impl PyPrimaryCoordinator {
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
-                    mass_death_grace: dist_mass_death_grace,
-                    mass_death_min_count: dist_mass_death_min_count,
                     // Threaded from the constructor's `source_dir`
                     // kwarg so the inner coordinator owns a local
                     // root for the initial staging walk's
@@ -357,6 +353,9 @@ impl PyPrimaryCoordinator {
                     source_dir,
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // Staged silence schedule: keepalive-interval-relative
+                    // defaults (not surfaced on the Python config today).
+                    ..PrimaryConfig::default()
                 };
 
                 // The mesh listener (held in `_mesh_server_guard` above)

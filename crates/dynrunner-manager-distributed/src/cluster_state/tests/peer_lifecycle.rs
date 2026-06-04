@@ -109,7 +109,7 @@ fn peer_removed_is_sticky() {
     assert_eq!(
         s.apply(ClusterMutation::PeerRemoved {
             id: "p1".into(),
-            cause: RemovalCause::MassDeathEscalation,
+            cause: RemovalCause::KeepaliveMiss,
         }),
         ApplyOutcome::NoOp
     );

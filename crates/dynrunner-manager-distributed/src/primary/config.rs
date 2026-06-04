@@ -29,6 +29,34 @@ pub struct PrimaryConfig {
     pub keepalive_interval: Duration,
     /// Number of missed keepalives that constitute a death (default 3).
     pub keepalive_miss_threshold: u32,
+    /// Staged silence-escalation thresholds for the honest dead-secondary
+    /// declaration policy, expressed as multiples of `keepalive_interval`
+    /// so the single cadence knob stays the only timing authority (and a
+    /// test can drive sub-second stages by shrinking the interval).
+    ///
+    /// Each entry is a WARN stage: the first time a secondary's continuous
+    /// silence crosses `multiple × keepalive_interval`, the heartbeat tick
+    /// logs once at that stage and never re-warns for it. The entries are
+    /// strictly ascending and all strictly below
+    /// [`Self::silence_hard_multiple`]. WARN stages are LOG-ONLY — they do
+    /// not declare a secondary dead.
+    ///
+    /// Default `[4, 12, 18]` ≈ `20s / 1m / 1m30` at the 5s default
+    /// interval.
+    pub silence_warn_multiples: Vec<u32>,
+    /// The HARD declaration backstop, as a multiple of `keepalive_interval`
+    /// and the last entry of the staged silence schedule. Once a
+    /// secondary's continuous silence crosses
+    /// `silence_hard_multiple × keepalive_interval`, the heartbeat tick
+    /// declares it dead and requeues its in-flight tasks REGARDLESS of
+    /// dispatch state. The backstop is REQUIRED: a purely starvation-driven
+    /// declaration would never empty `secondaries`, so the fleet-dead arm
+    /// would never arm and a fully-silent fleet would hang forever.
+    ///
+    /// Default `24` ≈ `2m` at the 5s default interval — the same order of
+    /// magnitude as the secondary-side `primary_silence_backstop` (the
+    /// symmetric primary-death detection on the secondary side).
+    pub silence_hard_multiple: u32,
     /// Pre-staged source mode (`--source-already-staged`): when set,
     /// the data is bind-mounted into each secondary container at
     /// `src_network` from this gateway-side host path. No
@@ -173,44 +201,6 @@ pub struct PrimaryConfig {
     /// dispatch).
     pub mesh_ready_timeout: Duration,
 
-    /// Mass-death grace window: when ALL currently-connected
-    /// secondaries appear in the dead list at the same heartbeat
-    /// tick (and there are at least `mass_death_min_count` of them),
-    /// infer a *correlated* cause — gateway-side SSH tunnel
-    /// collapse, network partition, or similar single-point-of-
-    /// failure — rather than per-secondary failures, and DEFER the
-    /// requeue for this duration to give the network a chance to
-    /// recover. Secondaries whose keepalives resume during the
-    /// grace are silently un-deferred (the fleet is back). Only
-    /// after the grace expires without recovery do we fall through
-    /// to the standard `requeue_dead_secondary` death sequence.
-    ///
-    /// Without this, a transient ~15-30s SSH tunnel blip causes the
-    /// primary to declare every secondary dead, requeue every in-
-    /// flight task (often hundreds), exhaust the retry budget on
-    /// the next pass (the secondaries reconnect in time but the
-    /// damage is done), and surface the entire wave as
-    /// `permanent_failures` — observed in tokenizer's cohort-5 z3
-    /// dispatch where 197 in-flight tasks were lost to a 15-second
-    /// tunnel hiccup despite the secondaries themselves being
-    /// healthy.
-    ///
-    /// Set to `Duration::ZERO` to disable (revert to legacy
-    /// behaviour where every dead secondary is requeued
-    /// immediately, regardless of correlation). Default `60s` —
-    /// covers the typical SSH ControlMaster reconnect window
-    /// (`ServerAliveInterval=30` × 2) plus slack.
-    pub mass_death_grace: Duration,
-
-    /// Minimum number of simultaneous deaths required to trigger
-    /// mass-death detection. Single-secondary runs and small
-    /// fleets shouldn't bias toward "treat as correlated" — the
-    /// signal is meaningful only when several secondaries are
-    /// affected at once. A run with `< mass_death_min_count`
-    /// connected secondaries always falls through to the standard
-    /// per-secondary requeue path. Default `2`.
-    pub mass_death_min_count: u32,
-
     /// Local source-tree root the primary uses to read file
     /// contents for the initial staging walk (content-hash + per-
     /// secondary StageFile fan-out). Threaded by every pyo3-side
@@ -299,6 +289,11 @@ impl Default for PrimaryConfig {
             peer_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
+            // ≈20s / 1m / 1m30 WARN stages, ≈2m HARD backstop at the 5s
+            // default interval. The hard backstop mirrors the secondary-
+            // side `primary_silence_backstop` order of magnitude.
+            silence_warn_multiples: vec![4, 12, 18],
+            silence_hard_multiple: 24,
             source_pre_staged_root: None,
             uses_file_based_items: true,
             required_setup_on_promote: false,
@@ -310,8 +305,6 @@ impl Default for PrimaryConfig {
             oom_retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
             mesh_ready_timeout: Duration::from_secs(60),
-            mass_death_grace: Duration::from_secs(60),
-            mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: Duration::from_secs(600),

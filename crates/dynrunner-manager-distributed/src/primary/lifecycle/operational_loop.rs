@@ -515,14 +515,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 }
                 _ = heartbeat_tick.tick() => {
                     self.broadcast_primary_keepalive().await;
-                    // `process_heartbeat_tick` runs the per-tick
-                    // mass-death-aware death evaluator: resolve any
-                    // already-deferred secondaries (recovery or grace
-                    // expiry), then categorise newly-dead ones as
-                    // either correlated (defer) or independent
-                    // (requeue). See `process_heartbeat_tick` for
-                    // detail and `PrimaryConfig.mass_death_grace` for
-                    // the disable knob.
+                    // `process_heartbeat_tick` collects the per-tick
+                    // death report and hands it to the dead-secondary
+                    // declaration/requeue policy. See
+                    // `process_heartbeat_tick` for detail.
                     self.process_heartbeat_tick().await?;
                 }
                 req = async {
