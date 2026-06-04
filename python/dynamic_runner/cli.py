@@ -451,6 +451,22 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unconfigured-deadline-secs",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Maximum wall-clock (seconds) a secondary spends NOT-YET-CONFIGURED "
+            "— in the pre-Operational lifecycle states (AwaitingPrimary + "
+            "Configuring), before the primary has announced itself and driven "
+            "this secondary to Operational. Default 600 (10 minutes). Raise this "
+            "for large/slow clusters where the authority's discover_items walk "
+            "is genuinely slow; a secondary that does not reach Operational "
+            "within this window gives up and exits. Unset leaves the framework "
+            "default."
+        ),
+    )
+    parser.add_argument(
         "--unfulfillable-reinject-max-per-task",
         type=int,
         default=None,
