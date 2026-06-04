@@ -635,14 +635,21 @@ where
             // poll_loop was running, so no Disconnected event
             // arrived; the dispatch attempt itself saw the dead
             // pipe). The two sources are unioned so duplicates are
-            // harmless: `restart_worker` first stops the slot,
+            // harmless: `restart_worker_async` first stops the slot,
             // which is a no-op on an already-stopped one.
             //
-            // Per Bug B's contract (worker process is restarted on
-            // the next assignment after NonRecoverableError), the
-            // respawn happens here, BEFORE `request_task_for_worker`
-            // re-engages the fresh subprocess with the primary's
-            // pool.
+            // NON-BLOCKING respawn: `restart_worker_async` pushes the
+            // wait-for-Ready into a background watcher and returns
+            // immediately, leaving the slot `Transitioning`. The
+            // operational loop's `WorkerEvent::Ready` arm reclaims the
+            // slot and re-issues its `TaskRequest` once the new
+            // subprocess reports `Response::Ready`. Using the inline-wait
+            // `restart_worker` here held the whole `select!` open for the
+            // entire slow-worker startup window — no keepalives fired —
+            // so a busy-but-alive secondary was falsely declared dead by
+            // the primary (the keepalive-starvation wedge). The repoll
+            // therefore rides the Ready arm, NOT a post-restart call here
+            // (the slot is not yet assignable when this returns).
             let mut restart_set: HashSet<WorkerId> = workers_to_restart.into_iter().collect();
             restart_set.extend(self.op_mut().pending_worker_restarts.drain());
             for wid in restart_set {
@@ -660,11 +667,10 @@ where
                 // replaced, so the worker doesn't get a chance
                 // to react.
                 self.op_mut().pool.workers[wid as usize].kill_subprocess();
-                if let Err(e) = self.op_mut().pool.restart_worker(wid, factory, false).await {
+                if let Err(e) = self.op_mut().pool.restart_worker_async(wid, factory, false).await {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }
-                let _ = self.request_task_for_worker(wid).await;
             }
         }
 

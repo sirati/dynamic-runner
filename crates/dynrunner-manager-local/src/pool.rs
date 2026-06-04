@@ -252,6 +252,109 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
     ) -> Result<(), String> {
+        self.replace_worker_slot(worker_id, factory, print_pid, "restart")
+            .await?;
+
+        // Wait for ready INLINE. This blocks the calling task until the
+        // freshly-respawned worker reports `Response::Ready`. Used only
+        // by callers that own their own follow-up sequencing and are NOT
+        // driving a `select!`-shaped operational loop — the in-process
+        // [`crate::manager::LocalManager`] pipeline, which dispatches the
+        // next task immediately after this returns. A `select!`-driven
+        // caller (the distributed secondary) MUST use
+        // [`Self::restart_worker_async`], which pushes the wait into a
+        // background watcher so the operational loop's other arms
+        // (keepalive, peer messages, OOM ticks) keep running while a slow
+        // subprocess starts.
+        loop {
+            if self.workers[worker_id as usize].is_ready() {
+                break;
+            }
+            self.workers[worker_id as usize].poll_ready().await;
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(worker_id, "worker restarted and ready");
+        Ok(())
+    }
+
+    /// Restart a single worker **without blocking the calling task on
+    /// the freshly-respawned worker's Ready**.
+    ///
+    /// Same kill + spawn + budget-preservation sequence as
+    /// [`Self::restart_worker`], but instead of the inline wait-for-Ready
+    /// loop it spawns a background `wait_ready` watcher that emits the
+    /// [`crate::worker::WorkerEvent::Ready`] event through the pool's
+    /// shared event channel once the new subprocess reports
+    /// `Response::Ready`. The slot is left in `Transitioning`
+    /// (`is_idle_state()` / `is_ready()` both false) until that event
+    /// lands, so the operational loop's `WorkerEvent::Ready` arm
+    /// reclaims the protocol state and re-engages the slot.
+    ///
+    /// # Wedge prevention (production-bug pin)
+    ///
+    /// The inline-wait [`Self::restart_worker`], when called from inside
+    /// the secondary's `select!`-driven operational loop, held the whole
+    /// `select!` open for the entire duration a slow worker subprocess
+    /// took to send `Response::Ready` — no keepalive ticks, no router
+    /// events, no OOM ticks fired for that window. In production a
+    /// `WorkerEvent::Disconnected` at a singleton-typed phase boundary
+    /// (a slow build worker that never reached Ready) drove the
+    /// operational restart loop into this wait; the new subprocess took
+    /// far longer than the keepalive interval to start, so the primary
+    /// observed a keepalive gap and declared the busy-but-alive secondary
+    /// dead. The async variant is the SAME fix shape
+    /// `ensure_worker_for_type_async` applied to the type-shift dispatch
+    /// path: the wait rides a background task, the operational loop keeps
+    /// its keepalive cadence.
+    ///
+    /// Preserves `reserved_budgets` and `assignment_failure_count` across
+    /// the respawn — same contract as [`Self::restart_worker`].
+    pub async fn restart_worker_async(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+    ) -> Result<(), String> {
+        self.replace_worker_slot(worker_id, factory, print_pid, "restart (async)")
+            .await?;
+
+        // Push the wait-for-Ready into a background task; it emits
+        // `WorkerEvent::Ready` (or `Disconnected`) on the pool's shared
+        // event channel. The slot stays `Transitioning` until the
+        // operational loop's Ready arm reclaims it. Failure here
+        // ("not in WaitingForReady") is a programmer error —
+        // `replace_worker_slot` installed a freshly-`WorkerHandle::new`-d
+        // handle one statement ago — but we propagate it rather than
+        // panic so the caller can surface a clean failure.
+        self.workers[worker_id as usize].spawn_ready_watcher()?;
+
+        tracing::info!(
+            worker_id,
+            "worker respawned; wait_ready running in background"
+        );
+        Ok(())
+    }
+
+    /// Shared kill + spawn + budget-preservation core for the two
+    /// worker-restart entry points ([`Self::restart_worker`] inline-wait,
+    /// [`Self::restart_worker_async`] background-watcher). Stops the old
+    /// subprocess, aborts its orphan poll task, recreates the per-worker
+    /// cgroup leaf, respawns the SAME `loaded_type_id` (so the argv keeps
+    /// matching), and installs a fresh `WorkerHandle` in
+    /// `WaitingForReady` carrying the preserved budgets + failure count.
+    /// Returns with the slot ready for the caller's chosen wait strategy;
+    /// it does NOT wait for `Response::Ready`.
+    ///
+    /// `label` only flavours the PID log line so the two callers stay
+    /// distinguishable in operator logs.
+    async fn replace_worker_slot(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+        label: &str,
+    ) -> Result<(), String> {
         let old = &mut self.workers[worker_id as usize];
         if !old.is_stopped() {
             old.stop().await;
@@ -292,7 +395,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
                 .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?,
         };
         if print_pid && let Some(pid) = pid {
-            tracing::info!(worker_id, pid, "worker PID (restart)");
+            tracing::info!(worker_id, pid, label, "worker PID ({label})");
         }
 
         let reserved_budgets = self.workers[worker_id as usize].reserved_budgets.clone();
@@ -305,17 +408,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.assignment_failure_count = failure_count;
         handle.loaded_type_id = preserved_type;
         self.workers[worker_id as usize] = handle;
-
-        // Wait for ready
-        loop {
-            if self.workers[worker_id as usize].is_ready() {
-                break;
-            }
-            self.workers[worker_id as usize].poll_ready().await;
-            tokio::task::yield_now().await;
-        }
-
-        tracing::info!(worker_id, "worker restarted and ready");
         Ok(())
     }
 
@@ -1065,6 +1157,168 @@ mod orphan_poll_task_tests {
                 // Avoid an unused-import warning in case the only
                 // ErrorType ref above is conditional.
                 let _ = ErrorType::Recoverable;
+            })
+            .await;
+    }
+
+    /// Fake worker that delays its `Response::Ready` by `ready_delay`
+    /// to mimic a slow subprocess startup (the production "build worker
+    /// whose archive-import prelude takes >> the keepalive interval").
+    /// After Ready it serves `ProcessTask` immediately so the test never
+    /// has to wait twice.
+    fn spawn_slow_ready_worker(
+        ready_delay: std::time::Duration,
+    ) -> impl FnMut(WorkerId) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        move |_worker_id| {
+            let (manager_end, runner_end) = channel_pair();
+            tokio::task::spawn_local(async move {
+                let mut runner: ChannelRunnerEnd = runner_end;
+                tokio::time::sleep(ready_delay).await;
+                let _ = runner.send(Response::Ready).await;
+                loop {
+                    match MessageReceiver::<Command>::recv(&mut runner).await {
+                        Some(Command::Stop) => break,
+                        Some(Command::ProcessTask { .. }) => {
+                            let _ = runner.send(Response::Done { result_data: None }).await;
+                        }
+                        None => break,
+                    }
+                }
+            });
+            Ok((manager_end, None))
+        }
+    }
+
+    struct SlowReadyFactory {
+        ready_delay: std::time::Duration,
+    }
+
+    impl WorkerFactory<ChannelManagerEnd> for SlowReadyFactory {
+        fn spawn_worker(
+            &mut self,
+            worker_id: WorkerId,
+            _subcgroup: Option<&SubcgroupHandle>,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            spawn_slow_ready_worker(self.ready_delay)(worker_id)
+        }
+        fn spawn_worker_for_type(
+            &mut self,
+            worker_id: WorkerId,
+            _type_id: &dynrunner_core::TypeId,
+            subcgroup: Option<&SubcgroupHandle>,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            self.spawn_worker(worker_id, subcgroup)
+        }
+    }
+
+    /// Regression pin (keepalive-starvation wedge): when a worker is
+    /// restarted on the secondary's operational `select!` loop and the
+    /// replacement subprocess is SLOW to report `Response::Ready`,
+    /// [`WorkerPool::restart_worker_async`] MUST return WITHOUT waiting
+    /// for that Ready — the wait rides a background watcher that later
+    /// emits `WorkerEvent::Ready` on the pool's event channel.
+    ///
+    /// The inline-wait [`WorkerPool::restart_worker`] used to block the
+    /// calling task here for the entire slow-startup window. Inside the
+    /// secondary's `select!`, that held EVERY other arm open — the
+    /// keepalive tick included — so the primary saw a keepalive gap and
+    /// declared the busy-but-alive secondary dead. This test pins the
+    /// non-blocking contract two ways:
+    ///
+    ///   1. `restart_worker_async` returns well before the worker's
+    ///      `ready_delay` elapses (the calling task is not blocked).
+    ///   2. A CONCURRENT ticker `spawn_local`ed alongside the restart
+    ///      keeps making progress while the watcher awaits Ready — the
+    ///      runtime is cooperatively scheduled, exactly the property the
+    ///      keepalive arm needs. (With the old inline wait the
+    ///      `restart_worker(...).await` would not yield until Ready, and
+    ///      the assertion-after-await would observe a starved ticker.)
+    ///
+    /// Pre-fix (`restart_worker_async` calling the inline `poll_ready`
+    /// loop instead of `spawn_ready_watcher`) the first assertion fails:
+    /// the call would not return until `ready_delay` elapsed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_worker_async_does_not_block_on_slow_ready() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+                let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+
+                // Worker startup is far longer than any keepalive-cadence
+                // tick a real secondary would run (5s in prod; here we use
+                // 600ms so the test stays fast while the gap is
+                // unambiguous against the 50ms cadence asserted below).
+                let ready_delay = std::time::Duration::from_millis(600);
+                let mut factory = SlowReadyFactory { ready_delay };
+
+                let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+                pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                    .await
+                    .expect("pool init");
+
+                // A concurrent ticker stands in for the keepalive arm:
+                // it must keep firing while the restart's watcher awaits
+                // the slow worker's Ready. Shared counter read back after
+                // the (non-blocking) restart returns.
+                let ticks = Arc::new(AtomicU32::new(0));
+                let ticks_for_task = ticks.clone();
+                let ticker = tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        ticks_for_task.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+
+                // Restart NON-BLOCKINGLY. This must return promptly — the
+                // wait for the slow worker's Ready is pushed onto the
+                // background watcher, NOT awaited here.
+                let started = std::time::Instant::now();
+                pool.restart_worker_async(0, &mut factory, false)
+                    .await
+                    .expect("restart_worker_async");
+                let restart_return_elapsed = started.elapsed();
+
+                assert!(
+                    restart_return_elapsed < ready_delay / 2,
+                    "restart_worker_async must return WITHOUT waiting for the slow \
+                     worker's Ready (the wait belongs on the background watcher); \
+                     it returned after {restart_return_elapsed:?} but the worker's \
+                     ready_delay is {ready_delay:?} — the calling task was blocked, \
+                     which is the keepalive-starvation wedge."
+                );
+
+                // Right after the (prompt) return the slot is still
+                // Transitioning — the watcher has not yet observed Ready.
+                assert!(
+                    !pool.workers[0].is_ready(),
+                    "slot must be Transitioning immediately after the async restart; \
+                     the watcher emits Ready later via the event channel"
+                );
+
+                // Now drive the runtime until the watcher emits Ready.
+                // The ticker must have advanced across this window —
+                // proving the operational loop's other arms keep running
+                // while a slow worker (re)spawns.
+                let ev = tokio::time::timeout(
+                    ready_delay + std::time::Duration::from_millis(400),
+                    pool.recv_event(),
+                )
+                .await
+                .expect("watcher must emit a WorkerEvent within the startup window")
+                .expect("event channel must stay open");
+                assert!(
+                    matches!(ev, WorkerEvent::Ready { worker_id: 0 }),
+                    "the background watcher must emit Ready for the restarted slot; got {ev:?}"
+                );
+
+                ticker.abort();
+                assert!(
+                    ticks.load(Ordering::SeqCst) >= 1,
+                    "the concurrent ticker (keepalive analog) must keep firing while \
+                     the slow worker restarts; a starved ticker means the runtime was \
+                     blocked on the worker's Ready"
+                );
             })
             .await;
     }

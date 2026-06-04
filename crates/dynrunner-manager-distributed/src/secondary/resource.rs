@@ -293,17 +293,24 @@ where
                     let _ = self.send_to_primary(msg).await;
                 }
 
-                // Restart the worker and request a new task
+                // Restart the worker NON-BLOCKINGLY. This handler runs
+                // inside the operational `select!` (the OOM-decision arm),
+                // so it must not inline-wait for the new subprocess's
+                // Ready — that would hold the `select!` open for the whole
+                // slow-worker startup window and starve the keepalive,
+                // exactly the wedge `restart_worker_async` exists to
+                // avoid. The `WorkerEvent::Ready` arm reclaims the slot
+                // and re-issues its `TaskRequest` once the replacement
+                // reports `Response::Ready`, so the post-restart repoll
+                // rides that arm rather than a (premature) call here.
                 if let Err(e) = self
                     .op_mut()
                     .pool
-                    .restart_worker(worker_id, factory, false)
+                    .restart_worker_async(worker_id, factory, false)
                     .await
                 {
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
-                    return;
                 }
-                let _ = self.request_task_for_worker(worker_id).await;
             }
             ResourcePressureResult::NoAction => {}
         }
