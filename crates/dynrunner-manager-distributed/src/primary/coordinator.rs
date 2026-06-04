@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
@@ -2213,17 +2214,31 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
     ) -> Result<(), RunError> {
-        let result = self
-            .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
-            .await;
-        self.cleanup_lifecycle_dispatcher().await;
-        // Independent of `cleanup_lifecycle_dispatcher` — the two
-        // dispatchers own independent channels + listener vectors;
-        // both run from spawn-at-`run()`-start to abort-at-`run()`-
-        // exit and both must be joined before `run()` returns so the
-        // PyO3 wrapper / SLURM pipeline don't leak them.
-        self.cleanup_task_completed_dispatcher().await;
-        result
+        // Role-tag the whole run future so every event this task emits is
+        // attributed to the primary role and routed to the per-role full
+        // log. See `dynrunner_core::role_span`. `.instrument` (not a held
+        // guard) so the span is correctly entered/exited across `.await`,
+        // and it wraps the cleanup tail too so those events are tagged.
+        let span = tracing::info_span!(
+            dynrunner_core::PRIMARY_ROLE_SPAN,
+            kind = "primary",
+            node = %self.config.node_id
+        );
+        async {
+            let result = self
+                .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
+                .await;
+            self.cleanup_lifecycle_dispatcher().await;
+            // Independent of `cleanup_lifecycle_dispatcher` — the two
+            // dispatchers own independent channels + listener vectors;
+            // both run from spawn-at-`run()`-start to abort-at-`run()`-
+            // exit and both must be joined before `run()` returns so the
+            // PyO3 wrapper / SLURM pipeline don't leak them.
+            self.cleanup_task_completed_dispatcher().await;
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     /// Original `run()` body, factored out so the public `run` wrapper
@@ -3181,17 +3196,24 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// (`run_pipeline`) and on-demand activation (`run_activated`) paths
     /// BEFORE any wire mutation can land.
     fn spawn_run_dispatchers(&mut self) {
+        // Propagate the primary role span (current at this call, which runs
+        // inside the instrumented `run`/`run_activated` future) into the
+        // spawned dispatcher tasks so the events THEY emit are attributed to
+        // the primary role too. `spawn_local` otherwise detaches the span
+        // context. See `dynrunner_core::role_span`.
         if let Some(rx) = self.lifecycle_rx.take() {
             let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
             let handle = tokio::task::spawn_local(
-                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
+                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
             );
             self.lifecycle_dispatcher_handle = Some(handle);
         }
         if let Some(rx) = self.task_completed_rx.take() {
             let listeners = std::mem::take(&mut self.task_completed_listeners);
             let handle = tokio::task::spawn_local(
-                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
+                crate::task_completed::run_task_completed_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
             );
             self.task_completed_dispatcher_handle = Some(handle);
         }
@@ -3226,10 +3248,24 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         &mut self,
         snapshot: crate::cluster_state::ClusterStateSnapshot<I>,
     ) -> Result<(), RunError> {
-        let result = self.run_activated_pipeline(snapshot).await;
-        self.cleanup_lifecycle_dispatcher().await;
-        self.cleanup_task_completed_dispatcher().await;
-        result
+        // Same primary role-tag as `run`: the on-demand co-located build is
+        // a separate `spawn_local` task from its host secondary, so its own
+        // primary span attributes its events to `primary.log` even while the
+        // host secondary's span keeps writing `secondary.log`. See
+        // `dynrunner_core::role_span`.
+        let span = tracing::info_span!(
+            dynrunner_core::PRIMARY_ROLE_SPAN,
+            kind = "primary",
+            node = %self.config.node_id
+        );
+        async {
+            let result = self.run_activated_pipeline(snapshot).await;
+            self.cleanup_lifecycle_dispatcher().await;
+            self.cleanup_task_completed_dispatcher().await;
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     /// Body of [`Self::run_activated`], factored out so the wrapper can
