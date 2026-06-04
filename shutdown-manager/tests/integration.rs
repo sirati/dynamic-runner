@@ -8,7 +8,7 @@
 
 use dynrunner_slurm_shutdown::cleanup::{final_cleanup, write_pid_file};
 use dynrunner_slurm_shutdown::config::parse;
-use dynrunner_slurm_shutdown::poll_loop::{Outcome, PollConfig, run};
+use dynrunner_slurm_shutdown::poll_loop::{Outcome, PollConfig, ReapStatus, run};
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
 use dynrunner_slurm_shutdown::testing::{FakeClock, MockBackend, MockProcessProbe};
 use std::time::Duration;
@@ -54,8 +54,8 @@ fn flag_set_before_run_yields_signal_shutdown() {
     let flag = ShutdownFlag::new();
     flag.set_for_test(); // simulates SIGTERM handler
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
-    assert_eq!(outcome, Outcome::SignalShutdown);
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    assert_eq!(report.outcome, Outcome::SignalShutdown);
 }
 
 /// Test 3: SIGCONT shares the flag (handler installs both signals on
@@ -69,8 +69,8 @@ fn sigcont_path_is_identical_to_sigterm_path() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
-    assert_eq!(outcome, Outcome::SignalShutdown);
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    assert_eq!(report.outcome, Outcome::SignalShutdown);
 }
 
 /// Test 4: idle-shutdown fires after `idle_shutdown_secs` of
@@ -83,8 +83,8 @@ fn idle_shutdown_after_grace_following_sighting() {
     backend.script_exists(vec![true, false, false]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
-    assert_eq!(outcome, Outcome::IdleShutdown);
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    assert_eq!(report.outcome, Outcome::IdleShutdown);
     assert!(backend.rm_all_called());
 }
 
@@ -98,9 +98,9 @@ fn idle_shutdown_does_not_fire_without_prior_sighting() {
     // for a spurious idle-shutdown to fire if the guard is broken.
     let clock = FakeClock::new();
     clock.set_on_sleep(7, flag.clone());
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(
-        outcome,
+        report.outcome,
         Outcome::SignalShutdown,
         "must reach the flag, not idle-shutdown"
     );
@@ -176,8 +176,8 @@ fn final_cleanup_runs_after_idle_path() {
     backend.script_remove(vec![true]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
-    assert_eq!(outcome, Outcome::IdleShutdown);
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    assert_eq!(report.outcome, Outcome::IdleShutdown);
     final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
     assert!(!pid_path.exists(), "pid file should be removed");
     let calls = backend.calls();
@@ -202,8 +202,8 @@ fn final_cleanup_runs_after_signal_path() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
-    assert_eq!(outcome, Outcome::SignalShutdown);
+    let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
+    assert_eq!(report.outcome, Outcome::SignalShutdown);
     final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
     assert!(!pid_path.exists());
 }
@@ -553,4 +553,105 @@ fn config_parse_rejects_unknown_flag() {
     ];
     let err = parse(argv).unwrap_err();
     assert!(err.contains("--whats-this"), "got: {}", err);
+}
+
+/// Reap-cfg with 1s graces so `FakeClock` (which never blocks) keeps
+/// the verify-loop poll counts short. `wrapper_pid = None` so the only
+/// `is_alive` calls come from the reap-verify path.
+fn cfg_reap() -> PollConfig {
+    PollConfig {
+        secondary_grace: Duration::from_secs(1),
+        container_stop_grace: Duration::from_secs(1),
+        ..cfg(2, 4)
+    }
+}
+
+/// Regression (issue #182), end-to-end at the run() boundary: an
+/// orphan whose podman record is GONE but whose host PID is still
+/// ALIVE. The reaper must (a) signal the captured PID directly — not
+/// no-op because the record vanished, and (b) since the PID never
+/// dies, report `OrphanSurvives`, NOT remove the podman handle, and
+/// drive `main` to a non-zero exit. This is the exact shape of the
+/// confirmed real-run failure where the reaper claimed success over a
+/// live orphan.
+#[test]
+fn orphan_reap_record_gone_pid_alive_does_not_no_op_or_false_succeed() {
+    let backend = MockBackend::new();
+    // tick1: record present → workload PID captured. SIGNAL_SHUTDOWN
+    // entry: record gone (the --rm/premature-cleanup orphan case).
+    backend.script_exists(vec![true, false]);
+    backend.script_workload_pid(vec![Some(90909)]);
+    let flag = ShutdownFlag::new();
+    let clock = FakeClock::new();
+    // Signal arrives after the PID is captured on tick 1.
+    clock.set_on_sleep(1, flag.clone());
+    // PID stays alive through SIGTERM, grace, SIGKILL, and the second
+    // grace — a stuck process the kernel-cgroup OOM path would handle
+    // but userspace signalling cannot.
+    let probe = MockProcessProbe::always_alive();
+
+    let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
+
+    assert_eq!(report.outcome, Outcome::SignalShutdown);
+    // (1) The reaper did NOT no-op: it signalled the captured PID even
+    //     though podman had lost the record.
+    assert!(
+        !probe.signals_sent().is_empty(),
+        "reaper must signal the captured PID, not no-op on a gone record"
+    );
+    assert!(
+        probe.signals_sent().contains(&(90909, libc::SIGTERM)),
+        "captured PID must receive SIGTERM; got {:?}",
+        probe.signals_sent()
+    );
+    assert!(
+        probe.signals_sent().contains(&(90909, libc::SIGKILL)),
+        "captured PID must be escalated to SIGKILL when it survives; got {:?}",
+        probe.signals_sent()
+    );
+    // (2) No false success: a live orphan ⇒ OrphanSurvives, handle left
+    //     intact. `main` maps this to a non-zero exit.
+    assert_eq!(
+        report.reap,
+        ReapStatus::OrphanSurvives,
+        "the manager must not report a live orphan as reaped"
+    );
+    assert!(
+        !backend.calls().contains(&"rm_all".to_string()),
+        "the podman handle must be left intact while the orphan lives; calls: {:?}",
+        backend.calls()
+    );
+}
+
+/// Companion to the above: the orphan PID dies after SIGTERM. Here the
+/// reaper succeeds — confirmed gone — and the handle is removed. Proves
+/// the happy path of the same mechanism (signal-by-captured-PID then
+/// rm-only-after-dead) for the force-kill/incomplete-run case the
+/// #181 self-exit fix does NOT cover.
+#[test]
+fn orphan_reap_record_gone_pid_dies_confirms_and_rms() {
+    let backend = MockBackend::new();
+    backend.script_exists(vec![true, false]);
+    backend.script_workload_pid(vec![Some(5555)]);
+    let flag = ShutdownFlag::new();
+    let clock = FakeClock::new();
+    clock.set_on_sleep(1, flag.clone());
+    // pre-check alive; first verify poll → gone.
+    let probe = MockProcessProbe::script(vec![true, false]);
+
+    let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
+
+    assert_eq!(report.outcome, Outcome::SignalShutdown);
+    assert_eq!(report.reap, ReapStatus::ConfirmedGone);
+    assert_eq!(
+        probe.signals_sent(),
+        vec![(5555, libc::SIGTERM)],
+        "only SIGTERM needed when the PID dies in grace; got {:?}",
+        probe.signals_sent()
+    );
+    assert!(
+        backend.calls().contains(&"rm_all".to_string()),
+        "handle removed once the PID is confirmed gone; calls: {:?}",
+        backend.calls()
+    );
 }

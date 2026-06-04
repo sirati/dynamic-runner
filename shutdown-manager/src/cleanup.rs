@@ -157,6 +157,9 @@ mod tests {
         fn exec_pgrep_first_child(&self, _: &str) -> Option<u32> {
             unreachable!()
         }
+        fn workload_pid(&self, _: &str) -> Option<u32> {
+            unreachable!("cleanup tests don't capture the workload PID")
+        }
         fn kill_pid1(&self, _: &str, _: &str) -> bool {
             unreachable!()
         }

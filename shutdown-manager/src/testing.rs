@@ -25,6 +25,7 @@ pub struct MockBackend {
     calls: RefCell<Vec<String>>,
     exists_script: RefCell<Vec<bool>>,
     pgrep_script: RefCell<Vec<Option<u32>>>,
+    workload_pid_script: RefCell<Vec<Option<u32>>>,
     remove_script: RefCell<Vec<bool>>,
     rm_all_called: RefCell<bool>,
 }
@@ -39,6 +40,9 @@ impl MockBackend {
     }
     pub fn script_pgrep(&self, results: Vec<Option<u32>>) {
         *self.pgrep_script.borrow_mut() = results;
+    }
+    pub fn script_workload_pid(&self, results: Vec<Option<u32>>) {
+        *self.workload_pid_script.borrow_mut() = results;
     }
     pub fn script_remove(&self, results: Vec<bool>) {
         *self.remove_script.borrow_mut() = results;
@@ -83,6 +87,11 @@ impl PodmanBackend for MockBackend {
     fn exec_pgrep_first_child(&self, name: &str) -> Option<u32> {
         let r = Self::pop_pgrep(&self.pgrep_script);
         self.record(format!("exec_pgrep_first_child({}) -> {:?}", name, r));
+        r
+    }
+    fn workload_pid(&self, name: &str) -> Option<u32> {
+        let r = Self::pop_pgrep(&self.workload_pid_script);
+        self.record(format!("workload_pid({}) -> {:?}", name, r));
         r
     }
     fn kill_pid1(&self, name: &str, signal: &str) -> bool {
@@ -159,6 +168,10 @@ pub struct MockProcessProbe {
     /// ever scripted.
     last: RefCell<bool>,
     calls: RefCell<u32>,
+    /// Every `(pid, signal)` delivered through `signal`, in order,
+    /// so reap tests can assert "SIGTERM then SIGKILL to the captured
+    /// PID" without a real PID space.
+    signals_sent: RefCell<Vec<(u32, i32)>>,
 }
 
 impl MockProcessProbe {
@@ -171,6 +184,7 @@ impl MockProcessProbe {
             script: RefCell::new(values),
             last: RefCell::new(saturating),
             calls: RefCell::new(0),
+            signals_sent: RefCell::new(Vec::new()),
         }
     }
 
@@ -182,6 +196,7 @@ impl MockProcessProbe {
             script: RefCell::new(Vec::new()),
             last: RefCell::new(true),
             calls: RefCell::new(0),
+            signals_sent: RefCell::new(Vec::new()),
         }
     }
 
@@ -192,6 +207,7 @@ impl MockProcessProbe {
             script: RefCell::new(Vec::new()),
             last: RefCell::new(false),
             calls: RefCell::new(0),
+            signals_sent: RefCell::new(Vec::new()),
         }
     }
 
@@ -200,6 +216,13 @@ impl MockProcessProbe {
     /// inertness test).
     pub fn calls(&self) -> u32 {
         *self.calls.borrow()
+    }
+
+    /// Every `(pid, signal)` delivered, in order. Reap tests assert
+    /// the captured PID was signalled SIGTERM, then SIGKILL on
+    /// survival.
+    pub fn signals_sent(&self) -> Vec<(u32, i32)> {
+        self.signals_sent.borrow().clone()
     }
 }
 
@@ -215,5 +238,13 @@ impl ProcessProbe for MockProcessProbe {
                 v
             }
         }
+    }
+
+    fn signal(&self, pid: u32, signal: i32) -> bool {
+        // Record the delivery; liveness is driven independently by the
+        // `script`/`last` sequence so a test can model "signal accepted
+        // but process survives" vs "process dies after the signal".
+        self.signals_sent.borrow_mut().push((pid, signal));
+        true
     }
 }
