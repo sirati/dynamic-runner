@@ -150,7 +150,16 @@ impl PyObserverLateJoiner {
                     // hardcoded as an observer.
                     // `can_be_primary = false`: an observer can never host
                     // the primary role (no workers, no dispatch authority).
-                    let snapshot_json = peer_network
+                    // `join_running_cluster` fans the snapshot request to
+                    // every seed and returns ALL responders' payloads
+                    // (multi-responder bootstrap). The first reachable seed
+                    // may be a secondary holding an incomplete roster, so a
+                    // single reply could bootstrap from a partial snapshot;
+                    // collecting every responder's snapshot and `restore()`-
+                    // ing each (idempotent lattice) heals — the union is
+                    // complete iff ANY responder (the primary above all)
+                    // was complete.
+                    let snapshot_jsons = peer_network
                         .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true, false)
                         .await
                         .map_err(|e| {
@@ -159,19 +168,24 @@ impl PyObserverLateJoiner {
                             ))
                         })?;
 
-                    // 3. Decode the snapshot. The wire frame is a String
+                    // 3. Decode each snapshot. The wire frame is a String
                     //    (the protocol crate keeps `I` erased there); we
-                    //    materialise it back into the typed snapshot here
+                    //    materialise each back into the typed snapshot here
                     //    so the manager-distributed crate gets the
                     //    `ClusterStateSnapshot<RunnerIdentifier>` it
-                    //    expects.
-                    let snap: ClusterStateSnapshot<RunnerIdentifier> =
-                        serde_json::from_str(&snapshot_json).map_err(|e| {
-                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "observer late-joiner: failed to decode \
-                             ClusterStateSnapshot from join_running_cluster reply: {e}"
-                            ))
-                        })?;
+                    //    expects. The caller `restore()`s each (Step 5
+                    //    below) — the lattice unions them.
+                    let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> = snapshot_jsons
+                        .iter()
+                        .map(|snapshot_json| {
+                            serde_json::from_str(snapshot_json).map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "observer late-joiner: failed to decode \
+                                 ClusterStateSnapshot from join_running_cluster reply: {e}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
 
                     // 4. Construct the observer's coordinator. is_observer=true,
                     //    num_workers=0; the Step 7 election filter + the
@@ -358,12 +372,21 @@ impl PyObserverLateJoiner {
                     let (announcer_handle, announcer_sender) =
                         secondary.attach_observer_announcer(holdings);
 
-                    // 5. Install the snapshot AND latch
+                    // 5. Install each collected snapshot AND latch
                     //    setup_phase_completed=true. The single-method
                     //    `restore_from_snapshot_and_skip_setup` is the
                     //    only place outside the secondary crate allowed
-                    //    to touch the latch (see its doc-comment).
-                    secondary.restore_from_snapshot_and_skip_setup(snap);
+                    //    to touch the latch (see its doc-comment). Called
+                    //    once per responder's snapshot: `restore` is an
+                    //    idempotent / commutative lattice merge, so the
+                    //    union of every responder's view converges
+                    //    regardless of arrival order, and the (idempotent)
+                    //    lifecycle latch lands the same Operational shell
+                    //    each time — the union heals an incomplete first
+                    //    responder against a complete later one.
+                    for snap in snaps {
+                        secondary.restore_from_snapshot_and_skip_setup(snap);
+                    }
 
                     // 5.5. Spawn the announcer task. The coordinator's
                     //      `select!` arm drains the production sender's

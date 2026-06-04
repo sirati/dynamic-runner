@@ -216,13 +216,19 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
     .await
     .expect("test deadline: join_running_cluster did not resolve within 2s");
 
-    let snapshot_json = match join_result {
+    let snapshot_jsons = match join_result {
         Ok(s) => s,
         Err(e) => panic!("join_running_cluster failed: {e}"),
     };
 
+    // Multi-responder bootstrap returns a non-empty Vec; only
+    // primary-peer answers here, so exactly one payload comes back.
+    assert!(
+        !snapshot_jsons.is_empty(),
+        "join_running_cluster must return at least one snapshot on Ok"
+    );
     let parsed: SyntheticSnapshot =
-        serde_json::from_str(&snapshot_json).expect("returned snapshot_json round-trips");
+        serde_json::from_str(&snapshot_jsons[0]).expect("returned snapshot_json round-trips");
 
     // Task ledger survives the RPC.
     assert_eq!(
@@ -248,6 +254,114 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
     // joiner's role-table on restore).
     assert_eq!(parsed.primary_epoch, 7);
     assert_eq!(parsed.current_primary.as_deref(), Some("primary-peer"));
+}
+
+/// Multi-responder bootstrap: the joiner fans `RequestClusterSnapshot`
+/// to ALL seeds and collects EVERY responder's snapshot (not just the
+/// first). This is the completeness fix — the first reachable seed may
+/// hold an INCOMPLETE roster, so a single reply could bootstrap from a
+/// partial snapshot. Two responders answer with DISTINCT payloads (one
+/// incomplete: {task-A}; one complete: {task-A, task-B}); the joiner
+/// returns both, and the caller-side union (decode each + restore) heals
+/// to {task-A, task-B}. The union is modelled here at the wire level
+/// (this transport-layer test can't depend on the manager-distributed
+/// `restore` lattice — that round-trip is pinned in `cluster_state.rs`).
+#[tokio::test]
+async fn join_running_cluster_collects_all_responders_for_union() {
+    let peer_ids: Vec<String> = vec![
+        "joiner".into(),
+        "incomplete-peer".into(),
+        "complete-peer".into(),
+    ];
+    let mut transports: Vec<ChannelPeerTransport<TestId>> = peer_mesh::<TestId>(&peer_ids);
+    let mut joiner = transports.remove(0);
+    let mut incomplete = transports.remove(0);
+    let mut complete = transports.remove(0);
+
+    // Incomplete responder: only task-A. Complete responder: task-A +
+    // task-B. Their union is the full ledger.
+    let incomplete_snap = SyntheticSnapshot {
+        tasks: [("task-A".to_string(), serde_json::json!({"Pending": {}}))]
+            .into_iter()
+            .collect(),
+        current_primary: None,
+        primary_epoch: 1,
+        phase_deps: HashMap::new(),
+        observers: Default::default(),
+    };
+    let complete_snap = SyntheticSnapshot {
+        tasks: [
+            ("task-A".to_string(), serde_json::json!({"Pending": {}})),
+            ("task-B".to_string(), serde_json::json!({"Pending": {}})),
+        ]
+        .into_iter()
+        .collect(),
+        current_primary: Some("primary-peer".to_string()),
+        primary_epoch: 5,
+        phase_deps: HashMap::new(),
+        observers: Default::default(),
+    };
+    let incomplete_json = serde_json::to_string(&incomplete_snap).unwrap();
+    let complete_json = serde_json::to_string(&complete_snap).unwrap();
+
+    let seed: Vec<PeerConnectionInfo> = ["incomplete-peer", "complete-peer"]
+        .iter()
+        .map(|id| PeerConnectionInfo {
+            secondary_id: (*id).into(),
+            cert: String::new(),
+            ipv4: None,
+            ipv6: None,
+            port: 0,
+            is_observer: false,
+        })
+        .collect();
+
+    let join_fut = joiner.join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, false, true);
+    tokio::pin!(join_fut);
+
+    let join_result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut join_fut => break result,
+                _ = responder_pump(&mut incomplete, "incomplete-peer", &incomplete_json) => {}
+                _ = responder_pump(&mut complete, "complete-peer", &complete_json) => {}
+            }
+        }
+    })
+    .await
+    .expect("test deadline: join_running_cluster did not resolve within 2s");
+
+    let snapshot_jsons = match join_result {
+        Ok(s) => s,
+        Err(e) => panic!("join_running_cluster failed: {e}"),
+    };
+
+    // BOTH responders' snapshots are collected (the multi-responder
+    // contract — first-success-wins would have returned exactly one).
+    assert_eq!(
+        snapshot_jsons.len(),
+        2,
+        "both responders' snapshots must be collected, got {}",
+        snapshot_jsons.len()
+    );
+
+    // The union of the returned payloads' task sets is the complete
+    // ledger — proving an incomplete responder is healed by a complete
+    // one (the idempotent-lattice union the caller performs via restore).
+    let mut union: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for json in &snapshot_jsons {
+        let parsed: SyntheticSnapshot =
+            serde_json::from_str(json).expect("each returned snapshot round-trips");
+        union.extend(parsed.tasks.keys().cloned());
+    }
+    assert_eq!(
+        union,
+        ["task-A".to_string(), "task-B".to_string()]
+            .into_iter()
+            .collect(),
+        "the union of all responders' snapshots heals to the complete ledger"
+    );
 }
 
 /// Edge case: when the seed list contains only the joiner itself,

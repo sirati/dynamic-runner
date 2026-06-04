@@ -80,8 +80,8 @@ pub enum ReadDirError {
 ///   so the joiner cannot dial them at the QUIC layer). The set of
 ///   surviving records is returned in directory-enumeration order
 ///   (whatever the OS reports). Ordering is irrelevant to the joiner
-///   — `join_running_cluster` iterates the seed and first-success-wins
-///   on `send_to_peer`.
+///   — `join_running_cluster` fans the request to all non-self seeds
+///   and merges every reply via the idempotent lattice.
 /// - If the surviving set is empty, return `NoV2Records` rather than
 ///   an empty `Vec`. An empty vec would cause `join_running_cluster`
 ///   to wait its entire connect-budget on `peer_count() > 0` (channel

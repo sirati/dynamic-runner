@@ -1,8 +1,11 @@
 use dynrunner_core::{Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, Destination, DistributedMessage, PeerId, PeerTransport,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
 impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
@@ -35,6 +38,89 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// exit-counter reads. The CRDT idempotency on `cluster_state`
     /// makes repeated apply safe; `HashSet::insert` is idempotent on
     /// the accounting side.
+    /// Answer a late-joiner's / re-bootstrapping peer's
+    /// `RequestClusterSnapshot` from the primary's authoritative ledger.
+    ///
+    /// Single concern: the snapshot-RPC responder on the primary side.
+    /// Pre-fix only the secondary router answered this request
+    /// (`secondary::dispatch::router`'s `RequestClusterSnapshot` arm);
+    /// the primary's `dispatch_message` had no arm and the request fell
+    /// through the catch-all. A requester that unicast to the primary
+    /// (`Destination::Primary` — the primary-preferred bootstrap target,
+    /// and the only responder guaranteed COMPLETE pre-mesh-convergence)
+    /// got no reply and timed out. The primary's `cluster_state` is the
+    /// authoritative copy of every replicated field, so its snapshot is
+    /// the strongest possible bootstrap payload.
+    ///
+    /// Mirrors the secondary responder exactly: snapshot the local
+    /// `cluster_state`, unicast `ClusterSnapshot` back to the requester
+    /// (its return address rides `sender_id`), and originate the
+    /// requester's `PeerJoined` over the canonical broadcast path so
+    /// every replica learns about the joiner. The joiner's declared
+    /// `is_observer` / `can_be_primary` ride the request frame and are
+    /// recorded truthfully (the same role-carrying contract the secondary
+    /// responder honours — `apply_peer_joined`'s observer ratchet keeps a
+    /// re-bootstrapping worker from mis-upgrading to observer).
+    ///
+    /// The wire-side `snapshot_json` keeps the protocol envelope free of
+    /// `ClusterStateSnapshot<I>` (the dependency direction: protocol must
+    /// not depend on manager-distributed). A serialization failure is
+    /// logged and the request is dropped — best-effort, exactly as the
+    /// secondary responder treats its own send failure; the requester's
+    /// bounded recv wait falls back to its own deadline.
+    pub(crate) async fn handle_request_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::RequestClusterSnapshot {
+            sender_id,
+            is_observer,
+            can_be_primary,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        let snapshot = self.cluster_state.snapshot();
+        match serde_json::to_string(&snapshot) {
+            Ok(snapshot_json) => {
+                let response = DistributedMessage::ClusterSnapshot {
+                    sender_id: self.config.node_id.clone(),
+                    timestamp: timestamp_now(),
+                    snapshot_json,
+                };
+                if let Err(e) = self
+                    .send_to(
+                        Destination::Secondary(PeerId::from(sender_id.clone())),
+                        response,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target = %sender_id,
+                        error = %e,
+                        "failed to deliver ClusterSnapshot response from primary"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target = %sender_id,
+                    error = %e,
+                    "snapshot serialization failed; dropping RequestClusterSnapshot"
+                );
+            }
+        }
+        // Originate the requester's `PeerJoined` over the canonical
+        // local-apply + broadcast path. The joiner declared its own
+        // role + capability on the request frame; record that truth in
+        // the replicated `RoleTable` (idempotent / set-once on re-apply,
+        // so a duplicate from a concurrent secondary responder NoOps).
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerJoined {
+            peer_id: sender_id,
+            is_observer,
+            can_be_primary,
+        }])
+        .await;
+    }
+
     pub(crate) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
             // Note whether any ledger-growing mutation rides in this

@@ -193,6 +193,17 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // for the full rationale and the asm-dataset-nix R2 / T3
             // hang it pins.
             MessageType::ClusterMutation => self.handle_cluster_mutation(msg).await,
+            // Snapshot-RPC responder. A late-joiner / re-bootstrapping
+            // peer (or a recovering observer) unicasts
+            // `RequestClusterSnapshot` to `Destination::Primary`; the
+            // primary's `cluster_state` is the authoritative copy, so its
+            // snapshot is the strongest bootstrap payload. Pre-fix only
+            // the secondary router answered this — a request addressed at
+            // the primary fell through the catch-all and timed out. See
+            // `handle_request_cluster_snapshot`.
+            MessageType::RequestClusterSnapshot => {
+                self.handle_request_cluster_snapshot(msg).await
+            }
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
@@ -255,8 +266,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // cloned once.
             let advertised_resources = resources.clone();
             let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn =
-                conn.receive_welcome(worker_count, resources, hostname, 0, None, is_observer);
+            let conn = conn.receive_welcome(
+                worker_count,
+                resources,
+                hostname,
+                0,
+                None,
+                is_observer,
+                can_be_primary,
+            );
             self.secondaries.insert(
                 secondary_id.clone(),
                 SecondaryConnectionState::Handshaking(conn),

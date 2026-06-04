@@ -184,6 +184,96 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         .await;
     }
 
+    /// Re-emit the FULL per-secondary roster after the peer mesh has
+    /// converged — the post-mesh anti-entropy backstop for the membership
+    /// records originated pre-mesh at `handle_welcome`.
+    ///
+    /// Single concern: close the `secondary_capacities` desync. Each
+    /// `SecondaryCapacity` (and the non-observer `PeerJoined`) is
+    /// originated per-secondary at `handle_welcome` — PRE-mesh, before
+    /// the later-welcoming secondaries' peer links exist — and never
+    /// re-emitted. A secondary that welcomed before a sibling therefore
+    /// holds an incomplete capacity roster; only the live primary's
+    /// `cluster_state` is complete. The blast radius: an observer's
+    /// occupancy undercounts, and — worse — a failover-promoted secondary
+    /// rebuilds an INCOMPLETE worker roster off its own
+    /// `known_secondaries()` (`reconstruct_workers_from_cluster_state`),
+    /// undercounting `alive_remote_secondary_count` into a premature
+    /// fleet-dead exit.
+    ///
+    /// The fix is one post-mesh re-broadcast of the records the primary
+    /// already holds (it IS the complete source). Called once, right
+    /// after `originate_primary_membership` — POST `wait_for_peer_connections`
+    /// (so the batch reaches the fully-formed mesh) and BEFORE the
+    /// seed/setup-defer branch (so both modes pass through). Iterates
+    /// `self.secondaries`, reading each connection's welcome-advertised
+    /// capabilities straight off the `SecondaryConnectionState` typestate
+    /// (the single record of `num_workers` / `resources` / `is_observer`
+    /// / `can_be_primary`), and emits ONE batch carrying a
+    /// `SecondaryCapacity` + a `PeerJoined` per secondary.
+    ///
+    /// Re-emitting the non-observer `PeerJoined` too is deliberate: it
+    /// shares the same pre-mesh-no-re-emit shape as `SecondaryCapacity`
+    /// (`send_peer_lists` only re-emits the OBSERVER `PeerJoined` batch),
+    /// so its membership record has the identical desync blast boundary
+    /// and heals in the same pass.
+    ///
+    /// This is a pure RE-EMISSION of records the primary ALREADY holds
+    /// locally — NOT a fresh origination. It therefore does NOT route
+    /// through `apply_and_broadcast_cluster_mutations`: that path
+    /// re-applies each mutation against the primary's OWN `cluster_state`
+    /// first and filters out everything that NoOps. Since every record
+    /// here is already present in the primary's complete mirror (it
+    /// originated them at `handle_welcome`), the apply-and-filter would
+    /// classify the ENTIRE batch as NoOp and drop it off the wire — a
+    /// silent no-op, defeating the re-broadcast. Instead it ships the
+    /// batch straight over the `Destination::All` mesh edge (the same
+    /// egress `apply_and_broadcast_cluster_mutations` uses for its final
+    /// send). The idempotency that makes this safe lives at the
+    /// RECEIVER: a secondary that already holds a record NoOps it on
+    /// apply and never re-broadcasts (`handle_cluster_mutation` /
+    /// `apply_cluster_mutations` are apply-only); a secondary missing the
+    /// record applies it and converges. Zero new merge logic — the
+    /// existing lattice does all the reconciliation.
+    pub(crate) async fn rebroadcast_full_roster(&mut self) {
+        // Build the full roster batch under the immutable borrow of
+        // `self.secondaries`. Two mutations per secondary: the membership
+        // `PeerJoined` and the static `SecondaryCapacity`.
+        let mut mutations: Vec<ClusterMutation<I>> =
+            Vec::with_capacity(self.secondaries.len() * 2);
+        for conn in self.secondaries.values() {
+            mutations.push(ClusterMutation::PeerJoined {
+                peer_id: conn.id().to_string(),
+                is_observer: conn.is_observer(),
+                can_be_primary: conn.can_be_primary(),
+            });
+            mutations.push(ClusterMutation::SecondaryCapacity {
+                secondary: conn.id().to_string(),
+                worker_count: conn.num_workers(),
+                resources: conn.resources().to_vec(),
+            });
+        }
+        if mutations.is_empty() {
+            return;
+        }
+        let count = self.secondaries.len();
+        let msg = DistributedMessage::ClusterMutation {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            mutations,
+        };
+        if let Err(error) = self.send_to(Destination::All, msg).await {
+            tracing::warn!(
+                error = %error,
+                "full-roster re-broadcast delivery failed"
+            );
+        }
+        tracing::info!(
+            secondaries = count,
+            "re-broadcast full secondary roster (capacity + membership) post-mesh"
+        );
+    }
+
     /// Originate the uniform primary announcement: `PrimaryChanged { new
     /// = self }` at the bootstrap/failover convergence point
     /// (`activate_local_primary`).

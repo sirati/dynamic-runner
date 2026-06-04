@@ -98,6 +98,7 @@ fn register_secondary_with_workers(
             0,
             None,
             false,
+            false,
         )
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
