@@ -99,10 +99,12 @@ def build_subprocess_spawn(
     framework-regenerated flags (``--secondary``, ``--secondary-id``,
     ``--secondary-quic-port``, ``--src-network``, ``--cores``,
     ``--max-memory``, ``--log-dir``) are stripped there so they don't
-    duplicate the explicit emissions above. Boolean store_true flags
-    that ARE manually re-emitted (``--raw-logs``, ``--log-oom-watcher``)
-    may appear twice if the operator passed them; argparse's
-    store_true tolerates that.
+    duplicate the explicit emissions above, and submitter-local flags
+    (``--important-stdio-only``) are stripped so the secondary keeps its
+    FULL logs rather than the operator's importance-only stdio. Boolean
+    store_true flags that ARE manually re-emitted (``--raw-logs``,
+    ``--log-oom-watcher``) may appear twice if the operator passed them;
+    argparse's store_true tolerates that.
     """
 
     def spawn_secondary(

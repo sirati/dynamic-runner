@@ -444,4 +444,42 @@ mod tests {
         assert_eq!(argv[idx + 1], "tcp://localhost:12345");
         assert!(argv.contains(&"--log-level=debug".to_string()));
     }
+
+    /// Importance-stdio mode is SUBMITTER-LOCAL: it must never reach a
+    /// secondary container, neither as a `-e DYNRUNNER_IMPORTANT_STDIO_ONLY`
+    /// env nor as an `--important-stdio-only` CLI token. The submitter's
+    /// `_forwarded_argv.filter_framework_argv` strips the flag before it
+    /// reaches `forwarded_argv`, and `build_run_argv` injects a fixed env
+    /// set that does not include the importance vars. This pins the
+    /// guarantee at the spawn-argv level so a future env addition can't
+    /// silently flip a secondary into important-only mode.
+    #[test]
+    fn secondary_argv_never_carries_importance_stdio() {
+        let cfg = maximal_cfg(ConnectionMode::Standard {
+            gateway_host: "gw".to_string(),
+            gateway_port: 4433,
+        });
+        let argv = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(8_589_934_592),
+            &both_ips(),
+            7777,
+            "tcp://gw:4433",
+        );
+
+        assert!(
+            !argv.iter().any(|a| a.contains("DYNRUNNER_IMPORTANT_STDIO_ONLY")),
+            "container env must not carry DYNRUNNER_IMPORTANT_STDIO_ONLY"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("DYNRUNNER_FULL_LOG_FILE")),
+            "container env must not carry DYNRUNNER_FULL_LOG_FILE"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--important-stdio-only"),
+            "container command must not carry the --important-stdio-only flag"
+        );
+    }
 }
