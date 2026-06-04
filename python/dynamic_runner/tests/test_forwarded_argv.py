@@ -207,6 +207,44 @@ class FilterFrameworkArgvTests(unittest.TestCase):
         ]
         self.assertEqual(filter_framework_argv(argv), ["--platform", "x64"])
 
+    def test_full_log_dir_is_framework_regenerated(self) -> None:
+        # The per-node runner-log dir is now forwarded as a framework
+        # `--full-log-dir=/app/log-network/{sid}` CLI arg by the spawn
+        # paths (replacing the retired DYNRUNNER_FULL_LOG_DIR env). So a
+        # dispatcher-supplied `--full-log-dir` must be dropped on forward —
+        # otherwise the secondary's argparse would see the flag twice.
+        argv = [
+            "--full-log-dir=/host/log/sec-0",
+            "--platform",
+            "x64",
+            "--full-log-dir",
+            "/another/sec",
+        ]
+        self.assertEqual(filter_framework_argv(argv), ["--platform", "x64"])
+
+
+class FrameworkFlagKnowledgeTests(unittest.TestCase):
+    """The forward classification is owned by `_framework_flags` and derived
+    from the framework's own registered flags — no hand-maintained drift.
+    """
+
+    def setUp(self) -> None:
+        self._ff = _load_module_direct("_framework_flags", "_framework_flags.py")
+
+    def test_classifications_are_registered_framework_flags(self) -> None:
+        # Every regenerated / submitter-local flag must actually be a flag
+        # the framework registers; a typo'd member that argparse never
+        # accepts would silently never match and break the strip.
+        registered = self._ff.framework_option_strings()
+        for flag in self._ff.FRAMEWORK_REGENERATED_FLAGS:
+            self.assertIn(flag, registered, f"{flag} not a registered framework flag")
+        for flag in self._ff.SUBMITTER_LOCAL_FLAGS:
+            self.assertIn(flag, registered, f"{flag} not a registered framework flag")
+
+    def test_full_log_dir_registered_and_regenerated(self) -> None:
+        self.assertIn("--full-log-dir", self._ff.framework_option_strings())
+        self.assertIn("--full-log-dir", self._ff.FRAMEWORK_REGENERATED_FLAGS)
+
 
 if __name__ == "__main__":
     unittest.main()

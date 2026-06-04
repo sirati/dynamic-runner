@@ -88,17 +88,6 @@ pub fn build_run_argv(
         "PRIMARY_NODE_IPV6={}",
         peer_ips.ipv6.clone().unwrap_or_default()
     ));
-    // Persist this container's framework runner log on the gateway-shared
-    // `--log-dir` mount. The container sees the mount at `/app/log-network`
-    // (the `-v {log_network}:/app/log-network` volume below); the per-node
-    // subdir keys it by `secondary_id` so the relocated/co-located primary
-    // and each secondary write to distinct, host-readable files. logging.rs
-    // composes the per-role filenames under this dir.
-    argv.push("-e".to_string());
-    argv.push(format!(
-        "DYNRUNNER_FULL_LOG_DIR=/app/log-network/{}",
-        cfg.secondary_id
-    ));
     if cfg.dynrunner_network_dir.is_some() {
         argv.push("-e".to_string());
         argv.push("DYNRUNNER_NETWORK=/app/dynrunner-network".to_string());
@@ -154,6 +143,17 @@ pub fn build_run_argv(
     argv.push(format!("--max-memory={}", cfg.max_memory_spec));
     argv.push(format!("--src-network={SRC_NETWORK_CONTAINER_PATH}"));
     argv.push("--log-dir=/app/log-network".to_string());
+    // Persist this container's framework runner log on the gateway-shared
+    // `--log-dir` mount, keyed per-node by `secondary_id` so the relocated/
+    // co-located primary and each secondary write to distinct, host-readable
+    // files (logging.rs composes the per-role filenames under this dir).
+    // Forwarded as a framework `--full-log-dir` CLI arg — parsed by the
+    // secondary's argparse and threaded into the explicit `init_logging`
+    // param — not an env injection.
+    argv.push(format!(
+        "--full-log-dir=/app/log-network/{}",
+        cfg.secondary_id
+    ));
     // Framework-owned reaper-panik sentinel. The host-side
     // shutdown-manager writes this exact file (its host path, via
     // `--panik-file` on the reaper) as a graceful last resort when its
@@ -295,8 +295,6 @@ mod tests {
             "-e",
             "PRIMARY_NODE_IPV6=fe80::1",
             "-e",
-            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
-            "-e",
             "DYNRUNNER_NETWORK=/app/dynrunner-network",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
@@ -330,6 +328,7 @@ mod tests {
             "--max-memory=-2G",
             "--src-network=/app/src-network",
             "--log-dir=/app/log-network",
+            "--full-log-dir=/app/log-network/sec-0",
             "--panik-file",
             "/app/log-tmp/.dynrunner-reaper.panik",
             "--mem-manager-reserved=524288000",
@@ -385,8 +384,6 @@ mod tests {
             "PRIMARY_NODE_IPV4=",
             "-e",
             "PRIMARY_NODE_IPV6=",
-            "-e",
-            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
             "-v",
@@ -415,6 +412,7 @@ mod tests {
             "--max-memory=-2G",
             "--src-network=/app/src-network",
             "--log-dir=/app/log-network",
+            "--full-log-dir=/app/log-network/sec-0",
             "--panik-file",
             "/app/log-tmp/.dynrunner-reaper.panik",
         ]

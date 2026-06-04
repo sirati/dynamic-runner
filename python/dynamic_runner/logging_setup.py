@@ -1,186 +1,76 @@
 """Logging configuration for the runner.
 
-Extracted verbatim from the previous `cli._setup_logging` so the prefix
-behaviour for primary (`P|`), secondary (`S|`), and `--raw-logs` modes
-is preserved.
+This module owns logging configuration end to end (its single concern),
+driven by EXPLICIT PARAMETERS from the parsed framework args — never
+environment variables. Both halves of the ``--important-stdio-only``
+feature are "configure logging for importance mode", so they live together:
 
-This module also owns the `--important-stdio-only` logging mode end to
-end (its single concern): both halves of the feature are "configure
-logging for importance mode", so they live together.
+  * The Rust side is a dual-sink tracing subscriber
+    (`crates/dynrunner-pyo3/src/logging.rs`) installed by the
+    `init_logging(...)` pyfunction. :func:`setup_logging` calls it with the
+    three parsed knobs (``important_stdio_only``, ``full_log_file``,
+    ``full_log_dir``) AFTER argparse — the subscriber is no longer installed
+    at `_native` import, so config is chosen by flags, not read from the
+    env. Anything that logs in the (do-nothing) window before this call has
+    no global subscriber and is dropped.
+  * The Python side suppresses the root console handler and routes Python's
+    own logs to the same full-log file, so stdio carries only the
+    Rust-emitted important events while the full log keeps everything. This
+    half runs inside :func:`setup_logging`.
 
-  * The Rust side of the mode is a dual-sink tracing subscriber
-    (`crates/dynrunner-pyo3/src/logging.rs`) that reads two env vars
-    ONCE at `_native` import time. `apply_important_stdio_env` exports
-    them from an argv lookahead and MUST run before the first `_native`
-    import (driven from `dynamic_runner.__init__` top, before the eager
-    `from ._native import ...`).
-  * The Python side suppresses the root console handler and routes
-    Python's own logs to the same full-log file, so stdio carries only
-    the Rust-emitted important events while the full log keeps
-    everything. This half runs inside `setup_logging`.
-
-Environment-variable configuration interface (for wrapping consumers)
-=====================================================================
-A program that drives ``dynamic_runner`` as a subprocess (a "wrapping
-consumer") configures logging through environment variables instead of
-injecting flags into a CLI it does not own. The two variables below are
-the supported, first-class config path; they are NOT aliases of the
-``--important-stdio-only`` flag — the flag is convenience sugar that
-merely SEEDS these same variables (`apply_important_stdio_env`), so the
-env path and the flag path converge on one mechanism, never a parallel
-surface:
-
-  * ``DYNRUNNER_IMPORTANT_STDIO_ONLY`` — truthy (``1``/``true``/``yes``/
-    ``on``, case-insensitive; mirrors the Rust `is_truthy`) arms
-    importance mode: the Rust dual-sink subscriber gates stdio to the
-    important target, and the Python side (here) drops its console
-    handler and redirects Python logs to the full-log file. Setting this
-    env var alone — with no flag — produces identical submitter behaviour
-    to passing ``--important-stdio-only``.
-  * ``DYNRUNNER_FULL_LOG_FILE`` — optional path for the full (unfiltered)
-    log. When set, the Rust full sink writes there and the Python side
-    appends its records to the same file; when unset, importance mode
-    falls back to ``./dynrunner-full.log`` (`DEFAULT_FULL_LOG_FILE`). A
-    pre-export is always respected — `apply_important_stdio_env` uses
-    ``setdefault`` and never clobbers it.
-
-Both variables are SUBMITTER-LOCAL: importance mode steers the
-submitter's own stdout/log split. It is deliberately NOT forwarded to
-secondaries (see `dynamic_runner._forwarded_argv.SUBMITTER_LOCAL_FLAGS`)
-— secondaries keep their full logs for debugging, and post-relocation
-the operator's narrative comes from the observer reading the CRDT.
+``--important-stdio-only`` is SUBMITTER-LOCAL: it steers the submitter's own
+stdout/log split and is deliberately NOT forwarded to secondaries (see
+:mod:`dynamic_runner._framework_flags`) — secondaries keep their full logs
+for debugging, and post-relocation the operator's narrative comes from the
+observer reading the CRDT.
 """
+
+from __future__ import annotations
 
 import argparse
 import logging
-import os
 from pathlib import Path
 
 from ._shared.logging_utils import remove_stream_handlers
 
-#: CLI flag that activates importance-stdio mode. Scanned from argv both
-#: here (early env export) and by argparse (`cli.build_arg_parser`); the
-#: literal lives in one place so the two scanners cannot drift.
+#: CLI flag that activates importance-stdio mode. Owned here so the
+#: classification in `_framework_flags.SUBMITTER_LOCAL_FLAGS` and any other
+#: reference share one literal.
 IMPORTANT_STDIO_ONLY_FLAG = "--important-stdio-only"
 
-#: Environment variables read ONCE by the Rust dual-sink subscriber at
-#: `_native` import. Names mirror `crates/dynrunner-pyo3/src/logging.rs`
-#: (the one cross-language contract); defined here so the Python side has
-#: a single source of truth for the two strings.
-IMPORTANT_STDIO_ONLY_ENV = "DYNRUNNER_IMPORTANT_STDIO_ONLY"
-FULL_LOG_FILE_ENV = "DYNRUNNER_FULL_LOG_FILE"
-
-#: Default destination for the full (unfiltered) log when the operator
-#: did not pre-export `FULL_LOG_FILE_ENV`. The framework exposes no
-#: dedicated full-log-file arg today (`--log-dir` / `--output` anchor
-#: per-secondary worker logs, not the framework's own stdout stream), and
-#: this export must resolve before the full argparse pass — so the
-#: working directory is the only context available. Relative on purpose:
-#: it lands wherever the run was launched, matching the historical
+#: Default destination for the full (unfiltered) log when importance mode is
+#: on and the operator did not pass ``--full-log-file``. Relative on
+#: purpose: it lands wherever the run was launched, matching the historical
 #: shell-redirection capture point.
 DEFAULT_FULL_LOG_FILE = "dynrunner-full.log"
 
 
-#: Truthy spellings for the env-var config path. Mirrors the Rust
-#: `is_truthy` (`crates/dynrunner-pyo3/src/logging.rs`) so the two sides
-#: of the one cross-language env contract agree on what "on" means.
-_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
+def resolve_full_log_file(
+    important_stdio_only: bool, full_log_file: str | None
+) -> Path | None:
+    """The full-log file the importance mode writes to, or ``None``.
 
+    Single concern: turn the two parsed knobs into the concrete path both
+    the Rust full sink and the Python redirect must agree on. When
+    importance mode is off, there is no submitter full-log file (``None``).
+    When on, honour an explicit ``--full-log-file`` else the cwd default.
 
-def _env_truthy(name: str) -> bool:
-    """Whether environment variable ``name`` holds a truthy value.
-
-    Case-insensitive; trims surrounding whitespace. Unset or any other
-    value is false. Shared convention with the Rust `is_truthy` so the
-    env-var interface behaves identically on both sides of the FFI.
+    The per-node ``--full-log-dir`` split is a separate sink (it takes
+    precedence on the Rust side and needs no Python-side redirect, since a
+    container's stdout is captured wholesale by the wrapper), so it is not
+    considered here — this is purely the submitter's single-file path.
     """
-    value = os.environ.get(name)
-    return value is not None and value.strip().lower() in _TRUTHY_VALUES
-
-
-def important_stdio_only_requested(args_list: list[str]) -> bool:
-    """Whether `--important-stdio-only` appears in the argv lookahead.
-
-    A bare membership test (mirroring the existing `--secondary` /
-    `--multi-computer` lookaheads in `setup_logging`) — the flag is a
-    `store_true` with no value token, so no parser is needed.
-
-    This is the FLAG half only; `apply_important_stdio_env` keys on it to
-    translate the flag into the env contract. "Is importance mode active"
-    (the unified question both the flag and the env-var path answer) is
-    `importance_mode_active`.
-    """
-    return IMPORTANT_STDIO_ONLY_FLAG in args_list
-
-
-def importance_mode_active() -> bool:
-    """Whether importance-stdio mode is armed for this submitter process.
-
-    The single predicate for "should the submitter run in importance
-    mode", composing the two ways it can be requested onto the ONE env
-    contract the Rust subscriber also reads:
-
-      * the ``--important-stdio-only`` flag, which `apply_important_stdio_env`
-        has already translated into ``DYNRUNNER_IMPORTANT_STDIO_ONLY=1``
-        by the time the submitter configures logging, and
-      * a wrapping consumer exporting ``DYNRUNNER_IMPORTANT_STDIO_ONLY``
-        directly (the first-class env config path).
-
-    Both collapse to "the env var is truthy", so the Python side reads
-    the same source of truth as the Rust dual-sink subscriber — the two
-    can never disagree about whether the mode is on.
-    """
-    return _env_truthy(IMPORTANT_STDIO_ONLY_ENV)
-
-
-def full_log_file_path() -> Path:
-    """The full-log file the importance mode writes to.
-
-    Honours an operator-supplied `FULL_LOG_FILE_ENV` (so a pre-export
-    composes), else the cwd default. `apply_important_stdio_env` seeds
-    the env var from this, so by `setup_logging` time the var is always
-    set and this re-reads the same value.
-    """
-    configured = os.environ.get(FULL_LOG_FILE_ENV)
-    if configured and configured.strip():
-        return Path(configured)
+    if not important_stdio_only:
+        return None
+    if full_log_file and full_log_file.strip():
+        return Path(full_log_file)
     return Path(DEFAULT_FULL_LOG_FILE)
 
 
-def apply_important_stdio_env(args_list: list[str]) -> None:
-    """Normalise the importance-mode env contract before the first
-    `_native` import (the Rust subscriber reads these ONCE at import) —
-    hence the call sits at the top of `dynamic_runner.__init__`, ahead of
-    the eager `_native` import.
-
-    Two request sources converge here onto the ONE env contract:
-
-      * the ``--important-stdio-only`` flag in ``args_list`` — translated
-        into ``DYNRUNNER_IMPORTANT_STDIO_ONLY=1``, and
-      * a wrapping consumer's pre-exported truthy
-        ``DYNRUNNER_IMPORTANT_STDIO_ONLY`` (the first-class env config
-        path) — already on the contract, nothing to translate.
-
-    When EITHER arms the mode, the default full-log file is seeded so the
-    Rust full sink and the Python redirect agree on a destination (without
-    it the Rust full sink would fall back to stdout and defeat the stdio
-    gating). The flag path and the env path therefore produce identical
-    behaviour — one mechanism, not a parallel surface.
-
-    Idempotent and operator-overridable: it never overwrites a value the
-    operator pre-exported (so `DYNRUNNER_FULL_LOG_FILE=/path run ...`
-    composes), it only fills the gaps the armed mode implies.
-    """
-    if not (important_stdio_only_requested(args_list) or importance_mode_active()):
-        return
-    os.environ.setdefault(IMPORTANT_STDIO_ONLY_ENV, "1")
-    os.environ.setdefault(FULL_LOG_FILE_ENV, DEFAULT_FULL_LOG_FILE)
-
-
-def _redirect_python_logs_to_full_log() -> None:
+def _redirect_python_logs_to_full_log(full_log_file: Path) -> None:
     """Importance-mode Python-side handler reconfiguration: drop the root
     console StreamHandler(s) so Python chatter does not reach stdio, and
-    append a FileHandler to the full-log file so Python's full record is
+    append a FileHandler to ``full_log_file`` so Python's full record is
     preserved alongside the Rust full sink.
 
     Reuses the shared `remove_stream_handlers` helper (no bespoke handler
@@ -188,7 +78,7 @@ def _redirect_python_logs_to_full_log() -> None:
     root logger.
     """
     root = logging.getLogger()
-    file_handler = logging.FileHandler(full_log_file_path(), mode="a")
+    file_handler = logging.FileHandler(full_log_file, mode="a")
     file_handler.setLevel(root.level)
     # Inherit the formatter the just-completed basicConfig installed on a
     # root stream handler so the file record reads identically to what
@@ -201,59 +91,63 @@ def _redirect_python_logs_to_full_log() -> None:
     root.addHandler(file_handler)
 
 
-def setup_logging(args_list: list[str]) -> logging.Logger:
-    """Configure the root logger from the early-arg-parsed flags.
+def setup_logging(args: argparse.Namespace) -> logging.Logger:
+    """Configure logging from the PARSED framework args.
 
-    Looks at `--debug`, `--raw-logs`, and the mode flags (`--secondary`,
-    `--multi-computer`, `--slurm`) to choose a prefix and verbosity. The
-    full argparse pass happens later; this is just a fast lookahead.
+    Single explicit-parameter path (no env vars, no argv lookahead):
 
-    When importance mode is armed (either the `--important-stdio-only`
-    flag or a wrapping consumer's ``DYNRUNNER_IMPORTANT_STDIO_ONLY`` env
-    export — see `importance_mode_active`), the Python console handler is
-    dropped and Python's logs are routed to the full-log file instead, so
-    stdio carries only the Rust-emitted important events (the Rust env
-    side was already read at `_native` import). Off by default — unchanged
-    console logging.
+      * Installs the native tracing subscriber via ``init_logging(...)``
+        with the three parsed knobs — this is the deferred init the
+        `_native` import no longer performs.
+      * Configures the Python root logger's level / prefix from
+        ``--debug`` / ``--raw-logs`` and the role flags (``--secondary``,
+        ``--multi-computer``, ``--slurm``).
+      * When importance mode is on, drops the Python console handler and
+        routes Python's logs to the full-log file so stdio carries only the
+        Rust-emitted important events.
+
+    The role flags choose a prefix: ``S|`` for a secondary, ``P|`` for a
+    distributed primary, none for plain local mode.
     """
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--raw-logs", action="store_true")
+    important_stdio_only = bool(getattr(args, "important_stdio_only", False))
+    full_log_file = getattr(args, "full_log_file", None)
+    full_log_dir = getattr(args, "full_log_dir", None)
 
-    help_requested = "-h" in args_list or "--help" in args_list
+    # Deferred native subscriber install — explicit params, after argparse.
+    # Local import: the native function lives on the package's re-exported
+    # surface; importing at module top would pull `_native` into modules
+    # (like the test harness) that import `logging_setup` in isolation.
+    from . import init_logging
 
-    if not help_requested:
-        early_args, _ = parser.parse_known_args(args_list)
+    init_logging(
+        important_stdio_only=important_stdio_only,
+        full_log_file=full_log_file,
+        full_log_dir=full_log_dir,
+    )
 
-        if "--secondary" in args_list:
-            prefix = "S|"
-        elif "--multi-computer" in args_list or "--slurm" in args_list:
-            prefix = "P|"
-        else:
-            prefix = ""
-
-        log_level = logging.DEBUG if early_args.debug else logging.INFO
-        logger = logging.getLogger()
-        logger.setLevel(log_level)
-
-        if early_args.raw_logs:
-            log_format = f"{prefix}%(message)s"
-            logging.basicConfig(level=log_level, format=log_format)
-        else:
-            if prefix:
-                log_format = f"%(levelname)s | %(asctime)s |{prefix}| %(message)s"
-            else:
-                log_format = "%(levelname)s | %(asctime)s | %(message)s"
-            logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
+    if getattr(args, "secondary", None):
+        prefix = "S|"
+    elif getattr(args, "multi_computer", None) or getattr(args, "slurm", False):
+        prefix = "P|"
     else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(levelname)s | %(asctime)s | %(message)s",
-            datefmt="%H:%M:%S",
-        )
-        logger = logging.getLogger()
+        prefix = ""
 
-    if importance_mode_active():
-        _redirect_python_logs_to_full_log()
+    log_level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
+    logger = logging.getLogger()
+    logger.setLevel(log_level)
+
+    if getattr(args, "raw_logs", False):
+        log_format = f"{prefix}%(message)s"
+        logging.basicConfig(level=log_level, format=log_format)
+    else:
+        if prefix:
+            log_format = f"%(levelname)s | %(asctime)s |{prefix}| %(message)s"
+        else:
+            log_format = "%(levelname)s | %(asctime)s | %(message)s"
+        logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
+
+    resolved = resolve_full_log_file(important_stdio_only, full_log_file)
+    if resolved is not None:
+        _redirect_python_logs_to_full_log(resolved)
 
     return logger

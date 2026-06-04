@@ -1,14 +1,16 @@
 """Thin runner facade: parse argparse, build typed configs, dispatch to Rust.
 
-`run(task, deployment=None, description="...")` is the canonical Python
-entry point.
+`run(task, ..., *, argv=None, args=None)` is the canonical Python entry
+point. It NEVER reads global ``sys.argv``: callers pass an explicit ``argv``
+slice OR a pre-parsed ``args`` namespace, so the framework's CLI is an API
+consumers compose against (see :func:`dynamic_runner.cli_main` and
+:func:`dynamic_runner.cli.add_framework_arguments`).
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 
 from ._forwarded_argv import filter_framework_argv
@@ -30,6 +32,9 @@ def run(
     task: TaskDefinition,
     deployment: TaskDeploymentSpec | None = None,
     description: str = "Dynamic batch processing with memory-aware parallel execution",
+    *,
+    argv: list[str] | None = None,
+    args: argparse.Namespace | None = None,
 ) -> None:
     """Run the dynamic batch processing CLI.
 
@@ -40,13 +45,42 @@ def run(
             ``--multi-computer local|slurm`` is used; ignored in
             single-process and plain-local modes.
         description: Description for the argparse help text.
-    """
-    logger = setup_logging(sys.argv[1:])
+        argv: Explicit framework+task argv slice to parse (the tokens a
+            framework parser, plus ``task.add_task_arguments``, accept).
+            Mutually exclusive with ``args``. Defaults to ``[]`` — the
+            framework NEVER reads global ``sys.argv``; a programmatic
+            caller that wants the historical "parse my command line"
+            behaviour passes ``argv=sys.argv[1:]`` explicitly.
+        args: A pre-parsed framework namespace (e.g. a consumer that ran
+            its own combined parser with
+            :func:`dynamic_runner.cli.add_framework_arguments` attached).
+            Mutually exclusive with ``argv``. When given, parsing is
+            skipped and the namespace is used directly; the forwarded
+            secondary argv is empty (the consumer carries no task-filter
+            flags to relay — those, if any, ride the ``argv`` path).
 
-    parser = build_arg_parser(description)
-    task.add_task_arguments(parser)
-    args = parser.parse_args()
-    validate_parsed_args(args, parser)
+    The forwarded secondary argv (task-filter flags the setup-promoted
+    secondary must re-parse, minus the framework-regenerated/submitter-local
+    flags) is derived from ``argv`` via
+    :func:`dynamic_runner._forwarded_argv.filter_framework_argv` — the
+    framework's own flag knowledge, not a consumer strip-set.
+    """
+    if argv is not None and args is not None:
+        raise ValueError("run() accepts argv OR args, not both")
+
+    if args is None:
+        parse_argv = argv if argv is not None else []
+        parser = build_arg_parser(description)
+        task.add_task_arguments(parser)
+        args = parser.parse_args(parse_argv)
+        validate_parsed_args(args, parser)
+        forward_source = parse_argv
+    else:
+        # Pre-parsed namespace path: the consumer owns parse + validation
+        # (it attached `add_framework_arguments` to its own parser). No
+        # task-filter argv to forward — the secondary re-discovers from the
+        # framework-regenerated invocation.
+        forward_source = []
 
     # Stash the dispatcher's argv-minus-framework-regenerated-flags so
     # the SLURM wrapper can forward task-specific filter args
@@ -57,7 +91,30 @@ def run(
     # carries other dispatch-time-only attributes (`resolved_output_root`,
     # `_setup_deferred_to_secondary`) and the non-SLURM dispatch paths
     # simply ignore the field.
-    args.forwarded_argv = filter_framework_argv(sys.argv[1:])
+    args.forwarded_argv = filter_framework_argv(forward_source)
+
+    # Configure logging from the PARSED args — explicit params, after parse
+    # (installs the native subscriber via `init_logging`, no env vars).
+    setup_logging(args)
+
+    dispatch(task, args, deployment)
+
+
+def dispatch(
+    task: TaskDefinition,
+    args: argparse.Namespace,
+    deployment: TaskDeploymentSpec | None,
+) -> None:
+    """Route a parsed-and-logging-configured ``args`` to the right mode.
+
+    The single dispatch implementation shared by :func:`run` and
+    :func:`dynamic_runner.cli_main.cli_main` — there is no duplicated
+    argv→mode logic (CLAUDE.md no-two-implementations). Callers must have
+    already parsed ``args``, set ``args.forwarded_argv``, and configured
+    logging; this function owns only the secondary / observer /
+    multi-computer / local mode selection.
+    """
+    logger = logging.getLogger()
 
     if args.secondary:
         _dispatch_secondary(task, args, logger)

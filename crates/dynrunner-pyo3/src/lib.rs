@@ -53,7 +53,12 @@ use system_resources::{parse_cores, parse_memory, pick_free_port};
 /// `_native` and adds the pure-Python `comm` subpackage.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    logging::init();
+    // Logging is NOT installed at import: the subscriber is chosen by the
+    // Python CLI's parsed flags and installed explicitly via `init_logging`
+    // (see `crate::logging::py_init_logging`). Installing at import would
+    // force the config to be read from the environment before argparse runs
+    // — the exact import-time coupling this surface removes.
+    m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;

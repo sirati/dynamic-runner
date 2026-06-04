@@ -14,36 +14,43 @@
 //! never a per-call-site `if`. Emitting at `target: "dynrunner_important"`
 //! is therefore the only thing a call site needs to know.
 //!
-//! Selection is read ONCE from the environment at [`init`] time, a fixed
-//! contract shared with the Python side (which sets the variables before
-//! the first `_native` import):
+//! Selection is passed in EXPLICITLY by the Python side after argparse
+//! (`init_logging(...)` — see [`crate::logging::py_init_logging`]), never
+//! read from the environment. The three knobs the Python CLI surface owns:
 //!
-//!   * [`IMPORTANT_STDIO_ONLY_ENV`] — truthy enables importance mode.
-//!   * [`FULL_LOG_FILE_ENV`] — optional explicit path for a single full-log
-//!     file (the submitter's `--important-stdio-only` sink). When set, the
-//!     full sink writes there (so stdout can be gated without losing the
-//!     full log).
-//!   * [`FULL_LOG_DIR_ENV`] — optional per-node directory anchored on the
+//!   * `important_stdio_only` — enables importance mode.
+//!   * `full_log_file` — optional explicit path for a single full-log file
+//!     (the submitter's `--important-stdio-only` sink). When set, the full
+//!     sink writes there (so stdout can be gated without losing the full
+//!     log).
+//!   * `full_log_dir` — optional per-node directory anchored on the
 //!     gateway-shared `--log-dir` mount. When set, the framework's own
 //!     runner log is persisted under it, SPLIT BY ROLE: primary-role
 //!     events to `<dir>/primary.log`, secondary-role events to
 //!     `<dir>/secondary.log`. So the log of a relocated/co-located primary
-//!     is isolated from its host secondary's, and both land host-readably
-//!     even when [`FULL_LOG_FILE_ENV`] is unset inside the container. The
-//!     role is read off the run future's role span (see
+//!     is isolated from its host secondary's, and both land host-readably.
+//!     The role is read off the run future's role span (see
 //!     [`role_full_layer`] and `dynrunner_core::role_span`), never a
-//!     per-call-site branch. Takes precedence over [`FULL_LOG_FILE_ENV`]:
-//!     the per-node mount is the durable sink the spawn paths inject, the
-//!     single-file var is the submitter-only legacy path.
-//!     When neither is set, the full log stays on stdout and shell/sbatch
-//!     redirection captures it, preserving today's single-stream
-//!     behaviour.
+//!     per-call-site branch. Takes precedence over `full_log_file`: the
+//!     per-node mount is the durable sink the spawn paths forward as a CLI
+//!     arg, the single-file knob is the submitter-only path. When neither
+//!     is set, the full log stays on stdout and shell/sbatch redirection
+//!     captures it, preserving today's single-stream behaviour.
+//!
+//! The subscriber is NOT installed at `_native` import — installing it
+//! there forced the config to be read from the environment before argparse
+//! could run. Instead [`py_init_logging`] installs it explicitly after the
+//! Python CLI has parsed the flags. Until that call lands there is no
+//! global subscriber, so any framework event emitted in the pre-init
+//! window is dropped (the framework drives no run loop in that window, so
+//! nothing operator-relevant is lost).
 
 use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 
 use chrono::Local;
+use pyo3::prelude::*;
 use tracing::{Event, Metadata};
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::MakeWriter;
@@ -63,31 +70,15 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// emit target and the gate can never diverge.
 pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
-/// Environment variable selecting importance mode. Truthy = on. Read once
-/// at [`init`]; set by Python before the first `_native` import.
-pub(crate) const IMPORTANT_STDIO_ONLY_ENV: &str = "DYNRUNNER_IMPORTANT_STDIO_ONLY";
-
-/// Optional destination for the full (unfiltered) sink. When set, the full
-/// log is written here instead of stdout, so stdout can carry only the
-/// important events without losing the full record.
-pub(crate) const FULL_LOG_FILE_ENV: &str = "DYNRUNNER_FULL_LOG_FILE";
-
-/// Optional per-node directory (the container-internal `--log-dir` mount
-/// path for this node) under which the framework's own runner log is
-/// persisted. Injected by the SLURM spawn paths so every container's full
-/// log lands on the gateway-shared mount. Read once at [`init`]; takes
-/// precedence over [`FULL_LOG_FILE_ENV`].
-pub(crate) const FULL_LOG_DIR_ENV: &str = "DYNRUNNER_FULL_LOG_DIR";
-
-/// Filename for primary-role events under [`FULL_LOG_DIR_ENV`]: every
+/// Filename for primary-role events under the per-node full-log dir: every
 /// event a primary coordinator's run future emits (it carries the
 /// [`PRIMARY_ROLE_SPAN`]). Separate from [`SECONDARY_LOG_FILENAME`] so a
 /// relocated/co-located primary's log is isolated from its host
 /// secondary's in the one-process promoted case.
 const PRIMARY_LOG_FILENAME: &str = "primary.log";
 
-/// Filename for secondary-role events under [`FULL_LOG_DIR_ENV`]: every
-/// event a secondary coordinator's run future emits (it carries the
+/// Filename for secondary-role events under the per-node full-log dir:
+/// every event a secondary coordinator's run future emits (it carries the
 /// [`SECONDARY_ROLE_SPAN`]).
 const SECONDARY_LOG_FILENAME: &str = "secondary.log";
 
@@ -103,13 +94,13 @@ pub(crate) enum FullSink {
     /// Share stdout with the stdio sink. Used when no full-log file is
     /// configured; preserves the historical single-stream behaviour.
     Stdout,
-    /// A single dedicated file (the submitter's explicit
-    /// [`FULL_LOG_FILE_ENV`] path). Lets stdout be gated without losing
-    /// the full log; one unfiltered layer, the only role on the bare
-    /// submitter is its own primary.
+    /// A single dedicated file (the submitter's explicit `full_log_file`
+    /// path). Lets stdout be gated without losing the full log; one
+    /// unfiltered layer, the only role on the bare submitter is its own
+    /// primary.
     File(PathBuf),
-    /// A per-node directory (the [`FULL_LOG_DIR_ENV`] mount path for this
-    /// node). The verbose sink splits by role: primary-span events to
+    /// A per-node directory (the `full_log_dir` mount path for this node).
+    /// The verbose sink splits by role: primary-span events to
     /// `<dir>/primary.log`, secondary-span events to `<dir>/secondary.log`.
     /// In the one-process promoted case the relocated/co-located primary
     /// and its host secondary are distinct `spawn_local` tasks carrying
@@ -117,7 +108,8 @@ pub(crate) enum FullSink {
     PerNodeDir(PathBuf),
 }
 
-/// Resolved logging mode, read once from the environment.
+/// Resolved logging mode, built from explicit parameters the Python CLI
+/// surface passes to [`py_init_logging`] after argparse.
 #[derive(Debug)]
 pub(crate) struct LogConfig {
     /// Whether the stdio sink is gated to the important target only.
@@ -127,22 +119,24 @@ pub(crate) struct LogConfig {
 }
 
 impl LogConfig {
-    /// Read the mode from the process environment. Truthiness mirrors the
-    /// common shell convention used on the Python side.
-    pub(crate) fn from_env() -> Self {
-        let important_stdio_only = std::env::var(IMPORTANT_STDIO_ONLY_ENV)
-            .map(|v| is_truthy(&v))
-            .unwrap_or(false);
-        // The per-node `--log-dir` mount wins over the legacy single-file
-        // var: it is the durable sink the spawn paths inject so every
-        // container persists its runner log, whereas `FULL_LOG_FILE_ENV`
-        // is the submitter-only `--important-stdio-only` path. Neither set
-        // → stdout (historical single-stream).
-        let full_sink = match std::env::var(FULL_LOG_DIR_ENV) {
-            Ok(dir) if !dir.trim().is_empty() => FullSink::PerNodeDir(PathBuf::from(dir)),
-            _ => match std::env::var(FULL_LOG_FILE_ENV) {
-                Ok(path) if !path.trim().is_empty() => FullSink::File(PathBuf::from(path)),
-                _ => FullSink::Stdout,
+    /// Build the mode from explicit parameters. The per-node `full_log_dir`
+    /// wins over the single `full_log_file`: it is the durable sink the
+    /// spawn paths forward (as a `--full-log-dir` CLI arg) so every
+    /// container persists its runner log split by role, whereas
+    /// `full_log_file` is the submitter-only `--important-stdio-only` path.
+    /// Neither set → stdout (historical single-stream). Whitespace-only
+    /// strings are treated as unset so an empty CLI value collapses cleanly.
+    pub(crate) fn new(
+        important_stdio_only: bool,
+        full_log_file: Option<String>,
+        full_log_dir: Option<String>,
+    ) -> Self {
+        let trimmed = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
+        let full_sink = match trimmed(full_log_dir) {
+            Some(dir) => FullSink::PerNodeDir(PathBuf::from(dir)),
+            None => match trimmed(full_log_file) {
+                Some(path) => FullSink::File(PathBuf::from(path)),
+                None => FullSink::Stdout,
             },
         };
         Self {
@@ -150,15 +144,6 @@ impl LogConfig {
             full_sink,
         }
     }
-}
-
-/// Truthy test shared with the Python side: `1`, `true`, `yes`, `on`
-/// (case-insensitive). Everything else — including unset — is false.
-fn is_truthy(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 /// The single layer-level gate for the stdio sink. Passes an event iff it
@@ -362,13 +347,39 @@ where
     layers
 }
 
-/// Install the process-wide subscriber from the environment. Idempotent and
-/// non-fatal: a second call (or a pre-existing global subscriber) is a no-op.
-pub(crate) fn init() {
-    let config = LogConfig::from_env();
+/// Install the process-wide subscriber for `config`. Idempotent and
+/// non-fatal: a second call (or a pre-existing global subscriber) is a
+/// no-op, so a secondary that re-enters `init_logging` after a respawn or
+/// a consumer that calls `cli_main` then `run` cannot panic.
+pub(crate) fn init_with(config: &LogConfig) {
     let _ = tracing_subscriber::registry()
-        .with(build_layers(&config))
+        .with(build_layers(config))
         .try_init();
+}
+
+/// Install the process-wide tracing subscriber from EXPLICIT parameters the
+/// Python CLI surface passes after argparse. This is the single, deferred
+/// init point — the `_native` pymodule init no longer installs logging, so
+/// the config is chosen by parsed flags rather than read from the
+/// environment at import.
+///
+/// Single concern: translate the three Python-side logging knobs into a
+/// [`LogConfig`] and install it. `important_stdio_only` arms the stdio gate;
+/// `full_log_file` / `full_log_dir` choose the full sink (dir wins — see
+/// [`LogConfig::new`]).
+#[pyfunction]
+#[pyo3(name = "init_logging", signature = (
+    important_stdio_only = false,
+    full_log_file = None,
+    full_log_dir = None,
+))]
+pub(crate) fn py_init_logging(
+    important_stdio_only: bool,
+    full_log_file: Option<String>,
+    full_log_dir: Option<String>,
+) {
+    let config = LogConfig::new(important_stdio_only, full_log_file, full_log_dir);
+    init_with(&config);
 }
 
 #[cfg(test)]
@@ -582,23 +593,30 @@ mod tests {
     }
 
     #[test]
-    fn truthy_parsing_matches_shared_contract() {
-        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
-            assert!(is_truthy(v), "expected truthy: {v:?}");
-        }
-        for v in ["0", "false", "no", "off", "", "maybe"] {
-            assert!(!is_truthy(v), "expected falsy: {v:?}");
-        }
+    fn config_dir_wins_over_file_and_whitespace_is_unset() {
+        // `LogConfig::new` is the param contract the Python CLI feeds:
+        // the per-node dir takes precedence over the single file, and a
+        // whitespace-only value collapses to "unset" so an empty CLI value
+        // is treated the same as an omitted one.
+        let cfg = LogConfig::new(true, Some("/x/full.log".into()), Some("/x/dir".into()));
+        assert!(matches!(cfg.full_sink, FullSink::PerNodeDir(_)));
+        assert!(cfg.important_stdio_only);
+
+        let cfg = LogConfig::new(false, Some("/x/full.log".into()), None);
+        assert!(matches!(cfg.full_sink, FullSink::File(_)));
+
+        let cfg = LogConfig::new(false, Some("   ".into()), Some("\t".into()));
+        assert!(
+            matches!(cfg.full_sink, FullSink::Stdout),
+            "whitespace-only knobs must collapse to the stdout single-stream"
+        );
     }
 
     #[test]
     fn no_full_log_file_yields_a_single_stdout_stream() {
         // Default config (no file, gate off) must produce exactly one
         // layer — the historical single stdout stream, no duplication.
-        let config = LogConfig {
-            important_stdio_only: false,
-            full_sink: FullSink::Stdout,
-        };
+        let config = LogConfig::new(false, None, None);
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
@@ -609,14 +627,15 @@ mod tests {
 
     #[test]
     fn single_full_log_file_adds_one_unfiltered_layer() {
-        // The submitter's explicit `FULL_LOG_FILE_ENV` path: one verbose
-        // file layer + the stdio layer. No role split (the bare submitter's
+        // The submitter's explicit `full_log_file` path: one verbose file
+        // layer + the stdio layer. No role split (the bare submitter's
         // only role is its own primary).
         let dir = tempfile::tempdir().unwrap();
-        let config = LogConfig {
-            important_stdio_only: true,
-            full_sink: FullSink::File(dir.path().join("full.log")),
-        };
+        let config = LogConfig::new(
+            true,
+            Some(dir.path().join("full.log").display().to_string()),
+            None,
+        );
         let layers = build_layers::<Registry>(&config);
         assert_eq!(layers.len(), 2, "expected full-file layer + stdio layer");
     }
@@ -630,10 +649,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
-        let config = LogConfig {
-            important_stdio_only: false,
-            full_sink: FullSink::PerNodeDir(node_dir.clone()),
-        };
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()));
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),

@@ -852,7 +852,6 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupf
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
-    -e DYNRUNNER_FULL_LOG_DIR="/app/log-network/{sid}" \
 {dynrunner_env_block}    -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
@@ -861,7 +860,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupf
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec} --src-network={src_network_path} --log-dir=/app/log-network{mem_manager_reserved_block}{forwarded_argv_block}"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec} --src-network={src_network_path} --log-dir=/app/log-network --full-log-dir=/app/log-network/{sid}{mem_manager_reserved_block}{forwarded_argv_block}"##
     ));
 
     script.push_str(
