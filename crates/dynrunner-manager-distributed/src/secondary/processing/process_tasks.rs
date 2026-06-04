@@ -64,7 +64,7 @@ where
         // A `SetupPending` re-entry (and the late-joiner observer, which
         // `restore_from_snapshot_and_skip_setup` landed directly in
         // `Operational`) finds the lifecycle already `Operational`, so the
-        // transition is a no-op on the state — and the four fire-once
+        // transition is a no-op on the state — and the three fire-once
         // latches' `Option::take()`s yield `None` the second time, so the
         // loop's latch locals re-park exactly as the pre-typed flat-field
         // flow did across the yield. The carrier ferries only the receivers
@@ -74,19 +74,26 @@ where
         // `command_rx` is transferred to the co-located primary — none is
         // drained here, so none rides this carrier.
         //
-        // The co-located loopback inbound receiver is deliberately NOT a
-        // fire-once latch: it is the SOLE terminal-signal path on a promoted
-        // node (the co-located primary's `RunComplete` reaches this loop only
-        // via the loopback — the mesh never closes), and a `SetupPending`
-        // re-entry IS a genuine second consumption. It is moved into
-        // `OperationalState` at `enter_operational` (first entry only; the
-        // re-entry passes `None` to the no-op `Operational` arm, preserving
-        // the receiver restored before the prior yield), then `take`-n into a
-        // loop-local below and restored to `OperationalState` before the
-        // `SetupPending` return.
+        // The co-located loopback inbound receiver and the panik signal
+        // receiver are deliberately NOT fire-once latches: each is the SOLE
+        // terminal-signal path for a NON-observer node that DOES take the
+        // `SetupPending` excursion, and a `SetupPending` re-entry IS a genuine
+        // second consumption.
+        //   - loopback: on a promoted node the co-located primary's
+        //     `RunComplete` reaches this loop only via the loopback (the mesh
+        //     never closes). Moved into `OperationalState` at
+        //     `enter_operational` (first entry only; the re-entry passes
+        //     `None` to the no-op `Operational` arm, preserving the receiver
+        //     restored before the prior yield).
+        //   - panik: a regular (non-observer) secondary registers panik AND
+        //     can be the pre-staged discovery node, so a SIGTERM delivered
+        //     after the discovery yield must still be acted on. Seeded into a
+        //     loop-local below from the coordinator slot (with a fallback to
+        //     the restored `OperationalState` value on re-entry).
+        // Both are `take`-n into loop-locals below and restored to
+        // `OperationalState` before the `SetupPending` return.
         let latches = super::super::lifecycle::OperationalLatches {
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
-            panik_signal_rx: self.panik_signal_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
             on_cluster_state_refresh: self.on_cluster_state_refresh.take(),
         };
@@ -116,7 +123,6 @@ where
         self.lifecycle = lifecycle;
         let super::super::lifecycle::OperationalLatches {
             mut announcer_outbox_rx,
-            mut panik_signal_rx,
             mut fatal_exit_signal_rx,
             on_cluster_state_refresh,
         } = latches;
@@ -128,6 +134,23 @@ where
         // loopback arm would conflict. It is restored to `OperationalState`
         // before the `SetupPending` return so re-entry re-attaches it.
         let mut colocated_loopback_inbound_rx = self.op_mut().colocated_loopback_inbound_rx.take();
+        // Seed the resumable panik receiver into a loop-local for the panik
+        // `select!` arm. Same loop-local requirement as the loopback arm. The
+        // seed is `coordinator-slot, else OperationalState`:
+        //   - First entry (normal or observer): the live receiver is on the
+        //     coordinator slot (`register_panik_signal_rx`), `OperationalState`
+        //     is `None` → take the coordinator slot.
+        //   - `SetupPending` re-entry: the coordinator slot is already `None`
+        //     (taken on the first entry) → fall back to the value restored to
+        //     `OperationalState` before the prior yield.
+        // It is restored to `OperationalState` before the `SetupPending`
+        // return (below) so re-entry re-attaches it — without that, a SIGTERM
+        // delivered after a pre-staged discovery yield would never reach the
+        // re-parked arm and graceful shutdown would fall back to `SIGKILL`.
+        let mut panik_signal_rx = self
+            .panik_signal_rx
+            .take()
+            .or_else(|| self.op_mut().panik_signal_rx.take());
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: after a host suspend/resume the
@@ -181,19 +204,20 @@ where
             }
         }
 
-        // `announcer_outbox_rx`, `panik_signal_rx`, `fatal_exit_signal_rx`,
-        // and `on_cluster_state_refresh` were surrendered into the loop's
-        // locals at the single `enter_operational` latch boundary above
-        // (the take-once carrier), so they own their receivers across the
+        // `announcer_outbox_rx`, `fatal_exit_signal_rx`, and
+        // `on_cluster_state_refresh` were surrendered into the loop's locals
+        // at the single `enter_operational` latch boundary above (the
+        // take-once carrier), so they own their receivers across the
         // `select!` iterations exactly as the pre-typed flat-field flow
         // did with per-field `Option::take()`. Each is `None` when its
-        // registration never happened (no observer announcer / no
-        // `--panik-file` / no fatal-exit policy / no refresh consumer) and
-        // the matching arm parks on `pending()`. `colocated_loopback_inbound_rx`
-        // is the one local owned across iterations that is NOT a fire-once
-        // latch: it round-trips through `OperationalState` so it survives a
-        // `SetupPending` re-entry (see the take above and the restore before
-        // the `SetupPending` return below).
+        // registration never happened (no observer announcer / no fatal-exit
+        // policy / no refresh consumer) and the matching arm parks on
+        // `pending()`. `colocated_loopback_inbound_rx` and `panik_signal_rx`
+        // are the two locals owned across iterations that are NOT fire-once
+        // latches: each round-trips through `OperationalState` so it survives
+        // a `SetupPending` re-entry (see the takes above and the restore
+        // before the `SetupPending` return below). `panik_signal_rx` is
+        // `None` only when no panik paths were configured.
         //
         // Grace for the SIGTERM → SIGKILL escalation on the worker pool is
         // 5s — same window the SubprocessWorkerFactory uses for its own
@@ -607,16 +631,23 @@ where
                      yielding from process_tasks so caller can run \
                      task.discover_items and call ingest_setup_discovery"
                 );
-                // Restore the loopback receiver to its resumable home in
-                // `OperationalState` BEFORE yielding. This is the ONLY return
-                // path that re-enters `process_tasks`; the loop-local would
-                // otherwise drop here and the re-entry would find `None`,
-                // parking the loopback arm on `pending()` forever — on a
-                // promoted node that loses the SOLE path to its own primary's
-                // `RunComplete` and leaks the run. Restoring to
-                // `OperationalState` (NOT the coordinator's fire-once slot)
-                // is what makes the receiver resumable across re-entry.
+                // Restore the resumable terminal-signal receivers to their
+                // home in `OperationalState` BEFORE yielding. This is the ONLY
+                // return path that re-enters `process_tasks`; a loop-local
+                // would otherwise drop here and the re-entry would find `None`
+                // (the coordinator slots are already consumed), parking the
+                // arm on `pending()` forever.
+                //   - loopback: on a promoted node that loses the SOLE path to
+                //     its own primary's `RunComplete` and leaks the run.
+                //   - panik: a SIGTERM (or sentinel file) delivered after this
+                //     pre-staged discovery yield would never be acted on by
+                //     the secondary loop — graceful shutdown is lost and
+                //     teardown falls back to the kernel `SIGKILL`.
+                // Restoring to `OperationalState` (NOT the coordinator's
+                // fire-once slots) is what makes them resumable across
+                // re-entry.
                 self.op_mut().colocated_loopback_inbound_rx = colocated_loopback_inbound_rx;
+                self.op_mut().panik_signal_rx = panik_signal_rx;
                 return Ok(RunOutcome::SetupPending);
             }
 
