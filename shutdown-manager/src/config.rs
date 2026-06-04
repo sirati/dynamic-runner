@@ -78,6 +78,21 @@ pub struct Config {
     /// been updated; the wrapper-script renderer resolves
     /// `command -v rm` and threads the absolute path explicitly.
     pub rm_path: PathBuf,
+    /// Optional HOST-side path of the secondary's monitored panik
+    /// sentinel. The secondary's in-container panik watcher polls a
+    /// fixed file under a podman bind-mounted folder (the wrapper
+    /// injects `--panik-file <container-path>` and mounts the same
+    /// directory host↔container); this flag carries the HOST side of
+    /// that exact same file so the reaper can write it.
+    ///
+    /// Used ONLY as a graceful last resort: when the direct PID-reap
+    /// reports the workload still alive (`OrphanSurvives`), the reaper
+    /// writes this sentinel and waits a bounded window for the
+    /// secondary's watcher to run its own graceful shutdown and exit.
+    /// `None` (the default) disables the last-resort attempt entirely —
+    /// a surviving orphan goes straight to the non-zero exit, preserving
+    /// pre-this-flag behaviour for callers that have not been updated.
+    pub panik_file: Option<PathBuf>,
 }
 
 /// Default per the CLI contract.
@@ -103,6 +118,7 @@ struct Builder {
     log_file: Option<PathBuf>,
     podman_path: Option<PathBuf>,
     rm_path: Option<PathBuf>,
+    panik_file: Option<PathBuf>,
 }
 
 impl Builder {
@@ -141,6 +157,7 @@ impl Builder {
                 .podman_path
                 .unwrap_or_else(|| PathBuf::from("podman")),
             rm_path: self.rm_path.unwrap_or_else(|| PathBuf::from("rm")),
+            panik_file: self.panik_file,
         })
     }
 }
@@ -199,6 +216,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
             "--log-file" => b.log_file = Some(PathBuf::from(take_str(&mut iter)?)),
             "--podman-path" => b.podman_path = Some(PathBuf::from(take_str(&mut iter)?)),
             "--rm-path" => b.rm_path = Some(PathBuf::from(take_str(&mut iter)?)),
+            "--panik-file" => b.panik_file = Some(PathBuf::from(take_str(&mut iter)?)),
             other => return Err(format!("unknown flag: {}", other)),
         }
     }
@@ -460,4 +478,41 @@ mod tests {
         );
     }
 
+    /// Omitting `--panik-file` resolves to `None`, disabling the
+    /// graceful last-resort entirely — a surviving orphan goes straight
+    /// to the non-zero exit, exactly as before this flag existed.
+    #[test]
+    fn panik_file_defaults_to_none() {
+        let cfg = parse(minimal_required()).expect("must parse");
+        assert!(
+            cfg.panik_file.is_none(),
+            "--panik-file omitted ⇒ None (no last-resort sentinel write)"
+        );
+    }
+
+    /// `--panik-file <host-path>` threads the host side of the
+    /// secondary's monitored sentinel into the resolved config verbatim.
+    /// The wrapper passes the host side of the same bind-mounted file the
+    /// secondary's in-container watcher polls.
+    #[test]
+    fn parses_panik_file_optional() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--panik-file", "/tmp/asm-XXX/log/.dynrunner-reaper.panik"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(
+            cfg.panik_file,
+            Some(PathBuf::from("/tmp/asm-XXX/log/.dynrunner-reaper.panik")),
+        );
+    }
+
+    #[test]
+    fn panik_file_equals_form() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--panik-file=/tmp/asm-XXX/log/.dynrunner-reaper.panik"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(
+            cfg.panik_file,
+            Some(PathBuf::from("/tmp/asm-XXX/log/.dynrunner-reaper.panik")),
+        );
+    }
 }

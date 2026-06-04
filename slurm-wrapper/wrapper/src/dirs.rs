@@ -6,6 +6,30 @@ use dynrunner_slurm_wrapper_config::WrapperConfig;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+/// Container-internal mount point of the per-node scratch `log` dir.
+/// `[`Layout::log_tmp`]` (host: `<rndtmp>/log`) is bind-mounted here by
+/// `podman_run.rs` (`-v <log_tmp>:/app/log-tmp`). Single source of
+/// truth for the one bind mount the reaper-panik sentinel rides on, so
+/// the host side ([`Layout::reaper_panik_host_path`]) and the container
+/// side ([`reaper_panik_container_path`]) can never drift.
+pub const LOG_TMP_CONTAINER_PATH: &str = "/app/log-tmp";
+
+/// Fixed basename of the reaper's graceful-last-resort panik sentinel.
+/// Framework-owned (dot-prefixed so it never collides with an operator
+/// `--panik-file` or a log file): the wrapper injects
+/// `--panik-file <container-path>` so the secondary's in-container
+/// watcher polls it, and passes the matching HOST path to the
+/// shutdown-manager so a surviving orphan can be asked to stop
+/// gracefully.
+pub const REAPER_PANIK_SENTINEL_BASENAME: &str = ".dynrunner-reaper.panik";
+
+/// Container-internal path of the reaper-panik sentinel — the exact
+/// path the secondary's panik watcher is told to poll. Mirror of
+/// [`Layout::reaper_panik_host_path`] across the `log_tmp` bind mount.
+pub fn reaper_panik_container_path() -> String {
+    format!("{LOG_TMP_CONTAINER_PATH}/{REAPER_PANIK_SENTINEL_BASENAME}")
+}
+
 /// All scratch paths + derived names, computed from the config's
 /// `rand_suffix` and `secondary_id`. Mirrors the bash shell variables
 /// RNDTMP, CONTAINER_NAME, {src,out,log}_tmp, PODMAN_STORAGE/RUN,
@@ -64,6 +88,18 @@ impl Layout {
             shutdown_pid_file,
             local_image,
         }
+    }
+
+    /// HOST-side path of the reaper-panik sentinel: the file under the
+    /// per-node scratch `log` dir that is bind-mounted into the
+    /// container at [`reaper_panik_container_path`]. The
+    /// shutdown-manager (on the host) writes here as a graceful last
+    /// resort; the secondary's in-container watcher sees it appear at
+    /// the mirrored container path and runs its own shutdown. Derived
+    /// from [`Self::log_tmp`] so the two sides share one source of
+    /// truth.
+    pub fn reaper_panik_host_path(&self) -> PathBuf {
+        self.log_tmp.join(REAPER_PANIK_SENTINEL_BASENAME)
     }
 
     /// mkdir -p the scratch tree; chmod 700 on podman storage + run
@@ -146,6 +182,34 @@ mod tests {
             PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.pid")
         );
         assert_eq!(l.local_image, PathBuf::from("/tmp/asm-2f1d4e89/img.tar"));
+    }
+
+    /// The reaper-panik sentinel's HOST path lives under the per-node
+    /// `log` dir (the host side of the `/app/log-tmp` bind mount), and
+    /// the CONTAINER path is the basename joined to that mount point.
+    /// Both derive from the same basename + mount constant so the
+    /// host-side reaper write and the in-container watcher poll the
+    /// SAME file.
+    #[test]
+    fn reaper_panik_host_and_container_paths_mirror_across_log_tmp_mount() {
+        let cfg = cfg_with("2f1d4e89", "sec-0", "img.tar");
+        let l = Layout::derive(&cfg);
+        assert_eq!(
+            l.reaper_panik_host_path(),
+            PathBuf::from("/tmp/asm-2f1d4e89/log/.dynrunner-reaper.panik"),
+            "host side must be <log_tmp>/<basename>"
+        );
+        assert_eq!(
+            reaper_panik_container_path(),
+            "/app/log-tmp/.dynrunner-reaper.panik",
+            "container side must be <log-tmp mount>/<basename>"
+        );
+        // The host and container paths share the SAME basename — the
+        // load-bearing property that makes the bind-mount mirror work.
+        assert_eq!(
+            l.reaper_panik_host_path().file_name().unwrap().to_str().unwrap(),
+            reaper_panik_container_path().rsplit('/').next().unwrap(),
+        );
     }
 
     #[test]
