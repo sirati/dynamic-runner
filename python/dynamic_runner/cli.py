@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 
 from ._shared import add_selection_arguments
+from .logging_setup import IMPORTANT_STDIO_ONLY_FLAG
 
 
 def parse_duration_secs(value: str) -> float:
@@ -64,7 +65,7 @@ def add_framework_arguments(
         help="Use raw log formatting (no level, timestamp - only prefix and message)",
     )
     parser.add_argument(
-        "--important-stdio-only",
+        IMPORTANT_STDIO_ONLY_FLAG,
         action="store_true",
         help=(
             "LLM-wake stdio mode: send only important (wake-worthy) events to "

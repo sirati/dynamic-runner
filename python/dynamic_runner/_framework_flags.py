@@ -35,6 +35,8 @@ from __future__ import annotations
 import argparse
 from functools import lru_cache
 
+from .logging_setup import IMPORTANT_STDIO_ONLY_FLAG
+
 
 # Value-taking framework flags the SLURM spawn paths regenerate from
 # per-job state. `--full-log-dir` joins this set: the spawn paths forward
@@ -61,7 +63,7 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
 # secondary still gets `--full-log-dir` for its per-role file logs.
 SUBMITTER_LOCAL_FLAGS: frozenset[str] = frozenset(
     {
-        "--important-stdio-only",
+        IMPORTANT_STDIO_ONLY_FLAG,
     }
 )
 

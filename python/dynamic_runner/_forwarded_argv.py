@@ -8,9 +8,9 @@ the secondary — *except* two categories of flag this filter drops:
 
   * **framework-regenerated value flags** (``--secondary``,
     ``--secondary-id``, ``--secondary-quic-port``, ``--src-network``,
-    ``--cores``, ``--max-memory``, ``--log-dir``) which the SLURM
-    wrapper emits afresh per-job; forwarding them would duplicate the
-    flag and confuse argparse, and
+    ``--cores``, ``--max-memory``, ``--log-dir``, ``--full-log-dir``)
+    which the SLURM wrapper emits afresh per-job; forwarding them would
+    duplicate the flag and confuse argparse, and
 
   * **submitter-local boolean flags** — flags that configure the
     *submitter's* behaviour only and must NOT change how a secondary
@@ -18,9 +18,10 @@ the secondary — *except* two categories of flag this filter drops:
     operator arms LLM-wake stdio mode on the submitter, but secondaries
     must keep their FULL logs for debugging (and post-relocation the
     operator's narrative comes from the observer reading the CRDT, not
-    from secondaries' stdout). The literal is owned by the logging
-    concern (:mod:`dynamic_runner.logging_setup`); this filter imports
-    it so the two cannot drift.
+    from secondaries' stdout). This filter imports the classification
+    sets from :mod:`dynamic_runner._framework_flags`; the flag *string*
+    itself is owned by :mod:`dynamic_runner.logging_setup` and referenced
+    from there, so neither the classification nor the literal can drift.
 
 The result is opaque to all downstream layers (SlurmPreparation,
 SlurmJobManager, the Rust wrapper-script generator). Only this

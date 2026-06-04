@@ -115,7 +115,6 @@ __all__ = [
     "SubprocessSpec",
     "WorkerSpec",
     "compute_task_hash",
-    "init_logging",
     "parse_cores",
     "parse_memory",
     "pick_free_port",
