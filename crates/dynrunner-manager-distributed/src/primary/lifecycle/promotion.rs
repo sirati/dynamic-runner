@@ -102,6 +102,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // tick is skipped (secondaries may not have sent their own first
         // keepalive yet), the cadence is `keepalive_interval`.
         let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
+        // Skip (not Burst) missed ticks: collapse a suspend/resume backlog to a
+        // single catch-up tick rather than bursting one keepalive per missed
+        // interval. Same rationale as the operational loop's `heartbeat_tick`.
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         heartbeat_tick.tick().await;
 
         loop {

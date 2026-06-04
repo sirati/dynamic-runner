@@ -320,10 +320,18 @@ where
                 // already excludes the current primary, so its length IS
                 // the live-peer count.
                 let peer_count = live_peers.len();
+                // Each `TimeoutResponse.last_keepalive` is now a monotonic AGE
+                // (seconds since the responder last saw the queried node, on the
+                // responder's own monotonic clock — see the `TimeoutQuery` arm),
+                // NOT an absolute wall-clock timestamp. A peer "agrees" the
+                // primary is silent iff that age exceeds the death deadline; a
+                // `None` (never seen) also agrees. Comparing a relative age means
+                // there is NO cross-node wall-clock subtraction, so a coordinated
+                // suspend/resume cannot fabricate a false quorum on primary death.
                 let agreeing = responses
                     .values()
-                    .filter(|last| {
-                        last.map(|t| (timestamp_now() - t) > deadline.as_secs_f64())
+                    .filter(|age| {
+                        age.map(|secs| secs > deadline.as_secs_f64())
                             .unwrap_or(true)
                     })
                     .count()
@@ -468,6 +476,11 @@ where
     /// Handle an incoming `TimeoutResponse` from a peer (called from
     /// `handle_peer_message`). Stores the response in the Suspecting bucket;
     /// the next tick will tally.
+    ///
+    /// `last_keepalive` is the responder's monotonic AGE (seconds since it last
+    /// saw the queried node, on the responder's own clock), not an absolute
+    /// timestamp — the Suspecting tally compares it directly to the death
+    /// deadline. `None` = never seen.
     pub(in crate::secondary) fn record_timeout_response(
         &mut self,
         peer: String,

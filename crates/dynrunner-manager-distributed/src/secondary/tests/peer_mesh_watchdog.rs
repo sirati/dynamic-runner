@@ -429,7 +429,6 @@ async fn degraded_failover_fails_loud_instead_of_self_promoting() {
 /// transport's role-blind `peer_count()`.
 #[tokio::test(flavor = "current_thread")]
 async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
-    use super::super::wire::timestamp_now;
     use std::time::Instant;
     let _ = tracing_subscriber::fmt::try_init();
 
@@ -495,7 +494,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         secondary
             .op_mut()
             .peer_keepalives
-            .insert(format!("peer-{i}"), timestamp_now());
+            .insert(format!("peer-{i}"), Instant::now());
     }
     secondary.mesh.peer_dial_count = 3;
     secondary.mesh.peer_mesh_check_at = Some(Instant::now() + Duration::from_secs(30));

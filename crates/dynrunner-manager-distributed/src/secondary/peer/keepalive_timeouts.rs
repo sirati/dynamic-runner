@@ -10,13 +10,14 @@
 //! (the single canonical owner of that recovery). Degraded-mesh
 //! short-circuit is documented inline.
 
+use std::time::Instant;
+
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
-use super::super::wire::timestamp_now;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -43,8 +44,15 @@ where
         if self.is_mesh_degraded() {
             return;
         }
-        let now = timestamp_now();
-        let timeout_secs = self.config.peer_timeout.as_secs_f64();
+        // Monotonic receipt-time comparison: `peer_keepalives` now stores the
+        // LOCAL `Instant` at which we last received each peer's keepalive, so
+        // staleness is `now.duration_since(last_seen)` on a single monotonic
+        // clock. `CLOCK_MONOTONIC` does not accrue host-suspend time, so a
+        // coordinated suspend/resume wall-clock jump can no longer make every
+        // peer instantly exceed `peer_timeout` and mass-prune the whole mesh
+        // (the false-degraded → mass-`fatal_exit` failure this fix closes).
+        let now = Instant::now();
+        let timeout = self.config.peer_timeout;
         let mut timed_out = Vec::new();
 
         // The current primary is NOT a peer for liveness purposes. Its
@@ -68,17 +76,21 @@ where
             if Some(peer_id.as_str()) == current_primary.as_deref() {
                 continue;
             }
-            if now - last_seen > timeout_secs {
+            if now.duration_since(*last_seen) > timeout {
                 timed_out.push(peer_id.clone());
             }
         }
 
         for peer_id in timed_out {
-            let last_seen = self.op_mut().peer_keepalives.remove(&peer_id).unwrap_or(0.0);
+            let elapsed = self
+                .op_mut()
+                .peer_keepalives
+                .remove(&peer_id)
+                .map(|last_seen| now.duration_since(last_seen).as_secs_f64())
+                .unwrap_or_default();
             tracing::warn!(
                 peer = %peer_id,
-                last_seen,
-                elapsed = now - last_seen,
+                elapsed,
                 "peer keepalive timed out; dropping from liveness view"
             );
         }

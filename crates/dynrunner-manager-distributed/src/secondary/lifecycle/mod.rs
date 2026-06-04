@@ -288,9 +288,16 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// unreachable.
     pub(in crate::secondary) primary_last_seen: Option<Instant>,
 
-    /// Peer-keepalive tracking: `peer_id -> last_seen` (epoch seconds).
+    /// Peer-keepalive tracking: `peer_id -> last_seen` (LOCAL receipt-time
+    /// monotonic `Instant`, recorded the moment THIS node receives the
+    /// peer's keepalive — NOT the sender's wire wall-clock timestamp).
+    /// Keying on a monotonic receipt `Instant` (mirroring `primary_last_seen`
+    /// and the primary's `secondary_keepalives`) makes peer-liveness immune to
+    /// a coordinated host suspend/resume: `CLOCK_MONOTONIC` does not accrue
+    /// suspend time, so a wall-clock jump cannot mass-prune every peer at once.
+    /// The next received keepalive resets the anchor (reset-on-receipt).
     /// Peer-liveness, distinct from primary-liveness (`primary_last_seen`).
-    pub(in crate::secondary) peer_keepalives: HashMap<String, f64>,
+    pub(in crate::secondary) peer_keepalives: HashMap<String, Instant>,
 
     /// Routing target + per-worker request rate limiting for the
     /// secondary→primary link.
@@ -576,7 +583,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         latches: OperationalLatches<I>,
         election: ElectionState,
         primary_last_seen: Option<Instant>,
-        peer_keepalives: HashMap<String, f64>,
+        peer_keepalives: HashMap<String, Instant>,
         primary_link: PrimaryLink,
         pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
         pending_worker_restarts: HashSet<WorkerId>,

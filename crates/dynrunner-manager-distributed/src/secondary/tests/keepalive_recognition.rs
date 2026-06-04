@@ -94,13 +94,21 @@ async fn peer_keepalive_does_not_touch_primary_last_seen() {
     sec.op_mut().primary_last_seen = Some(baseline);
 
     // sec-c is a regular peer, not the current primary.
+    let before = Instant::now();
     sec.handle_inbound(keepalive("sec-c", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
         .await;
 
-    assert_eq!(
-        sec.op_mut().peer_keepalives.get("sec-c").copied(),
-        Some(1.0),
-        "a non-primary peer keepalive must be filed in peer_keepalives"
+    // The entry records LOCAL receipt time (a monotonic `Instant`), NOT the
+    // wire `timestamp` (1.0). Assert presence + receipt-time freshness.
+    let recorded = sec
+        .op_mut()
+        .peer_keepalives
+        .get("sec-c")
+        .copied()
+        .expect("a non-primary peer keepalive must be filed in peer_keepalives");
+    assert!(
+        recorded >= before,
+        "the peer keepalive must record local receipt time, not the wire timestamp"
     );
     assert_eq!(
         sec.op_mut().primary_last_seen,
@@ -129,13 +137,21 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     // The co-located host emits its secondary-capability keepalive: it is
     // a live mesh peer and MUST land in peer_keepalives despite its id
     // being the current primary.
+    let before = Instant::now();
     sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
         .await;
-    assert_eq!(
-        sec.op_mut().peer_keepalives.get("sec-a").copied(),
-        Some(1.0),
-        "a Secondary keepalive from the primary's host MUST land in peer_keepalives \
-         (multi-role host is a live mesh peer)"
+    let recorded = sec
+        .op_mut()
+        .peer_keepalives
+        .get("sec-a")
+        .copied()
+        .expect(
+            "a Secondary keepalive from the primary's host MUST land in peer_keepalives \
+             (multi-role host is a live mesh peer)",
+        );
+    assert!(
+        recorded >= before,
+        "the peer entry records local receipt time (monotonic Instant), not the wire timestamp"
     );
     assert_eq!(
         sec.op_mut().primary_last_seen,
