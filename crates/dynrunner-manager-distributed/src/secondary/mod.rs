@@ -563,13 +563,18 @@ where
     /// exactly as a wire frame. `None` outside a co-located composition —
     /// the drain arm parks on `pending()`.
     ///
-    /// `take`-n ONCE at the first `process_tasks` entry and moved into
+    /// `take`-n ONCE at the first `process_tasks` entry into the loop-local
+    /// loopback arm and moved into
     /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
     /// its RESUMABLE home: a `SetupPending` re-entry is a real second
     /// consumption, and on a promoted node this is the SOLE path to the
     /// co-located primary's `RunComplete`, so it must survive the yield. This
     /// coordinator slot is therefore `None` from the first entry onward; the
-    /// live receiver lives on `OperationalState` thereafter.
+    /// live receiver lives on `OperationalState` thereafter. Seeded by the
+    /// same `coordinator-slot, else OperationalState` take-site idiom as
+    /// `panik_signal_rx` — registered only on the co-located (non-observer)
+    /// path, so on an observer both seed sources are `None` and the arm parks
+    /// on `pending()`.
     pub(super) colocated_loopback_inbound_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }
