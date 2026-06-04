@@ -11,14 +11,23 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+use super::DisconnectedPeer;
 use super::util::PeerConnection;
 
 /// Spawn reader/writer tasks for an outgoing connection. Returns the
 /// `outgoing_tx` channel the caller pushes outbound messages into.
+///
+/// When the reader OR writer task exits — including on the QUIC
+/// `IDLE_TIMEOUT` that fires when a blackholed link stops acking
+/// keep-alive PINGs (see `certs.rs`) — the supervisor fires a
+/// [`DisconnectedPeer`] through `disconnect_tx` so the owning
+/// `PeerNetwork::recv_peer` runs prune+redial. The supervisor carries a
+/// clone of `outgoing_tx` for the owner's generation check.
 pub(super) fn spawn_outgoing_handler<I: Identifier>(
     peer_id: String,
     connection: PeerConnection,
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) -> mpsc::UnboundedSender<DistributedMessage<I>> {
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
@@ -53,7 +62,7 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
             });
 
             // Writer
-            let writer_id = peer_id;
+            let writer_id = peer_id.clone();
             let mut writer = tokio::task::spawn_local(async move {
                 let mut send = send_stream;
                 while let Some(msg) = outgoing_rx.recv().await {
@@ -69,11 +78,16 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
                 tracing::debug!(peer = %writer_id, "peer QUIC writer done");
             });
 
+            let supervisor_tx = outgoing_tx.clone();
             tokio::task::spawn_local(async move {
                 tokio::select! {
                     _ = &mut reader => { writer.abort(); }
                     _ = &mut writer => { reader.abort(); }
                 }
+                let _ = disconnect_tx.send(DisconnectedPeer {
+                    peer_id,
+                    outgoing_tx: supervisor_tx,
+                });
             });
         }
         PeerConnection::Wss(conn) => {
@@ -102,7 +116,7 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
             });
 
             // Writer
-            let writer_id = peer_id;
+            let writer_id = peer_id.clone();
             let mut writer = tokio::task::spawn_local(async move {
                 while let Some(msg) = outgoing_rx.recv().await {
                     match codec::serialize_message(&msg) {
@@ -117,11 +131,16 @@ pub(super) fn spawn_outgoing_handler<I: Identifier>(
                 tracing::debug!(peer = %writer_id, "peer WSS writer done");
             });
 
+            let supervisor_tx = outgoing_tx.clone();
             tokio::task::spawn_local(async move {
                 tokio::select! {
                     _ = &mut reader => { writer.abort(); }
                     _ = &mut writer => { reader.abort(); }
                 }
+                let _ = disconnect_tx.send(DisconnectedPeer {
+                    peer_id,
+                    outgoing_tx: supervisor_tx,
+                });
             });
         }
     }

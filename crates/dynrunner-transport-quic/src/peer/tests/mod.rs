@@ -6,6 +6,10 @@
 //!   (`higher_id_does_not_dial_lower_id`).
 //! - [`recv_lifetime`]: `recv_peer_tick_survives_outer_drop` —
 //!   future-drop hardening for the reconnect tick arm.
+//! - [`reader_exit_disconnect`]: reader/writer-exit is the
+//!   authoritative disconnect detector + the `same_channel`
+//!   generation check that keeps a stale signal from pruning a
+//!   freshly-reconnected entry.
 //! - [`either`]: `NoPeerTransport` + `EitherPeerTransport::Disabled`
 //!   parity, plus `Real`-variant round-trip.
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
@@ -28,6 +32,7 @@ mod cert_parsing;
 mod either;
 mod log_capture;
 mod primary_link;
+mod reader_exit_disconnect;
 mod recv_lifetime;
 mod silent_reconnect;
 mod two_peers;

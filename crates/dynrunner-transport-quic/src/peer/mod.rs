@@ -42,6 +42,24 @@ pub(super) struct AcceptedPeer<I: Identifier> {
     pub(super) outgoing_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
 }
 
+/// A peer connection whose reader/writer supervisor has exited — the
+/// AUTHORITATIVE disconnect detector. Mirrors [`AcceptedPeer`]: the
+/// reader/writer tasks hold no `&mut self`, so the supervisor cannot
+/// touch `connections` directly; it hands the disconnect back to
+/// `recv_peer` through the disconnect-signal channel (the close-side
+/// analog of `new_conn_tx`), which runs the prune+redial disposition.
+///
+/// `outgoing_tx` is a clone of the writer's own channel sender, carried
+/// for the generation check in
+/// [`super::PeerNetwork::handle_peer_disconnect`]: the entry is pruned
+/// only if `connections[peer_id]` is STILL this exact channel, so a
+/// late disconnect signal from a torn-down connection cannot delete a
+/// freshly-reconnected entry for the same peer.
+pub(super) struct DisconnectedPeer<I: Identifier> {
+    pub(super) peer_id: String,
+    pub(super) outgoing_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+}
+
 /// Peer-to-peer network transport for secondary coordinators.
 ///
 /// Manages bidirectional connections to all peer secondaries. Uses QUIC (UDP)
@@ -68,6 +86,21 @@ pub struct PeerNetwork<I: Identifier> {
     /// have to await per-peer dials and miss tokio::select! tick
     /// budgets while connect_to_peers drains.
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    /// Reader/writer-supervisor disconnect signals that need the
+    /// prune+redial disposition. The close-side analog of
+    /// `new_conn_rx`: a per-connection supervisor (accept side in
+    /// `accept.rs`, outgoing side in `handler.rs`) fires a
+    /// [`DisconnectedPeer`] here the instant its reader OR writer task
+    /// exits, and `recv_peer`'s `select!` drains it and runs
+    /// `handle_peer_disconnect`. This is the AUTHORITATIVE liveness
+    /// detector — the QUIC `IDLE_TIMEOUT` (see `certs.rs`) errors a
+    /// blackholed read, the reader task exits, and the disconnect
+    /// surfaces here without waiting for an outbound-send failure.
+    disconnect_rx: mpsc::UnboundedReceiver<DisconnectedPeer<I>>,
+    /// Sender side for the disconnect-signal channel, cloned into every
+    /// per-connection supervisor (accept loops + outgoing-dial tasks),
+    /// mirroring how `new_conn_tx` is cloned into the same places.
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
     /// Peer-mesh routing dispatcher. Owns ALL routing state
     /// (in-flight relays, blacklist, per-peer route observation,
     /// monotonic relay-id counter) and produces the redial signal
@@ -148,13 +181,16 @@ impl<I: Identifier> PeerNetwork<I> {
 
         let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
         let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::unbounded_channel();
 
         // Spawn QUIC accept loop
         {
             let incoming_tx = incoming_tx.clone();
             let new_conn_tx = new_conn_tx.clone();
+            let disconnect_tx = disconnect_tx.clone();
             tokio::task::spawn_local(async move {
-                accept::quic_accept_loop::<I>(quic_listener, incoming_tx, new_conn_tx).await;
+                accept::quic_accept_loop::<I>(quic_listener, incoming_tx, new_conn_tx, disconnect_tx)
+                    .await;
             });
         }
 
@@ -162,8 +198,10 @@ impl<I: Identifier> PeerNetwork<I> {
         {
             let incoming_tx = incoming_tx.clone();
             let new_conn_tx = new_conn_tx.clone();
+            let disconnect_tx = disconnect_tx.clone();
             tokio::task::spawn_local(async move {
-                accept::wss_accept_loop::<I>(wss_listener, incoming_tx, new_conn_tx).await;
+                accept::wss_accept_loop::<I>(wss_listener, incoming_tx, new_conn_tx, disconnect_tx)
+                    .await;
             });
         }
 
@@ -210,6 +248,8 @@ impl<I: Identifier> PeerNetwork<I> {
             incoming_tx,
             new_conn_rx,
             new_conn_tx,
+            disconnect_rx,
+            disconnect_tx,
             router: Router::new(peer_id.to_string()),
             peer_dial_info: HashMap::new(),
             reconnect_tick_rx,
@@ -262,6 +302,26 @@ impl<I: Identifier> PeerNetwork<I> {
         // Inbound: drive the wire's inbound into the mesh's single
         // fan-in, so the primary's frames arrive via `recv_peer` like
         // every other peer's — no per-role uplink recv arm.
+        //
+        // App-layer-liveness independence (honest-liveness invariant):
+        // the bootstrap-primary entry deliberately does NOT feed the
+        // QUIC disconnect-signal channel — only the dial/accept mesh
+        // handlers do. The secondary→primary link's liveness is owned
+        // by the APPLICATION layer (the secondary's primary-link
+        // failure window in
+        // `dynrunner_manager_distributed::secondary::primary_link`,
+        // re-checked on every keepalive tick), keyed on
+        // `DistributedMessage` arrival, NOT on QUIC packet liveness. A
+        // primary that is alive-at-QUIC (PINGs still acked) but
+        // wedged-at-app (no `DistributedMessage`s) MUST still be
+        // declared dead — and it is, because no primary message arrives
+        // and `should_arm_failover` trips on the time axis regardless
+        // of QUIC. Conversely the QUIC `IDLE_TIMEOUT` (60s) is set
+        // ABOVE that 30s failure window precisely so the QUIC layer
+        // never closes a healthy-but-quiet bootstrap wire out from
+        // under the app layer. The two liveness detectors are
+        // orthogonal by construction; do not couple them by routing the
+        // forwarder's exit through `handle_peer_disconnect`.
         let incoming_tx = self.incoming_tx.clone();
         tokio::task::spawn_local(async move {
             let mut client = client;
@@ -480,17 +540,56 @@ impl<I: Identifier> PeerNetwork<I> {
     fn spawn_dial_task(&self, peer_info: PeerConnectionInfo) {
         let incoming_tx = self.incoming_tx.clone();
         let new_conn_tx = self.new_conn_tx.clone();
+        let disconnect_tx = self.disconnect_tx.clone();
         tokio::task::spawn_local(async move {
             let peer_id = peer_info.secondary_id.clone();
             let Some(connection) = dial::dial_peer(&peer_id, &peer_info).await else {
                 return;
             };
-            let outgoing_tx =
-                handler::spawn_outgoing_handler(peer_id.clone(), connection, incoming_tx);
+            let outgoing_tx = handler::spawn_outgoing_handler(
+                peer_id.clone(),
+                connection,
+                incoming_tx,
+                disconnect_tx,
+            );
             let _ = new_conn_tx.send(AcceptedPeer {
                 peer_id,
                 outgoing_tx,
             });
         });
+    }
+
+    /// Single prune+redial disposition for a detected disconnect,
+    /// shared by the AUTHORITATIVE reader/writer-exit detector
+    /// (`disconnect_rx` arm in `recv_peer`) and the send-failure
+    /// fallback (`broadcast` in `transport_impl.rs`). Both observe the
+    /// SAME dead `outgoing_tx`, so both route through here — no
+    /// duplicated disposition logic, no second redial path.
+    ///
+    /// Generation check: the entry is removed only if
+    /// `connections[peer_id]` is STILL the dead channel
+    /// (`same_channel`). A redial that already replaced the entry owns
+    /// a fresh channel, so a late/duplicate disconnect signal for the
+    /// stale connection is a no-op and cannot delete the live one.
+    ///
+    /// On a genuine prune, engage the reconnect tracker; the first
+    /// observation kicks an immediate redial (then the 5s ticker takes
+    /// over), matching the existing send-failure contract.
+    pub(super) fn handle_peer_disconnect(
+        &mut self,
+        peer_id: &str,
+        dead_tx: &mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        match self.connections.get(peer_id) {
+            Some(current) if current.same_channel(dead_tx) => {}
+            // Either already pruned, or a redial replaced the entry with
+            // a fresh channel — leave the live connection untouched.
+            _ => return,
+        }
+        self.connections.remove(peer_id);
+        let first_observation = self.reconnect_tracker.observe_disconnect(peer_id);
+        if first_observation {
+            self.spawn_redial(peer_id);
+        }
     }
 }

@@ -43,25 +43,25 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // `send_to_peer` / `recv_peer` traffic), routing state
         // accumulated by past relay activity needs sweeping.
         self.router.prune(Instant::now());
-        let mut errors = Vec::new();
+        // Send-failure prune is now the BACKUP detector: the
+        // AUTHORITATIVE one is the reader/writer-exit signal
+        // (`disconnect_rx` arm below, driven by the QUIC IDLE_TIMEOUT
+        // on a blackholed link). A failed `tx.send` still means the
+        // writer task is gone, so we observe the disconnect — but
+        // through the SAME generation-checked disposition
+        // (`handle_peer_disconnect`) as the authoritative path, so the
+        // prune cannot delete a freshly-reconnected entry whose channel
+        // differs from the dead one. We capture the dead `tx` (not just
+        // the id) precisely for that `same_channel` check.
+        let mut dead: Vec<(String, tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>)> =
+            Vec::new();
         for (peer_id, tx) in &self.connections {
             if tx.send(msg.clone()).is_err() {
-                errors.push(peer_id.clone());
+                dead.push((peer_id.clone(), tx.clone()));
             }
         }
-        for peer_id in &errors {
-            self.connections.remove(peer_id);
-            // Engage the reconnect tracker on detection so the
-            // first 5s retry pulse already has the peer in its
-            // tracking set. Idempotent on already-tracked peers
-            // (returns false). On first observation, kick a
-            // redial immediately rather than waiting for the
-            // next periodic tick — the user-directed contract is
-            // "reconnect immediately, then every 5 seconds".
-            let first_observation = self.reconnect_tracker.observe_disconnect(peer_id);
-            if first_observation {
-                self.spawn_redial(peer_id);
-            }
+        for (peer_id, dead_tx) in &dead {
+            self.handle_peer_disconnect(peer_id, dead_tx);
         }
         Ok(())
     }
@@ -156,6 +156,25 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                         );
                         self.connections
                             .insert(accepted.peer_id, accepted.outgoing_tx);
+                    }
+                    None
+                }
+                disconnected = self.disconnect_rx.recv() => {
+                    // AUTHORITATIVE disconnect: a per-connection
+                    // reader/writer supervisor exited (peer gone, or
+                    // the QUIC IDLE_TIMEOUT fired because keep-alive
+                    // PINGs stopped being acked on a blackholed link).
+                    // Run the SAME generation-checked prune+redial
+                    // disposition the broadcast send-failure fallback
+                    // uses, so a stale signal for a torn-down
+                    // connection cannot delete a freshly-reconnected
+                    // entry. `recv()` yields `None` only if every
+                    // `disconnect_tx` clone dropped — impossible while
+                    // the network lives (it holds one in
+                    // `self.disconnect_tx`), so this never spuriously
+                    // closes.
+                    if let Some(d) = disconnected {
+                        self.handle_peer_disconnect(&d.peer_id, &d.outgoing_tx);
                     }
                     None
                 }
