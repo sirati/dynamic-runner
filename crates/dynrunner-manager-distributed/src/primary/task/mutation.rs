@@ -121,6 +121,58 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         .await;
     }
 
+    /// Anti-entropy receive: compare a peer's `StateDigest` against the
+    /// primary's own and pull a snapshot iff the primary is somehow behind.
+    ///
+    /// Single concern: the receive-side of the convergence cadence on the
+    /// primary. The compare + target-selection + request-construction live
+    /// in `crate::anti_entropy` so all three roles share ONE policy; this
+    /// method only owns the primary's `send_to` edge. The authoritative
+    /// primary is essentially never behind a follower's digest, so this is
+    /// almost always a NoOp (a matching digest → `None`); it exists for
+    /// uniformity (a freshly-promoted primary still warming its mirror, or
+    /// an out-of-order seed window, could momentarily be behind a peer that
+    /// already saw a mutation). The pull's reply heals via the primary's
+    /// own `ClusterMutation`/snapshot apply paths. The primary declares
+    /// itself non-observer + primary-capable on the request frame.
+    pub(crate) async fn handle_state_digest(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::StateDigest {
+            digest, sender_id, ..
+        } = msg
+        else {
+            return;
+        };
+        let local = self.cluster_state.digest();
+        let requester = crate::anti_entropy::RequesterIdentity {
+            node_id: &self.config.node_id,
+            // The primary is never an observer and is always primary-capable.
+            is_observer: false,
+            can_be_primary: true,
+        };
+        if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
+            &local,
+            &digest,
+            &sender_id,
+            self.cluster_state.current_primary(),
+            &requester,
+            timestamp_now(),
+        ) {
+            if let Err(e) = self.send_to(destination, request).await {
+                tracing::debug!(
+                    error = %e,
+                    peer = %sender_id,
+                    "anti-entropy: primary snapshot pull request send failed; \
+                     a later digest round retries"
+                );
+            } else {
+                tracing::debug!(
+                    peer = %sender_id,
+                    "anti-entropy: primary behind peer digest; requested snapshot pull"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
             // Note whether any ledger-growing mutation rides in this

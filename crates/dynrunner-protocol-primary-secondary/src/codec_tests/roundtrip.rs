@@ -57,6 +57,53 @@ fn roundtrip_keepalive_primary_emitter_role() {
     }
 }
 
+/// The full `StateDigest` payload survives the wire byte-for-byte. The
+/// every-variant sweep only checks `msg_type`/`sender_id`, so this is the
+/// guard that a dropped digest field (or a serde-shape regression) is
+/// caught — every count, fold, scalar, and latch must decode back equal.
+#[test]
+fn roundtrip_state_digest_payload() {
+    let digest = StateDigest {
+        tasks_count: 11,
+        tasks_hash: 0x0123_4567_89AB_CDEF,
+        secondary_capacities_count: 3,
+        secondary_capacities_hash: 0xFEED,
+        alive_members_count: 4,
+        alive_members_hash: 0xCAFE,
+        observers_count: 2,
+        observers_hash: 0xB0BA,
+        can_be_primary_count: 3,
+        can_be_primary_hash: 0x1234,
+        task_outputs_count: 6,
+        task_outputs_hash: 0x9999_8888,
+        phase_deps_count: 7,
+        primary_epoch: 42,
+        run_complete: true,
+        run_aborted: true,
+    };
+    let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
+        sender_id: "sec-7".into(),
+        timestamp: 1234.5,
+        digest,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::StateDigest {
+            sender_id,
+            digest: decoded_digest,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-7");
+            assert_eq!(decoded_digest, digest);
+        }
+        _ => panic!("expected StateDigest"),
+    }
+}
+
 #[test]
 fn roundtrip_secondary_welcome() {
     use dynrunner_core::{ResourceAmount, ResourceKind};

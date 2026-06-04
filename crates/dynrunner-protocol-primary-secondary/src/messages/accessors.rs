@@ -20,6 +20,7 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { sender_id, .. }
             | Self::RequestClusterSnapshot { sender_id, .. }
             | Self::ClusterSnapshot { sender_id, .. }
+            | Self::StateDigest { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
@@ -49,6 +50,7 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { timestamp, .. }
             | Self::RequestClusterSnapshot { timestamp, .. }
             | Self::ClusterSnapshot { timestamp, .. }
+            | Self::StateDigest { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
@@ -78,6 +80,7 @@ impl<I> DistributedMessage<I> {
             Self::StageFile { .. } => MessageType::StageFile,
             Self::RequestClusterSnapshot { .. } => MessageType::RequestClusterSnapshot,
             Self::ClusterSnapshot { .. } => MessageType::ClusterSnapshot,
+            Self::StateDigest { .. } => MessageType::StateDigest,
             Self::MeshReady { .. } => MessageType::MeshReady,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,

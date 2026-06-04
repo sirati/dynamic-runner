@@ -26,6 +26,11 @@ pub enum MessageType {
     /// Response to `RequestClusterSnapshot`: a full `ClusterStateSnapshot`
     /// the receiver merges into its local mirror via `ClusterState::restore`.
     ClusterSnapshot,
+    /// Periodic anti-entropy fingerprint (`StateDigest`). Every role
+    /// broadcasts it on the convergence cadence; a receiver behind the
+    /// sender pulls a snapshot via `RequestClusterSnapshot`. Detector
+    /// only — carries no task payloads and triggers no merge by itself.
+    StateDigest,
     MeshReady,
     // Secondary <-> Secondary (peer-to-peer)
     TaskComplete,

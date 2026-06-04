@@ -67,6 +67,7 @@
 
 #![cfg(test)]
 
+mod anti_entropy_heal;
 mod cluster_state_refresh;
 mod colocated_loopback_resumes_across_setup_pending;
 mod honest_liveness;
