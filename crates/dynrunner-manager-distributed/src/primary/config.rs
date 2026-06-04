@@ -125,20 +125,29 @@ pub struct PrimaryConfig {
     /// attempted before the phase advances).
     pub oom_retry_max_passes: u32,
 
-    /// Grace period after every secondary in the fleet has been
-    /// declared dead (via `requeue_dead_secondary`) before the
-    /// operational loop gives up and exits cleanly with the still-
-    /// pending tasks marked failed. Default `30s`.
+    /// Grace period after the count of alive REMOTE worker-secondaries
+    /// (`ClusterState::alive_remote_secondary_count` — alive
+    /// worker-secondaries other than the recognized primary) reaches zero
+    /// with a non-empty pool, before the operational loop gives up and
+    /// exits cleanly with the still-pending tasks left stranded. Default
+    /// `30s`.
     ///
     /// Without this timer the framework idles forever when
-    /// `surviving_secondaries == 0 && pool not empty` — the
+    /// `alive_remote_secondary_count == 0 && pool not empty` — the
     /// existing exit conditions (counter-based + pool-drained)
-    /// never trip because no events arrive (no secondaries left
+    /// never trip because no events arrive (no remote secondary left
     /// to send TaskComplete/TaskRequest). Operator pain: have to
     /// `kill` the primary process by hand. Surfaced in tokenizer's
     /// cohort-3 runs where SSH-tunnel blips killed all 5
     /// secondaries simultaneously and the run sat idle for
     /// minutes before the operator noticed.
+    ///
+    /// Counting REMOTE secondaries (excluding the recognized primary by
+    /// identity) is what arms this correctly on a co-located host that
+    /// runs a primary alongside its own secondary: the primary's own
+    /// secondary never keeps the timer disarmed, so a co-located primary
+    /// cut off from every remote secondary still arms and strands rather
+    /// than hanging on its own loopback secondary.
     ///
     /// Set to `Duration::ZERO` for fail-fast (exit at the moment
     /// the fleet first goes empty). Set to a long value if a
@@ -247,9 +256,10 @@ pub struct PrimaryConfig {
     /// load-bearing exit path while `setup_pending = true` — the
     /// counter-based and pool-drain exits are gated off behind the
     /// latch, `cluster_state.run_complete()` requires the promoted
-    /// secondary to broadcast first, the fleet-dead timer is gated
-    /// behind `secondaries.is_empty()` which never becomes true on a
-    /// demoted primary (heartbeat tick is skipped on `self.demoted`),
+    /// secondary to broadcast first, the fleet-dead timer arms on the
+    /// count of alive REMOTE worker-secondaries
+    /// (`alive_remote_secondary_count == 0`) which a demoted submitter
+    /// still recognizing the promoted secondary never sees reach zero,
     /// and the `both transports closed` fallback only fires once every
     /// QUIC writer has finished its tear-down (which can take hours
     /// after a SLURM hard-kill). If the promoted secondary's discovery
