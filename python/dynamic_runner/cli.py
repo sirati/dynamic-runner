@@ -310,7 +310,13 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
             "default) under this path; falls back to the output dir when "
             "unset. The SLURM wrapper passes `--log-dir=/app/log-network` "
             "so worker logs land under the dedicated log-mount tree "
-            "instead of the output-mount tree."
+            "instead of the output-mount tree. In SLURM deployments the "
+            "wrapper also anchors the framework's own runner log here, "
+            "split by role per node (`{secondary_id}/primary.log` and "
+            "`{secondary_id}/secondary.log`), so a relocated/co-located "
+            "primary's full log is persisted host-readably and isolated "
+            "from its host secondary's rather than living only in the "
+            "container's journald."
         ),
     )
     parser.add_argument(
@@ -442,6 +448,22 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
             "disable (OOM failures become terminal after the first attempt). "
             "Separate from --retry-max-passes so Recoverable retries don't "
             "consume the OOM-retry budget and vice versa."
+        ),
+    )
+    parser.add_argument(
+        "--unconfigured-deadline-secs",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Maximum wall-clock (seconds) a secondary spends NOT-YET-CONFIGURED "
+            "— in the pre-Operational lifecycle states (AwaitingPrimary + "
+            "Configuring), before the primary has announced itself and driven "
+            "this secondary to Operational. Default 600 (10 minutes). Raise this "
+            "for large/slow clusters where the authority's discover_items walk "
+            "is genuinely slow; a secondary that does not reach Operational "
+            "within this window gives up and exits. Unset leaves the framework "
+            "default."
         ),
     )
     parser.add_argument(
