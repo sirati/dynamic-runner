@@ -119,6 +119,9 @@ fn snapshot_with(
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
         secondary_capacities: HashMap::new(),
+        alive_members: Default::default(),
+        run_complete: false,
+        run_aborted: None,
     }
 }
 

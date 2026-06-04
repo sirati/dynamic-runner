@@ -389,3 +389,143 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
     );
     assert!(deps[1].inherit_outputs);
 }
+
+/// Consumer-invariant round-trip — the regression test for the
+/// bootstrap-relocated-primary false-strand bug.
+///
+/// A primary applies the full alive-secondary fact set (a `PeerJoined`,
+/// a `SecondaryCapacity`, and a `RunComplete`), then a fresh node is
+/// seeded PURELY from `snapshot()` then `restore()` (the
+/// bootstrap-relocation / promotion path that bypasses `handle_welcome`).
+/// After restore the downstream consumers the operational loop arms
+/// fleet-dead on MUST read honest values: `is_peer_alive(secondary)`
+/// true, `alive_secondary_members()` non-empty, a positive
+/// `alive_remote_secondary_count()` (a `current_primary` is set so the
+/// `id` vs `current_primary` filter is genuinely exercised), and
+/// `run_complete()` true.
+///
+/// Without the `alive_members` projection (part 1 of the fix),
+/// `peer_state` would stay empty after restore, so `is_peer_alive` is
+/// false for all ids, `alive_secondary_members()` is empty, and
+/// `alive_remote_secondary_count()` is a FALSE ZERO from tick 0 — the
+/// exact condition that fires fleet-dead at 30s while remote
+/// secondaries are alive. This test fails on that omission.
+#[test]
+fn consumer_invariants_survive_snapshot_restore() {
+    use dynrunner_core::{ResourceAmount, ResourceKind};
+
+    let mem = |amount: u64| ResourceAmount {
+        kind: ResourceKind::memory(),
+        amount,
+    };
+
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // A co-located primary + a remote worker-secondary, exactly the
+    // bootstrap-relocation roster.
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "primary".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "sec-remote".into(),
+        is_observer: false,
+        can_be_primary: false,
+    });
+    s.apply(ClusterMutation::SecondaryCapacity {
+        secondary: "sec-remote".into(),
+        worker_count: 4,
+        resources: vec![mem(2 * 1024 * 1024 * 1024)],
+    });
+    // The co-located host is the recognized primary so the
+    // `id != current_primary` cut in `alive_remote_secondary_count`
+    // is genuinely exercised.
+    s.apply(ClusterMutation::PrimaryChanged {
+        new: "primary".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    s.apply(ClusterMutation::RunComplete);
+    s.apply(ClusterMutation::RunAborted {
+        reason: "abort-reason".into(),
+    });
+
+    // Seed a FRESH empty node purely from the snapshot — the
+    // bootstrap-relocation / promotion path.
+    let mut relocated = ClusterState::<RunnerIdentifier>::new();
+    relocated.restore(s.snapshot());
+
+    assert!(
+        relocated.is_peer_alive("sec-remote"),
+        "alive membership must survive snapshot/restore"
+    );
+    let members: HashSet<&str> = relocated.alive_secondary_members().collect();
+    assert_eq!(members, HashSet::from(["sec-remote"]));
+    assert_eq!(
+        relocated.alive_remote_secondary_count(),
+        1,
+        "honest remote-secondary count post-restore (false-zero is the bug)"
+    );
+    assert!(relocated.run_complete(), "run_complete must survive restore");
+    assert_eq!(
+        relocated.run_aborted(),
+        Some("abort-reason"),
+        "run_aborted reason must survive restore"
+    );
+}
+
+/// Dead-wins / sticky-removal merge on the `alive_members` field,
+/// mirroring `apply_peer.rs`: restoring an alive id over a local
+/// `Dead` peer keeps it Dead; restoring over an absent id inserts
+/// Alive; the merge is idempotent on repeat. The inserted entry's
+/// `is_observer` is reconstructed from the co-restored observer set.
+#[test]
+fn restore_alive_members_dead_wins_and_idempotent() {
+    // Source (the snapshotting primary) sees both ids alive, one of
+    // them an observer.
+    let mut source = ClusterState::<RunnerIdentifier>::new();
+    source.apply(ClusterMutation::PeerJoined {
+        peer_id: "sec-a".into(),
+        is_observer: false,
+        can_be_primary: false,
+    });
+    source.apply(ClusterMutation::PeerJoined {
+        peer_id: "obs-b".into(),
+        is_observer: true,
+        can_be_primary: false,
+    });
+    let snap = source.snapshot();
+
+    // Local node has already locally removed "sec-a" (sticky Dead) and
+    // never seen "obs-b".
+    let mut local = ClusterState::<RunnerIdentifier>::new();
+    local.apply(ClusterMutation::PeerJoined {
+        peer_id: "sec-a".into(),
+        is_observer: false,
+        can_be_primary: false,
+    });
+    local.apply(ClusterMutation::PeerRemoved {
+        id: "sec-a".into(),
+        cause: RemovalCause::KeepaliveMiss,
+    });
+
+    local.restore(snap.clone());
+    // Dead wins: the snapshot's Alive "sec-a" does NOT resurrect the
+    // locally-removed id.
+    assert!(
+        !local.is_peer_alive("sec-a"),
+        "sticky-removal: local Dead is never overwritten by a snapshot Alive"
+    );
+    // Absent id is inserted Alive, with its observer flag reconstructed
+    // from the co-restored observer set.
+    assert!(local.is_peer_alive("obs-b"), "absent id inserted Alive");
+    assert!(
+        local.role_table().observers.contains("obs-b"),
+        "observer flag transfers cohesively with alive membership"
+    );
+
+    // Idempotent: a second restore of the same snapshot changes nothing.
+    local.restore(snap);
+    assert!(!local.is_peer_alive("sec-a"));
+    assert!(local.is_peer_alive("obs-b"));
+}

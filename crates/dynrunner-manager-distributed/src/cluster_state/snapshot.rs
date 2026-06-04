@@ -13,6 +13,7 @@ use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
 use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
 use serde::{Deserialize, Serialize};
 
+use super::types::{PeerEntry, PeerState};
 use super::ClusterState;
 use super::TaskState;
 
@@ -64,6 +65,29 @@ use super::TaskState;
 ///   primary and late-joining observers hold the full per-secondary
 ///   roster on snapshot-restore, before any live `SecondaryCapacity`
 ///   broadcast reaches them.
+/// - `alive_members`: Dead-wins / sticky-removal merge, mirroring the
+///   `PeerJoined`/`PeerRemoved` apply rules in `apply_peer.rs`. Each
+///   incoming alive id is inserted as a fresh `Alive` `PeerEntry`
+///   ONLY IF the local `peer_state` has no entry for it — never
+///   overwriting a local `Dead` (sticky removal wins, exactly as
+///   `apply_peer_joined` drops a join for a `Dead` id). The set carries
+///   only the `Alive` ids; absence of an id is NOT read as `Dead` (a
+///   local-only `Dead` entry stays Dead, a never-seen id stays absent).
+///   Idempotent + order-insensitive: re-restoring inserts nothing new.
+///   Carried so a bootstrap-relocated / freshly-promoted primary seeded
+///   purely from a snapshot reconstructs the alive-membership ledger
+///   (`is_peer_alive` → `alive_secondary_members` →
+///   `alive_remote_secondary_count`) the moment it restores — without
+///   it `peer_state` stays empty and the count is a false zero from
+///   tick 0. The inserted entry's `is_observer` is reconstructed from
+///   the co-restored `observers` set so alive-state and observer-flag
+///   transfer cohesively.
+/// - `run_complete` / `run_aborted`: sticky-monotonic merge, mirroring
+///   the `RunComplete`/`RunAborted` apply arms. `run_complete` ratchets
+///   `false → true` only (never regresses); `run_aborted` latches the
+///   first `Some(reason)` and never overwrites an already-`Some` local
+///   value. Carried so a node seeded from a snapshot learns the run is
+///   already over / aborted without waiting for a re-broadcast.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -153,6 +177,35 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-feature shape).
     #[serde(default)]
     pub secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Projected alive-membership set: the ids whose `peer_state` entry
+    /// is `Alive`. A PROJECTION of the module-private `peer_state` map
+    /// (only `HashSet<String>` crosses the wire — `PeerEntry`/`PeerState`
+    /// stay module-private), carried exactly the way `observers` /
+    /// `can_be_primary` project `RoleTable` subsets.
+    ///
+    /// Merge rule on `restore`: Dead-wins / sticky-removal (see the
+    /// type-level `alive_members` doc). Only `Alive` ids are carried;
+    /// `Dead` is sticky-local, so the absence of an id must NOT be read
+    /// as `Dead`. `#[serde(default)]` keeps wire compat with senders
+    /// that predate the field (missing field decodes as an empty set,
+    /// the pre-field shape).
+    #[serde(default)]
+    pub alive_members: HashSet<String>,
+    /// Sticky-monotonic run-completion flag (the replicated `RunComplete`
+    /// latch). Merge rule on `restore`: ratchets `false → true` only,
+    /// never regresses — mirroring the `RunComplete` apply arm.
+    /// `#[serde(default)]` keeps wire compat with pre-field senders
+    /// (missing field decodes as `false`, the pre-field shape).
+    #[serde(default)]
+    pub run_complete: bool,
+    /// Sticky-monotonic run-abort latch (the replicated `RunAborted`
+    /// reason). Merge rule on `restore`: the first `Some(reason)` wins
+    /// and never overwrites an already-`Some` local value — mirroring
+    /// the `RunAborted` apply arm. `#[serde(default)]` keeps wire compat
+    /// with pre-field senders (missing field decodes as `None`, the
+    /// pre-field shape).
+    #[serde(default)]
+    pub run_aborted: Option<String>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -200,34 +253,81 @@ impl<I: Identifier> ClusterState<I> {
     /// does not affect the returned snapshot. Used as the response
     /// payload to `RequestClusterSnapshot`.
     pub fn snapshot(&self) -> ClusterStateSnapshot<I> {
+        // Exhaustive destructure (NO `..` rest pattern) — the structural
+        // completeness guard. Every `ClusterState` field is NAMED here,
+        // so adding a future field is a COMPILE ERROR at this site until
+        // the developer explicitly classifies it transfer-vs-node-local.
+        // This is the only mechanism that catches a silently-omitted
+        // replicated field (the bug this exists to prevent).
+        let ClusterState {
+            // ── replicated (transferred) ──
+            tasks,
+            current_primary,
+            primary_epoch,
+            phase_deps,
+            run_complete,
+            run_aborted,
+            role_table,
+            peer_state,
+            peer_holdings,
+            task_outputs,
+            secondary_capacities,
+            // ── node-local: not replicated ──
+            // Atomic mirror is derived from `primary_epoch`; restore
+            // re-stores it from the merged epoch (see `restore`).
+            primary_epoch_mirror: _primary_epoch_mirror,
+            // node-local: not replicated (transport write-through cache
+            // re-registers on the restoring replica).
+            role_change_hooks: _role_change_hooks,
+            // node-local: not replicated (dispatcher mpsc senders belong
+            // to the owning node's coordinator tasks).
+            lifecycle_tx: _lifecycle_tx,
+            matcher_trigger_tx: _matcher_trigger_tx,
+            worker_mgmt_tx: _worker_mgmt_tx,
+            task_completed_tx: _task_completed_tx,
+        } = self;
         ClusterStateSnapshot {
-            tasks: self.tasks.clone(),
-            current_primary: self.current_primary.clone(),
-            primary_epoch: self.primary_epoch,
-            phase_deps: self.phase_deps.clone(),
+            tasks: tasks.clone(),
+            current_primary: current_primary.clone(),
+            primary_epoch: *primary_epoch,
+            phase_deps: phase_deps.clone(),
             // Carry the replicated observer set through the snapshot
             // so a late-joiner can populate `RoleTable.observers`
             // before any `PeerJoined` mutation arrives. The set is
             // the same one the `PeerJoined { is_observer = true }`
             // apply rule writes; the snapshot is authoritative for
             // first-bootstrap and inert thereafter.
-            observers: self.role_table.observers.clone(),
+            observers: role_table.observers.clone(),
             // Replicated primary-capability set — same first-bootstrap-
             // only contract as `observers`. Carried so a late-joiner
             // sees which peers may host the primary on snapshot-restore.
-            can_be_primary: self.role_table.can_be_primary.clone(),
+            can_be_primary: role_table.can_be_primary.clone(),
             // Per-peer holdings — same first-bootstrap-only
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
-            peer_holdings: self.peer_holdings.clone(),
+            peer_holdings: peer_holdings.clone(),
             // Replicated keyed-output cache — carried so a late-joiner
             // can resolve a dependent's predecessor outputs without
             // waiting for the prereq's `TaskCompleted` to retransmit.
-            task_outputs: self.task_outputs.clone(),
+            task_outputs: task_outputs.clone(),
             // Per-secondary static capacity — carried so a freshly-
             // promoted primary and late-joining observers reconstruct
             // the full worker roster on snapshot-restore.
-            secondary_capacities: self.secondary_capacities.clone(),
+            secondary_capacities: secondary_capacities.clone(),
+            // Project the alive-membership set out of `peer_state`:
+            // ONLY ids whose entry is `Alive` (Dead is sticky-local;
+            // absence must not be read as Dead). `PeerEntry`/`PeerState`
+            // stay module-private — only the `HashSet<String>` crosses
+            // the wire, the same projection shape as `observers`.
+            alive_members: peer_state
+                .iter()
+                .filter(|(_, entry)| entry.state == PeerState::Alive)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            // Sticky-monotonic run latches — carried so a node seeded
+            // from a snapshot learns the run is already over / aborted.
+            run_complete: *run_complete,
+            run_aborted: run_aborted.clone(),
         }
     }
 
@@ -256,6 +356,15 @@ impl<I: Identifier> ClusterState<I> {
         // because a legacy snapshot only ever expressed same-phase deps
         // implicitly.
         migrate_unphased_deps(&mut snap);
+        // Capture the snapshot's authoritative observer set BEFORE the
+        // observer-set branch below may move `snap.observers` into the
+        // role table. The alive-membership merge (at the tail of this
+        // method) reads it to reconstruct each newly-inserted
+        // `PeerEntry`'s `is_observer` flag, so alive-state and
+        // observer-flag transfer cohesively regardless of whether the
+        // local observer set was already populated (in which case the
+        // branch keeps local and does NOT consume `snap.observers`).
+        let restored_observers = snap.observers.clone();
         for (hash, incoming) in snap.tasks {
             match self.tasks.get(&hash) {
                 None => {
@@ -352,6 +461,40 @@ impl<I: Identifier> ClusterState<I> {
         // entry when the snapshot interleaves with live broadcasts.
         for (secondary, record) in snap.secondary_capacities {
             self.secondary_capacities.entry(secondary).or_insert(record);
+        }
+        // Alive-membership merge: Dead-wins / sticky-removal, mirroring
+        // the `PeerJoined`/`PeerRemoved` apply rules in `apply_peer.rs`.
+        // For each incoming alive id insert a fresh `Alive` entry ONLY
+        // IF the local `peer_state` has no entry for it — never
+        // overwriting a local `Dead` (sticky removal wins, exactly as
+        // `apply_peer_joined` drops a join for a `Dead` id, and as a
+        // never-restore on an already-`Alive` local entry is a no-op).
+        // The `Entry::Vacant` guard makes this idempotent + order-
+        // insensitive. The inserted entry's `is_observer` is
+        // reconstructed from the snapshot's authoritative `observers`
+        // set (read from `snap.observers` directly, captured before the
+        // observer-set branch above may have moved it into the role
+        // table) so alive-state and observer-flag transfer cohesively.
+        for id in snap.alive_members {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id.clone()) {
+                e.insert(PeerEntry {
+                    state: PeerState::Alive,
+                    pubkey: None,
+                    endpoint: None,
+                    is_observer: restored_observers.contains(&id),
+                });
+            }
+        }
+        // Run latches: sticky-monotonic, mirroring the `RunComplete` /
+        // `RunAborted` apply arms. `run_complete` ratchets false→true
+        // only (`|=` never regresses true→false); `run_aborted` latches
+        // the first `Some` and never overwrites an already-`Some` local
+        // value (`get_or_insert` is a no-op when already `Some`).
+        self.run_complete |= snap.run_complete;
+        if self.run_aborted.is_none()
+            && let Some(reason) = snap.run_aborted
+        {
+            self.run_aborted = Some(reason);
         }
     }
 }
