@@ -19,9 +19,19 @@
 //! the first `_native` import):
 //!
 //!   * [`IMPORTANT_STDIO_ONLY_ENV`] — truthy enables importance mode.
-//!   * [`FULL_LOG_FILE_ENV`] — optional path; when set, the full sink
-//!     writes there (so stdout can be gated without losing the full log).
-//!     When unset, the full log stays on stdout and shell/sbatch
+//!   * [`FULL_LOG_FILE_ENV`] — optional explicit path for a single full-log
+//!     file (the submitter's `--important-stdio-only` sink). When set, the
+//!     full sink writes there (so stdout can be gated without losing the
+//!     full log).
+//!   * [`FULL_LOG_DIR_ENV`] — optional per-node directory anchored on the
+//!     gateway-shared `--log-dir` mount. When set, the framework's own
+//!     runner log is persisted under it as a fixed `runner.log`, so the
+//!     log of a relocated/co-located primary (and every secondary) lands
+//!     host-readably even when [`FULL_LOG_FILE_ENV`] is unset inside the
+//!     container. Takes precedence over [`FULL_LOG_FILE_ENV`]: the
+//!     per-node mount is the durable sink the spawn paths inject, the
+//!     single-file var is the submitter-only legacy path.
+//!     When neither is set, the full log stays on stdout and shell/sbatch
 //!     redirection captures it, preserving today's single-stream
 //!     behaviour.
 
@@ -57,6 +67,19 @@ pub(crate) const IMPORTANT_STDIO_ONLY_ENV: &str = "DYNRUNNER_IMPORTANT_STDIO_ONL
 /// important events without losing the full record.
 pub(crate) const FULL_LOG_FILE_ENV: &str = "DYNRUNNER_FULL_LOG_FILE";
 
+/// Optional per-node directory (the container-internal `--log-dir` mount
+/// path for this node) under which the framework's own runner log is
+/// persisted. Injected by the SLURM spawn paths so every container's full
+/// log lands on the gateway-shared mount. Read once at [`init`]; takes
+/// precedence over [`FULL_LOG_FILE_ENV`].
+pub(crate) const FULL_LOG_DIR_ENV: &str = "DYNRUNNER_FULL_LOG_DIR";
+
+/// Fixed filename for the per-node runner log written under
+/// [`FULL_LOG_DIR_ENV`]. A single per-node file; R2 splits the verbose
+/// sink into per-role files under the same directory without touching the
+/// directory contract.
+const RUNNER_LOG_FILENAME: &str = "runner.log";
+
 /// Where the full (everything) sink writes.
 #[derive(Debug)]
 pub(crate) enum FullSink {
@@ -64,6 +87,8 @@ pub(crate) enum FullSink {
     /// configured; preserves the historical single-stream behaviour.
     Stdout,
     /// A dedicated file. Lets stdout be gated without losing the full log.
+    /// The path is `<FULL_LOG_DIR_ENV>/runner.log` when a per-node dir is
+    /// injected, else the explicit [`FULL_LOG_FILE_ENV`] path.
     File(PathBuf),
 }
 
@@ -83,9 +108,19 @@ impl LogConfig {
         let important_stdio_only = std::env::var(IMPORTANT_STDIO_ONLY_ENV)
             .map(|v| is_truthy(&v))
             .unwrap_or(false);
-        let full_sink = match std::env::var(FULL_LOG_FILE_ENV) {
-            Ok(path) if !path.trim().is_empty() => FullSink::File(PathBuf::from(path)),
-            _ => FullSink::Stdout,
+        // The per-node `--log-dir` mount wins over the legacy single-file
+        // var: it is the durable sink the spawn paths inject so every
+        // container persists its runner log, whereas `FULL_LOG_FILE_ENV`
+        // is the submitter-only `--important-stdio-only` path. Neither set
+        // → stdout (historical single-stream).
+        let full_sink = match std::env::var(FULL_LOG_DIR_ENV) {
+            Ok(dir) if !dir.trim().is_empty() => {
+                FullSink::File(PathBuf::from(dir).join(RUNNER_LOG_FILENAME))
+            }
+            _ => match std::env::var(FULL_LOG_FILE_ENV) {
+                Ok(path) if !path.trim().is_empty() => FullSink::File(PathBuf::from(path)),
+                _ => FullSink::Stdout,
+            },
         };
         Self {
             important_stdio_only,
@@ -198,6 +233,25 @@ where
     }
 }
 
+/// Open a full-log file append-create, materialising its parent directory
+/// first. The per-node mount subdir (`<mount>/<secondary_id>`) need not
+/// exist yet when logging installs — the spawn paths inject the path but
+/// the framework composes the per-node tree lazily — so create the parent
+/// before opening. Append-create survives the read-once-at-import /
+/// file-not-yet-existing case and never truncates a prior run's record.
+fn open_append_create(path: &std::path::Path) -> std::fs::File {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
+            panic!("failed to create full-log dir {}: {e}", parent.display())
+        });
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("failed to open full-log file {}: {e}", path.display()))
+}
+
 /// Assemble the two-layer set for `config`.
 ///
 /// The full file layer exists *iff* a full-log file is configured; with no
@@ -211,12 +265,7 @@ where
 {
     let mut layers: Vec<Box<dyn Layer<S> + Send + Sync>> = Vec::new();
     if let FullSink::File(path) = &config.full_sink {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap_or_else(|e| panic!("failed to open full-log file {}: {e}", path.display()));
-        layers.push(full_layer(file));
+        layers.push(full_layer(open_append_create(path)));
     }
     layers.push(stdio_layer(io::stdout, config.important_stdio_only));
     layers
@@ -476,5 +525,21 @@ mod tests {
         };
         let layers = build_layers::<Registry>(&config);
         assert_eq!(layers.len(), 2, "expected full-file layer + stdio layer");
+    }
+
+    #[test]
+    fn full_log_file_creates_missing_parent_dir() {
+        // The per-node mount subdir is composed lazily, so the full-log
+        // path's parent may not exist when logging installs. Building the
+        // layers must materialise it and open the file (append-create).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sec-0").join(RUNNER_LOG_FILENAME);
+        assert!(!path.parent().unwrap().exists(), "precondition: parent absent");
+        let config = LogConfig {
+            important_stdio_only: false,
+            full_sink: FullSink::File(path.clone()),
+        };
+        let _ = build_layers::<Registry>(&config);
+        assert!(path.exists(), "runner log not created under fresh per-node dir");
     }
 }
