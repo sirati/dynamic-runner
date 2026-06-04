@@ -400,22 +400,23 @@ async fn run_phase_ordering_scenario(
     }
 }
 
-/// A1-before-A4 ordering regression + empty-initial-phase cascade +
-/// consumer lazy-spawn, end-to-end. Proves the operator-facing
+/// Connect-before-first-phase-start ordering + empty-initial-phase
+/// cascade + consumer lazy-spawn, end-to-end. Proves the operator-facing
 /// important-event setup narration is correctly ordered AFTER moving
 /// the initial `fire_initial_phase_starts` (+ its dependent empty-phase
 /// cascade) to run AFTER `wait_for_connections`:
 ///
-///   * The "all secondaries connected" milestone (A1, emitted from
+///   * The "all secondaries connected" milestone (emitted from
 ///     `wait_for_connections`) MUST precede the FIRST "starting job
-///     phase" milestone (A4, emitted from `fire_initial_phase_starts`).
+///     phase" milestone (emitted from `fire_initial_phase_starts`).
 ///     Pre-reorder, the initial phase-start fired BEFORE connect, so the
 ///     operator saw "starting job phase" before "all secondaries
 ///     connected" — the inversion this reorder fixes.
-///   * "initial assignment complete" (A7a, the phase-preparation /
-///     task-spawning important event) and "initial setup done" (A5, the
-///     steady-state milestone) both appear, A5 last, and A5 appears
-///     EXACTLY ONCE on the submitter's process.
+///   * "initial assignment complete" (the phase-preparation /
+///     task-spawning important event) and "initial setup done" (the
+///     steady-state milestone) both appear, "initial setup done" last,
+///     and "initial setup done" appears EXACTLY ONCE on the submitter's
+///     process.
 ///
 /// The workload deliberately leads with an EMPTY phase (`pre`, zero
 /// items) whose `Blocked` dependent (`work`) holds every real task —
@@ -429,7 +430,7 @@ async fn run_phase_ordering_scenario(
 /// re-asserted to prove the cascade behaviour is identical with the
 /// call moved.
 #[tokio::test(flavor = "current_thread")]
-async fn a1_before_a4_with_empty_initial_phase_and_lazy_spawn() {
+async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_spawn() {
     use crate::test_capture::{ImportantCapture, important_only};
     use tracing_subscriber::Layer;
     use tracing_subscriber::Registry;
@@ -604,19 +605,22 @@ async fn a1_before_a4_with_empty_initial_phase_and_lazy_spawn() {
                 starting_phase.is_some(),
                 "expected a 'starting job phase' important event; got {msgs:?}"
             );
-            // A1 before A4 — the regression this reorder fixes.
+            // Connect before the first phase-start — the regression this
+            // reorder fixes.
             assert!(
                 connected < starting_phase,
                 "'all secondaries connected' must precede the first \
                  'starting job phase'; got {msgs:?}"
             );
-            // A7a present, carrying the assignment count, before steady-state.
+            // The count-bearing initial-assignment event is present, before
+            // the steady-state milestone.
             assert!(
                 assignment.is_some(),
                 "expected an 'initial assignment complete' important event \
-                 (A7a, phase-preparation / task-spawning); got {msgs:?}"
+                 (phase-preparation / task-spawning); got {msgs:?}"
             );
-            // A5 present, EXACTLY ONCE, and last (the steady-state milestone).
+            // "initial setup done" present, EXACTLY ONCE, and last (the
+            // steady-state milestone).
             assert!(
                 setup_done.is_some(),
                 "expected an 'initial setup done' important event; got {msgs:?}"

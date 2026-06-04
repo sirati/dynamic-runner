@@ -2357,7 +2357,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Subsequent activations triggered by `mark_phase_done` are
         // observed via `process_phase_lifecycle`.
         //
-        // Ordering note (A1-before-A4): this MUST run AFTER
+        // Ordering: the "all secondaries connected" milestone must precede
+        // the first "starting job phase" milestone. This MUST run AFTER
         // `wait_for_connections` so the operator's "all secondaries
         // connected" milestone (`primary/connect.rs`) prints BEFORE the
         // "starting job phase" milestone `fire_initial_phase_starts` emits.
@@ -3401,12 +3402,16 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// phase and false-fires `on_phase_end(.., 0, 0)` for it,
     /// dropping every callback-injected task.
     ///
-    /// Pre-loop / post-loop callers (`coordinator.rs:1258`,
-    /// `drain_pending_messages`, `wait_for_connections`,
-    /// `wait_for_mesh_ready`) pass `&mut None` — at those moments
-    /// PyPrimaryHandle is either dormant (run hasn't started yet) or
-    /// the operational loop has already exited and won't re-enter, so
-    /// there is no in-runtime callback path to drain.
+    /// The pre-loop waits `wait_for_connections` and `wait_for_mesh_ready`
+    /// pass the LIVE `command_rx` (the `take`n receiver, `Some`): the
+    /// PyPrimaryHandle IS reachable before operational-loop entry (it
+    /// shares the pre-`run` `command_sender()` clone), so an
+    /// `on_phase_end` fired by a TaskComplete arriving during either wait
+    /// can queue `SpawnTasks` and have it drain inline via the same
+    /// `dispatch_message` → cascade path. The post-loop drain
+    /// (`drain_pending_messages`) passes `&mut None` — by then the
+    /// operational loop has already exited and won't re-enter, so there is
+    /// no in-runtime callback path left to drain.
     pub(super) async fn process_phase_lifecycle(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
