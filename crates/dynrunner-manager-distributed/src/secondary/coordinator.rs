@@ -286,7 +286,11 @@ where
     /// co-located composition — the drain arm parks on `pending()`.
     ///
     /// Pre-`run_until_setup_or_done` contract, one-shot: the receiver is
-    /// `take`-n into the operational loop on first entry.
+    /// `take`-n at the first `process_tasks` entry and moved into its
+    /// resumable home on
+    /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
+    /// where it survives a `SetupPending` re-entry (on a promoted node it is
+    /// the sole path to the co-located primary's `RunComplete`).
     pub fn register_colocated_loopback_inbound(
         &mut self,
         rx: tokio::sync::mpsc::UnboundedReceiver<

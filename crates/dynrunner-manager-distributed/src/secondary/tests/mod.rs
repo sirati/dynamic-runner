@@ -56,10 +56,15 @@
 //!   yield discriminator + the fire-once latch (`ingest_setup_discovery`
 //!   broadcasts `PhaseDepsSet + TaskAdded`, seeds the local ledger, and
 //!   suppresses re-yield even on an empty discovery).
+//! - [`colocated_loopback_resumes_across_setup_pending`] — a co-located
+//!   secondary observes its own primary's `RunComplete` over the loopback
+//!   AFTER a `SetupPending` yield/re-entry; the loopback receiver is
+//!   resumable per-run state, not a fire-once latch.
 
 #![cfg(test)]
 
 mod cluster_state_refresh;
+mod colocated_loopback_resumes_across_setup_pending;
 mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;
