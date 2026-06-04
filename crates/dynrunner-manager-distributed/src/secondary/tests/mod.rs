@@ -26,6 +26,11 @@
 //!   (degraded-mode + healthy-mesh non-regression).
 //! - [`r1`] — R1 promotion-threshold tests + cold-start no-primary
 //!   tests + post-promotion peer-message dispatch test.
+//! - [`honest_liveness`] — `run_election_tick`'s honest-by-source
+//!   `need_election`: a transient blip (route up, staleness < backstop)
+//!   does NOT elect, a dead link arms fast via leg (A), a wedged-but-
+//!   routable primary elects via the patient backstop (leg B), and a
+//!   resumed primary message cancels an in-flight election.
 //! - [`cluster_state_refresh`] — the registered
 //!   `on_cluster_state_refresh` callback fires on the `process_tasks`
 //!   periodic tick with the live, post-apply `cluster_state`.
@@ -55,6 +60,7 @@
 #![cfg(test)]
 
 mod cluster_state_refresh;
+mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;

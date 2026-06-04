@@ -120,9 +120,18 @@ where
     /// window via the normal `record_primary_message` path when the
     /// primary's reply / keepalive arrives.
     ///
-    /// On a breach the same arming the deleted recv-None branch used is
-    /// applied: backdate `primary_last_seen` so the next
-    /// `run_election_tick` enters Suspecting.
+    /// On a breach `primary_last_seen` is backdated. This is NOT what
+    /// trips the local election any more — `run_election_tick`'s fast leg
+    /// (A) reads `primary_link.should_arm_failover()` directly. The
+    /// backdate is RETAINED for the peer-side confirmation gates that
+    /// still key on the `keepalive_interval × keepalive_miss_threshold`
+    /// deadline (`record_promotion_vote`'s `primary_silent` + a peer's
+    /// own Suspecting quorum tally): on a busy genuine death the link
+    /// arms fast, and funnelling the no-route signal into
+    /// `primary_last_seen` lets those gates agree immediately rather than
+    /// stalling the full ~15s deadline. The backdate (≈20s) is far below
+    /// `primary_silence_backstop` (≈120s), so it never trips the
+    /// election's patient leg (B).
     pub(in crate::secondary) async fn send_to_primary(
         &mut self,
         msg: DistributedMessage<I>,

@@ -37,9 +37,23 @@ where
     /// and bumps the count axis. The COUNT axis can saturate (e.g. an idle worker's
     /// backoff suppresses further `TaskRequest` sends, so no further
     /// probes accrue); this method covers the TIME axis by polling
-    /// `should_arm_failover()` on every keepalive tick and backdating
-    /// `primary_last_seen` once the window has elapsed, so the next
-    /// `run_election_tick` enters Suspecting.
+    /// `should_arm_failover()` on every keepalive tick.
+    ///
+    /// `run_election_tick`'s honest-liveness predicate reads
+    /// `should_arm_failover()` DIRECTLY (its fast leg (A)), so this
+    /// method no longer needs to backdate `primary_last_seen` just to
+    /// trip an election. The backdate is RETAINED for a distinct
+    /// consumer: the peer-side confirmation gates that still key on the
+    /// `keepalive_interval × keepalive_miss_threshold` deadline
+    /// (`record_promotion_vote`'s `primary_silent`, the Suspecting
+    /// quorum tally a peer runs over its own clock). On a busy genuine
+    /// death the link arms fast (well before that ~15s deadline of
+    /// receive-staleness), and funnelling the no-route signal into
+    /// `primary_last_seen` lets those gates agree immediately instead of
+    /// stalling for the full deadline. The backdate magnitude
+    /// (`keepalive_interval × (keepalive_miss_threshold + 1)` ≈20s) is
+    /// far below `primary_silence_backstop` (≈120s), so it never trips
+    /// the election's patient leg (B).
     ///
     /// Transport-agnostic: it reads only the primary-link health
     /// predicate — never `peer_count()`, never an uplink-close branch.
