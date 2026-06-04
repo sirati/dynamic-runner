@@ -279,11 +279,14 @@ def _panik_kwargs(args: argparse.Namespace) -> dict:
 
 def _build_distributed_config(args: argparse.Namespace):
     """Return a `DistributedConfig` carrying any operator-supplied retry
-    knobs (`--retry-max-passes`, `--oom-retry-max-passes`), or `None`
-    when both are unset so the Rust default applies. Both retry buckets
-    run at each phase drain edge — Recoverable first, then OOM — and
-    have independent per-(phase, kind) counters so neither budget bleeds
-    into the other.
+    knobs (`--retry-max-passes`, `--oom-retry-max-passes`) or the setup
+    deadline override (`--unconfigured-deadline-secs`), or `None` when
+    all are unset so the Rust default applies. Both retry buckets run at
+    each phase drain edge — Recoverable first, then OOM — and have
+    independent per-(phase, kind) counters so neither budget bleeds into
+    the other. `--unconfigured-deadline-secs` rides on the same
+    `DistributedConfig` and propagates to each spawned secondary's
+    `SecondaryConfig.unconfigured_deadline` (the pre-Operational wait).
     """
     import dynamic_runner as _rs
 
@@ -292,6 +295,8 @@ def _build_distributed_config(args: argparse.Namespace):
         kwargs["retry_max_passes"] = args.retry_max_passes
     if getattr(args, "oom_retry_max_passes", None) is not None:
         kwargs["oom_retry_max_passes"] = args.oom_retry_max_passes
+    if getattr(args, "unconfigured_deadline_secs", None) is not None:
+        kwargs["unconfigured_deadline_secs"] = args.unconfigured_deadline_secs
     if not kwargs:
         return None
     return _rs.DistributedConfig(**kwargs)
@@ -420,6 +425,14 @@ def _dispatch_secondary(task, args, logger) -> None:
         dc_kwargs["log_oom_watcher"] = True
     if args.disable_peer_overlay:
         dc_kwargs["disable_peer_overlay"] = True
+    # `--unconfigured-deadline-secs` rides through to the secondary the
+    # same way (NOT a framework-regenerated flag, so it passes verbatim
+    # in `forwarded_argv`); wire it onto THIS secondary's
+    # DistributedConfig so the pre-Operational wait the coordinator
+    # reads from `SecondaryConfig.unconfigured_deadline` honours the
+    # operator override on large/slow clusters.
+    if getattr(args, "unconfigured_deadline_secs", None) is not None:
+        dc_kwargs["unconfigured_deadline_secs"] = args.unconfigured_deadline_secs
     distributed_config = _rs.DistributedConfig(**dc_kwargs) if dc_kwargs else None
     # Per-machine cores AND memory: resolve both specs against
     # THIS host's detected resources, not the primary's. The

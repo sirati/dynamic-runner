@@ -88,6 +88,17 @@ pub fn build_run_argv(
         "PRIMARY_NODE_IPV6={}",
         peer_ips.ipv6.clone().unwrap_or_default()
     ));
+    // Persist this container's framework runner log on the gateway-shared
+    // `--log-dir` mount. The container sees the mount at `/app/log-network`
+    // (the `-v {log_network}:/app/log-network` volume below); the per-node
+    // subdir keys it by `secondary_id` so the relocated/co-located primary
+    // and each secondary write to distinct, host-readable files. logging.rs
+    // composes the per-role filenames under this dir.
+    argv.push("-e".to_string());
+    argv.push(format!(
+        "DYNRUNNER_FULL_LOG_DIR=/app/log-network/{}",
+        cfg.secondary_id
+    ));
     if cfg.dynrunner_network_dir.is_some() {
         argv.push("-e".to_string());
         argv.push("DYNRUNNER_NETWORK=/app/dynrunner-network".to_string());
@@ -273,6 +284,8 @@ mod tests {
             "-e",
             "PRIMARY_NODE_IPV6=fe80::1",
             "-e",
+            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
+            "-e",
             "DYNRUNNER_NETWORK=/app/dynrunner-network",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
@@ -359,6 +372,8 @@ mod tests {
             "PRIMARY_NODE_IPV4=",
             "-e",
             "PRIMARY_NODE_IPV6=",
+            "-e",
+            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
             "-v",
@@ -428,5 +443,43 @@ mod tests {
             .expect("--secondary present");
         assert_eq!(argv[idx + 1], "tcp://localhost:12345");
         assert!(argv.contains(&"--log-level=debug".to_string()));
+    }
+
+    /// Importance-stdio mode is SUBMITTER-LOCAL: it must never reach a
+    /// secondary container, neither as a `-e DYNRUNNER_IMPORTANT_STDIO_ONLY`
+    /// env nor as an `--important-stdio-only` CLI token. The submitter's
+    /// `_forwarded_argv.filter_framework_argv` strips the flag before it
+    /// reaches `forwarded_argv`, and `build_run_argv` injects a fixed env
+    /// set that does not include the importance vars. This pins the
+    /// guarantee at the spawn-argv level so a future env addition can't
+    /// silently flip a secondary into important-only mode.
+    #[test]
+    fn secondary_argv_never_carries_importance_stdio() {
+        let cfg = maximal_cfg(ConnectionMode::Standard {
+            gateway_host: "gw".to_string(),
+            gateway_port: 4433,
+        });
+        let argv = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(8_589_934_592),
+            &both_ips(),
+            7777,
+            "tcp://gw:4433",
+        );
+
+        assert!(
+            !argv.iter().any(|a| a.contains("DYNRUNNER_IMPORTANT_STDIO_ONLY")),
+            "container env must not carry DYNRUNNER_IMPORTANT_STDIO_ONLY"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("DYNRUNNER_FULL_LOG_FILE")),
+            "container env must not carry DYNRUNNER_FULL_LOG_FILE"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--important-stdio-only"),
+            "container command must not carry the --important-stdio-only flag"
+        );
     }
 }

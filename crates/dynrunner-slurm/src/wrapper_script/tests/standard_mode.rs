@@ -240,6 +240,14 @@ fn script_forwards_log_dir_container_path() {
          secondary so its argparse stores the container-internal log-\
          mount path on `args.log_dir`; render did not contain it"
     );
+    // Every container persists its own framework runner log under the
+    // gateway-shared log mount, keyed by `secondary_id` so the relocated/
+    // co-located primary and each secondary write to distinct files.
+    assert!(
+        script.contains("-e DYNRUNNER_FULL_LOG_DIR=\"/app/log-network/sec-01\""),
+        "wrapper script must inject the per-node runner-log dir so the \
+         framework's full log lands host-readably; render did not contain it"
+    );
     let srcnet_idx = script
         .find("--src-network=")
         .expect("--src-network= must be present");

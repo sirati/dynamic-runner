@@ -852,6 +852,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupf
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
+    -e DYNRUNNER_FULL_LOG_DIR="/app/log-network/{sid}" \
 {dynrunner_env_block}    -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
