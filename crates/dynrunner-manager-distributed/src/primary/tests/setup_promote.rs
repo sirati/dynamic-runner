@@ -19,29 +19,15 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
             secondary_ends.into_iter().next().unwrap();
 
         let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
             connect_timeout: Duration::from_secs(5),
             peer_timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
             // Setup-promote intent: the submitter has deferred
             // discovery + ledger seed to the promoted secondary, so
             // `total_tasks` starts at 0 and the operational loop must
             // wait for the secondary's TaskAdded broadcast.
             required_setup_on_promote: true,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
+            ..test_primary_config()
         };
         let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -193,29 +179,15 @@ async fn pre_seeded_counter_exit_unchanged() {
             let (_sec_id, _to_sec_rx, _incoming_tx) = secondary_ends.into_iter().next().unwrap();
 
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
                 keepalive_interval: Duration::from_millis(50),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
                 // Pre-seeded bootstrap: `seed_cluster_state` ran locally, so
                 // `total_tasks` is set by `run()` from `binaries.len()`
                 // and the counter-based exit must fire on the very first
-                // iteration once completions cover the total.
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                // iteration once completions cover the total. The default
+                // `required_setup_on_promote = false` is exactly this path.
+                ..test_primary_config()
             };
             let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 config,
@@ -335,29 +307,15 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
         let (transport, _secondary_ends) = setup_test(1);
 
         let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
             connect_timeout: Duration::from_secs(5),
             peer_timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_millis(50),
-            keepalive_miss_threshold: 3,
-            source_pre_staged_root: None,
-            uses_file_based_items: true,
             // Setup-promote intent: the gate's invariant is keyed off
             // this. With `false` the gate is always satisfied and the
             // bug cannot manifest — that case is covered by the
             // pre-seeded-bootstrap regression above.
             required_setup_on_promote: true,
-            max_concurrent_per_type: std::collections::HashMap::new(),
-            retry_max_passes: 1,
-            oom_retry_max_passes: 1,
-            fleet_dead_timeout: std::time::Duration::from_secs(30),
-            mesh_ready_timeout: std::time::Duration::from_secs(5),
-            mass_death_grace: std::time::Duration::ZERO,
-            mass_death_min_count: 2,
-            source_dir: None,
-            unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: std::time::Duration::from_secs(600),
+            ..test_primary_config()
         };
         let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -627,31 +585,18 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
 
             let deadline = Duration::from_millis(200);
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
                 keepalive_interval: Duration::from_millis(50),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
                 // Setup-promote intent: `setup_pending` starts true and
                 // there is no TaskAdded / TasksSpawned / RunComplete
                 // coming. The new deadline arm is the only exit cue.
                 required_setup_on_promote: true,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
                 // The arm under test. 200ms is comfortably above the
                 // tokio timer resolution (1ms) so the elapsed-> Duration
                 // check below has room without flake-prone tight bounds.
                 setup_promote_deadline: deadline,
+                ..test_primary_config()
             };
             let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 config,
@@ -779,25 +724,12 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
 
             let deadline = Duration::from_millis(500);
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
                 keepalive_interval: Duration::from_millis(50),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
                 required_setup_on_promote: true,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
                 setup_promote_deadline: deadline,
+                ..test_primary_config()
             };
             let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
                 config,

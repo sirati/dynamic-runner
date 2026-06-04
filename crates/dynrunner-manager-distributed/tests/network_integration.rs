@@ -183,25 +183,10 @@ async fn e2e_primary_secondary_over_wss() {
 
             // Primary coordinator
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(60),
                 mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..PrimaryConfig::default()
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -344,25 +329,10 @@ async fn e2e_primary_secondary_over_quic() {
 
             // Primary coordinator
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(60),
                 mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..PrimaryConfig::default()
             };
 
             let mut primary = PrimaryCoordinator::new(

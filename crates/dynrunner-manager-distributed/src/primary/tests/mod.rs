@@ -83,6 +83,28 @@ pub(super) fn noop_phase_args() -> (
     (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _| {}))
 }
 
+/// Shared `PrimaryConfig` starting point for the in-process coordinator
+/// tests. Returns `PrimaryConfig::default()` with the two deviations the
+/// in-process harness shares almost universally baked in:
+///
+/// - `mesh_ready_timeout: 5s` (default 60s) — the in-process channel mesh
+///   settles immediately, so the production 60s wait only slows tests.
+/// - `mass_death_grace: ZERO` (default 60s) — tests assert the immediate
+///   `requeue_dead_secondary` path; the mass-death defer would just stall.
+///
+/// Everything else is `Default`. Tests spread `..test_primary_config()` and
+/// override only the fields they actually exercise (commonly
+/// `num_secondaries`, `connect_timeout`, `peer_timeout`). A test that wants
+/// the production `mesh_ready_timeout`/`mass_death_grace` (or any other
+/// non-default deviation) overrides it explicitly, same as any other field.
+pub(super) fn test_primary_config() -> PrimaryConfig {
+    PrimaryConfig {
+        mesh_ready_timeout: Duration::from_secs(5),
+        mass_death_grace: Duration::ZERO,
+        ..PrimaryConfig::default()
+    }
+}
+
 /// Build the channel-backed mesh transport a real secondary holds when
 /// driven against a primary in-process: the secondary reaches the primary
 /// as an ordinary mesh peer keyed by `"primary"` (folded in via

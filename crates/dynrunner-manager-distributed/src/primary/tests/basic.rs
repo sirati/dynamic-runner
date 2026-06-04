@@ -11,25 +11,9 @@ async fn single_secondary_processes_all_tasks() {
             let (transport, secondary_ends) = setup_test(1);
 
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..test_primary_config()
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -68,25 +52,10 @@ async fn two_secondaries_distribute_work() {
             let (transport, secondary_ends) = setup_test(2);
 
             let config = PrimaryConfig {
-                node_id: "primary".into(),
                 num_secondaries: 2,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..test_primary_config()
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -164,25 +133,10 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             let transport =
                 ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
-                node_id: "primary".into(),
                 num_secondaries: 2,
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..test_primary_config()
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -254,25 +208,9 @@ async fn live_distribution_continues_past_initial_batch() {
             let (transport, secondary_ends) = setup_test(1);
 
             let config = PrimaryConfig {
-                node_id: "primary".into(),
-                num_secondaries: 1,
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
-                keepalive_interval: Duration::from_secs(5),
-                keepalive_miss_threshold: 3,
-                source_pre_staged_root: None,
-                uses_file_based_items: true,
-                required_setup_on_promote: false,
-                max_concurrent_per_type: std::collections::HashMap::new(),
-                retry_max_passes: 1,
-                oom_retry_max_passes: 1,
-                fleet_dead_timeout: std::time::Duration::from_secs(30),
-                mesh_ready_timeout: std::time::Duration::from_secs(5),
-                mass_death_grace: std::time::Duration::ZERO,
-                mass_death_min_count: 2,
-                source_dir: None,
-                unfulfillable_reinject_max_per_task: None,
-                setup_promote_deadline: std::time::Duration::from_secs(600),
+                ..test_primary_config()
             };
 
             let mut primary = PrimaryCoordinator::new(

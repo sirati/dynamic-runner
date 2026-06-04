@@ -36,7 +36,6 @@ fn coordinator_with_confirmed_peers(
     let (transport, ends) = setup_test(confirmed_peers);
     let coordinator = PrimaryCoordinator::new(
         PrimaryConfig {
-            node_id: "primary".into(),
             num_secondaries: confirmed_peers.max(1),
             // Short so the dead-fleet grace fires fast in the
             // peer-count==0 observer test.
@@ -74,7 +73,6 @@ fn observer_with_short_timeouts(
     let (transport, ends) = setup_test(confirmed_peers);
     let coordinator = PrimaryCoordinator::new(
         PrimaryConfig {
-            node_id: "primary".into(),
             num_secondaries: confirmed_peers.max(1),
             peer_timeout,
             // The fleet-dead poll is the wake source that re-drives the

@@ -27,7 +27,6 @@ fn coordinator_with_confirmed_peers(
     let (transport, _ends) = setup_test(confirmed_peers);
     PrimaryCoordinator::new(
         PrimaryConfig {
-            node_id: "primary".into(),
             num_secondaries: confirmed_peers.max(1),
             ..Default::default()
         },

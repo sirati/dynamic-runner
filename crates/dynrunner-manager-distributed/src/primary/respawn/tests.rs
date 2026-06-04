@@ -121,7 +121,6 @@ use crate::primary::test_helpers::{FixedEstimator, TestId, setup_test};
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPeerTransport;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -177,25 +176,16 @@ fn make_coordinator() -> PrimaryCoordinator<
 > {
     let (transport, _ends) = setup_test(0);
     let config = PrimaryConfig {
-        node_id: "primary".into(),
         num_secondaries: 1,
         connect_timeout: Duration::from_secs(1),
         peer_timeout: Duration::from_secs(1),
         keepalive_interval: Duration::from_millis(100),
-        keepalive_miss_threshold: 3,
-        source_pre_staged_root: None,
         uses_file_based_items: false,
-        required_setup_on_promote: false,
-        max_concurrent_per_type: HashMap::new(),
         retry_max_passes: 0,
-        oom_retry_max_passes: 1,
         fleet_dead_timeout: Duration::from_secs(1),
         mesh_ready_timeout: Duration::from_secs(1),
         mass_death_grace: Duration::from_secs(1),
-        mass_death_min_count: 2,
-        source_dir: None,
-        unfulfillable_reinject_max_per_task: None,
-        setup_promote_deadline: std::time::Duration::from_secs(600),
+        ..PrimaryConfig::default()
     };
     PrimaryCoordinator::new(
         config,
