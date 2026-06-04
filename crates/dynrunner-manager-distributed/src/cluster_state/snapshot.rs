@@ -356,16 +356,41 @@ impl<I: Identifier> ClusterState<I> {
         // because a legacy snapshot only ever expressed same-phase deps
         // implicitly.
         migrate_unphased_deps(&mut snap);
+        // Exhaustive destructure (NO `..` rest pattern) — the SYMMETRIC
+        // structural completeness guard, mirroring `snapshot()`. Every
+        // `ClusterStateSnapshot` field is NAMED here, so adding a future
+        // snapshot field is a COMPILE ERROR at this site until the
+        // developer explicitly classifies it restore-vs-skip. This closes
+        // the round-trip: `snapshot()` guards "a new `ClusterState` field
+        // must be classified for serialize"; this guard catches "a new
+        // snapshot field silently ignored on restore". Each binding below
+        // is consumed by the merge that previously read `snap.<field>`;
+        // the transformation is a faithful rename (`snap.X` → `X`), not a
+        // logic change.
+        let ClusterStateSnapshot {
+            tasks,
+            current_primary,
+            primary_epoch,
+            phase_deps,
+            observers,
+            can_be_primary,
+            peer_holdings,
+            task_outputs,
+            secondary_capacities,
+            alive_members,
+            run_complete,
+            run_aborted,
+        } = snap;
         // Capture the snapshot's authoritative observer set BEFORE the
-        // observer-set branch below may move `snap.observers` into the
+        // observer-set branch below may move `observers` into the
         // role table. The alive-membership merge (at the tail of this
         // method) reads it to reconstruct each newly-inserted
         // `PeerEntry`'s `is_observer` flag, so alive-state and
         // observer-flag transfer cohesively regardless of whether the
         // local observer set was already populated (in which case the
-        // branch keeps local and does NOT consume `snap.observers`).
-        let restored_observers = snap.observers.clone();
-        for (hash, incoming) in snap.tasks {
+        // branch keeps local and does NOT consume `observers`).
+        let restored_observers = observers.clone();
+        for (hash, incoming) in tasks {
             match self.tasks.get(&hash) {
                 None => {
                     self.tasks.insert(hash, incoming);
@@ -377,16 +402,16 @@ impl<I: Identifier> ClusterState<I> {
                 }
             }
         }
-        if snap.primary_epoch > self.primary_epoch {
-            self.primary_epoch = snap.primary_epoch;
+        if primary_epoch > self.primary_epoch {
+            self.primary_epoch = primary_epoch;
             // Mirror update on the snapshot-merge path mirrors the live
             // `PrimaryChanged` apply rule — same `Release` ordering, same
             // pre-`fire_role_change_hooks` write — so a late-joiner's
             // announcer wakes from the restore-time trigger and reads the
             // restored epoch, not the cold-start 0.
             self.primary_epoch_mirror
-                .store(snap.primary_epoch, std::sync::atomic::Ordering::Release);
-            self.current_primary = snap.current_primary.clone();
+                .store(primary_epoch, std::sync::atomic::Ordering::Release);
+            self.current_primary = current_primary.clone();
             // Keep the replicated `RoleTable` in lockstep with
             // `current_primary` even when the new value lands via
             // the snapshot-merge path (late joiner / reconnect),
@@ -394,11 +419,11 @@ impl<I: Identifier> ClusterState<I> {
             // role-change hook fires AFTER the table update so any
             // registered write-through cache stays coherent with
             // the post-merge state.
-            self.role_table.primary = snap.current_primary;
+            self.role_table.primary = current_primary;
             self.fire_role_change_hooks();
         }
         if self.phase_deps.is_empty() {
-            self.phase_deps = snap.phase_deps;
+            self.phase_deps = phase_deps;
         }
         // Observer set: replace if local is empty (first-bootstrap
         // case), otherwise keep local. The live `PeerJoined` apply
@@ -409,8 +434,8 @@ impl<I: Identifier> ClusterState<I> {
         // the transport's write-through cache coherent on the
         // snapshot path the same way `PeerJoined` does on the live
         // path.
-        if self.role_table.observers.is_empty() && !snap.observers.is_empty() {
-            self.role_table.observers = snap.observers;
+        if self.role_table.observers.is_empty() && !observers.is_empty() {
+            self.role_table.observers = observers;
             self.fire_role_change_hooks();
         }
         // Primary-capability set: replace if local is empty (first-
@@ -421,8 +446,8 @@ impl<I: Identifier> ClusterState<I> {
         // mutation arrives. Fire the role-change hooks on a genuine
         // change so the write-through cache stays coherent on the
         // snapshot path the same way the live apply does.
-        if self.role_table.can_be_primary.is_empty() && !snap.can_be_primary.is_empty() {
-            self.role_table.can_be_primary = snap.can_be_primary;
+        if self.role_table.can_be_primary.is_empty() && !can_be_primary.is_empty() {
+            self.role_table.can_be_primary = can_be_primary;
             self.fire_role_change_hooks();
         }
         // Peer-holdings map: same first-bootstrap-only contract
@@ -433,8 +458,8 @@ impl<I: Identifier> ClusterState<I> {
         // fire here: holdings-change hooks (wired by the sibling
         // E3 subtask via the lifecycle dispatcher mpsc) are
         // per-peer-announce signals, not snapshot-bootstrap signals.
-        if self.peer_holdings.is_empty() && !snap.peer_holdings.is_empty() {
-            self.peer_holdings = snap.peer_holdings;
+        if self.peer_holdings.is_empty() && !peer_holdings.is_empty() {
+            self.peer_holdings = peer_holdings;
         }
         // Keyed-output cache merge: per-key first-write-wins. Each
         // `TaskCompleted` apply for a given hash records exactly one
@@ -447,7 +472,7 @@ impl<I: Identifier> ClusterState<I> {
         // `entry().or_insert(_)` shape is the CRDT-coherent choice;
         // a blanket replace would clobber legitimately-applied local
         // entries when the snapshot interleaves with live broadcasts.
-        for (hash, outputs) in snap.task_outputs {
+        for (hash, outputs) in task_outputs {
             self.task_outputs.entry(hash).or_insert(outputs);
         }
         // Per-secondary capacity merge: per-secondary first-write-wins,
@@ -459,7 +484,7 @@ impl<I: Identifier> ClusterState<I> {
         // regardless of (live-broadcast, snapshot) arrival order. A
         // blanket replace would clobber a legitimately-applied local
         // entry when the snapshot interleaves with live broadcasts.
-        for (secondary, record) in snap.secondary_capacities {
+        for (secondary, record) in secondary_capacities {
             self.secondary_capacities.entry(secondary).or_insert(record);
         }
         // Alive-membership merge: Dead-wins / sticky-removal, mirroring
@@ -472,10 +497,10 @@ impl<I: Identifier> ClusterState<I> {
         // The `Entry::Vacant` guard makes this idempotent + order-
         // insensitive. The inserted entry's `is_observer` is
         // reconstructed from the snapshot's authoritative `observers`
-        // set (read from `snap.observers` directly, captured before the
+        // set (via the `restored_observers` clone captured before the
         // observer-set branch above may have moved it into the role
         // table) so alive-state and observer-flag transfer cohesively.
-        for id in snap.alive_members {
+        for id in alive_members {
             if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id.clone()) {
                 e.insert(PeerEntry {
                     state: PeerState::Alive,
@@ -490,9 +515,9 @@ impl<I: Identifier> ClusterState<I> {
         // only (`|=` never regresses true→false); `run_aborted` latches
         // the first `Some` and never overwrites an already-`Some` local
         // value (`get_or_insert` is a no-op when already `Some`).
-        self.run_complete |= snap.run_complete;
+        self.run_complete |= run_complete;
         if self.run_aborted.is_none()
-            && let Some(reason) = snap.run_aborted
+            && let Some(reason) = run_aborted
         {
             self.run_aborted = Some(reason);
         }
