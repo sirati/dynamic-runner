@@ -545,16 +545,23 @@ where
     pub(super) colocated_primary_inbound_tx:
         Option<tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>>,
 
-    /// Co-located primary LOOPBACK receiver (channel CH1). Registered by
-    /// the pyo3 composition via
+    /// Co-located primary LOOPBACK receiver (channel CH1) — the PRE-RUN
+    /// REGISTRATION SLOT only. Registered by the pyo3 composition via
     /// [`Self::register_colocated_loopback_inbound`]. Carries the
     /// primary→secondary direction (own-host `TaskAssignment` loopback +
     /// the co-located primary's `Destination::All` broadcast leg); the
     /// secondary drains it in its operational `select!` loop next to
     /// `transport.recv_peer` and feeds each frame through `handle_inbound`
     /// exactly as a wire frame. `None` outside a co-located composition —
-    /// the drain arm parks on `pending()`. `take`-n into the operational
-    /// loop on first entry.
+    /// the drain arm parks on `pending()`.
+    ///
+    /// `take`-n ONCE at the first `process_tasks` entry and moved into
+    /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
+    /// its RESUMABLE home: a `SetupPending` re-entry is a real second
+    /// consumption, and on a promoted node this is the SOLE path to the
+    /// co-located primary's `RunComplete`, so it must survive the yield. This
+    /// coordinator slot is therefore `None` from the first entry onward; the
+    /// live receiver lives on `OperationalState` thereafter.
     pub(super) colocated_loopback_inbound_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }

@@ -328,6 +328,32 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// Setup-discovery fire-once latch, carried forward from
     /// [`ConfiguringState`].
     pub(in crate::secondary) setup_discovery_done: bool,
+
+    /// Co-located primary LOOPBACK receiver (channel CH1) — RESUMABLE
+    /// per-run terminal-signal state, NOT a fire-once latch.
+    ///
+    /// On a promoted / multi-role host the co-located
+    /// [`crate::primary::PrimaryCoordinator`] is NOT a mesh peer of itself,
+    /// so its `RunComplete` (and every other `Destination::All` broadcast)
+    /// reaches this co-located secondary's `process_tasks` loop ONLY through
+    /// this loopback — the QUIC mesh never closes, so the `recv_peer()==None`
+    /// break cannot fire. This receiver is therefore the SOLE path by which a
+    /// promoted secondary observes its own primary's clean completion.
+    ///
+    /// It lives on [`OperationalState`] (alongside `active_tasks` and the
+    /// other resumable per-run state) precisely BECAUSE a `SetupPending`
+    /// yield/re-entry is a real second consumption: the operational loop
+    /// `take`s it into a loop-local at each entry and restores it here before
+    /// the `SetupPending` return, so re-entry re-attaches it from this home.
+    /// Were it a fire-once [`OperationalLatches`] member, the re-entry would
+    /// find `None`, the loopback arm would park on `pending()` forever, and
+    /// the promoted secondary would never observe `RunComplete` (per-run
+    /// container/process leak). Seeded from the coordinator's
+    /// `colocated_loopback_inbound_rx` slot at the `enter_operational`
+    /// boundary; `None` on every non-co-located path (the drain arm parks on
+    /// `pending()`) and for the pure-observer construction.
+    pub(in crate::secondary) colocated_loopback_inbound_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -397,12 +423,22 @@ impl Default for MeshFormation {
 /// coordinator builds at construction and `take()`s once when it first
 /// reaches `process_tasks` (see the matching fields on
 /// [`super::SecondaryCoordinator`]: `announcer_outbox_rx`,
-/// `panik_signal_rx`, `fatal_exit_signal_rx`, `on_cluster_state_refresh`,
-/// `colocated_loopback_inbound_rx`). The `Configuring → Operational`
-/// transition is the ONE place they are consumed: the coordinator fills
-/// this carrier by `take()`-ing each `Option`, hands it to
-/// `enter_operational`, and gets the unwrapped values back to drive the
-/// operational `select!` loop.
+/// `panik_signal_rx`, `fatal_exit_signal_rx`, `on_cluster_state_refresh`).
+/// The `Configuring → Operational` transition is the ONE place they are
+/// consumed: the coordinator fills this carrier by `take()`-ing each
+/// `Option`, hands it to `enter_operational`, and gets the unwrapped values
+/// back to drive the operational `select!` loop.
+///
+/// **The co-located loopback inbound receiver is NOT here.** It used to ride
+/// this carrier, but a `SetupPending` yield/re-entry is a real SECOND
+/// consumption, and on a promoted node that receiver is the SOLE
+/// terminal-signal path (the co-located primary is not a mesh peer of
+/// itself, so its `RunComplete` reaches the secondary only via the
+/// loopback). A `None`-on-re-entry would park the loopback arm on
+/// `pending()` forever and leak the run. It is therefore resumable per-run
+/// state on [`OperationalState::colocated_loopback_inbound_rx`], `take`-n
+/// into a loop-local and restored before the `SetupPending` return so
+/// re-entry re-attaches it.
 ///
 /// The `lifecycle_rx` / `task_completed_rx` receivers are deliberately NOT
 /// here: they were already `take()`-n earlier (in
@@ -411,14 +447,21 @@ impl Default for MeshFormation {
 /// three is ever drained by this loop, so the carrier only ferries the
 /// receivers the operational `select!` actually polls.
 ///
-/// **Fire-once by construction.** A `SetupPending` excursion re-enters
-/// `run_until_setup_or_done` and finds the lifecycle already
-/// `Operational`, so `enter_operational` is never called twice; and even
-/// if it were, the coordinator's `Option::take()` yields `None` on the
-/// second pass. Modelling the latches as a move-in / move-out carrier (NOT
-/// fields of [`OperationalState`]) keeps them where they belong — local to
-/// the operational loop, not part of the resumable state data — exactly as
-/// the skeleton scoped [`OperationalState`].
+/// **Fire-once by construction — and that is exactly why the loopback rx is
+/// elsewhere.** A `SetupPending` excursion re-enters
+/// `run_until_setup_or_done` and finds the lifecycle already `Operational`,
+/// so `enter_operational` is never called twice; and even if it were, the
+/// coordinator's `Option::take()` yields `None` on the second pass. For the
+/// four members carried here that `None` is benign: each gates an OPTIONAL
+/// capability whose absence means "feature not configured", so a
+/// never-firing arm on re-entry is correct (no observer announcer / no
+/// `--panik-file` / no fatal-exit policy / no refresh consumer). Modelling
+/// these four as a move-in / move-out carrier (NOT fields of
+/// [`OperationalState`]) keeps them where they belong — local to the
+/// operational loop, not part of the resumable state data. The loopback
+/// inbound receiver is the lone exception: its `None`-on-re-entry is FATAL
+/// on a promoted node, so it is resumable per-run state on
+/// [`OperationalState`], not a member of this fire-once carrier.
 ///
 /// `primary_activator` is deliberately NOT here: it stays a
 /// coordinator-level slot, `take()`-n at the activation site when this node
@@ -442,17 +485,6 @@ pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// Periodic cluster-state refresh callback. `None` when no consumer
     /// registered.
     pub(in crate::secondary) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
-
-    /// Co-located primary LOOPBACK receiver (channel CH1). `Some` only on
-    /// a multi-role host whose pyo3 composition registered it (see
-    /// `SecondaryCoordinator::register_colocated_loopback_inbound`); the
-    /// secondary drains it in its operational `select!` loop alongside
-    /// `transport.recv_peer`, feeding each frame through `handle_inbound`
-    /// as a wire frame. `None` on every non-co-located path — the drain
-    /// arm parks on `pending()`. Surrendered at the same single fire-once
-    /// `enter_operational` boundary as the other take-once latches.
-    pub(in crate::secondary) colocated_loopback_inbound_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }
 
 impl<I: Identifier> OperationalLatches<I> {
@@ -473,7 +505,6 @@ impl<I: Identifier> OperationalLatches<I> {
             panik_signal_rx: None,
             fatal_exit_signal_rx: None,
             on_cluster_state_refresh: None,
-            colocated_loopback_inbound_rx: None,
         }
     }
 }
@@ -577,6 +608,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// Returns `self` unchanged (passing the latches straight back) if
     /// called from any non-`Configuring` variant: the transition is only
     /// valid out of `Configuring`.
+    ///
+    /// `colocated_loopback_inbound_rx` is the resumable per-run loopback
+    /// receiver (the coordinator's `colocated_loopback_inbound_rx.take()`):
+    /// it moves **into** [`OperationalState`] here on the first
+    /// (`Configuring`) entry, and is preserved across a `SetupPending`
+    /// re-entry (which hits the no-op `Operational` arm with a `None`
+    /// argument, leaving the already-attached receiver untouched). Unlike
+    /// the fire-once [`OperationalLatches`], it must survive re-entry — see
+    /// [`OperationalState::colocated_loopback_inbound_rx`].
     #[allow(clippy::too_many_arguments)]
     pub(in crate::secondary) fn enter_operational(
         self,
@@ -588,6 +628,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
         pending_worker_restarts: HashSet<WorkerId>,
         pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
+        colocated_loopback_inbound_rx: Option<
+            tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>,
+        >,
     ) -> (Self, OperationalLatches<I>) {
         match self {
             SecondaryLifecycle::Configuring(cfg) => {
@@ -614,9 +657,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done,
+                    colocated_loopback_inbound_rx,
                 }));
                 (next, latches)
             }
+            // Already `Operational` (a `SetupPending` re-entry, where the
+            // coordinator's loopback slot is now `None`): a no-op on the
+            // state, so the supplied `None` argument is simply dropped and
+            // the receiver already living in `OperationalState` (restored
+            // before the yield) is preserved.
             other => (other, latches),
         }
     }
@@ -655,6 +704,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             pre_staged_mode: false,
             uses_file_based_items: true,
             setup_discovery_done: false,
+            // A pure observer / late-joiner has no co-located primary, so no
+            // loopback inbound; the operational loop's drain arm parks on
+            // `pending()`.
+            colocated_loopback_inbound_rx: None,
         }));
         (state, latches)
     }

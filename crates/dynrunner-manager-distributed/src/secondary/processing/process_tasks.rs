@@ -64,20 +64,31 @@ where
         // A `SetupPending` re-entry (and the late-joiner observer, which
         // `restore_from_snapshot_and_skip_setup` landed directly in
         // `Operational`) finds the lifecycle already `Operational`, so the
-        // transition is a no-op on the state — and the `Option::take()`s
-        // yield `None` the second time, so the loop's latch locals re-park
-        // exactly as the pre-typed flat-field flow did across the yield.
-        // The carrier ferries only the receivers the operational `select!`
-        // actually polls. `lifecycle_rx` / `task_completed_rx` were already
-        // taken in `run_until_setup_or_done_inner` to spawn their
-        // dispatchers, and `command_rx` is transferred to the co-located
-        // primary — none is drained here, so none rides this carrier.
+        // transition is a no-op on the state — and the four fire-once
+        // latches' `Option::take()`s yield `None` the second time, so the
+        // loop's latch locals re-park exactly as the pre-typed flat-field
+        // flow did across the yield. The carrier ferries only the receivers
+        // the operational `select!` actually polls. `lifecycle_rx` /
+        // `task_completed_rx` were already taken in
+        // `run_until_setup_or_done_inner` to spawn their dispatchers, and
+        // `command_rx` is transferred to the co-located primary — none is
+        // drained here, so none rides this carrier.
+        //
+        // The co-located loopback inbound receiver is deliberately NOT a
+        // fire-once latch: it is the SOLE terminal-signal path on a promoted
+        // node (the co-located primary's `RunComplete` reaches this loop only
+        // via the loopback — the mesh never closes), and a `SetupPending`
+        // re-entry IS a genuine second consumption. It is moved into
+        // `OperationalState` at `enter_operational` (first entry only; the
+        // re-entry passes `None` to the no-op `Operational` arm, preserving
+        // the receiver restored before the prior yield), then `take`-n into a
+        // loop-local below and restored to `OperationalState` before the
+        // `SetupPending` return.
         let latches = super::super::lifecycle::OperationalLatches {
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
             panik_signal_rx: self.panik_signal_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
             on_cluster_state_refresh: self.on_cluster_state_refresh.take(),
-            colocated_loopback_inbound_rx: self.colocated_loopback_inbound_rx.take(),
         };
         let primary_link = super::super::primary_link::PrimaryLink::with_failover_threshold(
             self.config.primary_link_failure_threshold,
@@ -96,6 +107,11 @@ where
             Vec::new(),
             std::collections::HashSet::new(),
             std::collections::HashMap::new(),
+            // First (`Configuring`) entry: hand the coordinator's loopback
+            // receiver into `OperationalState`. Re-entry: `None` (already
+            // consumed), and the no-op `Operational` arm preserves the
+            // receiver restored before the prior yield.
+            self.colocated_loopback_inbound_rx.take(),
         );
         self.lifecycle = lifecycle;
         let super::super::lifecycle::OperationalLatches {
@@ -103,8 +119,15 @@ where
             mut panik_signal_rx,
             mut fatal_exit_signal_rx,
             on_cluster_state_refresh,
-            mut colocated_loopback_inbound_rx,
         } = latches;
+        // Take the resumable loopback receiver out of `OperationalState` into
+        // a loop-local for the `select!` drain arm. A loop-local is required
+        // here (it cannot be polled in-place off `OperationalState`) because
+        // the pool arm already holds a `&mut self.lifecycle` partial borrow
+        // for its own recv future; a second `&mut self.lifecycle` for the
+        // loopback arm would conflict. It is restored to `OperationalState`
+        // before the `SetupPending` return so re-entry re-attaches it.
+        let mut colocated_loopback_inbound_rx = self.op_mut().colocated_loopback_inbound_rx.take();
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: after a host suspend/resume the
@@ -166,7 +189,11 @@ where
         // did with per-field `Option::take()`. Each is `None` when its
         // registration never happened (no observer announcer / no
         // `--panik-file` / no fatal-exit policy / no refresh consumer) and
-        // the matching arm parks on `pending()`.
+        // the matching arm parks on `pending()`. `colocated_loopback_inbound_rx`
+        // is the one local owned across iterations that is NOT a fire-once
+        // latch: it round-trips through `OperationalState` so it survives a
+        // `SetupPending` re-entry (see the take above and the restore before
+        // the `SetupPending` return below).
         //
         // Grace for the SIGTERM → SIGKILL escalation on the worker pool is
         // 5s — same window the SubprocessWorkerFactory uses for its own
@@ -580,6 +607,16 @@ where
                      yielding from process_tasks so caller can run \
                      task.discover_items and call ingest_setup_discovery"
                 );
+                // Restore the loopback receiver to its resumable home in
+                // `OperationalState` BEFORE yielding. This is the ONLY return
+                // path that re-enters `process_tasks`; the loop-local would
+                // otherwise drop here and the re-entry would find `None`,
+                // parking the loopback arm on `pending()` forever — on a
+                // promoted node that loses the SOLE path to its own primary's
+                // `RunComplete` and leaks the run. Restoring to
+                // `OperationalState` (NOT the coordinator's fire-once slot)
+                // is what makes the receiver resumable across re-entry.
+                self.op_mut().colocated_loopback_inbound_rx = colocated_loopback_inbound_rx;
                 return Ok(RunOutcome::SetupPending);
             }
 
