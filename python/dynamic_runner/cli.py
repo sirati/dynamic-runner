@@ -311,10 +311,12 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
             "unset. The SLURM wrapper passes `--log-dir=/app/log-network` "
             "so worker logs land under the dedicated log-mount tree "
             "instead of the output-mount tree. In SLURM deployments the "
-            "wrapper also anchors the framework's own runner log here "
-            "(`{secondary_id}/runner.log` per node), so a relocated/co-"
-            "located primary's full log is persisted host-readably rather "
-            "than living only in the container's journald."
+            "wrapper also anchors the framework's own runner log here, "
+            "split by role per node (`{secondary_id}/primary.log` and "
+            "`{secondary_id}/secondary.log`), so a relocated/co-located "
+            "primary's full log is persisted host-readably and isolated "
+            "from its host secondary's rather than living only in the "
+            "container's journald."
         ),
     )
     parser.add_argument(

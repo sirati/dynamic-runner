@@ -25,11 +25,15 @@
 //!     full log).
 //!   * [`FULL_LOG_DIR_ENV`] — optional per-node directory anchored on the
 //!     gateway-shared `--log-dir` mount. When set, the framework's own
-//!     runner log is persisted under it as a fixed `runner.log`, so the
-//!     log of a relocated/co-located primary (and every secondary) lands
-//!     host-readably even when [`FULL_LOG_FILE_ENV`] is unset inside the
-//!     container. Takes precedence over [`FULL_LOG_FILE_ENV`]: the
-//!     per-node mount is the durable sink the spawn paths inject, the
+//!     runner log is persisted under it, SPLIT BY ROLE: primary-role
+//!     events to `<dir>/primary.log`, secondary-role events to
+//!     `<dir>/secondary.log`. So the log of a relocated/co-located primary
+//!     is isolated from its host secondary's, and both land host-readably
+//!     even when [`FULL_LOG_FILE_ENV`] is unset inside the container. The
+//!     role is read off the run future's role span (see
+//!     [`role_full_layer`] and `dynrunner_core::role_span`), never a
+//!     per-call-site branch. Takes precedence over [`FULL_LOG_FILE_ENV`]:
+//!     the per-node mount is the durable sink the spawn paths inject, the
 //!     single-file var is the submitter-only legacy path.
 //!     When neither is set, the full log stays on stdout and shell/sbatch
 //!     redirection captures it, preserving today's single-stream
@@ -40,11 +44,12 @@ use std::io;
 use std::path::PathBuf;
 
 use chrono::Local;
-use tracing::Metadata;
+use tracing::{Event, Metadata};
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
@@ -74,11 +79,23 @@ pub(crate) const FULL_LOG_FILE_ENV: &str = "DYNRUNNER_FULL_LOG_FILE";
 /// precedence over [`FULL_LOG_FILE_ENV`].
 pub(crate) const FULL_LOG_DIR_ENV: &str = "DYNRUNNER_FULL_LOG_DIR";
 
-/// Fixed filename for the per-node runner log written under
-/// [`FULL_LOG_DIR_ENV`]. A single per-node file; R2 splits the verbose
-/// sink into per-role files under the same directory without touching the
-/// directory contract.
-const RUNNER_LOG_FILENAME: &str = "runner.log";
+/// Filename for primary-role events under [`FULL_LOG_DIR_ENV`]: every
+/// event a primary coordinator's run future emits (it carries the
+/// [`PRIMARY_ROLE_SPAN`]). Separate from [`SECONDARY_LOG_FILENAME`] so a
+/// relocated/co-located primary's log is isolated from its host
+/// secondary's in the one-process promoted case.
+const PRIMARY_LOG_FILENAME: &str = "primary.log";
+
+/// Filename for secondary-role events under [`FULL_LOG_DIR_ENV`]: every
+/// event a secondary coordinator's run future emits (it carries the
+/// [`SECONDARY_ROLE_SPAN`]).
+const SECONDARY_LOG_FILENAME: &str = "secondary.log";
+
+/// Cross-crate role-span names, the routing keys for the two per-role
+/// full-log layers. Defined once in `dynrunner-core`; the coordinators
+/// enter spans of these names at their run entry, this layer reads the
+/// names off the event scope. See [`role_full_layer`].
+use dynrunner_core::{PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
 
 /// Where the full (everything) sink writes.
 #[derive(Debug)]
@@ -86,10 +103,18 @@ pub(crate) enum FullSink {
     /// Share stdout with the stdio sink. Used when no full-log file is
     /// configured; preserves the historical single-stream behaviour.
     Stdout,
-    /// A dedicated file. Lets stdout be gated without losing the full log.
-    /// The path is `<FULL_LOG_DIR_ENV>/runner.log` when a per-node dir is
-    /// injected, else the explicit [`FULL_LOG_FILE_ENV`] path.
+    /// A single dedicated file (the submitter's explicit
+    /// [`FULL_LOG_FILE_ENV`] path). Lets stdout be gated without losing
+    /// the full log; one unfiltered layer, the only role on the bare
+    /// submitter is its own primary.
     File(PathBuf),
+    /// A per-node directory (the [`FULL_LOG_DIR_ENV`] mount path for this
+    /// node). The verbose sink splits by role: primary-span events to
+    /// `<dir>/primary.log`, secondary-span events to `<dir>/secondary.log`.
+    /// In the one-process promoted case the relocated/co-located primary
+    /// and its host secondary are distinct `spawn_local` tasks carrying
+    /// distinct role spans, so their events land in distinct files.
+    PerNodeDir(PathBuf),
 }
 
 /// Resolved logging mode, read once from the environment.
@@ -114,9 +139,7 @@ impl LogConfig {
         // is the submitter-only `--important-stdio-only` path. Neither set
         // → stdout (historical single-stream).
         let full_sink = match std::env::var(FULL_LOG_DIR_ENV) {
-            Ok(dir) if !dir.trim().is_empty() => {
-                FullSink::File(PathBuf::from(dir).join(RUNNER_LOG_FILENAME))
-            }
+            Ok(dir) if !dir.trim().is_empty() => FullSink::PerNodeDir(PathBuf::from(dir)),
             _ => match std::env::var(FULL_LOG_FILE_ENV) {
                 Ok(path) if !path.trim().is_empty() => FullSink::File(PathBuf::from(path)),
                 _ => FullSink::Stdout,
@@ -169,6 +192,60 @@ where
     tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
         .with_filter(env_filter())
+        .boxed()
+}
+
+/// The single layer-level gate for a per-role full-log file: admit an
+/// event iff one of the spans in its scope is the role span named
+/// `role_span_name`. This is the ONLY place a role is decided for routing;
+/// call sites just emit, and the role span their run future entered (see
+/// `dynrunner_core::role_span`) carries the attribution.
+///
+/// The role is read off the span NAME (intrinsic metadata, always present
+/// in the event scope), so no field-value-recording layer is needed. Only
+/// `event_enabled` is overridden — `enabled` stays default-true so the
+/// role span is never disabled for either role layer, keeping the scope
+/// intact for the other layer to read.
+struct RoleFilter {
+    role_span_name: &'static str,
+}
+
+impl<S> Filter<S> for RoleFilter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn enabled(&self, _meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        // Verbosity is owned by the sibling env-filter; role routing is a
+        // per-event scope decision made in `event_enabled`. Never disable a
+        // span here (that would strip the role span from the other role's
+        // scope).
+        true
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
+        cx.event_scope(event)
+            .into_iter()
+            .flatten()
+            .any(|span| span.name() == self.role_span_name)
+    }
+}
+
+/// Build a per-role full (everything) `fmt` layer over `writer`: verbose
+/// (RFC3339-UTC, target shown) like [`full_layer`], but additionally
+/// scope-gated to the role span named `role_span_name`. Used by the
+/// per-node-dir sink to split `primary.log` / `secondary.log`.
+fn role_full_layer<S, W>(
+    make_writer: W,
+    role_span_name: &'static str,
+) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(make_writer)
+        .with_filter(env_filter())
+        .with_filter(RoleFilter { role_span_name })
         .boxed()
 }
 
@@ -241,9 +318,8 @@ where
 /// file-not-yet-existing case and never truncates a prior run's record.
 fn open_append_create(path: &std::path::Path) -> std::fs::File {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            panic!("failed to create full-log dir {}: {e}", parent.display())
-        });
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create full-log dir {}: {e}", parent.display()));
     }
     OpenOptions::new()
         .create(true)
@@ -252,20 +328,35 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("failed to open full-log file {}: {e}", path.display()))
 }
 
-/// Assemble the two-layer set for `config`.
+/// Assemble the layer set for `config`.
 ///
-/// The full file layer exists *iff* a full-log file is configured; with no
-/// file the stdio layer alone is the full stream (mode off → ungated → the
-/// historical single stdout; mode on → only the important target to stdout
-/// while the operator-supplied file would carry the rest). This is one
-/// rule, not a per-event branch.
+/// The full sink composes per `FullSink`: `Stdout` adds no file layer (the
+/// stdio layer alone is the full stream); `File` adds one unfiltered
+/// verbose file layer (the submitter's explicit path); `PerNodeDir` adds
+/// TWO role-routed verbose file layers (`primary.log` / `secondary.log`),
+/// each gated on the run future's role span. The stdio layer is always
+/// present (mode off → ungated stdout; mode on → only the important target
+/// to stdout). This is one rule per sink shape, not a per-event branch.
 fn build_layers<S>(config: &LogConfig) -> Vec<Box<dyn Layer<S> + Send + Sync>>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
     let mut layers: Vec<Box<dyn Layer<S> + Send + Sync>> = Vec::new();
-    if let FullSink::File(path) = &config.full_sink {
-        layers.push(full_layer(open_append_create(path)));
+    match &config.full_sink {
+        FullSink::Stdout => {}
+        FullSink::File(path) => {
+            layers.push(full_layer(open_append_create(path)));
+        }
+        FullSink::PerNodeDir(dir) => {
+            layers.push(role_full_layer(
+                open_append_create(&dir.join(PRIMARY_LOG_FILENAME)),
+                PRIMARY_ROLE_SPAN,
+            ));
+            layers.push(role_full_layer(
+                open_append_create(&dir.join(SECONDARY_LOG_FILENAME)),
+                SECONDARY_ROLE_SPAN,
+            ));
+        }
     }
     layers.push(stdio_layer(io::stdout, config.important_stdio_only));
     layers
@@ -517,7 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn full_log_file_adds_a_second_layer() {
+    fn single_full_log_file_adds_one_unfiltered_layer() {
+        // The submitter's explicit `FULL_LOG_FILE_ENV` path: one verbose
+        // file layer + the stdio layer. No role split (the bare submitter's
+        // only role is its own primary).
         let dir = tempfile::tempdir().unwrap();
         let config = LogConfig {
             important_stdio_only: true,
@@ -528,18 +622,112 @@ mod tests {
     }
 
     #[test]
-    fn full_log_file_creates_missing_parent_dir() {
-        // The per-node mount subdir is composed lazily, so the full-log
-        // path's parent may not exist when logging installs. Building the
-        // layers must materialise it and open the file (append-create).
+    fn per_node_dir_adds_two_role_layers_and_creates_missing_dir() {
+        // The per-node mount subdir is composed lazily, so the dir may not
+        // exist when logging installs. Building the per-node-dir layers must
+        // materialise it and open BOTH role files (append-create), plus the
+        // stdio layer — three layers total.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sec-0").join(RUNNER_LOG_FILENAME);
-        assert!(!path.parent().unwrap().exists(), "precondition: parent absent");
+        let node_dir = dir.path().join("sec-0");
+        assert!(!node_dir.exists(), "precondition: per-node dir absent");
         let config = LogConfig {
             important_stdio_only: false,
-            full_sink: FullSink::File(path.clone()),
+            full_sink: FullSink::PerNodeDir(node_dir.clone()),
         };
-        let _ = build_layers::<Registry>(&config);
-        assert!(path.exists(), "runner log not created under fresh per-node dir");
+        let layers = build_layers::<Registry>(&config);
+        assert_eq!(
+            layers.len(),
+            3,
+            "expected primary.log + secondary.log + stdio layers"
+        );
+        assert!(
+            node_dir.join(PRIMARY_LOG_FILENAME).exists(),
+            "primary.log not created under fresh per-node dir"
+        );
+        assert!(
+            node_dir.join(SECONDARY_LOG_FILENAME).exists(),
+            "secondary.log not created under fresh per-node dir"
+        );
+    }
+
+    #[test]
+    fn role_span_routes_events_to_the_matching_role_file() {
+        // The two per-role layers are scope-gated on the role span name:
+        // a primary-span event lands ONLY in primary.log, a secondary-span
+        // event ONLY in secondary.log, and an event under no role span lands
+        // in neither. This is the one-process promoted-case isolation.
+        let primary_buf = BufWriter::default();
+        let secondary_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
+        ];
+        let subscriber = Registry::default().with(layers);
+        with_default(subscriber, || {
+            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary")
+                .in_scope(|| tracing::info!("primary-event"));
+            tracing::info_span!(SECONDARY_ROLE_SPAN, kind = "secondary")
+                .in_scope(|| tracing::info!("secondary-event"));
+            // No role span in scope: routed to neither role file.
+            tracing::info!("orphan-event");
+        });
+
+        let primary = primary_buf.contents();
+        let secondary = secondary_buf.contents();
+
+        assert!(
+            primary.contains("primary-event"),
+            "primary.log missing the primary-span event: {primary}"
+        );
+        assert!(
+            !primary.contains("secondary-event"),
+            "primary.log leaked a secondary-span event: {primary}"
+        );
+        assert!(
+            !primary.contains("orphan-event"),
+            "primary.log leaked an unattributed event: {primary}"
+        );
+
+        assert!(
+            secondary.contains("secondary-event"),
+            "secondary.log missing the secondary-span event: {secondary}"
+        );
+        assert!(
+            !secondary.contains("primary-event"),
+            "secondary.log leaked a primary-span event: {secondary}"
+        );
+        assert!(
+            !secondary.contains("orphan-event"),
+            "secondary.log leaked an unattributed event: {secondary}"
+        );
+    }
+
+    #[test]
+    fn role_routing_attributes_nested_child_span_events() {
+        // Events emitted from a child span nested under the role span still
+        // route by role — the filter walks the whole event scope, not just
+        // the innermost span (the run future enters one role span and emits
+        // through whatever inner spans it may open).
+        let primary_buf = BufWriter::default();
+        let secondary_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
+        ];
+        let subscriber = Registry::default().with(layers);
+        with_default(subscriber, || {
+            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary").in_scope(|| {
+                tracing::info_span!("phase", n = 1)
+                    .in_scope(|| tracing::info!("nested-primary-event"));
+            });
+        });
+        assert!(
+            primary_buf.contents().contains("nested-primary-event"),
+            "nested primary event did not route to primary.log"
+        );
+        assert!(
+            !secondary_buf.contents().contains("nested-primary-event"),
+            "nested primary event leaked to secondary.log"
+        );
     }
 }
