@@ -60,6 +60,10 @@
 //!   secondary observes its own primary's `RunComplete` over the loopback
 //!   AFTER a `SetupPending` yield/re-entry; the loopback receiver is
 //!   resumable per-run state, not a fire-once latch.
+//! - [`panik_resumes_across_setup_pending`] — a regular pre-staged
+//!   secondary acts on a panik signal delivered AFTER a `SetupPending`
+//!   yield/re-entry; the panik receiver is resumable per-run state, not a
+//!   fire-once latch.
 
 #![cfg(test)]
 
@@ -73,6 +77,7 @@ mod late_joiner_observer;
 mod memprofile_hook;
 mod observer_announcer_wireup;
 mod panik_integration;
+mod panik_resumes_across_setup_pending;
 mod peer_mesh_watchdog;
 mod processing;
 mod pure_observer;

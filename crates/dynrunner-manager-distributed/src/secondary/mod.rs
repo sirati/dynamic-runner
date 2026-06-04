@@ -351,19 +351,27 @@ where
     pub(super) announcer_outbox_rx:
         Option<tokio::sync::mpsc::Receiver<crate::observer::announcer::AnnouncerOutboxItem<I>>>,
 
-    /// Panik-watcher signal receiver. Installed via
-    /// [`Self::register_panik_signal_rx`] before `run_until_setup_or_done`
-    /// (typically from the PyO3 wrapper which spawns
-    /// [`crate::panik_watcher::spawn_panik_watcher`] at `run()` start
-    /// and threads the receiver into the inner coordinator). `None`
-    /// when the operator did not pass any panik-file paths — the
-    /// `process_tasks` select! arm parks on `pending().await` and
+    /// Panik-watcher signal receiver — the PRE-RUN REGISTRATION SLOT only.
+    /// Installed via [`Self::register_panik_signal_rx`] before
+    /// `run_until_setup_or_done` (typically from the PyO3 wrapper which
+    /// spawns [`crate::panik_watcher::spawn_panik_watcher`] at `run()` start
+    /// and threads the receiver into the inner coordinator). `None` when the
+    /// operator did not pass any panik-file paths (and SIGTERM listening is
+    /// off) — the `process_tasks` select! arm parks on `pending().await` and
     /// never fires in that case.
     ///
-    /// Taken out for the duration of `process_tasks` so the arm's
-    /// `await` can own the receiver across `select!` iterations
-    /// (re-attaching `Option` from a struct field on every iteration
-    /// would race the take/put with cancel-on-arm-fire semantics).
+    /// `take`-n ONCE at the first `process_tasks` entry (normal OR observer)
+    /// into the loop-local panik arm and moved into
+    /// [`super::lifecycle::OperationalState::panik_signal_rx`], its RESUMABLE
+    /// home: a `SetupPending` re-entry is a real second consumption, and on a
+    /// regular (non-observer) pre-staged secondary this is the SOLE in-loop
+    /// path by which a SIGTERM (or sentinel file) delivered after the
+    /// discovery yield reaches the graceful-shutdown cascade, so it must
+    /// survive the yield. This coordinator slot is therefore `None` from the
+    /// first entry onward; the live receiver lives on `OperationalState`
+    /// thereafter. Re-attaching the `Option` from this struct field on every
+    /// iteration would race the take/put with the arm's cancel-on-fire
+    /// semantics, hence the loop owns it across `select!` iterations.
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
@@ -555,13 +563,18 @@ where
     /// exactly as a wire frame. `None` outside a co-located composition —
     /// the drain arm parks on `pending()`.
     ///
-    /// `take`-n ONCE at the first `process_tasks` entry and moved into
+    /// `take`-n ONCE at the first `process_tasks` entry into the loop-local
+    /// loopback arm and moved into
     /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
     /// its RESUMABLE home: a `SetupPending` re-entry is a real second
     /// consumption, and on a promoted node this is the SOLE path to the
     /// co-located primary's `RunComplete`, so it must survive the yield. This
     /// coordinator slot is therefore `None` from the first entry onward; the
-    /// live receiver lives on `OperationalState` thereafter.
+    /// live receiver lives on `OperationalState` thereafter. Seeded by the
+    /// same `coordinator-slot, else OperationalState` take-site idiom as
+    /// `panik_signal_rx` — registered only on the co-located (non-observer)
+    /// path, so on an observer both seed sources are `None` and the arm parks
+    /// on `pending()`.
     pub(super) colocated_loopback_inbound_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }

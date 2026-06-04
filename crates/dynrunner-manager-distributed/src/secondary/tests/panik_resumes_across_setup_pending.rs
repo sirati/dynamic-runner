@@ -1,55 +1,54 @@
-//! A co-located secondary observes its own primary's `RunComplete` over
-//! the loopback channel AFTER a `SetupPending` yield/re-entry.
+//! A regular (non-observer) pre-staged secondary acts on a panik signal
+//! delivered AFTER a `SetupPending` yield/re-entry.
 //!
-//! On a promoted / multi-role host the co-located `PrimaryCoordinator` is
-//! not a mesh peer of itself, so its `RunComplete` (and every other
-//! `Destination::All` broadcast) reaches the co-located secondary's
-//! `process_tasks` loop ONLY through the in-process loopback channel — the
-//! QUIC mesh never closes, so the `recv_peer()==None` break cannot fire.
-//! The loopback inbound receiver is therefore the SOLE terminal-signal path
-//! on such a node.
+//! A regular secondary registers a panik-watcher signal receiver
+//! (`register_panik_signal_rx`) AND can be the pre-staged discovery node, so
+//! it both reaches the operational panik `select!` arm and takes the
+//! `SetupPending` excursion (yield to the wrapper for `discover_items`, then
+//! re-enter `process_tasks`). The panik receiver is the SOLE in-loop path by
+//! which a SIGTERM (the SLURM time-limit / `scancel` → `kill -TERM` cascade)
+//! or a sentinel file reaches the graceful-shutdown cascade — worker
+//! teardown + the `Panik` terminal + exit(137) — letting the secondary
+//! release its SLURM-allocated resources before the kernel `SIGKILL`s at the
+//! grace deadline.
 //!
-//! In pre-staged mode the secondary yields `RunOutcome::SetupPending` so the
-//! wrapper can run discovery, then re-enters `process_tasks`. The loopback
-//! receiver must survive that yield/re-entry: it lives on `OperationalState`
-//! (resumable per-run state) and is restored there before the
-//! `SetupPending` return, NOT dropped as a fire-once latch. If it were lost
-//! on re-entry the loopback arm would park on `pending()` forever and the
-//! secondary would never observe `RunComplete` — idling in epoll with its
-//! container/process tree leaked.
+//! The panik receiver must therefore survive the yield/re-entry: it is
+//! resumable per-run state on `OperationalState`, taken into the loop-local
+//! panik arm and restored there before the `SetupPending` return, NOT dropped
+//! as a fire-once latch. If it were lost on re-entry the panik arm would park
+//! on `pending()` forever, a post-discovery SIGTERM would NOT be acted on by
+//! the secondary loop (the watcher's oneshot cannot reach the dead arm), and
+//! graceful shutdown would fall back to the kernel `SIGKILL`.
 //!
 //! This drives the production path end-to-end: real setup handshake →
-//! `Configuring → Operational` → first `process_tasks` seeds the loopback
-//! receiver from the coordinator slot into `OperationalState` and yields
-//! `SetupPending` → discovery ingest → re-entry re-attaches it from
-//! `OperationalState` → `RunComplete` delivered ON THE LOOPBACK →
-//! the loop breaks and reaches terminal `Done`. The mesh transport is kept
-//! open throughout (the fake primary holds its sender and never closes the
-//! channel), so the ONLY way the loop can terminate is the loopback
-//! `RunComplete && no_active_tasks` arm — exactly the path the prior
-//! `drop(submitter)`→mesh-close e2e could not reach.
+//! `Configuring → Operational` → first `process_tasks` yields `SetupPending`
+//! → discovery ingest → panik signal fired → re-entry → the panik arm drains
+//! the signal and the loop reaches terminal `Panik`. The mesh transport is
+//! kept open throughout (the fake primary holds its sender and never closes
+//! the channel) and no `RunComplete` is ever delivered, so the ONLY way the
+//! re-entry can terminate is the panik arm — exactly the path a lost panik
+//! receiver would never reach.
 
 #![cfg(test)]
 
 use std::collections::HashMap;
 
 use dynrunner_core::PhaseId;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, MessageType};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary};
-use super::super::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
+use super::super::{RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal};
 use super::processing::make_binary;
 
 /// A fake primary that drives the secondary through setup in PRE-STAGED
 /// mode (so it yields `SetupPending`), then holds the channel open
-/// indefinitely. It deliberately never broadcasts `RunComplete` over the
-/// mesh — in this scenario the run-over signal arrives on the loopback
-/// instead, so the mesh stays alive and the test isolates the loopback exit
-/// arm. Returns only when its inbound channel closes (the secondary tore
-/// down).
+/// indefinitely. It never broadcasts `RunComplete` and never closes the
+/// channel — so the secondary's mesh `recv_peer` stays pending and the
+/// re-entry can only terminate via the panik arm, isolating it. Returns
+/// only when its inbound channel closes (the secondary tore down).
 async fn pre_staged_fake_primary(
     secondary_id: String,
     mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -103,18 +102,19 @@ async fn pre_staged_fake_primary(
         .unwrap();
 
     // Drain whatever the secondary emits (task requests, keepalives) and
-    // keep the channel alive. We never close `to_secondary` here, so the
-    // secondary's mesh `recv_peer` stays pending — the loopback arm is the
-    // only reachable exit.
+    // keep the channel alive. We never close `to_secondary`, so the
+    // secondary's mesh `recv_peer` stays pending — the panik arm is the
+    // only reachable exit on re-entry.
     while from_secondary.recv().await.is_some() {}
 }
 
-/// PRE-FIX: hangs (the loopback receiver is `None` on re-entry → the
-/// loopback arm parks on `pending()` → the loop never sees `RunComplete`).
+/// PRE-FIX: hangs (the panik receiver is `None` on re-entry → the panik arm
+/// parks on `pending()` → the loop never observes the signal and never
+/// terminates, because the mesh never closes and no `RunComplete` arrives).
 /// POST-FIX: the second `run_until_setup_or_done` returns
-/// `RunOutcome::Terminal` and the lifecycle records `Done`.
+/// `RunOutcome::Terminal` and the lifecycle records `Panik`.
 #[tokio::test(flavor = "current_thread")]
-async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry() {
+async fn panik_signal_acted_on_after_setup_pending_reentry() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
@@ -174,18 +174,28 @@ async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry
             );
             secondary.set_bootstrap_primary_id("primary".to_string());
 
-            // Co-located loopback inbound (channel CH1): the only path the
-            // co-located primary's `RunComplete` can reach this loop. The
-            // test owns the sender and plays the primary's broadcast leg.
-            let (loopback_tx, loopback_rx) = tokio_mpsc::unbounded_channel();
-            secondary.register_colocated_loopback_inbound(loopback_rx);
+            // Register the panik signal receiver BEFORE entering
+            // `run_until_setup_or_done`, exactly as the regular-secondary
+            // PyO3 wrapper does. The receiver is the SOLE in-loop path for
+            // an operator-initiated graceful shutdown to reach the panik
+            // cascade; it must survive the `SetupPending` excursion below.
+            let (panik_tx, panik_rx) = tokio::sync::oneshot::channel();
+            secondary.register_panik_signal_rx(panik_rx);
+
+            // Synthetic matched-path payload — the panik watcher itself is
+            // not running here; we drive the signal channel directly so the
+            // test pins the coordinator's reaction across the re-entry in
+            // isolation. (The watcher's polling is covered by
+            // `panik_watcher::tests::detects_file_creation_and_carries_path`.)
+            let expected_path = std::path::PathBuf::from("/tmp/synthetic-panik-test");
 
             let mut factory = FakeWorkerFactory;
 
-            // First entry: real setup → `Configuring → Operational`; the
-            // `process_tasks` take-site seeds the loopback receiver from the
-            // coordinator slot into `OperationalState` → the empty pre-staged
-            // ledger makes `process_tasks` yield `SetupPending`.
+            // First entry: real setup → `Configuring → Operational` → the
+            // empty pre-staged ledger makes `process_tasks` yield
+            // `SetupPending`. The panik receiver is seeded into the loop's
+            // panik arm from the coordinator slot and restored to
+            // `OperationalState` before this yield.
             let first = secondary
                 .run_until_setup_or_done(&mut factory)
                 .await
@@ -200,9 +210,9 @@ async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry
             // latches the fire-once guard, WITHOUT broadcasting/applying a
             // local `RunComplete` — so on re-entry the loop's
             // `cluster_state.run_complete()` is still false and the ONLY way
-            // it can terminate is a `RunComplete` arriving over the loopback.
-            // (`active_tasks` stays empty: ingest only seeds the CRDT; no
-            // worker assignment is dispatched, so `no_active_tasks` holds.)
+            // it can terminate is the panik signal. (`active_tasks` stays
+            // empty: ingest only seeds the CRDT; no worker assignment is
+            // dispatched.)
             let mut deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
             deps.insert(PhaseId::from("default"), vec![]);
             secondary
@@ -210,51 +220,61 @@ async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry
                 .await
                 .expect("ingest must succeed");
 
-            // The co-located primary's clean-completion broadcast, delivered
-            // on the loopback exactly as the egress edge's `Destination::All`
-            // leg would (see `primary/coordinator.rs::send_to`'s Broadcast
-            // arm). Queued before re-entry; the loopback arm drains it on the
-            // second pass.
+            // Fire the panik signal AFTER the first yield but BEFORE re-entry.
+            // The oneshot value buffers in the channel; the re-entry's panik
+            // arm `rx.await` resolves it immediately. This stands in for a
+            // SIGTERM / sentinel file delivered to the python AFTER the
+            // discovery yield.
             //
-            // The send result is NOT asserted: if the loopback receiver was
-            // dropped across the SetupPending yield (the very defect under
-            // test), this send returns `Err(SendError)` because there is no
-            // receiver left to deliver to. Either way the load-bearing signal
-            // is the re-entry below — it can only reach `Terminal` if the
-            // receiver survived and drains this frame.
-            let _ = loopback_tx.send(DistributedMessage::ClusterMutation {
-                sender_id: "primary".into(),
-                timestamp: 0.0,
-                mutations: vec![ClusterMutation::RunComplete],
+            // The send result is NOT asserted: if the panik receiver was
+            // dropped across the `SetupPending` yield (the very defect under
+            // test), this send returns `Err` because there is no receiver
+            // left. Either way the load-bearing signal is the re-entry below
+            // — it can only reach `Terminal` if the receiver survived.
+            let _ = panik_tx.send(crate::panik_watcher::PanikSignal {
+                matched_path: expected_path.clone(),
             });
 
-            // Re-entry: with the loopback receiver re-attached from
-            // `OperationalState`, the loopback arm drains `RunComplete`, the
-            // `run_complete() && no_active_tasks` break fires, and the loop
-            // reaches terminal `Done`. PRE-FIX this hangs (loopback `None` on
-            // re-entry), so the bounded timeout below is the hang detector.
+            // Re-entry: with the panik receiver re-attached from
+            // `OperationalState`, the panik arm drains the signal, the
+            // handler records the `Panik` terminal, and the loop returns
+            // `Terminal`. PRE-FIX this hangs (panik `None` on re-entry → arm
+            // parks on `pending()`, mesh never closes, no `RunComplete`), so
+            // the bounded timeout below is the hang detector.
             let second = tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(10),
                 secondary.run_until_setup_or_done(&mut factory),
             )
             .await
             .expect(
-                "re-entry timed out: the secondary never observed RunComplete on the loopback \
-                 — the loopback receiver was lost across the SetupPending re-entry",
+                "re-entry timed out: the secondary never acted on the panik signal \
+                 — the panik receiver was lost across the SetupPending re-entry",
             )
             .expect("second run_until_setup_or_done must not error");
 
             assert!(
                 matches!(second, RunOutcome::Terminal),
-                "re-entry must reach Terminal once RunComplete lands on the loopback, got {second:?}",
+                "re-entry must reach Terminal once the panik signal is acted on, got {second:?}",
             );
-            assert!(
-                matches!(
-                    secondary.terminal(),
-                    Some(super::super::SecondaryTerminal::Done)
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Panik {
+                    matched_path,
+                    reason,
+                }) => {
+                    assert_eq!(
+                        matched_path, expected_path,
+                        "the panik terminal must carry the matched path"
+                    );
+                    assert!(
+                        reason.contains("synthetic-panik-test"),
+                        "panik reason should contain the matched-path substring; got: {reason}"
+                    );
+                }
+                other => panic!(
+                    "re-entry must record the Panik terminal once the panik signal \
+                     is acted on across the SetupPending re-entry, got {other:?}"
                 ),
-                "the loopback RunComplete must record the Done terminal",
-            );
+            }
 
             // Drop the secondary so the fake primary's inbound closes and
             // its task returns.

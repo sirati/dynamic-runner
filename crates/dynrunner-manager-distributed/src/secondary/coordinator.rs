@@ -336,7 +336,12 @@ where
     /// Register the panik-watcher signal receiver. Must be called
     /// BEFORE `run_until_setup_or_done` enters; calls afterwards have
     /// no effect on the active loop (the field is `Option::take`-n
-    /// into the loop's local state on first entry).
+    /// into the loop's local state on first entry, then moved into its
+    /// resumable home on
+    /// [`super::lifecycle::OperationalState::panik_signal_rx`] where it
+    /// survives a `SetupPending` re-entry — on a regular pre-staged
+    /// secondary this is the sole in-loop path for a post-discovery SIGTERM
+    /// to reach the graceful-shutdown cascade).
     ///
     /// Single concern: the coordinator owns the panik-react logic
     /// (announce a self-authored `ClusterMutation::PeerRemoved

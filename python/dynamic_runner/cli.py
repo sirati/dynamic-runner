@@ -59,7 +59,13 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
             "redirecting Python logs to the same full-log file. The full-log "
             "path defaults to ./dynrunner-full.log; pre-export "
             "DYNRUNNER_FULL_LOG_FILE to override. Off by default (today's "
-            "console logging)."
+            "console logging). Submitter-local: NOT propagated to secondaries "
+            "(they keep full logs for debugging). "
+            "Wrapping consumers (programs that invoke dynrunner as a subprocess "
+            "and do not own this CLI) should set DYNRUNNER_IMPORTANT_STDIO_ONLY=1 "
+            "in the environment instead of injecting this flag; it is the "
+            "first-class env config path and produces identical behaviour. See "
+            "dynamic_runner.logging_setup for the full env-var contract."
         ),
     )
 

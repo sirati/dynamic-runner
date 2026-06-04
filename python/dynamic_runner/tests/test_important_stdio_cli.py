@@ -154,6 +154,55 @@ class ApplyEnvTests(_EnvSandbox):
         )
 
 
+class EnvVarConfigInterfaceTests(_EnvSandbox):
+    """The env-var first-class config path for wrapping consumers: a
+    truthy ``DYNRUNNER_IMPORTANT_STDIO_ONLY`` set WITHOUT the flag must
+    produce identical submitter behaviour to passing the flag — one
+    mechanism, not a parallel surface.
+    """
+
+    def test_env_only_arms_importance_mode(self) -> None:
+        # No flag in argv; the consumer armed the mode via the env var.
+        os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = "1"
+        self.assertTrue(logging_setup.importance_mode_active())
+
+    def test_flag_not_in_argv_does_not_arm_without_env(self) -> None:
+        self.assertFalse(logging_setup.importance_mode_active())
+
+    def test_truthiness_mirrors_rust_convention(self) -> None:
+        # Mirrors the Rust `is_truthy` set (1/true/yes/on, ci); anything
+        # else — including the empty string and "0" — is off.
+        for on in ("1", "true", "TRUE", "Yes", "on", " on "):
+            os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = on
+            self.assertTrue(
+                logging_setup.importance_mode_active(), f"{on!r} should be truthy"
+            )
+        for off in ("0", "false", "no", "off", "", "maybe"):
+            os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = off
+            self.assertFalse(
+                logging_setup.importance_mode_active(), f"{off!r} should be falsey"
+            )
+
+    def test_env_only_seeds_default_full_log(self) -> None:
+        # apply_important_stdio_env converges the env path onto the same
+        # contract the flag path produces: the default full-log file is
+        # seeded so Rust's full sink and Python's redirect agree.
+        os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = "1"
+        logging_setup.apply_important_stdio_env(["--debug"])
+        self.assertEqual(
+            os.environ[logging_setup.FULL_LOG_FILE_ENV],
+            logging_setup.DEFAULT_FULL_LOG_FILE,
+        )
+
+    def test_env_only_respects_pre_exported_full_log(self) -> None:
+        os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = "1"
+        os.environ[logging_setup.FULL_LOG_FILE_ENV] = "/tmp/consumer-chosen.log"
+        logging_setup.apply_important_stdio_env(["--debug"])
+        self.assertEqual(
+            os.environ[logging_setup.FULL_LOG_FILE_ENV], "/tmp/consumer-chosen.log"
+        )
+
+
 class EnvExportedBeforeNativeImportTests(_EnvSandbox):
     """The load-bearing ordering: the env export must win the race
     against the `_native` pymodule init, which reads the two vars ONCE.
@@ -360,6 +409,30 @@ class PythonLoggingReconfigTests(_RootLoggerSandbox):
                 1,
                 "flag on must add exactly one full-log FileHandler",
             )
+            self.assertEqual(
+                pathlib.Path(file_handlers[0].baseFilename), full_log.resolve()
+            )
+
+    def test_env_only_removes_console_adds_file(self) -> None:
+        # The env-var config path (no flag in argv) must drive the SAME
+        # Python-side reconfiguration as the flag: console dropped, full-log
+        # FileHandler added. This is what makes the env var a first-class
+        # interface rather than a half-honoured one.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            full_log = pathlib.Path(d) / "full.log"
+            os.environ[logging_setup.IMPORTANT_STDIO_ONLY_ENV] = "1"
+            os.environ[logging_setup.FULL_LOG_FILE_ENV] = str(full_log)
+
+            logging_setup.setup_logging(["--debug"])
+
+            self.assertFalse(
+                self._bare_stream_handlers(),
+                "env-armed importance mode must drop the console handler",
+            )
+            file_handlers = self._file_handlers()
+            self.assertEqual(len(file_handlers), 1)
             self.assertEqual(
                 pathlib.Path(file_handlers[0].baseFilename), full_log.resolve()
             )
