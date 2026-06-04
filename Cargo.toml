@@ -44,6 +44,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Local-timezone clock for the important-stdio log timestamp. chrono's
+# `Local` reads the local offset via libc `localtime_r`, which is
+# thread-safe — unlike the `time` crate's `UtcOffset::current_local_offset`,
+# which deliberately refuses (and falls back to UTC) in a multithreaded
+# process. `clock` is the only feature needed; drop the default `oldtime`
+# / `serde` surface.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 thiserror = "2"
 async-trait = "0.1"
 pyo3 = { version = "0.28" }
