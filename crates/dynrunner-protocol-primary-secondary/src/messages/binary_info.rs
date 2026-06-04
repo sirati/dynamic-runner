@@ -97,22 +97,48 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
     /// these two methods so the phase/type/affinity/payload tags stay in
     /// lockstep across the wire.
     pub fn from_task_info(task: &TaskInfo<I>) -> Self {
+        // Exhaustive destructure (NO `..` rest pattern) — the structural
+        // completeness guard for the replicated-read side. Every
+        // `TaskInfo` field is NAMED here, so adding a future field is a
+        // COMPILE ERROR at this site until the developer explicitly
+        // classifies it transferred-vs-node-local. This is the only
+        // mechanism that catches a silently-omitted wire field (the bug
+        // this exists to prevent), symmetric with the `snapshot()` guard.
+        let TaskInfo {
+            // ── transferred (mapped onto the wire descriptor) ──
+            path,
+            size,
+            identifier,
+            phase_id,
+            type_id,
+            affinity_id,
+            payload,
+            task_id,
+            task_depends_on,
+            preferred_secondaries,
+            // ── node-local: not transferred ──
+            // `#[serde(skip)]` on the struct — the local on-disk resolved
+            // location is host-specific and the receiving secondary
+            // re-resolves it; `to_task_info` resets it to `None`. Never
+            // crosses the cluster wire, so it is intentionally dropped here.
+            resolved_path: _resolved_path,
+        } = task;
         Self {
-            path: task.path.to_string_lossy().into_owned(),
-            size: task.size,
-            identifier: task.identifier.clone(),
-            phase_id: task.phase_id.as_str().to_owned(),
-            type_id: task.type_id.as_str().to_owned(),
-            affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
+            path: path.to_string_lossy().into_owned(),
+            size: *size,
+            identifier: identifier.clone(),
+            phase_id: phase_id.as_str().to_owned(),
+            type_id: type_id.as_str().to_owned(),
+            affinity_id: affinity_id.as_ref().map(|a| a.as_str().to_owned()),
             // payload is opaque to the framework — round-trip the JSON
             // representation verbatim. `to_string` on `serde_json::Value`
             // is infallible.
-            payload_json: task.payload.to_string(),
+            payload_json: payload.to_string(),
             // `TaskInfo.task_id` is non-optional + non-empty per the
             // framework boundary contract — verbatim move.
-            task_id: task.task_id.clone(),
-            task_depends_on: task.task_depends_on.clone(),
-            preferred_secondaries: task.preferred_secondaries.clone(),
+            task_id: task_id.clone(),
+            task_depends_on: task_depends_on.clone(),
+            preferred_secondaries: preferred_secondaries.clone(),
         }
     }
 
