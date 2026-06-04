@@ -1,7 +1,12 @@
 """argparse setup for the dynamic_runner.
 
-The public surface of this module is `build_arg_parser(description)`,
-called by `dynamic_runner.run.run`.
+The public surface of this module is the composable
+`add_framework_arguments(parser)` — it registers EVERY framework flag onto
+any caller-supplied parser or subparser, so a consumer can attach the
+framework's CLI alongside its own arguments (top-level parser, or a
+`submit`/`secondary` subparser) without re-declaring a single flag.
+`build_arg_parser(description)` is the framework's own one-call convenience
+(fresh parser + `add_framework_arguments`), used by `dynamic_runner.run`.
 """
 
 from __future__ import annotations
@@ -34,13 +39,24 @@ def parse_duration_secs(value: str) -> float:
     return float(body) * multiplier
 
 
-def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    """Construct the runner argparse with all generic dynamic_runner flags.
+def add_framework_arguments(
+    parser: argparse.ArgumentParser | argparse._ArgumentGroup,
+) -> argparse.ArgumentParser | argparse._ArgumentGroup:
+    """Register EVERY generic dynamic_runner flag onto ``parser``.
+
+    The composable public surface: a consumer calls this on its OWN parser
+    — a top-level ``ArgumentParser`` OR a subparser (e.g. asm-dataset's
+    ``submit``/``secondary`` subcommand) — then adds its own arguments
+    alongside. Because the framework registers its flags here, it also
+    *knows* which flags are its own (see
+    :func:`dynamic_runner._framework_flags.framework_option_strings`): that
+    knowledge is what drives the secondary-forward filter, so no consumer
+    has to maintain a strip-set.
 
     Task-specific arguments are added by the caller via
-    `task.add_task_arguments(parser)` after this function returns.
+    ``task.add_task_arguments(parser)`` (and any consumer-CLI flags) after
+    this returns. Returns ``parser`` for call chaining.
     """
-    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed output")
     parser.add_argument(
         "--raw-logs",
@@ -52,20 +68,47 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "LLM-wake stdio mode: send only important (wake-worthy) events to "
-            "stdout while the FULL log keeps everything in a file. Drives the "
-            "native runner's dual-sink subscriber via DYNRUNNER_IMPORTANT_STDIO_ONLY "
-            "and DYNRUNNER_FULL_LOG_FILE (scanned from argv before the first "
-            "_native import) and suppresses Python's own console handler, "
+            "stdout while the FULL log keeps everything in a file. The parsed "
+            "flag is threaded as an explicit parameter into the native "
+            "runner's dual-sink subscriber (`init_logging(...)`, called after "
+            "argparse) and suppresses Python's own console handler, "
             "redirecting Python logs to the same full-log file. The full-log "
-            "path defaults to ./dynrunner-full.log; pre-export "
-            "DYNRUNNER_FULL_LOG_FILE to override. Off by default (today's "
-            "console logging). Submitter-local: NOT propagated to secondaries "
-            "(they keep full logs for debugging). "
-            "Wrapping consumers (programs that invoke dynrunner as a subprocess "
-            "and do not own this CLI) should set DYNRUNNER_IMPORTANT_STDIO_ONLY=1 "
-            "in the environment instead of injecting this flag; it is the "
-            "first-class env config path and produces identical behaviour. See "
-            "dynamic_runner.logging_setup for the full env-var contract."
+            "path defaults to ./dynrunner-full.log; pass --full-log-file to "
+            "override. Off by default (today's console logging). "
+            "Submitter-local: NOT propagated to secondaries (they keep full "
+            "logs for debugging) — the framework drops it from the forwarded "
+            "secondary argv via its own flag knowledge, no consumer strip-set."
+        ),
+    )
+    parser.add_argument(
+        "--full-log-file",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Destination for the full (unfiltered) log under "
+            "--important-stdio-only. When set, the native full sink writes "
+            "here (so stdout can be gated to important events without losing "
+            "the full record) and Python's own logs are appended to the same "
+            "file. Defaults to ./dynrunner-full.log when importance mode is on "
+            "and this is unset. Submitter-local (the per-node split is "
+            "--full-log-dir). Ignored when --important-stdio-only is off."
+        ),
+    )
+    parser.add_argument(
+        "--full-log-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Per-node directory under which the framework's OWN runner log is "
+            "persisted, SPLIT BY ROLE (primary.log / secondary.log). The SLURM "
+            "spawn paths forward this as `--full-log-dir=/app/log-network/"
+            "{secondary_id}` so every container's full log lands host-readably "
+            "on the gateway-shared --log-dir mount, with the relocated/co-"
+            "located primary isolated from its host secondary. Takes "
+            "precedence over --full-log-file. Threaded as an explicit "
+            "`init_logging(...)` parameter after argparse — no env var."
         ),
     )
 
@@ -589,6 +632,20 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         action="store_true",
         help="Skip building and transferring Docker image (assumes image already exists on gateway)",
     )
+    return parser
+
+
+def build_arg_parser(description: str) -> argparse.ArgumentParser:
+    """Construct a fresh framework parser — the framework's own one-call
+    convenience over :func:`add_framework_arguments`.
+
+    Single source of truth: this is just ``ArgumentParser(...)`` +
+    ``add_framework_arguments``; no flag is declared twice. Task-specific
+    arguments are added by the caller via ``task.add_task_arguments(parser)``
+    after this returns.
+    """
+    parser = argparse.ArgumentParser(description=description)
+    add_framework_arguments(parser)
     return parser
 
 
