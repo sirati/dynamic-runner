@@ -8,9 +8,9 @@ the secondary — *except* two categories of flag this filter drops:
 
   * **framework-regenerated value flags** (``--secondary``,
     ``--secondary-id``, ``--secondary-quic-port``, ``--src-network``,
-    ``--cores``, ``--max-memory``, ``--log-dir``) which the SLURM
-    wrapper emits afresh per-job; forwarding them would duplicate the
-    flag and confuse argparse, and
+    ``--cores``, ``--max-memory``, ``--log-dir``, ``--full-log-dir``)
+    which the SLURM wrapper emits afresh per-job; forwarding them would
+    duplicate the flag and confuse argparse, and
 
   * **submitter-local boolean flags** — flags that configure the
     *submitter's* behaviour only and must NOT change how a secondary
@@ -18,46 +18,24 @@ the secondary — *except* two categories of flag this filter drops:
     operator arms LLM-wake stdio mode on the submitter, but secondaries
     must keep their FULL logs for debugging (and post-relocation the
     operator's narrative comes from the observer reading the CRDT, not
-    from secondaries' stdout). The literal is owned by the logging
-    concern (:mod:`dynamic_runner.logging_setup`); this filter imports
-    it so the two cannot drift.
+    from secondaries' stdout). This filter imports the classification
+    sets from :mod:`dynamic_runner._framework_flags`; the flag *string*
+    itself is owned by :mod:`dynamic_runner.logging_setup` and referenced
+    from there, so neither the classification nor the literal can drift.
 
 The result is opaque to all downstream layers (SlurmPreparation,
 SlurmJobManager, the Rust wrapper-script generator). Only this
-module owns the filtering rule; everyone else carries the list.
+module owns the filtering RULE; the classification of *which* flags
+fall into each category is owned by
+:mod:`dynamic_runner._framework_flags` (single source of truth, derived
+from the framework's own flag registration), so the two cannot drift.
 """
 
 from __future__ import annotations
 
-from .logging_setup import IMPORTANT_STDIO_ONLY_FLAG
-
-
-# Framework flags the SLURM wrapper regenerates from per-job state
-# (gateway-derived URL, secondary index, host-detected cores/memory,
-# container-internal bind-mount path, container-internal log-mount
-# path). Forwarding these as well would duplicate the flag and confuse
-# the secondary's argparse.
-FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
-    {
-        "--secondary",
-        "--secondary-id",
-        "--secondary-quic-port",
-        "--src-network",
-        "--cores",
-        "--max-memory",
-        "--log-dir",
-    }
-)
-
-
-# Value-less ``store_true`` flags that are SUBMITTER-LOCAL: they steer
-# the submitter process only and must never propagate to a secondary.
-# Unlike the framework-regenerated set above, these take no value token,
-# so they are dropped as a SINGLE token (no value to consume).
-SUBMITTER_LOCAL_FLAGS: frozenset[str] = frozenset(
-    {
-        IMPORTANT_STDIO_ONLY_FLAG,
-    }
+from ._framework_flags import (
+    FRAMEWORK_REGENERATED_FLAGS,
+    SUBMITTER_LOCAL_FLAGS,
 )
 
 
