@@ -33,6 +33,16 @@ pub struct SecondaryConnection<S> {
     /// `PeerConnectionInfo.is_observer` so other secondaries know
     /// to exclude this peer from `lowest_alive` candidate selection.
     pub is_observer: bool,
+    /// Primary-capability marker, received in `SecondaryWelcome` (twin
+    /// of `is_observer`). An overlay-enabled compute secondary that can
+    /// host the primary role on demand advertises `true`; a no-mesh
+    /// host / observer advertises `false`. Persisted here so the post-
+    /// mesh roster re-broadcast (`rebroadcast_full_roster`) can re-emit
+    /// the exact capability the welcome carried, without consulting a
+    /// second source — this typestate is the single record of every
+    /// welcome-advertised capability (`num_workers`, `resources`,
+    /// `is_observer`, `can_be_primary`).
+    pub can_be_primary: bool,
     _state: PhantomData<S>,
 }
 
@@ -50,11 +60,18 @@ impl SecondaryConnection<AwaitingWelcome> {
             ipv6: None,
             transport: None,
             is_observer: false,
+            can_be_primary: false,
             _state: PhantomData,
         }
     }
 
     /// Transition: received welcome message with node capabilities.
+    ///
+    /// Faithful 1:1 carrier of the `SecondaryWelcome` wire frame's
+    /// distinct scalar fields into the typestate; the arg count tracks the
+    /// message shape, not an avoidable parameter sprawl (same rationale as
+    /// `SecondaryLifecycle::enter_operational`).
+    #[allow(clippy::too_many_arguments)]
     pub fn receive_welcome(
         mut self,
         num_workers: u32,
@@ -63,6 +80,7 @@ impl SecondaryConnection<AwaitingWelcome> {
         quic_port: u16,
         cert_pem: Option<String>,
         is_observer: bool,
+        can_be_primary: bool,
     ) -> SecondaryConnection<Handshaking> {
         self.num_workers = num_workers;
         self.resources = resources;
@@ -70,6 +88,7 @@ impl SecondaryConnection<AwaitingWelcome> {
         self.quic_port = quic_port;
         self.cert_pem = cert_pem;
         self.is_observer = is_observer;
+        self.can_be_primary = can_be_primary;
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
@@ -81,6 +100,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -110,6 +130,7 @@ impl SecondaryConnection<Handshaking> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -129,6 +150,7 @@ impl SecondaryConnection<CertExchanging> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -148,6 +170,7 @@ impl SecondaryConnection<PeerDiscovery> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -167,6 +190,7 @@ impl SecondaryConnection<InitialAssigning> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -186,6 +210,7 @@ impl SecondaryConnection<Operational> {
             ipv6: self.ipv6,
             transport: self.transport,
             is_observer: self.is_observer,
+            can_be_primary: self.can_be_primary,
             _state: PhantomData,
         }
     }
@@ -316,6 +341,23 @@ impl SecondaryConnectionState {
         }
     }
 
+    /// Primary-capability marker (twin of `is_observer`). False until
+    /// `receive_welcome` carries the flag — pre-welcome states default
+    /// to false, the conservative non-capable default. Read by the
+    /// post-mesh roster re-broadcast (`rebroadcast_full_roster`) to
+    /// re-emit the exact `can_be_primary` the welcome advertised.
+    pub fn can_be_primary(&self) -> bool {
+        match self {
+            Self::AwaitingWelcome(c) => c.can_be_primary,
+            Self::Handshaking(c) => c.can_be_primary,
+            Self::CertExchanging(c) => c.can_be_primary,
+            Self::PeerDiscovery(c) => c.can_be_primary,
+            Self::InitialAssigning(c) => c.can_be_primary,
+            Self::Operational(c) => c.can_be_primary,
+            Self::ShuttingDown(c) => c.can_be_primary,
+        }
+    }
+
     /// True if we have received the welcome and cert exchange.
     pub fn is_at_least_cert_exchanged(&self) -> bool {
         matches!(
@@ -365,6 +407,7 @@ mod tests {
             5000,
             None,
             false,
+            false,
         );
         assert_eq!(conn.num_workers, 4);
 
@@ -407,7 +450,7 @@ mod tests {
         // alongside `ipv4()` so a future drift between the two
         // accessors becomes a test failure.
         let conn = SecondaryConnection::new("sec-2".into());
-        let conn = conn.receive_welcome(1, vec![], "h".into(), 5000, None, false);
+        let conn = conn.receive_welcome(1, vec![], "h".into(), 5000, None, false, false);
         let conn = conn.receive_cert_exchange(
             "CERT".into(),
             Some("10.0.0.2".into()),

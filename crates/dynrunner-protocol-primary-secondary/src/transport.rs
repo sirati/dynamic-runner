@@ -204,50 +204,57 @@ pub trait PeerTransport<I: Identifier> {
     ///    return address and `is_observer` declaring the joiner's own
     ///    role (so the responder's `PeerJoined` broadcast carries the
     ///    truth instead of assuming observer).
-    /// 4. Send it via [`Self::send_to_peer`] to the first reachable
-    ///    seed id. The receiver-side handler in
-    ///    `secondary/dispatch.rs` accepts the request from any peer
-    ///    (`cluster_state` is replicated, so any responder's snapshot
-    ///    is valid bootstrap material) and replies with a unicast
+    /// 4. Send it via [`Self::send_to_peer`] to EVERY reachable non-self
+    ///    seed id (multi-responder fan-out). The receiver-side handler in
+    ///    `secondary/dispatch.rs` — and now the primary
+    ///    (`primary::task::mutation::handle_request_cluster_snapshot`) —
+    ///    accepts the request from any peer (`cluster_state` is
+    ///    replicated) and replies with a unicast
     ///    [`DistributedMessage::ClusterSnapshot`].
     ///
     ///    The request is addressed by concrete peer-id, not by role: a
     ///    cold-start joiner cannot resolve `Destination::Primary` yet
-    ///    (it has observed no `PrimaryChanged`), and any peer can answer
-    ///    per the dispatch.rs handler, so unicast to the first reachable
-    ///    seed is both correct and cache-independent.
+    ///    (it has observed no `PrimaryChanged`). Fanning to ALL seeds —
+    ///    rather than the first that accepts — is the primary-preferred /
+    ///    completeness fix: the first reachable seed may be a secondary
+    ///    whose own roster is incomplete (the pre-mesh
+    ///    `secondary_capacities` desync), so a SINGLE reply could
+    ///    bootstrap the joiner from a partial snapshot. Collecting every
+    ///    responder's snapshot and letting the caller `restore()` each
+    ///    one heals via the idempotent lattice (the union is complete iff
+    ///    ANY responder — the primary above all — was complete).
     ///
-    /// 5. Drive [`Self::recv_peer`] inside a `tokio::time::timeout`
-    ///    until a [`DistributedMessage::ClusterSnapshot`] arrives, or
-    ///    the bootstrap budget expires. Messages OTHER than
-    ///    `ClusterSnapshot` received in the bootstrap window are
-    ///    logged at `warn` and dropped — bootstrap is a one-shot
-    ///    rendezvous, the cluster's CRDT-merge guarantees the next
-    ///    live broadcast (or a follow-up snapshot) covers anything
+    /// 5. Drive [`Self::recv_peer`] inside a `tokio::time::timeout`,
+    ///    COLLECTING every [`DistributedMessage::ClusterSnapshot`] that
+    ///    arrives until either one reply per peer the request was sent to
+    ///    has been gathered or the bootstrap budget expires. Messages
+    ///    OTHER than `ClusterSnapshot` received in the window are logged
+    ///    at `warn` and dropped — the cluster's CRDT-merge guarantees the
+    ///    next live broadcast (or a follow-up snapshot) covers anything
     ///    dropped here.
     ///
-    /// Returns the snapshot's serialized JSON payload (the
-    /// `snapshot_json` field on the wire frame). The caller decodes
-    /// it into their own concrete `ClusterStateSnapshot<I>` and
-    /// passes that to `ClusterState::restore`. The protocol crate
-    /// stays free of `ClusterStateSnapshot<I>` — the wire-side
-    /// `String` keeps `I` erased at the transport boundary; see
-    /// the dispatch.rs commentary on the same direction-of-
-    /// dependency point.
+    /// Returns the COLLECTED snapshot payloads (the `snapshot_json` of
+    /// each `ClusterSnapshot` reply) as a `Vec<String>` — at least one on
+    /// `Ok`. The caller decodes each into its own concrete
+    /// `ClusterStateSnapshot<I>` and `restore()`s each (the idempotent
+    /// lattice unions them). The protocol crate stays free of
+    /// `ClusterStateSnapshot<I>` — the wire-side `String` keeps `I`
+    /// erased at the transport boundary; see the dispatch.rs commentary
+    /// on the same direction-of-dependency point.
     ///
     /// **Single concern**: bootstrap rendezvous + snapshot RPC. The
-    /// caller's concern is cluster-state restoration (one `restore`
-    /// call) and any retry policy if `Err` comes back. The 5-step
-    /// loop above never touches `ClusterState` directly — the
-    /// dependency edge is preserved (protocol crate does not depend
-    /// on manager-distributed).
+    /// caller's concern is cluster-state restoration (one `restore` per
+    /// returned payload) and any retry policy if `Err` comes back. The
+    /// loop above never touches `ClusterState` directly — the dependency
+    /// edge is preserved (protocol crate does not depend on
+    /// manager-distributed).
     fn join_running_cluster(
         &mut self,
         seed: &[crate::PeerConnectionInfo],
         timeout: Duration,
         is_observer: bool,
         can_be_primary: bool,
-    ) -> impl std::future::Future<Output = Result<String, JoinError>>
+    ) -> impl std::future::Future<Output = Result<Vec<String>, JoinError>>
     where
         I: 'static,
     {
@@ -256,8 +263,8 @@ pub trait PeerTransport<I: Identifier> {
             // mesh, tests); real work for `PeerNetwork`.
             self.connect_to_peers(seed).await;
 
-            // Step 2: rendezvous gate. Walk the seed list, pick the
-            // first id whose connection registered. Bound by a
+            // Step 2: rendezvous gate. Wait until at least one peer
+            // connection has registered. Bound by a
             // fraction of the total budget so the snapshot recv
             // gets the lion's share. Polling cadence is 25 ms —
             // tight enough that a ~100 ms QUIC handshake is observed
@@ -275,10 +282,11 @@ pub trait PeerTransport<I: Identifier> {
             // doesn't expose a per-id "is THIS id connected?"
             // predicate today (only peer_count, the cardinality),
             // so we drive the rendezvous on cardinality and then
-            // attempt the unicast send against each non-self seed
-            // id in order until one succeeds. Any peer can answer
-            // per dispatch.rs's RequestClusterSnapshot handler, so
-            // first-success-wins is correct on the join flow.
+            // (Step 3+4) send the request to EVERY non-self seed
+            // (multi-responder fan-out). Any peer can answer per
+            // dispatch.rs's RequestClusterSnapshot handler; collecting
+            // all replies and merging them via the idempotent lattice
+            // heals an incomplete responder.
             loop {
                 if self.peer_count() > 0 {
                     break;
@@ -289,20 +297,25 @@ pub trait PeerTransport<I: Identifier> {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
 
-            // Step 3+4: send the request. Unicast by-id to a reachable
-            // seed — the joiner's cold-start role table can't resolve
-            // `Destination::Primary` yet (no `PrimaryChanged` observed),
-            // and any peer can answer per dispatch.rs's snapshot handler.
-            // We address the transport directly by peer-id (no role
-            // resolution needed — the id IS the host). Iterate seed in
-            // order; the first `send_to_peer` that returns Ok stops the
-            // loop. Send-side errors (`no route`, `outgoing channel
-            // closed`) are tolerated and we move on to the next candidate
-            // so a partially-stale seed (one of the peers retired between
-            // file-write and this dial) still bootstraps via the
-            // remaining live peers.
+            // Step 3+4: send the request to EVERY reachable non-self
+            // seed (multi-responder fan-out). The joiner's cold-start role
+            // table can't resolve `Destination::Primary` yet (no
+            // `PrimaryChanged` observed), and any peer can answer per the
+            // dispatch.rs / primary snapshot handlers. We address the
+            // transport directly by peer-id (no role resolution — the id
+            // IS the host). Fanning to ALL seeds (not first-success) is
+            // the completeness fix: the first reachable seed may be a
+            // secondary holding an incomplete roster, so a single reply
+            // could bootstrap from a partial snapshot. Collecting every
+            // responder's snapshot and `restore()`-ing each (idempotent
+            // lattice) heals — the union is complete iff ANY responder
+            // (the primary above all) was complete. Per-peer send errors
+            // (`no route`, `outgoing channel closed`) are tolerated; a
+            // partially-stale seed (a peer retired between file-write and
+            // this dial) just doesn't get a request, and the remaining
+            // live peers still answer.
             let mut send_err: Option<String> = None;
-            let mut sent_to: Option<String> = None;
+            let mut sent_count: usize = 0;
             for peer in seed {
                 if peer.secondary_id == local_id {
                     continue;
@@ -316,50 +329,72 @@ pub trait PeerTransport<I: Identifier> {
                     is_observer,
                     can_be_primary,
                 };
-                match self
-                    .send_to_peer(&peer.secondary_id, request)
-                    .await
-                {
+                match self.send_to_peer(&peer.secondary_id, request).await {
                     Ok(()) => {
-                        sent_to = Some(peer.secondary_id.clone());
-                        break;
+                        sent_count += 1;
                     }
                     Err(e) => {
                         send_err = Some(e);
                     }
                 }
             }
-            if sent_to.is_none() {
+            if sent_count == 0 {
                 return Err(JoinError::SendFailed(
                     send_err.unwrap_or_else(|| "no seed peer accepted send".into()),
                 ));
             }
 
-            // Step 5: wait for the ClusterSnapshot reply. Non-
-            // ClusterSnapshot frames received in this window are
-            // dropped with a warn log — see method-doc.
+            // Step 5: collect ClusterSnapshot replies. Gather every reply
+            // that arrives until we have one per peer we sent to OR the
+            // bootstrap budget expires. Non-ClusterSnapshot frames in this
+            // window are dropped with a warn log — see method-doc. A
+            // budget expiry / inbound-close with at least one snapshot
+            // already collected is success (the caller unions them); zero
+            // collected surfaces `Timeout` — the operator-visible signal
+            // is identical to the cold-start no-reply case.
             let recv_budget = timeout.saturating_sub(connect_budget);
             let recv_deadline = tokio::time::Instant::now() + recv_budget;
+            let mut snapshots: Vec<String> = Vec::with_capacity(sent_count);
             loop {
+                if snapshots.len() >= sent_count {
+                    // Every peer we sent to has answered; no point waiting
+                    // out the rest of the budget.
+                    return Ok(snapshots);
+                }
                 let remaining =
                     recv_deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(JoinError::Timeout);
+                    return if snapshots.is_empty() {
+                        Err(JoinError::Timeout)
+                    } else {
+                        Ok(snapshots)
+                    };
                 }
                 let recv = tokio::time::timeout(remaining, self.recv_peer()).await;
                 match recv {
-                    Err(_) => return Err(JoinError::Timeout),
+                    Err(_) => {
+                        // Budget expired mid-recv.
+                        return if snapshots.is_empty() {
+                            Err(JoinError::Timeout)
+                        } else {
+                            Ok(snapshots)
+                        };
+                    }
                     Ok(None) => {
                         // Transport's inbound channel closed: no more
-                        // messages will ever arrive. Surface as
-                        // timeout — the operator-visible signal is
-                        // identical ("no snapshot in window") and the
-                        // cause shows up in the transport's own
-                        // teardown logs.
-                        return Err(JoinError::Timeout);
+                        // messages will ever arrive. Return whatever we
+                        // collected; empty surfaces as timeout (identical
+                        // operator-visible signal, cause shows up in the
+                        // transport's own teardown logs).
+                        return if snapshots.is_empty() {
+                            Err(JoinError::Timeout)
+                        } else {
+                            Ok(snapshots)
+                        };
                     }
                     Ok(Some(DistributedMessage::ClusterSnapshot { snapshot_json, .. })) => {
-                        return Ok(snapshot_json);
+                        snapshots.push(snapshot_json);
+                        continue;
                     }
                     Ok(Some(other)) => {
                         tracing::warn!(

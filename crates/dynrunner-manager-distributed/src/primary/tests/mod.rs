@@ -24,6 +24,7 @@
 
 mod basic;
 mod coordinator_setup;
+mod crdt_convergence;
 mod dispatch_decoupling;
 mod e2e;
 mod hydrate;
