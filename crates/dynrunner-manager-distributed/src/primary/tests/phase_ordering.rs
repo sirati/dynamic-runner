@@ -399,3 +399,245 @@ async fn run_phase_ordering_scenario(
         }
     }
 }
+
+/// Connect-before-first-phase-start ordering + empty-initial-phase
+/// cascade + consumer lazy-spawn, end-to-end. Proves the operator-facing
+/// important-event setup narration is correctly ordered AFTER moving
+/// the initial `fire_initial_phase_starts` (+ its dependent empty-phase
+/// cascade) to run AFTER `wait_for_connections`:
+///
+///   * The "all secondaries connected" milestone (emitted from
+///     `wait_for_connections`) MUST precede the FIRST "starting job
+///     phase" milestone (emitted from `fire_initial_phase_starts`).
+///     Pre-reorder, the initial phase-start fired BEFORE connect, so the
+///     operator saw "starting job phase" before "all secondaries
+///     connected" — the inversion this reorder fixes.
+///   * "initial assignment complete" (the phase-preparation /
+///     task-spawning important event) and "initial setup done" (the
+///     steady-state milestone) both appear, "initial setup done" last,
+///     and "initial setup done" appears EXACTLY ONCE on the submitter's
+///     process.
+///
+/// The workload deliberately leads with an EMPTY phase (`pre`, zero
+/// items) whose `Blocked` dependent (`work`) holds every real task —
+/// this exercises `drain_empty_active_phases` + the lifecycle cascade
+/// (the block relocated past `wait_for_connections`). Phase `work` has
+/// a slow item so it stays in-flight across the assignment window, and
+/// phase `post` is populated lazily via `PrimaryCommand::SpawnTasks`
+/// from inside `on_phase_end(work)` — the asm-tokenizer consumer
+/// pattern. The phase-event ordering invariant
+/// (on_phase_start(dependent) never precedes on_phase_end(dep)) is
+/// re-asserted to prove the cascade behaviour is identical with the
+/// call moved.
+#[tokio::test(flavor = "current_thread")]
+async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_spawn() {
+    use crate::test_capture::{ImportantCapture, important_only};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Capture only the importance-target events, scoped to this
+            // test's thread for the lifetime of the run. `set_default`
+            // (not `with_default`) so the subscriber is held across the
+            // `.await` — and `current_thread` + `LocalSet` keep every
+            // spawned secondary task on this thread, so the primary's
+            // important emits (fired from inside `primary.run().await`)
+            // are all reached. See `stranded.rs::capture_logs_thread_local`
+            // for the same discipline.
+            let capture = ImportantCapture::default();
+            let subscriber =
+                Registry::default().with(capture.clone().with_filter(important_only()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            // Phase chain: pre (EMPTY) → work (all real items, one slow)
+            //   plus a lazily-spawned `post` injected from on_phase_end(work).
+            let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            phase_deps.insert(PhaseId::from("work"), vec![PhaseId::from("pre")]);
+            phase_deps.insert(PhaseId::from("post"), vec![PhaseId::from("work")]);
+
+            // `pre` has NO binaries — it is the empty initial phase whose
+            // cascade must drain it Done so `work` (Blocked on `pre`)
+            // becomes visible to `view_for_worker`.
+            let binaries: Vec<TaskInfo<TestId>> = vec![
+                phased_binary("work_fast", "work", 100),
+                phased_binary("work_slow", "work", 50),
+            ];
+            let post_items = vec![phased_binary("post_one", "post", 50)];
+
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            let mut sec_handles = Vec::new();
+
+            for i in 0..2u32 {
+                let sec_id = format!("sec-{i}");
+                let (pri_to_sec_tx, sec_to_pri_rx, handle) = spawn_real_secondary_slow(
+                    sec_id.clone(),
+                    1,
+                    max_res.clone(),
+                    vec![("/tmp/work_slow".to_string(), Duration::from_millis(300))],
+                );
+                outgoing.insert(sec_id, pri_to_sec_tx);
+                sec_handles.push(handle);
+
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = sec_to_pri_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(incoming_tx);
+
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                ..test_primary_config()
+            };
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let command_sender = primary.command_sender();
+
+            // Interleaved phase-event log (start/end) so the cascade
+            // ordering invariant is checked the same way the sibling
+            // scenarios do.
+            let events: Arc<Mutex<Vec<PhaseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let starts_cb = events.clone();
+            let on_start: OnPhaseStart = Box::new(move |p: &PhaseId| {
+                starts_cb
+                    .lock()
+                    .unwrap()
+                    .push(PhaseEvent::Start(p.to_string()));
+            });
+            let ends_cb = events.clone();
+            let mut already_spawned = false;
+            let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32| {
+                ends_cb.lock().unwrap().push(PhaseEvent::End {
+                    phase: p.to_string(),
+                    completed: c,
+                    failed: f,
+                });
+                // Lazy spawn the `post` phase the first time `work` ends
+                // (the asm-tokenizer consumer pattern). The cascade's
+                // post-callback drain applies it inline.
+                if p.as_str() == "work" && !already_spawned {
+                    already_spawned = true;
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    let _ = command_sender.try_send(PrimaryCommand::SpawnTasks {
+                        tasks: post_items.clone(),
+                        reply: reply_tx,
+                    });
+                }
+            });
+
+            primary
+                .run(binaries, phase_deps, on_start, on_end)
+                .await
+                .unwrap();
+
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+
+            drop(primary);
+            for h in sec_handles {
+                let _ = h.await;
+            }
+
+            // All three real items (work_fast, work_slow, post_one) ran;
+            // the empty `pre` phase contributed nothing.
+            assert_eq!(completed, 3, "all real items must complete");
+            assert_eq!(failed, 0, "no failures expected");
+
+            // -------- Phase-event (consumer-callback) ordering --------
+            // on_phase_start(work) must precede on_phase_end(pre)'s
+            // dependent activation, and on_phase_start(post) must follow
+            // on_phase_end(work). This is the cascade behaviour the
+            // reorder must preserve.
+            let log = events.lock().unwrap().clone();
+            let pos = |pred: &dyn Fn(&PhaseEvent) -> bool| log.iter().position(pred);
+            let pre_end = pos(&|e| matches!(e, PhaseEvent::End { phase, .. } if phase == "pre"));
+            let work_start = pos(&|e| matches!(e, PhaseEvent::Start(p) if p == "work"));
+            let work_end = pos(&|e| matches!(e, PhaseEvent::End { phase, .. } if phase == "work"));
+            let post_start = pos(&|e| matches!(e, PhaseEvent::Start(p) if p == "post"));
+            assert!(
+                pre_end.is_some() && work_start.is_some(),
+                "empty `pre` must fire on_phase_end and `work` must start; log={log:?}"
+            );
+            assert!(
+                pre_end < work_start,
+                "on_phase_start(work) must follow on_phase_end(pre); log={log:?}"
+            );
+            assert!(
+                work_end.is_some() && post_start.is_some() && work_end < post_start,
+                "on_phase_start(post) must follow on_phase_end(work) (lazy spawn); log={log:?}"
+            );
+
+            // -------- Important-event (operator narration) ordering --------
+            let msgs = capture.messages();
+            let first_idx = |needle: &str| msgs.iter().position(|m| m.contains(needle));
+            let connected = first_idx("all secondaries connected");
+            let starting_phase = first_idx("starting job phase");
+            let assignment = first_idx("initial assignment complete");
+            let setup_done = first_idx("initial setup done");
+
+            assert!(
+                connected.is_some(),
+                "expected an 'all secondaries connected' important event; got {msgs:?}"
+            );
+            assert!(
+                starting_phase.is_some(),
+                "expected a 'starting job phase' important event; got {msgs:?}"
+            );
+            // Connect before the first phase-start — the regression this
+            // reorder fixes.
+            assert!(
+                connected < starting_phase,
+                "'all secondaries connected' must precede the first \
+                 'starting job phase'; got {msgs:?}"
+            );
+            // The count-bearing initial-assignment event is present, before
+            // the steady-state milestone.
+            assert!(
+                assignment.is_some(),
+                "expected an 'initial assignment complete' important event \
+                 (phase-preparation / task-spawning); got {msgs:?}"
+            );
+            // "initial setup done" present, EXACTLY ONCE, and last (the
+            // steady-state milestone).
+            assert!(
+                setup_done.is_some(),
+                "expected an 'initial setup done' important event; got {msgs:?}"
+            );
+            assert_eq!(
+                msgs.iter()
+                    .filter(|m| m.contains("initial setup done"))
+                    .count(),
+                1,
+                "'initial setup done' must be emitted exactly once on the \
+                 submitter's process; got {msgs:?}"
+            );
+            assert!(
+                assignment < setup_done && connected < setup_done && starting_phase < setup_done,
+                "'initial setup done' must come after connect, assignment, and \
+                 the first phase-start; got {msgs:?}"
+            );
+        })
+        .await;
+}

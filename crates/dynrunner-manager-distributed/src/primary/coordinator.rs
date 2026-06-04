@@ -2335,9 +2335,56 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             "primary starting"
         );
 
+        // Take/put-back the command-channel receiver for the whole
+        // pre-operational-loop chain: `wait_for_connections` below and the
+        // initial-phase-start + empty-phase cascade (relocated to AFTER
+        // connect — see the block past `wait_for_connections`) both need
+        // `&mut Receiver` while also holding `&mut self`, which would alias
+        // if we passed `&mut self.command_rx` directly. Mirrors the
+        // discipline `operational_loop` uses (see
+        // `lifecycle/operational_loop.rs:51`); the window between take and
+        // put-back is benign here because we're still in `run` before the
+        // operational loop has started — no concurrent sender access path
+        // exists. Put-back happens after `wait_for_mesh_ready` so the
+        // loop's own `self.command_rx.take()` re-acquires the same receiver.
+        let mut command_rx = self.command_rx.take();
+
+        // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
+        self.wait_for_connections(&mut command_rx).await?;
+
         // Fire on_phase_start for every phase the pool initialised as
-        // Active (zero-deps phases). Subsequent activations triggered
-        // by `mark_phase_done` are observed via `process_phase_lifecycle`.
+        // Active (zero-deps phases), THEN cascade trivially-empty phases.
+        // Subsequent activations triggered by `mark_phase_done` are
+        // observed via `process_phase_lifecycle`.
+        //
+        // Ordering: the "all secondaries connected" milestone must precede
+        // the first "starting job phase" milestone. This MUST run AFTER
+        // `wait_for_connections` so the operator's "all secondaries
+        // connected" milestone (`primary/connect.rs`) prints BEFORE the
+        // "starting job phase" milestone `fire_initial_phase_starts` emits.
+        // The relocation here is behaviour-preserving:
+        //   * The fire-before-cascade COUPLING is kept intact (the cascade's
+        //     `on_phase_end(.., 0, 0)` for an empty initial phase must come
+        //     AFTER that phase's `on_phase_start`, so `fire_initial_phase_starts`
+        //     stays immediately before the cascade).
+        //   * `wait_for_connections` reads no phase-start state (only
+        //     `self.secondaries` connection states + `num_secondaries`), so
+        //     seeding phases after it changes nothing it observes.
+        //   * The 3a/3b duplicate discriminator is STRUCTURAL (the code
+        //     path — `ingest_initial_batch` vs `apply_spawn_tasks`), not a
+        //     runtime read of `phase_started_emitted`; the only runtime read
+        //     of `phase_started_emitted` is `fire_initial_phase_starts`' own
+        //     `insert` guard, and `ingest_initial_batch`'s `debug_assert!`
+        //     (must run before fire) is satisfied — ingest still runs far
+        //     above, before connect.
+        //   * No `on_phase_end` can fire DURING `wait_for_connections`: no
+        //     task has been assigned yet (`perform_initial_assignment` runs
+        //     below, after connect), and because `drain_empty_active_phases`
+        //     now runs only AFTER connect, `drained_pending` is empty during
+        //     connect — so any inbound-driven `process_phase_lifecycle`
+        //     (`dispatch_message`'s TaskComplete/TaskFailed cascade) is a
+        //     guaranteed no-op there. The on_phase_start-before-on_phase_end
+        //     contract is therefore preserved.
         self.fire_initial_phase_starts();
 
         // Trivially-empty Active phases (no items at all) need to drain
@@ -2345,7 +2392,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // `Blocked` dependents — which may hold all the run's actual
         // work — never become visible to `view_for_worker`. Triggers
         // `on_phase_end(.., 0, 0)` for each empty phase via the
-        // lifecycle cascade.
+        // lifecycle cascade. Runs after connect but BEFORE the
+        // seed/assignment step below, preserving the load-bearing
+        // "cascade before initial assignment" ordering.
         //
         // Gated on `!self.setup_pending` because in setup-defer mode
         // the local primary enters `run()` with `binaries = []` and
@@ -2373,30 +2422,16 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // gate — the two are one logical unit (the pre-call exists
         // only to feed the cascade).
         //
-        // Take/put-back the command-channel receiver around the cascade
-        // call: the cascade's per-iteration drain step needs `&mut
-        // Receiver` AND the cascade itself needs `&mut self`, which
-        // would alias if we passed `&mut self.command_rx` directly.
-        // Mirrors the discipline `operational_loop` uses (see
-        // `lifecycle/operational_loop.rs:51`); the brief window between
-        // take and put-back is benign here because we're still in `run`
-        // before the operational loop has started — no concurrent
-        // sender access path exists.
-        //
         // Required at this pre-loop site (not optional): a consumer
         // `on_phase_end` callback fired by the initial-empty-phase
         // cascade can itself queue `spawn_tasks(next_phase_items)`,
         // and the cascade's next `drain_empty_active_phases` poll
         // would otherwise false-fire `on_phase_end(.., 0, 0)` on the
         // successor phase exactly the way the in-loop bug class did.
-        // Take the command-channel receiver out of `self` for the
-        // duration of every pre-operational-loop step that can fire
-        // `on_phase_end` (via `process_phase_lifecycle`'s in-cascade
-        // dispatch path). Each step is then a pass-through caller
-        // that can hand the receiver into `dispatch_message` so the
-        // cascade's per-iteration drain step picks up callback-queued
-        // `SpawnTasks` / `FailPermanent` / `ReinjectTask` / `Update
-        // PreferredSecondaries` commands inline.
+        // The `command_rx` taken above is handed into
+        // `process_phase_lifecycle` so the cascade's per-iteration drain
+        // step picks up callback-queued `SpawnTasks` / `FailPermanent` /
+        // `ReinjectTask` / `UpdatePreferredSecondaries` commands inline.
         //
         // Required because `operational_loop`'s entry-time exit
         // check (`completed + failed >= total_tasks && active_workers
@@ -2408,22 +2443,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Asm-tokenizer's lazy-spawn consumer pattern
         // (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
         // is the live consumer of this contract.
-        //
-        // Put-back semantics: returned to `self.command_rx` before
-        // `operational_loop` is called so the loop's own
-        // `self.command_rx.take()` re-acquires the same receiver.
-        // The window between take-here and put-back is `Send`-bound
-        // by the same `LocalSet` the rest of the coordinator runs
-        // on; no concurrent producer exists pre-loop.
-        let mut command_rx = self.command_rx.take();
-
         if !self.setup_pending() {
             self.pool_mut().drain_empty_active_phases();
             self.process_phase_lifecycle(&mut command_rx).await;
         }
-
-        // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
-        self.wait_for_connections(&mut command_rx).await?;
 
         // #3a abort gate. `ingest_initial_batch` recorded a pending
         // abort iff the INITIAL batch had a `(phase_id, task_id)`
@@ -2543,6 +2566,35 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // not consult `command_rx`; restoring it here keeps the field's
         // ownership symmetric across every fork branch.
         self.command_rx = command_rx;
+
+        // Initial-setup-done important event. This is the honest
+        // once-per-run "all initial setup complete, entering steady-state"
+        // milestone for the OPERATOR's submitter process: the fleet is
+        // connected (`wait_for_connections`), staged
+        // (`maybe_auto_stage_initial`), peer-linked (`send_peer_lists` +
+        // `wait_for_peer_connections`), the primary's own membership is
+        // recorded (`originate_primary_membership`), the ledger is seeded +
+        // tasks assigned (`seed_cluster_state` + `perform_initial_assignment`)
+        // OR the setup-defer handshake is emitted (`emit_setup_defer_handshake`),
+        // transfer-complete is sent (`send_transfer_complete`), and the peer
+        // mesh has settled (`wait_for_mesh_ready`). Both modes reconverge here
+        // (the `required_setup_on_promote` if/else above rejoins before
+        // `send_transfer_complete`), so a single emit at this point fires
+        // EXACTLY ONCE regardless of non-defer vs setup-defer mode.
+        //
+        // Placed BEFORE the bootstrap hand-off fork so it is NOT
+        // double-emitted after a relocation: the chosen peer's on-demand
+        // primary enters via `run_activated_pipeline`, which bypasses this
+        // whole connect/seed/mesh-ready chain (it inherits the already-formed
+        // mesh and resumes from the restored snapshot), so it never reaches
+        // this line. The submitter — whether it stays primary
+        // (`activate_local_primary`), relocates and observes
+        // (`run_as_observer`), or falls back to local — emits this once and
+        // only once, before any of those forks run.
+        tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
+            "initial setup done",
+        );
 
         // Bootstrap hand-off fork. The submitter bootstrapped the mesh as
         // the temporary primary WITHOUT a self-announce (it never
@@ -3350,12 +3402,16 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// phase and false-fires `on_phase_end(.., 0, 0)` for it,
     /// dropping every callback-injected task.
     ///
-    /// Pre-loop / post-loop callers (`coordinator.rs:1258`,
-    /// `drain_pending_messages`, `wait_for_connections`,
-    /// `wait_for_mesh_ready`) pass `&mut None` — at those moments
-    /// PyPrimaryHandle is either dormant (run hasn't started yet) or
-    /// the operational loop has already exited and won't re-enter, so
-    /// there is no in-runtime callback path to drain.
+    /// The pre-loop waits `wait_for_connections` and `wait_for_mesh_ready`
+    /// pass the LIVE `command_rx` (the `take`n receiver, `Some`): the
+    /// PyPrimaryHandle IS reachable before operational-loop entry (it
+    /// shares the pre-`run` `command_sender()` clone), so an
+    /// `on_phase_end` fired by a TaskComplete arriving during either wait
+    /// can queue `SpawnTasks` and have it drain inline via the same
+    /// `dispatch_message` → cascade path. The post-loop drain
+    /// (`drain_pending_messages`) passes `&mut None` — by then the
+    /// operational loop has already exited and won't re-enter, so there is
+    /// no in-runtime callback path left to drain.
     pub(super) async fn process_phase_lifecycle(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,

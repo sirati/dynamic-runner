@@ -306,7 +306,32 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
 
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();
+        // Phase-preparation / task-spawning important event: the initial
+        // per-secondary assignment has placed `assigned` tasks across the
+        // fleet (`remaining` still queued for the operational loop's
+        // TaskRequest cycle). This is the single point at which initial
+        // tasks have been spawned/assigned for the run, so it carries the
+        // count at the importance target — the dual-sink surfaces it on
+        // stdio under `--important-stdio-only`. Structured fields, not
+        // prose (mirrors `retry_bucket`'s `count`-bearing emit). One emit
+        // with the TOTAL, after the per-secondary fan-out — never inside
+        // the per-recipient loop.
+        //
+        // Defer-mode asymmetry (scope boundary): this event fires ONLY on
+        // the non-defer, submitter-side initial-assignment path. In
+        // setup-defer mode (`--source-already-staged` /
+        // `required_setup_on_promote`) `perform_initial_assignment` is not
+        // called at all — `emit_setup_defer_handshake` runs instead, and the
+        // real task discovery + assignment happens post-relocation on the
+        // promoted primary. That promoted-side spawning is NOT surfaced
+        // here, by design: this is a submitter-local important-stdio site,
+        // and the promoted primary enters via `run_activated` (a separate
+        // process / coordinator) whose own assignment is out of this
+        // emitter's reach. So under setup-defer the operator sees no
+        // "initial assignment complete" from the submitter — the boundary
+        // is honest, not a gap to paper over here.
         tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
             assigned,
             remaining = self.pool().len(),
             "initial assignment complete"

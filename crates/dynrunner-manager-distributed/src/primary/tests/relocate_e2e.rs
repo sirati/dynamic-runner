@@ -340,3 +340,175 @@ async fn e2e_no_capable_peer_submitter_stays_primary() {
         })
         .await;
 }
+
+/// RELOCATION single-emit guard for the "initial setup done" milestone.
+///
+/// The submitter emits "initial setup done" once in `run_pipeline`, placed
+/// BEFORE the bootstrap hand-off fork. When authority RELOCATES to a chosen
+/// peer, that peer's on-demand primary enters via `run_activated` /
+/// `run_activated_pipeline`, which bypasses `run_pipeline` (and therefore
+/// the emit) entirely — it inherits the formed mesh and resumes from the
+/// restored snapshot. So even though TWO `PrimaryCoordinator`s run during a
+/// relocating run (the submitter's, then the chosen peer's on-demand one),
+/// "initial setup done" must be captured EXACTLY ONCE.
+///
+/// Path this drives: the FULL bootstrap → relocate hand-off (the same
+/// `Some(chosen)` → `relocate_primary_to` → `run_as_observer` fork the
+/// headline e2e test exercises). The submitter relocates to the lowest-id
+/// capable peer (`sec-0`), whose on-demand primary dispatches the residual
+/// workload via `run_activated_pipeline` — the path that must NOT re-emit.
+///
+/// Why the assertion is REAL (not a tautology): every coordinator in this
+/// test — the submitter, both secondaries, and the chosen peer's on-demand
+/// activated primary — runs on the SAME `current_thread` `LocalSet`, under
+/// a `set_default` thread-local `ImportantCapture` subscriber. So if the
+/// relocated primary's `run_activated_pipeline` ever emitted "initial setup
+/// done" (e.g. if the emit were moved into the shared
+/// `run_operational_and_finalize` tail, or duplicated onto the activation
+/// path), the capture WOULD record a second occurrence and `count == 1`
+/// would fail. The assertion fires off the activated path actually running:
+/// the headline-test invariants (relocation happened, the chosen peer's own
+/// ledger credited every task) are re-checked here so a regression that
+/// silently skips relocation can't make the count==1 pass vacuously.
+#[tokio::test(flavor = "current_thread")]
+async fn initial_setup_done_emitted_once_across_relocation() {
+    use crate::test_capture::{ImportantCapture, important_only};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Capture only importance-target events, scoped to this test's
+            // thread for the lifetime of the run. `set_default` (not
+            // `with_default`) so the subscriber is held across the `.await`;
+            // `current_thread` + `LocalSet` keep every spawned coordinator
+            // (submitter, secondaries, AND the chosen peer's on-demand
+            // activated primary) on this thread, so an "initial setup done"
+            // emit from ANY of them is reached. See `phase_ordering.rs` for
+            // the same discipline.
+            let capture = ImportantCapture::default();
+            let subscriber =
+                Registry::default().with(capture.clone().with_filter(important_only()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            const NUM_TASKS: usize = 10;
+            // 2 secondaries × 2 workers = 4 initial-assignment slots, so the
+            // submitter places at most 4 of 10 tasks; the residual ≥6 MUST
+            // be dispatched by the chosen peer's on-demand primary AFTER
+            // relocation — that on-demand primary is the `run_activated`
+            // path that must NOT re-emit "initial setup done".
+            let (senders, mut receivers) = mesh_channels(&["primary", "sec-0", "sec-1"]);
+
+            let keepalive = Duration::from_millis(10);
+            let slow = || vec![("bin_".to_string(), Duration::from_millis(80))];
+
+            let (sec0_handle, sec0_primary_result) = spawn_real_secondary_primary_capable(
+                "sec-0".into(),
+                2,
+                big_ram(),
+                keepalive,
+                slow(),
+                receivers.remove("sec-0").unwrap(),
+                outgoing_for("sec-0", &senders),
+            );
+            let (sec1_handle, sec1_primary_result) = spawn_real_secondary_primary_capable(
+                "sec-1".into(),
+                2,
+                big_ram(),
+                keepalive,
+                slow(),
+                receivers.remove("sec-1").unwrap(),
+                outgoing_for("sec-1", &senders),
+            );
+
+            let submitter_inbound_rx = receivers.remove("primary").unwrap();
+            let transport = ChannelPeerTransport::from_raw_channels(
+                "primary".into(),
+                outgoing_for("primary", &senders),
+                submitter_inbound_rx,
+            );
+            drop(senders);
+
+            let mut submitter = PrimaryCoordinator::new(
+                submitter_config(2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..NUM_TASKS)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
+                .collect();
+
+            {
+                let (deps, ops, ope) = noop_phase_args();
+                submitter
+                    .run(binaries, deps, ops, ope)
+                    .await
+                    .expect("submitter run (bootstrap → relocate → observer) must return Ok");
+            }
+
+            // Re-assert that a REAL relocation happened so the single-emit
+            // count below can't pass vacuously: a regression that skipped
+            // relocation (submitter stays primary) would emit exactly once
+            // too, but would NOT exercise the activated-path bypass this
+            // test guards. The submitter must have observed (never pinned
+            // itself local) and the chosen peer must hold authority.
+            assert_eq!(
+                submitter.primary_id, None,
+                "the submitter must have relocated (observer tail), not stayed local primary"
+            );
+            assert_eq!(
+                submitter.completed_count(),
+                NUM_TASKS,
+                "the submitter-observer's replicated ledger must observe every completion"
+            );
+            assert_eq!(
+                submitter.cluster_state_for_test().current_primary(),
+                Some("sec-0"),
+                "the lowest-id capable peer must be the chosen primary"
+            );
+
+            drop(submitter);
+
+            let _sec0_own = sec0_handle.await.unwrap();
+            let _sec1_own = sec1_handle.await.unwrap();
+
+            // The chosen peer's on-demand primary actually ran the activated
+            // path (credited every task to its own ledger) — proving the
+            // `run_activated_pipeline` bypass was truly exercised, so the
+            // count==1 assertion below is a real negative control on it.
+            assert_eq!(
+                sec0_primary_result.get(),
+                Some(NUM_TASKS),
+                "the CHOSEN peer's on-demand primary must have run the activated path \
+                 (credited every task to its OWN ledger)"
+            );
+            assert_eq!(
+                sec1_primary_result.get(),
+                None,
+                "a non-chosen primary-capable secondary must never build a primary"
+            );
+
+            // The invariant: across the WHOLE relocating run — two
+            // coordinators, submitter + chosen-peer's on-demand primary —
+            // "initial setup done" was emitted EXACTLY ONCE. The submitter
+            // emits it before relocating; the relocated primary
+            // (`run_activated_pipeline`) must NOT emit a second.
+            let setup_done_count = capture
+                .messages()
+                .iter()
+                .filter(|m| m.contains("initial setup done"))
+                .count();
+            assert_eq!(
+                setup_done_count, 1,
+                "'initial setup done' must be emitted EXACTLY ONCE across a relocating \
+                 run — the submitter emits it before hand-off; the relocated primary's \
+                 `run_activated_pipeline` must not re-emit; got {:?}",
+                capture.messages()
+            );
+        })
+        .await;
+}

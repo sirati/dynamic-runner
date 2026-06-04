@@ -158,12 +158,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the TaskComplete / TaskFailed cascade so a
     /// callback-issued `spawn_tasks` applies inline before the next
-    /// `drain_empty_active_phases` poll. Pre-loop callers
-    /// (`wait_for_connections`, `wait_for_mesh_ready`) and post-loop
-    /// callers (`drain_pending_messages`) pass `&mut None`: at those
-    /// moments PyPrimaryHandle is either dormant (run hasn't entered
-    /// the operational loop yet) or the loop has already exited and
-    /// won't re-enter, so no in-runtime callback path needs draining.
+    /// `drain_empty_active_phases` poll. The pre-loop waits
+    /// (`wait_for_connections`, `wait_for_mesh_ready`) pass the LIVE
+    /// `command_rx` (`Some`): PyPrimaryHandle is already reachable before
+    /// operational-loop entry (it shares the pre-`run` `command_sender()`
+    /// clone), so a callback-queued command drains inline during those
+    /// waits. Only the post-loop caller (`drain_pending_messages`) passes
+    /// `&mut None`: the loop has already exited and won't re-enter, so no
+    /// in-runtime callback path needs draining.
     pub(super) async fn dispatch_message(
         &mut self,
         msg: DistributedMessage<I>,
