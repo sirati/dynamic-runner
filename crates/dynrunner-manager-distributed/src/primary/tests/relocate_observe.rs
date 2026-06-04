@@ -435,17 +435,14 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
     .expect("the observer must terminate via the silence backstop, NOT hang");
 }
 
-/// Integration regression for #180: the operator's run narration is
-/// emitted by the OBSERVER process reading the CRDT, so `run_as_observer`
-/// itself must produce the IMPORTANT_TARGET narrative (phase transitions
-/// + the one-shot completion summary) before it returns on
-/// `run_complete()`.
-///
-/// Pre-fix `run_as_observer` emitted ZERO IMPORTANT_TARGET lines (the
-/// narrative lived only on the primary, whose process is a DIFFERENT node
-/// after relocation) — so this test FAILS pre-fix on the phase-transition
-/// and summary assertions, and passes once the inline `RunNarrator` is
-/// plugged into the observer loop.
+/// The operator's run narration is emitted by the OBSERVER process
+/// reading the CRDT: `run_as_observer` itself produces the
+/// IMPORTANT_TARGET narrative (phase started/complete transitions plus a
+/// single one-shot completion summary) from the replicated `ClusterState`
+/// before it returns on `run_complete()`. The narrative is driven purely
+/// from the CRDT mirror, so it is independent of which node holds the
+/// primary — exactly the property that matters after a relocation moves
+/// the primary to a different process.
 ///
 /// The CRDT is pre-driven through a two-phase chain (`build` → `compile`)
 /// with mixed outcomes (2 succeeded, 1 failed-final) and `RunComplete`

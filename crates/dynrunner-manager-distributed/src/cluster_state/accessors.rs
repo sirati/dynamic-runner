@@ -247,7 +247,7 @@ impl<I: Identifier> ClusterState<I> {
             };
             let entry = base.entry(&task.phase_id).or_insert((false, false));
             entry.0 = true;
-            if !is_terminal(st) {
+            if !st.is_terminal() {
                 entry.1 = true;
             }
         }
@@ -469,22 +469,6 @@ impl<I: Identifier> ClusterState<I> {
             .map(|c| u64::from(c.worker_count))
             .sum()
     }
-}
-
-/// True iff `state` is a terminal state for dependency-resolution and
-/// phase-completion purposes (the pool resolves a dep once its prereq is
-/// `Completed` OR permanently failed; in the CRDT the permanent-failure
-/// set is `Failed` ∪ `Unfulfillable` ∪ `InvalidTask`). `Blocked` is
-/// cascade-paused (auto-resumes to `Pending`), so it is NOT terminal.
-/// Module-private: the only readers are the phase-rollup derivation.
-fn is_terminal<I>(state: &TaskState<I>) -> bool {
-    matches!(
-        state,
-        TaskState::Completed { .. }
-            | TaskState::Failed { .. }
-            | TaskState::Unfulfillable { .. }
-            | TaskState::InvalidTask { .. }
-    )
 }
 
 /// A phase is dispatchable iff every phase it depends on (transitively)

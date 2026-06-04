@@ -120,6 +120,24 @@ impl<I> TaskState<I> {
             | TaskState::Blocked { task, .. } => task,
         }
     }
+
+    /// True iff this is a terminal state for dependency-resolution and
+    /// phase-completion purposes. One canonical predicate so the CRDT
+    /// phase-rollup derivation and the pyo3 stats projection share the
+    /// permanent-failure set rather than each re-spelling the match: the
+    /// pool resolves a dep once its prereq is `Completed` OR permanently
+    /// failed, and in the CRDT the permanent-failure set is `Failed` ∪
+    /// `Unfulfillable` ∪ `InvalidTask`. `Blocked` is cascade-paused
+    /// (auto-resumes to `Pending`), so it is NOT terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskState::Completed { .. }
+                | TaskState::Failed { .. }
+                | TaskState::Unfulfillable { .. }
+                | TaskState::InvalidTask { .. }
+        )
+    }
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge

@@ -125,7 +125,7 @@ impl StatsSnapshot {
         // unsatisfied).
         let mut terminal_task_ids: HashSet<&str> = HashSet::new();
         for (_, st) in state.tasks_iter() {
-            if is_terminal(st) {
+            if st.is_terminal() {
                 let id = task_id_of(st);
                 if !id.is_empty() {
                     terminal_task_ids.insert(id);
@@ -226,21 +226,6 @@ impl StatsSnapshot {
 
 // These helpers are reached only through `from_cluster_state`, the live
 // CRDT-projection feed (producer: `observer_late_joiner/run.rs`).
-
-/// True iff `state` is a terminal state for dependency-resolution
-/// purposes (the pool resolves a dep once its prereq is `Completed` OR
-/// permanently failed; in the CRDT the permanent-failure set is
-/// `Failed` ∪ `Unfulfillable` ∪ `InvalidTask`). `Blocked` is
-/// cascade-paused, not terminal.
-fn is_terminal<I>(state: &TaskState<I>) -> bool {
-    matches!(
-        state,
-        TaskState::Completed { .. }
-            | TaskState::Failed { .. }
-            | TaskState::Unfulfillable { .. }
-            | TaskState::InvalidTask { .. }
-    )
-}
 
 fn task_id_of<I>(state: &TaskState<I>) -> &str {
     task_of(state).task_id.as_str()

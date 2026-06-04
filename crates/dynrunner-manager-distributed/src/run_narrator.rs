@@ -46,8 +46,9 @@ use dynrunner_core::{Identifier, IMPORTANT_TARGET, PhaseId};
 
 use crate::ClusterState;
 
-/// Stateful, pure differ over a sequence of [`ClusterState`] snapshots
-/// that emits the operator's run narrative idempotently.
+/// Stateful, pure projection that diffs the replicated [`ClusterState`]
+/// against its accumulated edge-sets and emits the operator's run
+/// narrative idempotently.
 ///
 /// Holds only accumulated edge-sets — no authority, no pool, no
 /// wall-clock. Construct once before the observer loop and call
