@@ -66,7 +66,19 @@ use crate::clock::Clock;
 use crate::podman::PodmanBackend;
 use crate::process_probe::ProcessProbe;
 use crate::shutdown_flag::ShutdownFlag;
+use std::path::Path;
 use std::time::Duration;
+
+/// Graceful last-resort budget: how long the reaper waits, after
+/// writing the panik sentinel, for the workload to stop on its own.
+/// The secondary's in-container panik watcher polls its sentinel paths
+/// at a 10s cadence by default, then runs worker-teardown before
+/// exiting; two minutes leaves comfortable room for that cascade even
+/// under load while still bounding how long the reaper lingers before
+/// finally giving up. Mirrors the other grace constants
+/// ([`PollConfig::secondary_grace`], [`PollConfig::container_stop_grace`])
+/// as a named value rather than a magic literal at the call site.
+const PANIK_GRACE: Duration = Duration::from_secs(120);
 
 /// Subset of `Config` that the state machine reads. Keeping this
 /// narrow avoids coupling the loop to argv shape.
@@ -83,6 +95,15 @@ pub struct PollConfig {
     /// branch). `None` disables the check; loop behaviour is then
     /// identical to the pre-monitor design.
     pub wrapper_pid: Option<u32>,
+    /// Optional HOST-side path of the secondary's monitored panik
+    /// sentinel (the host side of the file the secondary's in-container
+    /// watcher polls; see [`crate::config::Config::panik_file`]). When
+    /// `Some`, a surviving orphan triggers the graceful last resort:
+    /// write this sentinel and wait [`PANIK_GRACE`] for the secondary's
+    /// own watcher to shut its workers down and exit. `None` disables
+    /// the last resort; a surviving orphan reports `OrphanSurvives`
+    /// directly, exactly as before this knob existed.
+    pub panik_file: Option<std::path::PathBuf>,
 }
 
 /// Which branch of the state machine fired. Returned by `run` so the
@@ -237,6 +258,20 @@ pub fn signal_shutdown<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&st
 ) -> ReapStatus {
     record_based_signal(backend, clock, cfg, log);
     let reap = reap_workload_pid(probe, clock, cfg, workload_pid, log);
+    // When the direct PID-reap could not confirm the workload dead,
+    // try the graceful last resort BEFORE giving up: write the panik
+    // sentinel the secondary's own watcher monitors and wait a bounded
+    // window for it to shut down and exit on its own. This can only
+    // ever DOWNGRADE OrphanSurvives → ConfirmedGone (the workload
+    // self-exited) — it never escalates, never sends a signal, never
+    // removes anything. Any other reap status (ConfirmedGone /
+    // NotApplicable) passes through untouched.
+    let reap = match reap {
+        ReapStatus::OrphanSurvives => {
+            graceful_panik_file_attempt(probe, clock, cfg, workload_pid, log)
+        }
+        other => other,
+    };
     // Destroy the podman handle ONLY when nothing known is still alive.
     // Removing it while the workload survives is exactly the defect
     // that empties `podman ps -a` and turns every later name-based
@@ -252,6 +287,98 @@ pub fn signal_shutdown<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&st
         }
     }
     reap
+}
+
+/// Graceful last resort for a surviving orphan: write the panik
+/// sentinel into the secondary's monitored location and wait
+/// [`PANIK_GRACE`] for the workload to stop on its own.
+///
+/// Reached ONLY from the `OrphanSurvives` branch of
+/// [`signal_shutdown`], i.e. AFTER the direct PID-reap (SIGTERM →
+/// grace → SIGKILL → grace) failed to confirm the workload dead. It is
+/// the very last thing the reaper tries before reporting failure.
+///
+/// Behaviour:
+///   * `cfg.panik_file == None` ⇒ no sentinel location is known; the
+///     last resort is disabled and the orphan stays `OrphanSurvives`
+///     (the pre-this-knob behaviour).
+///   * no workload PID was captured ⇒ there is nothing to wait on;
+///     return the input status unchanged (defensive: the caller only
+///     reaches here on `OrphanSurvives`, which implies a captured PID,
+///     but the function stays total without relying on that).
+///   * otherwise: write the sentinel ONCE at `cfg.panik_file`, then
+///     poll the captured PID's identity-aware liveness for
+///     [`PANIK_GRACE`] via the SAME [`wait_for_pid_gone`] helper the
+///     PID-reap uses (the PID-reuse-safe `is_same_process` check, never
+///     a bare `is_alive`). If the workload self-exits within the
+///     window → `ConfirmedGone`; otherwise → `OrphanSurvives`.
+///
+/// The ONLY new side effect is writing one sentinel file at the one
+/// monitored path. No kill, no signal, no `rm`.
+fn graceful_panik_file_attempt<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
+    probe: &P,
+    clock: &C,
+    cfg: &PollConfig,
+    workload_pid: Option<(u32, Option<u64>)>,
+    log: &mut L,
+) -> ReapStatus {
+    let Some(panik_file) = cfg.panik_file.as_deref() else {
+        log(
+            "no --panik-file configured; skipping graceful last resort, \
+             orphan stays unreaped",
+        );
+        return ReapStatus::OrphanSurvives;
+    };
+    let Some((pid, captured_start)) = workload_pid else {
+        // No PID to wait on — nothing the sentinel could resolve.
+        return ReapStatus::OrphanSurvives;
+    };
+
+    write_panik_sentinel(panik_file, log);
+
+    log(&format!(
+        "waiting up to {}s for the secondary's panik watcher to stop workload PID {}",
+        PANIK_GRACE.as_secs(),
+        pid
+    ));
+    match wait_for_pid_gone(probe, clock, pid, captured_start, PANIK_GRACE, log) {
+        true => {
+            log(&format!(
+                "workload PID {} exited after the panik sentinel; graceful last resort succeeded",
+                pid
+            ));
+            ReapStatus::ConfirmedGone
+        }
+        false => {
+            log(&format!(
+                "workload PID {} still alive {}s after the panik sentinel; giving up",
+                pid,
+                PANIK_GRACE.as_secs()
+            ));
+            ReapStatus::OrphanSurvives
+        }
+    }
+}
+
+/// Write the panik sentinel file at the secondary's monitored host
+/// path. The secondary's in-container watcher fires on the file's mere
+/// existence, so an empty file is sufficient; we write a short marker
+/// for operator legibility. Best-effort: a write failure is logged and
+/// the caller falls through to the bounded wait anyway (which then
+/// times out to `OrphanSurvives`) — losing the graceful path is
+/// strictly less bad than aborting the reaper.
+fn write_panik_sentinel<L: FnMut(&str)>(panik_file: &Path, log: &mut L) {
+    match std::fs::write(panik_file, b"reaper last-resort: workload survived direct reap\n") {
+        Ok(()) => log(&format!(
+            "graceful last resort: wrote panik sentinel at {}",
+            panik_file.display()
+        )),
+        Err(e) => log(&format!(
+            "graceful last resort: could not write panik sentinel at {}: {}",
+            panik_file.display(),
+            e
+        )),
+    }
 }
 
 /// Stage 1: the original record-based signalling, unchanged except
@@ -457,6 +584,7 @@ mod tests {
             secondary_grace: Duration::from_secs(5),
             container_stop_grace: Duration::from_secs(10),
             wrapper_pid: None,
+            panik_file: None,
         }
     }
 
@@ -962,5 +1090,235 @@ mod tests {
             "rm_all still runs when there is nothing to reap; calls: {:?}",
             backend.calls()
         );
+    }
+
+    // ----------- graceful panik-file last resort ----------------
+    //
+    // Reached ONLY from the OrphanSurvives branch, AFTER the direct
+    // PID-reap (SIGTERM → grace → SIGKILL → grace) failed. The reaper
+    // writes the panik sentinel the secondary's own watcher monitors
+    // and waits PANIK_GRACE for the workload to self-exit. Properties
+    // pinned here: (1) the sentinel is written exactly once at the
+    // configured path; (2) workload-stops-within-budget ⇒ ConfirmedGone
+    // + rm_all; (3) workload-survives-budget ⇒ OrphanSurvives + handle
+    // intact; (4) NO new kill/signal/rm is introduced by the attempt.
+
+    use crate::testing::MOCK_WORKLOAD_START;
+
+    /// A `cfg_reap`-shaped config that also carries the panik-file
+    /// sentinel host path, enabling the graceful last resort.
+    fn cfg_reap_with_panik(panik_file: std::path::PathBuf) -> PollConfig {
+        PollConfig {
+            panik_file: Some(panik_file),
+            ..cfg_reap()
+        }
+    }
+
+    /// `--panik-file` set, workload survives the direct reap but then
+    /// self-exits inside the graceful window: the reaper writes the
+    /// sentinel exactly once at the configured path and reports
+    /// `ConfirmedGone` (exit 0 in `main`), removing the podman handle.
+    /// The start-time script keeps the PID alive through the entire
+    /// PID-reap (6 identity reads: capture + pre-SIGTERM + 2 SIGTERM-
+    /// grace + 2 SIGKILL-grace) so OrphanSurvives is reached, then
+    /// flips to gone on the first graceful poll.
+    #[test]
+    fn orphan_then_panik_file_workload_stops_within_budget_confirms_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        // The "host side" of the secondary's bind-mounted sentinel.
+        let panik_file = dir.path().join("log").join(".dynrunner-reaper.panik");
+        std::fs::create_dir_all(panik_file.parent().unwrap()).unwrap();
+
+        let backend = MockBackend::new();
+        backend.script_exists(vec![true, false]);
+        backend.script_workload_pid(vec![Some(4242)]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        clock.set_on_sleep(1, flag.clone());
+        // 6 reads alive (the full PID-reap), then gone on the graceful
+        // poll. Saturating `None` thereafter.
+        let probe = MockProcessProbe::reap_start_times(vec![
+            Some(MOCK_WORKLOAD_START),
+            Some(MOCK_WORKLOAD_START),
+            Some(MOCK_WORKLOAD_START),
+            Some(MOCK_WORKLOAD_START),
+            Some(MOCK_WORKLOAD_START),
+            Some(MOCK_WORKLOAD_START),
+            None,
+        ]);
+
+        let report = run(
+            &backend,
+            &flag,
+            &clock,
+            &probe,
+            &cfg_reap_with_panik(panik_file.clone()),
+            |_| {},
+        );
+
+        assert_eq!(report.outcome, Outcome::SignalShutdown);
+        assert_eq!(
+            report.reap,
+            ReapStatus::ConfirmedGone,
+            "workload self-exited inside the panik window ⇒ ConfirmedGone"
+        );
+        // The sentinel was written exactly once at the configured path.
+        assert!(
+            panik_file.exists(),
+            "panik sentinel must be written at the configured path"
+        );
+        // Only SIGTERM + SIGKILL from the direct reap — the graceful
+        // attempt sends NO new signal.
+        assert_eq!(
+            probe.signals_sent(),
+            vec![(4242, libc::SIGTERM), (4242, libc::SIGKILL)],
+            "graceful attempt must not send any new signal; got {:?}",
+            probe.signals_sent()
+        );
+        // Handle removed only after the workload was confirmed gone.
+        assert!(
+            backend.calls().contains(&"rm_all".to_string()),
+            "rm_all must run once the workload is confirmed gone; calls: {:?}",
+            backend.calls()
+        );
+    }
+
+    /// `--panik-file` set, workload survives BOTH the direct reap AND
+    /// the graceful window: the reaper writes the sentinel exactly once
+    /// and STILL reports `OrphanSurvives` (exit 1 in `main`), leaving
+    /// the podman handle intact. No new kill/signal/rm.
+    #[test]
+    fn orphan_then_panik_file_workload_survives_budget_stays_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let panik_file = dir.path().join("log").join(".dynrunner-reaper.panik");
+        std::fs::create_dir_all(panik_file.parent().unwrap()).unwrap();
+
+        let backend = MockBackend::new();
+        backend.script_exists(vec![true, false]);
+        backend.script_workload_pid(vec![Some(31337)]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        clock.set_on_sleep(1, flag.clone());
+        // Never dies — alive through the reap AND the whole panik window.
+        let probe = MockProcessProbe::always_alive();
+
+        let report = run(
+            &backend,
+            &flag,
+            &clock,
+            &probe,
+            &cfg_reap_with_panik(panik_file.clone()),
+            |_| {},
+        );
+
+        assert_eq!(report.outcome, Outcome::SignalShutdown);
+        assert_eq!(
+            report.reap,
+            ReapStatus::OrphanSurvives,
+            "workload alive after the panik window ⇒ still OrphanSurvives"
+        );
+        // The sentinel was still written exactly once (the reaper tried
+        // the graceful path before giving up).
+        assert!(
+            panik_file.exists(),
+            "panik sentinel must be written even when the workload survives"
+        );
+        // Only the direct reap's SIGTERM + SIGKILL — nothing new.
+        assert_eq!(
+            probe.signals_sent(),
+            vec![(31337, libc::SIGTERM), (31337, libc::SIGKILL)],
+            "graceful attempt must not send any new signal; got {:?}",
+            probe.signals_sent()
+        );
+        // Handle LEFT INTACT while the orphan lives — the no-false-
+        // success invariant of the direct PID-reap.
+        assert!(
+            !backend.calls().contains(&"rm_all".to_string()),
+            "rm_all must NOT run while the orphan PID is still alive; calls: {:?}",
+            backend.calls()
+        );
+    }
+
+    /// `--panik-file` UNSET (default): a surviving orphan must NOT write
+    /// any sentinel and must report `OrphanSurvives` directly, exactly
+    /// as before this knob existed. Guards the back-compat / opt-in
+    /// contract.
+    #[test]
+    fn orphan_without_panik_file_writes_nothing_and_stays_orphan() {
+        let backend = MockBackend::new();
+        backend.script_exists(vec![true, false]);
+        backend.script_workload_pid(vec![Some(777)]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        clock.set_on_sleep(1, flag.clone());
+        let probe = MockProcessProbe::always_alive();
+        // cfg_reap has panik_file: None.
+        let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
+
+        assert_eq!(report.reap, ReapStatus::OrphanSurvives);
+        assert!(
+            !backend.calls().contains(&"rm_all".to_string()),
+            "handle stays intact; calls: {:?}",
+            backend.calls()
+        );
+    }
+
+    /// Direct test of the graceful helper: a workload reported gone on
+    /// the first identity poll yields `ConfirmedGone` and writes the
+    /// sentinel exactly once. Isolated from the reap-read-count
+    /// bookkeeping of the run-boundary tests.
+    #[test]
+    fn graceful_helper_writes_sentinel_once_and_confirms_gone_when_pid_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let panik_file = dir.path().join(".dynrunner-reaper.panik");
+        let clock = FakeClock::new();
+        // start_time None ⇒ is_same_process false ⇒ "gone" on first poll.
+        let probe = MockProcessProbe::reap_start_times(vec![None]);
+        let cfg = cfg_reap_with_panik(panik_file.clone());
+
+        let mut writes = 0u32;
+        let status = graceful_panik_file_attempt(
+            &probe,
+            &clock,
+            &cfg,
+            Some((4242, Some(MOCK_WORKLOAD_START))),
+            &mut |m| {
+                if m.contains("wrote panik sentinel") {
+                    writes += 1;
+                }
+            },
+        );
+
+        assert_eq!(status, ReapStatus::ConfirmedGone);
+        assert_eq!(writes, 1, "sentinel must be written exactly once");
+        assert!(panik_file.exists(), "sentinel file must exist on disk");
+        assert!(
+            probe.signals_sent().is_empty(),
+            "the graceful helper must never signal; got {:?}",
+            probe.signals_sent()
+        );
+    }
+
+    /// Direct test of the graceful helper: `panik_file == None` ⇒ no
+    /// write, returns `OrphanSurvives` unchanged.
+    #[test]
+    fn graceful_helper_noop_when_panik_file_unset() {
+        let clock = FakeClock::new();
+        let probe = MockProcessProbe::always_alive();
+        let cfg = cfg_reap(); // panik_file: None
+        let mut writes = 0u32;
+        let status = graceful_panik_file_attempt(
+            &probe,
+            &clock,
+            &cfg,
+            Some((4242, Some(MOCK_WORKLOAD_START))),
+            &mut |m| {
+                if m.contains("wrote panik sentinel") {
+                    writes += 1;
+                }
+            },
+        );
+        assert_eq!(status, ReapStatus::OrphanSurvives);
+        assert_eq!(writes, 0, "no sentinel write when --panik-file is unset");
     }
 }

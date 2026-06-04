@@ -124,6 +124,7 @@ fn run_with_config(cfg: Config) -> ExitCode {
         secondary_grace: cfg.secondary_grace,
         container_stop_grace: cfg.container_stop_grace,
         wrapper_pid: cfg.wrapper_pid,
+        panik_file: cfg.panik_file.clone(),
     };
     if let Some(p) = cfg.wrapper_pid {
         log(&format!("wrapper-monitor enabled; watching pid {}", p));

@@ -55,6 +55,16 @@ fn manager_args(layout: &Layout, bins: &ResolvedBins, wrapper_pid: u32) -> Vec<S
         bins.podman.clone(),
         "--rm-path".to_string(),
         bins.rm.clone(),
+        // HOST side of the reaper-panik sentinel. The reaper writes this
+        // file as a graceful last resort when its direct PID-reap cannot
+        // confirm the workload dead; it appears at the mirrored container
+        // path (`podman_run.rs` mounts `<log_tmp>:/app/log-tmp` and injects
+        // the matching in-container `--panik-file`), so the secondary's
+        // own panik watcher sees it and shuts down gracefully. Derived
+        // from `layout.log_tmp` so host and container sides share one
+        // source of truth.
+        "--panik-file".to_string(),
+        layout.reaper_panik_host_path().display().to_string(),
     ]
 }
 
@@ -316,6 +326,8 @@ mod tests {
             "/run/current-system/sw/bin/podman",
             "--rm-path",
             "/run/current-system/sw/bin/rm",
+            "--panik-file",
+            "/tmp/asm-abc123/log/.dynrunner-reaper.panik",
         ];
         assert_eq!(got, expected);
     }
@@ -353,6 +365,8 @@ mod tests {
             "/run/current-system/sw/bin/podman",
             "--rm-path",
             "/run/current-system/sw/bin/rm",
+            "--panik-file",
+            "/tmp/asm-abc123/log/.dynrunner-reaper.panik",
         ];
         assert_eq!(got, expected);
     }
@@ -383,6 +397,8 @@ mod tests {
             "/run/current-system/sw/bin/podman",
             "--rm-path",
             "/run/current-system/sw/bin/rm",
+            "--panik-file",
+            "/tmp/asm-abc123/log/.dynrunner-reaper.panik",
         ];
         assert_eq!(got, expected);
     }

@@ -4,7 +4,7 @@
 //! capability). Phase 1 (1H) fills bodies.
 
 use crate::bin_resolve::ResolvedBins;
-use crate::dirs::Layout;
+use crate::dirs::{reaper_panik_container_path, Layout, LOG_TMP_CONTAINER_PATH};
 use crate::network::PeerIps;
 use dynrunner_slurm_wrapper_config::WrapperConfig;
 
@@ -110,7 +110,7 @@ pub fn build_run_argv(
     argv.push("-v".to_string());
     argv.push(format!("{}:/app/out-tmp", layout.out_tmp.display()));
     argv.push("-v".to_string());
-    argv.push(format!("{}:/app/log-tmp", layout.log_tmp.display()));
+    argv.push(format!("{}:{}", layout.log_tmp.display(), LOG_TMP_CONTAINER_PATH));
     argv.push("-v".to_string());
     argv.push(format!(
         "{}:{}:ro",
@@ -154,6 +154,17 @@ pub fn build_run_argv(
     argv.push(format!("--max-memory={}", cfg.max_memory_spec));
     argv.push(format!("--src-network={SRC_NETWORK_CONTAINER_PATH}"));
     argv.push("--log-dir=/app/log-network".to_string());
+    // Framework-owned reaper-panik sentinel. The host-side
+    // shutdown-manager writes this exact file (its host path, via
+    // `--panik-file` on the reaper) as a graceful last resort when its
+    // direct PID-reap cannot confirm the workload dead; this `--panik-file`
+    // makes the secondary's in-container watcher poll the SAME file
+    // across the `log_tmp` bind mount, so it sees the sentinel appear and
+    // runs its own graceful shutdown. Prepended to any operator
+    // `--panik-file` paths the dispatcher forwards below — the
+    // watcher races all of them (first match wins).
+    argv.push("--panik-file".to_string());
+    argv.push(reaper_panik_container_path());
     // mem-manager-reserved — generate.rs:748-751 (omitted when None).
     if let Some(b) = cfg.mem_manager_reserved_bytes {
         argv.push(format!("--mem-manager-reserved={b}"));
@@ -319,6 +330,8 @@ mod tests {
             "--max-memory=-2G",
             "--src-network=/app/src-network",
             "--log-dir=/app/log-network",
+            "--panik-file",
+            "/app/log-tmp/.dynrunner-reaper.panik",
             "--mem-manager-reserved=524288000",
             "--platform",
             "x86",
@@ -402,6 +415,8 @@ mod tests {
             "--max-memory=-2G",
             "--src-network=/app/src-network",
             "--log-dir=/app/log-network",
+            "--panik-file",
+            "/app/log-tmp/.dynrunner-reaper.panik",
         ]
         .into_iter()
         .map(String::from)
