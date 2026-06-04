@@ -88,6 +88,17 @@ pub fn build_run_argv(
         "PRIMARY_NODE_IPV6={}",
         peer_ips.ipv6.clone().unwrap_or_default()
     ));
+    // Persist this container's framework runner log on the gateway-shared
+    // `--log-dir` mount. The container sees the mount at `/app/log-network`
+    // (the `-v {log_network}:/app/log-network` volume below); the per-node
+    // subdir keys it by `secondary_id` so the relocated/co-located primary
+    // and each secondary write to distinct, host-readable files. logging.rs
+    // composes the per-role filenames under this dir.
+    argv.push("-e".to_string());
+    argv.push(format!(
+        "DYNRUNNER_FULL_LOG_DIR=/app/log-network/{}",
+        cfg.secondary_id
+    ));
     if cfg.dynrunner_network_dir.is_some() {
         argv.push("-e".to_string());
         argv.push("DYNRUNNER_NETWORK=/app/dynrunner-network".to_string());
@@ -273,6 +284,8 @@ mod tests {
             "-e",
             "PRIMARY_NODE_IPV6=fe80::1",
             "-e",
+            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
+            "-e",
             "DYNRUNNER_NETWORK=/app/dynrunner-network",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
@@ -359,6 +372,8 @@ mod tests {
             "PRIMARY_NODE_IPV4=",
             "-e",
             "PRIMARY_NODE_IPV6=",
+            "-e",
+            "DYNRUNNER_FULL_LOG_DIR=/app/log-network/sec-0",
             "-v",
             "/tmp/asm-2f1d4e89/src:/app/src-tmp",
             "-v",

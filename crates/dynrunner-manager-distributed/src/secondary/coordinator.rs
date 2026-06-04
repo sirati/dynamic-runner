@@ -14,6 +14,7 @@ use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tracing::Instrument;
 
 use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
@@ -1072,19 +1073,38 @@ where
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
-        let result = self.run_until_setup_or_done_inner(factory).await;
-        // SetupPending is a re-entrant yield, not a terminal exit;
-        // the dispatcher must stay alive across the boundary so the
-        // next `run_until_setup_or_done` re-entry inherits it.
-        // Match on the borrow to keep the result move-back intact.
-        let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
-        if cleanup {
-            self.cleanup_lifecycle_dispatcher().await;
-            // Independent of `cleanup_lifecycle_dispatcher`; same
-            // Done/Err vs. SetupPending discipline as documented above.
-            self.cleanup_task_completed_dispatcher().await;
+        // Role-tag the whole secondary run future so every event this task
+        // emits is attributed to the secondary role and routed to the
+        // per-role full log. This is the single entry all production
+        // secondary paths flow through (the legacy `run` wrapper delegates
+        // here), so one span here covers them all — including the events
+        // emitted on a `SetupPending` re-entry. A secondary that never
+        // promotes only ever carries this span → `secondary.log`; a peer
+        // that activates a co-located primary spawns a SEPARATE task whose
+        // own primary span keeps that authority's events in `primary.log`.
+        // See `dynrunner_core::role_span`.
+        let span = tracing::info_span!(
+            dynrunner_core::SECONDARY_ROLE_SPAN,
+            kind = "secondary",
+            id = %self.config.secondary_id
+        );
+        async {
+            let result = self.run_until_setup_or_done_inner(factory).await;
+            // SetupPending is a re-entrant yield, not a terminal exit;
+            // the dispatcher must stay alive across the boundary so the
+            // next `run_until_setup_or_done` re-entry inherits it.
+            // Match on the borrow to keep the result move-back intact.
+            let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
+            if cleanup {
+                self.cleanup_lifecycle_dispatcher().await;
+                // Independent of `cleanup_lifecycle_dispatcher`; same
+                // Done/Err vs. SetupPending discipline as documented above.
+                self.cleanup_task_completed_dispatcher().await;
+            }
+            result
         }
-        result
+        .instrument(span)
+        .await
     }
 
     /// Original `run_until_setup_or_done` body, factored out so the
@@ -1112,10 +1132,16 @@ where
         // run loop would leave the dispatcher blocked on its input
         // channel forever (the sender on `cluster_state` is still
         // alive as long as the coordinator object is).
+        // Propagate the secondary role span (current here, inside the
+        // instrumented `run_until_setup_or_done` future) into the spawned
+        // dispatcher tasks so the events THEY emit are attributed to the
+        // secondary role too. `spawn_local` otherwise detaches the span
+        // context. See `dynrunner_core::role_span`.
         if let Some(rx) = self.lifecycle_rx.take() {
             let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
             let handle = tokio::task::spawn_local(
-                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
+                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
             );
             self.lifecycle_dispatcher_handle = Some(handle);
         }
@@ -1126,7 +1152,8 @@ where
         if let Some(rx) = self.task_completed_rx.take() {
             let listeners = std::mem::take(&mut self.task_completed_listeners);
             let handle = tokio::task::spawn_local(
-                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
+                crate::task_completed::run_task_completed_dispatcher(rx, listeners)
+                    .instrument(tracing::Span::current()),
             );
             self.task_completed_dispatcher_handle = Some(handle);
         }
