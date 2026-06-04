@@ -85,12 +85,12 @@
 //! - `I`: the cluster [`Identifier`] — required by `WorkerPool<M, I>`,
 //!   `PendingFirstBind<I>`, and the queued `DistributedMessage<I>`.
 //!
-//! The plan's migration sketch wrote a single `<I>`; the binding rule is
-//! "mirror the real field types, never invent a placeholder where a real
-//! type exists", and the real `pool` type forces `M` in as well, so the
-//! machine is parameterized over both. The coordinator's other two
-//! generics (`Tr` transport, `S` scheduler, `E` estimator) are NOT needed:
-//! none of the fields migrated into a state is typed over them.
+//! The binding rule is "mirror the real field types, never invent a
+//! placeholder where a real type exists": the carried `pool` is a real
+//! [`WorkerPool<M, I>`], which forces `M` in alongside `I`, so the machine
+//! is parameterized over both. The coordinator's other generics (`Tr`
+//! transport, `S` scheduler, `E` estimator) are NOT needed: no field
+//! carried by a state is typed over them.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -226,10 +226,9 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
 /// Carries the worker pool (spawned on entry to this state) plus the
 /// setup-discovery flags the configuration phase reads. The pre-staged /
 /// file-based / discovery-done flags are *carried forward* into
-/// [`OperationalState`] when configuration completes (they are
-/// "Configuring → Operational data" in the plan's migration map), so the
-/// resolver and the `SetupPending` discriminator keep their values across
-/// the `enter_operational()` boundary.
+/// [`OperationalState`] when configuration completes, so the resolver and
+/// the `SetupPending` discriminator keep their values across the
+/// `enter_operational()` boundary.
 pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifier> {
     /// The local worker pool, built by `initialize_workers` on entry to
     /// this state. Real [`WorkerPool<M, I>`] — there is no pool in any
