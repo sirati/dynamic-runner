@@ -435,6 +435,140 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
     .expect("the observer must terminate via the silence backstop, NOT hang");
 }
 
+/// The operator's run narration is emitted by the OBSERVER process
+/// reading the CRDT: `run_as_observer` itself produces the
+/// IMPORTANT_TARGET narrative (phase started/complete transitions plus a
+/// single one-shot completion summary) from the replicated `ClusterState`
+/// before it returns on `run_complete()`. The narrative is driven purely
+/// from the CRDT mirror, so it is independent of which node holds the
+/// primary — exactly the property that matters after a relocation moves
+/// the primary to a different process.
+///
+/// The CRDT is pre-driven through a two-phase chain (`build` → `compile`)
+/// with mixed outcomes (2 succeeded, 1 failed-final) and `RunComplete`
+/// already applied, exactly the shape an observer's mirror holds when the
+/// relocated primary's broadcasts have all landed. With `run_complete()`
+/// true the loop emits the full narrative on its first iteration and then
+/// returns Ok.
+#[tokio::test(flavor = "current_thread")]
+async fn run_as_observer_narrates_phases_and_one_completion_summary() {
+    use crate::test_capture::{ImportantCapture, important_only};
+    use dynrunner_core::PhaseId;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// A `make_binary` re-tagged with an explicit phase + task_id.
+    fn phased(phase: &str, id: &str) -> TaskInfo<TestId> {
+        let mut t = make_binary(id, 100);
+        t.phase_id = PhaseId::from(phase);
+        t.task_id = id.to_string();
+        t
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _ends) = coordinator_with_confirmed_peers(1);
+
+            // Two-phase chain: compile depends on build. build has one
+            // (completed) task; compile has two (one completed, one
+            // failed-final). All terminal ⇒ both phases dispatchable AND
+            // complete; mixed outcomes ⇒ succeeded=2, fail_final=1.
+            let toolchain = phased("build", "toolchain");
+            let ok = phased("compile", "ok");
+            let bad = phased("compile", "bad");
+            {
+                let cs = coordinator.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(
+                        PhaseId::from("compile"),
+                        vec![PhaseId::from("build")],
+                    )]),
+                });
+                for b in [&toolchain, &ok, &bad] {
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: compute_task_hash(b),
+                        task: b.clone(),
+                    });
+                }
+                for b in [&toolchain, &ok] {
+                    cs.apply(ClusterMutation::TaskCompleted {
+                        hash: compute_task_hash(b),
+                        result_data: None,
+                    });
+                }
+                cs.apply(ClusterMutation::TaskFailed {
+                    hash: compute_task_hash(&bad),
+                    kind: ErrorType::NonRecoverable,
+                    error: "boom".into(),
+                });
+                // The authoritative primary declared the run over.
+                cs.apply(ClusterMutation::RunComplete);
+            }
+
+            // Capture importance-target events, held across the `.await`
+            // via `set_default` (current_thread + LocalSet keep the
+            // observer loop on this thread). See
+            // `phase_ordering.rs::connected_event_precedes_first_phase_start…`.
+            let capture = ImportantCapture::default();
+            let subscriber =
+                Registry::default().with(capture.clone().with_filter(important_only()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            coordinator
+                .run_as_observer()
+                .await
+                .expect("observer tail returns Ok on run_complete");
+
+            let events = capture.events();
+
+            // Both phases narrated as started AND complete.
+            let started: std::collections::HashSet<&str> = events
+                .iter()
+                .filter(|e| e.message.contains("starting job phase"))
+                .filter_map(|e| e.fields.get("phase").map(String::as_str))
+                .collect();
+            assert_eq!(
+                started,
+                std::collections::HashSet::from(["build", "compile"]),
+                "the observer must narrate both phases starting: {events:?}"
+            );
+            let done: std::collections::HashSet<&str> = events
+                .iter()
+                .filter(|e| e.message.contains("phase complete"))
+                .filter_map(|e| e.fields.get("phase").map(String::as_str))
+                .collect();
+            assert_eq!(
+                done,
+                std::collections::HashSet::from(["build", "compile"]),
+                "the observer must narrate both phases completing: {events:?}"
+            );
+
+            // Exactly one completion summary, with the correct partition.
+            let summary: Vec<_> = events
+                .iter()
+                .filter(|e| e.message.contains("run complete"))
+                .collect();
+            assert_eq!(
+                summary.len(),
+                1,
+                "exactly one run-complete summary from the observer: {events:?}"
+            );
+            assert_eq!(
+                summary[0].fields.get("succeeded").map(String::as_str),
+                Some("2"),
+                "summary succeeded count: {events:?}"
+            );
+            assert_eq!(
+                summary[0].fields.get("fail_final").map(String::as_str),
+                Some("1"),
+                "summary fail_final count: {events:?}"
+            );
+        })
+        .await;
+}
+
 /// A LEGITIMATE FAILOVER must NOT trip the silence backstop. The
 /// relocated primary dies, a surviving secondary re-elects (a
 /// `PrimaryChanged` to the new primary), and the new primary emits

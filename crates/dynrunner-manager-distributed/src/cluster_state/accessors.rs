@@ -13,7 +13,7 @@ use std::sync::Arc;
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
 use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
-use super::{ClusterState, OutcomeSummary, StateCounts, TaskState};
+use super::{ClusterState, OutcomeSummary, PhaseRollup, StateCounts, TaskState};
 
 impl<I: Identifier> ClusterState<I> {
     pub fn task_state(&self, hash: &str) -> Option<&TaskState<I>> {
@@ -201,6 +201,75 @@ impl<I: Identifier> ClusterState<I> {
 
     pub fn phase_deps(&self) -> &HashMap<PhaseId, Vec<PhaseId>> {
         &self.phase_deps
+    }
+
+    /// Per-phase derived view recomputed from the CRDT: for every phase
+    /// that owns at least one task, the [`PhaseRollup`] of `has_any`,
+    /// `has_live`, and `dispatchable`.
+    ///
+    /// # Single source of the phase state machine
+    ///
+    /// This is the no-duplication seam for "is this phase started /
+    /// done / dispatchable". An observer holds NO `PendingPool` — it
+    /// carries only the replicated `ClusterState` — so the pool's
+    /// pool-state reads are RECOMPUTED here from the ledger: the
+    /// per-task terminal set, the per-phase live bit, and the static
+    /// `phase_deps` graph. The recomputation mirrors the pool's own
+    /// resolution rule (a dep is satisfied once its prereq is terminal;
+    /// a phase is dispatchable once every phase it depends on has fully
+    /// terminated) so the pool view and the CRDT view converge.
+    ///
+    /// Both the operator run-narrator (`crate::run_narrator`, this
+    /// crate) and the pyo3 stats snapshot
+    /// (`StatsSnapshot::from_cluster_state`, the leaf `dynrunner-pyo3`
+    /// crate) read this rather than each re-deriving the terminal-set +
+    /// dispatchability walk.
+    ///
+    /// `O(n)` over the ledger (a single pass to build the live/any maps)
+    /// plus a depth-bounded dep walk per phase; not hot-path code (the
+    /// callers run on completion / on a multi-minute cadence). The dep
+    /// walk is bounded by the dep graph, which `PendingPool::new` already
+    /// cycle-rejects, so it terminates.
+    pub fn phase_rollups(&self) -> HashMap<&PhaseId, PhaseRollup> {
+        // Phase → (has any task, has any live task). Built in one pass
+        // over the ledger. A phase absent from the map owns no tasks
+        // (vacuously not-live / not-present).
+        let mut base: HashMap<&PhaseId, (bool, bool)> = HashMap::new();
+        for st in self.tasks.values() {
+            let task = match st {
+                TaskState::Pending { task }
+                | TaskState::InFlight { task, .. }
+                | TaskState::Completed { task }
+                | TaskState::Failed { task, .. }
+                | TaskState::Unfulfillable { task, .. }
+                | TaskState::InvalidTask { task, .. }
+                | TaskState::Blocked { task, .. } => task,
+            };
+            let entry = base.entry(&task.phase_id).or_insert((false, false));
+            entry.0 = true;
+            if !st.is_terminal() {
+                entry.1 = true;
+            }
+        }
+
+        // `phase_dispatchable` consults the per-phase live bit; project
+        // it once for the dep walk. A phase absent here is vacuously
+        // satisfied (`false`).
+        let phase_has_live: HashMap<&PhaseId, bool> =
+            base.iter().map(|(p, (_, live))| (*p, *live)).collect();
+
+        base.iter()
+            .map(|(&phase, &(has_any, has_live))| {
+                (
+                    phase,
+                    PhaseRollup {
+                        has_any,
+                        has_live,
+                        dispatchable: phase_dispatchable(phase, &self.phase_deps, &phase_has_live),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Borrow the replicated per-peer holdings map. Each entry is
@@ -400,4 +469,34 @@ impl<I: Identifier> ClusterState<I> {
             .map(|c| u64::from(c.worker_count))
             .sum()
     }
+}
+
+/// A phase is dispatchable iff every phase it depends on (transitively)
+/// has no live (non-terminal) task. Mirrors the pool's activation
+/// cascade: a phase activates once its dependency phases are Done, and a
+/// phase reaches Done once its tasks have all terminated.
+///
+/// `phase_has_live` is consulted as the per-phase "any live task"
+/// predicate; a phase absent from the map (no entries) is vacuously
+/// satisfied (`false`). The walk is depth-bounded by the dep graph,
+/// which `PendingPool::new` already cycle-rejects, so it terminates.
+fn phase_dispatchable(
+    phase: &PhaseId,
+    phase_deps: &HashMap<PhaseId, Vec<PhaseId>>,
+    phase_has_live: &HashMap<&PhaseId, bool>,
+) -> bool {
+    let mut stack: Vec<&PhaseId> = phase_deps.get(phase).into_iter().flatten().collect();
+    let mut seen: HashSet<&PhaseId> = HashSet::new();
+    while let Some(dep) = stack.pop() {
+        if !seen.insert(dep) {
+            continue;
+        }
+        if phase_has_live.get(dep).copied().unwrap_or(false) {
+            return false;
+        }
+        if let Some(parents) = phase_deps.get(dep) {
+            stack.extend(parents.iter());
+        }
+    }
+    true
 }

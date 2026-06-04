@@ -2948,7 +2948,21 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let mut fleet_dead_poll = tokio::time::interval(self.config.fleet_dead_timeout);
         fleet_dead_poll.tick().await;
 
+        // Operator run-narration over the replicated CRDT. After this
+        // bootstrap relocation the operator's process IS this observer, so
+        // the run narrative (phase started / complete, the one-shot
+        // run-complete-or-aborted summary) must be emitted HERE — reading
+        // the replicated `cluster_state` directly — rather than by the new
+        // primary on a different node's stdout. The narrator is a pure,
+        // idempotent differ; `observe()` is called at the TOP of every
+        // iteration BEFORE the `run_complete()` early-return below, so the
+        // iteration that detects completion emits the summary before the
+        // loop returns.
+        let mut narrator = crate::run_narrator::RunNarrator::new();
+
         loop {
+            narrator.observe(&self.cluster_state);
+
             // Happy-path exit: the authoritative primary declared the run
             // over (sticky monotonic flag). Checked first so a RunComplete
             // applied before this loop even entered returns immediately.
