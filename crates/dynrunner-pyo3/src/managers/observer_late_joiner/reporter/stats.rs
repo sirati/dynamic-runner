@@ -13,15 +13,19 @@
 //! An observer holds NO `PendingPool` — it carries only the replicated
 //! `ClusterState`. So "waiting-on-deps" and "ready-in-queue", which on
 //! the primary are pool-state reads, are RECOMPUTED here from the CRDT:
-//! the `Pending` task set, each task's `task_depends_on`, and the
-//! static phase-dependency graph (`phase_deps`). The recomputation
-//! mirrors the pool's own resolution rule (a dep is satisfied once its
-//! prereq is terminal; a phase is dispatchable once every phase it
-//! depends on has fully terminated) so the two views converge.
+//! the `Pending` task set and each task's `task_depends_on` for the
+//! per-task dep check, and the per-phase dispatchability read off
+//! [`ClusterState::phase_rollups`] — the single owning accessor in
+//! `dynrunner-manager-distributed` that encodes the phase state machine
+//! (a phase is dispatchable once every phase it depends on has fully
+//! terminated). Reading the rollup keeps this file from re-deriving the
+//! dispatchability walk; the per-task dep resolution (a dep is satisfied
+//! once its prereq is terminal) stays here because it is a TASK-level,
+//! not phase-level, predicate.
 
 use std::collections::{HashMap, HashSet};
 
-use dynrunner_core::{Identifier, PhaseId};
+use dynrunner_core::Identifier;
 use dynrunner_manager_distributed::{ClusterState, TaskState};
 
 /// One flat projection of the CRDT at an instant. Every field is a
@@ -121,7 +125,7 @@ impl StatsSnapshot {
         // unsatisfied).
         let mut terminal_task_ids: HashSet<&str> = HashSet::new();
         for (_, st) in state.tasks_iter() {
-            if is_terminal(st) {
+            if st.is_terminal() {
                 let id = task_id_of(st);
                 if !id.is_empty() {
                     terminal_task_ids.insert(id);
@@ -129,21 +133,13 @@ impl StatsSnapshot {
             }
         }
 
-        // Phase → has any non-terminal task? Drives the
-        // dispatchable-phase derivation below. A phase with no entries
-        // contributes `false` (treated as fully terminated / vacuously
-        // satisfiable) so a dependent of an empty upstream phase is not
-        // wedged forever.
-        let mut phase_has_live: HashMap<&PhaseId, bool> = HashMap::new();
-        for (_, st) in state.tasks_iter() {
-            let task = task_of(st);
-            let entry = phase_has_live.entry(&task.phase_id).or_insert(false);
-            if !is_terminal(st) {
-                *entry = true;
-            }
-        }
-
-        let phase_deps = state.phase_deps();
+        // Per-phase derived view (has_any / has_live / dispatchable),
+        // recomputed from the CRDT by the single owning accessor in
+        // `dynrunner-manager-distributed`. The `dispatchable` bit drives
+        // the ready-in-queue derivation below; reading it from the
+        // accessor removes the previously-duplicated `phase_has_live`
+        // loop + `phase_dispatchable` walk that this file used to carry.
+        let phase_rollups = state.phase_rollups();
 
         let mut waiting_on_deps = 0usize;
         let mut ready_in_queue = 0usize;
@@ -172,7 +168,10 @@ impl StatsSnapshot {
                         .all(|d| terminal_task_ids.contains(d.task_id.as_str()));
                     if !deps_satisfied {
                         waiting_on_deps += 1;
-                    } else if phase_dispatchable(&task.phase_id, phase_deps, &phase_has_live) {
+                    } else if phase_rollups
+                        .get(&task.phase_id)
+                        .is_some_and(|r| r.dispatchable)
+                    {
                         ready_in_queue += 1;
                     }
                     // else: deps satisfied but the phase is still gated
@@ -228,21 +227,6 @@ impl StatsSnapshot {
 // These helpers are reached only through `from_cluster_state`, the live
 // CRDT-projection feed (producer: `observer_late_joiner/run.rs`).
 
-/// True iff `state` is a terminal state for dependency-resolution
-/// purposes (the pool resolves a dep once its prereq is `Completed` OR
-/// permanently failed; in the CRDT the permanent-failure set is
-/// `Failed` ∪ `Unfulfillable` ∪ `InvalidTask`). `Blocked` is
-/// cascade-paused, not terminal.
-fn is_terminal<I>(state: &TaskState<I>) -> bool {
-    matches!(
-        state,
-        TaskState::Completed { .. }
-            | TaskState::Failed { .. }
-            | TaskState::Unfulfillable { .. }
-            | TaskState::InvalidTask { .. }
-    )
-}
-
 fn task_id_of<I>(state: &TaskState<I>) -> &str {
     task_of(state).task_id.as_str()
 }
@@ -257,34 +241,4 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
         | TaskState::Blocked { task, .. }
         | TaskState::InvalidTask { task, .. } => task,
     }
-}
-
-/// A phase is dispatchable iff every phase it depends on (transitively)
-/// has no live (non-terminal) task. Mirrors the pool's activation
-/// cascade: a phase activates once its dependency phases are Done, and
-/// a phase reaches Done once its tasks have all terminated.
-///
-/// `phase_has_live` is consulted as the per-phase "any live task"
-/// predicate; a phase absent from the map (no entries) is vacuously
-/// satisfied (`false`). The walk is depth-bounded by the dep graph,
-/// which `PendingPool::new` already cycle-rejects, so this terminates.
-fn phase_dispatchable(
-    phase: &PhaseId,
-    phase_deps: &HashMap<PhaseId, Vec<PhaseId>>,
-    phase_has_live: &HashMap<&PhaseId, bool>,
-) -> bool {
-    let mut stack: Vec<&PhaseId> = phase_deps.get(phase).into_iter().flatten().collect();
-    let mut seen: HashSet<&PhaseId> = HashSet::new();
-    while let Some(dep) = stack.pop() {
-        if !seen.insert(dep) {
-            continue;
-        }
-        if phase_has_live.get(dep).copied().unwrap_or(false) {
-            return false;
-        }
-        if let Some(parents) = phase_deps.get(dep) {
-            stack.extend(parents.iter());
-        }
-    }
-    true
 }

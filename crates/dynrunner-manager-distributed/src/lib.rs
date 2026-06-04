@@ -5,6 +5,7 @@ pub mod observer;
 pub mod panik_watcher;
 pub mod peer_lifecycle;
 pub mod primary;
+pub(crate) mod run_narrator;
 pub mod secondary;
 pub mod state;
 pub mod task_completed;
@@ -24,7 +25,7 @@ pub use secondary::{
 pub use zip_extract::compute_file_hash;
 // Re-export transport traits from the comm API crate for convenience.
 pub use cluster_state::{
-    ApplyOutcome, ClusterState, OutcomeSummary, RoleChangeHook, StateCounts, TaskState,
+    ApplyOutcome, ClusterState, OutcomeSummary, PhaseRollup, RoleChangeHook, StateCounts, TaskState,
 };
 pub use dynrunner_protocol_primary_secondary::SecondaryTransport;
 pub use message_router::{MessageRouter, RoutedMessage};
