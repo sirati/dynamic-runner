@@ -19,9 +19,10 @@
 //! container/process tree leaked.
 //!
 //! This drives the production path end-to-end: real setup handshake →
-//! `Configuring → Operational` (which moves the loopback receiver into
-//! `OperationalState`) → first `process_tasks` yields `SetupPending` →
-//! discovery ingest → re-entry → `RunComplete` delivered ON THE LOOPBACK →
+//! `Configuring → Operational` → first `process_tasks` seeds the loopback
+//! receiver from the coordinator slot into `OperationalState` and yields
+//! `SetupPending` → discovery ingest → re-entry re-attaches it from
+//! `OperationalState` → `RunComplete` delivered ON THE LOOPBACK →
 //! the loop breaks and reaches terminal `Done`. The mesh transport is kept
 //! open throughout (the fake primary holds its sender and never closes the
 //! channel), so the ONLY way the loop can terminate is the loopback
@@ -181,9 +182,10 @@ async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry
 
             let mut factory = FakeWorkerFactory;
 
-            // First entry: real setup → `Configuring → Operational` (moves
-            // the loopback receiver into `OperationalState`) → the empty
-            // pre-staged ledger makes `process_tasks` yield `SetupPending`.
+            // First entry: real setup → `Configuring → Operational`; the
+            // `process_tasks` take-site seeds the loopback receiver from the
+            // coordinator slot into `OperationalState` → the empty pre-staged
+            // ledger makes `process_tasks` yield `SetupPending`.
             let first = secondary
                 .run_until_setup_or_done(&mut factory)
                 .await

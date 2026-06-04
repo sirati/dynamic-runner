@@ -349,9 +349,11 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// find `None`, the loopback arm would park on `pending()` forever, and
     /// the promoted secondary would never observe `RunComplete` (per-run
     /// container/process leak). Seeded from the coordinator's
-    /// `colocated_loopback_inbound_rx` slot at the `enter_operational`
-    /// boundary; `None` on every non-co-located path (the drain arm parks on
-    /// `pending()`) and for the pure-observer construction.
+    /// `colocated_loopback_inbound_rx` slot at the `process_tasks`
+    /// loop-local-take site (`coordinator-slot, else OperationalState`),
+    /// the same single idiom as `panik_signal_rx`; `None` on every
+    /// non-co-located path (the drain arm parks on `pending()`) and for the
+    /// pure-observer construction.
     pub(in crate::secondary) colocated_loopback_inbound_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 
@@ -381,7 +383,9 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// (the watcher's oneshot cannot reach the dead arm) — graceful
     /// shutdown is lost and teardown falls back to the kernel `SIGKILL`.
     /// Seeded from the coordinator's `panik_signal_rx` slot at the
-    /// `enter_operational` boundary; `None` when no panik paths were set
+    /// `process_tasks` loop-local-take site
+    /// (`coordinator-slot, else OperationalState`), the same single idiom as
+    /// `colocated_loopback_inbound_rx`; `None` when no panik paths were set
     /// (the arm parks on `pending()`) and for the pure-observer
     /// construction.
     pub(in crate::secondary) panik_signal_rx:
@@ -651,24 +655,19 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// called from any non-`Configuring` variant: the transition is only
     /// valid out of `Configuring`.
     ///
-    /// `colocated_loopback_inbound_rx` is the resumable per-run loopback
-    /// receiver (the coordinator's `colocated_loopback_inbound_rx.take()`):
-    /// it moves **into** [`OperationalState`] here on the first
-    /// (`Configuring`) entry, and is preserved across a `SetupPending`
-    /// re-entry (which hits the no-op `Operational` arm with a `None`
-    /// argument, leaving the already-attached receiver untouched). Unlike
-    /// the fire-once [`OperationalLatches`], it must survive re-entry — see
-    /// [`OperationalState::colocated_loopback_inbound_rx`].
-    ///
-    /// `OperationalState::panik_signal_rx` — the OTHER resumable
-    /// terminal-signal receiver — is NOT seeded here: it starts `None` on
-    /// this construction and is seeded from the coordinator slot at the
-    /// `process_tasks` loop-local-take site (with a fallback to the restored
-    /// `OperationalState` value on re-entry). That single take site, rather
-    /// than this transition, is its seed/restore home because panik is also
-    /// registered on the observer's already-`Operational` path (which never
-    /// reaches this `Configuring` arm), so seeding it only here would drop
-    /// the observer's receiver. See [`OperationalState::panik_signal_rx`].
+    /// The two resumable terminal-signal receivers
+    /// ([`OperationalState::colocated_loopback_inbound_rx`] and
+    /// [`OperationalState::panik_signal_rx`]) are NOT seeded here: both start
+    /// `None` on this construction and are seeded from their coordinator slots
+    /// at the `process_tasks` loop-local-take site (with a fallback to the
+    /// restored `OperationalState` value on re-entry). That single take site,
+    /// rather than this transition, is the seed/restore home for both because
+    /// panik is also registered on the observer's already-`Operational` path
+    /// (which never reaches this `Configuring` arm), so seeding it only here
+    /// would drop the observer's receiver — and sourcing the loopback the same
+    /// way keeps ONE idiom for both. Unlike the fire-once
+    /// [`OperationalLatches`], both must survive re-entry — see the take site
+    /// and the matching `OperationalState` fields.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::secondary) fn enter_operational(
         self,
@@ -680,9 +679,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
         pending_worker_restarts: HashSet<WorkerId>,
         pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-        colocated_loopback_inbound_rx: Option<
-            tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>,
-        >,
     ) -> (Self, OperationalLatches<I>) {
         match self {
             SecondaryLifecycle::Configuring(cfg) => {
@@ -709,20 +705,20 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done,
-                    colocated_loopback_inbound_rx,
-                    // `panik_signal_rx` starts `None` on the lifecycle: the
-                    // live receiver is held on the coordinator slot until the
-                    // `process_tasks` loop-local-take site seeds it (see
+                    // Both resumable terminal-signal receivers start `None` on
+                    // the lifecycle: the live receiver is held on its
+                    // coordinator slot until the `process_tasks`
+                    // loop-local-take site seeds it (see
+                    // [`OperationalState::colocated_loopback_inbound_rx`] /
                     // [`OperationalState::panik_signal_rx`]).
+                    colocated_loopback_inbound_rx: None,
                     panik_signal_rx: None,
                 }));
                 (next, latches)
             }
-            // Already `Operational` (a `SetupPending` re-entry, where the
-            // coordinator's loopback slot is now `None`): a no-op on the
-            // state, so the supplied `None` argument is simply dropped and
-            // the receiver already living in `OperationalState` (restored
-            // before the yield) is preserved.
+            // Already `Operational` (a `SetupPending` re-entry): a no-op on the
+            // state — the receivers already living in `OperationalState`
+            // (restored before the yield) are preserved.
             other => (other, latches),
         }
     }

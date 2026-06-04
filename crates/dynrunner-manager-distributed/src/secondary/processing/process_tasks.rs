@@ -81,17 +81,13 @@ where
         // second consumption.
         //   - loopback: on a promoted node the co-located primary's
         //     `RunComplete` reaches this loop only via the loopback (the mesh
-        //     never closes). Moved into `OperationalState` at
-        //     `enter_operational` (first entry only; the re-entry passes
-        //     `None` to the no-op `Operational` arm, preserving the receiver
-        //     restored before the prior yield).
+        //     never closes).
         //   - panik: a regular (non-observer) secondary registers panik AND
         //     can be the pre-staged discovery node, so a SIGTERM delivered
-        //     after the discovery yield must still be acted on. Seeded into a
-        //     loop-local below from the coordinator slot (with a fallback to
-        //     the restored `OperationalState` value on re-entry).
-        // Both are `take`-n into loop-locals below and restored to
-        // `OperationalState` before the `SetupPending` return.
+        //     after the discovery yield must still be acted on.
+        // Both are seeded into loop-locals below from ONE idiom (the
+        // coordinator slot, else the value restored to `OperationalState`) and
+        // restored to `OperationalState` before the `SetupPending` return.
         let latches = super::super::lifecycle::OperationalLatches {
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
@@ -114,11 +110,6 @@ where
             Vec::new(),
             std::collections::HashSet::new(),
             std::collections::HashMap::new(),
-            // First (`Configuring`) entry: hand the coordinator's loopback
-            // receiver into `OperationalState`. Re-entry: `None` (already
-            // consumed), and the no-op `Operational` arm preserves the
-            // receiver restored before the prior yield.
-            self.colocated_loopback_inbound_rx.take(),
         );
         self.lifecycle = lifecycle;
         let super::super::lifecycle::OperationalLatches {
@@ -126,27 +117,34 @@ where
             mut fatal_exit_signal_rx,
             on_cluster_state_refresh,
         } = latches;
-        // Take the resumable loopback receiver out of `OperationalState` into
-        // a loop-local for the `select!` drain arm. A loop-local is required
-        // here (it cannot be polled in-place off `OperationalState`) because
-        // the pool arm already holds a `&mut self.lifecycle` partial borrow
-        // for its own recv future; a second `&mut self.lifecycle` for the
-        // loopback arm would conflict. It is restored to `OperationalState`
-        // before the `SetupPending` return so re-entry re-attaches it.
-        let mut colocated_loopback_inbound_rx = self.op_mut().colocated_loopback_inbound_rx.take();
-        // Seed the resumable panik receiver into a loop-local for the panik
-        // `select!` arm. Same loop-local requirement as the loopback arm. The
-        // seed is `coordinator-slot, else OperationalState`:
+        // Seed each resumable terminal-signal receiver into a loop-local for
+        // its `select!` arm. A loop-local is required here (it cannot be
+        // polled in-place off `OperationalState`) because the pool arm already
+        // holds a `&mut self.lifecycle` partial borrow for its own recv
+        // future; a second `&mut self.lifecycle` for either drain arm would
+        // conflict. Both seed via ONE idiom — `coordinator-slot, else
+        // OperationalState`:
         //   - First entry (normal or observer): the live receiver is on the
-        //     coordinator slot (`register_panik_signal_rx`), `OperationalState`
-        //     is `None` → take the coordinator slot.
+        //     coordinator slot (`register_colocated_loopback_inbound` /
+        //     `register_panik_signal_rx`), `OperationalState` is `None` → take
+        //     the coordinator slot.
         //   - `SetupPending` re-entry: the coordinator slot is already `None`
         //     (taken on the first entry) → fall back to the value restored to
         //     `OperationalState` before the prior yield.
-        // It is restored to `OperationalState` before the `SetupPending`
-        // return (below) so re-entry re-attaches it — without that, a SIGTERM
-        // delivered after a pre-staged discovery yield would never reach the
-        // re-parked arm and graceful shutdown would fall back to `SIGKILL`.
+        // Each is restored to `OperationalState` before the `SetupPending`
+        // return (below) so re-entry re-attaches it. Without that:
+        //   - loopback: a promoted node loses the SOLE path to its own
+        //     primary's `RunComplete` and leaks the run.
+        //   - panik: a SIGTERM delivered after a pre-staged discovery yield
+        //     never reaches the re-parked arm and graceful shutdown falls back
+        //     to `SIGKILL`.
+        // The loopback receiver is registered only on the co-located
+        // (non-observer) path, so on an observer both seed sources are `None`
+        // and its arm parks on `pending()`.
+        let mut colocated_loopback_inbound_rx = self
+            .colocated_loopback_inbound_rx
+            .take()
+            .or_else(|| self.op_mut().colocated_loopback_inbound_rx.take());
         let mut panik_signal_rx = self
             .panik_signal_rx
             .take()
