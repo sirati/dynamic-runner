@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
-use super::super::wire::timestamp_now;
 use super::*;
 use std::time::Duration;
 
@@ -25,7 +24,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
     // obs-a is registered as a peer AND marked observer.
-    sec.op_mut().peer_keepalives.insert("obs-a".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("obs-a".into(), std::time::Instant::now());
     sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-a".into(),
         is_observer: true,
@@ -184,7 +183,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
         is_observer: true,
         can_be_primary: false,
     });
-    sec.op_mut().peer_keepalives.insert("obs-a".into(), timestamp_now());
+    sec.op_mut().peer_keepalives.insert("obs-a".into(), std::time::Instant::now());
     sec.record_primary_message();
 
     // (a) Role-table read sees the observer.

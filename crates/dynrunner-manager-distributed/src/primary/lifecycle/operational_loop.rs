@@ -112,6 +112,12 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         tracing::info!("entering operational loop");
 
         let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
+        // Skip (not Burst) missed ticks: a host suspend/resume would otherwise
+        // make the default Burst behaviour fire one catch-up heartbeat per
+        // missed interval all at once. Skip collapses the backlog to a single
+        // catch-up tick so the post-resume heartbeat sweep runs once, not in a
+        // storm.
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the immediate first tick — secondaries might not have sent
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;

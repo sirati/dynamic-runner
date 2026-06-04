@@ -321,6 +321,12 @@ pub enum DistributedMessage<I> {
         /// Echoes the `query_node_id` from the corresponding TimeoutQuery
         /// so concurrent queries can be matched up by the aggregator.
         query_node_id: String,
+        /// AGE in seconds since the responder last saw the queried node,
+        /// measured on the responder's own monotonic clock (NOT an absolute
+        /// wall-clock timestamp). `None` = the responder has never seen it.
+        /// Relative-age keying makes failover-quorum tallies immune to a
+        /// coordinated suspend/resume wall-clock jump — there is no cross-node
+        /// absolute-clock subtraction.
         last_keepalive: Option<f64>,
     },
     PromotionVote {

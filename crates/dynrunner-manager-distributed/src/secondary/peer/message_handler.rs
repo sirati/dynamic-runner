@@ -94,7 +94,6 @@ where
         match msg {
             DistributedMessage::Keepalive {
                 secondary_id,
-                timestamp,
                 active_workers,
                 emitter_role,
                 ..
@@ -140,9 +139,18 @@ where
                         }
                     }
                     KeepaliveRole::Secondary => {
+                        // Record LOCAL receipt-time monotonic `Instant`, NOT
+                        // the sender's wire wall-clock `timestamp`. Keying peer
+                        // liveness off when WE received the keepalive (mirroring
+                        // `primary_last_seen` / the primary's
+                        // `secondary_keepalives`) makes the peer-timeout sweep
+                        // immune to a coordinated suspend/resume wall-clock jump:
+                        // the next receipt resets the anchor (reset-on-receipt).
+                        // The wire `timestamp` field stays on the message for
+                        // diagnostics but drives no liveness decision.
                         self.op_mut()
                             .peer_keepalives
-                            .insert(secondary_id.clone(), timestamp);
+                            .insert(secondary_id.clone(), std::time::Instant::now());
                         tracing::trace!(
                             peer = %secondary_id,
                             active_workers,
@@ -219,8 +227,21 @@ where
                 sender_id,
                 ..
             } => {
-                // Respond with our last known keepalive for the queried node.
-                let last_keepalive = self.op_mut().peer_keepalives.get(&query_node_id).copied();
+                // Respond with how STALE our last keepalive of the queried
+                // node is — a monotonic AGE in seconds, NOT an absolute
+                // wall-clock timestamp. We hold the receipt-time `Instant`
+                // locally (process-private; cannot cross the wire), so we
+                // convert it to a relative age here. The querier compares that
+                // age against its death deadline without any cross-node
+                // wall-clock subtraction, so a coordinated suspend/resume can't
+                // make a fresh peer look stale (or vice-versa). `None` =
+                // "never seen", same "agrees the node is silent" meaning as
+                // before. See `TimeoutResponse::last_keepalive` doc.
+                let last_keepalive = self
+                    .op_mut()
+                    .peer_keepalives
+                    .get(&query_node_id)
+                    .map(|t| t.elapsed().as_secs_f64());
                 let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),

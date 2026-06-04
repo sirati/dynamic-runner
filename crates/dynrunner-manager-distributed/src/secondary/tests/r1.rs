@@ -130,10 +130,10 @@ async fn r1_promotion_on_no_route_count_axis() {
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
-        .insert("sec-b".into(), r1_helpers::timestamp_now());
+        .insert("sec-b".into(), std::time::Instant::now());
     sec.op_mut()
         .peer_keepalives
-        .insert("sec-c".into(), r1_helpers::timestamp_now());
+        .insert("sec-c".into(), std::time::Instant::now());
     // Post-uniform-announce a secondary knows the primary's identity
     // before it can suspect its death; the Suspecting `TimeoutQuery`
     // names it. Install it via the real apply path.
@@ -209,7 +209,7 @@ async fn r1_recover_on_primary_back() {
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
-        .insert("sec-b".into(), r1_helpers::timestamp_now());
+        .insert("sec-b".into(), std::time::Instant::now());
     sec.record_primary_message();
 
     // One no-route send opens the health window — a short flap.
@@ -320,10 +320,10 @@ async fn r1_no_mesh_rebuild_during_arming() {
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
-        .insert("sec-b".into(), r1_helpers::timestamp_now());
+        .insert("sec-b".into(), std::time::Instant::now());
     sec.op_mut()
         .peer_keepalives
-        .insert("sec-c".into(), r1_helpers::timestamp_now());
+        .insert("sec-c".into(), std::time::Instant::now());
     sec.record_primary_message();
 
     // Snapshot the peer-mesh view before arming so we can assert

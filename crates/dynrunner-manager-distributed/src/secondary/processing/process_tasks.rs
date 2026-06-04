@@ -107,6 +107,12 @@ where
         } = latches;
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
+        // Skip (not Burst) missed ticks: after a host suspend/resume the
+        // default Burst would fire one catch-up tick per missed interval,
+        // bursting a flurry of keepalives at once. Skip collapses the backlog
+        // to exactly one catch-up tick, so liveness resumes at the normal
+        // cadence instead of a post-resume storm.
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Decouple sample cadence (50ms, 20Hz) from decision cadence
         // (config-driven, default 100ms). Pre-extraction the decision
         // cadence was a hardcoded 100ms literal here; now it reads
