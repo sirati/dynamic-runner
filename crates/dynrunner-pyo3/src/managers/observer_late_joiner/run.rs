@@ -203,6 +203,13 @@ impl PyObserverLateJoiner {
                         oom_retry_max_passes: dist_oom_retry_max_passes,
                         primary_link_failure_threshold: dist_primary_link_failure_threshold,
                         primary_link_failure_window: dist_primary_link_failure_window,
+                        // Internal default (no operator kwarg for the
+                        // app-silence failover backstop); single source of
+                        // truth lives in the distributed crate. Inert for an
+                        // observer (its election tick is a no-op) but set for
+                        // config-shape completeness.
+                        primary_silence_backstop:
+                            dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                         unconfigured_deadline: dist_unconfigured_deadline,
                         is_observer: true,
                         // An observer can never host the primary role (no

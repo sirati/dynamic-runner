@@ -204,50 +204,80 @@ where
         let secondary_id = self.config.secondary_id.clone();
         let is_observer = self.config.is_observer;
 
-        let deadline = self
-            .config
-            .keepalive_interval
-            .saturating_mul(self.config.keepalive_miss_threshold);
-        // `primary_silent` is the SOLE liveness predicate for whoever
-        // currently holds the primary role — co-located OR a promoted
-        // peer. `primary_last_seen` is refreshed by
-        // `record_primary_message`, driven by the role-tagged recognition
-        // path in `handle_inbound`'s Keepalive arm: a `Primary`-tagged
-        // keepalive whose originator IS the current primary (resolved via
-        // `cluster_state.current_primary()`, the single source of "who is
-        // primary now") refreshes `primary_last_seen`. So a promoted peer's
-        // primary keepalives refresh it exactly like the co-located
-        // primary's dispatch traffic once did, and a genuinely-dead primary
-        // trips `primary_silent` once its primary keepalives stop — there is
-        // no longer a separate promoted-peer-primary liveness axis to track.
+        // Honest liveness — by SOURCE, not by a bare receive-staleness
+        // clock. The decision to suspect the primary and start a failover
+        // election is the OR of two predicates, each honest about a
+        // distinct death mode, so the secondary rides out a transient
+        // keepalive blip exactly as the primary side does (the QUIC layer
+        // keeps a quiet-but-live link up to `max_idle_timeout` ≈60s):
         //
-        // This subsumes the former cascade trigger (`primary_peer_silent`,
-        // which read the promoted primary's `peer_keepalives` entry): that
-        // branch is both REDUNDANT (the recognition path keeps
-        // `primary_last_seen` fresh via the Primary keepalive) and BROKEN
-        // (it would fire against a HEALTHY just-promoted primary and storm
-        // `TimeoutQuery`, risking double-promotion). The cascade
-        // (promoted-peer-died) case Dataset's K=2 run hit is covered by
-        // `primary_silent`. A co-located primary's Secondary keepalive DOES
-        // land in `peer_keepalives` (it is a live mesh peer), but that
-        // entry is excluded from quorum/candidate counts by `live_peer_ids`,
-        // so peer liveness and primary liveness stay cleanly separate.
+        //   (A) genuine-dead-link (fast): `primary_link.should_arm_failover()`.
+        //       The primary-link health window arms ONLY when a
+        //       primary-bound send returns a no-route `Err` via
+        //       `send_to_primary` (the connection is closed / no primary
+        //       resolves). A live-but-app-quiet QUIC connection still
+        //       enqueues sends `Ok` (mpsc to a live writer task), so this
+        //       leg stays SILENT during a blip and fires only on a genuine
+        //       link death — the honest fast signal, identical to the one
+        //       `check_primary_link_threshold` already polls each keepalive
+        //       tick.
+        //   (B) wedged-primary backstop (patient): `primary_last_seen`
+        //       staleness past `primary_silence_backstop` (≈2 min). Covers
+        //       the ONLY case (A) cannot — a primary alive at QUIC but
+        //       wedged at the application layer (it sends nothing yet its
+        //       connection stays routable, so no send ever errors).
+        //
+        // The bare `keepalive_interval × keepalive_miss_threshold` (≈15s)
+        // receive-staleness trigger is GONE: it could not distinguish a
+        // blip from a dead primary, so it spuriously elected at 15s during
+        // a blip while the primary side patiently waited. Lengthening it to
+        // 2 min would instead delay EVERY genuine failover by 2 min; the
+        // (A)+(B) split keeps fast failover for a real dead link and is
+        // patient only when death is genuinely indistinguishable from a blip.
+        //
+        // `primary_last_seen` is refreshed by `record_primary_message`,
+        // driven by the role-tagged recognition path in `handle_inbound`'s
+        // Keepalive arm: a `Primary`-tagged keepalive whose originator IS
+        // the current primary refreshes it, so a promoted peer's primary
+        // keepalives feed leg (B) exactly like the co-located primary's
+        // traffic once did. A co-located primary's Secondary keepalive lands
+        // in `peer_keepalives` (it is a live mesh peer) but is excluded from
+        // quorum/candidate counts by `live_peer_ids`, so peer liveness and
+        // primary liveness stay cleanly separate.
+        //
         // Bind the operational state by direct field projection (borrows
         // only `self.lifecycle`, leaving `self.config` / `self.fatal_exit`
         // / `self.mesh` reachable as disjoint fields). The
         // `cluster_state` / `live_peer_ids` reads were already snapshotted
         // above, so nothing in the match below needs a `&self` method.
+        let backstop = self.config.primary_silence_backstop;
+        // The standard death deadline (`keepalive_interval ×
+        // keepalive_miss_threshold`, ≈15s). It NO LONGER gates
+        // `need_election` (the honest (A)+(B) split above replaced the bare
+        // staleness trigger); it survives ONLY as the per-peer agreement
+        // threshold the Suspecting-quorum tally compares each
+        // `TimeoutResponse` age against — a SEPARATE predicate about
+        // whether a PEER also sees the primary as silent, not about whether
+        // WE should start an election.
+        let deadline = self
+            .config
+            .keepalive_interval
+            .saturating_mul(self.config.keepalive_miss_threshold);
         let op = self
             .lifecycle
             .operational_mut()
             .expect("run_election_tick reached before Operational — type invariant violation");
 
-        let primary_silent = op
+        // (A) genuine-dead-link — the primary link's own no-route arming.
+        let link_dead = op.primary_link.should_arm_failover();
+        // (B) wedged-primary backstop — patient receive-staleness, ONLY for
+        // an app-silent primary whose link never armed leg (A).
+        let primary_silence_exceeded = op
             .primary_last_seen
-            .map(|t| Instant::now().duration_since(t) > deadline)
+            .map(|t| Instant::now().duration_since(t) > backstop)
             .unwrap_or(false);
 
-        let need_election = primary_silent;
+        let need_election = link_dead || primary_silence_exceeded;
 
         match &op.election {
             ElectionState::Normal if need_election => {
@@ -272,14 +302,16 @@ where
                 if mesh_degraded {
                     let reason = format!(
                         "peer mesh required for failover but not \
-                         available: primary went silent (primary_silent={}) \
+                         available: primary death suspected \
+                         (link_dead={link_dead}, \
+                         primary_silence_exceeded={primary_silence_exceeded}) \
                          and no peers connected to elect a new primary; \
                          exiting",
-                        primary_silent,
                     );
                     tracing::error!(
                         secondary = %secondary_id,
-                        primary_silent,
+                        link_dead,
+                        primary_silence_exceeded,
                         primary = ?current_primary_id,
                         "{reason}"
                     );
@@ -292,10 +324,11 @@ where
                 }
                 tracing::warn!(
                     secondary = %secondary_id,
-                    miss_threshold = self.config.keepalive_miss_threshold,
-                    primary_silent,
+                    link_dead,
+                    primary_silence_exceeded,
                     primary = ?current_primary_id,
-                    "primary missed keepalives; entering Suspecting"
+                    "primary death suspected (dead link or app-silence backstop); \
+                     entering Suspecting"
                 );
                 op.election = ElectionState::Suspecting {
                     since: Instant::now(),

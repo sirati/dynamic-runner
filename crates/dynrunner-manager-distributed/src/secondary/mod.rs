@@ -57,6 +57,7 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
+pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal};
 
 /// The shape of the cluster-state refresh callback registered via

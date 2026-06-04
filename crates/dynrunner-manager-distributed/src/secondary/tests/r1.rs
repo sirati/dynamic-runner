@@ -436,6 +436,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
                 // The typed lifecycle bounds the pre-config span
                 // (AwaitingPrimary + the Configuring excursion) by
                 // `unconfigured_deadline`, which SUPERSEDES the old
@@ -541,6 +542,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
                 // The typed lifecycle bounds the pre-config span by
                 // `unconfigured_deadline` (it SUPERSEDES `setup_deadline` as
                 // the setup-phase horizon); tight (200ms) so the
@@ -643,6 +645,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
                 unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 can_be_primary: false,

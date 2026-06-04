@@ -293,6 +293,11 @@ impl PySecondaryCoordinator {
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     primary_link_failure_threshold: dist_primary_link_failure_threshold,
                     primary_link_failure_window: dist_primary_link_failure_window,
+                    // Internal default (no operator kwarg surfaced for the
+                    // app-silence failover backstop); single source of truth
+                    // lives in the distributed crate.
+                    primary_silence_backstop:
+                        dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                     unconfigured_deadline: dist_unconfigured_deadline,
                     is_observer: false,
                     // Primary-capability marker (twin of `is_observer`): a

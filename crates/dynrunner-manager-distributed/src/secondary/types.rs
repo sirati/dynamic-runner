@@ -148,6 +148,33 @@ pub struct SecondaryConfig {
     /// probes would exceed the SLURM time budget.
     pub primary_link_failure_window: Duration,
 
+    /// Patient backstop for an alive-at-QUIC-but-wedged-at-app primary:
+    /// the wall-clock staleness of `primary_last_seen` past which the
+    /// secondary starts a failover election EVEN THOUGH the primary
+    /// link never armed a no-route failure (the QUIC connection stays
+    /// routable, so `PrimaryLink::should_arm_failover` stays silent).
+    /// Default `super::primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP`
+    /// (≈120s ≈ 24× the 5s `keepalive_interval`).
+    ///
+    /// This is the SECOND, patient leg of `run_election_tick`'s honest
+    /// liveness predicate; the FIRST, fast leg reads the primary link's
+    /// own no-route arming (`PrimaryLink::should_arm_failover`). The two
+    /// are OR'd: the fast leg fires on a genuinely dead link, the
+    /// backstop covers ONLY the case the fast leg structurally cannot —
+    /// a primary whose connection is still alive but which has stopped
+    /// emitting keepalives at the application layer. A bare
+    /// keepalive-staleness trigger at `keepalive_interval ×
+    /// keepalive_miss_threshold` (≈15s) is deliberately NOT used: it
+    /// cannot tell a transient keepalive blip (the QUIC link survives to
+    /// `max_idle_timeout` ≈60s) from a dead primary, so it would
+    /// spuriously elect during a blip while the primary side patiently
+    /// waits. Sizing this well past `max_idle_timeout` means a blip that
+    /// the QUIC layer would itself have torn down (arming the fast leg)
+    /// never reaches this backstop.
+    ///
+    /// Tests construct it with a tiny value for sub-second drive.
+    pub primary_silence_backstop: Duration,
+
     /// Observer mode: this secondary participates in cluster updates
     /// (ClusterMutation broadcasts, PeerInfo, Keepalive, peer-routed
     /// task-state messages) but cannot become primary and has no
@@ -369,6 +396,7 @@ impl Default for SecondaryConfig {
             oom_retry_max_passes: 1,
             primary_link_failure_threshold: super::primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: super::primary_link::DEFAULT_FAILURE_WINDOW,
+            primary_silence_backstop: super::primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
             is_observer: false,
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),

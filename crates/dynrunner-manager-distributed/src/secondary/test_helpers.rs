@@ -299,6 +299,14 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // count-axis behaviour.
         primary_link_failure_threshold: 3,
         primary_link_failure_window: Duration::from_millis(200),
+        // Tiny app-silence backstop (the patient leg (B) of
+        // `run_election_tick`'s honest-liveness predicate) so election-
+        // state tests drive a wedged-but-routable primary sub-second.
+        // 100ms == the OLD bare receive-staleness deadline
+        // (keepalive_interval 50ms × keepalive_miss_threshold 2), so the
+        // pre-existing `PAST_DEATH = 110ms` backdate keeps tripping the
+        // election with the same margin it always had.
+        primary_silence_backstop: Duration::from_millis(100),
         // Tests that drive election state don't exercise setup;
         // 60s is the production default and well outside any test's
         // wall-clock budget, so it never fires accidentally.

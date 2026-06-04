@@ -42,6 +42,23 @@ pub(super) const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
 /// pyo3 config for the parallel choice on the primary side.
 pub(super) const DEFAULT_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 
+/// Default patient backstop for `SecondaryConfig::primary_silence_backstop`
+/// — the staleness of `primary_last_seen` past which the secondary
+/// elects against a primary whose link never armed a no-route failure
+/// (alive at QUIC, wedged at the application layer). 120s ≈ 24× the 5s
+/// production `keepalive_interval`, and comfortably past the 60s QUIC
+/// `max_idle_timeout`: a quiet-but-live link survives to 60s without
+/// closing, so any link the QUIC layer would itself tear down arms the
+/// FAST leg (`should_arm_failover`) long before this patient leg fires.
+/// This leg is reached ONLY for a primary that stays routable yet
+/// app-silent — the one case the fast leg structurally cannot catch.
+///
+/// `pub` + re-exported from the crate root so the PyO3 manager
+/// construction sites (which hand-build a `SecondaryConfig` literal and
+/// have no `..Default::default()` spread) reference this single source
+/// of truth rather than duplicating the literal.
+pub const DEFAULT_PRIMARY_SILENCE_BACKSTOP: Duration = Duration::from_secs(120);
+
 /// State + behavior for the secondary→primary link.
 pub(super) struct PrimaryLink {
     /// Per-worker rate-limit window. Doubles on each empty
