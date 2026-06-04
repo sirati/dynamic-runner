@@ -74,30 +74,48 @@ impl Builder {
     /// are the envelope, version-key first then alphabetical (so a
     /// `diff` of two files is deterministic). Trailing newline.
     pub fn format(&self) -> String {
+        // Exhaustive destructure (NO `..` rest pattern) — the structural
+        // completeness guard for the format side. Every `Builder` field
+        // is NAMED here, so adding a future field is a COMPILE ERROR at
+        // this site until the developer either emits it into the envelope
+        // or explicitly classifies it as not-on-the-wire. This is the only
+        // mechanism that catches a field silently omitted from the
+        // serialised record (the bug this exists to prevent); the sibling
+        // `peer_info` round-trip test guards the inverse drift on `parse`.
+        let Builder {
+            host,
+            tunnel_port,
+            secondary_id,
+            cert_pem,
+            ipv4,
+            ipv6,
+            quic_port,
+            is_observer,
+        } = self;
         let mut out = String::with_capacity(256);
         // Line 1: legacy URI. `tcp://` is the framework convention
         // for SSH-reverse-tunnel mode (see preparation.rs's
         // back-compat reader). Writers in other modes can swap the
         // scheme inline via a direct line-1 string if they need to;
         // for now the only caller is the reverse-mode wrapper.
-        let _ = writeln!(&mut out, "tcp://{}:{}", self.host, self.tunnel_port);
+        let _ = writeln!(&mut out, "tcp://{host}:{tunnel_port}");
         let _ = writeln!(&mut out, "version=2");
-        if let Some(s) = &self.secondary_id {
+        if let Some(s) = secondary_id {
             let _ = writeln!(&mut out, "secondary_id={s}");
         }
-        if let Some(s) = &self.cert_pem {
+        if let Some(s) = cert_pem {
             let _ = writeln!(&mut out, "cert_pem_b64={}", encode_b64(s));
         }
-        if let Some(s) = &self.ipv4 {
+        if let Some(s) = ipv4 {
             let _ = writeln!(&mut out, "ipv4={s}");
         }
-        if let Some(s) = &self.ipv6 {
+        if let Some(s) = ipv6 {
             let _ = writeln!(&mut out, "ipv6={s}");
         }
-        if let Some(p) = self.quic_port {
+        if let Some(p) = quic_port {
             let _ = writeln!(&mut out, "quic_port={p}");
         }
-        if let Some(b) = self.is_observer {
+        if let Some(b) = is_observer {
             let _ = writeln!(&mut out, "is_observer={b}");
         }
         out

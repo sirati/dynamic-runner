@@ -120,6 +120,43 @@ fn builder_round_trip() {
     assert_eq!(r.is_observer, Some(true));
 }
 
+/// Full-shape round-trip: build a record with a NON-DEFAULT value for
+/// EVERY field (every envelope key present, `ipv6` set, `is_observer`
+/// = true rather than the absent/false default), `format()` then
+/// `parse()`, and assert each field survives. A symmetric test on an
+/// empty / partial shape would pass even if format/parse silently
+/// dropped a field — so every field carries a distinctive non-default
+/// value here, making any format-vs-parse drift a failed assertion.
+/// Complements the format-side exhaustive-destructure guard, which
+/// catches a field omitted from the serialiser; this test catches the
+/// inverse — a field the parser silently fails to recover.
+#[test]
+fn builder_round_trip_all_fields_non_default() {
+    let b = Builder::new("node-full", 40123)
+        .secondary_id("sec-roundtrip")
+        .cert_pem("-----BEGIN CERTIFICATE-----\nMIIBfull\n-----END CERTIFICATE-----\n")
+        .ipv4("10.1.2.3")
+        .ipv6("fd00::dead:beef")
+        .quic_port(52345)
+        .is_observer(true);
+    let s = b.format();
+    let r = parse(&s).unwrap();
+    // `version` is always V2 out of `format()` (it emits the marker).
+    assert_eq!(r.version, PeerInfoVersion::V2);
+    // host / tunnel_port project onto the legacy URI line.
+    assert_eq!(r.legacy_uri.host, "node-full");
+    assert_eq!(r.legacy_uri.port, 40123);
+    assert_eq!(r.secondary_id.as_deref(), Some("sec-roundtrip"));
+    assert_eq!(
+        r.cert_pem.as_deref(),
+        Some("-----BEGIN CERTIFICATE-----\nMIIBfull\n-----END CERTIFICATE-----\n")
+    );
+    assert_eq!(r.ipv4.as_deref(), Some("10.1.2.3"));
+    assert_eq!(r.ipv6.as_deref(), Some("fd00::dead:beef"));
+    assert_eq!(r.quic_port, Some(52345));
+    assert_eq!(r.is_observer, Some(true));
+}
+
 /// Forward-compat: a v1 reader on a v2 file (i.e. parsing only
 /// line 1 via `parse_v1_uri`) still resolves the legacy URI
 /// — protects gateway preparation against a v2 wrapper output.
