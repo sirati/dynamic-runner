@@ -306,7 +306,18 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
 
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();
+        // Phase-preparation / task-spawning important event: the initial
+        // per-secondary assignment has placed `assigned` tasks across the
+        // fleet (`remaining` still queued for the operational loop's
+        // TaskRequest cycle). This is the single point at which initial
+        // tasks have been spawned/assigned for the run, so it carries the
+        // count at the importance target — the dual-sink surfaces it on
+        // stdio under `--important-stdio-only`. Structured fields, not
+        // prose (mirrors `retry_bucket`'s `count`-bearing emit). One emit
+        // with the TOTAL, after the per-secondary fan-out — never inside
+        // the per-recipient loop.
         tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
             assigned,
             remaining = self.pool().len(),
             "initial assignment complete"
