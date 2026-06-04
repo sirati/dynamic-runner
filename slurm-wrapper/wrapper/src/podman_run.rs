@@ -160,8 +160,8 @@ pub fn build_run_argv(
     // direct PID-reap cannot confirm the workload dead; this `--panik-file`
     // makes the secondary's in-container watcher poll the SAME file
     // across the `log_tmp` bind mount, so it sees the sentinel appear and
-    // runs its own graceful shutdown. Appended to any operator
-    // `--panik-file` paths the dispatcher already forwarded — the
+    // runs its own graceful shutdown. Prepended to any operator
+    // `--panik-file` paths the dispatcher forwards below — the
     // watcher races all of them (first match wins).
     argv.push("--panik-file".to_string());
     argv.push(reaper_panik_container_path());
