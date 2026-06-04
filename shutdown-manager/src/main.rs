@@ -7,7 +7,7 @@
 use dynrunner_slurm_shutdown::cleanup::{final_cleanup, write_pid_file};
 use dynrunner_slurm_shutdown::clock::RealClock;
 use dynrunner_slurm_shutdown::config::{Config, parse};
-use dynrunner_slurm_shutdown::poll_loop::{PollConfig, run};
+use dynrunner_slurm_shutdown::poll_loop::{PollConfig, ReapStatus, run};
 use dynrunner_slurm_shutdown::podman::RealPodman;
 use dynrunner_slurm_shutdown::process_probe::KillProbe;
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
@@ -128,9 +128,34 @@ fn run_with_config(cfg: Config) -> ExitCode {
     if let Some(p) = cfg.wrapper_pid {
         log(&format!("wrapper-monitor enabled; watching pid {}", p));
     }
-    let outcome = run(&backend, &flag, &clock, &probe, &poll_cfg, &mut log);
-    log(&format!("state machine completed: {:?}", outcome));
-    final_cleanup(&backend, &cfg.tmp_prefix, &cfg.pid_file, &mut log);
-    log("exit 0");
-    ExitCode::SUCCESS
+    let report = run(&backend, &flag, &clock, &probe, &poll_cfg, &mut log);
+    log(&format!("state machine completed: {:?}", report));
+    // When the reaper left a live orphan (and its podman handle) intact,
+    // preserve the scratch tree too so the orphan stays inspectable —
+    // removing it would delete files out from under a still-live process
+    // and undercut that intent. Otherwise tear the scratch tree down as
+    // before.
+    let preserve_scratch = matches!(report.reap, ReapStatus::OrphanSurvives);
+    final_cleanup(
+        &backend,
+        &cfg.tmp_prefix,
+        &cfg.pid_file,
+        preserve_scratch,
+        &mut log,
+    );
+    // Never exit 0 with a known-live orphan. If the captured workload
+    // PID survived SIGTERM, the grace, SIGKILL, and the second grace,
+    // the reaper has NOT done its job — report failure so the operator
+    // (and any wrapping supervisor) does not treat the leftover process
+    // as cleaned up.
+    match report.reap {
+        ReapStatus::OrphanSurvives => {
+            log("exit 1: workload PID survived the reap; orphan left alive");
+            ExitCode::from(1)
+        }
+        ReapStatus::ConfirmedGone | ReapStatus::NotApplicable => {
+            log("exit 0");
+            ExitCode::SUCCESS
+        }
+    }
 }

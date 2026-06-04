@@ -37,6 +37,20 @@ pub trait PodmanBackend {
     /// commentary).
     fn exec_pgrep_first_child(&self, name: &str) -> Option<u32>;
 
+    /// `podman inspect --format {{.State.Pid}} <NAME>` — the HOST PID
+    /// of the container's main process (the workload, e.g. python),
+    /// which lives under conmon — NOT under host PID 1. Returns
+    /// `Some(pid)` when the record exists and reports a running PID;
+    /// `None` when the record is gone, the PID field is `0` (container
+    /// not running), or the output cannot be parsed.
+    ///
+    /// This is captured by the poll loop while the container record
+    /// still exists, so SIGNAL_SHUTDOWN can signal+verify the host PID
+    /// directly even after podman drops the record. It is the fix for
+    /// the `pgrep -P 1` parent assumption: the workload is conmon's
+    /// child, never host-PID-1's child, so `pgrep -P 1` never found it.
+    fn workload_pid(&self, name: &str) -> Option<u32>;
+
     /// `podman kill --signal <SIGNAL> <NAME>` — signals pid 1 of the
     /// container itself. Belt-and-suspenders for the case the user
     /// process never spawned a child, or pgrep missed it.
@@ -241,6 +255,31 @@ impl PodmanBackend for RealPodman {
             true => {
                 let text = String::from_utf8(out.stdout).ok()?;
                 text.trim().lines().next()?.trim().parse::<u32>().ok()
+            }
+        }
+    }
+
+    fn workload_pid(&self, name: &str) -> Option<u32> {
+        let mut c = self.cmd();
+        c.arg("inspect")
+            .arg("--format")
+            .arg("{{.State.Pid}}")
+            .arg(name)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        let out = c.output().ok()?;
+        match out.status.success() {
+            false => None,
+            true => {
+                let text = String::from_utf8(out.stdout).ok()?;
+                let pid = text.trim().lines().next()?.trim().parse::<u32>().ok()?;
+                // A `State.Pid` of 0 means the container is not running
+                // (created-but-not-started, or already exited). There is
+                // no host process to signal; report absence.
+                match pid {
+                    0 => None,
+                    _ => Some(pid),
+                }
             }
         }
     }
