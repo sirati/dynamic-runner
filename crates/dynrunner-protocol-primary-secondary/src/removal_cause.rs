@@ -28,10 +28,6 @@ pub enum RemovalCause {
     /// Authoritative-detection paths: primary's keepalive watchdog
     /// observed N missed heartbeats from a secondary.
     KeepaliveMiss,
-    /// Mass-death finalize after the grace window: the primary's
-    /// detector observed simultaneous death of >= N peers and the
-    /// grace window elapsed without recovery.
-    MassDeathEscalation,
     /// A peer reported a fatal error to the primary; the primary
     /// authored a `PeerRemoved` with this cause.
     ///

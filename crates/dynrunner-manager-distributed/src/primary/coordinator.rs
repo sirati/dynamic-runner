@@ -26,26 +26,6 @@ use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
 use crate::worker_signal::WorkerMgmtSignal;
 
-/// Per-secondary state for a deferred mass-death event. Recorded
-/// when a correlated mass-death is detected; each subsequent
-/// heartbeat tick consults it to decide whether the secondary has
-/// recovered (its keepalive timestamp advanced past the
-/// defer-moment one) or the grace window has expired (escalate to
-/// actual death). See `PrimaryConfig.mass_death_grace`.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingMassDeath {
-    /// Wall-clock instant when we deferred this secondary. Compared
-    /// against `mass_death_grace` to decide whether grace has
-    /// expired without recovery.
-    pub(super) deferred_at: Instant,
-    /// The secondary's `last_keepalive` value at the moment we
-    /// deferred. The recovery test is "current keepalive
-    /// timestamp > this value" — recovered means a new keepalive
-    /// arrived AFTER we deferred, not just that the old one is
-    /// still around.
-    pub(super) last_keepalive_at_defer: Instant,
-}
-
 /// The single-task lifecycle typestate of a remote worker slot.
 ///
 /// Replaces the removed `(current_task: Option<TaskInfo>, is_idle:
@@ -383,17 +363,6 @@ pub struct PrimaryCoordinator<
     /// nowhere. Recorded by `handle_mesh_ready`; consumed by
     /// `wait_for_mesh_ready`.
     pub(super) mesh_ready_secondaries: HashSet<String>,
-
-    /// Secondaries currently in mass-death deferred state. Populated
-    /// by the heartbeat tick when a correlated mass-death event is
-    /// detected (every connected secondary appears dead at the
-    /// same tick). Each entry's value records the moment we
-    /// deferred plus the keepalive timestamp seen at that moment;
-    /// each subsequent tick checks whether the live keepalive has
-    /// advanced past the defer-time keepalive (= secondary
-    /// recovered) or the `mass_death_grace` window has elapsed
-    /// (= escalate to actual death via `requeue_dead_secondary`).
-    pub(super) pending_mass_death: HashMap<String, PendingMassDeath>,
 
     // primary promotion
     pub(super) primary_id: Option<String>,
@@ -837,7 +806,6 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
-            pending_mass_death: HashMap::new(),
             primary_id: None,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),

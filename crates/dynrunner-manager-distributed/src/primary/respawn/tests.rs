@@ -52,7 +52,7 @@ fn respawn_outcome_constructs_with_ok_and_err() {
     let err = RespawnOutcome {
         original_id: "sec-b".to_owned(),
         new_id: "sec-b-replacement".to_owned(),
-        cause: RemovalCause::MassDeathEscalation,
+        cause: RemovalCause::KeepaliveMiss,
         result: Err("spawn failed".to_owned()),
     };
     assert!(matches!(err.result, Err(ref s) if s == "spawn failed"));
@@ -184,7 +184,6 @@ fn make_coordinator() -> PrimaryCoordinator<
         retry_max_passes: 0,
         fleet_dead_timeout: Duration::from_secs(1),
         mesh_ready_timeout: Duration::from_secs(1),
-        mass_death_grace: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
     PrimaryCoordinator::new(

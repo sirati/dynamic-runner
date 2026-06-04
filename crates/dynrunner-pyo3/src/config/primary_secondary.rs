@@ -71,8 +71,6 @@ impl PyPrimaryConfig {
             oom_retry_max_passes: self.distributed_config.oom_retry_max_passes(),
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(60),
-            mass_death_grace: self.distributed_config.mass_death_grace(),
-            mass_death_min_count: self.distributed_config.mass_death_min_count(),
             // The PyO3 shim doesn't surface the staging
             // walk's source root (PyPrimaryCoordinator's
             // own constructor takes that kwarg directly

@@ -21,13 +21,14 @@
 //! `cause` shape: a `dict` with two keys, mirroring the Rust
 //! `RemovalCause` enum so consumers get a stable, typed surface
 //! independent of Rust's `Debug` impl:
-//!   - `kind`: one of `"keepalive_miss"`, `"mass_death_escalation"`,
-//!     `"fatal_error"`.
-//!   - `reason`: `None` for the two authoritative-detection variants;
-//!     for `"fatal_error"` it is the (byte-capped) diagnostic string
-//!     the reporting peer attached. Encoded once here so adding a new
-//!     `RemovalCause` variant is a localised single-file change rather
-//!     than a string-format contract spread across consumers.
+//!   - `kind`: one of `"keepalive_miss"`, `"fatal_error"`,
+//!     `"self_departure"`.
+//!   - `reason`: `None` for the authoritative-detection `"keepalive_miss"`
+//!     variant; for `"fatal_error"` / `"self_departure"` it is the
+//!     (byte-capped) diagnostic string the reporting peer attached.
+//!     Encoded once here so adding a new `RemovalCause` variant is a
+//!     localised single-file change rather than a string-format
+//!     contract spread across consumers.
 //!
 //! Error / exception handling:
 //!   - `PyErr` from the call surfaces a `tracing::warn` and is
@@ -143,10 +144,6 @@ fn encode_cause<'py>(py: Python<'py>, cause: &RemovalCause) -> PyResult<Bound<'p
     match cause {
         RemovalCause::KeepaliveMiss => {
             dict.set_item("kind", "keepalive_miss")?;
-            dict.set_item("reason", py.None())?;
-        }
-        RemovalCause::MassDeathEscalation => {
-            dict.set_item("kind", "mass_death_escalation")?;
             dict.set_item("reason", py.None())?;
         }
         RemovalCause::FatalError(bs) => {
@@ -268,20 +265,6 @@ mod tests {
         let (peer_id, kind, reason) = captured_removed(&globals, 0);
         assert_eq!(peer_id, "sec-1");
         assert_eq!(kind, "keepalive_miss");
-        assert_eq!(reason, None);
-    }
-
-    #[test]
-    fn removed_mass_death_emits_typed_dict() {
-        let (listener_obj, globals) = make_recording_listener();
-        let bridge = PyPeerLifecycleListener::new(listener_obj);
-        bridge.on_event(&PeerLifecycleEvent::Removed {
-            id: "sec-2".to_owned(),
-            cause: RemovalCause::MassDeathEscalation,
-        });
-        let (peer_id, kind, reason) = captured_removed(&globals, 0);
-        assert_eq!(peer_id, "sec-2");
-        assert_eq!(kind, "mass_death_escalation");
         assert_eq!(reason, None);
     }
 

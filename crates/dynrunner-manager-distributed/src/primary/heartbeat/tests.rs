@@ -51,10 +51,6 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
         keepalive_interval,
         keepalive_miss_threshold: miss_threshold,
         mesh_ready_timeout: std::time::Duration::from_secs(5),
-        // Default OFF in legacy heartbeat tests — they assert the
-        // `requeue_dead_secondary` immediate path. Tests that
-        // exercise the mass-death path build their own config.
-        mass_death_grace: Duration::ZERO,
         ..PrimaryConfig::default()
     }
 }
@@ -218,146 +214,6 @@ fn register_operational_secondary<Tr, S, E>(
     );
 }
 
-fn config_with_mass_death(
-    keepalive_interval: Duration,
-    miss_threshold: u32,
-    grace: Duration,
-    min_count: u32,
-) -> PrimaryConfig {
-    let mut cfg = config(keepalive_interval, miss_threshold);
-    cfg.mass_death_grace = grace;
-    cfg.mass_death_min_count = min_count;
-    cfg
-}
-
-/// When EVERY connected secondary appears dead at the same
-/// heartbeat tick (and there are at least `mass_death_min_count`
-/// of them), the framework infers a correlated cause and DEFERS
-/// the requeue. Tasks remain in-flight; `pending_mass_death`
-/// tracks the deferred set. Pre-fix the primary requeued every
-/// secondary immediately, evicted the entire fleet, and burned
-/// the retry budget on what was actually a transient gateway-side
-/// blip — observed in tokenizer's cohort-5 dispatch where 197
-/// in-flight tasks were lost to a 15-second tunnel hiccup.
-#[tokio::test(flavor = "current_thread")]
-async fn mass_death_defers_requeue_when_all_secondaries_silent() {
-    let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    // Sleep past the deadline so both appear in the dead list.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // BOTH secondaries deferred — pending_mass_death population
-    // matches the connected fleet, no requeue happened, no
-    // workers evicted, pool still empty (tasks remain in-flight
-    // on `workers[].current_task`).
-    assert_eq!(primary.pending_mass_death.len(), 2);
-    assert!(primary.pending_mass_death.contains_key("sec-a"));
-    assert!(primary.pending_mass_death.contains_key("sec-b"));
-    assert_eq!(primary.workers.len(), 2, "no workers evicted");
-    assert_eq!(primary.pool().len(), 0, "no tasks requeued");
-    assert_eq!(primary.secondaries.len(), 2, "secondaries still registered");
-}
-
-/// During mass-death grace, a secondary whose keepalive resumes
-/// is silently un-deferred — no requeue, no logged death. The
-/// other deferred peer stays pending until it either recovers or
-/// the grace expires.
-#[tokio::test(flavor = "current_thread")]
-async fn mass_death_recovery_during_grace_undefers_secondary() {
-    let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-    assert_eq!(primary.pending_mass_death.len(), 2, "both deferred");
-
-    // sec-a's keepalive resumes — simulate by recording a fresh one.
-    primary.record_keepalive("sec-a");
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // sec-a un-deferred (back in the live fleet), sec-b still
-    // deferred. No requeue happened for either.
-    assert!(!primary.pending_mass_death.contains_key("sec-a"));
-    assert!(primary.pending_mass_death.contains_key("sec-b"));
-    assert_eq!(primary.workers.len(), 2, "no workers evicted");
-    assert_eq!(primary.pool().len(), 0, "no tasks requeued");
-}
-
-/// A single-secondary death is NOT mass-death; the legacy
-/// per-secondary requeue path runs unchanged. Guards against
-/// over-eager mass detection swallowing every death.
-#[tokio::test(flavor = "current_thread")]
-async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
-    let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    // Only sec-a is past the deadline; sec-b is still fresh.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.record_keepalive("sec-b");
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // sec-a went through the legacy path (requeue + evict + drop
-    // from secondaries); sec-b is unaffected. Mass-death pending
-    // stays empty — the rule didn't trip.
-    assert_eq!(primary.pending_mass_death.len(), 0);
-    assert!(!primary.secondaries.contains_key("sec-a"));
-    assert!(primary.secondaries.contains_key("sec-b"));
-    assert_eq!(primary.pool().len(), 1, "sec-a's task requeued");
-    assert_eq!(primary.workers.len(), 1, "only sec-b's worker remains");
-}
-
-/// `mass_death_grace = ZERO` reverts to legacy "requeue every
-/// dead secondary immediately" behaviour even when every connected
-/// peer dies at the same tick — the disable knob.
-#[tokio::test(flavor = "current_thread")]
-async fn mass_death_disabled_when_grace_is_zero() {
-    let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::ZERO, 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // Both requeued immediately — no deferral.
-    assert_eq!(primary.pending_mass_death.len(), 0);
-    assert_eq!(primary.workers.len(), 0, "all workers evicted");
-    assert_eq!(primary.pool().len(), 2, "both tasks requeued");
-    assert!(primary.secondaries.is_empty());
-}
-
 /// Drain `rx` non-blockingly and return every `PeerRemoved` mutation
 /// observed in any `DistributedMessage::ClusterMutation` batch. The
 /// primary's `apply_and_broadcast_cluster_mutations` helper fans the
@@ -379,114 +235,6 @@ fn collect_peer_removed(
         }
     }
     out
-}
-
-/// Independent / partial-death path: a single secondary misses the
-/// keepalive threshold while peers stay alive. The primary
-/// originates one `PeerRemoved { cause: KeepaliveMiss }` per dead
-/// secondary. Pins the call-site cause wiring (`process_heartbeat_tick`
-/// else-branch).
-#[tokio::test(flavor = "current_thread")]
-async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    // Only sec-a misses the deadline (sec-b is refreshed below), so
-    // the mass-death rule does NOT trip and the else-branch runs.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.record_keepalive("sec-b");
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // Drain BOTH receivers — broadcast goes to every entry in the
-    // outgoing map. Either drain sees the same PeerRemoved payload;
-    // we read sec-b's because the dead one's channel may still be
-    // sending its TimeoutDetected first.
-    let removed_a = collect_peer_removed(&mut sec_rxs[0]);
-    let removed_b = collect_peer_removed(&mut sec_rxs[1]);
-    let merged = if !removed_b.is_empty() {
-        removed_b
-    } else {
-        removed_a
-    };
-    assert_eq!(
-        merged.len(),
-        1,
-        "exactly one PeerRemoved must originate per single death; got {merged:?}",
-    );
-    assert_eq!(merged[0].0, "sec-a");
-    assert_eq!(merged[0].1, RemovalCause::KeepaliveMiss);
-}
-
-/// Mass-death finalize path: every connected secondary goes silent
-/// at the same tick → defer; after the grace window elapses without
-/// recovery, the primary escalates each deferred entry to actual
-/// death and originates `PeerRemoved { cause: MassDeathEscalation }`.
-/// Pins the call-site cause wiring (mass-death finalize loop).
-///
-/// Real-time sleeps (not paused tokio time) because the heartbeat
-/// path measures via `std::time::Instant::now`, which
-/// `tokio::time::advance` doesn't move.
-#[tokio::test(flavor = "current_thread")]
-async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_cause() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_millis(200), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    // First tick: both silent past the deadline → deferred, no
-    // PeerRemoved authored yet (the entry-deferral path is silent
-    // per the operative rule).
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-    assert_eq!(primary.pending_mass_death.len(), 2, "both deferred");
-    assert!(
-        collect_peer_removed(&mut sec_rxs[0]).is_empty(),
-        "entry-deferral must not author PeerRemoved (operative rule)"
-    );
-    assert!(
-        collect_peer_removed(&mut sec_rxs[1]).is_empty(),
-        "entry-deferral must not author PeerRemoved (operative rule)"
-    );
-
-    // Sleep past the grace window without recovery → finalize.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-
-    // One PeerRemoved per finalized secondary, all carrying
-    // MassDeathEscalation. Both receivers receive each broadcast
-    // (broadcast iterates the outgoing map), so reading either is
-    // sufficient — drain both and merge.
-    let mut removed = collect_peer_removed(&mut sec_rxs[0]);
-    removed.extend(collect_peer_removed(&mut sec_rxs[1]));
-    // De-dup by id (each finalize broadcasts once; both channels
-    // see the same broadcast).
-    removed.sort_by(|a, b| a.0.cmp(&b.0));
-    removed.dedup();
-    assert_eq!(
-        removed.len(),
-        2,
-        "one PeerRemoved per finalized secondary; got {removed:?}"
-    );
-    for (_, cause) in &removed {
-        assert_eq!(*cause, RemovalCause::MassDeathEscalation);
-    }
-    let ids: std::collections::HashSet<&str> = removed.iter().map(|(id, _)| id.as_str()).collect();
-    assert!(ids.contains("sec-a"));
-    assert!(ids.contains("sec-b"));
 }
 
 /// Fatal-error path: a secondary explicitly reports a fatal error.
@@ -546,58 +294,6 @@ async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
     // truncation invariant is checked via length above, but the
     // type itself is the load-bearing piece for that invariant.
     let _: BoundedString<1024> = BoundedString::from("anchor");
-}
-
-/// Negative pin (operative rule: "PeerRemoved fires only post-
-/// mass-death-grace"): while a secondary is deferred during the
-/// mass-death grace window, NO `PeerRemoved` mutation is authored.
-/// The hook fires only on the finalize path (covered by the
-/// `MassDeathEscalation` test above); a recovery during the grace
-/// window drops the deferred entry silently.
-#[tokio::test(flavor = "current_thread")]
-async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config_with_mass_death(Duration::from_millis(50), 2, Duration::from_secs(60), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.process_heartbeat_tick().await.unwrap();
-    assert_eq!(
-        primary.pending_mass_death.len(),
-        2,
-        "both deferred — neither requeued nor evicted"
-    );
-
-    // The entry-deferral path is silent: no PeerRemoved on EITHER
-    // receiver. If one ever fires here we'd duplicate-author with
-    // the finalize path AND break the recovery contract (a peer
-    // that recovers during grace must look as if it never died).
-    let from_a = collect_peer_removed(&mut sec_rxs[0]);
-    let from_b = collect_peer_removed(&mut sec_rxs[1]);
-    assert!(
-        from_a.is_empty() && from_b.is_empty(),
-        "entry-deferral must not author PeerRemoved; a={from_a:?} b={from_b:?}"
-    );
-
-    // Recovery during grace also stays silent: drop the pending
-    // entry, no PeerRemoved on either channel.
-    primary.record_keepalive("sec-a");
-    primary.process_heartbeat_tick().await.unwrap();
-    assert!(!primary.pending_mass_death.contains_key("sec-a"));
-    let from_a = collect_peer_removed(&mut sec_rxs[0]);
-    let from_b = collect_peer_removed(&mut sec_rxs[1]);
-    assert!(
-        from_a.is_empty() && from_b.is_empty(),
-        "grace-window recovery must not author PeerRemoved; \
-         a={from_a:?} b={from_b:?}"
-    );
 }
 
 /// A secondary that's still sending keepalives stays in the routable
@@ -716,10 +412,8 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
 
     // Sleep past the keepalive deadline so sec-a is dead. Refresh
     // sec-b's keepalive immediately before the tick so only sec-a
-    // ends up in the dead list (we want the legacy single-death
-    // requeue path, not mass-death — mass_death_grace is ZERO via the
-    // default `config` builder, but bumping sec-b is the same shape
-    // the surviving-peer scenario takes in production).
+    // ends up in the dead list — the surviving-peer shape the
+    // single-death requeue takes in production.
     tokio::time::sleep(Duration::from_millis(200)).await;
     primary.record_keepalive("sec-b");
     primary.process_heartbeat_tick().await.unwrap();

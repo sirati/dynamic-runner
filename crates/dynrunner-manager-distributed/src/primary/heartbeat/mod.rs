@@ -10,7 +10,7 @@
 //! per-worker tracking, drop the connection state, and notify surviving
 //! peers via `TimeoutDetected`.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
@@ -20,13 +20,19 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::wire::timestamp_now;
-use super::{PendingMassDeath, PrimaryCoordinator};
+use super::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
 /// Outcome of a single periodic heartbeat sweep.
 pub(super) struct SecondaryHeartbeatReport {
     /// Secondaries whose last keepalive is older than the configured death
     /// threshold. Each entry is `(secondary_id, last_keepalive_seen)`.
+    ///
+    /// Consumed by the dead-secondary declaration/requeue policy in
+    /// [`PrimaryCoordinator::decide_dead_secondaries`], which is
+    /// intentionally unimplemented until a later subtask; allow the
+    /// otherwise-unread field at this deliberately-incomplete seam.
+    #[allow(dead_code)]
     pub(super) dead: Vec<DeadSecondary>,
 }
 
@@ -291,127 +297,38 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         Ok(())
     }
 
-    /// Drive one heartbeat-tick cycle: resolve any deferred mass-death
-    /// pending state, then look at the fresh report and decide whether
-    /// new deaths look correlated (mass event, defer them) or
-    /// independent (requeue immediately).
-    ///
-    /// Replaces the legacy "for every dead in report.dead, requeue
-    /// immediately" path so a transient gateway-side tunnel collapse —
-    /// which makes every connected secondary appear silent at the
-    /// same tick — doesn't cause the primary to evict the entire
-    /// fleet and burn the retry budget on a recoverable network blip.
-    ///
-    /// Mass-death detection rule: if EVERY currently-alive (i.e.
-    /// `secondaries.len() - pending_mass_death.len()`) secondary
-    /// appears in the new dead list AND the count meets
-    /// `mass_death_min_count` AND `mass_death_grace > 0`, defer the
-    /// requeue. Otherwise (subset death, or singleton, or feature
-    /// disabled) requeue per-secondary as before.
+    /// Drive one heartbeat-tick cycle: collect the fresh death report
+    /// and hand it to the dead-secondary declaration/requeue policy.
     pub(super) async fn process_heartbeat_tick(&mut self) -> Result<(), String> {
-        let now = Instant::now();
-        let deadline = self
-            .config
-            .keepalive_interval
-            .saturating_mul(self.config.keepalive_miss_threshold);
-
-        // Step 1: resolve secondaries already in mass-death-deferred state.
-        // Each pending entry is either:
-        //   (a) recovered — its keepalive timestamp advanced past the
-        //       defer-time value AND is fresh (within `deadline`). Drop
-        //       from pending; secondary is alive again.
-        //   (b) grace expired — `mass_death_grace` elapsed since defer
-        //       without recovery. Escalate to actual death via
-        //       `requeue_dead_secondary`.
-        //   (c) still pending — neither recovered nor expired. Leave
-        //       alone for the next tick.
-        let mut to_resolve: Vec<String> = Vec::new();
-        let mut to_finalize: Vec<DeadSecondary> = Vec::new();
-        for (id, pending) in &self.pending_mass_death {
-            let live_keepalive = self.secondary_keepalives.get(id).copied();
-            let recovered = live_keepalive
-                .map(|t| t > pending.last_keepalive_at_defer && now.duration_since(t) <= deadline)
-                .unwrap_or(false);
-            if recovered {
-                to_resolve.push(id.clone());
-            } else if now.duration_since(pending.deferred_at) >= self.config.mass_death_grace {
-                to_finalize.push(DeadSecondary {
-                    secondary_id: id.clone(),
-                    last_keepalive: pending.last_keepalive_at_defer,
-                });
-            }
-        }
-        for id in to_resolve {
-            self.pending_mass_death.remove(&id);
-            tracing::info!(
-                secondary = %id,
-                "mass-death deferred secondary recovered; un-deferring"
-            );
-        }
-        for dead in to_finalize {
-            let id = dead.secondary_id.clone();
-            self.pending_mass_death.remove(&id);
-            tracing::warn!(
-                secondary = %id,
-                grace_s = self.config.mass_death_grace.as_secs_f64(),
-                "mass-death grace expired without keepalive recovery; \
-                 escalating to actual death"
-            );
-            self.requeue_dead_secondary(dead, RemovalCause::MassDeathEscalation)
-                .await?;
-        }
-
-        // Step 2: process newly-dead secondaries (fresh entries from
-        // `collect_heartbeat_report` not already in the pending set).
         let report = self.collect_heartbeat_report();
-        let new_dead: Vec<DeadSecondary> = report
-            .dead
-            .into_iter()
-            .filter(|d| !self.pending_mass_death.contains_key(&d.secondary_id))
-            .collect();
-        if new_dead.is_empty() {
-            return Ok(());
-        }
+        self.decide_dead_secondaries(report)
+    }
 
-        // "Mass event" iff every currently-alive secondary appears in
-        // the new dead list, gated by `mass_death_min_count` to keep
-        // singleton/dual-secondary runs from biasing toward correlated
-        // inference. `alive_count` excludes already-deferred peers
-        // (they're "dead from the alive set's perspective" too).
-        let alive_count = self
-            .secondaries
-            .len()
-            .saturating_sub(self.pending_mass_death.len());
-        let mass_event = self.config.mass_death_grace > Duration::ZERO
-            && new_dead.len() >= self.config.mass_death_min_count as usize
-            && new_dead.len() == alive_count;
-        if mass_event {
-            tracing::warn!(
-                count = new_dead.len(),
-                grace_s = self.config.mass_death_grace.as_secs_f64(),
-                "every connected secondary went silent at the same heartbeat tick; \
-                 inferring correlated cause (likely gateway-side tunnel collapse) \
-                 and deferring requeue. Tasks remain in-flight; secondaries that \
-                 reconnect during the grace window are silently un-deferred."
-            );
-            for dead in new_dead {
-                self.pending_mass_death.insert(
-                    dead.secondary_id.clone(),
-                    PendingMassDeath {
-                        deferred_at: now,
-                        last_keepalive_at_defer: dead.last_keepalive,
-                    },
-                );
-            }
-        } else {
-            // Independent / partial death. Per-secondary requeue as
-            // before — these really are dead, not a correlated blip.
-            for dead in new_dead {
-                self.requeue_dead_secondary(dead, RemovalCause::KeepaliveMiss)
-                    .await?;
-            }
-        }
-        Ok(())
+    /// Decide which silent secondaries to declare dead and requeue from
+    /// a single heartbeat sweep.
+    ///
+    /// Intentionally unimplemented: the honest dead-secondary
+    /// declaration/requeue policy lands in a later subtask. The
+    /// implementation MUST hold these invariants:
+    ///
+    /// - It declares a secondary dead by calling the existing
+    ///   [`PrimaryCoordinator::requeue_dead_secondary`] primitive, which
+    ///   already emits `WorkerMgmtSignal::TasksAdded` after requeueing —
+    ///   so the implementation MUST NOT re-nudge the worker-management
+    ///   bus itself.
+    /// - It needs a hard declaration backstop (~2 minutes). A purely
+    ///   starvation-driven declaration would never empty `secondaries`,
+    ///   so a fleet-dead condition would never arm and a fully-silent
+    ///   fleet would hang forever; the backstop guarantees forward
+    ///   progress once a secondary stays silent past the bound.
+    /// - [`PrimaryCoordinator::handle_secondary_fatal_error`] is a
+    ///   SIBLING path (`FatalError`), NOT routed through this method; it
+    ///   calls `requeue_dead_secondary` directly and stays untouched.
+    fn decide_dead_secondaries(
+        &mut self,
+        _report: SecondaryHeartbeatReport,
+    ) -> Result<(), String> {
+        unimplemented!("honest dead-secondary declaration/requeue policy lands in a later subtask")
     }
 
     /// Handle a `SecondaryFatalError` from a secondary that's about to
