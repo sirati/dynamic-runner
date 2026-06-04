@@ -597,6 +597,9 @@ impl PyDistributedManager {
                     // single source of truth for the inner loop.
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // Staged silence schedule: keepalive-interval-relative
+                    // defaults (not surfaced on the Python config today).
+                    ..PrimaryConfig::default()
                 };
 
                 let mut primary = PrimaryCoordinator::new(

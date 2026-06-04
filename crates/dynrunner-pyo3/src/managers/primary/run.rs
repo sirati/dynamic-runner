@@ -353,6 +353,9 @@ impl PyPrimaryCoordinator {
                     source_dir,
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // Staged silence schedule: keepalive-interval-relative
+                    // defaults (not surfaced on the Python config today).
+                    ..PrimaryConfig::default()
                 };
 
                 // The mesh listener (held in `_mesh_server_guard` above)

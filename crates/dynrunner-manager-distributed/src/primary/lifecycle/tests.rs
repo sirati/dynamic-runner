@@ -49,6 +49,7 @@ fn make_coordinator(
         source_dir: None,
         unfulfillable_reinject_max_per_task: None,
         setup_promote_deadline: std::time::Duration::from_secs(600),
+        ..PrimaryConfig::default()
     };
     PrimaryCoordinator::new(
         config,
@@ -128,6 +129,7 @@ fn make_recording_coordinator(
         source_dir: None,
         unfulfillable_reinject_max_per_task: None,
         setup_promote_deadline: Duration::from_secs(600),
+        ..PrimaryConfig::default()
     };
     let recorder = RecordingPeer::<TestId>::new();
     let log = recorder.log_handle();

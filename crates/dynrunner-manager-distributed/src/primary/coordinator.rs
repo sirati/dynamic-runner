@@ -331,6 +331,16 @@ pub struct PrimaryCoordinator<
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
 
+    /// Per-secondary count of staged silence WARN stages already logged
+    /// for the secondary's CURRENT silence streak. Owned by the liveness
+    /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
+    /// each WARN stage at most once, and clears the entry on keepalive
+    /// recovery, welcome, and requeue so a fresh streak re-warns from the
+    /// first stage. Absent entry == zero stages warned. Private to the
+    /// liveness concern: dispatch never reads it (the silent-id set is the
+    /// only liveness fact dispatch consumes, via the two boundary methods).
+    pub(super) silence_warn_stage: HashMap<String, usize>,
+
     /// Per-secondary backoff timestamps. When a secondary returns
     /// "No idle worker available" Recoverable (its dispatch.rs
     /// `is_idle_state()` check found every worker non-idle —
@@ -803,6 +813,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             on_phase_end: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
+            silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
@@ -1710,6 +1721,76 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         requeue_mutations
     }
 
+    /// Starvation oracle for the lazy on-demand dead-secondary requeue.
+    /// True IFF the ONLY outstanding work is in-flight on silent
+    /// secondaries — i.e. an idle worker has nothing it could dispatch,
+    /// and the only reason the run isn't done is that silent holders are
+    /// sitting on inherited/dispatched in-flight tasks.
+    ///
+    /// Composed of single-concern reads — no liveness/dispatch policy
+    /// `if`-hacks:
+    ///   1. `∃ silent secondary` — the liveness module's silent-id set
+    ///      ([`Self::silent_secondary_ids`]); empty ⇒ false.
+    ///   2. `no queued dispatchable work for active phases` —
+    ///      [`PendingPool::has_queued_dispatchable`]. (`is_empty()`/`len()`
+    ///      are NOT usable: they fold in-flight + blocked, so they would be
+    ///      false/`>0` precisely when silent in-flight work exists.)
+    ///   3. `blocked == 0` — [`PendingPool::blocked_len`]. A blocked item
+    ///      will become dispatchable once its prereq resolves, so evicting
+    ///      a holder now would be premature.
+    ///   4. `in_flight non-empty` — there is something to recover (and the
+    ///      guard against evicting a healthy secondary near run completion,
+    ///      paired with blocked==0).
+    ///   5. `every in_flight entry's secondary is silent` — so a non-silent
+    ///      secondary making progress is never evicted; if any in-flight
+    ///      task is held by a live secondary, the run is still advancing.
+    ///
+    /// The boundary the dispatch consumer sees is this predicate plus
+    /// [`Self::declare_silent_secondaries_dead`]; it never learns how
+    /// "silent" or "dispatchable" are computed.
+    pub(super) fn only_silent_held_work_remains(&self) -> bool {
+        let silent = self.silent_secondary_ids();
+        if silent.is_empty() {
+            return false;
+        }
+        if self.pool().has_queued_dispatchable() {
+            return false;
+        }
+        if self.pool().blocked_len() != 0 {
+            return false;
+        }
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        self.in_flight
+            .values()
+            .all(|e| silent.contains(&e.secondary_id))
+    }
+
+    /// The silent secondaries currently holding the only remaining work,
+    /// packaged as [`DeadSecondary`] declarations for
+    /// [`Self::declare_silent_secondaries_dead`]. Pairs with
+    /// [`Self::only_silent_held_work_remains`]: the oracle gates whether to
+    /// declare; this enumerates WHOM, reusing the liveness silent-id set
+    /// and the recorded keepalive timestamps.
+    pub(super) fn silent_held_dead_declarations(&self) -> Vec<super::heartbeat::DeadSecondary> {
+        let now = Instant::now();
+        self.silent_secondary_ids()
+            .into_iter()
+            .map(|id| {
+                let last_keepalive = self
+                    .secondary_keepalives
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(now);
+                super::heartbeat::DeadSecondary {
+                    secondary_id: id,
+                    last_keepalive,
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn cap_filter_view(
         &self,
         view: dynrunner_scheduler_api::WorkerView<I>,
@@ -1993,6 +2074,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     #[cfg(test)]
     pub fn alive_worker_count_for_test(&self) -> usize {
         self.workers.len()
+    }
+
+    /// Test-only inspector for the per-secondary staged-WARN counter
+    /// (number of WARN stages already logged this silence streak). `None`
+    /// when no stage has fired (or the streak was reset). Used by the
+    /// fire-once / reset-on-recovery policy test.
+    #[cfg(test)]
+    pub fn silence_warn_stage_for_test(&self, secondary_id: &str) -> Option<usize> {
+        self.silence_warn_stage.get(secondary_id).copied()
     }
 
     /// Test-only length of the hash-keyed in-flight ledger. Replaces

@@ -86,6 +86,9 @@ impl PyPrimaryConfig {
             // `PyPrimaryCoordinator`.
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: self.distributed_config.setup_promote_deadline(),
+            // Staged silence schedule: not surfaced on the PyO3 config
+            // shim; the keepalive-interval-relative defaults apply.
+            ..RustPrimaryConfig::default()
         }
     }
 }
