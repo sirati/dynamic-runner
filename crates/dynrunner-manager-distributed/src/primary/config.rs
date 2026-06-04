@@ -256,10 +256,12 @@ pub struct PrimaryConfig {
     /// load-bearing exit path while `setup_pending = true` — the
     /// counter-based and pool-drain exits are gated off behind the
     /// latch, `cluster_state.run_complete()` requires the promoted
-    /// secondary to broadcast first, the fleet-dead timer arms on the
-    /// count of alive REMOTE worker-secondaries
-    /// (`alive_remote_secondary_count == 0`) which a demoted submitter
-    /// still recognizing the promoted secondary never sees reach zero,
+    /// secondary to broadcast first, the fleet-dead arm
+    /// (`alive_remote_secondary_count() == 0 && !pool().is_empty()`) is
+    /// held off by its empty-pool guard — the demoted submitter's pool
+    /// is unseeded while `setup_pending`, so the arm cannot fire even
+    /// though the remote-secondary count itself can reach zero (it
+    /// excludes the recognized promoted primary),
     /// and the `both transports closed` fallback only fires once every
     /// QUIC writer has finished its tear-down (which can take hours
     /// after a SLURM hard-kill). If the promoted secondary's discovery
