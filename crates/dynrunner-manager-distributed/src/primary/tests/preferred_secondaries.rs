@@ -31,7 +31,7 @@ fn register_operational_secondary(
 ) {
     use crate::state::{SecondaryConnection, SecondaryConnectionState};
     let conn = SecondaryConnection::new(secondary_id.into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()

@@ -2519,6 +2519,21 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // the primary to the `PeerInfo` dial-list.
         self.originate_primary_membership().await;
 
+        // Post-mesh roster re-broadcast: each secondary's
+        // `SecondaryCapacity` + `PeerJoined` was originated pre-mesh at
+        // `handle_welcome` (before the later-welcoming secondaries' peer
+        // links existed) and never re-emitted, so a secondary that
+        // welcomed early holds an incomplete capacity roster. Re-emit the
+        // FULL roster the primary holds NOW that the mesh has converged
+        // (post `wait_for_peer_connections`), so every secondary's mirror
+        // matches the primary's complete view before a failover could
+        // promote one of them onto an incomplete worker roster. This is a
+        // pure re-emission (the records already exist in the primary's own
+        // mirror), so it ships straight over the mesh; the receiver-side
+        // set-once idempotency absorbs the records a secondary already
+        // holds. Both defer + non-defer modes pass here.
+        self.rebroadcast_full_roster().await;
+
         // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
         // perform the initial per-secondary assignment. Both steps are
         // skipped when this primary is operating in setup-defer mode
@@ -2975,6 +2990,67 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // loop returns.
         let mut narrator = crate::run_narrator::RunNarrator::new();
 
+        // Snapshot-RPC recovery (fixes #187) — REQUEST half. This observer
+        // is the demoted submitter running the observer tail; it applies
+        // replicated mutations INCREMENTALLY and has no other catch-up
+        // path. In setup-defer mode (`--source-already-staged`) the
+        // submitter skipped `seed_cluster_state` and the whole ledger is
+        // originated by the PROMOTED secondary post-promotion — any seed
+        // mutation the observer missed during the hand-off window leaves
+        // its `tasks` empty forever, and it reports an all-zeros summary.
+        // Heal it by unicasting a `RequestClusterSnapshot` to
+        // `Destination::Primary` (the primary-preferred,
+        // authoritative-complete responder, which answers the request)
+        // the moment the observer tail enters.
+        //
+        // The REPLY is healed by the loop's own `ClusterSnapshot` recv arm
+        // (below) — NOT by a separate pre-loop blocking recv. Folding the
+        // reply into the loop is what makes recovery cancel-safe and
+        // deadlock-free BY CONSTRUCTION: the loop already owns every
+        // backstop (setup-promote-deadline, fleet-dead grace,
+        // primary-silence) AND every live arm (incremental
+        // `ClusterMutation` apply, `Primary`-keepalive liveness refresh,
+        // `PrimaryChanged` re-point). A pre-loop blocking recv would
+        // instead (a) delay those backstops by its own budget and (b)
+        // swallow / mis-handle the live frames the loop is designed to
+        // process (a failover keepalive's liveness refresh, a `RunComplete`
+        // exit) — so the request is fire-and-let-the-loop-heal.
+        //
+        // Gated on `current_primary().is_some()` so a pre-relocation
+        // observer (no primary yet) skips the RPC entirely. A send failure
+        // is best-effort: the loop's deadline / fleet-dead arms remain the
+        // hard backstop, and a late/unsolicited snapshot still heals via
+        // the recv arm.
+        if self.cluster_state.current_primary().is_some() {
+            let request = DistributedMessage::RequestClusterSnapshot {
+                sender_id: self.config.node_id.clone(),
+                timestamp: crate::primary::wire::timestamp_now(),
+                // This tail is a strict observer; declare the truthful
+                // role so the responder's `PeerJoined` records it
+                // correctly (observer ⇒ never primary-capable).
+                is_observer: true,
+                can_be_primary: false,
+            };
+            if let Err(e) = self
+                .send_to(
+                    dynrunner_protocol_primary_secondary::Destination::Primary,
+                    request,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "observer tail: RequestClusterSnapshot send to primary failed; \
+                     relying on incremental apply + deadline backstops"
+                );
+            } else {
+                tracing::info!(
+                    "observer tail: requested cluster snapshot from primary; \
+                     the reply heals via the loop's ClusterSnapshot recv arm"
+                );
+            }
+        }
+
         loop {
             narrator.observe(&self.cluster_state);
 
@@ -3129,6 +3205,45 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                                             "observer tail: primary keepalive — \
                                              refreshing primary-liveness clock"
                                         );
+                                    }
+                                }
+                                MessageType::ClusterSnapshot => {
+                                    // Late / unsolicited snapshot heal.
+                                    // A `ClusterSnapshot` arriving here
+                                    // (e.g. the pre-loop recovery reply
+                                    // landed after the bounded wait, or a
+                                    // peer answered a request the observer
+                                    // re-issues) is merged via the
+                                    // idempotent `restore()` lattice — the
+                                    // same recovery the pre-loop RPC does,
+                                    // so a missed seed still heals once a
+                                    // snapshot reaches the observer. Apply-
+                                    // only; the observer NEVER re-broadcasts.
+                                    if let DistributedMessage::ClusterSnapshot {
+                                        snapshot_json,
+                                        ..
+                                    } = &m
+                                    {
+                                        match serde_json::from_str::<
+                                            crate::cluster_state::ClusterStateSnapshot<I>,
+                                        >(
+                                            snapshot_json
+                                        ) {
+                                            Ok(snap) => {
+                                                self.cluster_state.restore(snap);
+                                                tracing::info!(
+                                                    "observer tail: applied late/unsolicited \
+                                                     ClusterSnapshot — ledger healed"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "observer tail: ClusterSnapshot failed to \
+                                                     decode; ignoring"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 other => {

@@ -473,28 +473,39 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// replicated capacity ledger is the authoritative source.
     pub(crate) fn reconstruct_secondaries_from_cluster_state(&mut self) {
         let observers = self.cluster_state.role_table().observers.clone();
-        let roster: Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>)> = self
+        let roster: Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>, bool)> = self
             .cluster_state
             .known_secondaries()
             .map(String::from)
             .filter_map(|id| {
+                let can_be_primary = self.cluster_state.can_be_primary(&id);
                 self.cluster_state
                     .secondary_capacity(&id)
-                    .map(|cap| (id, cap.worker_count, cap.resources.clone()))
+                    .map(|cap| (id, cap.worker_count, cap.resources.clone(), can_be_primary))
             })
             .collect();
 
         self.secondaries.clear();
         self.secondary_keepalives.clear();
         let now = Instant::now();
-        for (id, worker_count, resources) in roster {
+        for (id, worker_count, resources, can_be_primary) in roster {
             let is_observer = observers.contains(&id);
             // Metadata-only Operational seed: walk the typestate to
             // Operational (the only state the heartbeat deadline applies
-            // to) carrying the advertised capacity + observer flag, with
-            // no `QuicConnection` (reached via the unified mesh instead).
+            // to) carrying the advertised capacity + observer flag +
+            // primary-capability (read from the replicated `RoleTable`,
+            // the authoritative source after hydration), with no
+            // `QuicConnection` (reached via the unified mesh instead).
             let conn = SecondaryConnection::new(id.clone())
-                .receive_welcome(worker_count, resources, String::new(), 0, None, is_observer)
+                .receive_welcome(
+                    worker_count,
+                    resources,
+                    String::new(),
+                    0,
+                    None,
+                    is_observer,
+                    can_be_primary,
+                )
                 .receive_cert_exchange(String::new(), None, None, 0)
                 .begin_peer_discovery()
                 .peers_ready()

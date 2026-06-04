@@ -127,7 +127,7 @@ async fn dead_secondary_requeues_in_flight_task() {
     // sender hasn't started yet, so falsely declaring dead
     // would drop a healthy node mid-setup).
     let conn = SecondaryConnection::new("dead-sec".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()
@@ -212,7 +212,7 @@ fn register_operational_secondary<Tr, S, E>(
     E: ResourceEstimator<TestId>,
 {
     let conn = SecondaryConnection::new(secondary_id.into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()
@@ -342,6 +342,7 @@ async fn live_secondary_is_not_falsely_declared_dead() {
         0,
         None,
         false,
+        false,
     );
     primary.secondaries.insert(
         "dead-sec".into(),
@@ -411,7 +412,7 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     // must exceed that). Without a budget the scheduler returns NoFit
     // and the test would falsely pass against a buggy primary.
     let sec_b_conn = SecondaryConnection::new("sec-b".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()
@@ -544,7 +545,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
 
     // Register the dead-to-be secondary, operational.
     let conn = SecondaryConnection::new("dead-sec".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()
@@ -813,6 +814,7 @@ async fn operational_gate_spares_setup_phase_secondary() {
         0,
         None,
         false,
+        false,
     );
     primary.secondaries.insert(
         "slow-sec".into(),
@@ -925,7 +927,7 @@ async fn oracle_false_corners() {
         install_default_pool(&mut p);
         // Operational but holds NO in-flight task.
         let conn = SecondaryConnection::new("dead-sec".into())
-            .receive_welcome(1, vec![], "host".into(), 0, None, false)
+            .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
             .receive_cert_exchange(String::new(), None, None, 0)
             .begin_peer_discovery()
             .peers_ready()
@@ -990,7 +992,7 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
 
     // sec-b is the idle survivor with a real memory budget.
     let sec_b_conn = SecondaryConnection::new("sec-b".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()

@@ -1,0 +1,451 @@
+//! CRDT convergence-robustness coverage.
+//!
+//! Three primary-side behaviors, all additive to the DELIVERY layer (the
+//! apply/merge/snapshot algebra is untouched):
+//!
+//!   (a) `rebroadcast_full_roster` re-emits the FULL per-secondary roster
+//!       post-mesh, healing a failover-promoted secondary that inherited
+//!       an INCOMPLETE `secondary_capacities` mirror (so it rebuilds the
+//!       full worker roster + correct `alive_remote_secondary_count`, no
+//!       premature fleet-dead).
+//!   (b) `run_as_observer` requests a cluster snapshot from the primary on
+//!       entry and `restore()`s the reply — fixes #187 (the setup-defer
+//!       all-zeros observer summary). Plus the negative control: with NO
+//!       reply the observer still terminates via the setup-promote-deadline
+//!       backstop.
+//!   (c) the primary ANSWERS `RequestClusterSnapshot` (unicasts a
+//!       `ClusterSnapshot` of its complete ledger + originates the
+//!       requester's `PeerJoined`).
+
+use super::*;
+
+use crate::primary::wire::compute_task_hash;
+use crate::state::{SecondaryConnection, SecondaryConnectionState};
+use dynrunner_protocol_primary_secondary::{MessageType, PrimaryChangeReason};
+
+/// One advertised-memory resource amount (bytes), mirroring the live
+/// welcome shape (a single `memory` `ResourceAmount`).
+fn mem(bytes: u64) -> Vec<dynrunner_core::ResourceAmount> {
+    vec![dynrunner_core::ResourceAmount {
+        kind: dynrunner_core::ResourceKind::memory(),
+        amount: bytes,
+    }]
+}
+
+/// Insert an Operational secondary into the primary's connection table
+/// carrying the advertised `(worker_count, ram)` + capability flags —
+/// the `self.secondaries` shape `rebroadcast_full_roster` iterates.
+fn insert_operational_secondary(
+    primary: &mut PrimaryCoordinator<
+        ChannelPeerTransport<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    secondary_id: &str,
+    worker_count: u32,
+    ram_bytes: u64,
+) {
+    let conn = SecondaryConnection::new(secondary_id.into())
+        .receive_welcome(worker_count, mem(ram_bytes), "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        secondary_id.into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+}
+
+/// Drain the single `ClusterMutation` batch a primary's
+/// `rebroadcast_full_roster` shipped to a secondary's inbox.
+fn drain_first_cluster_mutation(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> Vec<ClusterMutation<TestId>> {
+    while let Ok(msg) = rx.try_recv() {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            return mutations;
+        }
+    }
+    Vec::new()
+}
+
+/// (a) Mid-run failover with a partial roster. Two worker-secondaries
+/// (sec-0, sec-1) connect to a complete primary; a promotion-bound sec-0
+/// inherited an INCOMPLETE mirror (it missed sec-1's `SecondaryCapacity`
+/// + `PeerJoined`). Pre-rebroadcast its reconstructed roster undercounts
+/// (only sec-0's workers; `alive_remote_secondary_count` == 0). Running
+/// the complete primary's `rebroadcast_full_roster` ships the full roster;
+/// applying it to sec-0's mirror heals BOTH secondaries, so a promotion
+/// reconstructs the FULL worker roster and the correct
+/// `alive_remote_secondary_count` — no premature fleet-dead.
+#[tokio::test(flavor = "current_thread")]
+async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The COMPLETE primary: both secondaries connected, both
+            // capacity records present in its mirror (as `handle_welcome`
+            // would have originated them). Capture its rebroadcast batch
+            // over the `sec-0` wire.
+            let (transport, mut ends) = setup_test(2);
+            let mut sec0_inbox = ends.remove(0).1; // sec-0's primary→secondary rx
+            let mut complete: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            insert_operational_secondary(&mut complete, "sec-0", 2, 8 * 1024 * 1024 * 1024);
+            insert_operational_secondary(&mut complete, "sec-1", 3, 8 * 1024 * 1024 * 1024);
+            // The complete primary's own mirror already holds both records
+            // (set-once apply), mirroring the post-welcome state.
+            {
+                let cs = complete.cluster_state_mut_for_test();
+                for (id, n) in [("sec-0", 2u32), ("sec-1", 3u32)] {
+                    cs.apply(ClusterMutation::PeerJoined {
+                        peer_id: id.into(),
+                        is_observer: false,
+                        can_be_primary: false,
+                    });
+                    cs.apply(ClusterMutation::SecondaryCapacity {
+                        secondary: id.into(),
+                        worker_count: n,
+                        resources: mem(8 * 1024 * 1024 * 1024),
+                    });
+                }
+            }
+
+            // Re-emit the full roster. This is a PURE re-emission — the
+            // records are already in the primary's mirror, so it must NOT
+            // route through the NoOp-filtering originator path (which would
+            // drop the whole batch). Assert the wire batch carries BOTH
+            // secondaries' records.
+            complete.rebroadcast_full_roster().await;
+            let batch = drain_first_cluster_mutation(&mut sec0_inbox);
+            let cap_ids: std::collections::HashSet<&str> = batch
+                .iter()
+                .filter_map(|m| match m {
+                    ClusterMutation::SecondaryCapacity { secondary, .. } => Some(secondary.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                cap_ids.contains("sec-0") && cap_ids.contains("sec-1"),
+                "rebroadcast must carry BOTH secondaries' capacity records, got {cap_ids:?}"
+            );
+
+            // The promotion-bound sec-0: an INCOMPLETE inherited mirror —
+            // it has its OWN records but missed sec-1's. Model it as the
+            // promoted primary's coordinator.
+            let (t2, _e2) = setup_test(0);
+            let mut promoted: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                test_primary_config(),
+                t2,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            {
+                let cs = promoted.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-0".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                // sec-1's records are DENIED — the desync.
+            }
+
+            // Pre-heal: the reconstructed worker roster undercounts (only
+            // sec-0's 2 slots), and `alive_remote_secondary_count` is 0
+            // (sec-1 not yet a known alive worker-secondary). A promotion
+            // here would arm fleet-dead prematurely.
+            promoted.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                promoted.alive_worker_count_for_test(),
+                2,
+                "pre-heal the partial mirror rebuilds only sec-0's slots"
+            );
+            assert_eq!(
+                promoted
+                    .cluster_state_for_test()
+                    .alive_remote_secondary_count(),
+                1,
+                "pre-heal only sec-0 is known so the remote-secondary count undercounts \
+                 (sec-1 missing)"
+            );
+
+            // Apply the rebroadcast batch the complete primary shipped —
+            // the heal. The idempotent lattice absorbs sec-0's own
+            // already-present records (NoOp) and adds sec-1's.
+            promoted.handle_cluster_mutation(DistributedMessage::ClusterMutation {
+                sender_id: "primary".into(),
+                timestamp: 0.0,
+                mutations: batch,
+            })
+            .await;
+
+            // Post-heal: a fresh promotion reconstructs the FULL roster
+            // (sec-0's 2 + sec-1's 3 = 5 slots) and the correct
+            // `alive_remote_secondary_count` (both worker-secondaries are
+            // now known + alive) — no premature fleet-dead.
+            promoted.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                promoted.alive_worker_count_for_test(),
+                5,
+                "post-heal the full roster reconstructs ALL advertised slots"
+            );
+            assert_eq!(
+                promoted
+                    .cluster_state_for_test()
+                    .alive_remote_secondary_count(),
+                2,
+                "post-heal both worker-secondaries are known + alive"
+            );
+        })
+        .await;
+}
+
+/// (c) The primary answers `RequestClusterSnapshot`: it unicasts a
+/// `ClusterSnapshot` of its complete ledger back to the requester AND
+/// originates the requester's `PeerJoined` (carrying its declared role +
+/// capability). Pre-fix only the secondary router answered; a request
+/// addressed at the primary fell through the catch-all and timed out.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_request_cluster_snapshot() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // One existing secondary slot so the requester's unicast reply
+            // + the broadcast PeerJoined have somewhere to land.
+            let (transport, mut ends) = setup_test(1);
+            // setup_test keys the single secondary as "sec-0"; we re-key
+            // the requester onto that outbox by sending the request with
+            // sender_id == "sec-0".
+            let mut requester_inbox = ends.remove(0).1;
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seed the primary's complete ledger: one task.
+            let task = make_binary("task-x", 100);
+            let hash = compute_task_hash(&task);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task,
+                });
+            }
+
+            // A late-joining WORKER (is_observer=false, can_be_primary=true)
+            // requests a snapshot.
+            primary
+                .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                    sender_id: "sec-0".into(),
+                    timestamp: 0.0,
+                    is_observer: false,
+                    can_be_primary: true,
+                })
+                .await;
+
+            // The requester receives a unicast `ClusterSnapshot` whose
+            // payload restores into the seeded ledger (the task survives).
+            let mut got_snapshot = false;
+            let mut got_peer_joined = false;
+            while let Ok(msg) = requester_inbox.try_recv() {
+                match msg.msg_type() {
+                    MessageType::ClusterSnapshot => {
+                        if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = msg {
+                            let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
+                                serde_json::from_str(&snapshot_json).expect("snapshot decodes");
+                            let mut restored = crate::cluster_state::ClusterState::<TestId>::new();
+                            restored.restore(snap);
+                            assert!(
+                                restored.task_state(&hash).is_some(),
+                                "the snapshot must carry the primary's seeded task"
+                            );
+                            got_snapshot = true;
+                        }
+                    }
+                    MessageType::ClusterMutation => {
+                        // The originated PeerJoined for the requester rides
+                        // a broadcast ClusterMutation batch.
+                        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                            got_peer_joined |= mutations.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    ClusterMutation::PeerJoined { peer_id, can_be_primary, .. }
+                                        if peer_id == "sec-0" && *can_be_primary
+                                )
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(got_snapshot, "primary must unicast a ClusterSnapshot reply");
+            assert!(
+                got_peer_joined,
+                "primary must originate the requester's PeerJoined (with its declared capability)"
+            );
+            // The requester's PeerJoined landed in the primary's own mirror
+            // too (canonical apply-and-broadcast).
+            assert!(
+                primary.cluster_state_for_test().can_be_primary("sec-0"),
+                "the requester's declared can_be_primary must be recorded"
+            );
+        })
+        .await;
+}
+
+/// (b) Observer snapshot-recovery (#187 fix). The submitter runs
+/// `run_as_observer` with an EMPTY ledger but a named primary; on entry it
+/// requests a snapshot from the primary and `restore()`s the reply —
+/// healing the all-zeros summary. The reply carries completed tasks + the
+/// `RunComplete` latch, so the loop's first iteration exits Ok with a
+/// non-zero completion count.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_recovers_from_snapshot_reply() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Build the snapshot the primary would answer with: two
+            // completed tasks + the RunComplete latch.
+            let snapshot_json = {
+                let mut donor = crate::cluster_state::ClusterState::<TestId>::new();
+                for name in ["t1", "t2"] {
+                    let task = make_binary(name, 100);
+                    let hash = compute_task_hash(&task);
+                    donor.apply(ClusterMutation::TaskAdded {
+                        hash: hash.clone(),
+                        task,
+                    });
+                    donor.apply(ClusterMutation::TaskCompleted {
+                        hash,
+                        result_data: None,
+                    });
+                }
+                donor.apply(ClusterMutation::RunComplete);
+                serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
+            };
+
+            // Observer transport: an outbox to the named primary (so the
+            // recovery RPC's `Destination::Primary` send succeeds) + an
+            // inbound the test feeds the `ClusterSnapshot` reply into.
+            let (to_primary_tx, _to_primary_rx) = tokio_mpsc::unbounded_channel();
+            let (inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+            let transport = ChannelPeerTransport::from_raw_channels(
+                "submitter".into(),
+                outgoing,
+                inbound_rx,
+            );
+            let mut observer: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // A named current primary (the promoted secondary) so the
+            // recovery RPC fires; the submitter is NOT the primary.
+            {
+                let cs = observer.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "promoted-sec".into(),
+                    epoch: 2,
+                    reason: PrimaryChangeReason::Election,
+                });
+            }
+            // Pre-feed the ClusterSnapshot reply so the bounded recovery
+            // recv picks it up on entry.
+            inbound_tx
+                .send(DistributedMessage::ClusterSnapshot {
+                    sender_id: "promoted-sec".into(),
+                    timestamp: 0.0,
+                    snapshot_json,
+                })
+                .unwrap();
+
+            // Empty ledger BEFORE recovery — the all-zeros symptom.
+            assert_eq!(
+                observer.cluster_state_for_test().outcome_counts().succeeded,
+                0,
+                "pre-recovery the observer's ledger is empty (the #187 symptom)"
+            );
+
+            let result = observer.run_as_observer().await;
+            assert!(result.is_ok(), "observer must exit Ok after recovery: {result:?}");
+            assert_eq!(
+                observer.cluster_state_for_test().outcome_counts().succeeded,
+                2,
+                "recovery must restore the completed-task count (non-zero summary)"
+            );
+        })
+        .await;
+}
+
+/// (b) Negative control: with NO snapshot reply, the observer still
+/// terminates — via the setup-promote-deadline backstop. The recovery
+/// request is fire-and-forget (the reply, if any, heals through the
+/// loop's `ClusterSnapshot` arm), so a missing reply cannot deadlock:
+/// the loop's hard deadline arm fires regardless.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_no_reply_still_terminates_via_deadline() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (to_primary_tx, _to_primary_rx) = tokio_mpsc::unbounded_channel();
+            // Inbound kept open (sender held) but NEVER fed — the recovery
+            // recv must time out on its bounded budget, not block forever.
+            let (_inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let mut outgoing = HashMap::new();
+            outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+            let transport = ChannelPeerTransport::from_raw_channels(
+                "submitter".into(),
+                outgoing,
+                inbound_rx,
+            );
+            let config = PrimaryConfig {
+                // Setup-defer mode + empty ledger ⇒ `setup_pending()` true,
+                // arming the setup-promote-deadline backstop.
+                required_setup_on_promote: true,
+                setup_promote_deadline: Duration::from_millis(200),
+                // Keep fleet-dead far out so the deadline arm is the one
+                // that fires (peer_count() == 1 here anyway, so fleet-dead
+                // never arms).
+                fleet_dead_timeout: Duration::from_secs(60),
+                ..test_primary_config()
+            };
+            let mut observer: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            {
+                let cs = observer.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "promoted-sec".into(),
+                    epoch: 2,
+                    reason: PrimaryChangeReason::Election,
+                });
+            }
+
+            let result = observer.run_as_observer().await;
+            assert!(
+                result.is_err(),
+                "with no reply + setup pending, the observer must exit via the deadline arm"
+            );
+        })
+        .await;
+}
