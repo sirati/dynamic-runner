@@ -29,9 +29,11 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 
+use chrono::Local;
 use tracing::Metadata;
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -135,8 +137,37 @@ where
         .boxed()
 }
 
+/// Local-timezone `HH:MM` timer for the operator-facing important-stdio
+/// sink. Replaces the default RFC3339-UTC stamp with a compact local
+/// clock (e.g. a 19:07Z event prints `21:07` at UTC+2).
+///
+/// Local offset comes from [`chrono::Local`], which reads it through libc
+/// `localtime_r` and is therefore **thread-safe**. This is the deliberate
+/// reason for not using `tracing_subscriber`'s built-in local timer (the
+/// `time` crate's `UtcOffset::current_local_offset`): that one *refuses*
+/// to compute the offset in a multithreaded process for soundness and
+/// silently falls back to UTC — which is exactly the bug this fixes. By
+/// the time the runner installs logging the process is already
+/// multithreaded, so only the libc path yields correct local time.
+#[derive(Clone, Copy)]
+struct LocalHhMm;
+
+impl FormatTime for LocalHhMm {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", Local::now().format("%H:%M"))
+    }
+}
+
 /// Build the stdio `fmt` layer over `writer`. Always verbosity-filtered;
 /// additionally target-gated to [`IMPORTANT_TARGET`] when `important_only`.
+///
+/// In importance mode the layer is also reformatted for operators: a
+/// compact local-time [`LocalHhMm`] stamp and no event target (so the
+/// `dynrunner_important:` prefix is dropped). The field order is the
+/// fmt default — time, level, message, fields — which is already what's
+/// wanted, so only the timer and target are overridden. The non-important
+/// path and the full sink ([`full_layer`]) keep the verbose default format
+/// for debugging.
 pub(crate) fn stdio_layer<S, W>(
     make_writer: W,
     important_only: bool,
@@ -145,13 +176,25 @@ where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
-    let layer = tracing_subscriber::fmt::layer()
-        .with_writer(make_writer)
-        .with_filter(env_filter());
     if important_only {
-        layer.with_filter(important_stdio_filter()).boxed()
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_timer(LocalHhMm)
+            .with_target(false)
+            // Operator-facing plain text: no ANSI dim/colour escapes around
+            // the timestamp/level (the default `fmt` layer emits them, which
+            // would wrap `21:07` as `\e[2m21:07\e[0m` — noise the owner's
+            // target line forbids, and corruption when this sink is captured
+            // to a file / sbatch log rather than a terminal).
+            .with_ansi(false)
+            .with_filter(env_filter())
+            .with_filter(important_stdio_filter())
+            .boxed()
     } else {
-        layer.boxed()
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_filter(env_filter())
+            .boxed()
     }
 }
 
@@ -267,6 +310,118 @@ mod tests {
         assert!(
             !stdio.contains("routine-chatter"),
             "stdio leaked a normal event in importance mode: {stdio}"
+        );
+    }
+
+    #[test]
+    fn importance_stdio_line_is_compact_local_hhmm_no_target() {
+        use chrono::{Local, Timelike, Utc};
+
+        // Bracket the emit with local-clock samples so the assertion is
+        // robust across a minute boundary (the line stamps to one of the
+        // local minutes observed during the emit window).
+        let before = Local::now();
+        let (full, stdio) = run_capture(true);
+        let after = Local::now();
+
+        let line = stdio
+            .lines()
+            .find(|l| l.contains("wake-the-llm"))
+            .unwrap_or_else(|| panic!("important line missing from stdio: {stdio}"));
+
+        // Plain operator text: no ANSI dim/colour escape sequences.
+        assert!(
+            !line.contains('\u{1b}'),
+            "important-stdio line still carries ANSI escapes: {line:?}"
+        );
+
+        // Target is dropped: no `dynrunner_important:` prefix/noise.
+        assert!(
+            !line.contains(IMPORTANT_TARGET),
+            "important-stdio line still carries the target: {line:?}"
+        );
+        assert!(
+            !line.contains("dynrunner_important"),
+            "important-stdio line still names the important target: {line:?}"
+        );
+
+        // Shape: `HH:MM LEVEL message ...` — leading local clock, then the
+        // default field order (time, level, message, fields). The default
+        // `fmt` format right-pads the level into a 5-char field, so the
+        // separator after the timestamp is run-length whitespace; split on
+        // whitespace runs rather than single spaces.
+        let mut parts = line.split_whitespace();
+        let ts = parts.next().expect("timestamp token");
+        let level = parts.next().expect("level token");
+        let rest = parts.next().expect("message token");
+
+        // The leading timestamp token carries no RFC3339/date/seconds/UTC
+        // noise: no `T` separator, no `Z`, no date `-`, no seconds `.`
+        // (the message itself may legitimately contain `-`, so this is
+        // scoped to the timestamp token, not the whole line).
+        for noise in ['T', 'Z', '-', '.'] {
+            assert!(
+                !ts.contains(noise),
+                "timestamp {ts:?} still carries `{noise}` (date/RFC3339/seconds/UTC noise)"
+            );
+        }
+
+        assert_eq!(ts.len(), 5, "timestamp is not `HH:MM`: {ts:?}");
+        let (hh, mm) = ts.split_once(':').expect("`HH:MM` colon");
+        assert!(
+            hh.len() == 2 && hh.bytes().all(|b| b.is_ascii_digit()),
+            "hour is not two digits: {ts:?}"
+        );
+        assert!(
+            mm.len() == 2 && mm.bytes().all(|b| b.is_ascii_digit()),
+            "minute is not two digits: {ts:?}"
+        );
+        assert_eq!(level, "INFO", "level token not where expected: {line:?}");
+        assert!(
+            rest.starts_with("wake-the-llm"),
+            "message not directly after level: {line:?}"
+        );
+
+        // The stamp is LOCAL time: it must equal one of the local `HH:MM`
+        // values observed across the emit window (handles a minute roll).
+        let expected: Vec<String> = [before, after]
+            .iter()
+            .map(|t| t.format("%H:%M").to_string())
+            .collect();
+        assert!(
+            expected.iter().any(|e| e == ts),
+            "timestamp {ts:?} is not the local clock {expected:?}"
+        );
+
+        // And it is genuinely LOCAL, not UTC: whenever this box runs at a
+        // whole-hour offset from UTC the printed hour must differ from the
+        // UTC hour (the original bug printed UTC). When the box *is* UTC
+        // (offset 0) this is vacuously skipped — the shape checks above
+        // still pin the format.
+        let local_now = Local::now();
+        let utc_now = Utc::now();
+        if local_now.hour() != utc_now.hour() {
+            let utc_ts = utc_now.format("%H:%M").to_string();
+            assert_ne!(
+                ts, utc_ts,
+                "timestamp matches UTC {utc_ts:?}, not local — \
+                 multithreaded fallback-to-UTC regressed: {line:?}"
+            );
+        }
+
+        // The full sink keeps the verbose default format for debugging:
+        // the same event carries the target and an RFC3339-UTC instant.
+        let full_line = full
+            .lines()
+            .find(|l| l.contains("wake-the-llm"))
+            .unwrap_or_else(|| panic!("important line missing from full sink: {full}"));
+        assert!(
+            full_line.contains(IMPORTANT_TARGET),
+            "full sink dropped the target — verbose format regressed: {full_line:?}"
+        );
+        assert!(
+            full_line.contains('Z'),
+            "full sink dropped the RFC3339-UTC stamp — verbose format regressed: {full_line:?}"
         );
     }
 
