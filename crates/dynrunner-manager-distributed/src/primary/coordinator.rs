@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, MessageType, PeerId, PeerTransport,
+    ClusterMutation, DistributedMessage, KeepaliveRole, MessageType, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -2758,6 +2758,30 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ///     fleet_dead_timeout` of continuous emptiness the observer exits
     ///     with a stranded-fleet error (reusing the existing grace value,
     ///     not a new timer).
+    ///   * `primary_silence` backstop — the half-open-peer case the
+    ///     dead-fleet grace cannot see. In the relocation model the
+    ///     relocated primary's death is abnormal (SIGTERM / exit 137 / a
+    ///     dropped mesh-send handle) with NO clean `RunComplete`. The
+    ///     `peer_count()` is raw QUIC connection cardinality, pruned ONLY
+    ///     on an outbound-send failure — and the observer is apply-only,
+    ///     never sends, so a dead-primary connection stays resident,
+    ///     `peer_count()` stays `> 0`, and the dead-fleet arm never arms.
+    ///     The observer therefore tracks `primary_last_seen` directly
+    ///     (mirroring the secondary's `record_primary_message` →
+    ///     `primary_last_seen`): it is refreshed by a `Primary`-tagged
+    ///     keepalive whose originator IS `cluster_state.current_primary()`
+    ///     (surfaced from the recv arm, inspect-only, never re-broadcast)
+    ///     and by any `PrimaryChanged` that re-points `current_primary()`
+    ///     (a new/refreshed primary is live). If the current primary is
+    ///     silent for `config.peer_timeout` with no `RunComplete`, the run
+    ///     is stranded — either the whole fleet died or a failover failed —
+    ///     so the observer exits `Err`. `peer_timeout` (default 300s) is
+    ///     GENEROUS relative to a surviving-secondary failover cycle
+    ///     (`keepalive_miss_threshold * keepalive_interval` ≈ 15s, then a
+    ///     re-election whose new primary's keepalives refresh
+    ///     `primary_last_seen`), so a legitimate failover rides through and
+    ///     this backstop only fires when failover did NOT rescue the run.
+    ///     Independent of `peer_count()` (un-pruned / unreliable here).
     ///
     /// # Termination
     ///
@@ -2789,6 +2813,19 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // and the loop exits at the top of the next iteration. Mirrors the
         // operational loop's `transport_closed` shape.
         let mut transport_closed = false;
+
+        // Primary-liveness clock for the half-open-peer backstop. Mirrors
+        // the secondary's `OperationalState::primary_last_seen` (refreshed
+        // by `record_primary_message`). The relocated primary was just
+        // alive at hand-off, so initialise to `now`. Refreshed in the recv
+        // arm by a `Primary`-tagged keepalive from the CURRENT primary and
+        // by any `PrimaryChanged` that re-points `current_primary()`. When
+        // the current primary is silent past `config.peer_timeout` with no
+        // `RunComplete`, the run is stranded and the observer exits — the
+        // dead-fleet `peer_count()==0` arm cannot catch this because a
+        // SIGTERM'd primary's connection stays resident (the observer never
+        // sends, so the send-failure prune never runs).
+        let mut primary_last_seen = Instant::now();
 
         // Dead-fleet poll tick. The dead-fleet grace is accumulated at the
         // TOP of the loop, but when every peer is gone there is no recv
@@ -2857,6 +2894,37 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 fleet_dead_since = None;
             }
 
+            // Primary-silence backstop (the half-open-peer strand). When a
+            // primary is named but its keepalives have stopped for longer
+            // than `peer_timeout` — with no `RunComplete` — either the whole
+            // fleet died or a failover failed to produce a live successor,
+            // so the run is stranded and the observer must exit rather than
+            // block forever on a recv that will never deliver. Gated on
+            // `current_primary().is_some()` so a pre-relocation observer
+            // (no primary yet) never trips it. Independent of `peer_count()`
+            // (un-pruned for an apply-only observer, so unreliable here).
+            // `peer_timeout` (default 300s) >> a failover cycle (~15s), so a
+            // legitimate failover refreshes `primary_last_seen` (via the new
+            // primary's keepalives / `PrimaryChanged`) well before this
+            // fires — it only fires when failover did NOT rescue the run.
+            if let Some(primary) = self.cluster_state.current_primary() {
+                let silent_for = Instant::now().duration_since(primary_last_seen);
+                if silent_for > self.config.peer_timeout && !self.cluster_state.run_complete() {
+                    tracing::error!(
+                        primary,
+                        silent_s = silent_for.as_secs_f64(),
+                        timeout_s = self.config.peer_timeout.as_secs_f64(),
+                        "observer tail: current primary silent past peer_timeout with no \
+                         RunComplete — run stranded"
+                    );
+                    return Err(format!(
+                        "observer: current primary {primary} silent for {:.0}s with no \
+                         RunComplete — run stranded",
+                        silent_for.as_secs_f64()
+                    ));
+                }
+            }
+
             tokio::select! {
                 msg = self.transport.recv_peer(), if !transport_closed => {
                     match msg {
@@ -2865,16 +2933,71 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                             // the authority, so it mirrors `ClusterMutation`
                             // batches into its `cluster_state` (the source
                             // for `run_complete()` and the replicated result
-                            // ledger) and NEVER re-broadcasts. Every other
-                            // wire shape is ignored — the observer assigns
-                            // no tasks and coordinates nothing.
-                            if let MessageType::ClusterMutation = m.msg_type() {
-                                self.handle_cluster_mutation(m).await;
-                            } else {
-                                tracing::trace!(
-                                    msg_type = ?m.msg_type(),
-                                    "observer tail: ignoring non-ClusterMutation frame"
-                                );
+                            // ledger) and NEVER re-broadcasts. A `Primary`
+                            // keepalive from the current primary is
+                            // INSPECTED (never re-broadcast) to refresh the
+                            // primary-liveness clock. Every other wire shape
+                            // is ignored — the observer assigns no tasks and
+                            // coordinates nothing.
+                            match m.msg_type() {
+                                MessageType::ClusterMutation => {
+                                    // A `PrimaryChanged` riding this batch
+                                    // re-points `current_primary()`; the
+                                    // newly-named primary is live by
+                                    // construction (the relocate/election
+                                    // that announced it), so detect the
+                                    // re-point across the apply and refresh
+                                    // the liveness clock. Snapshot the id
+                                    // BEFORE the `&mut self` apply (it
+                                    // borrows `cluster_state`).
+                                    let before =
+                                        self.cluster_state.current_primary().map(str::to_owned);
+                                    self.handle_cluster_mutation(m).await;
+                                    let after =
+                                        self.cluster_state.current_primary().map(str::to_owned);
+                                    if after.is_some() && after != before {
+                                        primary_last_seen = Instant::now();
+                                        tracing::debug!(
+                                            primary = ?after,
+                                            "observer tail: PrimaryChanged repointed the \
+                                             current primary — refreshing primary-liveness clock"
+                                        );
+                                    }
+                                }
+                                MessageType::Keepalive => {
+                                    // Inspect-only primary-liveness refresh.
+                                    // A `Primary`-tagged keepalive whose
+                                    // ORIGINATOR (`secondary_id`) IS the
+                                    // current primary is a primary-liveness
+                                    // assertion — mirrors the secondary's
+                                    // `handle_inbound` Keepalive arm
+                                    // (`record_primary_message`). A stray
+                                    // `Primary` keepalive from a non-current
+                                    // id, or any `Secondary` keepalive, is
+                                    // not primary liveness and is ignored.
+                                    // The observer NEVER re-broadcasts.
+                                    if let DistributedMessage::Keepalive {
+                                        secondary_id,
+                                        emitter_role: KeepaliveRole::Primary,
+                                        ..
+                                    } = &m
+                                        && self.cluster_state.current_primary()
+                                            == Some(secondary_id.as_str())
+                                    {
+                                        primary_last_seen = Instant::now();
+                                        tracing::trace!(
+                                            primary = %secondary_id,
+                                            "observer tail: primary keepalive — \
+                                             refreshing primary-liveness clock"
+                                        );
+                                    }
+                                }
+                                other => {
+                                    tracing::trace!(
+                                        msg_type = ?other,
+                                        "observer tail: ignoring non-ClusterMutation frame"
+                                    );
+                                }
                             }
                         }
                         None => {

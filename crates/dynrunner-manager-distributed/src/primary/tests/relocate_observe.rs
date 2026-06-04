@@ -11,7 +11,7 @@
 
 use super::*;
 use dynrunner_core::ErrorType;
-use dynrunner_protocol_primary_secondary::PeerId;
+use dynrunner_protocol_primary_secondary::{KeepaliveRole, PeerId, PeerTransport};
 
 use crate::primary::lifecycle::RelocationOutcome;
 use crate::primary::wire::compute_task_hash;
@@ -41,6 +41,46 @@ fn coordinator_with_confirmed_peers(
             // Short so the dead-fleet grace fires fast in the
             // peer-count==0 observer test.
             fleet_dead_timeout: std::time::Duration::from_millis(50),
+            ..Default::default()
+        },
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (coordinator, ends)
+}
+
+/// Build an observer coordinator with `confirmed_peers` resident mesh
+/// peers AND short `peer_timeout` / `fleet_dead_timeout`, so the
+/// primary-silence backstop fires fast in tests. The resident `outgoing`
+/// entries keep `peer_count() > 0` (the SIGTERM'd-remote shape: the
+/// connection table is non-empty because the observer never sends and so
+/// never prunes the dead link), while a `recv_peer()` that is never fed
+/// stays pending — exactly the half-open-peer strand. Returns the
+/// per-secondary ends so a test can feed primary keepalives / mutations
+/// into the observer's inbound via the shared `incoming_tx`.
+#[allow(clippy::type_complexity)]
+fn observer_with_short_timeouts(
+    confirmed_peers: u32,
+    peer_timeout: std::time::Duration,
+) -> (
+    PrimaryCoordinator<ChannelPeerTransport<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>,
+    Vec<(
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio::sync::mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )>,
+) {
+    let (transport, ends) = setup_test(confirmed_peers);
+    let coordinator = PrimaryCoordinator::new(
+        PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: confirmed_peers.max(1),
+            peer_timeout,
+            // The fleet-dead poll is the wake source that re-drives the
+            // top-of-loop silence check; keep it short and below
+            // `peer_timeout` so the backstop re-evaluates promptly.
+            fleet_dead_timeout: std::time::Duration::from_millis(20),
             ..Default::default()
         },
         transport,
@@ -328,4 +368,171 @@ async fn relinquished_result_getters_read_replicated_ledger() {
             );
         })
         .await;
+}
+
+/// THE BUG (asm-dataset-nix, on-cluster): the relocated primary dies
+/// abnormally (SIGTERM / exit 137 / dropped mesh-send handle) with NO
+/// clean `RunComplete`. The dead connection stays RESIDENT in the
+/// transport's `outgoing` table (the apply-only observer never sends, so
+/// the send-failure prune never runs), so `peer_count() > 0` and the
+/// dead-fleet arm never arms; `recv_peer()` blocks forever on an inbox
+/// that will never deliver. Pre-fix the observer hung here. The
+/// primary-silence backstop must terminate it: with a primary NAMED, the
+/// connection resident (`peer_count() > 0`), inbound silent, and no
+/// `RunComplete`, the observer exits `Err` within `peer_timeout` rather
+/// than hanging.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_exits_on_silent_primary_with_resident_peer() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // One resident peer → peer_count() == 1 (NOT zero): the
+                // dead-fleet grace can NEVER arm. peer_timeout is short so
+                // the silence backstop fires fast.
+                let (mut coordinator, _ends) = observer_with_short_timeouts(
+                    1,
+                    std::time::Duration::from_millis(80),
+                );
+                assert!(
+                    coordinator.transport_mut_for_test().peer_count() > 0,
+                    "fixture precondition: the dead primary's connection stays \
+                     resident, so peer_count() > 0 and the dead-fleet arm cannot fire"
+                );
+
+                // A primary IS named (the relocated primary, now dead).
+                // The observer applied this PrimaryChanged at hand-off.
+                coordinator
+                    .cluster_state_mut_for_test()
+                    .apply(ClusterMutation::PrimaryChanged {
+                        new: "sec-0".into(),
+                        epoch: 1,
+                        reason:
+                            dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
+                    });
+                assert_eq!(
+                    coordinator.cluster_state_for_test().current_primary(),
+                    Some("sec-0"),
+                    "fixture precondition: a primary is named"
+                );
+
+                // No RunComplete is ever applied; no frame is ever fed to
+                // the inbound (recv_peer stays pending forever). The only
+                // exit is the primary-silence backstop.
+                let result = coordinator.run_as_observer().await;
+                assert!(
+                    result.is_err(),
+                    "an observer whose named primary went silent (resident peer, \
+                     no RunComplete) must exit on the primary-silence backstop, not hang"
+                );
+                let err = result.unwrap_err();
+                assert!(
+                    err.contains("stranded") && err.contains("sec-0"),
+                    "the silence exit must name the silent primary and say stranded: {err}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the observer must terminate via the silence backstop, NOT hang");
+}
+
+/// A LEGITIMATE FAILOVER must NOT trip the silence backstop. The
+/// relocated primary dies, a surviving secondary re-elects (a
+/// `PrimaryChanged` to the new primary), and the new primary emits
+/// `Primary` keepalives that refresh `primary_last_seen`; the observer
+/// rides through and exits `Ok` on the new primary's eventual
+/// `RunComplete`. Feeds the refresh + RunComplete over the real inbound
+/// so the recv-arm's keepalive-surfacing + mutation-apply path is what is
+/// exercised (not a direct cluster_state poke).
+#[tokio::test(flavor = "current_thread")]
+async fn observer_rides_through_failover_and_exits_on_run_complete() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // peer_timeout 120ms; the refresh + RunComplete land well
+                // inside it, and the backstop would otherwise fire by then
+                // — so a green Ok proves the refresh actually reset the
+                // clock (a non-default value: not the 300s default).
+                let (mut coordinator, ends) = observer_with_short_timeouts(
+                    1,
+                    std::time::Duration::from_millis(120),
+                );
+                // The original relocated primary, now dead.
+                coordinator
+                    .cluster_state_mut_for_test()
+                    .apply(ClusterMutation::PrimaryChanged {
+                        new: "sec-0".into(),
+                        epoch: 1,
+                        reason:
+                            dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
+                    });
+
+                // The shared inbound sender every secondary end carries
+                // (setup_test feeds all ends' `incoming_tx` into the
+                // transport's single `incoming_rx`). The new primary's
+                // failover signals ride this into recv_peer.
+                let inbound = ends[0].2.clone();
+
+                // Drive the failover sequence from a spawned task so the
+                // observer loop is concurrently running its recv: (1) a
+                // `PrimaryChanged` re-electing sec-1 as the new primary —
+                // applied via the recv arm, refreshes primary_last_seen;
+                // (2) a `Primary` keepalive from sec-1 — surfaced + refreshes
+                // again; (3) `RunComplete` — the happy-path exit.
+                tokio::task::spawn_local(async move {
+                    // Let the observer enter its loop and (had we not fired
+                    // failover) approach the silence deadline.
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                    inbound
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "sec-1".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::PrimaryChanged {
+                                new: "sec-1".into(),
+                                epoch: 2,
+                                reason:
+                                    dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+                            }],
+                        })
+                        .expect("inbound open");
+                    inbound
+                        .send(DistributedMessage::Keepalive {
+                            sender_id: "sec-1".into(),
+                            timestamp: 0.0,
+                            secondary_id: "sec-1".into(),
+                            active_workers: 0,
+                            emitter_role: KeepaliveRole::Primary,
+                        })
+                        .expect("inbound open");
+                    // Past the ORIGINAL 120ms deadline: if the refresh did
+                    // not reset the clock the observer would already have
+                    // exited Err; reaching RunComplete proves it rode
+                    // through.
+                    tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+                    inbound
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "sec-1".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::RunComplete],
+                        })
+                        .expect("inbound open");
+                });
+
+                coordinator
+                    .run_as_observer()
+                    .await
+                    .expect("a legitimate failover must NOT trip the silence backstop; \
+                             the observer rides through and exits Ok on RunComplete");
+                assert_eq!(
+                    coordinator.cluster_state_for_test().current_primary(),
+                    Some("sec-1"),
+                    "the failover re-elected sec-1 as the new primary"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the failover-ride-through test must terminate");
 }
