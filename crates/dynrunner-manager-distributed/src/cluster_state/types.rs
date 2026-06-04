@@ -149,6 +149,34 @@ pub struct StateCounts {
     pub invalid_task: usize,
 }
 
+/// Per-phase derived view used by every reader that needs the phase
+/// state machine recomputed from the CRDT rather than from the
+/// primary-only `PendingPool`. Pure projection of the replicated
+/// `tasks` ledger + static `phase_deps`; carries no authority, no pool,
+/// no wall-clock — exactly the inputs a zero-authority observer holds.
+///
+/// Single source for the "is this phase started / done / dispatchable"
+/// rule: both the operator run-narrator (`crate::run_narrator`) and the
+/// pyo3 stats snapshot (`StatsSnapshot::from_cluster_state`) read this
+/// off [`ClusterState::phase_rollups`] instead of each re-deriving the
+/// terminal-set + dispatchability walk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhaseRollup {
+    /// The phase has ≥1 task entry in the ledger (in any state).
+    pub has_any: bool,
+    /// The phase has ≥1 NON-terminal task. Terminal == `Completed |
+    /// Failed | Unfulfillable | InvalidTask`; `Pending` / `InFlight` /
+    /// `Blocked` are live. A phase with `has_any && !has_live` has fully
+    /// terminated (every task reached a terminal state). A phase with no
+    /// entries reads `has_live == false` (vacuously satisfied, so a
+    /// dependent of an empty upstream phase is never wedged).
+    pub has_live: bool,
+    /// Every phase this phase (transitively) depends on has fully
+    /// terminated (`!has_live`), so this phase is eligible to dispatch.
+    /// Mirrors the pool's activation cascade.
+    pub dispatchable: bool,
+}
+
 /// Per-class outcome breakdown the primary emits on every
 /// counter-bearing log line. Replaces the older single-number
 /// `completed=N failed=N` shape: `succeeded` is the unique-hash

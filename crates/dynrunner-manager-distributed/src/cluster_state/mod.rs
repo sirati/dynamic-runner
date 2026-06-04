@@ -52,7 +52,7 @@ mod types;
 pub(crate) use broadcast::{AppliedBatch, apply_locally_for_broadcast};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
-pub use types::{ApplyOutcome, OutcomeSummary, RoleChangeHook, StateCounts, TaskState};
+pub use types::{ApplyOutcome, OutcomeSummary, PhaseRollup, RoleChangeHook, StateCounts, TaskState};
 
 #[cfg(test)]
 mod tests;
