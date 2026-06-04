@@ -16,20 +16,22 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::transport::{QuicConnection, QuicListener};
 use crate::wss::{WssConnection, WssListener};
 
-use super::AcceptedPeer;
+use super::{AcceptedPeer, DisconnectedPeer};
 
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
     loop {
         match listener.accept().await {
             Ok(conn) => {
                 let incoming_tx = incoming_tx.clone();
                 let new_conn_tx = new_conn_tx.clone();
+                let disconnect_tx = disconnect_tx.clone();
                 tokio::task::spawn_local(async move {
-                    handle_accepted_quic(conn, incoming_tx, new_conn_tx).await;
+                    handle_accepted_quic(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
                 });
             }
             Err(e) => {
@@ -44,14 +46,16 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
     listener: WssListener,
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
     loop {
         match listener.accept().await {
             Ok(conn) => {
                 let incoming_tx = incoming_tx.clone();
                 let new_conn_tx = new_conn_tx.clone();
+                let disconnect_tx = disconnect_tx.clone();
                 tokio::task::spawn_local(async move {
-                    handle_accepted_wss(conn, incoming_tx, new_conn_tx).await;
+                    handle_accepted_wss(conn, incoming_tx, new_conn_tx, disconnect_tx).await;
                 });
             }
             Err(e) => {
@@ -66,6 +70,7 @@ async fn handle_accepted_quic<I: Identifier>(
     mut conn: QuicConnection,
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
     // Read first message to identify peer
     let first_msg = match MessageReceiver::<DistributedMessage<I>>::recv(&mut conn).await {
@@ -79,6 +84,10 @@ async fn handle_accepted_quic<I: Identifier>(
     }
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    // Clone the writer's channel for the disconnect-signal generation
+    // check (see `DisconnectedPeer`): the owner prunes only if its live
+    // `connections[peer_id]` is STILL this exact channel.
+    let supervisor_tx = outgoing_tx.clone();
 
     if new_conn_tx
         .send(AcceptedPeer {
@@ -118,7 +127,7 @@ async fn handle_accepted_quic<I: Identifier>(
         tracing::debug!(peer = %reader_id, "accepted peer QUIC reader done");
     });
 
-    let writer_id = peer_id;
+    let writer_id = peer_id.clone();
     let mut writer = tokio::task::spawn_local(async move {
         let mut send = send_stream;
         while let Some(msg) = outgoing_rx.recv().await {
@@ -138,12 +147,19 @@ async fn handle_accepted_quic<I: Identifier>(
         _ = &mut reader => { writer.abort(); }
         _ = &mut writer => { reader.abort(); }
     }
+    // Reader/writer exited (peer gone, or QUIC IDLE_TIMEOUT on a
+    // blackholed link): signal the owner to prune+redial.
+    let _ = disconnect_tx.send(DisconnectedPeer {
+        peer_id,
+        outgoing_tx: supervisor_tx,
+    });
 }
 
 async fn handle_accepted_wss<I: Identifier>(
     mut conn: WssConnection,
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    disconnect_tx: mpsc::UnboundedSender<DisconnectedPeer<I>>,
 ) {
     // Read first message to identify peer
     let first_msg = match MessageReceiver::<DistributedMessage<I>>::recv(&mut conn).await {
@@ -157,6 +173,9 @@ async fn handle_accepted_wss<I: Identifier>(
     }
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    // Clone the writer's channel for the disconnect-signal generation
+    // check (see `DisconnectedPeer`).
+    let supervisor_tx = outgoing_tx.clone();
 
     if new_conn_tx
         .send(AcceptedPeer {
@@ -192,7 +211,7 @@ async fn handle_accepted_wss<I: Identifier>(
         tracing::debug!(peer = %reader_id, "accepted peer WSS reader done");
     });
 
-    let writer_id = peer_id;
+    let writer_id = peer_id.clone();
     let mut writer = tokio::task::spawn_local(async move {
         while let Some(msg) = outgoing_rx.recv().await {
             match codec::serialize_message(&msg) {
@@ -211,4 +230,9 @@ async fn handle_accepted_wss<I: Identifier>(
         _ = &mut reader => { writer.abort(); }
         _ = &mut writer => { reader.abort(); }
     }
+    // Reader/writer exited: signal the owner to prune+redial.
+    let _ = disconnect_tx.send(DisconnectedPeer {
+        peer_id,
+        outgoing_tx: supervisor_tx,
+    });
 }
