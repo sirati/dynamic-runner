@@ -355,6 +355,41 @@ impl<I: Identifier> ClusterState<I> {
             .filter(move |id| self.is_peer_alive(id))
     }
 
+    /// Count of [`Self::alive_secondary_members`] that are NOT the
+    /// recognized primary ([`Self::current_primary`]). The fleet-liveness
+    /// quantity the primary's operational loop arms fleet-dead on: it
+    /// answers "are there any alive worker-secondaries OTHER than the
+    /// host I currently recognize as primary".
+    ///
+    /// The `id != current_primary` cut is the single thing that
+    /// distinguishes this from the raw `alive_secondary_members` count,
+    /// and it is exactly what makes the fleet-dead arming honest on a
+    /// co-located (Phase-E) host. A host that runs a `PrimaryCoordinator`
+    /// ALONGSIDE its own co-located secondary advertises BOTH a primary
+    /// and a worker-secondary under one peer-id, so its id IS
+    /// `current_primary` AND appears in `alive_secondary_members`. The
+    /// filter excludes that single co-located entry by IDENTITY — never
+    /// by a magic string and never by counting its loopback workers — so
+    /// the count drops to zero exactly when every OTHER worker-secondary
+    /// is gone, even though the primary's own secondary is still alive.
+    /// That is the fleet-dead arming condition (run cannot make progress)
+    /// without the split-brain hazard of keeping a superseded primary
+    /// alive on the strength of its own loopback secondary.
+    ///
+    /// For a submitter primary (no co-located secondary) the recognized
+    /// primary is not a worker-secondary, so it is absent from
+    /// `alive_secondary_members` and the filter is a no-op — the count is
+    /// simply "all alive worker-secondaries", matching the pre-co-located
+    /// semantics. A `None` `current_primary` (pre-`PrimaryChanged`) makes
+    /// the `Some(id) != None` filter universally true, so it is likewise
+    /// a no-op.
+    pub fn alive_remote_secondary_count(&self) -> usize {
+        let current_primary = self.current_primary();
+        self.alive_secondary_members()
+            .filter(|id| Some(*id) != current_primary)
+            .count()
+    }
+
     /// Total advertised worker-slot count across every secondary with a
     /// replicated capacity record. CRDT-derived occupancy DENOMINATOR
     /// for the worker-roster stats and the failover roster

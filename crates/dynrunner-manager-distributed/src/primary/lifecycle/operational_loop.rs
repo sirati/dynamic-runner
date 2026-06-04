@@ -255,22 +255,36 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 break;
             }
 
-            // Fleet-dead detection. When every secondary has been
-            // declared dead (via `requeue_dead_secondary`) and the
-            // pool still has pending work, the loop would otherwise
-            // sit forever waiting for events that no living
-            // secondary can send. Track the first moment the fleet
-            // is empty-but-pool-has-work; after
-            // `config.fleet_dead_timeout` of continuous emptiness,
-            // exit cleanly with pending tasks marked failed so the
-            // operator gets a clear failure rather than a silent
-            // idle. Cleared the moment a secondary is present
-            // again (re-handshake / partial fleet survival).
+            // Fleet-dead detection. The arming quantity is the count of
+            // alive worker-secondaries OTHER than the host this node
+            // recognizes as primary
+            // (`cluster_state.alive_remote_secondary_count()`): when it
+            // reaches zero and the pool still has pending work, no living
+            // secondary can dispatch the queued tasks and the loop would
+            // otherwise sit forever waiting for events that never arrive.
+            // Track the first moment that count is zero-but-pool-has-work;
+            // after `config.fleet_dead_timeout` of continuous emptiness,
+            // exit cleanly with pending tasks left stranded so the
+            // operator gets a clear failure rather than a silent idle.
+            // Cleared the moment a remote secondary is present again
+            // (re-handshake / partial fleet survival).
             //
-            // Tokenizer surfaced this on cohort-3 where SSH-tunnel
-            // blips killed all 5 secondaries at once and the run
-            // sat idle until manually killed.
-            if self.secondaries.is_empty() && !self.pool().is_empty() {
+            // Counting REMOTE secondaries (excluding the recognized
+            // primary by identity) is what makes the arming honest on a
+            // co-located (Phase-E) host that runs a `PrimaryCoordinator`
+            // alongside its own co-located secondary: its own secondary
+            // never counts, so a co-located primary partitioned from every
+            // remote secondary arms fleet-dead and strands — it does NOT
+            // hang on the strength of its own loopback secondary, and it
+            // does NOT stay alive against a freshly-elected primary
+            // (split-brain). For a submitter primary the recognized
+            // primary is not a worker-secondary, so the count is just "all
+            // alive worker-secondaries" — unchanged behaviour.
+            //
+            // Tokenizer surfaced the original failure on cohort-3 where
+            // SSH-tunnel blips killed all 5 secondaries at once and the
+            // run sat idle until manually killed.
+            if self.cluster_state.alive_remote_secondary_count() == 0 && !self.pool().is_empty() {
                 let now = Instant::now();
                 let since = *self.fleet_dead_since.get_or_insert(now);
                 let elapsed = now.duration_since(since);
@@ -294,7 +308,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         elapsed_s = elapsed.as_secs_f64(),
                         timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
                         marking_stranded = pending.len(),
-                        "fleet-dead timeout: every secondary gone with non-empty pool; \
+                        "fleet-dead timeout: every remote secondary gone with non-empty pool; \
                          pending tasks left stranded and exiting operational loop"
                     );
                     break;
