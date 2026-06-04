@@ -229,8 +229,8 @@ where
     /// unconfigured peer and continues unchanged into `Operational`). It
     /// is NOT a config state and is NOT gated behind configuration: an
     /// unconfigured secondary joins the mesh as far as it can. Modelled
-    /// as a sibling field of the lifecycle FSM exactly the way the plan
-    /// scopes it — see [`MeshFormation`].
+    /// as a sibling field of the lifecycle FSM rather than one of its
+    /// variants — see [`MeshFormation`].
     pub(in crate::secondary) mesh: MeshFormation,
 
     /// Set by handlers that detect an unrecoverable local fault.

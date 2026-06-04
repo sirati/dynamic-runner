@@ -414,6 +414,184 @@ async fn retry_bucket_skips_unfulfillable_failures() {
         .await;
 }
 
+/// Issue #189 regression: an `Unfulfillable` task sitting in
+/// `failed_tasks` must NOT be drained/reinjected by — nor charge —
+/// the actual-execution-error retry-pass buckets.
+///
+/// `Unfulfillable` means a task's dependencies aren't available — it
+/// is NOT an execution failure. Its reinjection is reserved for the
+/// operator/matcher `PrimaryCommand::ReinjectTask` channel (with its
+/// OWN budget, `unfulfillable_reinject_max_per_task`). If the
+/// execution-error buckets (`Recoverable` / OOM) instead treated an
+/// `Unfulfillable` entry as a candidate, a never-resolving
+/// Unfulfillable task would be reinjected, re-fail as Unfulfillable,
+/// land back in `failed_tasks`, and be reinjected again on the next
+/// drain — each reinject burning one execution-error retry pass.
+/// That churn would EXHAUST the `Recoverable` budget a genuinely
+/// transient failure needs, wrongly giving up on it. issue #189
+/// (asm-dataset-reported) is exactly this conflation.
+///
+/// Scenario: ONE phase owning BOTH an `Unfulfillable` task and a
+/// `Recoverable` task, `retry_max_passes = 2`, BOTH present in
+/// `failed_tasks` when the execution-error bucket runs (the
+/// worker-reported shape — neither has been operator-reinjected). We
+/// run the `Recoverable` bucket repeatedly with the Unfulfillable
+/// entry persistently re-seeded into `failed_tasks` (modelling a
+/// never-resolving dependency), and assert:
+///   * the Unfulfillable entry is NEVER drained from `failed_tasks` by
+///     the execution-error bucket (it is not a bucket candidate), and
+///   * the Recoverable task still receives its FULL `retry_max_passes`
+///     reinjections — the budget tally is charged purely by the
+///     Recoverable candidate, with ZERO consumed by the persistent
+///     Unfulfillable entry.
+///
+/// This pins the budget-accounting invariant the partition test
+/// (`retry_bucket_skips_unfulfillable_failures`) does not: that test
+/// runs the bucket once; this one keeps the Unfulfillable entry in
+/// `failed_tasks` across the whole budget so a conflated predicate
+/// would visibly churn-exhaust the Recoverable budget early.
+#[tokio::test(flavor = "current_thread")]
+async fn unfulfillable_entry_does_not_consume_execution_error_retry_budget() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            const RETRY_MAX_PASSES: u32 = 2;
+            let mut coordinator = make_coordinator(RETRY_MAX_PASSES);
+
+            // Both tasks live in the SAME phase ("default") so a conflated
+            // budget would be visibly shared.
+            let unfulfillable_bin = make_binary("deps-missing", 50);
+            let recoverable_bin = make_binary("transient-fail", 40);
+            let unfulfillable_hash = compute_task_hash(&unfulfillable_bin);
+            let recoverable_hash = compute_task_hash(&recoverable_bin);
+            let phase = unfulfillable_bin.phase_id.clone();
+            assert_eq!(
+                phase, recoverable_bin.phase_id,
+                "both tasks must share a phase for the budget-sharing check"
+            );
+
+            install_pool_for_phase(&mut coordinator, &unfulfillable_bin);
+            coordinator.all_binaries = vec![unfulfillable_bin.clone(), recoverable_bin.clone()];
+
+            // Seed the CRDT: the Unfulfillable task in its discrete state.
+            for bin in [&unfulfillable_bin, &recoverable_bin] {
+                coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(bin),
+                    task: bin.clone(),
+                });
+            }
+
+            // The Unfulfillable entry — re-seeded before every bucket run
+            // to model a dependency that never becomes available. If the
+            // execution-error bucket treated it as a candidate, this
+            // persistent entry would be reinjected (and charge a pass)
+            // every time the budget allowed.
+            let reseed_unfulfillable = |c: &mut PrimaryCoordinator<_, _, _, _>| {
+                c.failed_tasks.insert(
+                    unfulfillable_hash.clone(),
+                    ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                );
+            };
+
+            // No execution-error pass charged before the bucket runs.
+            reseed_unfulfillable(&mut coordinator);
+            assert_eq!(
+                coordinator.retry_passes_used_for_test(),
+                0,
+                "no retry pass should be charged before the bucket runs"
+            );
+
+            // Run the Recoverable execution-error bucket to exhaustion.
+            // The Recoverable task re-fails after each reinject; the
+            // Unfulfillable entry stays present the entire time.
+            let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
+            for pass in 1..=RETRY_MAX_PASSES {
+                reseed_unfulfillable(&mut coordinator);
+                coordinator
+                    .failed_tasks
+                    .insert(recoverable_hash.clone(), ErrorType::Recoverable);
+
+                let reinjected = coordinator
+                    .try_run_phase_retry_bucket(
+                        &phase,
+                        crate::primary::retry_bucket::BucketKind::Recoverable,
+                        &mut no_cmd_rx,
+                    )
+                    .await
+                    .expect("retry bucket runs cleanly");
+                assert!(
+                    reinjected,
+                    "Recoverable task must get its full retry budget; \
+                     pass {pass} of {RETRY_MAX_PASSES} should reinject"
+                );
+
+                // The execution-error bucket must NEVER touch the
+                // Unfulfillable entry — it is not a candidate, so it stays
+                // in `failed_tasks` for the operator/matcher channel.
+                assert!(
+                    matches!(
+                        coordinator.failed_tasks.get(&unfulfillable_hash),
+                        Some(ErrorType::Unfulfillable { .. })
+                    ),
+                    "Unfulfillable entry must remain in failed_tasks after \
+                     the Recoverable bucket runs (pass {pass}); the \
+                     execution-error bucket must not drain it"
+                );
+            }
+
+            // The Recoverable bucket charged EXACTLY `retry_max_passes`
+            // passes. With a conflated predicate the persistent
+            // Unfulfillable entry would have been reinjected alongside the
+            // Recoverable task each pass — but the pass TALLY is per
+            // bucket-run, so the decisive signal is below: with the budget
+            // now spent, a Recoverable failure must still be deniable
+            // (budget exhausted), AND the next probe must show the
+            // Unfulfillable entry was never the reason a pass was spent.
+            assert_eq!(
+                coordinator.retry_passes_used_for_test(),
+                RETRY_MAX_PASSES,
+                "the execution-error retry budget must be charged purely \
+                 by the Recoverable bucket"
+            );
+
+            // Budget exhausted: a further Recoverable failure does NOT
+            // reinject. Crucially, the Unfulfillable entry is STILL
+            // present — proving it was carried untouched across the entire
+            // budget rather than being churned through the execution-error
+            // channel (which a conflated predicate would have done,
+            // draining it on the first pass that had budget).
+            reseed_unfulfillable(&mut coordinator);
+            coordinator
+                .failed_tasks
+                .insert(recoverable_hash.clone(), ErrorType::Recoverable);
+            let post_exhaustion = coordinator
+                .try_run_phase_retry_bucket(
+                    &phase,
+                    crate::primary::retry_bucket::BucketKind::Recoverable,
+                    &mut no_cmd_rx,
+                )
+                .await
+                .expect("retry bucket runs cleanly");
+            assert!(
+                !post_exhaustion,
+                "Recoverable budget should be exhausted after exactly \
+                 retry_max_passes passes"
+            );
+            assert!(
+                matches!(
+                    coordinator.failed_tasks.get(&unfulfillable_hash),
+                    Some(ErrorType::Unfulfillable { .. })
+                ),
+                "Unfulfillable entry must survive in failed_tasks for the \
+                 operator/matcher reinject channel — never consumed by the \
+                 execution-error retry budget"
+            );
+        })
+        .await;
+}
+
 /// Pin the cleanup invariant ReinjectTask depends on: the local
 /// `failed_tasks` HashMap entry for a hash is removed when
 /// `apply_reinject_task` transitions the CRDT from
