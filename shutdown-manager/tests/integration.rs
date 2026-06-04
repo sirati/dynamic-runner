@@ -42,7 +42,7 @@ fn pid_file_lifecycle_roundtrip() {
     assert!(pid_path.exists(), "pid file should exist after write");
     let backend = MockBackend::new();
     backend.script_remove(vec![true]);
-    final_cleanup(&backend, &dir.path().join("tmp-nope"), &pid_path, |_| {});
+    final_cleanup(&backend, &dir.path().join("tmp-nope"), &pid_path, false, |_| {});
     assert!(!pid_path.exists(), "pid file must be removed after cleanup");
 }
 
@@ -178,7 +178,9 @@ fn final_cleanup_runs_after_idle_path() {
     let clock = FakeClock::new();
     let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(report.outcome, Outcome::IdleShutdown);
-    final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
+    // Idle path ⇒ no orphan ⇒ scratch is torn down as before.
+    let preserve_scratch = matches!(report.reap, ReapStatus::OrphanSurvives);
+    final_cleanup(&backend, &tmp_prefix, &pid_path, preserve_scratch, |_| {});
     assert!(!pid_path.exists(), "pid file should be removed");
     let calls = backend.calls();
     assert!(
@@ -204,7 +206,8 @@ fn final_cleanup_runs_after_signal_path() {
     let clock = FakeClock::new();
     let report = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(report.outcome, Outcome::SignalShutdown);
-    final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
+    let preserve_scratch = matches!(report.reap, ReapStatus::OrphanSurvives);
+    final_cleanup(&backend, &tmp_prefix, &pid_path, preserve_scratch, |_| {});
     assert!(!pid_path.exists());
 }
 
@@ -557,7 +560,7 @@ fn config_parse_rejects_unknown_flag() {
 
 /// Reap-cfg with 1s graces so `FakeClock` (which never blocks) keeps
 /// the verify-loop poll counts short. `wrapper_pid = None` so the only
-/// `is_alive` calls come from the reap-verify path.
+/// probe consultations come from the reap-verify path's identity check.
 fn cfg_reap() -> PollConfig {
     PollConfig {
         secondary_grace: Duration::from_secs(1),
@@ -566,7 +569,7 @@ fn cfg_reap() -> PollConfig {
     }
 }
 
-/// Regression (issue #182), end-to-end at the run() boundary: an
+/// Regression, end-to-end at the run() boundary: an
 /// orphan whose podman record is GONE but whose host PID is still
 /// ALIVE. The reaper must (a) signal the captured PID directly — not
 /// no-op because the record vanished, and (b) since the PID never
@@ -627,7 +630,7 @@ fn orphan_reap_record_gone_pid_alive_does_not_no_op_or_false_succeed() {
 /// reaper succeeds — confirmed gone — and the handle is removed. Proves
 /// the happy path of the same mechanism (signal-by-captured-PID then
 /// rm-only-after-dead) for the force-kill/incomplete-run case the
-/// #181 self-exit fix does NOT cover.
+/// manager's normal self-exit on a clean run does NOT cover.
 #[test]
 fn orphan_reap_record_gone_pid_dies_confirms_and_rms() {
     let backend = MockBackend::new();
@@ -636,8 +639,9 @@ fn orphan_reap_record_gone_pid_dies_confirms_and_rms() {
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
     clock.set_on_sleep(1, flag.clone());
-    // pre-check alive; first verify poll → gone.
-    let probe = MockProcessProbe::script(vec![true, false]);
+    // start_time channel: capture, pre-SIGTERM identity check → same,
+    // first verify poll → gone.
+    let probe = MockProcessProbe::reap(vec![true, true, false]);
 
     let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
 

@@ -145,10 +145,13 @@ pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
     let ticks_for_idle = ceil_ticks(cfg.idle_shutdown, cfg.poll_interval);
     let mut saw_once = false;
     let mut down_count: u64 = 0;
-    // Latest host PID of the container workload, captured each time the
-    // container record is present. This is what lets SIGNAL_SHUTDOWN
-    // reap the workload by PID even after podman has dropped the record.
-    let mut workload_pid: Option<u32> = None;
+    // Latest host PID of the container workload PLUS the start time
+    // captured for it, recorded each time the container record is
+    // present. The PID lets SIGNAL_SHUTDOWN reap the workload even
+    // after podman drops the record; the captured start time lets the
+    // reap confirm the PID still names the SAME process before
+    // signalling, closing the PID-reuse kill-path hazard.
+    let mut workload_pid: Option<(u32, Option<u64>)> = None;
     loop {
         if flag.is_set() {
             log("signal observed; entering SIGNAL_SHUTDOWN");
@@ -168,8 +171,11 @@ pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
                 // still exists. A `None` here (transient inspect
                 // failure) does not clobber a previously-captured PID:
                 // the last known good value is what we want to reap.
+                // The PID's start time is captured at the SAME instant
+                // (via the probe's `/proc` read) so the reap can later
+                // confirm the PID still names this exact process.
                 if let Some(pid) = backend.workload_pid(&cfg.container_name) {
-                    workload_pid = Some(pid);
+                    workload_pid = Some((pid, probe.start_time(pid)));
                 }
             }
             false => {
@@ -226,7 +232,7 @@ pub fn signal_shutdown<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&st
     clock: &C,
     probe: &P,
     cfg: &PollConfig,
-    workload_pid: Option<u32>,
+    workload_pid: Option<(u32, Option<u64>)>,
     log: &mut L,
 ) -> ReapStatus {
     record_based_signal(backend, clock, cfg, log);
@@ -295,8 +301,12 @@ fn record_based_signal<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
 ///
 /// Conservative by construction:
 ///   * signals only the ONE captured PID — never a pattern/pkill;
-///   * a PID that is already gone short-circuits to `ConfirmedGone`
-///     with no signal sent;
+///   * before EVERY signal it re-confirms the PID still names the
+///     SAME process via the captured start time
+///     ([`ProcessProbe::is_same_process`]); a PID that is gone OR
+///     whose start time has changed (kernel PID reuse) short-circuits
+///     to `ConfirmedGone` with NO signal sent, so the reap signal only
+///     ever reaches the genuine original workload;
 ///   * escalation to SIGKILL only happens if the PID survives the
 ///     SIGTERM grace; `OrphanSurvives` is returned only after SIGKILL
 ///     plus its own grace fail to clear it (a stuck/uninterruptible
@@ -305,21 +315,24 @@ fn reap_workload_pid<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
     probe: &P,
     clock: &C,
     cfg: &PollConfig,
-    workload_pid: Option<u32>,
+    workload_pid: Option<(u32, Option<u64>)>,
     log: &mut L,
 ) -> ReapStatus {
-    let Some(pid) = workload_pid else {
+    let Some((pid, captured_start)) = workload_pid else {
         log("no workload PID was captured; nothing to reap by PID");
         return ReapStatus::NotApplicable;
     };
-    if !probe.is_alive(pid) {
-        log(&format!("workload PID {} already gone; no signal needed", pid));
+    if !probe.is_same_process(pid, captured_start) {
+        log(&format!(
+            "workload PID {} gone or reused (start time no longer matches); no signal sent",
+            pid
+        ));
         return ReapStatus::ConfirmedGone;
     }
 
     let term_ok = probe.signal(pid, libc::SIGTERM);
     log(&format!("kill -TERM {} → {}", pid, term_ok));
-    if wait_for_pid_gone(probe, clock, pid, cfg.secondary_grace, log) {
+    if wait_for_pid_gone(probe, clock, pid, captured_start, cfg.secondary_grace, log) {
         return ReapStatus::ConfirmedGone;
     }
 
@@ -330,7 +343,7 @@ fn reap_workload_pid<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
     ));
     let kill_ok = probe.signal(pid, libc::SIGKILL);
     log(&format!("kill -KILL {} → {}", pid, kill_ok));
-    match wait_for_pid_gone(probe, clock, pid, cfg.container_stop_grace, log) {
+    match wait_for_pid_gone(probe, clock, pid, captured_start, cfg.container_stop_grace, log) {
         true => ReapStatus::ConfirmedGone,
         false => {
             log(&format!(
@@ -389,22 +402,24 @@ fn wait_for_exit<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
     log(&format!("grace of {}s elapsed; container still alive", grace.as_secs()));
 }
 
-/// Poll `is_alive(pid)` once per second up to `grace`, returning `true`
-/// as soon as the PID is gone (the reap-success condition) and `false`
-/// if `grace` elapses with the PID still alive. The 1-second cadence
-/// mirrors [`wait_for_exit`] and is intentionally independent of
-/// `poll_interval`.
+/// Poll the captured workload's identity-aware liveness once per second
+/// up to `grace`, returning `true` as soon as the PID is gone (or its
+/// start time no longer matches — a reused PID is treated as gone, the
+/// reap-success condition) and `false` if `grace` elapses with the SAME
+/// process still alive. The 1-second cadence mirrors [`wait_for_exit`]
+/// and is intentionally independent of `poll_interval`.
 fn wait_for_pid_gone<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
     probe: &P,
     clock: &C,
     pid: u32,
+    captured_start: Option<u64>,
     grace: Duration,
     log: &mut L,
 ) -> bool {
     let tick = Duration::from_secs(1);
     let mut elapsed = Duration::ZERO;
     while elapsed < grace {
-        if !probe.is_alive(pid) {
+        if !probe.is_same_process(pid, captured_start) {
             log(&format!(
                 "workload PID {} exited after {}s",
                 pid,
@@ -417,7 +432,7 @@ fn wait_for_pid_gone<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
     }
     // Final check after the last sleep so a process that dies exactly
     // on the boundary is still observed as gone.
-    !probe.is_alive(pid)
+    !probe.is_same_process(pid, captured_start)
 }
 
 /// Ceiling division `idle_shutdown / poll_interval`, with at least 1
@@ -454,11 +469,11 @@ mod tests {
 
     /// Tiny-grace cfg for the PID-reap regression tests. `FakeClock`
     /// never actually sleeps, so the grace value only controls how
-    /// many `is_alive` polls the verify loop performs — keeping it at
+    /// many identity polls the verify loop performs — keeping it at
     /// 1s makes the probe scripts short and the call accounting
-    /// obvious. `wrapper_pid` stays `None` so the ONLY `is_alive`
-    /// calls in these tests come from the reap-verify path, never the
-    /// wrapper-monitor.
+    /// obvious. `wrapper_pid` stays `None` so the ONLY probe
+    /// consultations in these tests come from the reap-verify path's
+    /// identity check, never the wrapper-monitor.
     fn cfg_reap() -> PollConfig {
         PollConfig {
             secondary_grace: Duration::from_secs(1),
@@ -733,7 +748,7 @@ mod tests {
         );
     }
 
-    // ----------- PID-based orphan reap (issue #182) ----------------
+    // ----------- PID-based orphan reap ----------------
     //
     // The confirmed real-world failure: the reaper spawned, ran
     // SIGNAL_SHUTDOWN, but did NOT reap a live orphan. Three defects:
@@ -769,8 +784,9 @@ mod tests {
         // captured on tick 1, modelling "signal arrives once the
         // workload is running".
         clock.set_on_sleep(1, flag.clone());
-        // is_alive: pre-signal check → alive; first verify poll → gone.
-        let probe = MockProcessProbe::script(vec![true, false]);
+        // start_time channel: [capture (tick 1), pre-SIGTERM identity
+        // check → still same, first verify poll → gone].
+        let probe = MockProcessProbe::reap(vec![true, true, false]);
         let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
 
         assert_eq!(report.outcome, Outcome::SignalShutdown);
@@ -807,10 +823,11 @@ mod tests {
         let flag = ShutdownFlag::new();
         let clock = FakeClock::new();
         clock.set_on_sleep(1, flag.clone());
-        // grace=1s ⇒ wait_for_pid_gone does 2 is_alive polls when alive.
-        // pre-check(true) + SIGTERM-grace(true,true survives) + SIGKILL-
-        // grace(false dies on first poll). Saturating false thereafter.
-        let probe = MockProcessProbe::script(vec![true, true, true, false]);
+        // grace=1s ⇒ wait_for_pid_gone does 2 identity polls when same.
+        // start_time channel: capture(true) + pre-SIGTERM(true) +
+        // SIGTERM-grace(true in-loop, true final ⇒ survives) + SIGKILL-
+        // grace(false ⇒ gone on first poll). Saturating gone thereafter.
+        let probe = MockProcessProbe::reap(vec![true, true, true, true, false]);
         let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
 
         assert_eq!(report.outcome, Outcome::SignalShutdown);
@@ -824,6 +841,53 @@ mod tests {
         assert!(
             backend.calls().contains(&"rm_all".to_string()),
             "rm_all runs once SIGKILL confirms the PID gone; calls: {:?}",
+            backend.calls()
+        );
+    }
+
+    /// PID-reuse kill-path guard: the workload PID was captured while
+    /// the container record existed, but by the time SIGNAL_SHUTDOWN
+    /// reaches the reap the original workload has exited and the kernel
+    /// has handed the SAME PID number to an unrelated process — so its
+    /// `/proc/<pid>/starttime` no longer matches the captured value.
+    /// The reaper MUST treat the captured PID as gone: send NO signal
+    /// (so it never hits the innocent reuser), report `ConfirmedGone`,
+    /// and remove the podman handle. This is the conservative property:
+    /// the reap signal only ever reaches the genuine original workload.
+    #[test]
+    fn captured_pid_reused_before_signal_is_treated_as_gone_not_signaled() {
+        let backend = MockBackend::new();
+        // tick1: record present → PID + start time captured. Record
+        // gone at SIGNAL_SHUTDOWN entry (the orphan/--rm shape).
+        backend.script_exists(vec![true, false]);
+        backend.script_workload_pid(vec![Some(8080)]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        clock.set_on_sleep(1, flag.clone());
+        // start_time channel: capture records 1000; the pre-SIGTERM
+        // identity re-check reads 2000 — the PID has been REUSED by a
+        // new process (different start time). is_same_process(8080,
+        // Some(1000)) is therefore false ⇒ gone, no signal.
+        let probe = MockProcessProbe::reap_start_times(vec![Some(1000), Some(2000)]);
+        let report = run(&backend, &flag, &clock, &probe, &cfg_reap(), |_| {});
+
+        assert_eq!(report.outcome, Outcome::SignalShutdown);
+        assert_eq!(
+            report.reap,
+            ReapStatus::ConfirmedGone,
+            "a PID whose start time changed (reuse) must be treated as gone"
+        );
+        // The crux: NOTHING was signalled. The reaper did not deliver
+        // SIGTERM/SIGKILL to the reused PID's innocent occupant.
+        assert!(
+            probe.signals_sent().is_empty(),
+            "no signal may be sent to a PID whose identity cannot be confirmed; got {:?}",
+            probe.signals_sent()
+        );
+        // The handle is removed — the original workload is gone.
+        assert!(
+            backend.calls().contains(&"rm_all".to_string()),
+            "rm_all runs once the original workload is confirmed gone; calls: {:?}",
             backend.calls()
         );
     }

@@ -172,42 +172,93 @@ pub struct MockProcessProbe {
     /// so reap tests can assert "SIGTERM then SIGKILL to the captured
     /// PID" without a real PID space.
     signals_sent: RefCell<Vec<(u32, i32)>>,
+    /// Scripted `start_time` returns, consumed in order (saturating at
+    /// the final value once drained). This is the SECOND observable
+    /// channel — distinct from `script`/`is_alive` (which feeds the
+    /// wrapper-monitor) — and it drives the reap path's identity guard:
+    /// the poll loop captures element 0 at PID-capture time, and the
+    /// reap re-checks via the trait-default `is_same_process`, so a
+    /// later element that differs from the captured value models a
+    /// PID-reuse / process-gone event without a real `/proc`.
+    start_time_script: RefCell<Vec<Option<u64>>>,
+    /// Saturating value once `start_time_script` drains. Defaults to
+    /// the last scripted value, falling back to `None`.
+    start_time_last: RefCell<Option<u64>>,
 }
+
+/// Sentinel "this is still the original workload" start-time value used
+/// by the reap-path mock constructors. Any value distinct from this one
+/// (or `None`) models the process being gone or the PID reused.
+pub const MOCK_WORKLOAD_START: u64 = 4242_4242;
 
 impl MockProcessProbe {
     /// Construct a probe with a scripted sequence of `is_alive`
-    /// returns. After the script is drained the most recent value
-    /// is returned on every subsequent call.
+    /// returns (the wrapper-monitor channel). After the script is
+    /// drained the most recent value is returned on every subsequent
+    /// call. The `start_time` channel is left at its default (`None`,
+    /// saturating) — `script` is for wrapper-monitor tests; reap tests
+    /// use [`MockProcessProbe::reap`] / [`MockProcessProbe::reap_start_times`].
     pub fn script(values: Vec<bool>) -> Self {
         let saturating = values.last().copied().unwrap_or(false);
         Self {
             script: RefCell::new(values),
             last: RefCell::new(saturating),
-            calls: RefCell::new(0),
-            signals_sent: RefCell::new(Vec::new()),
+            ..Default::default()
+        }
+    }
+
+    /// Reap-path probe whose identity-aware liveness mirrors a liveness
+    /// intent. Element 0 of the intent is the PID-capture sighting; for
+    /// the reap to have a captured start time at all it must be `true`.
+    /// Each `true` maps to `Some(MOCK_WORKLOAD_START)` (still the SAME
+    /// process) and each `false` to `None` (process gone). The capture
+    /// call and every `is_same_process` re-check then consume this one
+    /// `start_time` channel, so the trait-default identity comparison —
+    /// not a mock-side override — decides alive-vs-gone.
+    pub fn reap(intent: Vec<bool>) -> Self {
+        let start_times = intent
+            .into_iter()
+            .map(|alive| alive.then_some(MOCK_WORKLOAD_START))
+            .collect();
+        Self::reap_start_times(start_times)
+    }
+
+    /// Reap-path probe driven by a raw `start_time` script. The poll
+    /// loop's capture call consumes element 0; each `is_same_process`
+    /// re-check consumes the next. A later element differing from the
+    /// captured value models kernel PID reuse (same PID, new process);
+    /// `None` models the process having exited. Saturates at the final
+    /// value once drained.
+    pub fn reap_start_times(start_times: Vec<Option<u64>>) -> Self {
+        let saturating = start_times.last().copied().unwrap_or(None);
+        Self {
+            start_time_script: RefCell::new(start_times),
+            start_time_last: RefCell::new(saturating),
+            ..Default::default()
         }
     }
 
     /// Probe that always reports the wrapper as alive — the test
     /// default for paths that do not exercise the wrapper-monitor
-    /// branch.
+    /// branch. Its `start_time` channel also saturates at a fixed
+    /// value, so on the reap path it reports the workload as the SAME
+    /// live process forever (the "orphan never dies" case).
     pub fn always_alive() -> Self {
         Self {
-            script: RefCell::new(Vec::new()),
             last: RefCell::new(true),
-            calls: RefCell::new(0),
-            signals_sent: RefCell::new(Vec::new()),
+            start_time_last: RefCell::new(Some(MOCK_WORKLOAD_START)),
+            ..Default::default()
         }
     }
 
     /// Probe that always reports the wrapper as dead — used to
-    /// drive the SIGNAL_SHUTDOWN branch from the wrapper-monitor.
+    /// drive the SIGNAL_SHUTDOWN branch from the wrapper-monitor. Its
+    /// `start_time` channel saturates at `None` (no process), the
+    /// default.
     pub fn always_dead() -> Self {
         Self {
-            script: RefCell::new(Vec::new()),
             last: RefCell::new(false),
-            calls: RefCell::new(0),
-            signals_sent: RefCell::new(Vec::new()),
+            ..Default::default()
         }
     }
 
@@ -246,5 +297,21 @@ impl ProcessProbe for MockProcessProbe {
         // but process survives" vs "process dies after the signal".
         self.signals_sent.borrow_mut().push((pid, signal));
         true
+    }
+
+    fn start_time(&self, _pid: u32) -> Option<u64> {
+        // Second observable channel, distinct from `is_alive`. The
+        // trait-default `is_same_process` consumes this, so the reap
+        // path's identity comparison is exercised for real; the mock
+        // never reimplements the comparison.
+        let mut script = self.start_time_script.borrow_mut();
+        match script.is_empty() {
+            true => *self.start_time_last.borrow(),
+            false => {
+                let v = script.remove(0);
+                *self.start_time_last.borrow_mut() = v;
+                v
+            }
+        }
     }
 }

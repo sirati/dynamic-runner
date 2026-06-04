@@ -130,7 +130,19 @@ fn run_with_config(cfg: Config) -> ExitCode {
     }
     let report = run(&backend, &flag, &clock, &probe, &poll_cfg, &mut log);
     log(&format!("state machine completed: {:?}", report));
-    final_cleanup(&backend, &cfg.tmp_prefix, &cfg.pid_file, &mut log);
+    // When the reaper left a live orphan (and its podman handle) intact,
+    // preserve the scratch tree too so the orphan stays inspectable —
+    // removing it would delete files out from under a still-live process
+    // and undercut that intent. Otherwise tear the scratch tree down as
+    // before.
+    let preserve_scratch = matches!(report.reap, ReapStatus::OrphanSurvives);
+    final_cleanup(
+        &backend,
+        &cfg.tmp_prefix,
+        &cfg.pid_file,
+        preserve_scratch,
+        &mut log,
+    );
     // Never exit 0 with a known-live orphan. If the captured workload
     // PID survived SIGTERM, the grace, SIGKILL, and the second grace,
     // the reaper has NOT done its job — report failure so the operator

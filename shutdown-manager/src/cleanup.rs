@@ -47,6 +47,16 @@ use std::path::Path;
 
 /// Run the full filesystem-cleanup phase.
 ///
+/// `preserve_scratch` reflects the reaper's "leave the orphan
+/// inspectable" decision: when a known workload PID survived the reap
+/// the podman handle is intentionally left intact (see
+/// [`crate::poll_loop::signal_shutdown`]), and removing the scratch
+/// tree out from under that still-live orphan would undercut the
+/// inspectable intent and delete files the process may still hold open.
+/// So when `preserve_scratch` is set the tmp tree is LEFT on disk; the
+/// PID file is still removed unconditionally (the reaper process is
+/// exiting, so its own pid-file is stale regardless).
+///
 /// `log` is invoked once per step with a human-readable message; main
 /// wires it to `eprintln!` with the shared prefix, tests record
 /// messages instead.
@@ -54,10 +64,17 @@ pub fn final_cleanup<B: PodmanBackend, L: FnMut(&str)>(
     backend: &B,
     tmp_prefix: &Path,
     pid_file: &Path,
+    preserve_scratch: bool,
     log: L,
 ) {
     let mut log = log;
-    remove_tmp_prefix(backend, tmp_prefix, &mut log);
+    match preserve_scratch {
+        true => log(&format!(
+            "orphan survived the reap; leaving scratch tree {} on disk for inspection",
+            tmp_prefix.display()
+        )),
+        false => remove_tmp_prefix(backend, tmp_prefix, &mut log),
+    }
     remove_pid_file(pid_file, &mut log);
 }
 
@@ -175,6 +192,66 @@ mod tests {
                 .push(format!("remove_tmp_tree({})", p.display()));
             self.remove_result.clone()
         }
+    }
+
+    /// When the reaper left a live orphan, `final_cleanup` must LEAVE
+    /// the scratch tree on disk (so the orphan stays inspectable) while
+    /// still removing the stale pid-file. `remove_tmp_tree` must NOT be
+    /// called — the `unreachable!()` on the backend proves it.
+    #[test]
+    fn final_cleanup_preserves_scratch_when_orphan_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("asm-xxx");
+        fs::create_dir(&tmp).unwrap();
+        let inner = tmp.join("file");
+        fs::write(&inner, b"x").unwrap();
+        let pid_path = dir.path().join("p.pid");
+        write_pid_file(&pid_path).unwrap();
+        // remove_tmp_tree must never be invoked; the bare new(true)
+        // backend records calls but the preserve gate short-circuits
+        // before reaching it.
+        let backend = FakeBackend::new(true);
+        let mut logs: Vec<String> = Vec::new();
+        final_cleanup(&backend, &tmp, &pid_path, true, |m| logs.push(m.to_string()));
+        assert!(tmp.exists(), "scratch tree must be preserved for an orphan");
+        assert!(inner.exists(), "scratch contents must be preserved");
+        assert!(
+            backend.calls.borrow().is_empty(),
+            "remove_tmp_tree must NOT run when scratch is preserved; calls: {:?}",
+            backend.calls.borrow()
+        );
+        assert!(!pid_path.exists(), "stale pid-file is still removed");
+        assert!(
+            logs.iter().any(|l| l.contains("leaving scratch tree")),
+            "logs must note the scratch tree was left for inspection: {:?}",
+            logs
+        );
+    }
+
+    /// On the normal (no-orphan) path `final_cleanup` removes both the
+    /// scratch tree and the pid-file, exactly as before the gate.
+    #[test]
+    fn final_cleanup_removes_scratch_when_no_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("asm-xxx");
+        fs::create_dir(&tmp).unwrap();
+        let pid_path = dir.path().join("p.pid");
+        write_pid_file(&pid_path).unwrap();
+        let backend = FakeBackend::new(true);
+        let mut logs: Vec<String> = Vec::new();
+        final_cleanup(&backend, &tmp, &pid_path, false, |m| logs.push(m.to_string()));
+        assert_eq!(
+            backend.calls.borrow().len(),
+            1,
+            "remove_tmp_tree must run once on the no-orphan path; calls: {:?}",
+            backend.calls.borrow()
+        );
+        assert!(
+            backend.calls.borrow()[0].contains("remove_tmp_tree"),
+            "calls: {:?}",
+            backend.calls.borrow()
+        );
+        assert!(!pid_path.exists(), "pid-file removed on the no-orphan path");
     }
 
     #[test]
