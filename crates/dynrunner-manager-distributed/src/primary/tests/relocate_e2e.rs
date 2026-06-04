@@ -60,25 +60,10 @@ fn big_ram() -> dynrunner_core::ResourceMap {
 /// so the bootstrap reaches the hand-off fork fast.
 fn submitter_config(num_secondaries: u32) -> PrimaryConfig {
     PrimaryConfig {
-        node_id: "primary".into(),
         num_secondaries,
         connect_timeout: Duration::from_secs(10),
         peer_timeout: Duration::from_secs(10),
-        keepalive_interval: Duration::from_secs(5),
-        keepalive_miss_threshold: 3,
-        source_pre_staged_root: None,
-        uses_file_based_items: true,
-        required_setup_on_promote: false,
-        max_concurrent_per_type: std::collections::HashMap::new(),
-        retry_max_passes: 1,
-        oom_retry_max_passes: 1,
-        fleet_dead_timeout: std::time::Duration::from_secs(30),
-        mesh_ready_timeout: std::time::Duration::from_secs(5),
-        mass_death_grace: std::time::Duration::ZERO,
-        mass_death_min_count: 2,
-        source_dir: None,
-        unfulfillable_reinject_max_per_task: None,
-        setup_promote_deadline: std::time::Duration::from_secs(600),
+        ..test_primary_config()
     }
 }
 
