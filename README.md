@@ -108,7 +108,7 @@ class MyTask:
     ) -> list[str]:
         cmd = [str(source_dir), str(output_dir)]
         if skip_existing:
-            cmd.append("--skip-existing")
+            cmd.append("--skip_existing")  # underscore: matches the framework's own worker-arg injection
         if args.my_flag:
             cmd.append("--my-flag")
         return cmd
