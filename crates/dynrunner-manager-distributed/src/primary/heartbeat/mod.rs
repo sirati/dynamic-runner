@@ -29,10 +29,9 @@ pub(super) struct SecondaryHeartbeatReport {
     /// threshold. Each entry is `(secondary_id, last_keepalive_seen)`.
     ///
     /// Consumed by the dead-secondary declaration/requeue policy in
-    /// [`PrimaryCoordinator::decide_dead_secondaries`], which is
-    /// intentionally unimplemented until a later subtask; allow the
-    /// otherwise-unread field at this deliberately-incomplete seam.
-    #[allow(dead_code)]
+    /// [`PrimaryCoordinator::decide_dead_secondaries`], whose full body is
+    /// intentionally unimplemented until a later subtask; it reads this
+    /// field's emptiness so a healthy (no-dead) tick stays a no-op.
     pub(super) dead: Vec<DeadSecondary>,
 }
 
@@ -326,8 +325,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ///   calls `requeue_dead_secondary` directly and stays untouched.
     fn decide_dead_secondaries(
         &mut self,
-        _report: SecondaryHeartbeatReport,
+        report: SecondaryHeartbeatReport,
     ) -> Result<(), String> {
+        // A healthy sweep with no dead secondaries is a no-op, so the stub
+        // panics ONLY on the actual dead-secondary path (the honest
+        // declaration/requeue policy lands in a later subtask).
+        if report.dead.is_empty() {
+            return Ok(());
+        }
         unimplemented!("honest dead-secondary declaration/requeue policy lands in a later subtask")
     }
 
