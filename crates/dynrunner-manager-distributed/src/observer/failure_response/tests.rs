@@ -16,9 +16,8 @@ use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 
 use dynrunner_core::IMPORTANT_TARGET;
-use dynrunner_manager_distributed::task_completed::{
-    TaskCompletedEvent, run_collector, windowed_failure_collector,
-};
+
+use crate::task_completed::{TaskCompletedEvent, run_collector, windowed_failure_collector};
 
 use super::aggregation::ErrorAggregationPolicy;
 use super::invalid_task::InvalidTaskMonitorPolicy;

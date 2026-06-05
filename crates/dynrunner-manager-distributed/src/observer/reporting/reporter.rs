@@ -159,6 +159,13 @@ impl Reporter {
             );
         }
     }
+
+    /// Flush a final stats line before observer exit; delegates to
+    /// [`on_stats_tick`](Self::on_stats_tick) (a short run renders every
+    /// nonzero metric; a steady run with no change stays silent).
+    pub fn flush_final(&mut self, snapshot: &StatsSnapshot) {
+        self.on_stats_tick(snapshot);
+    }
 }
 
 /// Drive both cadences until `cancel` resolves. Pulls a fresh snapshot
@@ -199,7 +206,7 @@ where
                 let snapshot = source.snapshot();
                 reporter.on_idle_tick(&snapshot, clock.now());
             }
-            _ = &mut cancel => break,
+            _ = &mut cancel => { reporter.flush_final(&source.snapshot()); break; }
         }
     }
 }

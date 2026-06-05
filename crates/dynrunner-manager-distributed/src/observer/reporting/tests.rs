@@ -11,12 +11,13 @@
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, PhaseId, TaskDep, TaskInfo, TypeId, WorkerId};
-use dynrunner_manager_distributed::ClusterState;
 use dynrunner_protocol_primary_secondary::ClusterMutation;
+
+use crate::ClusterState;
 
 use super::format::render_report;
 use super::idle::IdleDetector;
-use super::run::{IDLE_THRESHOLD, SharedSnapshotSource};
+use super::reporter::{IDLE_THRESHOLD, SharedSnapshotSource};
 use super::stats::StatsSnapshot;
 use super::stats::StatsSnapshot as Snap;
 
@@ -682,7 +683,7 @@ fn idle_rearms_after_secondary_receives_task() {
 
 #[test]
 fn shared_source_publishes_latest() {
-    use super::run::CrdtSnapshotSource;
+    use super::reporter::CrdtSnapshotSource;
     let src = SharedSnapshotSource::new(StatsSnapshot::default());
     assert_eq!(src.snapshot(), StatsSnapshot::default());
     src.publish(snap_with(9, 0));
@@ -703,7 +704,7 @@ fn live_feed_publishes_real_crdt_projection_to_reporter() {
     // next tick. The reporter is seeded all-zero (a fresh observer); the
     // first publish must make the reporter observe the REAL counts so
     // its cadence has wake-worthy data — not the seeded zero snapshot.
-    use super::run::CrdtSnapshotSource;
+    use super::reporter::CrdtSnapshotSource;
 
     // Seed a cluster with a spread of states — the same view a late-
     // joiner observer restores from a running cluster.
@@ -760,7 +761,7 @@ fn live_feed_publishes_real_crdt_projection_to_reporter() {
 /// deterministically, so the idle threshold elapses at a known virtual
 /// time with no wall-clock race.
 struct VirtualClock;
-impl super::run::Clock for VirtualClock {
+impl super::reporter::Clock for VirtualClock {
     fn now(&self) -> Instant {
         tokio::time::Instant::now().into_std()
     }
@@ -781,7 +782,7 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
     let driver = tokio::spawn({
         let src = src.clone();
         async move {
-            super::run::run_reporter(src, VirtualClock, async move {
+            super::reporter::run_reporter(src, VirtualClock, async move {
                 let _ = cancel_rx.await;
             })
             .await;

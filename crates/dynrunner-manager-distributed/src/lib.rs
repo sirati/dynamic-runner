@@ -41,6 +41,7 @@ pub use dynrunner_protocol_primary_secondary::{RoleChangeHookRegistrar, RoleTabl
 // announcer task body + the lifecycle attach helper live behind one
 // import path so consumers don't have to descend into the submodule.
 pub use observer::{
-    AnnounceTrigger, AnnouncerHandle, AnnouncerSender, PeerResourceHoldingsUpdatedPayload,
-    attach_observer_announcer, run_observer_announcer,
+    AnnounceTrigger, AnnouncerHandle, AnnouncerSender, ErrorAggregationPolicy,
+    InvalidTaskMonitorPolicy, PeerResourceHoldingsUpdatedPayload, Reporter, SharedSnapshotSource,
+    StatsSnapshot, TokioClock, attach_observer_announcer, run_observer_announcer, run_reporter,
 };
