@@ -188,7 +188,26 @@ async fn activate_local_primary_emits_a_keepalive() {
         .run_until(async {
             let (mut coordinator, log, _ends) =
                 make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
-            seed_secondary(&mut coordinator, "sec-0");
+            // Seed sec-0 into the REPLICATED capacity ledger, not just the
+            // local `secondaries` map: `activate_local_primary` now always
+            // hydrates the pool + roster from `cluster_state` on the
+            // on-demand path (the bug fix — `pending.is_none() &&
+            // total_tasks == 0`), and the roster reconstruction
+            // (`reconstruct_secondaries_from_cluster_state`) clears + rebuilds
+            // `self.secondaries` from this capacity ledger. A directly-seeded
+            // `secondaries` entry would be wiped by that rebuild — production
+            // always carries the secondary capacity in the activation
+            // snapshot, so this mirrors the real activation shape.
+            coordinator
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: 1024 * 1024 * 1024,
+                    }],
+                });
 
             assert_eq!(
                 count_keepalives(&log),

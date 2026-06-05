@@ -196,35 +196,56 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     ///
     ///   * **Bootstrap**: `run_pipeline` already built the pool from the
     ///     `binaries` argument and set `total_tasks` before reaching this
-    ///     call. Nothing to seed — the local pool IS the source of truth.
-    ///   * **Failover resume**: a node whose co-located primary was
-    ///     PARKED (it never ran `run_pipeline`'s pool-build) activates
-    ///     after the election. Its pool is unseeded but the continuously-
-    ///     replicated `cluster_state` already holds the full ledger. It
-    ///     must rebuild its `PendingPool` + unified `in_flight` ledger +
-    ///     `completed_tasks` from that CRDT (`hydrate_from_cluster_state`)
-    ///     so dispatch resumes seeded, BYPASSING the connect / mesh-ready
-    ///     handshake (it inherited a formed mesh). The discriminator is
-    ///     "the CRDT holds tasks the local pool does not reflect"
-    ///     (`total_tasks == 0 && cluster_state.task_count() > 0`): true
-    ///     only on the parked-then-activated path, false for bootstrap
-    ///     (where `total_tasks` was set from `binaries`) and for the
-    ///     setup-defer authority (whose CRDT is still empty at activation
-    ///     — discovery seeds it later via the feed).
+    ///     call (`pending.is_some()`). Nothing to seed — the local pool
+    ///     IS the source of truth.
+    ///   * **Activated resume (failover OR setup-defer)**: a co-located
+    ///     primary built ON DEMAND (`run_activated`) never ran
+    ///     `run_pipeline`'s pool-build, so `pending` is `None`. It must
+    ///     build its `PendingPool` from the replicated `cluster_state`
+    ///     (`hydrate_from_cluster_state`) so dispatch resumes seeded,
+    ///     BYPASSING the connect / mesh-ready handshake (it inherited a
+    ///     formed mesh). This covers BOTH activation snapshots uniformly:
+    ///       * a POPULATED failover snapshot — the CRDT already holds the
+    ///         full ledger, so hydrate rebuilds the pool + unified
+    ///         `in_flight` ledger + `completed_tasks` from it; and
+    ///       * an EMPTY setup-defer snapshot — `cluster_state` is still
+    ///         empty at activation (discovery seeds it later via the
+    ///         feed), so hydrate builds an EMPTY (phase-deps-seeded) pool.
+    ///         The pool MUST be built here regardless: the operational
+    ///         loop's `run_complete_check` (and the `TaskAdded` reinject
+    ///         path) calls `self.pool()`, which `expect`s `pending` is
+    ///         `Some`. The empty pool is harmless while `setup_pending()`
+    ///         holds (its drain/counter exits are gated off); the first
+    ///         discovery `TaskAdded` then reinjects into THIS pool and
+    ///         dispatch fires. This mirrors the submitter's
+    ///         `run_pipeline`, which builds the pool UNCONDITIONALLY even
+    ///         in setup-defer mode (empty `binaries`).
+    ///
+    /// The discriminator is `pending.is_none() && total_tasks == 0`:
+    /// true on EVERY on-demand-activated path (both empty and populated
+    /// snapshots — a parked/on-demand primary has `pending == None` and
+    /// `total_tasks == 0` until hydrate runs), false for bootstrap (where
+    /// `run_pipeline` set `pending` and `total_tasks` from `binaries`).
     pub(crate) async fn activate_local_primary(&mut self) -> Result<(), String> {
         self.primary_id = Some(self.config.node_id.clone());
 
-        // Seeded-resume hydration. See the doc above for the
-        // discriminator's rationale; the bootstrap and setup-defer paths
-        // both leave this false, so this is reached ONLY by a parked
-        // co-located primary activating into an already-replicated
-        // ledger.
-        if self.total_tasks == 0 && self.cluster_state.task_count() > 0 {
+        // Activated-resume hydration. See the doc above: the bootstrap
+        // path leaves `pending` Some (and `total_tasks` > 0 for a
+        // non-empty run), so this is reached ONLY by an on-demand
+        // co-located primary (`run_activated`) — whether it activates
+        // into a POPULATED failover ledger or an EMPTY setup-defer one.
+        // In both cases the pool MUST be built so `self.pool()` is never
+        // `None` in the operational loop; for an empty ledger
+        // `hydrate_from_cluster_state` builds an empty (phase-deps-
+        // seeded) pool, exactly what `run_pipeline` builds for the
+        // setup-defer submitter.
+        if self.pending.is_none() && self.total_tasks == 0 {
             tracing::info!(
                 node = %self.config.node_id,
                 crdt_tasks = self.cluster_state.task_count(),
-                "co-located primary activating on a replicated ledger; \
-                 hydrating pool + in-flight ledger from cluster_state"
+                "co-located primary activating on demand; hydrating pool \
+                 + in-flight ledger from cluster_state (empty pool when \
+                 the setup-defer ledger is not yet seeded)"
             );
             self.hydrate_from_cluster_state();
         }

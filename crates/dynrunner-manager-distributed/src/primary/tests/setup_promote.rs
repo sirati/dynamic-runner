@@ -313,18 +313,28 @@ async fn pre_seeded_counter_exit_unchanged() {
 /// neither side-effect runs — phases stay `Active`, no callback
 /// fires, no `drained_pending` accumulates. The latch clears via
 /// the `TaskAdded` / `TasksSpawned` / `RunComplete` mirror in
-/// `mirror_mutation_to_accounting`, after which the SAME cascade
-/// shape (drain + process) legitimately fires `on_phase_end` on
-/// the now-truly-empty phases.
+/// `mirror_mutation_to_accounting`.
+///
+/// Post-clear, the discovery batch's seeding edge REBUILDS the
+/// activated primary's pool from the now-seeded `cluster_state`
+/// (`hydrate_from_cluster_state`, the same on-demand-primary build path
+/// failover uses) so the discovered tasks are dispatchable. A phase that
+/// drew at least one discovered task stays `Active` (it can dispatch); a
+/// declared-but-empty phase is drained to `Done` by the rebuild's
+/// `cascade_drain_done` WITHOUT firing `on_phase_end` — the
+/// activated-primary semantics (the prior authority owned those
+/// callbacks). What this test pins is that NO `on_phase_end` fires while
+/// the gate is up.
 ///
 /// Test rig: builds a `PrimaryCoordinator` directly (no operational
 /// loop, no wire), seeds a 2-phase pool, attaches an `on_phase_end`
-/// callback that records every fire, and calls the cascade pair
-/// twice — once with `setup_pending = true`, once after a
-/// `TaskAdded` mutation has cleared the latch. Asserts on (a) the
-/// callback fire-counts pre- and post-clear, (b) the `phase_state`
-/// reading on the pool (Active before, Done after), and (c) the
-/// latch transition itself.
+/// callback that records every fire, drives the cascade once under the
+/// gate, then applies the discovery `PhaseDepsSet` + `TaskAdded` batch
+/// that clears the latch and rebuilds the pool. Asserts (a) NO callback
+/// fires while `setup_pending = true` even with a non-empty
+/// `drained_pending`, (b) the post-rebuild `phase_state` (phase_a Active
+/// + holding the dispatchable discovered task, phase_b Done), (c) the
+/// rebuild fires no `on_phase_end`, and (d) the latch transition itself.
 #[tokio::test(flavor = "current_thread")]
 async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
     let local = tokio::task::LocalSet::new();
@@ -448,16 +458,20 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
             );
         }
 
-        // -------- Transition: apply a TaskAdded mutation --------
-        // The mirror path (`mirror_mutation_to_accounting`) flips
-        // `setup_pending = false` on TaskAdded / TasksSpawned /
-        // RunComplete. We synthesise the mutation locally and route
-        // it through `handle_cluster_mutation` — the same chokepoint
-        // the operational loop uses when a TaskAdded arrives off the
-        // wire from the promoted secondary. Using a task in
-        // `phase_a` so the post-apply ledger has at least one entry;
-        // `phase_b` stays empty to pin "still-empty phases fire
-        // on_phase_end legitimately post-discovery".
+        // -------- Transition: apply the discovery batch --------
+        // The discovery feed (`ingest_setup_discovery`) broadcasts
+        // `PhaseDepsSet` AHEAD of its `TaskAdded` batch; we mirror that
+        // production shape here (the `PhaseDepsSet` declares both phases so
+        // the setup-defer seeding-edge pool REBUILD keeps phase_b even
+        // though it has no task). Routed through `handle_cluster_mutation`
+        // — the same chokepoint the operational loop uses when the batch
+        // arrives off the wire. The `TaskAdded` clears `setup_pending`
+        // (`mirror_mutation_to_accounting`) and, because this is the
+        // setup-defer seeding edge, REBUILDS the pool from the now-seeded
+        // `cluster_state`: phase_a gains the discovered task (it is no
+        // longer an empty cascade-through phase — the whole point of the
+        // dispatch-enablement fix is that the discovered task reaches the
+        // pool), while phase_b stays empty + declared.
         let bin = TaskInfo {
             path: std::path::PathBuf::from("/tmp/discovered"),
             size: 100,
@@ -473,14 +487,21 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
             resolved_path: None,
         };
         let hash = crate::primary::wire::compute_task_hash(&bin);
+        let mut deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>> =
+            HashMap::new();
+        deps.insert(phase_a.clone(), Vec::new());
+        deps.insert(phase_b.clone(), Vec::new());
         primary
             .handle_cluster_mutation(DistributedMessage::ClusterMutation {
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
-                mutations: vec![ClusterMutation::TaskAdded {
-                    hash: hash.clone(),
-                    task: bin.clone(),
-                }],
+                mutations: vec![
+                    ClusterMutation::PhaseDepsSet { deps },
+                    ClusterMutation::TaskAdded {
+                        hash: hash.clone(),
+                        task: bin.clone(),
+                    },
+                ],
             })
             .await;
 
@@ -499,58 +520,82 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
              post-apply refresh in handle_cluster_mutation)"
         );
 
-        // -------- Phase 2: cascade-after-setup-cleared --------
-        // Re-invoke `process_phase_lifecycle`. The `drained_pending`
-        // queue Phase 1's drain populated is STILL pending (the
-        // early-return suppressed both the callback fire AND the
-        // mark_phase_done step, so poll_drain_transitions never ran
-        // to consume the queue). With the gate cleared, the cascade
-        // now consumes the queue and fires `on_phase_end(.., 0, 0)`
-        // per phase, then marks each Done. This pins the
-        // post-discovery behaviour: the gate is a strict superset of
-        // the historical semantics; once cleared, the cascade
-        // exhibits the same shape a legacy bootstrap pre-loop
-        // cascade would have.
-        //
-        // Note: cluster_state now holds 1 task in phase_a, but the
-        // LOCAL pool is still empty for both phases — TaskAdded
-        // mirrors into cluster_state, not the local pool (see the
-        // `if self.pending.is_some() { reinject }` arm in
-        // handle_cluster_mutation: it gates on TasksSpawned, not
-        // TaskAdded). The locally-empty phases are therefore the
-        // right cascade subject — the shape a setup-defer authority
-        // sees while discovery has seeded the CRDT but not the local
-        // pool.
-        primary.process_phase_lifecycle(&mut None).await;
-
-        // Assertion (3): on_phase_end fires exactly once per declared
-        // phase, with (completed=0, failed=0). Order is not pinned
-        // (the cascade walks `drained_pending` whose ordering is
-        // implementation-defined); we sort-and-compare to keep the
-        // assertion deterministic.
+        // The setup-defer seeding edge REBUILT the pool from the
+        // now-seeded cluster_state via `hydrate_from_cluster_state` — the
+        // SAME on-demand-primary build path failover activation uses. The
+        // pre-injected pool + Phase 1's `drained_pending` queue are
+        // replaced. The rebuilt pool reflects the seeded ledger:
+        //   * phase_a: Active with the discovered task QUEUED (so it can
+        //     DISPATCH — the dispatch-enablement fix). NOT cascade-drained.
+        //   * phase_b: declared (via the discovery PhaseDepsSet) but empty.
+        //     `hydrate_from_cluster_state`'s `cascade_drain_done` walks the
+        //     freshly-built pool to quiescence, so an empty declared phase
+        //     is marked Done DIRECTLY (no `on_phase_end` fired) — the
+        //     SAME activated-primary semantics a failover-promoted primary
+        //     exhibits for a phase that drained on the prior authority.
+        assert_eq!(
+            primary.pool().phase_state(&phase_a),
+            Some(dynrunner_scheduler_api::PhaseState::Active),
+            "phase_a must be Active in the rebuilt pool — it holds the \
+             discovered task and is dispatchable, NOT cascade-drained"
+        );
+        assert!(
+            primary.pool().iter().any(|t| t.phase_id == phase_a),
+            "the discovered task must be QUEUED in the rebuilt pool's phase_a \
+             — the whole point of the dispatch-enablement fix is that a \
+             discovery TaskAdded reaches the dispatch pool, not just the CRDT"
+        );
+        // phase_b is already Done from the rebuild's drain-to-quiescence —
+        // NOT Active (the activated-primary `cascade_drain_done` semantics).
+        assert_eq!(
+            primary.pool().phase_state(&phase_b),
+            Some(dynrunner_scheduler_api::PhaseState::Done),
+            "phase_b (declared but empty) must be Done directly from the \
+             rebuild's cascade_drain_done — an on-demand-built primary does \
+             not re-fire on_phase_end for a phase that drained at build time"
+        );
+        // And the rebuild fired NO on_phase_end — consistent with failover
+        // hydration (the prior authority owned those callbacks). The gate
+        // (`setup_pending`) suppressed the cascade through Phase 1; the
+        // rebuild past the gate drains silently, NOT via the callback path.
         {
-            let mut recorded = calls.lock().expect("poisoned").clone();
-            recorded.sort();
-            assert_eq!(
-                recorded,
-                vec![
-                    ("tokenize".to_string(), 0, 0),
-                    ("unify_vocab".to_string(), 0, 0),
-                ],
-                "post-setup_pending cascade must fire on_phase_end once \
-                 per declared phase with (completed=0, failed=0); \
+            let recorded = calls.lock().expect("poisoned").clone();
+            assert!(
+                recorded.is_empty(),
+                "the setup-defer seeding-edge rebuild must NOT fire on_phase_end \
+                 (activated-primary semantics, same as failover hydration); \
                  observed calls = {recorded:?}"
             );
         }
-        // Assertion (4): the pool has fully cascaded — both phases
-        // reached Done (mark_phase_done ran post-on_phase_end).
-        for phase in [&phase_a, &phase_b] {
-            assert_eq!(
-                primary.pool().phase_state(phase),
-                Some(dynrunner_scheduler_api::PhaseState::Done),
-                "phase {phase} must reach Done after the post-clear cascade"
+
+        // -------- Phase 2: post-rebuild cascade is a no-op --------
+        // Re-running the cascade after the rebuild does nothing: phase_b is
+        // already Done (and is not re-emitted by `poll_drain_transitions`),
+        // and phase_a holds dispatchable work so it is not drained. This
+        // pins that the gate release + rebuild reached a stable state — no
+        // duplicate/late `on_phase_end` fires for either phase.
+        primary.pool_mut().drain_empty_active_phases();
+        primary.process_phase_lifecycle(&mut None).await;
+        {
+            let recorded = calls.lock().expect("poisoned").clone();
+            assert!(
+                recorded.is_empty(),
+                "no on_phase_end may fire post-rebuild: phase_b is already Done \
+                 and phase_a still holds its discovered task; observed calls = \
+                 {recorded:?}"
             );
         }
+        assert_eq!(
+            primary.pool().phase_state(&phase_a),
+            Some(dynrunner_scheduler_api::PhaseState::Active),
+            "phase_a must stay Active — its discovered task is dispatchable, \
+             not cascade-completed"
+        );
+        assert_eq!(
+            primary.pool().phase_state(&phase_b),
+            Some(dynrunner_scheduler_api::PhaseState::Done),
+            "phase_b must remain Done"
+        );
     }).await;
 }
 
@@ -910,8 +955,18 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
                 "setup_pending must be initialised true from config.required_setup_on_promote"
             );
 
-            // Empty ledger at entry — what `activate_local_primary` hydrates
-            // from an EMPTY snapshot: default phase, no binaries, total=0.
+            // Empty ledger at entry. This test injects the pool directly to
+            // isolate the SUPPRESSION half (the `setup_pending()` gate
+            // holding the run-complete exits while the ledger is empty); it
+            // does NOT exercise `activate_local_primary`. The ENABLEMENT
+            // half — `activate_local_primary` BUILDING this pool on an empty
+            // setup-defer snapshot so `self.pool()` is never `None` — is
+            // covered by the real-path test
+            // `activated_empty_snapshot_builds_pool_and_dispatches_discovery`
+            // below, which drives `run_activated` instead of injecting
+            // `pending`. (A prior comment here wrongly claimed
+            // `activate_local_primary` hydrated a pool on an empty snapshot;
+            // it did not — that was the silent-panic bug.)
             let phase = dynrunner_core::PhaseId::from("default");
             let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
                 [phase.clone()],
@@ -1131,4 +1186,298 @@ async fn empty_discovery_run_complete_exits_promptly_not_after_deadline() {
             }
         })
         .await;
+}
+
+/// T8 — the DISPATCH-ENABLEMENT half of the seeded-resume contract,
+/// driven through the REAL `run_activated` path (NOT an injected pool).
+///
+/// This is the regression test for the `--source-already-staged` silent
+/// panic. Every other setup-promote test above injects
+/// `primary.pending = Some(pool)` directly, which is exactly the
+/// false-confidence pattern that hid the bug: they exercise the
+/// SUPPRESSION half (the `setup_pending()` gate) while assuming a pool
+/// was already built. Production reaches this state via `run_activated`
+/// on an EMPTY setup-defer snapshot, where the pool is NOT pre-built —
+/// it must be built BY `activate_local_primary`. Pre-fix
+/// `activate_local_primary` hydrated only when
+/// `total_tasks == 0 && cluster_state.task_count() > 0`; an empty
+/// snapshot has `task_count() == 0`, so hydrate was skipped, `pending`
+/// stayed `None`, and the first `run_complete_check` after the discovery
+/// batch cleared `setup_pending()` hit `self.pool().expect(...)` and
+/// PANICKED inside the `spawn_local` task — silently (no `catch_unwind`),
+/// leaving the host RUNNING and the primary mute.
+///
+/// Beyond the panic, the test pins the FULL dispatch-enablement contract:
+/// `activate_local_primary`'s pool is built EMPTY (the activation snapshot
+/// carries no `PhaseDepsSet`), so the later discovery batch introduces a
+/// phase the empty pool does not know. A plain reinject can't make a
+/// new-phase task dispatchable (the pool registers phases only at build
+/// time, classified Active/Blocked from `phase_deps`), so the receive path
+/// REBUILDS the pool from the now-seeded `cluster_state` on the setup-defer
+/// seeding edge. Without that rebuild the panic is fixed but the discovery
+/// task silently NEVER dispatches and the run hangs.
+///
+/// The test drives `run_activated(EMPTY_SNAPSHOT)` end to end:
+///   1. The snapshot carries a `SecondaryCapacity` for `sec-0` (1 idle
+///      worker) but ZERO tasks — so `activate_local_primary` →
+///      `hydrate_from_cluster_state` builds an EMPTY pool AND reconstructs
+///      an idle worker, while `setup_pending()` stays true (no tasks yet).
+///   2. A concurrent producer SLEEPS first (so the operational loop spins
+///      at least one full iteration on the empty ledger — pre-fix THAT
+///      iteration's `run_complete_check` panics on `pool()`), then feeds
+///      the loopback the real discovery batch
+///      (`PhaseDepsSet` + 1×`TaskAdded`). It then AWAITS the actual
+///      `TaskAssignment` the primary dispatches to sec-0 and only THEN
+///      reports the worker's `TaskComplete` — completion causally follows
+///      dispatch (the production ordering), removing the select-arm race a
+///      fixed-timer completion would introduce.
+///   3. Assertions: (a) `run_activated` returns `Ok` — no panic, the pool
+///      was built; (b) the discovery task became DISPATCHABLE — a
+///      `TaskAssignment` for its hash was sent to `sec-0` (the seeding-edge
+///      pool rebuild registered the discovery phase Active and the
+///      `TasksAdded`→recheck→`dispatch_to_idle_workers` chain fired); and
+///      (c) the run finalized via the counter exit at `total == 1`
+///      (not 0, not hung).
+#[tokio::test(flavor = "current_thread")]
+async fn activated_empty_snapshot_builds_pool_and_dispatches_discovery() {
+    use dynrunner_core::{ResourceAmount, ResourceKind};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let (_sec_id, mut to_sec_rx, incoming_tx) =
+                secondary_ends.into_iter().next().unwrap();
+
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                // Keepalive well ABOVE the 50ms worker-signal batch idle
+                // window: the operational loop's `select!` cancels the
+                // worker-management arm's in-progress batch drain whenever
+                // another arm fires, dropping the already-recv'd signals.
+                // The other setup-promote tests use a 50ms keepalive (they
+                // never DISPATCH, so they don't care), but this test does
+                // dispatch — a 50ms keepalive would race the drain's 50ms
+                // idle window and the heartbeat tick could swallow the
+                // `TasksAdded` recheck. Production keepalive is seconds, so
+                // this is the realistic cadence, not a workaround.
+                keepalive_interval: Duration::from_secs(2),
+                // Setup-defer mode — the activated co-located primary on the
+                // `--source-already-staged` path is built with exactly this
+                // flag set. A long deadline so the ONLY clean exit is the
+                // counter path after the discovery batch lands.
+                required_setup_on_promote: true,
+                setup_promote_deadline: Duration::from_secs(30),
+                ..test_primary_config()
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // The on-demand primary's own ledger is empty until the restore;
+            // the pool is NOT pre-built (the bug-shaped initial state).
+            assert!(
+                primary.pending.is_none(),
+                "an on-demand-activated primary starts with NO pool — the whole \
+                 point of the test is that activate_local_primary must BUILD it"
+            );
+            assert_eq!(primary.total_tasks, 0);
+
+            // EMPTY setup-defer activation snapshot: ZERO tasks (so
+            // `setup_pending()` is true at activation) but a `sec-0`
+            // capacity record (1 worker) so the reconstructed roster has an
+            // idle dispatch target. This is the `--source-already-staged`
+            // shape — the chosen peer's mirror BEFORE its discovery feed has
+            // seeded any task.
+            let snapshot = {
+                let mut seed = crate::cluster_state::ClusterState::<TestId>::new();
+                seed.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: vec![ResourceAmount {
+                        kind: ResourceKind::memory(),
+                        amount: 8 * 1024 * 1024 * 1024,
+                    }],
+                });
+                seed.snapshot()
+            };
+            assert_eq!(
+                snapshot_task_count(&snapshot),
+                0,
+                "the activation snapshot must be EMPTY of tasks — the bug shape \
+                 hydrate previously skipped (task_count() == 0)"
+            );
+
+            // The discovery task the feed broadcasts after activation.
+            let bin = make_binary("setup-discovered-task", 100);
+            let hash = crate::primary::wire::compute_task_hash(&bin);
+
+            // The producer drives the REAL production ORDERING and owns the
+            // secondary's inbox so the completion CAUSALLY FOLLOWS the
+            // dispatch (a worker reports done only after it was assigned the
+            // task) — this removes the select!-arm race a fixed-timer
+            // completion would create (TaskComplete winning the recv arm
+            // before the TasksAdded recheck dispatches). It records the
+            // dispatched `file_hash` into a shared cell the assertion reads.
+            let dispatched: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let producer_tx = incoming_tx.clone();
+            let producer_bin = bin.clone();
+            let producer_hash = hash.clone();
+            let dispatched_w = dispatched.clone();
+            let producer = async move {
+                // Spin first so the operational loop iterates on the EMPTY
+                // ledger (the iteration that PANICS pre-fix on `pool()`),
+                // THEN broadcast the real discovery batch shape: PhaseDepsSet
+                // ahead of the TaskAdded (mirrors `ingest_setup_discovery`).
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                producer_tx
+                    .send(DistributedMessage::ClusterMutation {
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![
+                            ClusterMutation::<TestId>::PhaseDepsSet {
+                                deps: HashMap::new(),
+                            },
+                            ClusterMutation::<TestId>::TaskAdded {
+                                hash: producer_hash.clone(),
+                                task: producer_bin,
+                            },
+                        ],
+                    })
+                    .expect(
+                        "the inbound channel must still be open — a SendError here \
+                         means run_activated already exited/panicked at total=0, i.e. \
+                         the activated empty-snapshot pool build failed",
+                    );
+
+                // Await the actual TaskAssignment the primary dispatches to
+                // sec-0 (the load-bearing proof that the rebuilt pool's
+                // discovery phase is Active and the TasksAdded recheck
+                // assigned the task). Poll the secondary inbox with short
+                // yields; bounded so a never-dispatch regression fails the
+                // OUTER 5s timeout loudly rather than hanging here.
+                let mut assigned_worker: Option<u32> = None;
+                for _ in 0..200 {
+                    while let Ok(msg) = to_sec_rx.try_recv() {
+                        if let DistributedMessage::TaskAssignment {
+                            worker_id,
+                            file_hash,
+                            ..
+                        } = msg
+                        {
+                            dispatched_w.borrow_mut().push(file_hash);
+                            assigned_worker = Some(worker_id);
+                        }
+                    }
+                    if assigned_worker.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let worker_id = assigned_worker.expect(
+                    "the discovery task must have been DISPATCHED to sec-0 within the \
+                     poll window — no TaskAssignment arrived, so the rebuilt pool's \
+                     discovery phase never became dispatchable",
+                );
+
+                // Report the completion for the ACTUALLY-assigned worker, so
+                // the counter exit fires only AFTER a genuine dispatch.
+                producer_tx
+                    .send(DistributedMessage::TaskComplete {
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        secondary_id: "sec-0".into(),
+                        worker_id,
+                        task_hash: producer_hash,
+                        result_data: None,
+                    })
+                    .expect("inbound channel must remain open for the completion report");
+            };
+            // Hold the original sender so the channel never closes.
+            let _hold = incoming_tx;
+
+            let exit = tokio::time::timeout(Duration::from_secs(5), async {
+                let (run_res, ()) = tokio::join!(primary.run_activated(snapshot), producer);
+                run_res
+            })
+            .await;
+
+            // (a) NO PANIC: run_activated returned cleanly. Pre-fix the
+            // operational loop's `pool()` call panicked inside the future,
+            // which would surface here as the joined future panicking (the
+            // test process aborts) — NOT an Ok.
+            match exit {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!(
+                    "run_activated returned Err on the empty-snapshot seeded resume: {e:?}"
+                ),
+                Err(_) => panic!(
+                    "run_activated did not finish within 5s — the activated primary \
+                     hung (pool never built / TasksAdded never fired / counter exit \
+                     not re-enabling)"
+                ),
+            }
+
+            // (c) The discovery task was absorbed and the run finalized via
+            // the counter path — total=1 (not the bug's stuck-at-0), and the
+            // task credited.
+            assert!(
+                !primary.setup_pending(),
+                "setup_pending must clear once the discovery TaskAdded lands"
+            );
+            assert_eq!(
+                primary.total_tasks, 1,
+                "the discovery task must be absorbed (total=1), not stuck at 0"
+            );
+            assert_eq!(
+                primary.completed_count(),
+                1,
+                "the discovered task's completion must be credited"
+            );
+            assert_eq!(
+                primary.stranded_count(),
+                0,
+                "no stranded tasks — the run finalized cleanly via the counter exit"
+            );
+            assert!(
+                primary.setup_deadline_outcome.is_none(),
+                "the run completed via the counter path, not the deadline backstop"
+            );
+
+            // (b) DISPATCHABILITY: the freshly-Pending TaskAdded was surfaced
+            // into the built pool, fired `TasksAdded`, and the recheck
+            // dispatched it to the reconstructed idle worker — so a
+            // `TaskAssignment` for the discovery task's hash was sent to
+            // sec-0. This is the load-bearing proof that the pool was not
+            // only built (no panic) but is genuinely DISPATCHING. A
+            // bookkeeping-only credit (counter exit without dispatch) would
+            // leave this inbox without a matching assignment.
+            let assigned_hashes = dispatched.borrow().clone();
+            assert!(
+                assigned_hashes.contains(&hash),
+                "the discovery task must have been DISPATCHED (a TaskAssignment for \
+                 its hash sent to sec-0) — proof that activate_local_primary built \
+                 the pool AND the setup-defer seeding edge rebuilt it from the seeded \
+                 cluster_state so the discovery phase is Active and the \
+                 TasksAdded→recheck dispatch chain fired. Got assignments: \
+                 {assigned_hashes:?}"
+            );
+        })
+        .await;
+}
+
+/// Count the tasks carried by a `ClusterStateSnapshot` without restoring
+/// it — used to pin that an activation snapshot is genuinely EMPTY of
+/// tasks (the setup-defer bug shape `hydrate` previously skipped). Built
+/// by restoring into a throwaway `ClusterState` and reading its count, so
+/// it reads the same field `setup_pending()` / hydrate consult.
+fn snapshot_task_count(snap: &crate::cluster_state::ClusterStateSnapshot<TestId>) -> usize {
+    let mut probe = crate::cluster_state::ClusterState::<TestId>::new();
+    probe.restore(snap.clone());
+    probe.task_count()
 }
