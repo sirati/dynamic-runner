@@ -536,6 +536,7 @@ async fn activation_is_fire_once() {
             peer_id: "sec-a".into(),
             is_observer: false,
             can_be_primary: true,
+            cap_version: Default::default(),
         },
     );
     {
@@ -642,6 +643,7 @@ async fn wake_frame_double_apply_is_fire_once() {
         peer_id: "sec-a".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
     {
         let bc = build_count.clone();
@@ -715,6 +717,7 @@ async fn on_demand_capable_without_activator_latches_fatal_exit() {
         peer_id: "sec-a".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
     assert!(sec.fatal_exit.is_none(), "no fatal_exit before activation");
 

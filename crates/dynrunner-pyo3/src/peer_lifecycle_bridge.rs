@@ -154,6 +154,10 @@ fn encode_cause<'py>(py: Python<'py>, cause: &RemovalCause) -> PyResult<Bound<'p
             dict.set_item("kind", "self_departure")?;
             dict.set_item("reason", bs.as_str())?;
         }
+        RemovalCause::RosterReemit => {
+            dict.set_item("kind", "roster_reemit")?;
+            dict.set_item("reason", py.None())?;
+        }
     }
     Ok(dict)
 }

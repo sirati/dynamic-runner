@@ -459,12 +459,21 @@ pub(super) enum PeerState {
     Dead,
 }
 
-/// One entry in `ClusterState::peer_state`. Holds the liveness bit plus
-/// scaffolding metadata that future mutations (`PeerInfo`/`PeerCert`
+/// One entry in `ClusterState::peer_state`. Holds ONLY the liveness bit
+/// plus scaffolding metadata that future mutations (`PeerInfo`/`PeerCert`
 /// broadcasts) will populate — today `pubkey`/`endpoint` start `None`
-/// and stay `None` because no mutation writes them yet. `is_observer`
-/// mirrors the `RoleTable.observers` projection so reads that need the
-/// flag without going through the observer set have a single source.
+/// and stay `None` because no mutation writes them yet.
+///
+/// Liveness ONLY (C6): the role-capability bits (`is_observer`,
+/// `can_be_primary`) used to live here, duplicating the `RoleTable`
+/// projection (CRD-4: two sources of truth). They now live in EXACTLY
+/// ONE replicated place — the `capabilities` 2P-set on `ClusterState` —
+/// and the `RoleTable.observers` / `RoleTable.can_be_primary` sets are
+/// read-time projections of `capability × this map's Alive bit`
+/// (`reproject_roles`). This entry composes with the capability set at
+/// projection time; it is never MERGED with it. Liveness is node-local
+/// and honest (never resurrected by anti-entropy); capability converges
+/// as a proper CRDT.
 ///
 /// Internal — exposed nowhere outside `cluster_state`'s sub-modules.
 /// `pub(super)` visibility so the `ClusterState` struct in
@@ -482,5 +491,45 @@ pub(super) struct PeerEntry {
     /// See `pubkey` — same forward-looking scaffolding.
     #[allow(dead_code)]
     pub(super) endpoint: Option<String>,
-    pub(super) is_observer: bool,
+}
+
+/// One entry in `ClusterState::capabilities` — the replicated 2P-set
+/// that is the SINGLE source of truth for a peer's role capabilities
+/// (`is_observer` / `can_be_primary`), decoupled from liveness (C6).
+///
+/// Two-phase-set semantics: `Advertised` grows on a join / capability
+/// advertisement; `Departed` is the tombstone written on a genuine
+/// departure (`PeerRemoved`) and DOMINATES any `Advertised`. The merge
+/// (`merge_capability`, `merge.rs`) is commutative/associative/idempotent:
+///   * `Departed ∨ _ = Departed`;
+///   * `Advertised ∨ Advertised = Advertised { is_observer: a || b,
+///     can_be_primary: <bit of the higher cap_version>,
+///     cap_version: max(...) }`.
+///
+/// `is_observer` is a pure upward ratchet (OR — an observer never
+/// un-observes mid-run); `can_be_primary` follows the higher `cap_version`
+/// so a later `SetCanBePrimary(false)` wins over an earlier `true`.
+///
+/// `Serialize`/`Deserialize` so the map round-trips through the snapshot
+/// (the 2P-set IS snapshot-healable — a divergence the digest flags is
+/// one a snapshot pull's `restore` actually heals; see `merge_capability`
+/// + the digest `capabilities_hash`).
+///
+/// `pub` (unlike the module-private `PeerEntry`/`PeerState`) because it
+/// crosses the WIRE inside the `pub` `ClusterStateSnapshot` — the same
+/// category as `SecondaryCapacityRecord`. Liveness (`PeerEntry`) projects
+/// to a bare `HashSet<String>` on the wire and stays private; the
+/// capability 2P-set carries structured per-id state, so its value type is
+/// part of the snapshot's public serialization contract. The variants are
+/// only CONSTRUCTED inside `cluster_state`; external callers round-trip the
+/// snapshot opaquely (decode + `restore`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CapabilityEntry {
+    Advertised {
+        is_observer: bool,
+        can_be_primary: bool,
+        cap_version: TaskVersion,
+    },
+    /// 2P-set tombstone (genuine departure). Dominates any `Advertised`.
+    Departed,
 }

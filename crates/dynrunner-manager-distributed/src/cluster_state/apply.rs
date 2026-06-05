@@ -179,13 +179,22 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 self.apply_merge(&hash, incoming, None, resumed)
             }
-            // `reason` is advisory routing metadata only; the epoch-LWW
-            // apply ("highest epoch wins, one primary") is `reason`-blind.
+            // `reason` is advisory routing metadata only; the register
+            // adopt rule ("higher epoch wins; equal epoch → lex-lower id
+            // wins") is `reason`-blind. CRD-2/D-P: the equal-epoch
+            // tie-break (lower id wins, applied identically here and in
+            // restore via `primary_register_adopt`) heals the permanent
+            // equal-epoch identity split two concurrent `PrimaryChanged`
+            // originations would otherwise create — and it agrees with the
+            // election's `lowest_alive` `.min()` leader, so the CRDT
+            // register names the same primary the election would.
             ClusterMutation::PrimaryChanged { new, epoch, .. } => {
-                if epoch < self.primary_epoch {
-                    return ApplyOutcome::NoOp;
-                }
-                if epoch == self.primary_epoch && self.current_primary.as_deref() == Some(&new) {
+                if !super::merge::primary_register_adopt(
+                    self.primary_epoch,
+                    self.current_primary.as_deref(),
+                    epoch,
+                    &new,
+                ) {
                     return ApplyOutcome::NoOp;
                 }
                 self.current_primary = Some(new.clone());
@@ -211,7 +220,36 @@ impl<I: Identifier> ClusterState<I> {
             }
             ClusterMutation::PhaseDepsSet { deps } => {
                 if !self.phase_deps.is_empty() {
-                    // Static config: re-application is silent.
+                    // Static config: re-application is silent on the SAME
+                    // graph (and on a degenerate EMPTY re-set, which is not
+                    // a second origination — just a redundant no-op). CRD-3
+                    // detection layer: a re-application with a non-empty
+                    // DIVERGENT graph is a contract violation (the phase
+                    // graph is set-once per run; a genuine second
+                    // origination means two primaries minted different
+                    // graphs). Flag it LOUDLY (a live cluster never
+                    // wedges — the deterministic content-hash reconcile
+                    // runs in `restore`, the separate reconciliation
+                    // layer; detection here, reconciliation there, sharing
+                    // the one `canonical_phase_deps_hash` helper).
+                    if !deps.is_empty()
+                        && super::merge::canonical_phase_deps_hash(&self.phase_deps)
+                            != super::merge::canonical_phase_deps_hash(&deps)
+                    {
+                        tracing::error!(
+                            target: "dynrunner_cluster_state",
+                            "PhaseDepsSet re-applied with a DIVERGENT graph — \
+                             the per-run phase-dependency graph is set-once; a \
+                             second origination with different deps is a contract \
+                             violation. Keeping the local graph; anti-entropy \
+                             restore reconciles deterministically (lower \
+                             content-hash wins)."
+                        );
+                        debug_assert!(
+                            false,
+                            "PhaseDepsSet re-applied with a divergent graph"
+                        );
+                    }
                     return ApplyOutcome::NoOp;
                 }
                 self.phase_deps = deps;
@@ -361,11 +399,13 @@ impl<I: Identifier> ClusterState<I> {
                 peer_id,
                 is_observer,
                 can_be_primary,
-            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary),
+                cap_version,
+            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary, cap_version),
             ClusterMutation::SetCanBePrimary {
                 peer_id,
                 can_be_primary,
-            } => self.apply_set_can_be_primary(peer_id, can_be_primary),
+                cap_version,
+            } => self.apply_set_can_be_primary(peer_id, can_be_primary, cap_version),
             ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,

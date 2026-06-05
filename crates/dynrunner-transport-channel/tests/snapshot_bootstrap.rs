@@ -25,14 +25,15 @@
 //!
 //! ## Architectural assertion
 //!
-//! The pre-baked snapshot JSON includes both task entries AND an
-//! `observers` field — the joiner asserts both round-trip. This pins
-//! Step 7's "observers as first-class cluster facts" wiring through
-//! the snapshot frame: without observers carried through the
-//! snapshot, a fresh joiner would have an empty `role_table.observers`
-//! between snapshot-restore and the next live PeerInfo broadcast, and
-//! its election filter (`secondary::election::lowest_alive` skips
-//! observers) would briefly mis-promote an observer candidate.
+//! The pre-baked snapshot JSON includes both task entries AND a
+//! `capabilities` map — the joiner asserts both round-trip. This pins
+//! the role-capability 2P-set (C6) wiring through the snapshot frame:
+//! without the capability roster carried through the snapshot, a fresh
+//! joiner would have empty `role_table.observers` /
+//! `role_table.can_be_primary` projections between snapshot-restore and
+//! the next live PeerInfo broadcast, and its election filter
+//! (`secondary::election::lowest_alive` skips observers) would briefly
+//! mis-promote an observer candidate.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -61,6 +62,16 @@ struct TestId(String);
 /// snapshot tests in `cluster_state.rs` pin the round-trip on the
 /// production side; this test pins the transport-layer plumbing
 /// against the same wire shape.
+///
+/// The `capabilities` field mirrors the real
+/// `capabilities: HashMap<String, CapabilityEntry>` 2P-set the
+/// production snapshot serializes (C6 — the SINGLE source of
+/// `is_observer` / `can_be_primary`, which replaced the old projected
+/// `observers` field). [`SyntheticCapability`] reproduces
+/// `CapabilityEntry`'s EXACT externally-tagged serde shape verbatim (see
+/// its doc), so the bytes this fixture round-trips are the bytes
+/// production emits — not a parallel shape that would give false
+/// confidence the transport carries the real role data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyntheticSnapshot {
     tasks: HashMap<String, serde_json::Value>,
@@ -68,13 +79,47 @@ struct SyntheticSnapshot {
     primary_epoch: u64,
     phase_deps: HashMap<String, Vec<String>>,
     #[serde(default)]
-    observers: std::collections::HashSet<String>,
+    capabilities: HashMap<String, SyntheticCapability>,
+}
+
+/// Byte-for-byte mirror of `CapabilityEntry`'s serde shape
+/// (`cluster_state/types.rs`). `CapabilityEntry` is a plain
+/// `#[derive(Serialize, Deserialize)]` enum with no `serde(tag)` /
+/// `rename` / `deny_unknown_fields`, so serde's DEFAULT externally-tagged
+/// representation applies. `Advertised { is_observer, can_be_primary,
+/// cap_version }` encodes as
+/// `{"Advertised":{"is_observer":<bool>,"can_be_primary":<bool>,"cap_version":{"primary_epoch":<u64>,"seq":<u32>}}}`;
+/// `Departed` (a unit variant) encodes as the bare string `"Departed"`.
+///
+/// Because the encoding is STRUCTURAL, the variant + field names here MUST
+/// match `CapabilityEntry`'s exactly for the bytes to be identical — which
+/// is the whole point of this fixture (mirror the real encoder's bytes, do
+/// not invent a parallel shape). `cap_version` mirrors `TaskVersion`'s
+/// `{primary_epoch, seq}` serde shape via [`SyntheticVersion`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum SyntheticCapability {
+    Advertised {
+        is_observer: bool,
+        can_be_primary: bool,
+        cap_version: SyntheticVersion,
+    },
+    Departed,
+}
+
+/// Mirror of `TaskVersion`'s serde shape (`core/types/version.rs`):
+/// `{ "primary_epoch": <u64>, "seq": <u32> }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct SyntheticVersion {
+    primary_epoch: u64,
+    seq: u32,
 }
 
 /// Pre-bake a snapshot payload the responder will echo. Two task
-/// hashes, a known primary epoch, and two observer ids. The shape is
-/// deliberately minimal — the assertion target is `tasks` + `observers`
-/// round-trip; the live merge-rule tests live in `cluster_state.rs`.
+/// hashes, a known primary epoch, and one capability entry: an
+/// `Advertised { is_observer: true, .. }` for the late-joining observer
+/// peer. The shape is deliberately minimal — the assertion target is
+/// `tasks` + `capabilities` round-trip; the live merge-rule tests live in
+/// `cluster_state.rs`.
 fn make_synthetic_snapshot() -> SyntheticSnapshot {
     SyntheticSnapshot {
         tasks: [
@@ -86,7 +131,19 @@ fn make_synthetic_snapshot() -> SyntheticSnapshot {
         current_primary: Some("primary-peer".to_string()),
         primary_epoch: 7,
         phase_deps: HashMap::new(),
-        observers: ["observer-peer".to_string()].into_iter().collect(),
+        capabilities: [(
+            "observer-peer".to_string(),
+            SyntheticCapability::Advertised {
+                is_observer: true,
+                can_be_primary: false,
+                cap_version: SyntheticVersion {
+                    primary_epoch: 7,
+                    seq: 1,
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
     }
 }
 
@@ -142,11 +199,12 @@ async fn responder_pump(
 ///    proves the wire frame round-tripped exactly.
 /// 3. `snapshot.tasks` matches the canned set — proves the task
 ///    ledger survives the snapshot RPC.
-/// 4. `snapshot.observers` matches the canned set — proves Step 7's
-///    "observers as first-class cluster facts" wiring survives the
-///    snapshot roundtrip (this is the new contract added in Step 8).
+/// 4. `snapshot.capabilities` matches the canned 2P-set — proves the
+///    role-capability roster (C6) survives the snapshot roundtrip (the
+///    `Advertised { is_observer: true, .. }` entry for the observer peer
+///    round-trips byte-identically to `CapabilityEntry`'s wire shape).
 #[tokio::test]
-async fn join_running_cluster_returns_snapshot_with_observers() {
+async fn join_running_cluster_returns_snapshot_with_capabilities() {
     let peer_ids: Vec<String> = vec![
         "joiner".into(),
         "primary-peer".into(),
@@ -241,14 +299,27 @@ async fn join_running_cluster_returns_snapshot_with_observers() {
             .collect()
     );
 
-    // Step 7 + 8 contract: observers survive the snapshot roundtrip.
-    // Without this, the joiner's election filter would briefly
-    // promote an observer in the gap between snapshot-restore and
-    // the next live PeerInfo broadcast.
-    assert_eq!(
-        parsed.observers,
-        ["observer-peer".to_string()].into_iter().collect()
-    );
+    // C6 contract: the role-capability 2P-set survives the snapshot
+    // roundtrip. Without this, the joiner's election filter would briefly
+    // promote an observer in the gap between snapshot-restore and the next
+    // live PeerInfo broadcast. The decoded entry must be the exact
+    // `Advertised { is_observer: true, .. }` the fixture baked — proving
+    // the transport carried `CapabilityEntry`'s real wire bytes (the
+    // structured capability state), not just a key presence.
+    let expected_capabilities: HashMap<String, SyntheticCapability> = [(
+        "observer-peer".to_string(),
+        SyntheticCapability::Advertised {
+            is_observer: true,
+            can_be_primary: false,
+            cap_version: SyntheticVersion {
+                primary_epoch: 7,
+                seq: 1,
+            },
+        },
+    )]
+    .into_iter()
+    .collect();
+    assert_eq!(parsed.capabilities, expected_capabilities);
 
     // Primary-epoch carries through (canonical authority for the
     // joiner's role-table on restore).
@@ -287,7 +358,7 @@ async fn join_running_cluster_collects_all_responders_for_union() {
         current_primary: None,
         primary_epoch: 1,
         phase_deps: HashMap::new(),
-        observers: Default::default(),
+        capabilities: Default::default(),
     };
     let complete_snap = SyntheticSnapshot {
         tasks: [
@@ -299,7 +370,7 @@ async fn join_running_cluster_collects_all_responders_for_union() {
         current_primary: Some("primary-peer".to_string()),
         primary_epoch: 5,
         phase_deps: HashMap::new(),
-        observers: Default::default(),
+        capabilities: Default::default(),
     };
     let incomplete_json = serde_json::to_string(&incomplete_snap).unwrap();
     let complete_json = serde_json::to_string(&complete_snap).unwrap();

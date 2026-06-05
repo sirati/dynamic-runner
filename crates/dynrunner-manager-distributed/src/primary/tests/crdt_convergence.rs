@@ -16,7 +16,7 @@ use super::*;
 
 use crate::primary::wire::compute_task_hash;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
-use dynrunner_protocol_primary_secondary::MessageType;
+use dynrunner_protocol_primary_secondary::{MessageType, RemovalCause};
 
 /// One advertised-memory resource amount (bytes), mirroring the live
 /// welcome shape (a single `memory` `ResourceAmount`).
@@ -111,6 +111,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                         peer_id: id.into(),
                         is_observer: false,
                         can_be_primary: false,
+                        cap_version: Default::default(),
                     });
                     cs.apply(ClusterMutation::SecondaryCapacity {
                         secondary: id.into(),
@@ -157,6 +158,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                     peer_id: "sec-0".into(),
                     is_observer: false,
                     can_be_primary: true,
+                    cap_version: Default::default(),
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "sec-0".into(),
@@ -212,6 +214,108 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                     .alive_remote_secondary_count(),
                 2,
                 "post-heal both worker-secondaries are known + alive"
+            );
+        })
+        .await;
+}
+
+/// (a') The `RosterReemit` Departed re-emit path. `rebroadcast_full_roster`
+/// catches a reconnecting node's LIVENESS view up by re-emitting a
+/// `PeerRemoved { cause: RosterReemit }` for every id the `capabilities`
+/// 2P-set holds as `Departed` — iterating `departed_capability_ids()` (the
+/// authoritative tombstone view), NOT `self.secondaries` (which already
+/// dropped the departed peer). This pins that a Departed-tombstoned id is
+/// re-emitted while live ids are NOT (live ids ride the `PeerJoined` /
+/// `SecondaryCapacity` records, never a `PeerRemoved`).
+#[tokio::test(flavor = "current_thread")]
+async fn rebroadcast_full_roster_reemits_departed_tombstones() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let mut sec_inbox = ends.remove(0).1;
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // One LIVE secondary in the connection table (rides PeerJoined +
+            // SecondaryCapacity, never a PeerRemoved).
+            insert_operational_secondary(&mut primary, "sec-live", 2, 8 * 1024 * 1024 * 1024);
+
+            // Seed the capabilities 2P-set with a Departed tombstone for a
+            // peer that joined and then departed (the apply path that writes
+            // the tombstone). `sec-live` also gets its membership record so
+            // the live-vs-departed distinction is exercised end to end.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-live".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                });
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "sec-gone".into(),
+                    is_observer: false,
+                    can_be_primary: false,
+                    cap_version: Default::default(),
+                });
+                cs.apply(ClusterMutation::PeerRemoved {
+                    id: "sec-gone".into(),
+                    cause: RemovalCause::KeepaliveMiss,
+                });
+            }
+            // Precondition: the 2P-set holds sec-gone as the ONLY Departed
+            // tombstone (sec-live is still Advertised).
+            let departed: std::collections::HashSet<&str> = primary
+                .cluster_state_for_test()
+                .departed_capability_ids()
+                .collect();
+            assert_eq!(
+                departed,
+                std::iter::once("sec-gone").collect(),
+                "only sec-gone is a Departed tombstone"
+            );
+
+            primary.rebroadcast_full_roster().await;
+            let batch = drain_first_cluster_mutation(&mut sec_inbox);
+
+            // The batch re-emits a `PeerRemoved { cause: RosterReemit }` for
+            // the Departed-tombstoned id, and for NO live id.
+            let reemitted: std::collections::HashSet<&str> = batch
+                .iter()
+                .filter_map(|m| match m {
+                    ClusterMutation::PeerRemoved {
+                        id,
+                        cause: RemovalCause::RosterReemit,
+                    } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reemitted,
+                std::iter::once("sec-gone").collect(),
+                "rebroadcast must re-emit a RosterReemit PeerRemoved for the Departed id only"
+            );
+            assert!(
+                !reemitted.contains("sec-live"),
+                "a live secondary must never be re-emitted as a PeerRemoved"
+            );
+            // The live secondary still rides its membership record (proves
+            // the live roster path is untouched by the Departed re-emit).
+            let joined: std::collections::HashSet<&str> = batch
+                .iter()
+                .filter_map(|m| match m {
+                    ClusterMutation::PeerJoined { peer_id, .. } => Some(peer_id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                joined.contains("sec-live"),
+                "the live secondary must still ride a PeerJoined membership record"
             );
         })
         .await;

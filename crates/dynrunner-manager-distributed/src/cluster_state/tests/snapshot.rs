@@ -129,11 +129,13 @@ fn snapshot_round_trip_preserves_observers() {
         peer_id: "obs-1".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-2".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
 
     let snap = s.snapshot();
@@ -147,34 +149,38 @@ fn snapshot_round_trip_preserves_observers() {
     );
 }
 
-/// Pins the Step 8 "first-bootstrap only" branch on `restore`:
-/// a joiner that has already observed a live `PeerJoined`
-/// broadcast (so `observers` is non-empty) keeps its local set
-/// rather than overwriting from a (possibly stale) snapshot.
-/// Mirrors the `phase_deps` "replaced if local empty, else kept"
-/// shape.
+/// C6: `restore` MERGES the capability 2P-set rather than the old
+/// "first-bootstrap-replace, else keep local" workaround. A joiner that
+/// already observed one observer via a live `PeerJoined` and then restores
+/// a snapshot carrying a DIFFERENT observer ends up with BOTH — the proper
+/// grow-set union, not a clobber-or-ignore. (The old keep-local-else-
+/// replace branch was a band-aid for the broken merge; the 2P-set unions
+/// the capability entries and the projection re-derives both observers.)
 #[test]
-fn restore_keeps_local_observers_when_already_populated() {
+fn restore_merges_capability_2p_set_unioning_observers() {
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
     joiner.apply(ClusterMutation::PeerJoined {
         peer_id: "live-obs".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::PeerJoined {
-        peer_id: "stale-obs".into(),
+        peer_id: "snap-obs".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
 
     joiner.restore(peer.snapshot());
-    // Local set wins (live `PeerJoined` path is authoritative
-    // once it has fired); snapshot's observers field is inert.
+    // The 2P-set union: BOTH observers are present after restore (each was
+    // alive on its origin, so each rode `alive_members` into the joiner and
+    // projects in). No clobber, no ignore — a proper CRDT merge.
     assert_eq!(
         joiner.role_table().observers,
-        HashSet::from(["live-obs".to_string()])
+        HashSet::from(["live-obs".to_string(), "snap-obs".to_string()])
     );
 }
 
@@ -431,11 +437,13 @@ fn consumer_invariants_survive_snapshot_restore() {
         peer_id: "primary".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "sec-remote".into(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     s.apply(ClusterMutation::SecondaryCapacity {
         secondary: "sec-remote".into(),
@@ -485,8 +493,9 @@ fn consumer_invariants_survive_snapshot_restore() {
 /// Dead-wins / sticky-removal merge on the `alive_members` field,
 /// mirroring `apply_peer.rs`: restoring an alive id over a local
 /// `Dead` peer keeps it Dead; restoring over an absent id inserts
-/// Alive; the merge is idempotent on repeat. The inserted entry's
-/// `is_observer` is reconstructed from the co-restored observer set.
+/// Alive; the merge is idempotent on repeat. The observer ROLE rides
+/// the separate `capabilities` 2P-set (C6) and the `role_table().observers`
+/// projection re-derives from `capability × alive` after both merge.
 #[test]
 fn restore_alive_members_dead_wins_and_idempotent() {
     // Source (the snapshotting primary) sees both ids alive, one of
@@ -496,11 +505,13 @@ fn restore_alive_members_dead_wins_and_idempotent() {
         peer_id: "sec-a".into(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     source.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-b".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     let snap = source.snapshot();
 
@@ -511,6 +522,7 @@ fn restore_alive_members_dead_wins_and_idempotent() {
         peer_id: "sec-a".into(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     local.apply(ClusterMutation::PeerRemoved {
         id: "sec-a".into(),
@@ -524,16 +536,106 @@ fn restore_alive_members_dead_wins_and_idempotent() {
         !local.is_peer_alive("sec-a"),
         "sticky-removal: local Dead is never overwritten by a snapshot Alive"
     );
-    // Absent id is inserted Alive, with its observer flag reconstructed
-    // from the co-restored observer set.
+    // Absent id is inserted Alive; its observer ROLE comes from the
+    // co-restored `capabilities` 2P-set, and the projection composes it
+    // with the (now-Alive) liveness bit.
     assert!(local.is_peer_alive("obs-b"), "absent id inserted Alive");
     assert!(
         local.role_table().observers.contains("obs-b"),
-        "observer flag transfers cohesively with alive membership"
+        "observer role projects in once the capability + alive bit converge"
     );
 
     // Idempotent: a second restore of the same snapshot changes nothing.
     local.restore(snap);
     assert!(!local.is_peer_alive("sec-a"));
     assert!(local.is_peer_alive("obs-b"));
+}
+
+/// The `capabilities` 2P-set round-trips through the snapshot WIRE (serde
+/// JSON, the same path `RequestClusterSnapshot`/`ClusterSnapshot` use): an
+/// `Advertised` entry and a `Departed` tombstone both survive
+/// encode→decode verbatim (C6).
+#[test]
+fn snapshot_wire_round_trips_capabilities_2p_set() {
+    use dynrunner_core::TaskVersion;
+
+    let mut origin = ClusterState::<RunnerIdentifier>::new();
+    origin.apply(ClusterMutation::PeerJoined {
+        peer_id: "obs-1".into(),
+        is_observer: true,
+        can_be_primary: false,
+        cap_version: TaskVersion {
+            primary_epoch: 1,
+            seq: 2,
+        },
+    });
+    origin.apply(ClusterMutation::PeerJoined {
+        peer_id: "gone".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
+    });
+    origin.apply(ClusterMutation::PeerRemoved {
+        id: "gone".into(),
+        cause: RemovalCause::KeepaliveMiss,
+    });
+
+    // Encode → decode the snapshot exactly as the wire path does.
+    let snap = origin.snapshot();
+    let json = serde_json::to_string(&snap).unwrap();
+    let decoded: crate::cluster_state::ClusterStateSnapshot<RunnerIdentifier> =
+        serde_json::from_str(&json).unwrap();
+
+    assert_eq!(
+        decoded.capabilities.get("obs-1"),
+        Some(&crate::cluster_state::CapabilityEntry::Advertised {
+            is_observer: true,
+            can_be_primary: false,
+            cap_version: TaskVersion {
+                primary_epoch: 1,
+                seq: 2
+            },
+        })
+    );
+    assert_eq!(
+        decoded.capabilities.get("gone"),
+        Some(&crate::cluster_state::CapabilityEntry::Departed),
+        "the Departed tombstone must survive the snapshot wire round-trip"
+    );
+}
+
+/// Backward-compat: a snapshot from a sender that PREDATES the
+/// `capabilities` field (its JSON omits the key entirely) must decode with
+/// an EMPTY capability map (`#[serde(default)]`), not a missing-field
+/// error. Mirrors the legacy wire BYTES (the omitted field), not a
+/// symmetric round-trip of the new shape.
+#[test]
+fn legacy_snapshot_without_capabilities_decodes_empty() {
+    // Hand-build the legacy wire shape: every field a pre-`capabilities`
+    // sender emitted, with NO `capabilities` key.
+    let legacy = serde_json::json!({
+        "tasks": {},
+        "current_primary": "primary-x",
+        "primary_epoch": 4,
+        "phase_deps": {},
+        "peer_holdings": {},
+        "task_outputs": {},
+        "secondary_capacities": {},
+        "alive_members": [],
+        "run_complete": false,
+        "run_aborted": null
+    });
+    let decoded: crate::cluster_state::ClusterStateSnapshot<RunnerIdentifier> =
+        serde_json::from_str(&legacy.to_string()).unwrap();
+    assert!(
+        decoded.capabilities.is_empty(),
+        "a pre-field snapshot must decode capabilities as an empty map"
+    );
+    // The rest of the legacy fields still decode (sanity that the shape is
+    // otherwise the current one).
+    assert_eq!(decoded.current_primary.as_deref(), Some("primary-x"));
+    assert_eq!(decoded.primary_epoch, 4);
 }
