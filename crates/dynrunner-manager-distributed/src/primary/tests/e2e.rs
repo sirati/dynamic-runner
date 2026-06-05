@@ -295,7 +295,6 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                         primary_link_failure_window: Duration::from_secs(30),
                         primary_silence_backstop: Duration::from_secs(120),
                         unconfigured_deadline: Duration::from_secs(600),
-                        is_observer: false,
                         can_be_primary: false,
                         resource_check_interval: Duration::from_millis(100),
                         log_oom_watcher: false,

@@ -114,13 +114,15 @@ where
             resources: self.config.max_resources.to_resource_amounts(),
             worker_count: self.config.num_workers,
             hostname: self.config.hostname.clone(),
-            // Task #36: surface observer status to the primary so
-            // peer broadcasts can carry it. The primary stores this
-            // on its per-secondary connection state and fans it out
-            // via PeerInfo's `PeerConnectionInfo.is_observer`,
-            // letting OTHER secondaries filter observers from their
-            // `lowest_alive` candidate selection in election.
-            is_observer: self.config.is_observer,
+            // Wire role advertisement: surface observer status to the
+            // primary so peer broadcasts can carry it via PeerInfo's
+            // `PeerConnectionInfo.is_observer`, letting OTHER secondaries
+            // filter observers from `lowest_alive` candidate selection.
+            // A compute SecondaryCoordinator is never an observer (the
+            // observer role IS the standalone ObserverCoordinator, which
+            // advertises `true` on its own join path), so this is a
+            // constant `false`.
+            is_observer: false,
             // Advertise primary-capability (twin of `is_observer`): an
             // overlay-enabled compute secondary that can construct a
             // primary on demand declares `true`, so the submitter's

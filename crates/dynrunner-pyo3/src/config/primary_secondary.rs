@@ -343,7 +343,6 @@ impl PySecondaryConfig {
             primary_silence_backstop:
                 dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
             unconfigured_deadline: self.distributed_config.unconfigured_deadline(),
-            is_observer: false,
             // Conservative default for this (unused) one-step builder: the
             // live secondary-construction site sets `can_be_primary` from
             // its actual mesh presence (`mesh_send_handle.is_some()`); this

@@ -100,11 +100,13 @@ where
     ///
     ///   1. **Observer-not-primary guard.** An observer cannot host the
     ///      primary role (no workers, no dispatch authority). If `new`
-    ///      names an observer — this node when `is_observer` set, or any
-    ///      peer in the replicated `RoleTable.observers` — REJECT loud and
-    ///      do NOT install it as `current_primary`. This guard protects
-    ///      the single-source-of-truth `current_primary()` against a
-    ///      forged or racy announcement naming an observer.
+    ///      names any peer in the replicated `RoleTable.observers`, REJECT
+    ///      loud and do NOT install it as `current_primary`. This guard
+    ///      protects the single-source-of-truth `current_primary()`
+    ///      against a forged or racy announcement naming an observer. (A
+    ///      compute SecondaryCoordinator is never itself an observer — the
+    ///      observer role IS the ObserverCoordinator — so the self case
+    ///      cannot arise.)
     ///   2. **Epoch-LWW apply.** The CRDT `PrimaryChanged` arm is
     ///      last-writer-wins on `(epoch, primary_id)`, so a stale
     ///      lower-epoch announcement NoOps against an already-installed
@@ -149,14 +151,12 @@ where
         // (1) Observer guard — reject naming an observer before the apply
         // moves `current_primary`.
         let observers = &self.cluster_state.role_table().observers;
-        let names_observer = (self.config.is_observer && new == self.config.secondary_id)
-            || observers.contains(&new);
+        let names_observer = observers.contains(&new);
         if names_observer {
             tracing::error!(
                 secondary = %self.config.secondary_id,
                 target = %new,
                 epoch,
-                self_is_observer = self.config.is_observer,
                 target_in_role_table_observers = observers.contains(&new),
                 "REJECTED PrimaryChanged naming an observer — observers \
                  cannot host the primary role (no workers, no dispatch \

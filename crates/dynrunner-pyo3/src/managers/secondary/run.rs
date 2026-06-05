@@ -299,8 +299,8 @@ impl PySecondaryCoordinator {
                     primary_silence_backstop:
                         dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                     unconfigured_deadline: dist_unconfigured_deadline,
-                    is_observer: false,
-                    // Primary-capability marker (twin of `is_observer`): a
+                    // Primary-capability marker (twin of the wire `is_observer`
+                    // role advertisement): a
                     // compute secondary can host the primary ON DEMAND iff
                     // a REAL peer mesh is present (`mesh_send_handle`), so
                     // it can construct a `PrimaryCoordinator` when named.

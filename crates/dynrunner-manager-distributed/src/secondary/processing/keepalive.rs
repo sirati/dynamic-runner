@@ -103,22 +103,7 @@ where
     /// member), so skipping the broadcast when degraded would starve the
     /// primary of keepalives and trip a false primary-death.
     ///
-    /// Strict-observer suppression: a pure observer (`config.is_observer`)
-    /// originates NOTHING — keepalive included. A keepalive is a "my
-    /// liveness matters to cluster timing" assertion; an observer is a
-    /// passive bystander with zero authority and is filtered out of
-    /// every election candidate set, so its silence drives no decision
-    /// and its keepalive would only add noise to peers'
-    /// `peer_keepalives` maps. This is the keepalive concern's own
-    /// single role-gate — there is no scattered `is_observer` branch
-    /// elsewhere on the emission path. The resource-holdings announcer
-    /// (a SEPARATE opt-in resource-provider capability) is the only
-    /// thing an observer-mode coordinator ever broadcasts, and only
-    /// when a caller explicitly attaches it.
     pub(in crate::secondary) async fn send_keepalive(&mut self) {
-        if self.config.is_observer {
-            return;
-        }
         let active_count = self
             .op_mut()
             .pool

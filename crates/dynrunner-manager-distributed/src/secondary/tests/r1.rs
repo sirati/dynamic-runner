@@ -443,7 +443,6 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 // `setup_deadline` as the setup-phase horizon. Tight (200ms)
                 // so the cold-start setup-deadline path reaps in ~200ms.
                 unconfigured_deadline: Duration::from_millis(200),
-                is_observer: false,
                 can_be_primary: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -548,7 +547,6 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 // the setup-phase horizon); tight (200ms) so the
                 // peers-reachable setup-deadline branch reaps fast.
                 unconfigured_deadline: Duration::from_millis(200),
-                is_observer: false,
                 can_be_primary: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -647,7 +645,6 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 primary_link_failure_window: Duration::from_secs(30),
                 primary_silence_backstop: Duration::from_secs(120),
                 unconfigured_deadline: Duration::from_secs(600),
-                is_observer: false,
                 can_be_primary: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,

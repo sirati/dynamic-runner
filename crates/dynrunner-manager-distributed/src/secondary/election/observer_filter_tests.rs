@@ -117,37 +117,6 @@ async fn primary_changed_naming_observer_is_rejected() {
     );
 }
 
-/// Mirror of the above for the SELF-observer case: a node configured as
-/// an observer, applying `PrimaryChanged { new = self }`, must reject it
-/// (an observer cannot host the primary role) — `current_primary` stays
-/// uninstalled.
-#[tokio::test(flavor = "current_thread")]
-async fn primary_changed_naming_self_observer_is_rejected() {
-    use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut cfg = election_config("obs-a");
-    cfg.is_observer = true;
-    let mut sec = make_secondary(cfg);
-    sec.enter_operational_for_test();
-
-    let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
-        sender_id: "primary".into(),
-        timestamp: 0.0,
-        mutations: vec![ClusterMutation::PrimaryChanged {
-            new: "obs-a".into(),
-            epoch: 1,
-            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-        }],
-    };
-    sec.dispatch_message(promote, &mut FakeWorkerFactory)
-        .await
-        .expect("handler returns Ok even when rejecting");
-
-    assert!(
-        sec.cluster_state.current_primary().is_none(),
-        "a self-observer must NOT be installed as primary"
-    );
-}
-
 /// Step 7 / Decision G end-to-end: the `ClusterMutation::
 /// PeerJoined { is_observer: true }` apply rule is the SAME
 /// source of truth that both `lowest_alive` filtering and the

@@ -27,9 +27,9 @@
 //! that send through `primary_transport`), and the steady-state
 //! processing loop never invokes `primary_transport.send` from an
 //! observer (every `.send` site is gated on either
-//! `is_primary` — observers can never be primary, per
-//! `SecondaryConfig.is_observer` — or on completion/setup paths a
-//! zero-worker observer never reaches; the audit trail is in
+//! `is_primary` — observers can never be primary, the standalone
+//! `ObserverCoordinator` being a distinct role — or on completion/setup
+//! paths a zero-worker observer never reaches; the audit trail is in
 //! `secondary/processing.rs:380`, `secondary/resource.rs:168`,
 //! `secondary/setup.rs:57/80`, `secondary/primary.rs:814`).
 //!

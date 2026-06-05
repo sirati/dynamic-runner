@@ -175,35 +175,6 @@ pub struct SecondaryConfig {
     /// Tests construct it with a tiny value for sub-second drive.
     pub primary_silence_backstop: Duration,
 
-    /// Observer mode: this secondary participates in cluster updates
-    /// (ClusterMutation broadcasts, PeerInfo, Keepalive, peer-routed
-    /// task-state messages) but cannot become primary and has no
-    /// workers. Use case: the dispatcher in SLURM mode hosts an
-    /// in-process observer so it stays connected to the cluster as
-    /// a non-candidate secondary even after a primary handoff/death
-    /// — the surviving SLURM secondaries elect among themselves and
-    /// the dispatcher's observer just receives the broadcasts.
-    ///
-    /// When `is_observer = true`:
-    ///   - `num_workers` should be 0 (no work to take on); the
-    ///     framework does not validate this, but processing-loop
-    ///     paths that iterate workers behave correctly with an
-    ///     empty pool.
-    ///   - The election state machine refuses to enter `Candidate`
-    ///     state — the observer never self-promotes even when it
-    ///     would otherwise be the lowest-id alive peer. See
-    ///     `election.rs::run_election_tick`'s `we_lead` branch.
-    ///   - A `PrimaryChanged` naming this secondary is rejected
-    ///     with a loud error (defensive: should not happen if peers
-    ///     honour the same flag, but protects against a misconfigured
-    ///     peer or a wire-level forgery).
-    ///
-    /// Default `false` (regular secondary). The peer-mesh-side
-    /// fortification (peers filtering observers from `lowest_alive`
-    /// candidate selection) requires extending `PeerConnectionInfo`
-    /// with this flag; tracked as a follow-up to this commit.
-    pub is_observer: bool,
-
     /// Whether this secondary can host the primary role ON DEMAND — it is
     /// an overlay-enabled (real peer mesh present), non-observer compute
     /// secondary whose runtime registered a primary-activator (a closure
@@ -397,7 +368,6 @@ impl Default for SecondaryConfig {
             primary_link_failure_threshold: super::primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: super::primary_link::DEFAULT_FAILURE_WINDOW,
             primary_silence_backstop: super::primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
-            is_observer: false,
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
