@@ -387,6 +387,10 @@ class SlurmJobManager:
             image_name=self.packaging.get_image_name(),
             image_tag=self.packaging.get_image_tag(),
             image_tar_basename=self.deployment.image_tar_basename,
+            # Content key for the wrapper binary's node-local image cache:
+            # the secondary reuses a digest-keyed local copy instead of
+            # re-reading the shared-FS tarball per job (see image.rs).
+            image_digest=image_metadata.image_hash,
             load_command=self.packaging.get_load_command(
                 "$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN"
             ),

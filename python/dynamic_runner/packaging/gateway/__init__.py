@@ -1,6 +1,25 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
+
+
+def expand_gateway_tilde(gateway: Any, path: str | Path) -> str:
+    """Resolve a leading ``~`` in a remote path against the gateway's home.
+
+    Remote paths reach the gateway through ``shlex.quote`` (mkdir, scp
+    targets, …), which single-quotes a ``~`` so the remote shell never
+    tilde-expands it — ``mkdir -p`` then creates a literal ``~``
+    directory under ``$HOME`` while server-side ``~``-expanding tools
+    target the real home, so the two diverge. Resolving the tilde here
+    against ``gateway.remote_home`` keeps every emitted path absolute
+    and consistent. Paths without a leading ``~`` (and the no-home
+    case) pass through unchanged.
+    """
+    path_str = str(path)
+    remote_home = getattr(gateway, "remote_home", None)
+    if path_str.startswith("~") and remote_home:
+        return path_str.replace("~", str(remote_home), 1)
+    return path_str
 
 
 @dataclass

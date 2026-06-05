@@ -617,22 +617,19 @@ def _dispatch_late_joiner(task, args, logger) -> None:
 
     Reads peer-info files from `args.observer_join_from_peer_info_dir`,
     starts a real `PeerNetwork` on this host, dials in via
-    `peer_transport.join_running_cluster`, restores the snapshot, and
-    drives the secondary run loop with `is_observer=true` and
-    `num_workers=0`. The Rust-side coordinator handles every detail
-    of the bootstrap; the Python dispatcher's only job is to surface
-    the configured peer-info-dir and forward the task_definition (so
-    the Rust side can pull the resource estimator off it).
+    `peer_transport.join_running_cluster`, restores the snapshot(s), and
+    cold-joins the standalone `ObserverCoordinator` — a zero-authority
+    node that holds the replicated CRDT and narrates the run from it. The
+    Rust-side coordinator handles every detail of the bootstrap; the
+    Python dispatcher's only job is to surface the configured
+    peer-info-dir. The observer needs no task_definition / scheduler /
+    estimator (it runs no workers), so none are forwarded — `task` stays
+    in the signature only for dispatcher-table uniformity.
 
     No primary URL is required: a late-joiner is a peer-mesh-only
-    participant. It reaches the primary (a TunneledPeerTransport mesh
-    member since Step 5b) via `Address::Role(Role::Primary)`
-    dispatch over the peer mesh once the snapshot's `current_primary`
-    warms the role-cache during `cluster_state.restore`. The
-    coordinator's `primary_transport` slot is filled with a
-    `NoPrimaryTransport` stub (see Rust `no_primary.rs`) so the
-    setup-skip latch is the single source of truth for "this node
-    doesn't speak primary protocol".
+    participant. It reaches the primary via the peer mesh once the
+    snapshot's `current_primary` warms the role-cache during
+    `cluster_state.restore`.
     """
     import dynamic_runner as _rs
 
@@ -660,9 +657,7 @@ def _dispatch_late_joiner(task, args, logger) -> None:
     )
     result = _rs.run_observer_late_joiner(
         args.observer_join_from_peer_info_dir,
-        task,
         distributed_config=distributed_config,
-        scheduler_config=_build_scheduler_config(args),
         **_panik_kwargs(args),
     )
     logger.info(f"Observer Completed (observed): {result['completed']}")

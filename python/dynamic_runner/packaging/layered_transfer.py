@@ -81,6 +81,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from .gateway import expand_gateway_tilde
+
 logger = logging.getLogger(__name__)
 
 
@@ -310,7 +312,12 @@ class LayeredUploader:
 
     def __init__(self, gateway: Any, cache_root: Path) -> None:
         self.gateway = gateway
-        self.cache_root = Path(cache_root)
+        # Resolve a leading ``~`` against the gateway's remote home up
+        # front, so every derived remote path (``_blob_dir`` etc.) is
+        # absolute before it reaches a ``shlex.quote``d remote ``mkdir``
+        # / ``mv``. A quoted ``~`` is never shell-expanded server-side,
+        # which would otherwise create a literal ``~`` directory.
+        self.cache_root = Path(expand_gateway_tilde(gateway, cache_root))
 
     # ── Remote layout helpers ───────────────────────────────────────
 

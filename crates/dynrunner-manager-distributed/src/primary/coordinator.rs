@@ -8,7 +8,7 @@ use tracing::Instrument;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, KeepaliveRole, MessageType, PeerId, PeerTransport,
+    ClusterMutation, DistributedMessage, PeerId, PeerTransport,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -202,6 +202,126 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     /// The full task — its `task_id` resolves dep edges, its `type_id`
     /// releases the per-type concurrency slot.
     pub(super) task: TaskInfo<I>,
+}
+
+/// Post-bootstrap fork DECISION returned by
+/// [`PrimaryCoordinator::run_pipeline`].
+///
+/// The pipeline body runs through `&mut self`, so it can never move `self`
+/// out — it can only signal which regime the run took. The owned-`self`
+/// [`PrimaryCoordinator::run_consuming`] consumes this decision and, on
+/// [`PostBootstrap::Relocate`], destructures `self` into an
+/// [`crate::observer::ObserverHandoff`] (the relinquished submitter becomes
+/// the standalone observer). There is no payload on either arm: the
+/// stay-local arm has already run the operational loop to completion (and
+/// left the accounting on `self.cluster_state`); the relocate arm leaves
+/// `self` intact for the caller's by-value handoff. Neither arm carries the
+/// transport/identifier, so the enum is plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostBootstrap {
+    /// The submitter stayed the local primary (single-node / no capable
+    /// peer / chosen candidate evaporated) and ran the operational loop to
+    /// completion in-place. The caller reads the accounting off
+    /// `self.cluster_state` and tears the dispatchers down in-place.
+    StayLocal,
+    /// The submitter relinquished full authority onto a chosen compute peer
+    /// and dropped its own `Role::Primary`. The caller must destructure
+    /// `self` into an [`crate::observer::ObserverHandoff`] and run the
+    /// standalone observer tail; the dispatcher handles ride across (NOT
+    /// cleaned in-place).
+    Relocate,
+}
+
+/// The post-run accounting surfaced by
+/// [`PrimaryCoordinator::run_consuming`] for BOTH the stay-local and
+/// relocated paths.
+///
+/// After the owned-`self` `run_consuming` returns, the submitter binding is
+/// gone — so the post-run counts the PyO3 boundary used to read off
+/// `primary.completed_count()` must travel back through this value. On the
+/// stay-local path they are read off this coordinator's own
+/// `cluster_state`; on the relocated path they are re-sourced from the
+/// observer's moved-in (converged) `cluster_state`. The `result` carries
+/// the structured exit contract: `Ok(())` ⇒ exit 0, an `Err` ⇒ a non-zero
+/// exit at the PyO3 boundary (the relocated arm maps the observer terminal
+/// onto the same `RunError` shape the boundary already translates).
+#[derive(Debug)]
+pub enum PrimaryRunOutcome {
+    /// The submitter stayed (or fell back to) the local primary. `result`
+    /// follows the in-place pipeline outcome; the counts come from the
+    /// primary's own replicated ledger. The PyO3 boundary applies its
+    /// legacy per-variant exit mapping (`Other`/`Ok` ⇒ swallow/exit 0).
+    Local {
+        result: Result<(), RunError>,
+        completed: usize,
+        failed: usize,
+        stranded: usize,
+    },
+    /// The submitter relocated and ran the standalone observer tail.
+    /// `result` is the observer terminal mapped onto the exit contract
+    /// (`Done` ⇒ `Ok`, `Panik` ⇒ `PanikShutdown`, `Aborted` ⇒ a
+    /// non-zero-mapping `RunError`, and any strand-backstop / fatal-exit
+    /// `Err` propagated as-is). The counts are re-sourced from the
+    /// observer's converged `cluster_state` (`stranded` is always 0 — an
+    /// observer never dispatched). The PyO3 boundary RAISES on any `Err`
+    /// here (a relocated strand must never swallow to exit 0).
+    Relocated {
+        result: Result<(), RunError>,
+        completed: usize,
+        failed: usize,
+        stranded: usize,
+    },
+}
+
+impl PrimaryRunOutcome {
+    /// Build the relocated outcome from the finished observer + its run
+    /// terminal. Re-sources the post-run counts from the observer's
+    /// moved-in (converged) `cluster_state` — the SAME CRDT reader
+    /// (`outcome_counts()`) the primary's own `completed_count`/
+    /// `failed_count` route through — and maps the observer terminal onto
+    /// the structured exit contract.
+    fn from_observer<Tr, I>(
+        observer: &crate::observer::ObserverCoordinator<Tr, I>,
+        terminal: Result<crate::observer::ObserverTerminal, RunError>,
+    ) -> Self
+    where
+        Tr: PeerTransport<I>,
+        I: Identifier,
+    {
+        let result = match terminal {
+            Ok(crate::observer::ObserverTerminal::Done) => Ok(()),
+            // Panik ⇒ the SAME `PanikShutdown` the PyO3 boundary already
+            // maps to `exit(137)`; carry the matched path so the wrapper's
+            // structured-panik arm fires.
+            Ok(crate::observer::ObserverTerminal::Panik { matched_path }) => {
+                Err(RunError::PanikShutdown {
+                    matched_path,
+                    reason: "observer panik".to_string(),
+                })
+            }
+            // Aborted ⇒ a structured non-zero terminal. `run_aborted`'s
+            // sole originator today is the pre-phase duplicate-task-id
+            // case, so reuse that structured variant (the PyO3 boundary
+            // raises a `PyRuntimeError` on it → non-zero exit), carrying
+            // the abort reason.
+            Ok(crate::observer::ObserverTerminal::Aborted { reason }) => {
+                Err(RunError::DuplicateTaskIdPrePhase { reason })
+            }
+            // Strand backstops / fatal-exit: propagate the `Err` as-is.
+            // The PyO3 boundary raises on ANY relocated `Err` so a
+            // fleet-dead / primary-silence strand surfaces non-zero (it
+            // must NOT take the legacy `Other` ⇒ swallow path).
+            Err(e) => Err(e),
+        };
+        PrimaryRunOutcome::Relocated {
+            result,
+            // Re-sourced from the observer's converged ledger through the
+            // SAME surface shape the primary exposes.
+            completed: observer.completed_count(),
+            failed: observer.failed_count(),
+            stranded: observer.stranded_count(),
+        }
+    }
 }
 
 /// The primary coordinator: orchestrates work across secondaries.
@@ -2253,29 +2373,215 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let result = self
                 .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
                 .await;
-            self.cleanup_lifecycle_dispatcher().await;
-            // Independent of `cleanup_lifecycle_dispatcher` — the two
-            // dispatchers own independent channels + listener vectors;
-            // both run from spawn-at-`run()`-start to abort-at-`run()`-
-            // exit and both must be joined before `run()` returns so the
-            // PyO3 wrapper / SLURM pipeline don't leak them.
-            self.cleanup_task_completed_dispatcher().await;
-            result
+            // Cleanup BOTH dispatchers on every stay-local exit (Ok or
+            // Err). The two dispatchers own independent channels + listener
+            // vectors; both run from spawn-at-`run()`-start to
+            // abort-at-`run()`-exit and both must be joined before `run()`
+            // returns so the PyO3 wrapper / SLURM pipeline don't leak them.
+            self.cleanup_run_dispatchers().await;
+            match result {
+                Ok(PostBootstrap::StayLocal) => Ok(()),
+                // The `&mut self` entry cannot surrender `self` to an
+                // observer, so a genuine relocation is unreachable through
+                // it. Relocation-capable callers (the PyO3 boundary, the
+                // relocation e2e) use [`Self::run_consuming`], which owns
+                // `self` and performs the by-value [`Self::into_observer_handoff`].
+                Ok(PostBootstrap::Relocate) => Err(RunError::Other(
+                    "primary relocated to a chosen peer but was driven through the \
+                     non-consuming run() entry; use run_consuming() for a \
+                     relocation-capable run"
+                        .to_string(),
+                )),
+                Err(e) => Err(e),
+            }
         }
         .instrument(span)
         .await
     }
 
+    /// Owned-`self` run entry for relocation-capable callers (the PyO3
+    /// boundary + the relocation e2e).
+    ///
+    /// Mirrors [`Self::run`] but OWNS `self`, so on a successful relocation
+    /// it can destructure `self` into an [`ObserverHandoff`] and drive the
+    /// standalone [`crate::observer::ObserverCoordinator`] to its terminal.
+    /// Returns a [`PrimaryRunOutcome`] that surfaces the post-run accounting
+    /// (`completed`/`failed`/`stranded`) for BOTH paths through a SINGLE
+    /// surface — sourced from this coordinator's own `cluster_state` on the
+    /// stay-local path, and from the observer's moved-in (converged)
+    /// `cluster_state` on the relocated path — plus the structured
+    /// exit-contract `result` (the observer terminal mapped onto the same
+    /// `RunError`-or-`Ok` shape the PyO3 boundary already maps to exit
+    /// codes).
+    pub async fn run_consuming(
+        mut self,
+        binaries: Vec<TaskInfo<I>>,
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) -> Result<PrimaryRunOutcome, RunError>
+    where
+        // The relocated arm spawns the standalone observer's tasks
+        // (`ObserverCoordinator::run` requires `Self: 'static`), which the
+        // moved-in transport/identifier must outlive.
+        Tr: 'static,
+        I: 'static,
+    {
+        let span = tracing::info_span!(
+            dynrunner_core::PRIMARY_ROLE_SPAN,
+            kind = "primary",
+            node = %self.config.node_id
+        );
+        async move {
+            let fork = self
+                .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
+                .await;
+            match fork {
+                Ok(PostBootstrap::StayLocal) => {
+                    // Stay-local: tear the dispatchers down in-place (same
+                    // contract as `run`), read the counts off this
+                    // coordinator's own replicated ledger, then drop `self`.
+                    self.cleanup_run_dispatchers().await;
+                    Ok(PrimaryRunOutcome::Local {
+                        result: Ok(()),
+                        completed: self.completed_count(),
+                        failed: self.failed_count(),
+                        stranded: self.stranded_count(),
+                    })
+                }
+                Err(e) => {
+                    // A stay-local pipeline error: still tear down the
+                    // in-place dispatchers, surface the counts gathered so
+                    // far, and carry the error through `result`.
+                    self.cleanup_run_dispatchers().await;
+                    Ok(PrimaryRunOutcome::Local {
+                        result: Err(e),
+                        completed: self.completed_count(),
+                        failed: self.failed_count(),
+                        stranded: self.stranded_count(),
+                    })
+                }
+                Ok(PostBootstrap::Relocate) => {
+                    // Relocated: destructure `self` into the handoff (the
+                    // two dispatcher handles ride across — DO NOT clean them
+                    // here) and run the standalone observer to its terminal.
+                    let handoff = self.into_observer_handoff();
+                    let mut observer =
+                        crate::observer::ObserverCoordinator::from_handoff(handoff);
+                    let terminal = observer.run().await;
+                    Ok(PrimaryRunOutcome::from_observer(&observer, terminal))
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Tear down both run-spawned dispatchers (peer-lifecycle +
+    /// task-completion) on a stay-local exit. The single in-place cleanup
+    /// choke point both `run` and `run_consuming`'s stay-local arms share —
+    /// keeps the abort+join discipline in one home. NOT called on the
+    /// relocated path: there the handles ride across into the observer's
+    /// single-teardown via [`Self::into_observer_handoff`].
+    async fn cleanup_run_dispatchers(&mut self) {
+        self.cleanup_lifecycle_dispatcher().await;
+        self.cleanup_task_completed_dispatcher().await;
+    }
+
+    /// Consume this primary BY VALUE into the standalone observer's
+    /// hand-off payload.
+    ///
+    /// Called ONLY on the genuine relocation path (the submitter
+    /// relinquished full authority onto a chosen compute peer and dropped
+    /// its own `Role::Primary`). A FULL DESTRUCTURE drops the scheduler
+    /// `S`, the estimator `E`, the worker pool, the secondary table, and
+    /// every other primary-only concern structurally — the
+    /// `PrimaryCoordinator<Tr, S, E, I>` becomes an
+    /// [`ObserverHandoff<Tr, I>`], a strictly smaller, zero-authority
+    /// payload. No `mem::take` / `Option::take` is used on any field of
+    /// `self`; the move is compiler-checked by the destructure pattern.
+    ///
+    /// Carries across exactly what the observer needs to resume without
+    /// dropping a live event: the mesh `transport`, the replicated
+    /// `cluster_state` (with its already-installed `task_completed_tx`),
+    /// the node id, the deadlines as an [`ObserverConfig`], the
+    /// `started_phases` narration seed (the `phase_started_emitted` set),
+    /// the STABLE `required_setup_on_promote` config bool (the observer
+    /// recomputes `setup_pending` LIVE — never a frozen snapshot), the
+    /// panik signal receiver, and the two dispatcher join handles. The
+    /// `holdings` are empty: the submitter primary advertised no
+    /// resource-holdings (workers run on secondaries).
+    fn into_observer_handoff(self) -> crate::observer::ObserverHandoff<Tr, I> {
+        // Full destructure: every field NOT named below is dropped by the
+        // `..` — scheduler/estimator/pool/secondaries/etc. — so the larger
+        // `PrimaryCoordinator` is structurally consumed.
+        let Self {
+            config,
+            transport,
+            cluster_state,
+            phase_started_emitted,
+            lifecycle_dispatcher_handle,
+            task_completed_dispatcher_handle,
+            panik_signal_rx,
+            ..
+        } = self;
+
+        crate::observer::ObserverHandoff {
+            transport,
+            cluster_state,
+            node_id: config.node_id.clone(),
+            deadlines: crate::observer::ObserverConfig {
+                node_id: config.node_id,
+                fleet_dead_timeout: config.fleet_dead_timeout,
+                peer_timeout: config.peer_timeout,
+                setup_promote_deadline: config.setup_promote_deadline,
+                required_setup_on_promote: config.required_setup_on_promote,
+                // The submitter's panik watcher already ran; its signal
+                // receiver rides across directly (below), so the observer
+                // does NOT re-spawn a watcher from these — they are inert
+                // on the relocation path.
+                panik_watcher_paths: Vec::new(),
+                panik_watcher_poll_interval: Duration::from_secs(60),
+            },
+            started_phases: phase_started_emitted,
+            required_setup_on_promote: config.required_setup_on_promote,
+            panik_signal_rx,
+            // The dispatchers are spawned unconditionally at `run_pipeline`
+            // entry (`spawn_run_dispatchers`), so both handles are present
+            // at the relocate point. Carried so the observer's
+            // single-teardown ABORTS them cleanly (the inherited
+            // task-completed dispatcher is superseded by the observer's own
+            // fresh channel in `from_handoff`; see its reconciliation note).
+            task_completed_dispatcher_handle: task_completed_dispatcher_handle
+                .expect("task-completed dispatcher spawned at run_pipeline entry"),
+            lifecycle_dispatcher_handle: lifecycle_dispatcher_handle
+                .expect("peer-lifecycle dispatcher spawned at run_pipeline entry"),
+            holdings: HashSet::new(),
+        }
+    }
+
     /// Original `run()` body, factored out so the public `run` wrapper
     /// can drive cleanup-on-exit regardless of how this function
     /// returns. See [`Self::run`] for the rationale.
+    ///
+    /// Returns the post-bootstrap fork DECISION (not the relinquished
+    /// `self`): the body runs the whole pipeline through `&mut self`, so
+    /// it can never move `self` out (that is the owned-self
+    /// [`Self::run`]'s job). On a successful relocation it returns
+    /// [`PostBootstrap::Relocate`] WITHOUT touching the dispatcher
+    /// cleanup — the owned-self caller then destructures `self` into the
+    /// [`ObserverHandoff`] so the two dispatcher handles ride across into
+    /// the observer's single-teardown rather than being aborted here. On
+    /// every stay-local outcome (single-node / no capable peer / chosen
+    /// candidate evaporated) it runs the operational loop to completion
+    /// and returns [`PostBootstrap::StayLocal`].
     async fn run_pipeline(
         &mut self,
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
-    ) -> Result<(), RunError> {
+    ) -> Result<PostBootstrap, RunError> {
         // Reset the stranded counter so a previous run's residue
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
@@ -2643,8 +2949,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // whole connect/seed/mesh-ready chain (it inherits the already-formed
         // mesh and resumes from the restored snapshot), so it never reaches
         // this line. The submitter — whether it stays primary
-        // (`activate_local_primary`), relocates and observes
-        // (`run_as_observer`), or falls back to local — emits this once and
+        // (`activate_local_primary`), relocates and observes (the relocation
+        // observer tail), or falls back to local — emits this once and
         // only once, before any of those forks run.
         tracing::info!(
             target: super::important_events::IMPORTANT_TARGET,
@@ -2674,8 +2980,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         //     (`relocate_primary_to` originates `PrimaryChanged { chosen,
         //     reason: Transferred }` at epoch `primary_epoch()+1 = 1`; the
         //     submitter's own apply drops `Role::Primary`). On a successful
-        //     relocation the submitter enters the observer tail
-        //     (`run_as_observer`), which watches the replicated
+        //     relocation the submitter enters the relocation observer tail,
+        //     which watches the replicated
         //     `cluster_state` for `RunComplete` and never runs the pool /
         //     operational loop. If `chosen` evaporated between selection
         //     and origination, `relocate_primary_to` falls back to local
@@ -2688,11 +2994,25 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         match self.select_bootstrap_primary() {
             None => {
                 self.activate_local_primary().await?;
-                self.run_operational_and_finalize(total).await
+                self.run_operational_and_finalize(total).await?;
+                Ok(PostBootstrap::StayLocal)
             }
             Some(chosen) => match self.relocate_primary_to(chosen).await? {
-                RelocationOutcome::Relocated => self.run_as_observer().await.map_err(RunError::from),
-                RelocationOutcome::FellBackToLocal => self.run_operational_and_finalize(total).await,
+                // The submitter relinquished full authority onto the
+                // chosen compute peer and dropped its own `Role::Primary`.
+                // It must now run the standalone observer tail — but the
+                // observer needs `self` BY VALUE (the moved-across
+                // transport + cluster_state), which this `&mut self` body
+                // cannot surrender. Signal the fork; the owned-self
+                // `run`/`run_consuming` caller performs the destructuring
+                // handoff. Crucially we do NOT fall through to the
+                // dispatcher cleanup here — the two dispatcher handles ride
+                // across into the observer's single-teardown.
+                RelocationOutcome::Relocated => Ok(PostBootstrap::Relocate),
+                RelocationOutcome::FellBackToLocal => {
+                    self.run_operational_and_finalize(total).await?;
+                    Ok(PostBootstrap::StayLocal)
+                }
             },
         }
     }
@@ -2883,532 +3203,6 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         Ok(())
     }
 
-    /// The submitter's observer tail, entered after `relocate_primary_to`
-    /// has handed full primary authority off to a chosen compute peer.
-    ///
-    /// # Concern
-    ///
-    /// Observer-ness is a CAPABILITY set, not a fourth role/FSM
-    /// (invariant 2): post-relocation the submitter holds no
-    /// `Role::Primary`, runs no dispatch pool, and drives no phase
-    /// machine — it only WATCHES the replicated `cluster_state` for the
-    /// authoritative primary's `RunComplete` and returns. It is NOT the
-    /// full-SecondaryCoordinator observer late-joiner
-    /// (`managers/observer_late_joiner/run.rs`); the submitter is
-    /// primary-only with no composed secondary, so this is a thin
-    /// purpose-built select-loop on the PrimaryCoordinator.
-    ///
-    /// # The select
-    ///
-    ///   * `recv_peer` — every inbound frame. ONLY `ClusterMutation`
-    ///     batches are acted on, through the existing RECEIVE-apply path
-    ///     (`handle_cluster_mutation`): apply-only, NEVER re-broadcast,
-    ///     because the observer is not the authority. Any other wire shape
-    ///     (TaskRequest etc.) is ignored — the observer must not assign or
-    ///     coordinate. A `None` (transport inbound closed) ends the watch:
-    ///     no further mutation can arrive, so the run's outcome is frozen.
-    ///   * `setup_promote_deadline` — copied verbatim from the operational
-    ///     loop, gated on `self.setup_pending()`. A hung discovery on the
-    ///     chosen peer (no `TaskAdded` / `TasksSpawned` / `RunComplete`
-    ///     within `config.setup_promote_deadline`) must still terminate the
-    ///     observer rather than hang forever; non-setup-promote relinquish
-    ///     never arms it (the gate is permanently false).
-    ///   * `fleet_dead_timeout` grace — a dead-fleet backstop. The
-    ///     operational loop's fleet-dead arm reads pool/authority state the
-    ///     relinquished observer no longer owns, so it is NOT copied here
-    ///     (RESIDUAL-RISK-#3). Instead the observer's dead-fleet grace is
-    ///     gated purely on the Phase-A role-blind `transport.peer_count()`
-    ///     reaching zero: with every peer gone there is no authority left
-    ///     to ever broadcast `RunComplete`, so after `config.
-    ///     fleet_dead_timeout` of continuous emptiness the observer exits
-    ///     with a stranded-fleet error (reusing the existing grace value,
-    ///     not a new timer).
-    ///   * `primary_silence` backstop — the half-open-peer case the
-    ///     dead-fleet grace cannot see. In the relocation model the
-    ///     relocated primary's death is abnormal (SIGTERM / exit 137 / a
-    ///     dropped mesh-send handle) with NO clean `RunComplete`. The
-    ///     `peer_count()` is raw QUIC connection cardinality, pruned ONLY
-    ///     on an outbound-send failure — and the observer is apply-only,
-    ///     never sends, so a dead-primary connection stays resident,
-    ///     `peer_count()` stays `> 0`, and the dead-fleet arm never arms.
-    ///     The observer therefore tracks `primary_last_seen` directly
-    ///     (mirroring the secondary's `record_primary_message` →
-    ///     `primary_last_seen`): it is refreshed by a `Primary`-tagged
-    ///     keepalive whose originator IS `cluster_state.current_primary()`
-    ///     (surfaced from the recv arm, inspect-only, never re-broadcast)
-    ///     and by any `PrimaryChanged` that re-points `current_primary()`
-    ///     (a new/refreshed primary is live). If the current primary is
-    ///     silent for `config.peer_timeout` with no `RunComplete`, the run
-    ///     is stranded — either the whole fleet died or a failover failed —
-    ///     so the observer exits `Err`. `peer_timeout` (default 300s) is
-    ///     GENEROUS relative to a surviving-secondary failover cycle
-    ///     (`keepalive_miss_threshold * keepalive_interval` ≈ 15s, then a
-    ///     re-election whose new primary's keepalives refresh
-    ///     `primary_last_seen`), so a legitimate failover rides through and
-    ///     this backstop only fires when failover did NOT rescue the run.
-    ///     Independent of `peer_count()` (un-pruned / unreliable here).
-    ///
-    /// # Termination
-    ///
-    /// `cluster_state.run_complete()` is checked at the TOP of every
-    /// iteration, so a `RunComplete` the submitter already applied (e.g.
-    /// during the hand-off window) returns `Ok(())` immediately without
-    /// blocking on a recv. The check is epoch-agnostic — a chosen primary
-    /// that died and was superseded by a re-elected epoch-≥3 primary still
-    /// produces the same `RunComplete` the observer watches for.
-    pub(crate) async fn run_as_observer(&mut self) -> Result<(), String> {
-        // `setup_promote_loop_start` is captured locally so the deadline
-        // measures from observer-tail entry — the same shape the
-        // operational loop's deadline arm uses (see `operational_loop`).
-        let setup_promote_loop_start = Instant::now();
-        let setup_promote_deadline_at =
-            setup_promote_loop_start + self.config.setup_promote_deadline;
-        // One-shot gate so the setup-promote arm fires at most once.
-        let mut setup_promote_deadline_consumed = false;
-
-        // Dead-fleet grace clock: the first moment `peer_count()` is
-        // observed at zero. Cleared the moment a peer is present again
-        // (partial fleet survival / re-handshake). Mirrors the operational
-        // loop's `fleet_dead_since` discipline but is gated on the
-        // role-blind transport peer-count, never a pool read.
-        let mut fleet_dead_since: Option<Instant> = None;
-
-        // Inbound-closed latch: once `recv_peer` returns `None` the arm is
-        // disabled (so the select! does not hot-poll a resolved future)
-        // and the loop exits at the top of the next iteration. Mirrors the
-        // operational loop's `transport_closed` shape.
-        let mut transport_closed = false;
-
-        // Primary-liveness clock for the half-open-peer backstop. Mirrors
-        // the secondary's `OperationalState::primary_last_seen` (refreshed
-        // by `record_primary_message`). The relocated primary was just
-        // alive at hand-off, so initialise to `now`. Refreshed in the recv
-        // arm by a `Primary`-tagged keepalive from the CURRENT primary and
-        // by any `PrimaryChanged` that re-points `current_primary()`. When
-        // the current primary is silent past `config.peer_timeout` with no
-        // `RunComplete`, the run is stranded and the observer exits — the
-        // dead-fleet `peer_count()==0` arm cannot catch this because a
-        // SIGTERM'd primary's connection stays resident (the observer never
-        // sends, so the send-failure prune never runs).
-        let mut primary_last_seen = Instant::now();
-
-        // Dead-fleet poll tick. The dead-fleet grace is accumulated at the
-        // TOP of the loop, but when every peer is gone there is no recv
-        // traffic to re-iterate the loop and re-evaluate it. This tick is
-        // the wake source: it fires on the `fleet_dead_timeout` cadence so
-        // a fully-silent observer still re-checks (and exits) within one
-        // grace window. Cadence-only — it carries no work itself; the
-        // exit decision stays at the top-of-loop check. The immediate
-        // first tick is consumed so the cadence starts one interval out.
-        let mut fleet_dead_poll = tokio::time::interval(self.config.fleet_dead_timeout);
-        fleet_dead_poll.tick().await;
-
-        // Anti-entropy cadence. On each tick this observer broadcasts its
-        // `StateDigest` so peers learn its view (and it pulls when a peer's
-        // digest shows the observer is behind — the apply-only observer's
-        // periodic catch-up beyond the one-shot bootstrap RPC). The period
-        // carries a deterministic per-node jitter (from `node_id`); the
-        // immediate first tick is consumed so the first broadcast lands one
-        // full period in.
-        let mut anti_entropy_tick =
-            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.node_id));
-        anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        anti_entropy_tick.tick().await;
-
-        // Operator run-narration over the replicated CRDT. After this
-        // bootstrap relocation the operator's process IS this observer, so
-        // the run narrative (phase started / complete, the one-shot
-        // run-complete-or-aborted summary) must be emitted HERE — reading
-        // the replicated `cluster_state` directly — rather than by the new
-        // primary on a different node's stdout. The narrator is a pure,
-        // idempotent differ; `observe()` is called at the TOP of every
-        // iteration BEFORE the `run_complete()` early-return below, so the
-        // iteration that detects completion emits the summary before the
-        // loop returns.
-        let mut narrator = crate::run_narrator::RunNarrator::new();
-
-        // Snapshot-RPC recovery (fixes #187) — REQUEST half. This observer
-        // is the demoted submitter running the observer tail; it applies
-        // replicated mutations INCREMENTALLY and has no other catch-up
-        // path. In setup-defer mode (`--source-already-staged`) the
-        // submitter skipped `seed_cluster_state` and the whole ledger is
-        // originated by the PROMOTED secondary post-promotion — any seed
-        // mutation the observer missed during the hand-off window leaves
-        // its `tasks` empty forever, and it reports an all-zeros summary.
-        // Heal it by unicasting a `RequestClusterSnapshot` to
-        // `Destination::Primary` (the primary-preferred,
-        // authoritative-complete responder, which answers the request)
-        // the moment the observer tail enters.
-        //
-        // The REPLY is healed by the loop's own `ClusterSnapshot` recv arm
-        // (below) — NOT by a separate pre-loop blocking recv. Folding the
-        // reply into the loop is what makes recovery cancel-safe and
-        // deadlock-free BY CONSTRUCTION: the loop already owns every
-        // backstop (setup-promote-deadline, fleet-dead grace,
-        // primary-silence) AND every live arm (incremental
-        // `ClusterMutation` apply, `Primary`-keepalive liveness refresh,
-        // `PrimaryChanged` re-point). A pre-loop blocking recv would
-        // instead (a) delay those backstops by its own budget and (b)
-        // swallow / mis-handle the live frames the loop is designed to
-        // process (a failover keepalive's liveness refresh, a `RunComplete`
-        // exit) — so the request is fire-and-let-the-loop-heal.
-        //
-        // Gated on `current_primary().is_some()` so a pre-relocation
-        // observer (no primary yet) skips the RPC entirely. A send failure
-        // is best-effort: the loop's deadline / fleet-dead arms remain the
-        // hard backstop, and a late/unsolicited snapshot still heals via
-        // the recv arm.
-        if self.cluster_state.current_primary().is_some() {
-            let request = DistributedMessage::RequestClusterSnapshot {
-                sender_id: self.config.node_id.clone(),
-                timestamp: crate::primary::wire::timestamp_now(),
-                // This tail is a strict observer; declare the truthful
-                // role so the responder's `PeerJoined` records it
-                // correctly (observer ⇒ never primary-capable).
-                is_observer: true,
-                can_be_primary: false,
-            };
-            if let Err(e) = self
-                .send_to(
-                    dynrunner_protocol_primary_secondary::Destination::Primary,
-                    request,
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    "observer tail: RequestClusterSnapshot send to primary failed; \
-                     relying on incremental apply + deadline backstops"
-                );
-            } else {
-                tracing::info!(
-                    "observer tail: requested cluster snapshot from primary; \
-                     the reply heals via the loop's ClusterSnapshot recv arm"
-                );
-            }
-        }
-
-        loop {
-            narrator.observe(&self.cluster_state);
-
-            // Happy-path exit: the authoritative primary declared the run
-            // over (sticky monotonic flag). Checked first so a RunComplete
-            // applied before this loop even entered returns immediately.
-            if self.cluster_state.run_complete() {
-                tracing::info!(
-                    "observer tail: cluster_state.run_complete() — run is over, \
-                     submitter observer exiting"
-                );
-                return Ok(());
-            }
-
-            // Inbound closed WITH the fleet still present: no further
-            // mutation can arrive yet peers remain (a clean drain where the
-            // inbound senders were dropped but the mesh is otherwise live),
-            // so the run's outcome is frozen and the watch cannot make
-            // progress — exit cleanly. When the fleet is ALSO dead
-            // (`peer_count() == 0`), a closed inbound is NOT a clean exit:
-            // it is the stranded-run condition the dead-fleet grace below
-            // owns (every peer gone with no `RunComplete` ⇒ Err), so fall
-            // through to it rather than masking a strand as `Ok`.
-            if transport_closed && self.transport.peer_count() > 0 {
-                tracing::info!(
-                    "observer tail: transport inbound closed while peers remain; \
-                     submitter observer exiting"
-                );
-                return Ok(());
-            }
-
-            // Dead-fleet grace (RESIDUAL-RISK-#3): gated purely on the
-            // role-blind `peer_count()`, NOT on the pool the observer
-            // relinquished. With every peer gone, no authority remains to
-            // ever broadcast `RunComplete`.
-            if self.transport.peer_count() == 0 {
-                let now = Instant::now();
-                let since = *fleet_dead_since.get_or_insert(now);
-                let elapsed = now.duration_since(since);
-                if elapsed >= self.config.fleet_dead_timeout {
-                    tracing::error!(
-                        elapsed_s = elapsed.as_secs_f64(),
-                        timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
-                        "observer tail: every peer gone with no RunComplete; \
-                         exiting on the fleet-dead grace"
-                    );
-                    return Err(format!(
-                        "observer fleet-dead: every peer left the mesh and no \
-                         RunComplete was broadcast within {:.1}s",
-                        self.config.fleet_dead_timeout.as_secs_f64()
-                    ));
-                }
-            } else {
-                // Fleet present (or recovered); reset the grace clock so a
-                // later emptiness measures from its own start.
-                fleet_dead_since = None;
-            }
-
-            // Primary-silence backstop (the half-open-peer strand). When a
-            // primary is named but its keepalives have stopped for longer
-            // than `peer_timeout` — with no `RunComplete` — either the whole
-            // fleet died or a failover failed to produce a live successor,
-            // so the run is stranded and the observer must exit rather than
-            // block forever on a recv that will never deliver. Gated on
-            // `current_primary().is_some()` so a pre-relocation observer
-            // (no primary yet) never trips it. Independent of `peer_count()`
-            // (un-pruned for an apply-only observer, so unreliable here).
-            // `peer_timeout` (default 300s) >> a failover cycle (~15s), so a
-            // legitimate failover refreshes `primary_last_seen` (via the new
-            // primary's keepalives / `PrimaryChanged`) well before this
-            // fires — it only fires when failover did NOT rescue the run.
-            if let Some(primary) = self.cluster_state.current_primary() {
-                let silent_for = Instant::now().duration_since(primary_last_seen);
-                if silent_for > self.config.peer_timeout && !self.cluster_state.run_complete() {
-                    tracing::error!(
-                        primary,
-                        silent_s = silent_for.as_secs_f64(),
-                        timeout_s = self.config.peer_timeout.as_secs_f64(),
-                        "observer tail: current primary silent past peer_timeout with no \
-                         RunComplete — run stranded"
-                    );
-                    return Err(format!(
-                        "observer: current primary {primary} silent for {:.0}s with no \
-                         RunComplete — run stranded",
-                        silent_for.as_secs_f64()
-                    ));
-                }
-            }
-
-            tokio::select! {
-                msg = self.transport.recv_peer(), if !transport_closed => {
-                    match msg {
-                        Some(m) => {
-                            // Apply-only RECEIVE path: the observer is NOT
-                            // the authority, so it mirrors `ClusterMutation`
-                            // batches into its `cluster_state` (the source
-                            // for `run_complete()` and the replicated result
-                            // ledger) and NEVER re-broadcasts. A `Primary`
-                            // keepalive from the current primary is
-                            // INSPECTED (never re-broadcast) to refresh the
-                            // primary-liveness clock. Every other wire shape
-                            // is ignored — the observer assigns no tasks and
-                            // coordinates nothing.
-                            match m.msg_type() {
-                                MessageType::ClusterMutation => {
-                                    // A `PrimaryChanged` riding this batch
-                                    // re-points `current_primary()`; the
-                                    // newly-named primary is live by
-                                    // construction (the relocate/election
-                                    // that announced it), so detect the
-                                    // re-point across the apply and refresh
-                                    // the liveness clock. Snapshot the id
-                                    // BEFORE the `&mut self` apply (it
-                                    // borrows `cluster_state`).
-                                    let before =
-                                        self.cluster_state.current_primary().map(str::to_owned);
-                                    self.handle_cluster_mutation(m).await;
-                                    let after =
-                                        self.cluster_state.current_primary().map(str::to_owned);
-                                    if after.is_some() && after != before {
-                                        primary_last_seen = Instant::now();
-                                        tracing::debug!(
-                                            primary = ?after,
-                                            "observer tail: PrimaryChanged repointed the \
-                                             current primary — refreshing primary-liveness clock"
-                                        );
-                                    }
-                                }
-                                MessageType::Keepalive => {
-                                    // Inspect-only primary-liveness refresh.
-                                    // A `Primary`-tagged keepalive whose
-                                    // ORIGINATOR (`secondary_id`) IS the
-                                    // current primary is a primary-liveness
-                                    // assertion — mirrors the secondary's
-                                    // `handle_inbound` Keepalive arm
-                                    // (`record_primary_message`). A stray
-                                    // `Primary` keepalive from a non-current
-                                    // id, or any `Secondary` keepalive, is
-                                    // not primary liveness and is ignored.
-                                    // The observer NEVER re-broadcasts.
-                                    if let DistributedMessage::Keepalive {
-                                        secondary_id,
-                                        emitter_role: KeepaliveRole::Primary,
-                                        ..
-                                    } = &m
-                                        && self.cluster_state.current_primary()
-                                            == Some(secondary_id.as_str())
-                                    {
-                                        primary_last_seen = Instant::now();
-                                        tracing::trace!(
-                                            primary = %secondary_id,
-                                            "observer tail: primary keepalive — \
-                                             refreshing primary-liveness clock"
-                                        );
-                                    }
-                                }
-                                MessageType::ClusterSnapshot => {
-                                    // Late / unsolicited snapshot heal.
-                                    // A `ClusterSnapshot` arriving here
-                                    // (e.g. the pre-loop recovery reply
-                                    // landed after the bounded wait, or a
-                                    // peer answered a request the observer
-                                    // re-issues) is merged via the
-                                    // idempotent `restore()` lattice — the
-                                    // same recovery the pre-loop RPC does,
-                                    // so a missed seed still heals once a
-                                    // snapshot reaches the observer. Apply-
-                                    // only; the observer NEVER re-broadcasts.
-                                    if let DistributedMessage::ClusterSnapshot {
-                                        snapshot_json,
-                                        ..
-                                    } = &m
-                                    {
-                                        match serde_json::from_str::<
-                                            crate::cluster_state::ClusterStateSnapshot<I>,
-                                        >(
-                                            snapshot_json
-                                        ) {
-                                            Ok(snap) => {
-                                                self.cluster_state.restore(snap);
-                                                tracing::info!(
-                                                    "observer tail: applied late/unsolicited \
-                                                     ClusterSnapshot — ledger healed"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    "observer tail: ClusterSnapshot failed to \
-                                                     decode; ignoring"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                MessageType::StateDigest => {
-                                    // Anti-entropy receive on the observer.
-                                    // Compare the peer's digest against the
-                                    // observer's apply-only mirror and pull a
-                                    // snapshot iff behind — the periodic
-                                    // catch-up beyond the one-shot bootstrap
-                                    // RPC. The compare + target selection live
-                                    // in `crate::anti_entropy` (shared across
-                                    // all three roles); this arm only owns the
-                                    // `send_to`. The pull's reply heals via the
-                                    // `ClusterSnapshot` recv arm above
-                                    // (idempotent `restore`), so a converged
-                                    // second round matches and pulls nothing.
-                                    // The observer NEVER re-broadcasts a peer's
-                                    // digest; it only sends its own request.
-                                    if let DistributedMessage::StateDigest {
-                                        digest,
-                                        sender_id,
-                                        ..
-                                    } = &m
-                                    {
-                                        let local = self.cluster_state.digest();
-                                        let requester =
-                                            crate::anti_entropy::RequesterIdentity {
-                                                node_id: &self.config.node_id,
-                                                // This tail is a strict
-                                                // observer: never primary-capable.
-                                                is_observer: true,
-                                                can_be_primary: false,
-                                            };
-                                        if let Some((destination, request)) =
-                                            crate::anti_entropy::reconcile_against_peer(
-                                                &local,
-                                                digest,
-                                                sender_id,
-                                                self.cluster_state.current_primary(),
-                                                &requester,
-                                                crate::primary::wire::timestamp_now(),
-                                            )
-                                        {
-                                            if let Err(e) =
-                                                self.send_to(destination, request).await
-                                            {
-                                                tracing::debug!(
-                                                    error = %e,
-                                                    "observer tail: anti-entropy snapshot \
-                                                     pull request send failed; a later \
-                                                     digest round retries"
-                                                );
-                                            } else {
-                                                tracing::debug!(
-                                                    "observer tail: behind peer digest; \
-                                                     requested snapshot pull"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                other => {
-                                    tracing::trace!(
-                                        msg_type = ?other,
-                                        "observer tail: ignoring non-ClusterMutation frame"
-                                    );
-                                }
-                            }
-                        }
-                        None => {
-                            transport_closed = true;
-                            tracing::debug!(
-                                "observer tail: transport.recv_peer() returned None; \
-                                 disabling the inbound arm"
-                            );
-                        }
-                    }
-                }
-                // Setup-promote-deadline arm. Copied from the operational
-                // loop (`operational_loop`): gated on `self.setup_pending()
-                // && !setup_promote_deadline_consumed` so it is disabled the
-                // moment discovery seeds the ledger, and re-checked at fire
-                // time so a TaskAdded landing in the same tick is not raced.
-                // The submitter no longer runs the operational loop, so the
-                // backstop against a hung setup-defer discovery must live
-                // here.
-                _ = tokio::time::sleep_until(setup_promote_deadline_at.into()),
-                    if self.setup_pending() && !setup_promote_deadline_consumed => {
-                    setup_promote_deadline_consumed = true;
-                    if self.setup_pending() {
-                        let elapsed = setup_promote_loop_start.elapsed();
-                        tracing::error!(
-                            elapsed_s = elapsed.as_secs_f64(),
-                            deadline_s = self.config.setup_promote_deadline.as_secs_f64(),
-                            "observer tail: setup-promote deadline expired — the \
-                             chosen primary's discovery feed never seeded the ledger \
-                             (no TaskAdded / TasksSpawned / RunComplete)"
-                        );
-                        self.setup_deadline_outcome = Some(elapsed);
-                        return Err(RunError::SetupDeadlineExpired { elapsed }.to_string());
-                    }
-                }
-                // Dead-fleet poll wake. Carries no work — it only re-drives
-                // the loop so the top-of-loop dead-fleet grace check
-                // re-evaluates when there is no recv traffic to do so.
-                _ = fleet_dead_poll.tick() => {}
-                // Anti-entropy tick: broadcast the observer's digest so
-                // peers learn its view and it converges with the mesh. Pure
-                // EMIT of the role-agnostic frame from `crate::anti_entropy`;
-                // the receive-side compare+pull is the `StateDigest` recv arm
-                // above. `interval.tick` is cancel-safe (tokio docs).
-                _ = anti_entropy_tick.tick() => {
-                    let digest = self.cluster_state.digest();
-                    let frame = crate::anti_entropy::digest_broadcast(
-                        &self.config.node_id,
-                        crate::primary::wire::timestamp_now(),
-                        digest,
-                    );
-                    let _ = self
-                        .send_to(
-                            dynrunner_protocol_primary_secondary::Destination::All,
-                            frame,
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
     /// Spawn the peer-lifecycle + task-completion dispatcher tasks.
     ///
     /// The (sender, receiver) pairs were built in `new()` and the
@@ -3489,8 +3283,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         );
         async {
             let result = self.run_activated_pipeline(snapshot).await;
-            self.cleanup_lifecycle_dispatcher().await;
-            self.cleanup_task_completed_dispatcher().await;
+            self.cleanup_run_dispatchers().await;
             result
         }
         .instrument(span)

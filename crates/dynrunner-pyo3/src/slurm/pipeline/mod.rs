@@ -179,6 +179,7 @@ pub(super) fn pkill_leftover_tunnels(py: Python<'_>) -> PyResult<()> {
 }
 
 mod drive_rust;
+mod image_build;
 mod preparation;
 mod respawn;
 mod run_pipeline;

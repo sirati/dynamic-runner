@@ -297,6 +297,7 @@ mod tests {
             shutdown_log_path: PathBuf::from("/net/log/7/shutdown-manager.log"),
             shutdown_pid_file: PathBuf::from("/tmp/asm-abc123/shutdown-manager.pid"),
             local_image: PathBuf::from("/tmp/asm-abc123/image.tar"),
+            image_cache_root: PathBuf::from("/tmp/asm-imgcache"),
         }
     }
 

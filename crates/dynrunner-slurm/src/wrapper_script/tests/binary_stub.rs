@@ -145,6 +145,10 @@ fn expected_wire(cfg_name_prefix: &str, rand_suffix: &str) -> WrapperConfig {
         secondary_id: "sec-01".to_string(),
         image_path: "/images/test.tar".to_string(),
         image_tar_basename: "test-app.tar".to_string(),
+        // Mirrors `standard_cfg`'s baseline digest; the stub encodes it
+        // and the cli parser must reconstruct it (anti-drift coverage
+        // for the image-digest plumb).
+        image_digest: "testdigest0001".to_string(),
         image_name: "test-app".to_string(),
         image_tag: "latest".to_string(),
         load_command:

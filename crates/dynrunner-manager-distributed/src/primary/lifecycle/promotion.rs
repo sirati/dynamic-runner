@@ -13,7 +13,7 @@ use crate::primary::command_channel::PrimaryCommand;
 ///
 /// The bootstrap fork in `run_pipeline` branches on this to choose the
 /// post-activation regime: a successful relocation drops into the
-/// observer tail (`run_as_observer`), while a fall-back-to-local keeps
+/// relocation observer tail, while a fall-back-to-local keeps
 /// the submitter on the normal operational path
 /// (`run_operational_and_finalize`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

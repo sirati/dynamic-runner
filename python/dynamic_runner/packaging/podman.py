@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from ..deployment_spec import TaskDeploymentSpec
+from .gateway import expand_gateway_tilde
 from .layered_transfer import LayeredUploader, UploadStats, make_bundle_from_archive
 
 logger = logging.getLogger(__name__)
@@ -158,10 +159,13 @@ class PodmanPackaging:
     def image_tag(self) -> str:
         return self.deployment.image_tag
 
-    def _normalize_path(self, path: str | Path) -> Path:
-        if isinstance(path, Path):
-            return path
-        return Path(path)
+    def _normalize_path(self, gateway: Any, path: str | Path) -> Path:
+        # Resolve a leading ``~`` against the gateway's remote home so a
+        # ``~``-prefixed output dir never lands a literal ``~`` directory
+        # once the path is ``shlex.quote``d into a remote ``mkdir``. The
+        # production path (pipeline._make_slurm_config) already expands at
+        # the config boundary; this is the defensive lower-level guard.
+        return Path(expand_gateway_tilde(gateway, path))
 
     def _resolve_layer_cache_path(self, local_project_root: Path) -> Path | None:
         """Resolve the local file path for the partial-build cache.
@@ -380,7 +384,7 @@ class PodmanPackaging:
             out_link="docker-image-result",
         )
 
-        output_dir_path = self._normalize_path(output_dir)
+        output_dir_path = self._normalize_path(gateway, output_dir)
         remote_path = output_dir_path / self.deployment.image_tar_basename
         marker_remote_path = output_dir_path / self.deployment.image_marker_basename
         layer_cache_root = output_dir_path / self.LAYER_CACHE_SUBDIR
