@@ -218,6 +218,7 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
         image_name: "app",
         image_tag: "latest",
         image_tar_basename: "app.tar.gz",
+        image_digest: "appdigest0001",
         load_command: "podman load",
         container_command: "dynamic_runner.task",
         cores_spec: "0",
