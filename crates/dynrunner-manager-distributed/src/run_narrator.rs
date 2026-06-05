@@ -67,12 +67,29 @@ pub struct RunNarrator {
 }
 
 impl RunNarrator {
-    pub(crate) fn new() -> Self {
+    /// Construct with the started-phases edge-set pre-seeded from phases
+    /// already announced by another emitter in THIS process (the
+    /// pre-relocation submitter's `fire_initial_phase_starts`), so the
+    /// narrator does not re-announce them but still emits phases that
+    /// first become dispatchable post-relocation. The relocation observer
+    /// tail seeds from `phase_started_emitted`; the empty-seed [`Self::new`]
+    /// is the cold-join / test constructor.
+    pub(crate) fn with_started_phases(started_phases: HashSet<PhaseId>) -> Self {
         Self {
-            started_phases: HashSet::new(),
+            started_phases,
             done_phases: HashSet::new(),
             completion_emitted: false,
         }
+    }
+
+    /// Empty-seed narrator (no phase pre-announced). The cold-join path
+    /// seeds an empty set through [`Self::with_started_phases`] directly;
+    /// this delegating constructor is the test entry point (the production
+    /// observer always calls `with_started_phases`). Delegates so field
+    /// initialisation has one source of truth.
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::with_started_phases(HashSet::new())
     }
 
     /// Diff `state` against the accumulated edge-sets and emit any newly

@@ -275,6 +275,10 @@ pub(super) fn spawn_real_secondary_slow(
 /// attribution the relocation e2e asserts on — proof that the CHOSEN peer's
 /// own authority dispatched + drove the run to completion, not merely that
 /// cluster totals reconcile.
+// Retained scaffolding for the relocation-e2e wave (its tests were removed
+// in the Wave-0 `run_as_observer` cleanup and are re-added by a later wave);
+// currently unreferenced.
+#[allow(dead_code)]
 pub(super) type ActivatedPrimaryResult = std::rc::Rc<std::cell::Cell<Option<usize>>>;
 
 /// Like [`spawn_real_secondary`] but PRIMARY-CAPABLE: the secondary joins
@@ -320,6 +324,10 @@ pub(super) type ActivatedPrimaryResult = std::rc::Rc<std::cell::Cell<Option<usiz
 ///
 /// Returns the secondary's own-work `JoinHandle` plus the
 /// [`ActivatedPrimaryResult`] cell.
+// Retained scaffolding for the relocation-e2e wave (its tests were removed
+// in the Wave-0 `run_as_observer` cleanup and are re-added by a later wave);
+// currently unreferenced.
+#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub(super) fn spawn_real_secondary_primary_capable(
     secondary_id: String,

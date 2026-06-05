@@ -18,6 +18,7 @@
 //! See each submodule's header for its concern.
 
 pub mod announcer;
+pub mod coordinator;
 pub mod failure_response;
 pub mod lifecycle;
 pub mod reporting;
@@ -25,6 +26,10 @@ pub mod reporting;
 pub use announcer::{
     AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender, PeerMeshAnnouncerSender,
     PeerResourceHoldingsUpdatedPayload, run_observer_announcer,
+};
+pub use coordinator::{
+    ObserverConfig, ObserverCoordinator, ObserverHandoff, ObserverTerminal,
+    build_cold_join_observer,
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
