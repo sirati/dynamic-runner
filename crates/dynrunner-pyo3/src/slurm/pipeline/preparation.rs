@@ -5,6 +5,7 @@
 //! calls; the inner `run_preparation` is the Rust-callable signature
 //! the orchestrator uses directly.
 
+use dynrunner_core::IMPORTANT_TARGET;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
@@ -182,9 +183,28 @@ pub(super) fn run_preparation<'py>(
             .getattr("Path")?
             .call0()?
             .call_method0("cwd")?;
+        // A2 build-start milestone (LLM-wake): occurrence point is the start
+        // of the container image build+transfer. Direct importance emit so
+        // the dual-sink surfaces it on stdio under `--important-stdio-only`.
+        // Only on the real-build branch — the `--skip-image-build` arm above
+        // never builds. Additive to the `log.info` lines.
+        tracing::info!(
+            target: IMPORTANT_TARGET,
+            "Building and transferring container image...",
+        );
         let metadata = job_manager.call_method1("build_and_transfer_images", (project_root,))?;
         let uploaded: bool = metadata.getattr("uploaded")?.extract().unwrap_or(false);
         let remote_path = metadata.getattr("remote_path")?;
+        // A3 image-ready milestone (LLM-wake): occurrence point is the
+        // image-transfer result. `uploaded` discriminates an actual upload
+        // (cache miss) from a reused remote artifact (cache hit); both are
+        // the "image is now on the gateway" milestone. Same importance target.
+        tracing::info!(
+            target: IMPORTANT_TARGET,
+            remote_path = %remote_path,
+            uploaded,
+            "container image ready on gateway",
+        );
         let image_hash: String = metadata
             .getattr("image_hash")
             .and_then(|v| v.extract())
