@@ -141,6 +141,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             hash: task_hash,
             secondary,
             worker,
+            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            version: Default::default(),
         }])
         .await;
     }
@@ -239,8 +241,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // Build the full roster batch under the immutable borrow of
         // `self.secondaries`. Two mutations per secondary: the membership
         // `PeerJoined` and the static `SecondaryCapacity`.
-        let mut mutations: Vec<ClusterMutation<I>> =
-            Vec::with_capacity(self.secondaries.len() * 2);
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(self.secondaries.len() * 2);
         for conn in self.secondaries.values() {
             mutations.push(ClusterMutation::PeerJoined {
                 peer_id: conn.id().to_string(),

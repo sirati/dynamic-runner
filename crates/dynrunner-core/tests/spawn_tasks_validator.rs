@@ -38,6 +38,7 @@ fn task(task_id: &str, deps: Vec<&str>) -> TaskInfo<Arc<str>> {
             })
             .collect(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -163,8 +164,11 @@ fn dep_resolution_is_phase_aware_on_receiver_side() {
     // Pre-fix the phase-blind closure accepted any phase carrying `foo`.
     let is_present = |_h: &str| false;
     let is_known = |p: &PhaseId, id: &str| p == &PhaseId::from("A") && id == "foo";
-    let (valid, errors) =
-        validate_spawn_tasks(is_present, is_known, vec![task_in("B", "child", &[("B", "foo")])]);
+    let (valid, errors) = validate_spawn_tasks(
+        is_present,
+        is_known,
+        vec![task_in("B", "child", &[("B", "foo")])],
+    );
     assert!(valid.is_empty(), "the phase-B dep is unsatisfiable");
     assert_eq!(errors.len(), 1);
     match &errors[0].1 {
@@ -179,8 +183,11 @@ fn cross_phase_dep_naming_right_phase_resolves_on_receiver_side() {
     // (phase=A, foo) names the right phase → resolves.
     let is_present = |_h: &str| false;
     let is_known = |p: &PhaseId, id: &str| p == &PhaseId::from("A") && id == "foo";
-    let (valid, errors) =
-        validate_spawn_tasks(is_present, is_known, vec![task_in("B", "child", &[("A", "foo")])]);
+    let (valid, errors) = validate_spawn_tasks(
+        is_present,
+        is_known,
+        vec![task_in("B", "child", &[("A", "foo")])],
+    );
     assert_eq!(valid.len(), 1);
     assert!(errors.is_empty());
 }

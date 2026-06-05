@@ -259,8 +259,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.send_to(Destination::Secondary(PeerId::from(secondary_id.clone())), msg)
-                .await?;
+            self.send_to(
+                Destination::Secondary(PeerId::from(secondary_id.clone())),
+                msg,
+            )
+            .await?;
 
             // Send succeeded: originate the CRDT `Pending → InFlight`
             // transition for each task in this secondary's initial
@@ -383,8 +386,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 pre_staged_mode: true,
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.send_to(Destination::Secondary(PeerId::from(secondary_id.clone())), msg)
-                .await?;
+            self.send_to(
+                Destination::Secondary(PeerId::from(secondary_id.clone())),
+                msg,
+            )
+            .await?;
         }
 
         // InitialAssigning → Operational + seed keepalive, identical to

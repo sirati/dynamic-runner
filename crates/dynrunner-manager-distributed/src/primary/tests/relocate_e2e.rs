@@ -141,7 +141,11 @@ async fn e2e_no_capable_peer_submitter_stays_primary() {
                 Some("primary"),
                 "with no hand-off target the submitter must stay current_primary"
             );
-            assert_eq!(submitter.completed_count(), NUM_TASKS, "all tasks must complete");
+            assert_eq!(
+                submitter.completed_count(),
+                NUM_TASKS,
+                "all tasks must complete"
+            );
             assert_eq!(submitter.failed_count(), 0, "no task may fail");
 
             drop(submitter);

@@ -62,8 +62,10 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             task_id: ident.into(),
             task_depends_on: vec![],
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
             resolved_path: None,
         },
+        version: Default::default(),
     };
     tasks.insert("task-1".to_string(), mk_pending("/tmp/task-1", "task-1"));
     tasks.insert("task-2".to_string(), mk_pending("/tmp/task-2", "task-2"));
@@ -294,11 +296,10 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             // the production late-joiner / phase-end-observer flow
             // produces). No pool is installed after
             // `enter_operational_for_test`, so `pool.workers` is empty.
-            let (mut sec, log) =
-                super::super::test_helpers::make_secondary_recording(
-                    election_config("zero-worker-op"),
-                    1,
-                );
+            let (mut sec, log) = super::super::test_helpers::make_secondary_recording(
+                election_config("zero-worker-op"),
+                1,
+            );
             // Cold role table: resolve `Destination::Primary` to the
             // captured `"primary"` peer so the backpressure report is
             // recorded (the secondary's own id differs, so it resolves to
@@ -398,8 +399,7 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             // slots are genuinely Idle.
             let mut config = election_config("oob-worker");
             config.num_workers = 2;
-            let (mut sec, _log) =
-                super::super::test_helpers::make_secondary_recording(config, 1);
+            let (mut sec, _log) = super::super::test_helpers::make_secondary_recording(config, 1);
             sec.set_bootstrap_primary_id("primary".to_string());
             sec.enter_operational_for_test();
 
@@ -478,6 +478,7 @@ fn make_relative_path_binary(name: &str) -> TaskInfo<TestId> {
         task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -508,11 +509,10 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, log) =
-                super::super::test_helpers::make_secondary_recording(
-                    election_config("zero-worker-unresolvable"),
-                    1,
-                );
+            let (mut sec, log) = super::super::test_helpers::make_secondary_recording(
+                election_config("zero-worker-unresolvable"),
+                1,
+            );
             sec.set_bootstrap_primary_id("primary".to_string());
             sec.enter_operational_for_test();
             assert_eq!(
@@ -604,11 +604,10 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (mut sec, log) =
-                super::super::test_helpers::make_secondary_recording(
-                    election_config("zero-worker-initial"),
-                    1,
-                );
+            let (mut sec, log) = super::super::test_helpers::make_secondary_recording(
+                election_config("zero-worker-initial"),
+                1,
+            );
             sec.set_bootstrap_primary_id("primary".to_string());
             sec.enter_operational_for_test();
             assert_eq!(

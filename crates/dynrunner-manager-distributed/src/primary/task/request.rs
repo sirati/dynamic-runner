@@ -143,7 +143,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         // the operator-facing symptom of cumulative
                         // leaks from this and the sibling path.
                         if let Err(send_err) = self
-                            .send_to(Destination::Secondary(PeerId::from(sec_id.clone())), assignment_msg)
+                            .send_to(
+                                Destination::Secondary(PeerId::from(sec_id.clone())),
+                                assignment_msg,
+                            )
                             .await
                         {
                             tracing::warn!(

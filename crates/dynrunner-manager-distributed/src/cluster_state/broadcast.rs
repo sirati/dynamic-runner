@@ -15,10 +15,90 @@
 
 use std::sync::Arc;
 
-use dynrunner_core::{Identifier, TaskInfo};
+use dynrunner_core::{Identifier, TaskInfo, TaskVersion};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, RoleChangeHookRegistrar, RoleTable};
 
 use super::{ApplyOutcome, ClusterState};
+
+impl<I: Identifier> ClusterState<I> {
+    /// Mint the next monotone `TaskVersion` for `hash` (the originator's
+    /// half of the D-V stamp). Bumps the node-local per-hash `task_seq`
+    /// counter and pairs it with the current `primary_epoch`. The FIRST
+    /// stamp for a hash is `seq = 1` (not 0) so even at `primary_epoch ==
+    /// 0` (a pre-failover / local-bootstrap run that never minted an
+    /// epoch) the first stamped version `(0, 1)` strictly EXCEEDS the
+    /// `(0, 0)` default that a fresh state field (`TaskInfo.preferred_version`,
+    /// the cold-start non-terminal version) and a legacy pre-field sender
+    /// both carry — so a stamped update always wins its first apply.
+    /// Total order is lexicographic `(primary_epoch, seq)`, so each
+    /// subsequent stamp for the same hash strictly exceeds the prior, and
+    /// a post-promotion stamp (higher `primary_epoch`) exceeds every
+    /// pre-promotion version regardless of the local `seq` cold-start.
+    pub(super) fn next_task_version(&mut self, hash: &str) -> TaskVersion {
+        let seq = self
+            .task_seq
+            .entry(hash.to_string())
+            .and_modify(|s| *s += 1)
+            .or_insert(1);
+        TaskVersion {
+            primary_epoch: self.primary_epoch,
+            seq: *seq,
+        }
+    }
+}
+
+/// Stamp the originator's `TaskVersion` onto every version-bearing
+/// mutation in `mutations`, BEFORE the apply+filter loop (B3). The ONE
+/// choke point both originator paths route through, so a forgotten stamp
+/// at any `failed.rs`/`handler.rs`/`mutations.rs`/`coordinator.rs`
+/// origination site is impossible — those sites build the mutation with
+/// `version: Default::default()` and this pass overwrites it with the
+/// minted version.
+///
+/// Compile guard (B3): the match is EXHAUSTIVE over `ClusterMutation`.
+/// The version-bearing variants are matched by DESTRUCTURING their
+/// `version` binding (so the field is named and written); a NEW
+/// version-bearing variant added without a stamp arm here is a COMPILE
+/// ERROR against the enum's exhaustiveness (it would have to be added to
+/// one arm or the other). The `_`-equivalent arm lists the genuinely
+/// version-less variants EXPLICITLY (no `..` rest) — the invariant a
+/// reviewer enforces is that it NEVER silently swallows a
+/// `version`-bearing variant. A forgotten stamp would otherwise degrade
+/// silently to `(0,0)` = the losing value.
+fn stamp_versions<I: Identifier>(
+    state: &mut ClusterState<I>,
+    mutations: &mut [ClusterMutation<I>],
+) {
+    for m in mutations.iter_mut() {
+        match m {
+            ClusterMutation::TaskFailed { hash, version, .. }
+            | ClusterMutation::TaskAssigned { hash, version, .. }
+            | ClusterMutation::TaskPreferredSecondariesUpdated { hash, version, .. }
+            | ClusterMutation::TaskReinjected { hash, version }
+            | ClusterMutation::TaskRequeued { hash, version } => {
+                *version = state.next_task_version(hash);
+            }
+            // The genuinely version-LESS variants, listed EXPLICITLY (B3
+            // invariant: this arm must NEVER swallow a version-bearing
+            // variant). `TaskAdded` (vacant-insert), `TaskCompleted`
+            // (idempotent + rank-dominant), `TaskBlocked` (cascade-pause
+            // keyed on `on`), and every non-task mutation.
+            ClusterMutation::TaskAdded { .. }
+            | ClusterMutation::TaskCompleted { .. }
+            | ClusterMutation::TaskBlocked { .. }
+            | ClusterMutation::PrimaryChanged { .. }
+            | ClusterMutation::PhaseDepsSet { .. }
+            | ClusterMutation::RunComplete
+            | ClusterMutation::RunAborted { .. }
+            | ClusterMutation::PeerJoined { .. }
+            | ClusterMutation::SetCanBePrimary { .. }
+            | ClusterMutation::PeerRemoved { .. }
+            | ClusterMutation::PeerResourceHoldingsUpdated { .. }
+            | ClusterMutation::SecondaryCapacity { .. }
+            | ClusterMutation::TasksSpawned { .. } => {}
+        }
+    }
+}
 
 /// `ClusterState` is the authoritative role-table owner; transports
 /// register their write-through cache through this boundary trait.
@@ -82,8 +162,14 @@ pub(crate) struct AppliedBatch<I: Identifier> {
 ///     `PhaseDepsSet`, and by the panik self-departure announcement).
 pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     state: &mut ClusterState<I>,
-    mutations: Vec<ClusterMutation<I>>,
+    mut mutations: Vec<ClusterMutation<I>>,
 ) -> AppliedBatch<I> {
+    // Version-stamp pass (B3): the SINGLE origination choke point stamps
+    // the monotone `TaskVersion` onto every version-bearing mutation
+    // BEFORE the apply+filter loop, so a forgotten stamp at any
+    // origination call site is impossible. The applied subset re-broadcast
+    // below carries the stamped versions.
+    stamp_versions(state, &mut mutations);
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
     // The originator paths (live primary's `apply_spawn_tasks`,

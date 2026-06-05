@@ -264,6 +264,7 @@ pub(crate) fn extract_binaries(
                 task_id,
                 task_depends_on,
                 preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
+                preferred_version: Default::default(),
                 resolved_path: None,
             })
         })

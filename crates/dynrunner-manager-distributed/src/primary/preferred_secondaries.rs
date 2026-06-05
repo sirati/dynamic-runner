@@ -214,6 +214,7 @@ mod tests {
             preferred_secondaries: SoftPreferredSecondaries::new(
                 prefs.iter().map(|s| (*s).to_string()).collect(),
             ),
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }
@@ -306,6 +307,7 @@ mod tests {
             preferred_secondaries: SoftPreferredSecondaries::new(
                 prefs.iter().map(|s| (*s).to_string()).collect(),
             ),
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }

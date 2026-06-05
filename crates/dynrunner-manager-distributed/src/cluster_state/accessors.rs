@@ -31,7 +31,7 @@ impl<I: Identifier> ClusterState<I> {
 
     pub fn iter_pending(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Pending { task } => Some((h, task)),
+            TaskState::Pending { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -136,7 +136,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn iter_all(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().map(|(h, s)| {
             let t = match s {
-                TaskState::Pending { task }
+                TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
@@ -237,7 +237,7 @@ impl<I: Identifier> ClusterState<I> {
         let mut base: HashMap<&PhaseId, (bool, bool)> = HashMap::new();
         for st in self.tasks.values() {
             let task = match st {
-                TaskState::Pending { task }
+                TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
@@ -321,7 +321,7 @@ impl<I: Identifier> ClusterState<I> {
     pub fn task_hash_for_dep(&self, phase_id: &PhaseId, task_id: &str) -> Option<&str> {
         self.tasks.iter().find_map(|(h, s)| {
             let task = match s {
-                TaskState::Pending { task }
+                TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }

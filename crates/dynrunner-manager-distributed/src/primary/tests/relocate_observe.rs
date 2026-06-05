@@ -25,7 +25,12 @@ use crate::primary::wire::compute_task_hash;
 fn coordinator_with_confirmed_peers(
     confirmed_peers: u32,
 ) -> (
-    PrimaryCoordinator<ChannelPeerTransport<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryCoordinator<
+        ChannelPeerTransport<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
     Vec<(
         String,
         tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -258,6 +263,7 @@ async fn relinquished_result_getters_read_replicated_ledger() {
                     hash: compute_task_hash(&bad),
                     kind: ErrorType::NonRecoverable,
                     error: "boom".into(),
+                    version: Default::default(),
                 });
 
             // The getters the PyO3 boundary reads (run.rs:497-498) route

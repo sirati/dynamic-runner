@@ -114,6 +114,7 @@ fn make_binary(path: impl Into<PathBuf>) -> TaskInfo<String> {
         task_id,
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }

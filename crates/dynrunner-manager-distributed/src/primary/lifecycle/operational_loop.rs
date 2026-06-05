@@ -16,8 +16,7 @@ use crate::primary::wire::compute_task_hash;
 /// can accumulate the map cheaply (one increment per frame) and hand it
 /// here once, and the format is unit-testable in isolation.
 fn format_drain_tally(by_type: &HashMap<MessageType, usize>) -> String {
-    let mut entries: Vec<(&MessageType, usize)> =
-        by_type.iter().map(|(ty, &n)| (ty, n)).collect();
+    let mut entries: Vec<(&MessageType, usize)> = by_type.iter().map(|(ty, &n)| (ty, n)).collect();
     // Count descending; `Debug`-name ascending as the stable tie-break.
     entries.sort_by(|(a_ty, a_n), (b_ty, b_n)| {
         b_n.cmp(a_n)
@@ -962,10 +961,7 @@ mod tests {
     fn breakdown_reflects_counts_sorted_by_count_desc() {
         // 3 TaskRequest + 1 Keepalive → both present, dominant first.
         let by_type = tally(&[(MessageType::TaskRequest, 3), (MessageType::Keepalive, 1)]);
-        assert_eq!(
-            format_drain_tally(&by_type),
-            "[TaskRequest=3, Keepalive=1]"
-        );
+        assert_eq!(format_drain_tally(&by_type), "[TaskRequest=3, Keepalive=1]");
     }
 
     #[test]
@@ -986,10 +982,7 @@ mod tests {
     fn equal_counts_break_ties_by_name_for_stable_order() {
         let by_type = tally(&[(MessageType::TaskRequest, 4), (MessageType::Keepalive, 4)]);
         // Equal counts → ascending Debug-name: Keepalive before TaskRequest.
-        assert_eq!(
-            format_drain_tally(&by_type),
-            "[Keepalive=4, TaskRequest=4]"
-        );
+        assert_eq!(format_drain_tally(&by_type), "[Keepalive=4, TaskRequest=4]");
     }
 
     #[test]

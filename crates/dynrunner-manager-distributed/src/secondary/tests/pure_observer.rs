@@ -98,12 +98,19 @@ fn snapshot_with(
         task_id: ident.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     };
     let mut tasks = HashMap::new();
     for i in 0..n_pending {
         let id = format!("pending-{i}");
-        tasks.insert(id.clone(), TaskState::Pending { task: mk_task(&id) });
+        tasks.insert(
+            id.clone(),
+            TaskState::Pending {
+                task: mk_task(&id),
+                version: Default::default(),
+            },
+        );
     }
     for i in 0..n_completed {
         let id = format!("done-{i}");

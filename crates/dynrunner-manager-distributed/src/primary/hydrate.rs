@@ -119,13 +119,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // entries and any work it itself dispatched is tracked
                 // as `InFlight` in cluster_state. A `Pending` entry is
                 // therefore always genuinely pending: into the pool.
-                TaskState::Pending { task } => {
+                TaskState::Pending { task, .. } => {
                     items.push(task.clone());
                 }
                 TaskState::InFlight {
                     task,
                     secondary,
                     worker,
+                    ..
                 } => {
                     // The originating dispatcher dispatched the work; this
                     // coordinator inherits it on promotion and will observe
@@ -401,6 +402,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     task,
                     secondary,
                     worker,
+                    ..
                 } => Some((hash.clone(), secondary.clone(), *worker, task.clone())),
                 _ => None,
             })

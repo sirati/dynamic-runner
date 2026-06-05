@@ -74,8 +74,9 @@ where
                 let estimated_for_memuse = self.op_mut().pool.workers[worker_id as usize]
                     .estimated_resources
                     .clone();
-                let actual_for_memuse =
-                    self.op_mut().pool.workers[worker_id as usize].actual_usage.clone();
+                let actual_for_memuse = self.op_mut().pool.workers[worker_id as usize]
+                    .actual_usage
+                    .clone();
                 if let Some(log_path) = self.config.memuse_log_path.as_deref() {
                     dynrunner_manager_local::memuse::log_resource_usage(
                         log_path,

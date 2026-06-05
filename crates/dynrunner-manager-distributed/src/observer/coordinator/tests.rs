@@ -51,6 +51,7 @@ fn task(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId> {
             .collect(),
         preferred_secondaries: Default::default(),
         resolved_path: None,
+        preferred_version: Default::default(),
     }
 }
 
@@ -241,6 +242,7 @@ async fn observer_narrates_phases_and_one_completion_summary() {
                 hash: "bad".to_string(),
                 kind: ErrorType::NonRecoverable,
                 error: "boom".into(),
+                version: Default::default(),
             });
             cs.apply(ClusterMutation::RunComplete);
 

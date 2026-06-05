@@ -171,6 +171,7 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
                 })
                 .collect(),
             preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }

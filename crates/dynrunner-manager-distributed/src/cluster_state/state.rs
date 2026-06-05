@@ -88,12 +88,19 @@ pub struct ClusterState<I> {
     /// authoritative "have we ever seen this id, and is it currently
     /// alive or dead-forever" answer.
     ///
-    /// Skipped from `Clone`, snapshot, and restore — same rationale
-    /// as `role_change_hooks`: the map is paired with the node-local
-    /// `lifecycle_tx` dispatcher channel and a cloned replica has
-    /// neither the channel nor any reason to inherit the source's
-    /// runtime peer view. Receivers rebuild the map by re-applying
-    /// broadcast `PeerJoined`/`PeerRemoved` mutations after restore.
+    /// Skipped from `Clone` (a cloned replica is a fresh node-local view
+    /// paired with the node-local `lifecycle_tx` dispatcher channel, and
+    /// has no reason to inherit the source's runtime peer view).
+    ///
+    /// Snapshot/restore: the ALIVE subset DOES cross the wire — `snapshot`
+    /// projects the `Alive` ids out of this map into
+    /// `ClusterStateSnapshot::alive_members` (only the `HashSet<String>`,
+    /// not the module-private `PeerEntry`), and `restore` reconstructs a
+    /// fresh `Alive` `PeerEntry` for each incoming id into a VACANT slot
+    /// (Dead-wins / sticky: a local `Dead` is never resurrected; absence
+    /// is not read as Dead — honest-liveness). Dead ids are NOT
+    /// snapshotted. The steady-state writers remain the live
+    /// `PeerJoined`/`PeerRemoved` broadcasts.
     pub(super) peer_state: HashMap<String, PeerEntry>,
     /// Sender end of the peer-lifecycle dispatcher mpsc. Installed
     /// via [`Self::install_lifecycle_sender`] when the coordinator
@@ -153,14 +160,14 @@ pub struct ClusterState<I> {
     /// reached `Completed` and committed a non-empty `TaskOutputs`
     /// via its `TaskCompleted` mutation's `result_data` payload.
     ///
-    /// Keyed by `task_id` (not the CRDT-internal task hash) — dependents
-    /// reference predecessors by `task_id` (see `TaskDep.task_id`), and
-    /// `ClusterState` does not maintain a `task_id → hash` reverse
-    /// index. Keying the cache by `task_id` lets the dispatch-side
-    /// resolver look up a dependent's predecessor outputs in O(1)
-    /// without a linear scan, and matches the shape downstream consumers
-    /// see (Python-side task bindings dereference by user-chosen
-    /// `task_id` strings, never by internal hashes).
+    /// Keyed by the wire-canonical CONTENT HASH (the same key as the
+    /// `tasks` ledger), NOT `task_id`. The content hash folds in
+    /// `phase_id`, so the same `task_id` in two different phases keys to
+    /// two distinct cache entries (no cross-phase output collision). The
+    /// dispatch-time predecessor assembler resolves a dep's full
+    /// `(phase_id, task_id)` identity to its hash, then reads this cache
+    /// by that hash (`co_present_outputs_for` / `record_task_outputs_value`
+    /// both key by hash).
     ///
     /// Replicated CRDT data — clone preserves it (matches `tasks`,
     /// `peer_holdings`, and `phase_deps` semantics). Included in
@@ -169,13 +176,12 @@ pub struct ClusterState<I> {
     /// reaches it. Populated by the `TaskCompleted` apply arm (see
     /// the `record_task_outputs` helper in `apply_tasks.rs`).
     ///
-    /// Anonymous tasks (`TaskInfo.task_id == None`) cannot be
-    /// referenced as dependencies and are skipped — they have no key
-    /// to insert under. Malformed `result_data` (failed JSON decode)
+    /// A hash with no `tasks` ledger entry (a late-arriving mutation for
+    /// a task this replica never saw) is skipped — there is no anchor to
+    /// key the cache against. Malformed `result_data` (failed JSON decode)
     /// logs a `tracing::warn!` and stores an empty `TaskOutputs` so
-    /// dependents that hard-require a key see a controlled-empty
-    /// view rather than racing the cache between "populated" and
-    /// "absent".
+    /// dependents that hard-require a key see a controlled-empty view
+    /// rather than racing the cache between "populated" and "absent".
     pub(super) task_outputs: HashMap<String, TaskOutputs>,
     /// Per-secondary static capacity (worker-slot count + advertised
     /// resource amounts). Set once per secondary by the
@@ -194,6 +200,21 @@ pub struct ClusterState<I> {
     /// reconstructs `alive_worker_count()` / `self.workers` from this
     /// replicated source rather than starting empty.
     pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Node-local per-task monotone "next seq" counter — the originator's
+    /// half of the `TaskVersion` stamp. The originating primary (or a
+    /// promoted secondary holding a `ClusterState`) bumps this at the
+    /// version-stamp choke point (`broadcast::stamp_versions`) to mint a
+    /// strictly-increasing `(primary_epoch, seq)` per hash.
+    ///
+    /// NOT replicated: it is the local originator's counter, not part of
+    /// the converged ledger — skipped from `Clone`, snapshot, restore, and
+    /// the digest (classified node-local in the exhaustive-destructure
+    /// guards, like the dispatcher senders). A replica that never
+    /// originates a mutation for a hash never reads it; a freshly-promoted
+    /// primary cold-starts the counter, and `next_task_version` mints
+    /// against the (already-advanced) `primary_epoch`, so a post-promotion
+    /// stamp still strictly exceeds every pre-promotion version.
+    pub(super) task_seq: HashMap<String, u32>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -229,6 +250,9 @@ where
             task_outputs: self.task_outputs.clone(),
             // Replicated CRDT data — clone preserves it.
             secondary_capacities: self.secondary_capacities.clone(),
+            // Node-local originator counter — reset on clone (a cloned
+            // replica originates nothing inherited from the source).
+            task_seq: HashMap::new(),
         }
     }
 }
@@ -255,6 +279,7 @@ where
             .field("peer_holdings", &self.peer_holdings)
             .field("task_outputs", &self.task_outputs.len())
             .field("secondary_capacities", &self.secondary_capacities)
+            .field("task_seq", &self.task_seq.len())
             .finish()
     }
 }
@@ -279,6 +304,7 @@ impl<I> Default for ClusterState<I> {
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
+            task_seq: HashMap::new(),
         }
     }
 }

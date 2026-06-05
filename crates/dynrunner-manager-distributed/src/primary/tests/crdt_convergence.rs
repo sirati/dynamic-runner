@@ -42,7 +42,15 @@ fn insert_operational_secondary(
     ram_bytes: u64,
 ) {
     let conn = SecondaryConnection::new(secondary_id.into())
-        .receive_welcome(worker_count, mem(ram_bytes), "host".into(), 0, None, false, false)
+        .receive_welcome(
+            worker_count,
+            mem(ram_bytes),
+            "host".into(),
+            0,
+            None,
+            false,
+            false,
+        )
         .receive_cert_exchange(String::new(), None, None, 0)
         .begin_peer_discovery()
         .peers_ready()
@@ -122,7 +130,9 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             let cap_ids: std::collections::HashSet<&str> = batch
                 .iter()
                 .filter_map(|m| match m {
-                    ClusterMutation::SecondaryCapacity { secondary, .. } => Some(secondary.as_str()),
+                    ClusterMutation::SecondaryCapacity { secondary, .. } => {
+                        Some(secondary.as_str())
+                    }
                     _ => None,
                 })
                 .collect();
@@ -178,12 +188,13 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             // Apply the rebroadcast batch the complete primary shipped —
             // the heal. The idempotent lattice absorbs sec-0's own
             // already-present records (NoOp) and adds sec-1's.
-            promoted.handle_cluster_mutation(DistributedMessage::ClusterMutation {
-                sender_id: "primary".into(),
-                timestamp: 0.0,
-                mutations: batch,
-            })
-            .await;
+            promoted
+                .handle_cluster_mutation(DistributedMessage::ClusterMutation {
+                    sender_id: "primary".into(),
+                    timestamp: 0.0,
+                    mutations: batch,
+                })
+                .await;
 
             // Post-heal: a fresh promotion reconstructs the FULL roster
             // (sec-0's 2 + sec-1's 3 = 5 slots) and the correct

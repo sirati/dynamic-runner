@@ -161,6 +161,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -220,7 +221,8 @@ async fn secondary_with_real_workers_processes_tasks() {
 
             // Channel-backed mesh: the `fake_primary` is folded in as an
             // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
-            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -299,7 +301,8 @@ async fn secondary_multi_worker_processes_tasks() {
 
             // Channel-backed mesh: the `fake_primary` is folded in as an
             // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
-            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -378,7 +381,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
 
             // Channel-backed mesh: the `fake_primary` is folded in as an
             // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
-            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -585,7 +589,8 @@ async fn stage_file_then_assign_task_succeeds() {
 
             // Channel-backed mesh: the `fake_primary` is folded in as an
             // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
-            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
@@ -735,7 +740,8 @@ async fn run_aborted_yields_terminal_aborted() {
 
             // Channel-backed mesh: the `fake_primary` is folded in as an
             // ordinary mesh peer keyed by `"primary"` — no per-role uplink.
-            let unified = channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 unified,
