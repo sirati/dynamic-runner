@@ -184,7 +184,8 @@ pub struct SecondaryConfig {
     /// `RoleTable.can_be_primary`, which `select_bootstrap_primary` reads
     /// as the single authoritative capability marker.
     ///
-    /// This is the JOIN-TIME advertised value (twin of `is_observer`). It
+    /// This is the JOIN-TIME advertised value (twin of the wire
+    /// `is_observer` role advertisement). It
     /// is NOT itself the activation gate — the activation site reads
     /// `cluster_state.can_be_primary(self)` (the replicated marker, which
     /// a client may also flip at runtime via `SetCanBePrimary`). A host

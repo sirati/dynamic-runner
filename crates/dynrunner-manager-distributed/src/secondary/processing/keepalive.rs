@@ -102,7 +102,6 @@ where
     /// `connections`; the firewalled arm routes `All` to the sole folded
     /// member), so skipping the broadcast when degraded would starve the
     /// primary of keepalives and trip a false primary-death.
-    ///
     pub(in crate::secondary) async fn send_keepalive(&mut self) {
         let active_count = self
             .op_mut()
