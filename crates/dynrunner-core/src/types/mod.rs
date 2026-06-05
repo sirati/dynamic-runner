@@ -11,6 +11,8 @@
 //!   wrapper around `TaskOutputs` plus the `warnings`/`filtered`
 //!   counters; consumed by both manager crates' decoder paths.
 //! - [`error`]: [`ErrorType`], [`TaskResult`], [`FailedTask`].
+//! - [`version`]: [`TaskVersion`] — the primary-stamped monotone per-task
+//!   metadata version that makes the non-lattice CRDT fields convergent.
 //!
 //! Tests live in `types_tests.rs` (sibling of this `types/` directory) and
 //! exercise the public API of all sub-modules through the re-exports below.
@@ -21,6 +23,7 @@ pub mod identifiers;
 pub mod outputs;
 pub mod resource;
 pub mod task;
+pub mod version;
 
 pub use done_payload::DonePayload;
 pub use error::{ErrorType, FailedTask, TaskResult};
@@ -28,6 +31,7 @@ pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdent
 pub use outputs::{ResultValue, TaskOutputs, check_soft_caps};
 pub use resource::{ResourceAmount, ResourceMap, SoftPreferredSecondaries};
 pub use task::{TaskDep, TaskInfo, TaskInput};
+pub use version::TaskVersion;
 
 pub type WorkerId = u32;
 

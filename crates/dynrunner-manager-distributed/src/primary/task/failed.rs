@@ -196,6 +196,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 hash: task_hash.clone(),
                 kind: error_type.clone(),
                 error: error_message.clone(),
+                // Stamped at the origination choke point (apply_locally_for_broadcast).
+                version: Default::default(),
             }])
             .await;
 

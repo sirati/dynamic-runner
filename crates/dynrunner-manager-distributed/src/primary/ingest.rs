@@ -190,6 +190,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     reason: BoundedString::from(reason),
                 },
                 error: "missing dependency".to_string(),
+                // Stamped at the origination choke point (apply_locally_for_broadcast).
+                version: Default::default(),
             });
         }
         self.apply_and_broadcast_cluster_mutations(mutations).await;
@@ -222,7 +224,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .cluster_state
             .tasks_iter()
             .filter_map(|(hash, state)| match state {
-                TaskState::Pending { task }
+                TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
                 | TaskState::Blocked { task, .. } => Some((hash.clone(), task.clone())),
                 TaskState::Completed { .. }
@@ -248,6 +250,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     reason: BoundedString::from(reason.clone()),
                 },
                 error: "run-wide invalidation (duplicate task identity)".to_string(),
+                // Stamped at the origination choke point (apply_locally_for_broadcast).
+                version: Default::default(),
             });
         }
         self.apply_and_broadcast_cluster_mutations(mutations).await;

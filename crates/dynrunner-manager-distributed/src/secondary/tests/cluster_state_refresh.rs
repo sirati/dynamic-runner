@@ -63,6 +63,7 @@ fn snapshot_with_completed(
         task_id: ident.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     };
     let mut tasks = HashMap::new();

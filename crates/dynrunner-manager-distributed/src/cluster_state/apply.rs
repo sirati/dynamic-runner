@@ -20,8 +20,8 @@
 use dynrunner_core::{ErrorType, Identifier, SoftPreferredSecondaries, TaskInfo};
 use dynrunner_protocol_primary_secondary::ClusterMutation;
 
+use super::merge::MergeOutcome;
 use super::{ApplyOutcome, ClusterState, TaskState};
-use crate::task_completed::TaskCompletedEvent;
 
 impl<I: Identifier> ClusterState<I> {
     /// Convenience wrapper around [`Self::apply_with_resumed_blocked`]
@@ -79,7 +79,10 @@ impl<I: Identifier> ClusterState<I> {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
                 if let std::collections::hash_map::Entry::Vacant(e) = self.tasks.entry(hash) {
-                    e.insert(TaskState::Pending { task });
+                    e.insert(TaskState::Pending {
+                        task,
+                        version: Default::default(),
+                    });
                     ApplyOutcome::Applied
                 } else {
                     ApplyOutcome::NoOp
@@ -89,209 +92,92 @@ impl<I: Identifier> ClusterState<I> {
                 hash,
                 secondary,
                 worker,
+                version,
             } => {
-                let Some(state) = self.tasks.get_mut(&hash) else {
+                // The arm owns the mutation→state translation (its
+                // legitimate concern): the assignment carries no TaskInfo,
+                // so the candidate `InFlight` reuses the local entry's
+                // task. The join then decides whether it wins — under C3 a
+                // stale (pre-reset) assignment LOSES to a higher-version
+                // requeue/reinject reset within the non-terminal band, so
+                // a dead-secondary assignment is never resurrected.
+                let Some(state) = self.tasks.get(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    TaskState::Pending { task } => task.clone(),
-                    _ => return ApplyOutcome::NoOp,
-                };
-                *state = TaskState::InFlight {
+                let task = state.task().clone();
+                let incoming = TaskState::InFlight {
                     task,
                     secondary,
                     worker,
+                    version,
                 };
-                ApplyOutcome::Applied
+                self.apply_merge(&hash, incoming, None, resumed)
             }
             ClusterMutation::TaskCompleted { hash, result_data } => {
-                let Some(state) = self.tasks.get_mut(&hash) else {
+                // The arm owns the mutation→state translation: the
+                // completion carries no TaskInfo, so the candidate
+                // `Completed` reuses the local entry's task. The join then
+                // decides — `Completed` is terminal-rank-dominant over
+                // `{Failed, Unfulfillable}` and all non-terminals, but
+                // LOSES to a local `InvalidTask` (D-T: InvalidTask is the
+                // unique TOP), which preserves the InvalidTask lockout. The
+                // retry-success supersession (`Failed → Completed`) and the
+                // newly-completed side-effects (output cache, auto-resume,
+                // event) are all owned by `merge_task_state`.
+                let Some(state) = self.tasks.get(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    // Idempotent dedup on a redundant TaskCompleted (the
-                    // same hash arrives twice via peer-forwarding
-                    // redundancy or snapshot replay).
-                    TaskState::Completed { .. } => return ApplyOutcome::NoOp,
-                    // `InvalidTask` is a terminal, non-reinjectable
-                    // lockout: a structurally-invalid task is never
-                    // dispatched, so a `TaskCompleted` for its hash is
-                    // spurious and must NOT regress the terminal. This
-                    // diverges from the `Unfulfillable`/`Blocked` arm
-                    // below, which IS superseded by a genuine success
-                    // (those tasks can legitimately run once the
-                    // resource appears).
-                    TaskState::InvalidTask { .. } => return ApplyOutcome::NoOp,
-                    // Retry-success supersedes a prior Recoverable
-                    // failure: the retry pass re-injects the binary,
-                    // a worker picks it up, and the next TaskCompleted
-                    // for the same hash legitimately transitions
-                    // Failed → Completed. Pre-fix this branch NoOp'd,
-                    // leaving the ledger stuck at `Failed { Recoverable }`
-                    // even though the task ultimately succeeded — so
-                    // `outcome_counts().succeeded` undercounted the
-                    // retry-successes and the run-done logic that reads
-                    // it never saw the cluster reach "all terminal as
-                    // succeeded". The HashSet-side bookkeeping in
-                    // `primary/task.rs::handle_task_complete` already
-                    // implements this same supersession; this arm
-                    // brings the CRDT into agreement so cross-node
-                    // mirrors converge to the right terminal state.
-                    //
-                    // Commutativity: if peer A observes
-                    // (TaskFailed, TaskCompleted) for the same hash and
-                    // peer B observes (TaskCompleted, TaskFailed), both
-                    // converge to `Completed` — A applies Failed then
-                    // transitions to Completed here; B applies Completed
-                    // then NoOps the late TaskFailed (the Completed
-                    // arm in `TaskFailed` below). Success is the
-                    // strongest terminal regardless of arrival order;
-                    // the prior `attempts` / `last_error` are dropped
-                    // because the cluster's authoritative outcome for
-                    // this hash is now success.
-                    //
-                    // `Unfulfillable` and `Blocked` both yield the same
-                    // way: if the run somehow reaches Completed for the
-                    // hash (worker raced ahead of the cascade decision,
-                    // or external resolver dispatched the binary out-of-
-                    // band), success is still the strongest terminal.
-                    TaskState::Failed { task, .. }
-                    | TaskState::Unfulfillable { task, .. }
-                    | TaskState::Blocked { task, .. } => task.clone(),
-                    TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
-                };
-                // Snapshot the `task_id` for the dispatcher event
-                // BEFORE the move into `TaskState::Completed`; both
-                // halves consume distinct fields of the same `task`
-                // value, but the dispatcher event lives strictly off
-                // the apply path (mpsc enqueue) so capturing the id
-                // before the state transition keeps the apply rule
-                // observably equivalent to the pre-event-emit
-                // baseline.
-                let event_task_id = task.task_id.clone();
-                *state = TaskState::Completed { task };
-                // Cache the wire mutation's `result_data` payload under
-                // the completing task's `task_id` so dispatch-time
-                // dependent resolution can attach predecessor outputs
-                // without re-decoding the wire bytes. Helper lives in
-                // `apply_tasks.rs` alongside other task-related apply
-                // helpers (`resume_blocked_on`). No-op for `None`
-                // payloads (worker did not publish outputs) and for
-                // anonymous tasks (no `task_id` to key under).
-                self.record_task_outputs(&hash, result_data);
-                // Auto-resume: any `Blocked { on: <this hash>, .. }`
-                // dependent transitions back to `Pending` so the next
-                // dispatch tick on the live primary picks it up. Event-
-                // driven (apply-rule-local) rather than retry-pass
-                // wall-clock; the same broadcast that converges this
-                // hash to Completed converges every blocked dependent
-                // to Pending on the same apply call across every
-                // replica.
-                let just_resumed = self.resume_blocked_on(&hash);
-                resumed.extend(just_resumed);
-                // Best-effort, non-blocking dispatcher fan-out. See
-                // [`Self::emit_task_completed_event`] for the CCD-9
-                // contract (apply path never invokes a listener
-                // directly).
-                self.emit_task_completed_event(TaskCompletedEvent {
-                    task_id: event_task_id,
-                    task_hash: hash,
-                    success: true,
-                    error_kind: None,
-                    last_error: None,
-                });
-                ApplyOutcome::Applied
+                let task = state.task().clone();
+                let outputs = Self::decode_done_payload_outputs(result_data);
+                let incoming = TaskState::Completed { task };
+                self.apply_merge(&hash, incoming, outputs, resumed)
             }
-            ClusterMutation::TaskFailed { hash, kind, error } => {
-                let Some(state) = self.tasks.get_mut(&hash) else {
+            ClusterMutation::TaskFailed {
+                hash,
+                kind,
+                error,
+                version,
+            } => {
+                // The arm owns the mutation→state translation (error class
+                // → discrete variant); the join owns the supersede
+                // precedence. The candidate terminal carries BOTH the
+                // typed body (`reason`) AND the wire message (`last_error`)
+                // so a restore-path emit reconstructs the identical
+                // `last_error` (TS-4). The join then decides:
+                //   * incoming `InvalidTask` SUPERSEDES a local `Completed`
+                //     (D-T flip — InvalidTask is the unique TOP);
+                //   * a local terminal of equal-or-higher join key locks
+                //     out the incoming (e.g. local `InvalidTask` NoOps an
+                //     incoming generic `Failed`; an equal-version
+                //     `Unfulfillable` NoOps an incoming generic `Failed`);
+                //   * a higher-version re-failure WINS (B1 re-failure emit
+                //     cadence), an idempotent same-version re-delivery
+                //     NoOps (no double-count).
+                let Some(state) = self.tasks.get(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                // Capture task_id + wire-stable error_kind + the error
-                // message for the dispatcher event. The snapshot lives
-                // outside the arms below so the emit at the bottom of
-                // the match sees a uniform binding regardless of which
-                // arm applied. The arms that NoOp return early and
-                // never reach the emit; the two "Applied" arms set this
-                // to `Some(...)` BEFORE `error` is moved into the
-                // ledger entry, so the carried message is the same body
-                // that lands on the entry's `last_error`.
-                // `task.task_id` is non-optional per the framework's
-                // boundary contract; the captured payload is `String`.
-                let mut emit_payload: Option<(String, String, String)> = None;
-                let outcome = match state {
-                    // Strongest terminals lock out incoming TaskFailed.
-                    // `Completed` never regresses; `Unfulfillable` is a
-                    // stable reinjectable terminal — a late generic
-                    // worker-originated TaskFailed must not regress it;
-                    // `InvalidTask` is a stable non-reinjectable
-                    // terminal — once a task is structurally invalid a
-                    // later generic TaskFailed must not overwrite the
-                    // discrete reason (the lockout keeps the invalid-
-                    // task reason accurate).
-                    TaskState::Completed { .. }
-                    | TaskState::Unfulfillable { .. }
-                    | TaskState::InvalidTask { .. } => ApplyOutcome::NoOp,
-                    TaskState::Failed {
+                let task = state.task().clone();
+                let incoming = match kind {
+                    ErrorType::Unfulfillable { reason } => TaskState::Unfulfillable {
                         task,
-                        kind: k,
-                        last_error,
-                        attempts,
-                    } => {
-                        emit_payload =
-                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
-                        *attempts += 1;
-                        *k = kind;
-                        *last_error = error;
-                        ApplyOutcome::Applied
-                    }
-                    // Non-terminal states transition based on the
-                    // error class: `Unfulfillable` and `InvalidTask`
-                    // each route to their discrete state so downstream
-                    // matcher / reinject logic can dispatch on the
-                    // discriminant; every other `ErrorType` lands in
-                    // the generic `Failed` bucket preserving the legacy
-                    // attempts/last_error shape.
-                    TaskState::Pending { task }
-                    | TaskState::InFlight { task, .. }
-                    | TaskState::Blocked { task, .. } => {
-                        let task = task.clone();
-                        emit_payload =
-                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
-                        *state = match kind {
-                            ErrorType::Unfulfillable { reason } => TaskState::Unfulfillable {
-                                task,
-                                reason: reason.to_string(),
-                            },
-                            ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
-                                task,
-                                reason: reason.to_string(),
-                            },
-                            other => TaskState::Failed {
-                                task,
-                                kind: other,
-                                last_error: error,
-                                attempts: 1,
-                            },
-                        };
-                        ApplyOutcome::Applied
-                    }
+                        reason: reason.to_string(),
+                        last_error: error,
+                        version,
+                    },
+                    ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
+                        task,
+                        reason: reason.to_string(),
+                        last_error: error,
+                        version,
+                    },
+                    other => TaskState::Failed {
+                        task,
+                        kind: other,
+                        last_error: error,
+                        version,
+                    },
                 };
-                // Best-effort, non-blocking dispatcher fan-out — only
-                // when the apply actually advanced state (the
-                // strongest-terminal NoOp arms above leave
-                // `emit_payload = None`). See
-                // [`Self::emit_task_completed_event`] for the CCD-9
-                // contract.
-                if let Some((task_id, error_kind, last_error)) = emit_payload {
-                    self.emit_task_completed_event(TaskCompletedEvent {
-                        task_id,
-                        task_hash: hash,
-                        success: false,
-                        error_kind: Some(error_kind),
-                        last_error: Some(last_error),
-                    });
-                }
-                outcome
+                self.apply_merge(&hash, incoming, None, resumed)
             }
             // `reason` is advisory routing metadata only; the epoch-LWW
             // apply ("highest epoch wins, one primary") is `reason`-blind.
@@ -350,7 +236,7 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_aborted = Some(reason);
                 ApplyOutcome::Applied
             }
-            ClusterMutation::TaskReinjected { hash } => {
+            ClusterMutation::TaskReinjected { hash, version } => {
                 // External-control reinjection moves a
                 // `Unfulfillable { .. }` entry back to `Pending`. Any
                 // other state is a NoOp so out-of-order delivery and
@@ -362,6 +248,14 @@ impl<I: Identifier> ClusterState<I> {
                 // operator-resolvable-failure class now has its own
                 // discrete state, so the apply rule rejects anything
                 // outside it.
+                //
+                // A reset is an authoritative rank-DROP (NOT a monotone
+                // join), so it keeps its explicit precondition and does
+                // NOT route through `merge_task_state`. It writes the
+                // primary-stamped `version` (strictly higher than the
+                // pre-reset state's, via the monotone choke point) onto the
+                // new `Pending` so a late stale assignment cannot
+                // resurrect (C3).
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
@@ -369,10 +263,10 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Unfulfillable { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending { task };
+                *state = TaskState::Pending { task, version };
                 ApplyOutcome::Applied
             }
-            ClusterMutation::TaskRequeued { hash } => {
+            ClusterMutation::TaskRequeued { hash, version } => {
                 // Dead-secondary recovery moves an `InFlight { .. }`
                 // entry back to `Pending` so the live primary re-
                 // dispatches it (and a post-failover hydrate routes it
@@ -388,6 +282,11 @@ impl<I: Identifier> ClusterState<I> {
                 //     task — there is nothing in flight to requeue.
                 // The preserved `TaskInfo` is moved into the new
                 // `Pending` so re-dispatch carries the same binary.
+                // Authoritative rank-DROP (see TaskReinjected): kept
+                // outside the join with its explicit precondition; writes
+                // the stamped `version` onto the new `Pending` so a
+                // redelivered stale `TaskAssigned` (lower version) cannot
+                // resurrect the dead-secondary assignment (C3).
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
@@ -395,7 +294,7 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::InFlight { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending { task };
+                *state = TaskState::Pending { task, version };
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskBlocked { hash, on } => {
@@ -426,27 +325,36 @@ impl<I: Identifier> ClusterState<I> {
                         // dependent is silent either way.
                         ApplyOutcome::NoOp
                     }
-                    TaskState::Pending { task } => {
+                    TaskState::Pending { task, .. } => {
                         let task = task.clone();
                         *state = TaskState::Blocked { task, on };
                         ApplyOutcome::Applied
                     }
                 }
             }
-            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries } => {
+            ClusterMutation::TaskPreferredSecondariesUpdated {
+                hash,
+                secondaries,
+                version,
+            } => {
+                // Preferred metadata is a `TaskInfo`-level concern (R4),
+                // NOT a state transition: it mutates `preferred_secondaries`
+                // in place on EVERY variant under a fixed ledger key. It
+                // does NOT route through `merge_task_state` (which keys on
+                // the variant-level join); instead it keeps the higher
+                // `preferred_version` so two concurrent updates converge
+                // regardless of the task's state.
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    TaskState::Pending { task }
-                    | TaskState::InFlight { task, .. }
-                    | TaskState::Completed { task }
-                    | TaskState::Failed { task, .. }
-                    | TaskState::Unfulfillable { task, .. }
-                    | TaskState::InvalidTask { task, .. }
-                    | TaskState::Blocked { task, .. } => task,
-                };
+                let task = state.task_mut();
+                if version <= task.preferred_version {
+                    // A stale (or idempotent re-delivered) update loses to
+                    // the already-recorded higher-or-equal version.
+                    return ApplyOutcome::NoOp;
+                }
                 task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
+                task.preferred_version = version;
                 ApplyOutcome::Applied
             }
             ClusterMutation::PeerJoined {
@@ -471,6 +379,31 @@ impl<I: Identifier> ClusterState<I> {
             } => self.apply_secondary_capacity(secondary, worker_count, resources),
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
+            }
+        }
+    }
+
+    /// Apply-side adapter over the shared [`Self::merge_task_state`] join:
+    /// run the join, emit the pre-built terminal event on a win (the emit
+    /// SINK is the caller's concern — `merge_task_state` only BUILDS the
+    /// event so apply and restore emit byte-identical bytes), and map the
+    /// [`MergeOutcome`] onto the [`ApplyOutcome`] the apply arms return.
+    /// One seam so the monotone arms never re-spell the supersede
+    /// precedence nor the emit.
+    fn apply_merge(
+        &mut self,
+        hash: &str,
+        incoming: TaskState<I>,
+        incoming_outputs: Option<dynrunner_core::TaskOutputs>,
+        resumed: &mut Vec<TaskInfo<I>>,
+    ) -> ApplyOutcome {
+        match self.merge_task_state(hash, incoming, incoming_outputs, resumed) {
+            MergeOutcome::NoOp => ApplyOutcome::NoOp,
+            MergeOutcome::Applied { event, .. } => {
+                if let Some(ev) = event {
+                    self.emit_task_completed_event(ev);
+                }
+                ApplyOutcome::Applied
             }
         }
     }

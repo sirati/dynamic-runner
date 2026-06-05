@@ -53,6 +53,7 @@ fn assigned_late_after_completed_is_noop() {
             hash: "h".into(),
             secondary: "s1".into(),
             worker: 0,
+            version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -104,6 +105,7 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
+        version: Default::default(),
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
@@ -144,6 +146,7 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
             hash: "h".into(),
             kind: ErrorType::Recoverable,
             error: "late".into(),
+            version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -184,6 +187,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "c".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
+        version: Default::default(),
     });
     // 1 fail_oom (ResourceExhausted("memory"))
     s.apply(ClusterMutation::TaskAdded {
@@ -194,6 +198,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "d".into(),
         kind: ErrorType::ResourceExhausted("memory".into()),
         error: "oom".into(),
+        version: Default::default(),
     });
     // 1 fail_final (ResourceExhausted("disk") falls through)
     s.apply(ClusterMutation::TaskAdded {
@@ -204,6 +209,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "e".into(),
         kind: ErrorType::ResourceExhausted("disk".into()),
         error: "no space".into(),
+        version: Default::default(),
     });
     // 1 fail_final (NonRecoverable)
     s.apply(ClusterMutation::TaskAdded {
@@ -214,6 +220,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
+        version: Default::default(),
     });
     // 1 Pending (uncounted)
     s.apply(ClusterMutation::TaskAdded {
@@ -259,6 +266,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
             reason: "missing dep".to_string().into(),
         },
         error: "invalid_task:missing dep".into(),
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "pend".into(),
@@ -292,8 +300,11 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     assert!(!terminal_ids.contains("pend"), "Pending is not terminal");
 }
 
+/// A HIGHER-version re-failure supersedes the prior failure record
+/// (`attempts` is dropped — convergence rides the per-task version, D-A/
+/// D-V). The newer failure's `(kind, last_error)` wins the join.
 #[test]
-fn failed_attempts_counter_increments() {
+fn higher_version_refailure_supersedes() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
@@ -303,25 +314,58 @@ fn failed_attempts_counter_increments() {
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "first".into(),
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 0,
+        },
     });
-    s.apply(ClusterMutation::TaskFailed {
-        hash: "h".into(),
-        kind: ErrorType::NonRecoverable,
-        error: "second".into(),
-    });
+    // A strictly-higher-version re-failure wins the join (the re-failure
+    // cadence the collector's repeat-count relies on, B1).
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "second".into(),
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 1,
+            },
+        }),
+        ApplyOutcome::Applied
+    );
     match s.task_state("h") {
         Some(TaskState::Failed {
             kind,
             last_error,
-            attempts,
+            version,
             ..
         }) => {
-            assert_eq!(*attempts, 2);
             assert_eq!(*kind, ErrorType::NonRecoverable);
             assert_eq!(last_error, "second");
+            assert_eq!(
+                *version,
+                TaskVersion {
+                    primary_epoch: 1,
+                    seq: 1
+                }
+            );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
+    // A same-version re-delivery is an idempotent NoOp (today's
+    // per-delivery double-count is fixed).
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "second".into(),
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 1,
+            },
+        }),
+        ApplyOutcome::NoOp
+    );
 }
 
 #[test]
@@ -428,6 +472,7 @@ fn iter_pending_only_returns_pending() {
         hash: "i".into(),
         secondary: "s".into(),
         worker: 0,
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
@@ -463,6 +508,7 @@ fn convergence_completed_can_race_assigned() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
+        version: Default::default(),
     };
     let completed: ClusterMutation<RunnerIdentifier> = ClusterMutation::TaskCompleted {
         hash: "h".into(),
@@ -507,6 +553,7 @@ fn convergence_under_duplicates() {
             hash: "h1".into(),
             secondary: "s".into(),
             worker: 0,
+            version: Default::default(),
         },
         ClusterMutation::TaskCompleted {
             hash: "h1".into(),
@@ -516,6 +563,7 @@ fn convergence_under_duplicates() {
             hash: "h2".into(),
             kind: ErrorType::Recoverable,
             error: "boom".into(),
+            version: Default::default(),
         },
     ];
     let mut once = ClusterState::<RunnerIdentifier>::new();
@@ -536,10 +584,32 @@ fn convergence_under_duplicates() {
         twice.task_state("h1"),
         Some(TaskState::Completed { .. })
     ));
-    // Failed got applied twice; second TaskFailed bumps attempts.
-    match twice.task_state("h2") {
-        Some(TaskState::Failed { attempts, .. }) => assert_eq!(*attempts, 2),
-        other => panic!("expected Failed, got {other:?}"),
+    // The same-version `TaskFailed` applied twice is idempotent (the
+    // second is a NoOp under the version-keyed join — `attempts` is
+    // dropped, so a re-delivery no longer mutates the record). Both
+    // states converge to the identical failure record.
+    match (once.task_state("h2"), twice.task_state("h2")) {
+        (
+            Some(TaskState::Failed {
+                kind: k1,
+                last_error: e1,
+                version: v1,
+                ..
+            }),
+            Some(TaskState::Failed {
+                kind: k2,
+                last_error: e2,
+                version: v2,
+                ..
+            }),
+        ) => {
+            assert_eq!(k1, k2);
+            assert_eq!(e1, e2);
+            assert_eq!(v1, v2);
+            assert_eq!(*k2, ErrorType::Recoverable);
+            assert_eq!(e2, "boom");
+        }
+        other => panic!("expected Failed on both, got {other:?}"),
     }
 }
 

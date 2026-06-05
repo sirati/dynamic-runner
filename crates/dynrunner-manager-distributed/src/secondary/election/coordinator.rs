@@ -186,8 +186,13 @@ where
         // primary's diagnostic identity + the `TimeoutQuery` target.
         let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
         let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
-        let observers: std::collections::HashSet<String> =
-            self.cluster_state.role_table().observers.iter().cloned().collect();
+        let observers: std::collections::HashSet<String> = self
+            .cluster_state
+            .role_table()
+            .observers
+            .iter()
+            .cloned()
+            .collect();
         let mesh_degraded = self.mesh.degraded;
         let secondary_id = self.config.secondary_id.clone();
 

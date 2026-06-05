@@ -76,35 +76,51 @@ impl<I: Identifier> ClusterState<I> {
     ///    key from racing the cache between "populated" and "absent";
     ///    the warn surfaces the wire-format mismatch to the operator.
     ///
-    /// Single-write per task: `TaskCompleted` is the only writer and a
-    /// duplicate `TaskCompleted` for the same hash NoOps in the apply
-    /// arm before this helper fires, so the insert is effectively
-    /// first-write-wins under the apply rule. No explicit `.entry().
-    /// or_insert(_)` guard is needed at this layer.
-    pub(super) fn record_task_outputs(&mut self, hash: &str, result_data: Option<Vec<u8>>) {
-        let Some(bytes) = result_data else {
+    /// First-write-wins (AE-5 / C7): the cache entry is set exactly once
+    /// per hash. The guard is LOAD-BEARING for the merge-driven RESTORE
+    /// path — a co-present snapshot output landing on a slot a live
+    /// broadcast already populated must NOT clobber the local entry
+    /// (matching `restore`'s own `or_insert`). On the apply path the
+    /// second-`TaskCompleted` already NoOps in `merge_task_state` BEFORE
+    /// this helper fires, so the guard is a no-op there — but it is not
+    /// "redundant": the restore path has no such upstream NoOp.
+    ///
+    /// `outputs: None` (the worker did not publish outputs) records
+    /// nothing. A hash with no ledger entry (late-arriving mutation for a
+    /// task this replica never saw) is silently skipped (no anchor).
+    pub(super) fn record_task_outputs_value(&mut self, hash: &str, outputs: Option<TaskOutputs>) {
+        let Some(outputs) = outputs else {
             return;
         };
         if !self.tasks.contains_key(hash) {
-            // Hash with no entry in the task ledger: late-arriving
-            // mutation against a task this replica never saw. Nothing
-            // to key the cache against.
             return;
         }
+        self.task_outputs.entry(hash.to_string()).or_insert(outputs);
+    }
+
+    /// Decode a `TaskCompleted` mutation's wire `result_data` payload into
+    /// the [`TaskOutputs`] the cache stores. Single owner of the
+    /// DonePayload decode concern (kept separate from the cache insert so
+    /// the apply path decodes once and hands the value to the shared
+    /// `merge_task_state`, while restore reads its already-decoded
+    /// co-present snapshot value directly).
+    ///
+    /// `None` (no outputs committed) → `None`. A malformed payload emits a
+    /// `tracing::warn!` and yields an EMPTY `TaskOutputs` (rather than
+    /// `None`) so dependents that hard-require a key see a controlled-empty
+    /// view rather than racing the cache between "populated" and "absent".
+    pub(super) fn decode_done_payload_outputs(result_data: Option<Vec<u8>>) -> Option<TaskOutputs> {
+        let bytes = result_data?;
         match serde_json::from_slice::<DonePayload>(&bytes) {
-            Ok(body) => {
-                self.task_outputs.insert(hash.to_string(), body.outputs);
-            }
+            Ok(body) => Some(body.outputs),
             Err(e) => {
                 tracing::warn!(
                     target: "dynrunner_cluster_state",
                     error = %e,
-                    hash = %hash,
                     "TaskCompleted result_data failed to decode as DonePayload; \
                      storing empty entry"
                 );
-                self.task_outputs
-                    .insert(hash.to_string(), TaskOutputs::default());
+                Some(TaskOutputs::default())
             }
         }
     }
@@ -122,7 +138,17 @@ impl<I: Identifier> ClusterState<I> {
         for h in to_resume {
             if let Some(TaskState::Blocked { task, .. }) = self.tasks.remove(&h) {
                 resumed.push(task.clone());
-                self.tasks.insert(h, TaskState::Pending { task });
+                // Auto-resume is an authoritative cross-task transition
+                // (Blocked → Pending), not an assignment; the fresh
+                // `Pending` starts at the default version and a later
+                // genuine assignment mints a higher one.
+                self.tasks.insert(
+                    h,
+                    TaskState::Pending {
+                        task,
+                        version: Default::default(),
+                    },
+                );
             }
         }
         resumed
@@ -145,7 +171,7 @@ impl<I: Identifier> ClusterState<I> {
     ///    state per the cascade rules:
     ///      * Any dep in `Failed { kind: NonRecoverable, .. }` →
     ///        insert as `Failed { kind: NonRecoverable, task,
-    ///        last_error: "upstream-failed", attempts: 1 }`
+    ///        last_error: "upstream-failed", version: default }`
     ///        (cascade-fail; matches the legacy worker-originated
     ///        cascade shape).
     ///      * Else any dep in `Unfulfillable { .. }` → insert as
@@ -302,7 +328,7 @@ impl<I: Identifier> ClusterState<I> {
                     task,
                     kind: ErrorType::NonRecoverable,
                     last_error: "upstream-failed".to_string(),
-                    attempts: 1,
+                    version: Default::default(),
                 }
             } else if let Some(on) = blocked_on_unfulfillable {
                 TaskState::Blocked { task, on }
@@ -315,7 +341,10 @@ impl<I: Identifier> ClusterState<I> {
                 // callers may move it into a pool via `reinject`
                 // without disturbing the ledger.
                 newly_pending_from_spawn.push(task.clone());
-                TaskState::Pending { task }
+                TaskState::Pending {
+                    task,
+                    version: Default::default(),
+                }
             };
             tracing::debug!(
                 target: "dynrunner_cluster_state",

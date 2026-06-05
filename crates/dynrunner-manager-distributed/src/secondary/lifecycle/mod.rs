@@ -580,11 +580,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// identity arm is defensive rather than a reachable path.
     pub(in crate::secondary) fn enter_awaiting_primary(self) -> Self {
         match self {
-            SecondaryLifecycle::Connecting => {
-                SecondaryLifecycle::AwaitingPrimary {
-                    handshake_sent: false,
-                }
-            }
+            SecondaryLifecycle::Connecting => SecondaryLifecycle::AwaitingPrimary {
+                handshake_sent: false,
+            },
             other => other,
         }
     }

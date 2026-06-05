@@ -66,6 +66,7 @@ fn phased_task(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
         task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }

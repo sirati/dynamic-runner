@@ -469,6 +469,7 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
             task_id: "task-discovered".into(),
             task_depends_on: vec![],
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
             resolved_path: None,
         };
         let hash = crate::primary::wire::compute_task_hash(&bin);

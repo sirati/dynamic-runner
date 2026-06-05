@@ -378,13 +378,13 @@ where
 {
     // Mark the node primary-capable through the real CRDT apply path.
     let self_id = coord.config.secondary_id.clone();
-    coord
-        .cluster_state
-        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
+    coord.cluster_state.apply(
+        dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
             peer_id: self_id,
             is_observer: false,
             can_be_primary: true,
-        });
+        },
+    );
     let fired = Rc::new(std::cell::Cell::new(false));
     let fired_for_closure = fired.clone();
     coord.register_primary_activator(Box::new(move |_snapshot| {

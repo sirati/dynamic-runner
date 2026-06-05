@@ -98,7 +98,7 @@ where
     ) -> Option<(dynrunner_core::PhaseId, String)> {
         let state = self.cluster_state.task_state(hash)?;
         let task = match state {
-            TaskState::Pending { task }
+            TaskState::Pending { task, .. }
             | TaskState::InFlight { task, .. }
             | TaskState::Completed { task }
             | TaskState::Failed { task, .. }
@@ -194,6 +194,8 @@ where
             hash,
             kind: error,
             error: reason,
+            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            version: Default::default(),
         });
         for (dep_hash, on_hash) in cascaded_blocks {
             mutations.push(ClusterMutation::TaskBlocked {
@@ -260,8 +262,12 @@ where
 
         // Broadcast so every node's CRDT mirror moves the entry off
         // `Failed` synchronously.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskReinjected { hash }])
-            .await;
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskReinjected {
+            hash,
+            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            version: Default::default(),
+        }])
+        .await;
         // The reinjected binary is a pool-entry edge — EMIT a
         // `TasksAdded` so the worker-management recheck picks it up. The
         // matcher auto-fires this command, and a free worker that
@@ -322,7 +328,12 @@ where
             );
         }
         self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries },
+            ClusterMutation::TaskPreferredSecondariesUpdated {
+                hash,
+                secondaries,
+                // Stamped at the origination choke point (apply_locally_for_broadcast).
+                version: Default::default(),
+            },
         ])
         .await;
         Ok(())
@@ -387,7 +398,11 @@ where
             // the apply rule agree — a dep that resolves to no ledger
             // entry for its NAMED phase is `UnknownDependency` here
             // rather than silently landing Pending never-runnable.
-            |phase_id, task_id| self.cluster_state.task_hash_for_dep(phase_id, task_id).is_some(),
+            |phase_id, task_id| {
+                self.cluster_state
+                    .task_hash_for_dep(phase_id, task_id)
+                    .is_some()
+            },
             tasks,
         );
 
@@ -489,7 +504,7 @@ where
         let mut pool_grew = false;
         for hash in valid_hashes {
             match self.cluster_state.task_state(&hash) {
-                Some(TaskState::Pending { task }) => {
+                Some(TaskState::Pending { task, .. }) => {
                     let task = task.clone();
                     self.pool_mut().reinject(task);
                     pool_grew = true;

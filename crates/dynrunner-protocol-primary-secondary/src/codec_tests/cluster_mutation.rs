@@ -1,5 +1,6 @@
 use super::*;
 use crate::cluster_mutation::{ClusterMutation, PrimaryChangeReason};
+use dynrunner_core::TaskVersion;
 
 #[test]
 fn roundtrip_task_completed_with_result_data() {
@@ -85,13 +86,26 @@ fn roundtrip_secondary_capacity() {
 fn roundtrip_task_requeued() {
     let mutation: ClusterMutation<TestId> = ClusterMutation::TaskRequeued {
         hash: "h-requeued".into(),
+        version: TaskVersion {
+            primary_epoch: 3,
+            seq: 7,
+        },
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
 
     match decoded {
-        ClusterMutation::TaskRequeued { hash } => assert_eq!(hash, "h-requeued"),
+        ClusterMutation::TaskRequeued { hash, version } => {
+            assert_eq!(hash, "h-requeued");
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 3,
+                    seq: 7
+                }
+            );
+        }
         _ => panic!("expected TaskRequeued"),
     }
 }
@@ -181,4 +195,195 @@ fn task_completed_omits_absent_result_data_on_wire() {
         "absent result_data must be omitted on the wire, got: {v}"
     );
     assert_eq!(inner["hash"], "h-bare");
+}
+
+/// `TaskFailed` round-trips carrying a NON-DEFAULT `version` — the
+/// primary-stamped terminal-payload version survives encode→decode. A
+/// default-valued test would pass even if the field were dropped on the
+/// wire, so the assertion is pinned on the non-default.
+#[test]
+fn roundtrip_task_failed_with_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskFailed {
+        hash: "h-failed".into(),
+        kind: ErrorType::NonRecoverable,
+        error: "boom".into(),
+        version: TaskVersion {
+            primary_epoch: 5,
+            seq: 2,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskFailed {
+            hash,
+            kind,
+            error,
+            version,
+        } => {
+            assert_eq!(hash, "h-failed");
+            assert_eq!(kind, ErrorType::NonRecoverable);
+            assert_eq!(error, "boom");
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 5,
+                    seq: 2
+                }
+            );
+        }
+        _ => panic!("expected TaskFailed"),
+    }
+}
+
+/// Backward-compat: a sender that predates the `version` field emits a
+/// `TaskFailed` JSON shape with only `{ hash, kind, error }`.
+/// `#[serde(default)]` must decode it as the `(0, 0)` strict minimum so a
+/// legacy record never dominates a versioned one.
+#[test]
+fn legacy_task_failed_decodes_version_as_default() {
+    let legacy = serde_json::json!({
+        "TaskFailed": { "hash": "legacy", "kind": "NonRecoverable", "error": "e" }
+    });
+    let json = legacy.to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskFailed { version, .. } => {
+            assert_eq!(version, TaskVersion::default());
+        }
+        _ => panic!("expected TaskFailed"),
+    }
+}
+
+/// `TaskAssigned` round-trips carrying a NON-DEFAULT `version` (the
+/// assignment-lifecycle version that lets a stale assignment lose to a
+/// higher-version reset).
+#[test]
+fn roundtrip_task_assigned_with_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskAssigned {
+        hash: "h-assigned".into(),
+        secondary: "sec-1".into(),
+        worker: 4,
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 9,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskAssigned {
+            hash,
+            secondary,
+            worker,
+            version,
+        } => {
+            assert_eq!(hash, "h-assigned");
+            assert_eq!(secondary, "sec-1");
+            assert_eq!(worker, 4);
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 1,
+                    seq: 9
+                }
+            );
+        }
+        _ => panic!("expected TaskAssigned"),
+    }
+}
+
+/// `TaskPreferredSecondariesUpdated` round-trips carrying a NON-DEFAULT
+/// `version` (the preferred-metadata version, mirrored onto
+/// `TaskInfo.preferred_version`).
+#[test]
+fn roundtrip_preferred_updated_with_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskPreferredSecondariesUpdated {
+        hash: "h-pref".into(),
+        secondaries: vec!["a".into(), "b".into()],
+        version: TaskVersion {
+            primary_epoch: 2,
+            seq: 1,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskPreferredSecondariesUpdated {
+            hash,
+            secondaries,
+            version,
+        } => {
+            assert_eq!(hash, "h-pref");
+            assert_eq!(secondaries, vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 2,
+                    seq: 1
+                }
+            );
+        }
+        _ => panic!("expected TaskPreferredSecondariesUpdated"),
+    }
+}
+
+/// `TaskReinjected` round-trips carrying a NON-DEFAULT reset `version`.
+#[test]
+fn roundtrip_task_reinjected_with_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskReinjected {
+        hash: "h-reinj".into(),
+        version: TaskVersion {
+            primary_epoch: 4,
+            seq: 6,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskReinjected { hash, version } => {
+            assert_eq!(hash, "h-reinj");
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 4,
+                    seq: 6
+                }
+            );
+        }
+        _ => panic!("expected TaskReinjected"),
+    }
+}
+
+/// Backward-compat: a sender that predates the reset `version` field emits
+/// `TaskRequeued` / `TaskReinjected` with only `{ hash }`; the field must
+/// decode to the `(0, 0)` strict minimum.
+#[test]
+fn legacy_reset_mutations_decode_version_as_default() {
+    for (key, wrap) in [
+        ("TaskRequeued", "TaskRequeued"),
+        ("TaskReinjected", "TaskReinjected"),
+    ] {
+        let legacy = serde_json::json!({ wrap: { "hash": "h" } });
+        let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
+        let version = match decoded {
+            ClusterMutation::TaskRequeued { version, .. } => version,
+            ClusterMutation::TaskReinjected { version, .. } => version,
+            _ => panic!("expected {key}"),
+        };
+        assert_eq!(
+            version,
+            TaskVersion::default(),
+            "{key} legacy version default"
+        );
+    }
 }

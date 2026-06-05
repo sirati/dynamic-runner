@@ -253,7 +253,9 @@ where
                 };
                 tracing::debug!(peer = %sender_id, "timeout query received, queueing response");
                 // Queue for async send — will be flushed in the main loop
-                self.op_mut().pending_peer_messages.push((sender_id, response));
+                self.op_mut()
+                    .pending_peer_messages
+                    .push((sender_id, response));
             }
             DistributedMessage::TimeoutResponse {
                 sender_id,

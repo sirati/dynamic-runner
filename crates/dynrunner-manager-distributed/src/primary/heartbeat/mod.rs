@@ -36,8 +36,8 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::wire::timestamp_now;
 use super::PrimaryCoordinator;
+use super::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
 /// Outcome of a single periodic heartbeat sweep: the RAW per-secondary

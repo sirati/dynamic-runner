@@ -131,8 +131,11 @@ async fn busy_genuine_death_arms_fast_via_leg_a() {
     );
     // Leg (B) is NOT what fires here: staleness is fresh, far under the
     // backstop.
-    let stale = Instant::now()
-        .duration_since(sec.op_mut().primary_last_seen.expect("set by record_primary_message"));
+    let stale = Instant::now().duration_since(
+        sec.op_mut()
+            .primary_last_seen
+            .expect("set by record_primary_message"),
+    );
     assert!(
         stale < BACKSTOP,
         "leg (B) must be inactive — staleness {stale:?} should be under backstop {BACKSTOP:?}",

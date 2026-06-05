@@ -36,6 +36,7 @@ fn mk_task(name: &str) -> TaskInfo<TestId> {
         task_id: name.into(),
         task_depends_on: Vec::new(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -122,7 +123,10 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 task: mk_task("t"),
             });
             assert!(
-                matches!(sec.cluster_state.task_state("t"), Some(TaskState::Pending { .. })),
+                matches!(
+                    sec.cluster_state.task_state("t"),
+                    Some(TaskState::Pending { .. })
+                ),
                 "precondition: the secondary missed the TaskCompleted and is stuck Pending"
             );
             // The replicas genuinely diverge: same count, different fold.
@@ -221,11 +225,8 @@ async fn converged_secondary_emits_but_does_not_pull() {
             assert_eq!(sec.cluster_state.digest(), peer.digest());
 
             // The emit path produces an All-addressed digest frame.
-            let frame: DistributedMessage<TestId> = crate::anti_entropy::digest_broadcast(
-                "worker-b",
-                0.0,
-                sec.cluster_state.digest(),
-            );
+            let frame: DistributedMessage<TestId> =
+                crate::anti_entropy::digest_broadcast("worker-b", 0.0, sec.cluster_state.digest());
             sec.send_to(Destination::All, frame)
                 .await
                 .expect("digest broadcast send succeeds");
