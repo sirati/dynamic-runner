@@ -51,6 +51,21 @@ pub trait PodmanBackend {
     /// child, never host-PID-1's child, so `pgrep -P 1` never found it.
     fn workload_pid(&self, name: &str) -> Option<u32>;
 
+    /// `podman inspect --format {{.State.ConmonPid}} <NAME>` — the HOST
+    /// PID of the container's **conmon** monitor (the workload's parent).
+    /// Returns `Some(pid)` when the record exists and reports a running
+    /// conmon; `None` when the record is gone, the field is `0`/absent,
+    /// or the output cannot be parsed.
+    ///
+    /// Captured alongside [`Self::workload_pid`] so SIGNAL_SHUTDOWN reaps
+    /// conmon TOO, not only the workload. conmon — not the workload — is
+    /// the process that double-forks out of the SLURM job cgroup, is
+    /// missed by proctrack's end-of-job sweep, re-parents to host PID 1,
+    /// and keeps the container + its NFS bind-mount writers alive 30+ min
+    /// post-termination. Reaping the workload alone leaves that conmon
+    /// orphan; this closes the targeting gap.
+    fn conmon_pid(&self, name: &str) -> Option<u32>;
+
     /// `podman kill --signal <SIGNAL> <NAME>` — signals pid 1 of the
     /// container itself. Belt-and-suspenders for the case the user
     /// process never spawned a child, or pgrep missed it.
@@ -198,6 +213,37 @@ impl RealPodman {
         matches!(cmd.status(), Ok(s) if s.success())
     }
 
+    /// `podman inspect --format <fmt> <NAME>` parsed to a host PID. Shared
+    /// by [`PodmanBackend::workload_pid`] (`{{.State.Pid}}`) and
+    /// [`PodmanBackend::conmon_pid`] (`{{.State.ConmonPid}}`) so the
+    /// inspect+parse lives in exactly one place. Returns `None` when the
+    /// record is gone, the field is `0` (container not running / no
+    /// conmon), or the output cannot be parsed.
+    fn inspect_pid(&self, name: &str, format: &str) -> Option<u32> {
+        let mut c = self.cmd();
+        c.arg("inspect")
+            .arg("--format")
+            .arg(format)
+            .arg(name)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        let out = c.output().ok()?;
+        match out.status.success() {
+            false => None,
+            true => {
+                let text = String::from_utf8(out.stdout).ok()?;
+                let pid = text.trim().lines().next()?.trim().parse::<u32>().ok()?;
+                // A PID of 0 means there is no running host process to
+                // signal (created-but-not-started, already exited, or no
+                // conmon); report absence.
+                match pid {
+                    0 => None,
+                    _ => Some(pid),
+                }
+            }
+        }
+    }
+
     /// Run a command capturing stderr (stdout/stdin still nulled).
     /// `Ok(())` on exit-0; `Err(diag)` otherwise, where `diag` packs
     /// argv (debug-formatted — may include shell-unsafe chars, fine
@@ -260,28 +306,11 @@ impl PodmanBackend for RealPodman {
     }
 
     fn workload_pid(&self, name: &str) -> Option<u32> {
-        let mut c = self.cmd();
-        c.arg("inspect")
-            .arg("--format")
-            .arg("{{.State.Pid}}")
-            .arg(name)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
-        let out = c.output().ok()?;
-        match out.status.success() {
-            false => None,
-            true => {
-                let text = String::from_utf8(out.stdout).ok()?;
-                let pid = text.trim().lines().next()?.trim().parse::<u32>().ok()?;
-                // A `State.Pid` of 0 means the container is not running
-                // (created-but-not-started, or already exited). There is
-                // no host process to signal; report absence.
-                match pid {
-                    0 => None,
-                    _ => Some(pid),
-                }
-            }
-        }
+        self.inspect_pid(name, "{{.State.Pid}}")
+    }
+
+    fn conmon_pid(&self, name: &str) -> Option<u32> {
+        self.inspect_pid(name, "{{.State.ConmonPid}}")
     }
 
     fn kill_pid1(&self, name: &str, signal: &str) -> bool {

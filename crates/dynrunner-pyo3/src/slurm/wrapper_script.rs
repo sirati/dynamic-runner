@@ -133,20 +133,25 @@ pub fn generate_wrapper_script(
     // Resolve the shutdown-manager binary path the wrapper renderer
     // expects (`Option<&Path>`) from the kwarg's string shape. The
     // Python side passes the value the Rust job-manager recorded
-    // after `upload_shutdown_manager_binary_from` ran. In production
-    // the SLURM dispatch path always populates this (the Python
-    // bridge raises on missing source binary rather than skipping);
-    // the `None` branch exists for renderer-internal unit tests and
-    // back-compat callers that do not exercise the SLURM dispatch
-    // path.
+    // after `upload_shutdown_manager_binary_from` ran. The `None`
+    // branch (no out-of-cgroup survivor spawned) is a LIVE option the
+    // wrapper binary honours; it is NOT the removed legacy heredoc.
     let shutdown_manager_bin_path = shutdown_manager_bin_path.map(Path::new);
 
-    // When the Python preparation step plumbs the uploaded wrapper
-    // binary's gateway-side path, the renderer emits the tiny
-    // `exec <bin> <args>` stub instead of the legacy inline bash.
-    // `None` keeps the legacy body (renderer-internal unit tests +
-    // back-compat callers that don't exercise the SLURM dispatch path).
-    let wrapper_bin_path = wrapper_bin_path.map(Path::new);
+    // The wrapper renderer emits ONLY the `exec <bin> <args>` stub: the
+    // uploaded `dynrunner-slurm-wrapper` binary performs the full
+    // secondary lifecycle. `wrapper_bin_path` is therefore MANDATORY —
+    // there is no longer a legacy inline-bash body to fall back to. The
+    // SLURM dispatch path always plumbs the uploaded binary's
+    // gateway-side path; surface a clear error if a caller omits it
+    // rather than silently rendering an unrunnable script.
+    let wrapper_bin_path = wrapper_bin_path.map(Path::new).ok_or_else(|| {
+        PyValueError::new_err(
+            "wrapper_bin_path is required: the wrapper renderer emits an `exec <bin>` \
+             stub for the uploaded dynrunner-slurm-wrapper binary (the legacy inline-bash \
+             body was removed)",
+        )
+    })?;
 
     let cfg = WrapperScriptConfig {
         slurm_config: &slurm_config,

@@ -7,11 +7,14 @@
 use dynrunner_slurm_shutdown::cleanup::{final_cleanup, write_pid_file};
 use dynrunner_slurm_shutdown::clock::RealClock;
 use dynrunner_slurm_shutdown::config::{Config, parse};
-use dynrunner_slurm_shutdown::poll_loop::{Outcome, PollConfig, ReapStatus, run};
+use dynrunner_slurm_shutdown::poll_loop::{
+    PollConfig, ReapStatus, ShutdownTrigger, run,
+};
 use dynrunner_slurm_shutdown::podman::RealPodman;
 use dynrunner_slurm_shutdown::process_probe::KillProbe;
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
 use dynrunner_slurm_shutdown::signals;
+use dynrunner_slurm_shutdown::squeue_snapshot;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -27,9 +30,9 @@ fn main() -> ExitCode {
         Err(e) => {
             // No `cfg` yet ⇒ no log-file destination. The argv-parse-
             // error path falls back to stderr alone; callers always
-            // have stderr in the failure case (systemd-run captures
-            // its own command stderr to the journal, and the setsid
-            // path's shell redirect captures the same).
+            // have stderr in the failure case (the manager is spawned via
+            // systemd-run, which captures its command stderr to the
+            // journal).
             eprintln!("{} argv error: {}", LOG_PREFIX, e);
             return ExitCode::from(2);
         }
@@ -130,19 +133,43 @@ fn run_with_config(cfg: Config) -> ExitCode {
         log(&format!("wrapper-monitor enabled; watching pid {}", p));
     }
     let report = run(&backend, &flag, &clock, &probe, &poll_cfg, &mut log);
-    // When a signal drove the shutdown, report WHO sent it (sender pid +
-    // binary + full cmdline) and WHY we tore down — the diagnostic that
-    // tells the operator whether the kill came from slurmstepd (SLURM
-    // TIMEOUT/scancel), the wrapper/coordinator, or the kernel OOM-killer.
-    // `None` when the SignalShutdown branch was reached for a non-signal
-    // reason (the monitored wrapper PID disappeared), which the loop has
-    // already logged as such.
-    if report.outcome == Outcome::SignalShutdown {
-        if let Some(line) =
-            signals::describe_last_signal("the shutdown flag was set by an incoming signal")
-        {
-            log(&line);
+    // Always record WHY teardown happened — the diagnostic that tells the
+    // operator what decided to force shutdown. Every trigger gets a line:
+    //   * Signal      — WHO sent it (sender pid + binary + full cmdline),
+    //     via the captured siginfo, so slurmstepd (SLURM TIMEOUT/scancel)
+    //     vs the wrapper/coordinator vs the kernel OOM-killer is visible.
+    //   * WrapperGone — the monitored wrapper PID disappeared (the SLURM
+    //     job process that owns this container is gone). This is the path
+    //     where no signal was ever captured, so describe_last_signal would
+    //     return None and — before this — NO why-line was logged at all.
+    //   * Idle        — the IDLE_SHUTDOWN branch already logged its cause.
+    match report.trigger {
+        ShutdownTrigger::Signal => {
+            if let Some(line) =
+                signals::describe_last_signal("the shutdown flag was set by an incoming signal")
+            {
+                log(&line);
+            }
         }
+        ShutdownTrigger::WrapperGone { pid } => {
+            log(&format!(
+                "forcing teardown because the monitored wrapper pid {} disappeared — the \
+                 SLURM job process that owns this container is gone (no signal was delivered \
+                 to this manager; the wrapper-monitor decided the shutdown)",
+                pid
+            ));
+        }
+        ShutdownTrigger::Idle => {}
+    }
+    // One-shot SLURM-state snapshot for CONTEXT (never a trigger, never a
+    // poll): capture `squeue -u <runtime-user>` once at teardown so the
+    // operator can correlate the WHY-line above against what SLURM thought
+    // the user's jobs were doing at that instant. A transiently-empty
+    // result here is harmless — it decides nothing. Captured on the
+    // force-teardown paths (Signal / WrapperGone); the idle path means the
+    // container was simply absent, where a SLURM snapshot adds no signal.
+    if !matches!(report.trigger, ShutdownTrigger::Idle) {
+        squeue_snapshot::capture(&mut log);
     }
     log(&format!("state machine completed: {:?}", report));
     // When the reaper left a live orphan (and its podman handle) intact,

@@ -2,9 +2,9 @@
 //!
 //! Single concern: stage the musl-static secondary-wrapper binary on
 //! the SLURM gateway so each per-job wrapper-script stub can `exec` it
-//! to run the full secondary lifecycle (the stub is rendered by
-//! `wrapper_script::generate` when
-//! `WrapperScriptConfig::wrapper_bin_path` is `Some`).
+//! to run the full secondary lifecycle (the stub is the ONLY thing
+//! `wrapper_script::generate` renders; `WrapperScriptConfig::wrapper_bin_path`
+//! is the mandatory `exec` target).
 //! Same deployment pattern as the per-job wrapper script
 //! (`job_<name>.sh`) and the source-binary upload — write to
 //! `root_folder`, `chmod` the remote, remember the resolved path.

@@ -15,25 +15,24 @@ pub struct WrapperScriptConfig<'a> {
     /// Consumer-supplied short identifier for their program/deployment
     /// (e.g. `"asm"`). Prefixes BOTH the scratch dir
     /// `/tmp/<name_prefix>-<suffix>` and the container name
-    /// `<name_prefix>-<suffix>-<secondary_id>`, replacing the legacy
-    /// hardcoded `asm` literal — dynrunner is a framework and must not
-    /// bake in any one consumer's program name. The renderer threads
-    /// this verbatim into both the legacy bash path (the `/tmp/...` and
-    /// container-name literals) and, when `wrapper_bin_path` is `Some`,
-    /// the binary's [`WrapperConfig::name_prefix`]. There is NO default:
-    /// the caller (Python dispatch) must source it from the consumer's
+    /// `<name_prefix>-<suffix>-<secondary_id>` (derived inside the
+    /// wrapper binary), replacing the legacy hardcoded `asm` literal —
+    /// dynrunner is a framework and must not bake in any one consumer's
+    /// program name. The renderer threads this verbatim into the
+    /// binary's [`WrapperConfig::name_prefix`]. There is NO default: the
+    /// caller (Python dispatch) must source it from the consumer's
     /// deployment spec.
     pub name_prefix: &'a str,
-    /// When `Some`, the renderer emits a TINY stub wrapper script that
-    /// `exec`s this compute-node binary path with the
-    /// [`WrapperConfig::to_args`] vector (each element bash-quoted)
-    /// instead of the legacy inline bash heredoc — the Rust musl
-    /// wrapper binary then performs the full secondary lifecycle the
-    /// bash used to. When `None`, the renderer emits the legacy bash
-    /// body unchanged (modulo the `name_prefix` substitution above).
-    /// The `#SBATCH`/entrypoint mechanics are identical in both cases;
-    /// only the script body differs.
-    pub wrapper_bin_path: Option<&'a Path>,
+    /// Compute-node path of the `dynrunner-slurm-wrapper` musl-static
+    /// binary. The renderer emits a TINY stub wrapper script that
+    /// `exec`s this binary with the [`WrapperConfig::to_args`] vector
+    /// (each element bash-quoted); the Rust wrapper binary then performs
+    /// the full secondary lifecycle. This is the ONLY render path: the
+    /// legacy inline bash heredoc (old `setsid` fallback, no
+    /// `--cgroup-parent`/adopt, no in-band reap) was deleted at root —
+    /// every secondary now runs the binary. The `#SBATCH`/entrypoint
+    /// mechanics are owned by `submit_job`, unchanged.
+    pub wrapper_bin_path: &'a Path,
     /// Absolute (already tilde-expanded) path to the docker-archive
     /// tar on the gateway.
     pub image_path: &'a str,
@@ -52,8 +51,7 @@ pub struct WrapperScriptConfig<'a> {
     /// binary's [`WrapperConfig::image_digest`] as the content key for
     /// the node-local image cache (the binary's `image.rs` reuses a
     /// digest-keyed node-local copy instead of re-reading the shared-FS
-    /// tarball per secondary). Empty string disables the cache. Only the
-    /// binary stub path consumes it; the legacy bash body ignores it.
+    /// tarball per secondary). Empty string disables the cache.
     pub image_digest: &'a str,
     /// Bash snippet that loads the image into podman storage. The
     /// caller pre-substitutes `$LOCAL_IMAGE`, `$PODMAN_STORAGE`,

@@ -216,12 +216,16 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
 
     // Construct a wrapper config the same way preparation.rs does:
     // pull the path off the manager, hand it (as a &Path) to the
-    // renderer's `shutdown_manager_bin_path` field.
+    // renderer's `shutdown_manager_bin_path` field. The renderer emits
+    // the `exec <wrapper-bin> <args…>` stub, so the shutdown-manager path
+    // travels through as a bash-quoted `--shutdown-manager-bin-path`
+    // argument the wrapper binary parses back.
     let bin_path = Path::new(remote);
+    let wrapper_bin = Path::new("/srv/slurm/dynrunner-slurm-wrapper");
     let cfg = WrapperScriptConfig {
         slurm_config: &config,
         name_prefix: "asm",
-        wrapper_bin_path: None,
+        wrapper_bin_path: wrapper_bin,
         image_path: "/srv/slurm/image_bin/app.tar.gz",
         secondary_id: "sec-0",
         image_name: "app",
@@ -249,14 +253,9 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
     let script = generate_wrapper_script(&cfg);
 
     assert!(
-        script.contains("systemd-run --user --quiet"),
-        "rendered wrapper must contain the systemd-run spawn block \
-         (service mode, --quiet) when shutdown_manager_bin_path is \
-         Some; got script: {script}",
-    );
-    assert!(
         script.contains(remote),
-        "rendered wrapper must reference the resolved remote path verbatim; \
-         expected substring `{remote}`, full script: {script}",
+        "rendered wrapper stub must reference the resolved remote \
+         shutdown-manager path verbatim (as a `--shutdown-manager-bin-path` \
+         arg); expected substring `{remote}`, full script: {script}",
     );
 }

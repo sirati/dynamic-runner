@@ -8,18 +8,25 @@ gone.
 
 ## Why a separate subproject
 
-This binary is fixed infrastructure. It depends on no framework types
-and should not be rebuilt every time the framework's Cargo workspace
-changes. Living in its own flake means:
+This binary is fixed infrastructure. It depends on no FRAMEWORK runtime
+types and should not be rebuilt every time the framework's Cargo
+workspace changes. It does share ONE small, dependency-free crate with
+the SLURM wrapper — `crates/dynrunner-reap`, the host-PID reap
+state-machine — so the two reapers never carry duplicated reap logic; that
+crate is itself libc+std only, so the static binary stays minimal. Being
+its own Cargo workspace still means:
 
-- Independent build cache (framework rebuilds do not invalidate it).
+- Independent build cache (framework crate rebuilds do not invalidate it;
+  only an edit to `dynrunner-reap` or this subproject does).
 - Decoupled distribution: consumers pin a specific shutdown-manager
   revision, separate from their framework version.
 - The static musl binary is portable across nix-store rebuilds of
   framework deps.
 
 Accordingly, `shutdown-manager/` is intentionally listed under
-`[workspace].exclude` in the repo-root `Cargo.toml`.
+`[workspace].exclude` in the repo-root `Cargo.toml`. The nix build src
+(see `nix/shutdown-manager-bin.nix`) unions this subtree with
+`crates/dynrunner-reap` so the shared path-dep resolves.
 
 ## CLI contract
 
@@ -128,21 +135,39 @@ that holds a lock the nested `rm` then deadlocks on.
 | `podman` | `PodmanBackend` trait + `RealPodman` |
 | `shutdown_flag` | `AtomicBool` flag set by signal handlers |
 | `signals` | install SIGTERM/SIGCONT handlers on the flag |
-| `clock` | `Clock` trait + `RealClock` for testable sleeps |
-| `process_probe` | `ProcessProbe` trait + `KillProbe` (`kill(pid,0)`) — wrapper-PID liveness, the loop's third wake input |
-| `poll_loop` | state machine |
+| `poll_loop` | state machine (uses the shared reap below) |
+| `squeue_snapshot` | one-shot `squeue -u <user>` diagnostic at teardown (context only) |
 | `cleanup` | `/tmp` removal + PID-file lifecycle |
-| `testing` | `MockBackend` + `FakeClock` + `MockProcessProbe` shared by unit + integration tests (LTO-stripped from the production binary) |
+| `testing` | `MockBackend` + the flag-coupled `FakeClock`, re-exporting the reap crate's process-probe mock (LTO-stripped from the production binary) |
+
+The host-PID reap state-machine + the `ProcessProbe`/`Clock` traits and
+`KillProbe`/`RealClock` live in the shared `crates/dynrunner-reap` crate
+(re-exported here as `process_probe`/`clock`), so the SLURM wrapper and
+this manager run ONE reap implementation, not two.
 
 ## Building
 
-Canonical build (musl-static, what consumers ship):
+Canonical build (musl-static, what consumers ship) — via the framework
+flake, because this binary now path-depends on the repo-root
+`crates/dynrunner-reap` crate (shared with the SLURM wrapper) and the
+build src must include both trees:
 
 ```
-nix build .#default --print-build-logs
+# from the repo root:
+nix build .#dynrunner-slurm-shutdown --print-build-logs
 file result/bin/dynrunner-slurm-shutdown   # → "static-pie linked"
 ldd result/bin/dynrunner-slurm-shutdown    # → "statically linked"
 ```
+
+The standalone `shutdown-manager/flake.nix` no longer exposes a build
+package — it provides ONLY a musl dev shell (`nix develop` here). Since the
+manager started path-depending on the repo-root `crates/dynrunner-reap`
+crate (shared with the slurm-wrapper), a `crane` build rooted at
+`shutdown-manager/` cannot resolve that out-of-subtree sibling without
+fighting crane's root-`Cargo.toml`/root-`Cargo.lock` assumptions. Rather
+than maintain a second, redundant (and fragile) build path, the canonical
+musl-static build is the framework flake's `.#dynrunner-slurm-shutdown`
+target above — the exact artefact the wheel bundles.
 
 Native development build (glibc-linked, fine for tests):
 

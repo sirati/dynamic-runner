@@ -21,6 +21,7 @@ members = [
     "crates/dynrunner-gateway",
     "crates/dynrunner-driver",
     "crates/dynrunner-discovery",
+    "crates/dynrunner-reap",
     "crates/dynrunner-slurm",
     "crates/dynrunner-pyo3",
     "crates/dynrunner-publish",

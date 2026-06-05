@@ -1,6 +1,9 @@
-//! Single concern: spawn the out-of-cgroup shutdown manager
-//! (generate.rs:214-296): `systemd-run --user --unit` service mode with a
-//! `setsid -f` fallback, same argv as the bash.
+//! Single concern: spawn the out-of-cgroup shutdown manager via
+//! `systemd-run --user --unit` (service mode). There is no `setsid`
+//! fallback: when the user-systemd bus is unreachable or registration
+//! fails, no out-of-cgroup survivor is spawned ([`ShutdownMode::None`])
+//! and the wrapper's bounded in-band reap is authoritative (see the
+//! [`ShutdownMode`] docs for why the old `setsid -f` path was removed).
 //!
 //! XDG_RUNTIME_DIR invariant (Phase 2): `systemd_user_runtime_dir` is the
 //! canonical per-uid value (`$XDG_RUNTIME_DIR` or `/run/user/<euid>`). It is
@@ -19,17 +22,31 @@ use std::fs::OpenOptions;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
-/// Which cgroup-escape primitive actually started the manager — the
+/// How (whether) the out-of-cgroup shutdown manager was started — the
 /// teardown forward (`teardown.rs`) picks the matching signal path.
+///
+/// There are only two states now. The old `setsid -f` fallback was
+/// REMOVED: `setsid` makes a new session, NOT a new cgroup, so the
+/// fallback manager shared the SLURM job cgroup and was SIGKILLed by the
+/// `KillWait` sweep mid-reap — the very band-aid that produced the
+/// "WATCHDOG: sending SIGTERM / no exited-gracefully" field signature. Its
+/// only remaining purpose (the TIMEOUT/scancel reap) is now covered by the
+/// wrapper's bounded in-band reap (`teardown::reap_container_inband`) plus
+/// the conmon cgroup-membership adopt, which finish BEFORE the sweep and
+/// need no out-of-cgroup delegate. The `systemd-run --user --unit` survivor
+/// is retained ONLY for the genuinely-ungraceful cases the wrapper itself
+/// can never handle (its own OOM-kill, a node reboot, a SIGKILL with no
+/// grace); when the user-systemd bus is unreachable the manager is simply
+/// not spawned (`None`) and the in-band reap is authoritative.
 #[derive(Debug, Clone)]
 pub enum ShutdownMode {
-    /// `systemd-run --user --unit=<unit>` (cgroup escape OK).
+    /// `systemd-run --user --unit=<unit>` (genuine out-of-cgroup survivor
+    /// in the `user@<uid>.service` slice).
     Systemd { unit: String },
-    /// `setsid -f` fallback; pid captured from the manager's pid-file.
-    Setsid { pid: u32 },
-    /// Neither primitive available, or the config had no binary path.
+    /// No out-of-cgroup manager was spawned (bus unreachable, systemd-run
+    /// absent/failed, or the config had no binary path). The wrapper's
+    /// in-band reap + conmon cgroup adopt are the guarantee on this path.
     None,
 }
 
@@ -85,14 +102,6 @@ fn systemd_run_args(layout: &Layout, bin: &Path, manager_args: &[String]) -> Vec
     args
 }
 
-/// `setsid` argv (everything after the `setsid` program), mirroring
-/// generate.rs:266-275: `-f <bin> <manager_args...>`. Pure for golden testing.
-fn setsid_args(bin: &Path, manager_args: &[String]) -> Vec<String> {
-    let mut args = vec!["-f".to_string(), bin.display().to_string()];
-    args.extend(manager_args.iter().cloned());
-    args
-}
-
 /// Canonical per-uid systemd runtime dir (generate.rs:333-341): `$XDG_RUNTIME_DIR`
 /// if set, else `/run/user/<euid>`. Captured WITHOUT mutating the wrapper's own
 /// environment — see the module-level XDG_RUNTIME_DIR invariant.
@@ -141,22 +150,29 @@ pub fn spawn(
         }
     }
 
-    // --- setsid fallback (cgroup escape DISABLED).
-    if on_path("setsid") {
-        return run_setsid(layout, bin, &manager, log_path);
-    }
-
+    // No out-of-cgroup survivor could be started (user-systemd bus
+    // unreachable, systemd-run absent, or registration failed). This is
+    // NOT a degraded reap: the old `setsid -f` fallback that used to run
+    // here lived INSIDE the SLURM job cgroup and was SIGKILLed by the
+    // KillWait sweep mid-reap (the broken band-aid), so it has been
+    // removed. The wrapper's bounded in-band reap
+    // (`teardown::reap_container_inband`) plus the conmon cgroup-membership
+    // adopt are the authoritative TIMEOUT/scancel teardown and need no
+    // out-of-cgroup delegate; the systemd survivor only adds coverage for
+    // the wrapper-dies-without-grace cases. Log that the in-band path is
+    // now authoritative and carry on.
     eprintln!(
-        "ERROR: neither systemd-run --user --unit (bus probe failed or \
-         registration failed) nor setsid available; orphan-container cleanup \
-         DISABLED on signal"
+        "NOTE: out-of-cgroup shutdown manager not started (user-systemd bus \
+         unreachable or systemd-run unavailable); the wrapper's in-band reap \
+         is authoritative for SLURM TIMEOUT/scancel teardown"
     );
     ShutdownMode::None
 }
 
-/// Run `systemd-run` synchronously (it blocks until registration). `Some` on
-/// success, `None` (with a WARNING logged) on non-zero / spawn failure so the
-/// caller falls through to setsid.
+/// Run `systemd-run` synchronously (it blocks until registration). `Some`
+/// on success, `None` (with a WARNING logged) on non-zero / spawn failure;
+/// the caller then returns [`ShutdownMode::None`] and the wrapper's in-band
+/// reap is authoritative (there is no `setsid` fallback).
 fn try_systemd_run(
     layout: &Layout,
     bin: &Path,
@@ -168,8 +184,9 @@ fn try_systemd_run(
         Ok(f) => Stdio::from(f),
         Err(e) => {
             eprintln!(
-                "WARNING: systemd-run --user --unit failed (cannot open log \
-                 {}: {e}); falling back to setsid -- cgroup escape DISABLED",
+                "WARNING: systemd-run --user --unit not started (cannot open log \
+                 {}: {e}); no out-of-cgroup survivor — the wrapper's in-band reap \
+                 is authoritative",
                 log_path.display()
             );
             return None;
@@ -201,8 +218,9 @@ fn try_systemd_run(
         }
         Ok(s) => {
             eprintln!(
-                "WARNING: systemd-run --user --unit failed (exit={}); falling \
-                 back to setsid -- cgroup escape DISABLED",
+                "WARNING: systemd-run --user --unit failed (exit={}); no \
+                 out-of-cgroup survivor — the wrapper's in-band reap is \
+                 authoritative",
                 s.code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string())
@@ -211,68 +229,13 @@ fn try_systemd_run(
         }
         Err(e) => {
             eprintln!(
-                "WARNING: systemd-run --user --unit failed (exit={e}); falling \
-                 back to setsid -- cgroup escape DISABLED"
+                "WARNING: systemd-run --user --unit failed (exit={e}); no \
+                 out-of-cgroup survivor — the wrapper's in-band reap is \
+                 authoritative"
             );
             None
         }
     }
-}
-
-/// `setsid -f <bin> <manager_args>` with stdin from /dev/null and stdout+stderr
-/// appended to the log; then poll the manager's pid-file (50 * 100ms).
-fn run_setsid(layout: &Layout, bin: &Path, manager: &[String], log_path: &Path) -> ShutdownMode {
-    eprintln!(
-        "WARNING: shutdown manager running under setsid -- cgroup escape \
-         DISABLED; SLURM TIMEOUT will reap the manager before cleanup."
-    );
-
-    let devnull = match OpenOptions::new().read(true).open("/dev/null") {
-        Ok(f) => Stdio::from(f),
-        Err(_) => Stdio::null(),
-    };
-    let (out, err) = match (append_log(log_path), append_log(log_path)) {
-        (Ok(o), Ok(e)) => (Stdio::from(o), Stdio::from(e)),
-        _ => (Stdio::null(), Stdio::null()),
-    };
-    // setsid -f detaches and returns immediately; we ignore its handle and rely
-    // on the manager's pid-file for the pid (mirrors the bash, which does the
-    // same poll rather than trusting setsid's exit pid).
-    let mut cmd = Command::new("setsid");
-    cmd.args(setsid_args(bin, manager))
-        .stdin(devnull)
-        .stdout(out)
-        .stderr(err);
-    // Reset the inherited blocked signal mask before exec (C2 safety note:
-    // applied to the setsid invocation regardless of session inheritance).
-    // SAFETY: child_pre_exec runs only an async-signal-safe sigprocmask.
-    unsafe {
-        cmd.pre_exec(crate::signals::child_pre_exec());
-    }
-    let _ = cmd.status();
-
-    let pid_file = layout.shutdown_pid_file.as_path();
-    for _ in 0..50 {
-        if pid_file.is_file() {
-            if let Some(pid) = std::fs::read_to_string(pid_file)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-            {
-                println!(
-                    "Spawned shutdown manager (setsid pid={pid}); cgroup escape \
-                     unavailable"
-                );
-                return ShutdownMode::Setsid { pid };
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    eprintln!(
-        "ERROR: setsid-spawned shutdown manager did not write pid-file within \
-         5s -- wrapper cleanup forward will be a no-op"
-    );
-    ShutdownMode::None
 }
 
 #[cfg(test)]
@@ -350,38 +313,6 @@ mod tests {
             "--property=PrivateTmp=false",
             "--property=StandardError=journal",
             "--",
-            "/opt/dynrunner-slurm-shutdown",
-            "--container-name",
-            "asm-abc123-7",
-            "--storage-root",
-            "/tmp/asm-abc123/storage",
-            "--runroot",
-            "/tmp/asm-abc123/run",
-            "--tmp-prefix",
-            "/tmp/asm-abc123",
-            "--pid-file",
-            "/tmp/asm-abc123/shutdown-manager.pid",
-            "--wrapper-pid",
-            "4242",
-            "--log-file",
-            "/net/log/7/shutdown-manager.log",
-            "--podman-path",
-            "/run/current-system/sw/bin/podman",
-            "--rm-path",
-            "/run/current-system/sw/bin/rm",
-            "--panik-file",
-            "/tmp/asm-abc123/log/.dynrunner-reaper.panik",
-        ];
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn setsid_args_golden() {
-        let bin = PathBuf::from("/opt/dynrunner-slurm-shutdown");
-        let manager = manager_args(&layout(), &bins(), 4242);
-        let got = setsid_args(&bin, &manager);
-        let expected = vec![
-            "-f",
             "/opt/dynrunner-slurm-shutdown",
             "--container-name",
             "asm-abc123-7",

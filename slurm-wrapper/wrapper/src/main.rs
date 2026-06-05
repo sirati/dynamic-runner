@@ -31,6 +31,7 @@
 //! block and `block_on`s [`run`].
 
 mod bin_resolve;
+mod cgroup;
 mod dirs;
 mod image;
 mod memcap;
@@ -53,11 +54,6 @@ use crate::network::PeerIps;
 /// Stable log prefix so operators can grep wrapper lines out of mixed
 /// SLURM job stderr (mirrors the shutdown-manager's `[shutdown-mgr]`).
 const LOG_TARGET: &str = "slurm-wrapper";
-
-/// Bounded grace for the container to exit after a forwarded SIGTERM on the
-/// terminating-signal path before teardown proceeds regardless (mirrors the
-/// bash `stop -t 10` graceful window).
-const SIGNAL_GRACE: Duration = Duration::from_secs(10);
 
 /// SYNC entrypoint. Blocks the monitored signal set BEFORE the tokio runtime
 /// exists (C1), then builds the runtime and `block_on`s the async lifecycle.
@@ -179,7 +175,35 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    // --- 10. build argv + run the container concurrently with the monitor ---
+    // --- 10. resolve job-cgroup containment (design §4 a1+a2) ---
+    // The wrapper is already a member of the slurmstepd per-job cgroup;
+    // discover it once. (a1) `--cgroup-parent` is attempted ONLY when a
+    // write-probe proves cgroup-v2 delegation is present (podman can mkdir
+    // a child cgroup beneath it); otherwise the flags are omitted and the
+    // post-launch (a2) `cgroup.procs` adopt + the in-band reap carry the
+    // load. Both are belt-and-suspenders: the orphan is reaped regardless
+    // of delegation.
+    let job_cgroup = cgroup::current_job_cgroup_real();
+    let cgroup_parent: Option<String> = job_cgroup.as_ref().and_then(|cg| {
+        if cgroup::cgroup_parent_probe_real(cg) {
+            tracing::info!(
+                target: LOG_TARGET,
+                cgroup = %cg.0,
+                "job cgroup is delegated; launching container under --cgroup-parent (a1)"
+            );
+            Some(cg.as_parent_arg().to_string())
+        } else {
+            tracing::info!(
+                target: LOG_TARGET,
+                cgroup = ?job_cgroup.as_ref().map(|c| &c.0),
+                "job cgroup not delegated (or absent); omitting --cgroup-parent, \
+                 relying on cgroup.procs adopt (a2) + in-band reap"
+            );
+            None
+        }
+    });
+
+    // --- 11. build argv + run the container concurrently with the monitor ---
     let argv = podman_run::build_run_argv(
         &cfg,
         &layout,
@@ -188,11 +212,41 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
         &net.peer_ips,
         net.quic_port,
         &net.secondary_url,
+        cgroup_parent.as_deref(),
     );
     banner_container_start(&cfg, &layout, &net);
 
     let exit_code = match spawn_container(&bins.podman, &argv, &layout) {
-        Ok(child) => run_to_completion(child, &mut monitor).await,
+        Ok(child) => {
+            // (a2) Adopt conmon into the wrapper's own (job) cgroup as the
+            // delegation-independent backstop: resolve conmon's host PID
+            // and write it to our own `cgroup.procs`, pulling the
+            // double-forked conmon back inside SLURM's authoritative
+            // sweep. Best-effort and forensic-logged; the in-band reap is
+            // the hard guarantee if this cannot run.
+            //
+            // The adopt POLLS `podman inspect` for conmon's PID for up to
+            // ~2s of `std::thread::sleep` — a SYNCHRONOUS, blocking probe.
+            // Running it inline here would block this tokio worker (and
+            // therefore delay the `run_to_completion` select! below) for up
+            // to 2s, so a SIGTERM arriving in that window would not be
+            // raced for up to 2s. Instead it runs on a `spawn_blocking`
+            // thread CONCURRENTLY with `run_to_completion`: the signal path
+            // is live from the instant the container is spawned, and the
+            // adopt's blocking polls never sit on a runtime worker. The
+            // handle is awaited AFTER the race resolves (the adopt has
+            // almost always finished by then; awaiting only reaps the
+            // blocking task cleanly).
+            let adopt_podman = bins.podman.clone();
+            let adopt_layout = layout.clone();
+            let adopt_cgroup = job_cgroup.clone();
+            let adopt = tokio::task::spawn_blocking(move || {
+                adopt_conmon_into_job_cgroup(&adopt_podman, &adopt_layout, adopt_cgroup.as_ref());
+            });
+            let code = run_to_completion(child, &mut monitor, &bins.podman, &layout).await;
+            let _ = adopt.await;
+            code
+        }
         Err(e) => {
             tracing::error!(target: LOG_TARGET, "failed to spawn container: {e}");
             // Treat a spawn failure like the bash set-e abort: exit 1.
@@ -320,18 +374,27 @@ fn spawn_container(
 /// Returns the exit code to propagate: the container's code on normal exit,
 /// or `128 + signo` on signal-termination. Logs the explicit wait-status
 /// (the forensic deliverable: WIFSIGNALED/WTERMSIG vs exit code).
+///
+/// On a terminating signal it runs the BOUNDED SYNCHRONOUS in-band reap
+/// (`teardown::reap_container_inband`) — graceful `podman stop`, then
+/// identity-checked SIGTERM→grace→SIGKILL of conmon AND the workload,
+/// then `podman rm -f` — finishing inside `KillWait` BEFORE returning so
+/// the orphan never survives the cgroup sweep. The reap is sync/blocking
+/// (it sleeps its graces), so it runs on `spawn_blocking`.
 async fn run_to_completion(
     mut child: tokio::process::Child,
     monitor: &mut signals::SignalMonitor,
+    podman: &str,
+    layout: &Layout,
 ) -> i32 {
     tokio::select! {
         // Container finished on its own.
         status = child.wait() => {
             exit_code_from_status(status)
         }
-        // A terminating signal arrived first: log the cause, forward SIGTERM
-        // to the container (idempotent if SLURM already group-signalled it),
-        // await its exit with a bounded grace, then return 128+signo.
+        // A terminating signal arrived first: log the cause (full
+        // provenance from the signalfd), run the bounded in-band reap,
+        // then return 128+signo.
         term = monitor.recv_terminating() => {
             tracing::warn!(
                 target: LOG_TARGET,
@@ -341,25 +404,91 @@ async fn run_to_completion(
                 si_code = %term.si_code,
                 comm = %term.comm,
                 cmdline = %term.cmdline,
-                "shutdown cause: terminating signal received; forwarding SIGTERM to container"
+                "shutdown cause: terminating signal received; beginning bounded in-band reap"
             );
-            forward_sigterm(&child);
-            // Bounded grace: let the container stop, but never wedge teardown.
-            let _ = tokio::time::timeout(SIGNAL_GRACE, child.wait()).await;
-            // Best-effort reap to avoid a zombie if the grace elapsed.
+            // Run the sync reap off the async runtime. Owned clones cross
+            // the 'static spawn_blocking boundary; the wrapper is exiting
+            // so the small clone cost is irrelevant.
+            let podman_owned = podman.to_string();
+            let layout_owned = layout.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                teardown::reap_container_inband(&podman_owned, &layout_owned)
+            })
+            .await;
+            // The foreground `podman run` client child is reaped by the
+            // in-band stop/rm; best-effort wait to avoid a zombie.
             let _ = child.try_wait();
             128 + term.signo as i32
         }
     }
 }
 
-/// Forward SIGTERM to the container child by pid (best-effort).
-fn forward_sigterm(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+/// Resolve conmon's host PID via `podman inspect {{.State.ConmonPid}}` and
+/// adopt it into the wrapper's own (job) cgroup — the (a2) backstop.
+/// Best-effort + forensic-logged: a missing cgroup, an unresolvable
+/// conmon, or a failed adopt is not fatal (the in-band reap is the
+/// guarantee). No-op when the job cgroup could not be discovered (v1 host).
+fn adopt_conmon_into_job_cgroup(
+    podman: &str,
+    layout: &Layout,
+    job_cgroup: Option<&cgroup::CgroupPath>,
+) {
+    let Some(cg) = job_cgroup else {
+        return;
+    };
+    // Poll briefly for conmon's PID — `podman inspect` may report 0/absent
+    // for a moment right after `podman run` starts while conmon comes up.
+    let mut conmon_pid = None;
+    for _ in 0..20 {
+        if let Some(pid) = inspect_conmon_pid(podman, layout) {
+            conmon_pid = Some(pid);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    match conmon_pid {
+        Some(pid) => {
+            cgroup::adopt_into_self_cgroup(cg, pid);
+        }
+        None => tracing::warn!(
+            target: LOG_TARGET,
+            "could not resolve conmon PID for cgroup adopt; relying on in-band reap"
+        ),
+    }
+}
+
+/// `podman inspect --format {{.State.ConmonPid}}` → conmon host PID, or
+/// `None` when the record is gone / the field is 0 / unparsable. Uses the
+/// per-secondary storage prefix so it sees the just-launched container.
+fn inspect_conmon_pid(podman: &str, layout: &Layout) -> Option<u32> {
+    let out = std::process::Command::new(podman)
+        .arg("--root")
+        .arg(&layout.podman_storage)
+        .arg("--runroot")
+        .arg(&layout.podman_run)
+        .arg("--cgroup-manager=cgroupfs")
+        .arg("inspect")
+        .arg("--format")
+        .arg("{{.State.ConmonPid}}")
+        .arg(&layout.container_name)
+        .env("XDG_RUNTIME_DIR", &layout.podman_run)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .lines()
+        .next()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    match pid {
+        0 => None,
+        _ => Some(pid),
     }
 }
 
@@ -581,7 +710,7 @@ mod tests {
 
     #[test]
     fn exit_code_wait_error_is_one() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "boom");
+        let err = std::io::Error::other("boom");
         assert_eq!(exit_code_from_status(Err(err)), 1);
     }
 
@@ -714,7 +843,7 @@ mod tests {
         let child = spawn_container(&podman, &[], &layout).unwrap();
         let code = tokio::time::timeout(
             Duration::from_secs(15),
-            run_to_completion(child, &mut monitor),
+            run_to_completion(child, &mut monitor, &podman, &layout),
         )
         .await
         .expect("happy path resolves");
@@ -737,27 +866,46 @@ mod tests {
         let child = spawn_container(&podman, &[], &layout).unwrap();
         let code = tokio::time::timeout(
             Duration::from_secs(15),
-            run_to_completion(child, &mut monitor),
+            run_to_completion(child, &mut monitor, &podman, &layout),
         )
         .await
         .expect("nonzero path resolves");
         assert_eq!(code, 37);
     }
 
-    /// Signal → teardown routing: a long-running fake podman (`exec sleep`) is
-    /// still running when a synthetic SIGTERM is INJECTED into the monitor.
-    /// run_to_completion must pick the signal branch of the select!, forward
-    /// SIGTERM to the live container (a real signalable `sleep`), await its
-    /// exit within the grace, and return 128+SIGTERM. This asserts the
-    /// teardown-always routing and the 128+signo mapping deterministically.
+    /// Signal → in-band-reap routing: a long-running fake podman
+    /// (`run` → `exec sleep`) is still running when a synthetic SIGTERM is
+    /// INJECTED into the monitor. `run_to_completion` must pick the signal
+    /// branch of the select!, run the BOUNDED IN-BAND REAP
+    /// (`teardown::reap_container_inband` — which shells `podman
+    /// stop`/`rm`), and return 128+SIGTERM. The fake podman is
+    /// subcommand-aware: `run` execs `sleep`; `inspect` reports no record
+    /// (exit 1) so the reap captures no PIDs (NotApplicable); `stop`/`rm`
+    /// record a marker file and exit 0. We assert the routing + exit code
+    /// AND that the in-band reap actually invoked stop+rm. The reap's
+    /// kill-by-PID behaviour is unit-tested in `teardown`/`dynrunner-reap`.
     #[tokio::test]
-    async fn lifecycle_injected_signal_forwards_and_maps_exit_code() {
+    async fn lifecycle_injected_signal_runs_inband_reap_and_maps_exit_code() {
         let tmp = tempfile::tempdir().unwrap();
-        let podman = write_fake_podman(tmp.path(), "exec sleep 30");
+        let marker = tmp.path().join("podman-calls.log");
+        // Subcommand-aware fake podman. Args include podman GLOBAL flags
+        // before the subcommand, so scan all args for the first known verb.
+        let body = format!(
+            "verb=\"\"\n\
+             for a in \"$@\"; do case \"$a\" in run|inspect|stop|rm) verb=\"$a\"; break;; esac; done\n\
+             case \"$verb\" in\n\
+             run) exec sleep 30;;\n\
+             inspect) exit 1;;\n\
+             stop) echo stop >> {m}; exit 0;;\n\
+             rm) echo rm >> {m}; exit 0;;\n\
+             *) exit 0;;\n\
+             esac",
+            m = marker.display()
+        );
+        let podman = write_fake_podman(tmp.path(), &body);
         let layout = test_layout(tmp.path());
         let (mut monitor, inject) = signals::SignalMonitor::for_test();
         let child = spawn_container(&podman, &[], &layout).unwrap();
-        let container_pid = child.id().expect("child has a pid");
 
         let sigterm = nix::sys::signal::Signal::SIGTERM as i32;
         inject
@@ -774,8 +922,8 @@ mod tests {
             .unwrap();
 
         let code = tokio::time::timeout(
-            Duration::from_secs(15),
-            run_to_completion(child, &mut monitor),
+            Duration::from_secs(20),
+            run_to_completion(child, &mut monitor, &podman, &layout),
         )
         .await
         .expect("run_to_completion must resolve via the injected signal path");
@@ -785,14 +933,17 @@ mod tests {
             "signal path returns 128+signo (SIGTERM)"
         );
 
-        // The container (sleep) must have been SIGTERM'd — it is no longer a
-        // live process (reaped via the wait inside run_to_completion). Sending
-        // signal 0 to its pid should now fail with ESRCH.
-        let alive =
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(container_pid as i32), None).is_ok();
+        // The in-band reap must have shelled `podman stop` then `podman rm`.
+        let calls = std::fs::read_to_string(&marker).unwrap_or_default();
         assert!(
-            !alive,
-            "container should have been terminated by the forwarded SIGTERM"
+            calls.contains("stop"),
+            "in-band reap must invoke `podman stop`; calls: {:?}",
+            calls
+        );
+        assert!(
+            calls.contains("rm"),
+            "in-band reap must invoke `podman rm`; calls: {:?}",
+            calls
         );
     }
 }

@@ -20,14 +20,20 @@ name = "dynrunner_slurm_shutdown"
 path = "src/lib.rs"
 
 [dependencies]
-# libc is the only runtime dependency:
+# libc is the only direct external runtime dependency:
 #   * `signals` installs SA_SIGINFO handlers via `sigaction(2)` and reads
-#     `siginfo_t.si_pid` to report which process sent each signal;
-#   * `process_probe::KillProbe` uses `kill(pid, 0/sig)` + `__errno_location`.
+#     `siginfo_t.si_pid` to report which process sent each signal.
 # `default-features = false` keeps the static binary minimal (no std-feature
 # pull-ins we don't use); `sigaction`/`siginfo_t`/`kill` are all available
 # without optional features.
 libc = { version = "0.2", default-features = false }
+
+# The shared reap state-machine + the host-PID probe/clock traits live
+# here so the wrapper and this manager carry NO private copy of the
+# SIGTERM→grace→SIGKILL reap. Path-dep only (it is itself libc+std), so
+# the musl-static binary stays minimal. The nix builds set `src` to the
+# repo root so this sibling path is reachable from the standalone build.
+dynrunner-reap = { path = "../crates/dynrunner-reap" }
 
 [dev-dependencies]
 # Cross-platform temp dir for filesystem cleanup tests. Tiny crate, no proc-macros.

@@ -2,24 +2,18 @@
 //! liveness probing (`kill(pid, 0)`) and signal delivery
 //! (`kill(pid, signal)`). Both are the same syscall behind the same
 //! permission model; keeping them in one module means every host-PID
-//! operation the reaper performs has exactly one owner.
+//! operation a reaper performs has exactly one owner.
 //!
-//! The poll loop in [`crate::poll_loop`] uses [`ProcessProbe::is_alive`]
-//! as a third wake input alongside the shutdown flag and the
-//! container-idle counter. When the wrapper script that spawned the
-//! shutdown manager is reaped by SLURM proctrack before its signal
-//! trap can forward `systemctl --user kill`, the manager would
-//! otherwise sit forever (orphan conmons keep the container "present"
-//! from podman's POV, so the idle branch never trips). Observing
-//! wrapper liveness lets the manager fall through to SIGNAL_SHUTDOWN
-//! on its own.
-//!
-//! The same poll loop uses [`ProcessProbe::signal`] + [`ProcessProbe::is_alive`]
-//! to reap the captured container workload PID directly — independent
-//! of podman's container record. Once podman loses the record (`--rm`
-//! cleanup, or a premature `rm -af`), a name-based `podman kill`
-//! no-ops; signalling the host PID does not, so the reaper can still
-//! finish the job and verify the workload actually terminated.
+//! Callers use [`ProcessProbe::is_alive`] as a liveness wake-input (e.g.
+//! the shutdown-manager watches the wrapper PID: when SLURM proctrack
+//! reaps the wrapper before its trap can forward `systemctl --user kill`,
+//! the disappearance is the cue to tear down). They use
+//! [`ProcessProbe::signal`] + [`ProcessProbe::is_same_process`] to reap a
+//! captured host PID directly — independent of any container record. Once
+//! podman loses the record (`--rm` cleanup, or a premature `rm -af`), a
+//! name-based `podman kill` no-ops; signalling the host PID does not, so
+//! the reaper can still finish the job and verify the process actually
+//! terminated.
 //!
 //! ## Boundary
 //!
@@ -27,39 +21,39 @@
 //! `ProcessProbe::signal(pid, signal) -> bool`,
 //! `ProcessProbe::start_time(pid) -> Option<u64>`, and the
 //! identity-aware liveness check
-//! `ProcessProbe::is_same_process(pid, captured) -> bool`. Callers
-//! know nothing about how aliveness is determined, how the signal is
-//! delivered, or where the start time comes from; the probe knows
-//! nothing about state machines or container records. Production uses
+//! `ProcessProbe::is_same_process(pid, captured) -> bool`. Callers know
+//! nothing about how aliveness is determined, how the signal is
+//! delivered, or where the start time comes from; the probe knows nothing
+//! about state machines or container records. Production uses
 //! [`KillProbe`]; tests use a scripted mock in [`crate::testing`].
 //!
-//! ## PID-reuse and the workload-reap identity guard
+//! ## PID-reuse and the reap identity guard
 //!
-//! The kernel may reuse a PID once it is freed. Two callers observe a
-//! host PID, and they handle reuse differently:
+//! The kernel may reuse a PID once it is freed. The probe distinguishes
+//! the two ways a caller observes a host PID:
 //!
-//!   * **Wrapper-monitor** (`is_alive`): if the wrapper exits and the
-//!     kernel hands its PID to an unrelated process before the next
-//!     poll tick, `kill(pid, 0)` reports the reuser as alive. Cleanup
-//!     is then delayed by however long the reuser stays up — never
-//!     skipped, never misdirected (we only ever *read* liveness here,
-//!     we never signal the wrapper PID). We accept that delay.
+//!   * **Liveness monitor** (`is_alive`): if a watched PID exits and the
+//!     kernel hands it to an unrelated process before the next poll tick,
+//!     `kill(pid, 0)` reports the reuser as alive. Cleanup is then
+//!     delayed by however long the reuser stays up — never skipped, never
+//!     misdirected (we only ever *read* liveness here, we never signal
+//!     the watched PID). We accept that delay.
 //!
-//!   * **Workload reap** (`is_same_process`): here the probe *signals*
-//!     the captured PID, so reuse is a kill-path hazard — a reused PID
-//!     would route SIGTERM/SIGKILL at an unrelated same-UID process.
-//!     The poll loop captures the workload PID's `/proc/<pid>/starttime`
-//!     (field 22 of `/proc/<pid>/stat`, the monotonic boot-relative
-//!     start time) at the same moment it captures the PID, and the reap
-//!     path re-checks it via [`ProcessProbe::is_same_process`] before
-//!     every signal. A missing `/proc` entry or a changed start time
-//!     means the original workload is gone; the reaper treats it as
-//!     gone and does NOT signal — so the reap signal only ever reaches
-//!     the genuine original workload.
+//!   * **Reap** (`is_same_process`): here the probe *signals* the
+//!     captured PID, so reuse is a kill-path hazard — a reused PID would
+//!     route SIGTERM/SIGKILL at an unrelated same-UID process. The reap
+//!     caller captures the PID's `/proc/<pid>/starttime` (field 22 of
+//!     `/proc/<pid>/stat`, the monotonic boot-relative start time) at the
+//!     same moment it captures the PID, and the reap path re-checks it
+//!     via [`ProcessProbe::is_same_process`] before every signal. A
+//!     missing `/proc` entry or a changed start time means the original
+//!     process is gone; the reaper treats it as gone and does NOT signal
+//!     — so the reap signal only ever reaches the genuine original
+//!     process.
 
-/// Probe interface so the poll loop is testable without a real PID
-/// space. Production impl uses `kill(pid, 0)`; test impl returns
-/// scripted booleans.
+/// Probe interface so reap logic is testable without a real PID space.
+/// Production impl uses `kill(pid, 0)`; test impl returns scripted
+/// booleans.
 pub trait ProcessProbe {
     /// Return `true` iff a process with this PID exists and is
     /// visible to the calling UID. `false` on `ESRCH` (no such
@@ -76,9 +70,10 @@ pub trait ProcessProbe {
     /// and confirms via [`Self::is_alive`]).
     ///
     /// This is the precise, single-PID counterpart to a broad
-    /// `pkill`: the reaper only ever signals the one workload PID it
-    /// captured from podman while the container record existed — never
-    /// a name/pattern match that could hit an unrelated process.
+    /// `pkill`: the reaper only ever signals the exact host PIDs it
+    /// captured (e.g. the container's conmon + workload) while their
+    /// identity was confirmed — never a name/pattern match that could
+    /// hit an unrelated process.
     fn signal(&self, pid: u32, signal: i32) -> bool;
 
     /// Read the process start time (field 22 of `/proc/<pid>/stat`,
@@ -148,8 +143,16 @@ impl ProcessProbe for KillProbe {
             // orphans, while the inverse would deadlock the loop.
             libc::EPERM => false,
             other => {
+                // No consumer-specific prefix here: `dynrunner-reap` is
+                // SHARED between the shutdown-manager (`[shutdown-mgr]`) and
+                // the SLURM wrapper (`slurm-wrapper`), and the
+                // `ProcessProbe::is_alive` trait method (called per-tick in
+                // tight liveness loops) does not thread either consumer's
+                // log sink. The crate owns NO consumer's label, so the line
+                // is self-identifying via the type/method name and carries
+                // no foreign prefix.
                 eprintln!(
-                    "[shutdown-mgr] KillProbe::is_alive: unexpected errno {} for pid {}",
+                    "dynrunner-reap KillProbe::is_alive: unexpected errno {} for pid {}",
                     other, pid
                 );
                 false

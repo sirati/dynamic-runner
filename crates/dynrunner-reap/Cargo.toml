@@ -1,0 +1,23 @@
+[package]
+name = "dynrunner-reap"
+version = "0.1.0"
+edition = "2021"
+description = "Single concern: reap a captured host-PID set safely (identity-checked SIGTERM → grace → SIGKILL → verify, PID-reuse-safe). Shared by the SLURM wrapper's in-band teardown and the out-of-cgroup shutdown-manager so neither carries a private reap state-machine."
+license = "Apache-2.0"
+repository = "https://github.com/sirati/dynamic-runner"
+
+[lib]
+name = "dynrunner_reap"
+path = "src/lib.rs"
+
+[dependencies]
+# libc is the ONLY runtime dependency, matching the musl-static
+# constraints of BOTH consumers (the shutdown-manager binary and the
+# slurm-wrapper binary). `KillProbe` uses `kill(pid, 0/sig)` +
+# `__errno_location`; the reap state-machine uses libc signal numbers.
+# `default-features = false` keeps the static binaries minimal — the
+# same discipline shutdown-manager's own Cargo.toml applies.
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

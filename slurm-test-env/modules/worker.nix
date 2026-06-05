@@ -55,4 +55,23 @@
     # closed.
     Environment = [ "DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1" ];
   };
+
+  # Delegate the cgroup-v2 subtree to the per-user manager so rootless
+  # podman (and the in-container worker-isolation logic) can create child
+  # cgroups and enable controllers under the user's own slice. This is the
+  # twin of `loginctl enable-linger` (set in provision-user.sh): linger
+  # keeps `user@<uid>.service` ALIVE across logout, while `Delegate=yes`
+  # makes the kernel hand that service a WRITABLE cgroup subtree. Both are
+  # needed — linger alone leaves the subtree undelegated, which is exactly
+  # the Krater condition that defeats the conmon `--cgroup-parent` (a1)
+  # containment route and the in-container `cgroup.subtree_control` write.
+  #
+  # Pinning it here reproduces the delegated condition on slurm-test-env so
+  # the orphan-conmon acceptance test can exercise the `--cgroup-parent`
+  # route (without it, even our own test cluster falls back to the
+  # delegation-independent cgroup.procs adopt + in-band reap, masking a1
+  # regressions). On a real cluster (Krater) the framework cannot set this
+  # — it is the site admin's systemd/PAM config — so the framework only
+  # warns and degrades gracefully there.
+  systemd.services."user@".serviceConfig.Delegate = "yes";
 }
