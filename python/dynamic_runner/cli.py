@@ -40,6 +40,58 @@ def parse_duration_secs(value: str) -> float:
     return float(body) * multiplier
 
 
+def non_negative_int(value: str) -> int:
+    """argparse ``type`` for an integer ``>= 0``.
+
+    The framework owns its count/budget flags now (a consumer that adopts
+    :func:`add_framework_arguments` inherits them and cannot re-attach its
+    own validator via ``set_defaults``), so the bound lives here once and
+    every ``>= 0`` flag reuses it. Zero is a valid value — it disables the
+    bucket/budget it gates — so only negatives are rejected, with a clean
+    ``ArgumentTypeError`` instead of an ``OverflowError`` at the PyO3
+    ``u32``/``usize`` boundary.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer, got {value!r}"
+        ) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"value must be >= 0, got {parsed}")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    """argparse ``type`` for an integer ``>= 1``.
+
+    The ``>= 1`` sibling of :func:`non_negative_int`, for count flags where
+    zero is meaningless (e.g. ``--jobs`` — zero secondaries is not a run).
+    """
+    parsed = non_negative_int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"value must be >= 1, got {parsed}")
+    return parsed
+
+
+def non_negative_float(value: str) -> float:
+    """argparse ``type`` for a float ``>= 0``.
+
+    The float analogue of :func:`non_negative_int`, for duration/cadence
+    knobs (e.g. ``--unconfigured-deadline-secs``) where a negative value is
+    nonsensical and would otherwise surface as an ugly downstream error.
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a number, got {value!r}"
+        ) from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"value must be >= 0, got {parsed}")
+    return parsed
+
+
 def add_framework_arguments(
     parser: argparse.ArgumentParser | argparse._ArgumentGroup,
 ) -> argparse.ArgumentParser | argparse._ArgumentGroup:
@@ -246,7 +298,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--panik-poll-interval-secs",
-        type=float,
+        type=non_negative_float,
         default=10.0,
         metavar="SECONDS",
         help=(
@@ -278,7 +330,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--debug-simulate-errors",
-        type=float,
+        type=non_negative_float,
         metavar="PERCENTAGE",
         dest="simulate_errors",
         help="Simulate random worker error on a task with given percentage chance (0-100)",
@@ -314,7 +366,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--secondary-quic-port",
-        type=int,
+        type=non_negative_int,
         default=0,
         help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
     )
@@ -468,7 +520,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--slurm-cpus-per-task",
-        type=int,
+        type=positive_int,
         default=None,
         help=(
             "Per-secondary SLURM cpus-per-task (sbatch --cpus-per-task). "
@@ -477,7 +529,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--retry-max-passes",
-        type=int,
+        type=non_negative_int,
         default=None,
         help=(
             "Number of Recoverable-retry passes at each phase drain edge. "
@@ -489,7 +541,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--oom-retry-max-passes",
-        type=int,
+        type=non_negative_int,
         default=None,
         help=(
             "Number of OOM-retry passes at each phase drain edge for tasks "
@@ -502,7 +554,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--unconfigured-deadline-secs",
-        type=float,
+        type=non_negative_float,
         default=None,
         metavar="SECONDS",
         help=(
@@ -518,7 +570,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--unfulfillable-reinject-max-per-task",
-        type=int,
+        type=non_negative_int,
         default=None,
         help=(
             "Per-task budget for the PrimaryHandle.reinject_task control-plane "
@@ -550,7 +602,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--respawn-max-per-secondary",
-        type=int,
+        type=non_negative_int,
         default=3,
         metavar="N",
         help=(
@@ -563,7 +615,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--respawn-max-total",
-        type=int,
+        type=non_negative_int,
         default=10,
         metavar="N",
         help=(
@@ -624,7 +676,7 @@ def add_framework_arguments(
     )
     parser.add_argument(
         "--jobs",
-        type=int,
+        type=positive_int,
         default=1,
         help="Number of SLURM secondary nodes to spawn (default: 1)",
     )
