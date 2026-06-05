@@ -39,6 +39,7 @@ mod relocate_observe;
 mod result_data_plumbing;
 mod retry;
 mod select_bootstrap;
+mod self_relay;
 mod setup_promote;
 mod stranded;
 mod wire;
