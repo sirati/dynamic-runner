@@ -9,6 +9,7 @@ Re-exports the names every consumer needs to write a worker module:
 
 See ``runtime.py`` for the full contract and exception → wire mapping.
 """
+from .logging_setup import setup_worker_logging
 from .publish import (
     PublishError,
     publish,
@@ -32,5 +33,6 @@ __all__ = [
     "publish",
     "publish_all",
     "run",
+    "setup_worker_logging",
     "task_function",
 ]

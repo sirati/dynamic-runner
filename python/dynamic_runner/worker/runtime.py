@@ -624,6 +624,15 @@ def run(
             args = parser.parse_args()
         if on_args is not None:
             on_args(args)
+        # Framework default: route this worker's logs to the per-worker
+        # `--log-file` in the compact `{h:mm:ss} {LEVEL} W-<id>  {message}`
+        # shape that matches the manager-side per-role files. A no-op when the
+        # consumer already configured logging in `on_args` (it runs first and
+        # wins) or when no `--log-file` was passed. Local import keeps the
+        # logging concern out of the runtime module's import surface.
+        from .logging_setup import setup_worker_logging
+
+        setup_worker_logging(getattr(args, "log_file", None))
         comm = _open_comm(args)
 
     prev_term = _install_term_handler()
