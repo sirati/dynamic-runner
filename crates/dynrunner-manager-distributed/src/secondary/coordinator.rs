@@ -96,7 +96,6 @@ where
             announcer_outbox_rx: None,
             panik_signal_rx: None,
             fatal_exit_signal_rx: None,
-            on_cluster_state_refresh: None,
             primary_activator: None,
             activated_primary_handle: None,
             pending_transfer_activation: false,
@@ -371,31 +370,6 @@ where
         rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         self.fatal_exit_signal_rx = Some(rx);
-    }
-
-    /// Register a callback invoked on a modest periodic tick from the
-    /// `process_tasks` loop with a read-only borrow of the live,
-    /// post-apply `cluster_state`. The matching consumer (the PyO3
-    /// observer's live-snapshot feed) cannot borrow the CRDT directly —
-    /// the run loop owns the `&mut cluster_state` for its whole lifetime
-    /// — so the loop calls IN to the consumer's closure at the one
-    /// in-loop moment it legitimately holds `&self.cluster_state`.
-    ///
-    /// Pre-`run_until_setup_or_done` contract, same single-shot
-    /// registration shape as [`Self::register_fatal_exit_signal_rx`]:
-    /// the slot is `Option::take`-n into the loop's local state on first
-    /// entry, so a registration after the loop started has no effect on
-    /// the active loop. Absent registration leaves the slot `None` — the
-    /// periodic tick still fires but invokes nothing.
-    ///
-    /// Single concern: own the registration surface. This crate never
-    /// learns what the consumer does with the borrow (it projects + the
-    /// `StatsSnapshot` / `SharedSnapshotSource` shapes live entirely in
-    /// the PyO3 layer); the callback is the clean boundary. The tick is
-    /// periodic — NOT per-`ClusterMutation` — so the projection cost is
-    /// `O(ledger)` per tick rather than `O(ledger × mutations)`.
-    pub fn register_cluster_state_refresh(&mut self, callback: super::ClusterStateRefreshFn<I>) {
-        self.on_cluster_state_refresh = Some(callback);
     }
 
     /// Register the ON-DEMAND primary-activator closure: the

@@ -31,9 +31,6 @@
 //!   does NOT elect, a dead link arms fast via leg (A), a wedged-but-
 //!   routable primary elects via the patient backstop (leg B), and a
 //!   resumed primary message cancels an in-flight election.
-//! - [`cluster_state_refresh`] — the registered
-//!   `on_cluster_state_refresh` callback fires on the `process_tasks`
-//!   periodic tick with the live, post-apply `cluster_state`.
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
@@ -64,7 +61,6 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
-mod cluster_state_refresh;
 mod colocated_loopback_resumes_across_setup_pending;
 mod honest_liveness;
 mod keepalive_emission;
