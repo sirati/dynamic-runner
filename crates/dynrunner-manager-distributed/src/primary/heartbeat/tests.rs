@@ -870,6 +870,68 @@ async fn oracle_true_when_only_silent_held_work_remains() {
     );
 }
 
+/// Self-cut guard: the recognized primary's OWN same-peer secondary, when
+/// transiently silent past the first WARN stage, must NOT appear in
+/// `silent_secondary_ids` and must NOT flip `only_silent_held_work_remains`
+/// on. The early dispatch-altitude lazy requeue acts on first-stage silence;
+/// during a momentary self-keepalive gap (the host's own secondary is still
+/// processing but briefly silent) reporting self here would yank the self's
+/// LIVE in-flight task before the next keepalive refreshes the clock and
+/// before the hard backstop. The identity filter (`id != current_primary`,
+/// the same cut `alive_remote_secondary_count` uses) excludes that single
+/// co-located entry by IDENTITY. The hard backstop is deliberately left
+/// unfiltered — this guard is the EARLY path only.
+#[tokio::test(flavor = "current_thread")]
+async fn self_secondary_excluded_from_silent_set_and_oracle() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // The recognized primary is the local host ("primary", the default
+    // `node_id`); its OWN co-located secondary advertises under the same
+    // peer-id and holds the only in-flight task.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PrimaryChanged {
+            new: "primary".into(),
+            epoch: 1,
+            reason: Default::default(),
+        });
+    register_operational_secondary(&mut primary, "primary", 0, "self-victim");
+
+    // The self-secondary goes silent past the FIRST WARN stage (50ms) but
+    // well under the hard backstop — exactly the transient self-keepalive
+    // gap §15 describes.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Without the filter the staged classifier would flag the self entry;
+    // the identity cut excludes it.
+    let report = primary.collect_heartbeat_report();
+    assert_eq!(
+        report.silences.len(),
+        1,
+        "the self-secondary is tracked in the raw silence sweep"
+    );
+    assert!(
+        primary.silent_secondary_ids().is_empty(),
+        "the recognized primary's own same-peer secondary must be excluded \
+         from the silent set by the identity filter"
+    );
+
+    // And therefore the early dispatch-altitude oracle cannot fire on it:
+    // the self's LIVE in-flight task is not early-requeue-eligible.
+    assert!(
+        !primary.only_silent_held_work_remains(),
+        "self-held silent in-flight work must NOT make the lazy-requeue \
+         oracle true — yanking the self's live task is the §15 self-cut"
+    );
+}
+
 /// Oracle FALSE corners — each one alone flips the predicate off, proving
 /// the predicate is the conjunction the brief specifies (no corner is
 /// load-bearing-by-accident).
