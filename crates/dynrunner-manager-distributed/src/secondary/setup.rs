@@ -172,8 +172,11 @@ where
     /// send.
     async fn send_setup_frame(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         let wire: DistributedMessage<I> = msg.into();
-        self.send_to(dynrunner_protocol_primary_secondary::Destination::Primary, wire)
-            .await
+        self.send_to(
+            dynrunner_protocol_primary_secondary::Destination::Primary,
+            wire,
+        )
+        .await
     }
 
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
@@ -230,101 +233,102 @@ where
                     // `enter_configuring` transition is a no-op from any
                     // other state, but the spawn is gated on the state
                     // check so workers are built at most once).
-                    self.enter_configuring_on_first_primary_frame(factory).await?;
+                    self.enter_configuring_on_first_primary_frame(factory)
+                        .await?;
                     match msg.msg_type() {
-                    MessageType::PeerInfo => {
-                        got_peer_info = true;
-                        if let DistributedMessage::PeerInfo { peers, .. } = &msg {
-                            let peer_count = peers
-                                .iter()
-                                .filter(|p| p.secondary_id != self.config.secondary_id)
-                                .count();
-                            tracing::info!(
-                                peers = peer_count,
-                                "received peer list, kicking off peer dials"
-                            );
-                            // Observer-set replication no longer rides
-                            // PeerInfo: the primary originates one
-                            // `ClusterMutation::PeerJoined { is_observer:
-                            // true }` per observer secondary
-                            // immediately after this PeerInfo broadcast
-                            // (`primary/peer_setup.rs::send_peer_lists`),
-                            // and the receiver applies them via the
-                            // standard `apply_cluster_mutations` path —
-                            // the same single-writer CRDT channel that
-                            // serves every other replicated field. The
-                            // `PeerConnectionInfo.is_observer` flag on
-                            // the wire frame is retained for backwards
-                            // compatibility (Batch D's wider peer-
-                            // lifecycle plumbing will consume it) but
-                            // is no longer the source of truth for
-                            // `RoleTable.observers`.
-                            // Non-blocking: per-peer dials run as
-                            // spawn_local tasks; returns immediately.
-                            // `connect_to_peers` dials the rest of the one
-                            // mesh (the primary link is already connected).
-                            self.transport.connect_to_peers(peers).await;
-                            // Arm the peer-mesh watchdog. 30s = 10s
-                            // QUIC timeout + 10s WSS fallback timeout
-                            // + 10s slack for the accept side to
-                            // finish handshakes that completed near
-                            // the deadline. After this point a 0-peer
-                            // count means "the cluster blocks
-                            // peer-direct connectivity" rather than
-                            // "the dials are still in flight".
-                            if peer_count > 0 {
-                                self.mesh.peer_dial_count = peer_count as u32;
-                                self.mesh.peer_mesh_check_at =
-                                    Some(Instant::now() + std::time::Duration::from_secs(30));
+                        MessageType::PeerInfo => {
+                            got_peer_info = true;
+                            if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                                let peer_count = peers
+                                    .iter()
+                                    .filter(|p| p.secondary_id != self.config.secondary_id)
+                                    .count();
+                                tracing::info!(
+                                    peers = peer_count,
+                                    "received peer list, kicking off peer dials"
+                                );
+                                // Observer-set replication no longer rides
+                                // PeerInfo: the primary originates one
+                                // `ClusterMutation::PeerJoined { is_observer:
+                                // true }` per observer secondary
+                                // immediately after this PeerInfo broadcast
+                                // (`primary/peer_setup.rs::send_peer_lists`),
+                                // and the receiver applies them via the
+                                // standard `apply_cluster_mutations` path —
+                                // the same single-writer CRDT channel that
+                                // serves every other replicated field. The
+                                // `PeerConnectionInfo.is_observer` flag on
+                                // the wire frame is retained for backwards
+                                // compatibility (Batch D's wider peer-
+                                // lifecycle plumbing will consume it) but
+                                // is no longer the source of truth for
+                                // `RoleTable.observers`.
+                                // Non-blocking: per-peer dials run as
+                                // spawn_local tasks; returns immediately.
+                                // `connect_to_peers` dials the rest of the one
+                                // mesh (the primary link is already connected).
+                                self.transport.connect_to_peers(peers).await;
+                                // Arm the peer-mesh watchdog. 30s = 10s
+                                // QUIC timeout + 10s WSS fallback timeout
+                                // + 10s slack for the accept side to
+                                // finish handshakes that completed near
+                                // the deadline. After this point a 0-peer
+                                // count means "the cluster blocks
+                                // peer-direct connectivity" rather than
+                                // "the dials are still in flight".
+                                if peer_count > 0 {
+                                    self.mesh.peer_dial_count = peer_count as u32;
+                                    self.mesh.peer_mesh_check_at =
+                                        Some(Instant::now() + std::time::Duration::from_secs(30));
+                                }
                             }
                         }
-                    }
-                    MessageType::InitialAssignment => {
-                        got_assignment = true;
-                        if let DistributedMessage::InitialAssignment {
-                            zip_files,
-                            workers_ready,
-                            staged_files,
-                            pre_staged_mode,
-                            uses_file_based_items,
-                            ..
-                        } = msg
-                        {
-                            self.set_pre_staged_mode(pre_staged_mode);
-                            self.set_uses_file_based_items(uses_file_based_items);
-                            self.handle_initial_assignment(
+                        MessageType::InitialAssignment => {
+                            got_assignment = true;
+                            if let DistributedMessage::InitialAssignment {
                                 zip_files,
                                 workers_ready,
                                 staged_files,
-                                factory,
-                            )
-                            .await;
+                                pre_staged_mode,
+                                uses_file_based_items,
+                                ..
+                            } = msg
+                            {
+                                self.set_pre_staged_mode(pre_staged_mode);
+                                self.set_uses_file_based_items(uses_file_based_items);
+                                self.handle_initial_assignment(
+                                    zip_files,
+                                    workers_ready,
+                                    staged_files,
+                                    factory,
+                                )
+                                .await;
+                            }
+                            tracing::info!("received initial assignment");
                         }
-                        tracing::info!("received initial assignment");
-                    }
-                    MessageType::TransferComplete => {
-                        // The `got_peer_info / got_assignment / got_transfer`
-                        // trio (local to this loop) is the SINGLE
-                        // `Configuring → Operational` gate — there is no
-                        // parallel tracking on `ConfiguringState`.
-                        got_transfer = true;
-                        tracing::info!("received transfer complete");
-                    }
-                    MessageType::ClusterMutation => {
-                        // Setup-phase ClusterMutation broadcasts (e.g.
-                        // the primary's `seed_cluster_state` TaskAdded
-                        // batch fired between Phase 4 and Phase 5)
-                        // must update the local mirror or the
-                        // post-setup view starts out incomplete. CRDT
-                        // semantics make this idempotent against any
-                        // re-applied mutation post-setup.
-                        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
-                            self.apply_cluster_mutations(mutations);
+                        MessageType::TransferComplete => {
+                            // The `got_peer_info / got_assignment / got_transfer`
+                            // trio (local to this loop) is the SINGLE
+                            // `Configuring → Operational` gate — there is no
+                            // parallel tracking on `ConfiguringState`.
+                            got_transfer = true;
+                            tracing::info!("received transfer complete");
                         }
-                    }
-                    other => {
-                        tracing::debug!(?other, "unexpected message during setup");
-                    }
+                        MessageType::ClusterMutation => {
+                            // Setup-phase ClusterMutation broadcasts (e.g.
+                            // the primary's `seed_cluster_state` TaskAdded
+                            // batch fired between Phase 4 and Phase 5)
+                            // must update the local mirror or the
+                            // post-setup view starts out incomplete. CRDT
+                            // semantics make this idempotent against any
+                            // re-applied mutation post-setup.
+                            if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                                self.apply_cluster_mutations(mutations);
+                            }
+                        }
+                        other => {
+                            tracing::debug!(?other, "unexpected message during setup");
+                        }
                     }
 
                     // Setup-FSM Transferred transition: a `PrimaryChanged
@@ -393,7 +397,8 @@ where
         // Spawn the pool if still `AwaitingPrimary` (idempotent no-op once
         // `Configuring`/`Operational`). The on-demand primary dispatches to
         // these workers via the co-located loopback.
-        self.enter_configuring_on_first_primary_frame(factory).await?;
+        self.enter_configuring_on_first_primary_frame(factory)
+            .await?;
         // Build + start the co-located primary from the setup-seeded CRDT
         // snapshot. Capability-gated + loud inside the builder.
         self.activate_co_located_primary_on_demand();

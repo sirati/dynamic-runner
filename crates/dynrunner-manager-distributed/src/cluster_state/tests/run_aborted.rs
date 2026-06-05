@@ -73,6 +73,8 @@ fn task_failed_invalid_task_transitions_pending_to_invalid() {
                 reason: BoundedString::from("missing dep (phase=p0, task_id=ghost)".to_string()),
             },
             error: "missing dependency".into(),
+
+            version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -97,6 +99,8 @@ fn invalid_task_terminal_locks_out_later_generic_failure() {
             reason: BoundedString::from("missing dep".to_string()),
         },
         error: "missing dependency".into(),
+
+        version: Default::default(),
     });
     // A later generic NonRecoverable TaskFailed is locked out.
     assert_eq!(
@@ -104,6 +108,8 @@ fn invalid_task_terminal_locks_out_later_generic_failure() {
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "upstream-failed".into(),
+
+            version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );

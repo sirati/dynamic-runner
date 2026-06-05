@@ -39,7 +39,9 @@ use dynrunner_scheduler::ResourceStealingScheduler;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary};
+use super::super::test_helpers::{
+    FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary,
+};
 use super::super::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use super::processing::make_binary;
 

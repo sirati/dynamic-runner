@@ -9,9 +9,11 @@
 
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, TaskInfo, WorkerId};
+use dynrunner_core::{ErrorType, TaskInfo, TaskVersion, WorkerId};
 use dynrunner_protocol_primary_secondary::RoleTable;
 use serde::{Deserialize, Serialize};
+
+use crate::task_completed::TaskCompletedEvent;
 
 /// Per-task state in the replicated ledger.
 ///
@@ -28,11 +30,19 @@ use serde::{Deserialize, Serialize};
 pub enum TaskState<I> {
     Pending {
         task: TaskInfo<I>,
+        /// Assignment-lifecycle version (C3). Carried so a reset's
+        /// higher version beats a stale pre-reset `InFlight` within the
+        /// non-terminal band even though `Pending`'s rank is lower.
+        version: TaskVersion,
     },
     InFlight {
         task: TaskInfo<I>,
         secondary: String,
         worker: WorkerId,
+        /// Assignment-lifecycle version (C3). Set from the stamped
+        /// `TaskAssigned` mutation; a genuine post-reset re-assignment
+        /// mints a still-higher version so it beats the reset `Pending`.
+        version: TaskVersion,
     },
     Completed {
         task: TaskInfo<I>,
@@ -41,7 +51,12 @@ pub enum TaskState<I> {
         task: TaskInfo<I>,
         kind: ErrorType,
         last_error: String,
-        attempts: u32,
+        /// Terminal-payload version (D-V / AE-2). Two divergent failure
+        /// records converge on the higher version; an equal-version
+        /// divergence is settled by the payload content hash in the join
+        /// key. Replaces the dropped `attempts` counter (which had no
+        /// authoritative source and no reader).
+        version: TaskVersion,
     },
     /// The task hit `ErrorType::Unfulfillable` — a required cluster
     /// resource (e.g. a toolchain outpath) is not held by any peer.
@@ -61,6 +76,14 @@ pub enum TaskState<I> {
     Unfulfillable {
         task: TaskInfo<I>,
         reason: String,
+        /// The wire `error` message body (TS-4). Stored ALONGSIDE the
+        /// typed `reason` so a restore-path emit's `last_error` is
+        /// byte-identical to the apply-path emit's — the divergent
+        /// `last_error` between the two paths (which split a consumer's
+        /// dedup bucket) is killed at the source.
+        last_error: String,
+        /// Terminal-payload version (D-V / AE-2). See `Failed::version`.
+        version: TaskVersion,
     },
     /// The task is a transitive dependent of a task currently in
     /// `Unfulfillable`. Dormant until the prerequisite (identified by
@@ -101,6 +124,10 @@ pub enum TaskState<I> {
     InvalidTask {
         task: TaskInfo<I>,
         reason: String,
+        /// The wire `error` message body (TS-4). See `Unfulfillable::last_error`.
+        last_error: String,
+        /// Terminal-payload version (D-V / AE-2). See `Failed::version`.
+        version: TaskVersion,
     },
 }
 
@@ -111,7 +138,23 @@ impl<I> TaskState<I> {
     /// deps) do not each re-spell the all-variants match.
     pub(crate) fn task_mut(&mut self) -> &mut TaskInfo<I> {
         match self {
-            TaskState::Pending { task }
+            TaskState::Pending { task, .. }
+            | TaskState::InFlight { task, .. }
+            | TaskState::Completed { task }
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::InvalidTask { task, .. }
+            | TaskState::Blocked { task, .. } => task,
+        }
+    }
+
+    /// Shared (`&self`) borrow of the carried `TaskInfo`, regardless of
+    /// variant. The read-only twin of [`Self::task_mut`] — callers that
+    /// need the `task_id` (e.g. the terminal-event projection) read it
+    /// here without re-spelling the all-variants match.
+    pub(crate) fn task(&self) -> &TaskInfo<I> {
+        match self {
+            TaskState::Pending { task, .. }
             | TaskState::InFlight { task, .. }
             | TaskState::Completed { task }
             | TaskState::Failed { task, .. }
@@ -138,6 +181,151 @@ impl<I> TaskState<I> {
                 | TaskState::InvalidTask { .. }
         )
     }
+
+    /// Project a terminal `TaskState` onto the dispatcher
+    /// [`TaskCompletedEvent`]. The SINGLE event-shape projection both
+    /// emit paths use (apply's monotone arms and restore's merge loop),
+    /// so a success/failure event built from the POST-merge state is
+    /// byte-identical regardless of which path produced it — killing the
+    /// apply-emit-vs-restore-emit `last_error` divergence at the source.
+    ///
+    /// Returns `None` for a non-terminal state (no terminal event to
+    /// emit). The `error_kind` strings mirror [`ErrorType::wire_value`]
+    /// so consumer Policy bucketing (`starts_with("invalid_task:")`,
+    /// `unfulfillable:` dedup) is byte-identical to the apply path.
+    pub(crate) fn to_completed_event(&self, task_hash: &str) -> Option<TaskCompletedEvent> {
+        let task_id = self.task().task_id.clone();
+        match self {
+            TaskState::Completed { .. } => Some(TaskCompletedEvent {
+                task_id,
+                task_hash: task_hash.to_string(),
+                success: true,
+                error_kind: None,
+                last_error: None,
+            }),
+            TaskState::Failed {
+                kind, last_error, ..
+            } => Some(TaskCompletedEvent {
+                task_id,
+                task_hash: task_hash.to_string(),
+                success: false,
+                error_kind: Some(kind.wire_value()),
+                last_error: Some(last_error.clone()),
+            }),
+            TaskState::Unfulfillable {
+                reason, last_error, ..
+            } => Some(TaskCompletedEvent {
+                task_id,
+                task_hash: task_hash.to_string(),
+                success: false,
+                error_kind: Some(format!("unfulfillable:{reason}")),
+                last_error: Some(last_error.clone()),
+            }),
+            TaskState::InvalidTask {
+                reason, last_error, ..
+            } => Some(TaskCompletedEvent {
+                task_id,
+                task_hash: task_hash.to_string(),
+                success: false,
+                error_kind: Some(format!("invalid_task:{reason}")),
+                last_error: Some(last_error.clone()),
+            }),
+            TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => {
+                None
+            }
+        }
+    }
+}
+
+/// Coarse convergence band. The band dominates FIRST in the
+/// [`TaskJoinKey`] ordering, so any terminal beats any non-terminal
+/// regardless of version (C3 req-a: a worker outcome that raced a reset
+/// is never resurrected to an assignment), and `Blocked` sits between
+/// (it carries the cascade-prereq identity and must not be overwritten
+/// by a stale `Pending` observation).
+///
+/// Discriminant values encode the order (`NonTerminal < Blocked <
+/// Terminal`); derived `Ord` follows the discriminants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum JoinBand {
+    NonTerminal = 0,
+    Blocked = 1,
+    Terminal = 2,
+}
+
+/// Within the `Terminal` band: `{Failed, Unfulfillable} < Completed <
+/// InvalidTask` (D-T — InvalidTask is the unique TOP). `FailedLike`
+/// covers `Failed | Unfulfillable`; they tie-break below by a fixed
+/// `failedlike` discriminant then the payload content hash, but only
+/// when both are `FailedLike` at equal version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum TerminalRank {
+    FailedLike = 0,
+    Completed = 1,
+    InvalidTask = 2,
+}
+
+/// Within the `NonTerminal` band, the rank sub-key (`Pending < InFlight`),
+/// consulted ONLY as the last tiebreak at EQUAL version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum NonTerminalRank {
+    Pending = 0,
+    InFlight = 1,
+}
+
+/// Within `TerminalRank::FailedLike` at EQUAL version, a fixed total
+/// order between `Failed` and `Unfulfillable` so two DIFFERENT
+/// non-success terminals converge deterministically. `Unfulfillable` is
+/// the more-specific, reinjectable verdict; `Failed` is the generic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum FailedLikeRank {
+    Failed = 0,
+    Unfulfillable = 1,
+}
+
+/// The ONE canonical per-task convergence key. Replaces BOTH the two
+/// hand-rolled per-state rank fns that previously lived in `snapshot.rs`
+/// and `digest.rs` (the duplicated logic). It is a
+/// TOTAL comparator tuple compared lexicographically: the [`JoinBand`]
+/// dominates first, then — within the non-terminal band — `version`
+/// arbitrates BEFORE rank (C3), and within the terminal band the
+/// [`TerminalRank`] separates the D-T order before `version` and the
+/// payload hash. Constructed by `task_join_key` (logic in `merge.rs`);
+/// the comparison logic lives there too, so apply, restore, and the
+/// digest fold all derive their order from this single key.
+///
+/// The fields are ordered so that `#[derive(Ord)]`'s field-by-field
+/// lexicographic comparison IS the convergence order. For the
+/// non-terminal band the discriminating fields are `(band, version,
+/// nonterminal_rank)`; for terminals `(band, terminal_rank, version,
+/// failedlike, payload_content_hash)`. The unused sub-keys for a given
+/// band are filled with their minimum so they never perturb the order
+/// (a band's own discriminator already separates it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TaskJoinKey {
+    /// Coarse band — dominates first.
+    pub(super) band: JoinBand,
+    /// Terminal ordering (D-T). Minimum (`FailedLike`) for non-terminals
+    /// and `Blocked`, where it is inert (the band already separates them).
+    pub(super) terminal_rank: TerminalRank,
+    /// The version: assignment version for non-terminals; terminal-payload
+    /// version for the three versioned terminals; default `(0,0)` for
+    /// `Completed`/`Blocked` (which carry no version — their band/terminal
+    /// rank already places them). For non-terminals this is compared
+    /// BEFORE `nonterminal_rank`, which is exactly the C3 ordering.
+    pub(super) version: TaskVersion,
+    /// Non-terminal rank (`Pending < InFlight`), the LAST tiebreak within
+    /// the non-terminal band (consulted only at equal version). Minimum
+    /// (`Pending`) for terminals/Blocked where it is inert.
+    pub(super) nonterminal_rank: NonTerminalRank,
+    /// FailedLike tiebreak (`Failed < Unfulfillable`) at equal terminal
+    /// version. Minimum (`Failed`) outside the FailedLike sub-band.
+    pub(super) failedlike: FailedLikeRank,
+    /// Content hash of the terminal payload (`(kind/discriminant,
+    /// error/reason, last_error)`), NON-OPTIONAL for terminals so two
+    /// divergent failure records at equal `(terminal_rank, version)`
+    /// compare/fold differently (C4). `0` for non-terminals.
+    pub(super) payload_content_hash: u64,
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge

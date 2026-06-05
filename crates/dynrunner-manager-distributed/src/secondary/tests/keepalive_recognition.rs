@@ -66,11 +66,17 @@ async fn primary_keepalive_refreshes_primary_last_seen() {
     let stale = Instant::now() - Duration::from_secs(60);
     sec.op_mut().primary_last_seen = Some(stale);
 
-    sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Primary), &mut FakeWorkerFactory)
-        .await;
+    sec.handle_inbound(
+        keepalive("sec-a", KeepaliveRole::Primary),
+        &mut FakeWorkerFactory,
+    )
+    .await;
 
     assert!(
-        sec.op_mut().primary_last_seen.expect("primary_last_seen set") > stale,
+        sec.op_mut()
+            .primary_last_seen
+            .expect("primary_last_seen set")
+            > stale,
         "a Primary keepalive from the current primary must advance primary_last_seen"
     );
     assert!(
@@ -95,8 +101,11 @@ async fn peer_keepalive_does_not_touch_primary_last_seen() {
 
     // sec-c is a regular peer, not the current primary.
     let before = Instant::now();
-    sec.handle_inbound(keepalive("sec-c", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
-        .await;
+    sec.handle_inbound(
+        keepalive("sec-c", KeepaliveRole::Secondary),
+        &mut FakeWorkerFactory,
+    )
+    .await;
 
     // The entry records LOCAL receipt time (a monotonic `Instant`), NOT the
     // wire `timestamp` (1.0). Assert presence + receipt-time freshness.
@@ -138,17 +147,15 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     // a live mesh peer and MUST land in peer_keepalives despite its id
     // being the current primary.
     let before = Instant::now();
-    sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Secondary), &mut FakeWorkerFactory)
-        .await;
-    let recorded = sec
-        .op_mut()
-        .peer_keepalives
-        .get("sec-a")
-        .copied()
-        .expect(
-            "a Secondary keepalive from the primary's host MUST land in peer_keepalives \
+    sec.handle_inbound(
+        keepalive("sec-a", KeepaliveRole::Secondary),
+        &mut FakeWorkerFactory,
+    )
+    .await;
+    let recorded = sec.op_mut().peer_keepalives.get("sec-a").copied().expect(
+        "a Secondary keepalive from the primary's host MUST land in peer_keepalives \
              (multi-role host is a live mesh peer)",
-        );
+    );
     assert!(
         recorded >= before,
         "the peer entry records local receipt time (monotonic Instant), not the wire timestamp"
@@ -161,10 +168,16 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
 
     // Its primary-capability keepalive refreshes primary_last_seen,
     // independently of the peer entry just recorded.
-    sec.handle_inbound(keepalive("sec-a", KeepaliveRole::Primary), &mut FakeWorkerFactory)
-        .await;
+    sec.handle_inbound(
+        keepalive("sec-a", KeepaliveRole::Primary),
+        &mut FakeWorkerFactory,
+    )
+    .await;
     assert!(
-        sec.op_mut().primary_last_seen.expect("primary_last_seen set") > stale,
+        sec.op_mut()
+            .primary_last_seen
+            .expect("primary_last_seen set")
+            > stale,
         "a Primary keepalive from the current primary refreshes primary_last_seen"
     );
     assert!(

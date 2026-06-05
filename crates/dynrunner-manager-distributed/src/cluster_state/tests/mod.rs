@@ -7,7 +7,7 @@
 
 use super::*;
 use dynrunner_core::{
-    ErrorType, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId,
+    ErrorType, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TaskVersion, TypeId,
 };
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, RemovalCause, RoleChangeHookRegistrar, RoleTable,
@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 mod apply_basics;
 mod cascade_and_reinject;
+mod convergence;
 mod digest;
 mod dispatchers;
 mod panik;
@@ -41,6 +42,7 @@ pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
         task_id: name.into(),
         task_depends_on: Vec::new(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }

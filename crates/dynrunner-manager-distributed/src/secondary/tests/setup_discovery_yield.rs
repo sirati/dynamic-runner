@@ -217,7 +217,9 @@ async fn seed_key_mirrors_primary_assignment_key() {
                  path+identifier hash is the drifted recipe the bug shipped",
             );
             assert!(
-                sec.cluster_state.task_state(&bare_path_identifier_hash).is_none(),
+                sec.cluster_state
+                    .task_state(&bare_path_identifier_hash)
+                    .is_none(),
                 "the ledger must NOT carry an entry under the bare \
                  path+identifier key — if it did, the seed used the \
                  drifted recipe and would strand the task",
@@ -283,11 +285,13 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
                     hash: key.clone(),
                     secondary: "sec-promoted".into(),
                     worker: 0u32,
+                    version: Default::default(),
                 });
-                sec.cluster_state.apply(ClusterMutation::<_>::TaskCompleted {
-                    hash: key,
-                    result_data: None,
-                });
+                sec.cluster_state
+                    .apply(ClusterMutation::<_>::TaskCompleted {
+                        hash: key,
+                        result_data: None,
+                    });
             }
 
             // CRDT-authoritative terminal: every task succeeded, none
@@ -302,7 +306,8 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
                  mutation missed the seed entry (divergent hash recipe)",
             );
             assert_eq!(
-                sec.cluster_state.counts().pending, 0,
+                sec.cluster_state.counts().pending,
+                0,
                 "no task may be stranded Pending after every completion \
                  lands; a non-zero count is the 'cluster routing \
                  collapsed' symptom",

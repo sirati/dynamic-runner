@@ -95,6 +95,23 @@ pub struct TaskInfo<I> {
     /// indistinguishable on the wire.
     #[serde(default, skip_serializing_if = "SoftPreferredSecondaries::is_empty")]
     pub preferred_secondaries: SoftPreferredSecondaries,
+    /// Monotone version of the `preferred_secondaries` metadata, stamped
+    /// by the originating primary on each
+    /// `TaskPreferredSecondariesUpdated` mutation. Lives at the
+    /// `TaskInfo` level (not per-`TaskState`-variant) because the
+    /// preferred update mutates `preferred_secondaries` in place on
+    /// EVERY variant (incl. `Completed`/`Pending`) under a fixed ledger
+    /// key — the enclosing variant's assignment/terminal version would
+    /// be the wrong home (a preferred-update on a `Completed` task must
+    /// not be incoherent). Two concurrent preferred-updates converge on
+    /// the higher `preferred_version`. NOT folded into
+    /// `compute_task_hash` (the hash recipe is `{phase_id, path,
+    /// identifier}`), so a preferred update never changes the ledger
+    /// key. `#[serde(default)]` keeps the wire backward-compatible with
+    /// peers that predate the field (missing field decodes as the
+    /// `(0, 0)` strict minimum).
+    #[serde(default)]
+    pub preferred_version: super::version::TaskVersion,
     /// Local-only on-disk location, set by the secondary after
     /// resolving `path` through its extraction cache / pre-staged
     /// shared mount. `None` means "the worker should open `path`

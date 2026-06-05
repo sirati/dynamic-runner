@@ -42,7 +42,7 @@
 
 use std::collections::HashSet;
 
-use dynrunner_core::{Identifier, IMPORTANT_TARGET, PhaseId};
+use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId};
 
 use crate::ClusterState;
 
@@ -89,10 +89,7 @@ impl RunNarrator {
         // counts as COMPLETE once it owns ≥1 task and has no live task
         // left (every task reached a terminal state).
         for (phase, rollup) in state.phase_rollups() {
-            if rollup.has_any
-                && rollup.dispatchable
-                && self.started_phases.insert(phase.clone())
-            {
+            if rollup.has_any && rollup.dispatchable && self.started_phases.insert(phase.clone()) {
                 // REUSE of the exact phrase the primary emits at
                 // `fire_initial_phase_starts` (coordinator.rs) so the
                 // operator reads ONE consistent line pre- and
@@ -193,6 +190,7 @@ mod tests {
                 })
                 .collect(),
             preferred_secondaries: Default::default(),
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }
@@ -245,7 +243,10 @@ mod tests {
             1,
             "exactly one starting-job-phase line for the one dispatchable phase: {events:?}"
         );
-        assert_eq!(starts[0].fields.get("phase").map(String::as_str), Some("compile"));
+        assert_eq!(
+            starts[0].fields.get("phase").map(String::as_str),
+            Some("compile")
+        );
     }
 
     /// A phase gated on an upstream phase does NOT emit "starting job
@@ -312,7 +313,10 @@ mod tests {
             1,
             "exactly one phase-complete line, only after both tasks terminal: {events:?}"
         );
-        assert_eq!(done[0].fields.get("phase").map(String::as_str), Some("compile"));
+        assert_eq!(
+            done[0].fields.get("phase").map(String::as_str),
+            Some("compile")
+        );
     }
 
     /// The run-complete summary fires exactly once with the correct
@@ -331,6 +335,8 @@ mod tests {
                 hash: "bad".to_string(),
                 kind: ErrorType::NonRecoverable,
                 error: "boom".into(),
+
+                version: Default::default(),
             });
             state.apply(ClusterMutation::RunComplete);
 
@@ -390,7 +396,10 @@ mod tests {
             1,
             "exactly one run-aborted summary: {events:?}"
         );
-        assert_eq!(aborted[0].fields.get("succeeded").map(String::as_str), Some("1"));
+        assert_eq!(
+            aborted[0].fields.get("succeeded").map(String::as_str),
+            Some("1")
+        );
         assert!(
             events.iter().all(|e| !e.message.contains("run complete")),
             "an aborted run must NOT narrate as completed: {events:?}"

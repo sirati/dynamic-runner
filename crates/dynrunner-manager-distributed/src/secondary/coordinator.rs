@@ -175,9 +175,7 @@ where
     /// sends — touch only `cluster_state` / `transport` / config, never
     /// this state.)
     #[track_caller]
-    pub(in crate::secondary) fn op_mut(
-        &mut self,
-    ) -> &mut super::lifecycle::OperationalState<M, I> {
+    pub(in crate::secondary) fn op_mut(&mut self) -> &mut super::lifecycle::OperationalState<M, I> {
         self.lifecycle.operational_mut().expect(
             "operational handler reached before the lifecycle entered Operational — \
              type-invariant violation (worker dispatch / election / keepalive are \
@@ -189,9 +187,7 @@ where
     /// `Operational`. `None` in every pre-`Operational` / terminal state.
     /// Used by the read-only paths that may run before the loop is fully
     /// operational (e.g. the mesh watchdog's keepalive-active count).
-    pub(in crate::secondary) fn op_ref(
-        &self,
-    ) -> Option<&super::lifecycle::OperationalState<M, I>> {
+    pub(in crate::secondary) fn op_ref(&self) -> Option<&super::lifecycle::OperationalState<M, I>> {
         self.lifecycle.operational_ref()
     }
 
@@ -850,10 +846,7 @@ where
         &mut self,
         transition: impl FnOnce(SecondaryLifecycle<M, I>) -> SecondaryLifecycle<M, I>,
     ) {
-        let lifecycle = std::mem::replace(
-            &mut self.lifecycle,
-            SecondaryLifecycle::connecting(),
-        );
+        let lifecycle = std::mem::replace(&mut self.lifecycle, SecondaryLifecycle::connecting());
         self.lifecycle = transition(lifecycle);
     }
 
@@ -1170,11 +1163,8 @@ where
         // this state — only the setup handshake below. Idempotent: a no-op
         // from any state other than `Connecting` (a `SetupPending`
         // re-entry is already `Operational`, so this leaves it unchanged).
-        self.lifecycle = std::mem::replace(
-            &mut self.lifecycle,
-            SecondaryLifecycle::connecting(),
-        )
-        .enter_awaiting_primary();
+        self.lifecycle = std::mem::replace(&mut self.lifecycle, SecondaryLifecycle::connecting())
+            .enter_awaiting_primary();
 
         // Skip the per-secondary setup phase once the lifecycle has
         // reached `Operational` (or terminal) — the `setup_phase_completed`

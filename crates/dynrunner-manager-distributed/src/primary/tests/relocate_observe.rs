@@ -26,7 +26,12 @@ use crate::primary::wire::compute_task_hash;
 fn coordinator_with_confirmed_peers(
     confirmed_peers: u32,
 ) -> (
-    PrimaryCoordinator<ChannelPeerTransport<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryCoordinator<
+        ChannelPeerTransport<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
     Vec<(
         String,
         tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -63,7 +68,12 @@ fn observer_with_short_timeouts(
     confirmed_peers: u32,
     peer_timeout: std::time::Duration,
 ) -> (
-    PrimaryCoordinator<ChannelPeerTransport<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryCoordinator<
+        ChannelPeerTransport<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
     Vec<(
         String,
         tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -349,6 +359,8 @@ async fn relinquished_result_getters_read_replicated_ledger() {
                     hash: compute_task_hash(&bad),
                     kind: ErrorType::NonRecoverable,
                     error: "boom".into(),
+
+                    version: Default::default(),
                 });
 
             // The getters the PyO3 boundary reads (run.rs:497-498) route
@@ -388,10 +400,8 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
                 // One resident peer → peer_count() == 1 (NOT zero): the
                 // dead-fleet grace can NEVER arm. peer_timeout is short so
                 // the silence backstop fires fast.
-                let (mut coordinator, _ends) = observer_with_short_timeouts(
-                    1,
-                    std::time::Duration::from_millis(80),
-                );
+                let (mut coordinator, _ends) =
+                    observer_with_short_timeouts(1, std::time::Duration::from_millis(80));
                 assert!(
                     coordinator.transport_mut_for_test().peer_count() > 0,
                     "fixture precondition: the dead primary's connection stays \
@@ -481,10 +491,7 @@ async fn run_as_observer_narrates_phases_and_one_completion_summary() {
             {
                 let cs = coordinator.cluster_state_mut_for_test();
                 cs.apply(ClusterMutation::PhaseDepsSet {
-                    deps: HashMap::from([(
-                        PhaseId::from("compile"),
-                        vec![PhaseId::from("build")],
-                    )]),
+                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
                 });
                 for b in [&toolchain, &ok, &bad] {
                     cs.apply(ClusterMutation::TaskAdded {
@@ -502,6 +509,8 @@ async fn run_as_observer_narrates_phases_and_one_completion_summary() {
                     hash: compute_task_hash(&bad),
                     kind: ErrorType::NonRecoverable,
                     error: "boom".into(),
+
+                    version: Default::default(),
                 });
                 // The authoritative primary declared the run over.
                 cs.apply(ClusterMutation::RunComplete);

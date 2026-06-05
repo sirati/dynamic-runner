@@ -323,7 +323,11 @@ async fn e2e_no_capable_peer_submitter_stays_primary() {
                 Some("primary"),
                 "with no hand-off target the submitter must stay current_primary"
             );
-            assert_eq!(submitter.completed_count(), NUM_TASKS, "all tasks must complete");
+            assert_eq!(
+                submitter.completed_count(),
+                NUM_TASKS,
+                "all tasks must complete"
+            );
             assert_eq!(submitter.failed_count(), 0, "no task may fail");
 
             drop(submitter);
@@ -503,7 +507,8 @@ async fn initial_setup_done_emitted_once_across_relocation() {
                 .filter(|m| m.contains("initial setup done"))
                 .count();
             assert_eq!(
-                setup_done_count, 1,
+                setup_done_count,
+                1,
                 "'initial setup done' must be emitted EXACTLY ONCE across a relocating \
                  run — the submitter emits it before hand-off; the relocated primary's \
                  `run_activated_pipeline` must not re-emit; got {:?}",

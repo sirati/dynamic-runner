@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, TaskInfo, WorkerId};
+use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, TaskInfo, TaskVersion, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use crate::removal_cause::RemovalCause;
@@ -70,6 +70,13 @@ pub enum ClusterMutation<I> {
         hash: String,
         secondary: String,
         worker: WorkerId,
+        /// Primary-stamped assignment-lifecycle version (D-V). Stamped at
+        /// the origination choke point; the receiver writes it onto the
+        /// resulting `InFlight` state so a stale (pre-reset) assignment
+        /// loses to a higher-version requeue/reinject reset. Defaults to
+        /// the `(0, 0)` strict minimum for a legacy sender.
+        #[serde(default)]
+        version: TaskVersion,
     },
     TaskCompleted {
         hash: String,
@@ -80,6 +87,12 @@ pub enum ClusterMutation<I> {
         hash: String,
         kind: ErrorType,
         error: String,
+        /// Primary-stamped terminal-payload version (D-V). Stamped at the
+        /// origination choke point; lets two divergent failure records
+        /// converge on the higher version (and the per-task content hash
+        /// settles an equal-version divergence). Defaults to `(0, 0)`.
+        #[serde(default)]
+        version: TaskVersion,
     },
     PrimaryChanged {
         new: String,
@@ -161,6 +174,13 @@ pub enum ClusterMutation<I> {
     /// state and is reset on transition to Pending.
     TaskReinjected {
         hash: String,
+        /// Primary-stamped reset version (D-V / C3). A reinject is an
+        /// authoritative rank-DROP (`Unfulfillable → Pending`); the
+        /// stamped version is written onto the resulting `Pending` so it
+        /// strictly supersedes the pre-reset state and a late stale
+        /// assignment cannot resurrect. Defaults to `(0, 0)`.
+        #[serde(default)]
+        version: TaskVersion,
     },
     /// Dead-secondary recovery requeue: the secondary that held
     /// `hash` in `TaskState::InFlight { secondary, .. }` died, so the
@@ -193,6 +213,14 @@ pub enum ClusterMutation<I> {
     /// task re-dispatches the same binary.
     TaskRequeued {
         hash: String,
+        /// Primary-stamped reset version (D-V / C3). A requeue is an
+        /// authoritative rank-DROP (`InFlight → Pending`); the stamped
+        /// version is written onto the resulting `Pending` so it strictly
+        /// supersedes the pre-reset `InFlight` and a redelivered stale
+        /// `TaskAssigned` cannot resurrect the dead-secondary assignment.
+        /// Defaults to `(0, 0)`.
+        #[serde(default)]
+        version: TaskVersion,
     },
     /// A cascade-paused dependent: `hash`'s prerequisite (identified
     /// by `on`, the prereq's task hash) just transitioned to
@@ -231,6 +259,13 @@ pub enum ClusterMutation<I> {
     TaskPreferredSecondariesUpdated {
         hash: String,
         secondaries: Vec<String>,
+        /// Primary-stamped preferred-metadata version (D-V / R4). Stamped
+        /// at the origination choke point and written onto the task's
+        /// `TaskInfo.preferred_version`; two concurrent preferred updates
+        /// converge on the higher version regardless of the task's state.
+        /// Defaults to `(0, 0)`.
+        #[serde(default)]
+        version: TaskVersion,
     },
     /// A peer has joined the cluster. The apply rule maintains the
     /// replicated `peer_state` map on `ClusterState` and the legacy

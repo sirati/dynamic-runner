@@ -160,6 +160,8 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
                 reason: "missing upstream".to_string().into(),
             },
             error: "invalid_task:missing upstream".into(),
+
+            version: Default::default(),
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "dep-a".into(),
@@ -228,6 +230,8 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
             hash: "inflight-1".into(),
             secondary: "secondary-0".into(),
             worker: 0,
+
+            version: Default::default(),
         });
     }
 
@@ -311,6 +315,8 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                     hash: "inflight-1".into(),
                     secondary: "secondary-0".into(),
                     worker: 0,
+
+                    version: Default::default(),
                 });
             }
             primary.hydrate_from_cluster_state();
@@ -626,6 +632,8 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 1,
+
+                    version: Default::default(),
                 });
             }
 
@@ -733,6 +741,8 @@ async fn promotion_resume_reconstructs_roster_without_redispatch() {
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 0,
+
+                    version: Default::default(),
                 });
             }
             assert_eq!(primary.total_tasks, 0, "parked primary counts no tasks yet");
@@ -789,7 +799,7 @@ fn drain_requeued(
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
             for m in mutations {
-                if let ClusterMutation::TaskRequeued { hash } = m {
+                if let ClusterMutation::TaskRequeued { hash, .. } = m {
                     out.push(hash);
                 }
             }
@@ -864,6 +874,8 @@ async fn promoted_primary_detects_dead_secondary_and_requeues_inherited_inflight
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 0,
+
+                    version: Default::default(),
                 });
             }
             assert_eq!(primary.total_tasks, 0, "parked primary counts no tasks yet");
@@ -969,6 +981,8 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                         hash: hash.clone(),
                         secondary: "sec-dead".into(),
                         worker: 0,
+
+                        version: Default::default(),
                     });
                 }
                 // Hydrate the live primary so its in-flight ledger holds

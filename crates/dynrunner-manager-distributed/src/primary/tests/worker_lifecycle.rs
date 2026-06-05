@@ -517,7 +517,7 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
             assert!(
                 matches!(
                     recovered.first(),
-                    Some(ClusterMutation::TaskRequeued { hash }) if hash == &dead_hash
+                    Some(ClusterMutation::TaskRequeued { hash, .. }) if hash == &dead_hash
                 ),
                 "recovery emits a TaskRequeued for the dead secondary's in-flight hash"
             );

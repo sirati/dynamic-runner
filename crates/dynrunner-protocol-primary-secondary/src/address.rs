@@ -359,12 +359,7 @@ mod tests {
             Some(SendTarget::Loopback)
         );
         assert_eq!(
-            resolve_destination(
-                Destination::Secondary(PeerId::from("me")),
-                None,
-                None,
-                "me"
-            ),
+            resolve_destination(Destination::Secondary(PeerId::from("me")), None, None, "me"),
             Some(SendTarget::Loopback)
         );
     }

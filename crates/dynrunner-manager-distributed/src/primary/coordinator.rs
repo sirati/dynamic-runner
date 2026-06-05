@@ -993,9 +993,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // (`current_primary()` is a remote peer) still relays, and
             // that resolves to `SendTarget::Peer`, never here.
             SendTarget::Loopback => match &self.colocated_loopback_tx {
-                Some(tx) => tx.send(msg).map_err(|_| {
-                    "co-located secondary inbound loopback closed".to_string()
-                }),
+                Some(tx) => tx
+                    .send(msg)
+                    .map_err(|_| "co-located secondary inbound loopback closed".to_string()),
                 None => {
                     tracing::debug!(
                         "Destination resolved to self with no co-located secondary \
@@ -1741,7 +1741,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             if let Some(entry) = self.in_flight.remove(&hash) {
                 self.release_type_slot(&entry.task.type_id);
                 self.pool_mut().requeue(entry.task);
-                requeue_mutations.push(ClusterMutation::TaskRequeued { hash });
+                requeue_mutations.push(ClusterMutation::TaskRequeued {
+                    hash,
+                    // Stamped at the origination choke point (apply_locally_for_broadcast).
+                    version: Default::default(),
+                });
             }
         }
         requeue_mutations
@@ -1804,11 +1808,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         self.silent_secondary_ids()
             .into_iter()
             .map(|id| {
-                let last_keepalive = self
-                    .secondary_keepalives
-                    .get(&id)
-                    .copied()
-                    .unwrap_or(now);
+                let last_keepalive = self.secondary_keepalives.get(&id).copied().unwrap_or(now);
                 super::heartbeat::DeadSecondary {
                     secondary_id: id,
                     last_keepalive,
@@ -2691,8 +2691,12 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 self.run_operational_and_finalize(total).await
             }
             Some(chosen) => match self.relocate_primary_to(chosen).await? {
-                RelocationOutcome::Relocated => self.run_as_observer().await.map_err(RunError::from),
-                RelocationOutcome::FellBackToLocal => self.run_operational_and_finalize(total).await,
+                RelocationOutcome::Relocated => {
+                    self.run_as_observer().await.map_err(RunError::from)
+                }
+                RelocationOutcome::FellBackToLocal => {
+                    self.run_operational_and_finalize(total).await
+                }
             },
         }
     }

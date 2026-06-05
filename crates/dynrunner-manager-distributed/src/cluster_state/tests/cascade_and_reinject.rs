@@ -20,10 +20,16 @@ fn task_preferred_secondaries_updated_apply_writes_to_task() {
         s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
             hash: "h".into(),
             secondaries: vec!["secondary-2".into(), "secondary-5".into()],
+            // Strictly above the task's initial preferred_version (0,0)
+            // so the update wins (the choke point stamps this in prod).
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 0,
+            },
         }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Pending { task }) = s.task_state("h") else {
+    let Some(TaskState::Pending { task, .. }) = s.task_state("h") else {
         panic!("expected Pending");
     };
     assert_eq!(
@@ -39,6 +45,10 @@ fn task_preferred_secondaries_updated_apply_unknown_hash_is_noop() {
         s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
             hash: "nope".into(),
             secondaries: vec!["secondary-1".into()],
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 0,
+            },
         }),
         ApplyOutcome::NoOp
     );
@@ -57,15 +67,20 @@ fn task_preferred_secondaries_updated_apply_preserves_state() {
             reason: "missing".to_string().into(),
         },
         error: "missing".into(),
+        version: Default::default(),
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
             hash: "h".into(),
             secondaries: vec!["secondary-7".into()],
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 0,
+            },
         }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Unfulfillable { task, reason }) = s.task_state("h") else {
+    let Some(TaskState::Unfulfillable { task, reason, .. }) = s.task_state("h") else {
         panic!("state must stay Unfulfillable across preferred-secondaries update");
     };
     assert_eq!(reason, "missing");
@@ -93,6 +108,7 @@ fn task_failed_with_unfulfillable_lands_in_unfulfillable_variant() {
                 reason: "missing toolchain xyz".to_string().into(),
             },
             error: "unfulfillable".into(),
+            version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -120,6 +136,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
         hash: "h".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
+        version: Default::default(),
     });
     assert!(matches!(
         s.task_state("h"),
@@ -139,6 +156,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
         hash: "h2".into(),
         kind: ErrorType::Recoverable,
         error: "transient".into(),
+        version: Default::default(),
     });
     assert!(matches!(
         s2.task_state("h2"),
@@ -168,6 +186,7 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
             reason: "missing".to_string().into(),
         },
         error: "missing".into(),
+        version: Default::default(),
     });
     // Dependent enters Blocked-on-prereq via cascade broadcast.
     s.apply(ClusterMutation::TaskAdded {
@@ -218,6 +237,7 @@ fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
             reason: "missing dep".to_string().into(),
         },
         error: "missing dependency".into(),
+        version: Default::default(),
     });
     assert_eq!(s.counts().invalid_task, 1);
 
@@ -276,9 +296,11 @@ fn task_completed_auto_resumes_blocked_dependents() {
             reason: "missing".to_string().into(),
         },
         error: "missing".into(),
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskReinjected {
         hash: "prereq".into(),
+        version: Default::default(),
     });
     // Two dependents Blocked-on-prereq.
     for h in ["d1", "d2"] {
@@ -342,9 +364,13 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
             reason: "missing".to_string().into(),
         },
         error: "missing".into(),
+        version: Default::default(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskReinjected { hash: "u".into() }),
+        s.apply(ClusterMutation::TaskReinjected {
+            hash: "u".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::Applied
     );
     assert!(matches!(s.task_state("u"), Some(TaskState::Pending { .. })));
@@ -359,9 +385,13 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
+        version: Default::default(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskReinjected { hash: "f".into() }),
+        s.apply(ClusterMutation::TaskReinjected {
+            hash: "f".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::NoOp
     );
     assert!(matches!(s.task_state("f"), Some(TaskState::Failed { .. })));
@@ -385,16 +415,20 @@ fn task_requeued_transitions_in_flight_back_to_pending() {
         hash: "h".into(),
         secondary: "dead-sec".into(),
         worker: 0,
+        version: Default::default(),
     });
     assert!(matches!(
         s.task_state("h"),
         Some(TaskState::InFlight { .. })
     ));
     assert_eq!(
-        s.apply(ClusterMutation::TaskRequeued { hash: "h".into() }),
+        s.apply(ClusterMutation::TaskRequeued {
+            hash: "h".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::Applied
     );
-    let Some(TaskState::Pending { task }) = s.task_state("h") else {
+    let Some(TaskState::Pending { task, .. }) = s.task_state("h") else {
         panic!("InFlight must requeue to Pending");
     };
     assert_eq!(
@@ -415,7 +449,8 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     assert_eq!(
         s.apply(ClusterMutation::TaskRequeued {
-            hash: "nope".into()
+            hash: "nope".into(),
+            version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -425,7 +460,10 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
         task: mk_task("p"),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskRequeued { hash: "p".into() }),
+        s.apply(ClusterMutation::TaskRequeued {
+            hash: "p".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::NoOp
     );
     assert!(matches!(s.task_state("p"), Some(TaskState::Pending { .. })));
@@ -438,13 +476,17 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
         hash: "c".into(),
         secondary: "dead-sec".into(),
         worker: 0,
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskCompleted {
         hash: "c".into(),
         result_data: None,
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskRequeued { hash: "c".into() }),
+        s.apply(ClusterMutation::TaskRequeued {
+            hash: "c".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::NoOp,
         "a completion that raced the death observation must win"
     );
@@ -463,9 +505,13 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
             reason: "dup".to_string().into(),
         },
         error: "invalid_task:dup".into(),
+        version: Default::default(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskRequeued { hash: "i".into() }),
+        s.apply(ClusterMutation::TaskRequeued {
+            hash: "i".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::NoOp
     );
     assert!(matches!(
@@ -495,6 +541,7 @@ fn task_failed_with_invalid_task_lands_in_invalid_task_variant() {
                 reason: "missing dep nope".to_string().into(),
             },
             error: "invalid_task:missing dep nope".into(),
+            version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -524,9 +571,13 @@ fn reinject_against_invalid_task_is_noop_non_reinjectable() {
             reason: "dup id".to_string().into(),
         },
         error: "invalid_task:dup id".into(),
+        version: Default::default(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskReinjected { hash: "h".into() }),
+        s.apply(ClusterMutation::TaskReinjected {
+            hash: "h".into(),
+            version: Default::default()
+        }),
         ApplyOutcome::NoOp,
         "InvalidTask is non-reinjectable; ReinjectTask must NoOp"
     );
@@ -552,6 +603,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
             reason: "missing dep".to_string().into(),
         },
         error: "invalid_task:missing dep".into(),
+        version: Default::default(),
     });
     // A late generic worker-originated TaskFailed must NoOp.
     assert_eq!(
@@ -559,6 +611,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "panic".into(),
+            version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );

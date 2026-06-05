@@ -89,6 +89,7 @@ mod tests {
             task_id: name.into(),
             task_depends_on: deps,
             preferred_secondaries: SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }

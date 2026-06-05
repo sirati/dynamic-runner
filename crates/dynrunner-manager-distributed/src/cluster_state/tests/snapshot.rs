@@ -24,6 +24,8 @@ fn snapshot_round_trip_preserves_state() {
         hash: "i".into(),
         secondary: "s1".into(),
         worker: 7,
+
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "c".into(),
@@ -82,6 +84,8 @@ fn snapshot_round_trip_preserves_invalid_task() {
             reason: "duplicate (phase,task_id)".to_string().into(),
         },
         error: "invalid_task:duplicate (phase,task_id)".into(),
+
+        version: Default::default(),
     });
 
     let snap = s.snapshot();
@@ -200,6 +204,8 @@ fn restore_lattice_merge_preserves_local_terminal() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
+
+        version: Default::default(),
     });
 
     joiner.restore(peer.snapshot());
@@ -228,6 +234,8 @@ fn restore_lattice_merge_promotes_pending_to_in_flight() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 4,
+
+        version: Default::default(),
     });
 
     joiner.restore(peer.snapshot());
@@ -303,6 +311,8 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
             reason: "missing dep".to_string().into(),
         },
         error: "missing".into(),
+
+        version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
         hash: "b".into(),
@@ -367,7 +377,7 @@ fn restore_migrates_unphased_deps_to_enclosing_phase() {
     joiner.restore(snap);
 
     let restored = match joiner.task_state("h") {
-        Some(TaskState::Pending { task }) => task,
+        Some(TaskState::Pending { task, .. }) => task,
         other => panic!("expected Pending, got {other:?}"),
     };
     let deps = &restored.task_depends_on;
@@ -466,7 +476,10 @@ fn consumer_invariants_survive_snapshot_restore() {
         1,
         "honest remote-secondary count post-restore (false-zero is the bug)"
     );
-    assert!(relocated.run_complete(), "run_complete must survive restore");
+    assert!(
+        relocated.run_complete(),
+        "run_complete must survive restore"
+    );
     assert_eq!(
         relocated.run_aborted(),
         Some("abort-reason"),

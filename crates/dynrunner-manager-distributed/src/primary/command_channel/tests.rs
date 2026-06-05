@@ -262,6 +262,8 @@ async fn reinject_task_budget_exhaustion() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
+
+                    version: Default::default(),
                 });
             // Pool init: reinject requires the phase to exist.
             let mut phase_set = std::collections::HashSet::new();
@@ -298,6 +300,8 @@ async fn reinject_task_budget_exhaustion() {
                         reason: "still missing".to_string().into(),
                     },
                     error: "unfulfillable again".into(),
+
+                    version: Default::default(),
                 });
             let (reply_tx2, reply_rx2) = oneshot::channel();
             super::handle_primary_command(
@@ -808,7 +812,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
 
             // CRDT mirror updated.
             let crdt_task = match coordinator.cluster_state.task_state(&hash) {
-                Some(TaskState::Pending { task }) => task.clone(),
+                Some(TaskState::Pending { task, .. }) => task.clone(),
                 other => panic!("expected Pending, got {other:?}"),
             };
             let expected: Vec<&str> = vec!["sec-a", "sec-b"];
@@ -1072,6 +1076,8 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
+
+                    version: Default::default(),
                 });
             seed_pool(&mut coordinator, &[&b.phase_id]);
 
@@ -1512,10 +1518,7 @@ async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
                 "the invalid-dep task must NOT land in the ledger"
             );
             assert!(
-                !coordinator
-                    .pool()
-                    .iter()
-                    .any(|t| t.task_id == "child"),
+                !coordinator.pool().iter().any(|t| t.task_id == "child"),
                 "the invalid-dep task must NOT be in the pool"
             );
         })

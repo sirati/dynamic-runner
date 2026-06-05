@@ -33,8 +33,12 @@ async fn primary_dies_lowest_id_promotes() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-a"));
     sec.enter_operational_for_test();
-    sec.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
-    sec.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
     // Post-uniform-announce a secondary always knows the primary's
     // identity before it can suspect that primary's death; the
     // Suspecting `TimeoutQuery` names it. Install it via the real apply
@@ -50,7 +54,10 @@ async fn primary_dies_lowest_id_promotes() {
 
     // First tick: enter Suspecting and broadcast TimeoutQuery.
     let actions = sec.run_election_tick();
-    assert!(matches!(sec.op_mut().election, ElectionState::Suspecting { .. }));
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
     assert!(
         actions
             .broadcast
@@ -68,7 +75,10 @@ async fn primary_dies_lowest_id_promotes() {
     // Second tick: tally quorum, transition Suspecting → Candidate
     // (sec-a is the lowest id), and broadcast PromotionVote.
     let actions = sec.run_election_tick();
-    assert!(matches!(sec.op_mut().election, ElectionState::Candidate { .. }));
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Candidate { .. }
+    ));
     assert!(
         actions
             .broadcast
@@ -90,9 +100,15 @@ async fn primary_dies_lowest_id_promotes() {
 async fn double_failure_election_still_succeeds() {
     let mut sec = make_secondary(election_config("sec-a"));
     sec.enter_operational_for_test();
-    sec.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
-    sec.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
-    sec.op_mut().peer_keepalives.insert("sec-d".into(), std::time::Instant::now()); // will not respond
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-d".into(), std::time::Instant::now()); // will not respond
     sec.record_primary_message();
 
     tokio::time::sleep(PAST_DEATH).await;
@@ -352,14 +368,26 @@ async fn primary_changed_applies_with_epoch_lww() {
 async fn split_brain_lowest_id_wins() {
     let mut sec_a = make_secondary(election_config("sec-a"));
     sec_a.enter_operational_for_test();
-    sec_a.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
-    sec_a.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec_a
+        .op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec_a
+        .op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
     sec_a.record_primary_message();
 
     let mut sec_b = make_secondary(election_config("sec-b"));
     sec_b.enter_operational_for_test();
-    sec_b.op_mut().peer_keepalives.insert("sec-a".into(), std::time::Instant::now());
-    sec_b.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec_b
+        .op_mut()
+        .peer_keepalives
+        .insert("sec-a".into(), std::time::Instant::now());
+    sec_b
+        .op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
     sec_b.record_primary_message();
 
     tokio::time::sleep(PAST_DEATH).await;
@@ -426,7 +454,9 @@ async fn observer_election_tick_is_a_no_op_even_when_lowest_id() {
     // obs-a is lex-lowest in the alive set (obs-a < sec-b). Under
     // the OLD model this would drive an election; under the
     // pure-observer model it originates nothing.
-    sec.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
     sec.record_primary_message();
 
     // Primary goes silent — a worker secondary would suspect here.
@@ -472,8 +502,12 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
 
     // Drive sec-a into Candidate(round=1) so the confirm tally has a
     // matching round to credit.
-    sec.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
-    sec.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
     sec.record_primary_message();
     tokio::time::sleep(PAST_DEATH).await;
     sec.run_election_tick(); // → Suspecting
@@ -481,7 +515,10 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     sec.record_timeout_response("sec-b".into(), None);
     sec.record_timeout_response("sec-c".into(), None);
     sec.run_election_tick(); // → Candidate { round: 1 }
-    assert!(matches!(sec.op_mut().election, ElectionState::Candidate { .. }));
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Candidate { .. }
+    ));
 
     // One peer confirms — self + sec-b = quorum (2). The terminal
     // action mirrors the message-handler arm: on `true`, fire.
@@ -522,8 +559,7 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
         }
         _ => None,
     });
-    let (new_primary, epoch) =
-        change.expect("a PrimaryChanged must be broadcast on promotion");
+    let (new_primary, epoch) = change.expect("a PrimaryChanged must be broadcast on promotion");
     assert_eq!(new_primary, "sec-a", "must name self as new primary");
     assert!(
         epoch >= 1,
@@ -543,12 +579,13 @@ async fn activation_is_fire_once() {
     let build_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
     // Mark the node capable + register a counting activator (the standard
     // arming probe records a bool; here we need a count to prove fire-once).
-    sec.cluster_state
-        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
+    sec.cluster_state.apply(
+        dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
             peer_id: "sec-a".into(),
             is_observer: false,
             can_be_primary: true,
-        });
+        },
+    );
     {
         let bc = build_count.clone();
         sec.register_primary_activator(Box::new(move |_snap| {
@@ -628,7 +665,10 @@ async fn wake_frame_peer_named_does_not_build() {
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
 
-    assert!(changed, "a peer-named PrimaryChanged still advances the identity");
+    assert!(
+        changed,
+        "a peer-named PrimaryChanged still advances the identity"
+    );
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-b"));
     assert!(
         !activated.get(),
@@ -646,12 +686,11 @@ async fn wake_frame_double_apply_is_fire_once() {
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
     sec.enter_operational_for_test();
     let build_count = std::rc::Rc::new(std::cell::Cell::new(0u32));
-    sec.cluster_state
-        .apply(ClusterMutation::PeerJoined {
-            peer_id: "sec-a".into(),
-            is_observer: false,
-            can_be_primary: true,
-        });
+    sec.cluster_state.apply(ClusterMutation::PeerJoined {
+        peer_id: "sec-a".into(),
+        is_observer: false,
+        can_be_primary: true,
+    });
     {
         let bc = build_count.clone();
         sec.register_primary_activator(Box::new(move |_snap| {
@@ -713,7 +752,10 @@ async fn wake_frame_self_observer_is_rejected() {
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     }]);
 
-    assert!(!changed, "naming an observer is rejected — no genuine advance");
+    assert!(
+        !changed,
+        "naming an observer is rejected — no genuine advance"
+    );
     assert!(
         sec.cluster_state.current_primary().is_none(),
         "an observer must NOT be installed as current primary",
@@ -846,7 +888,10 @@ async fn transferred_during_setup_latches_then_builds_on_demand() {
         epoch: 1,
         reason: PrimaryChangeReason::Transferred,
     }]);
-    assert!(changed, "a genuine Transferred self-naming advances the identity");
+    assert!(
+        changed,
+        "a genuine Transferred self-naming advances the identity"
+    );
     assert!(
         sec.pending_transfer_activation,
         "Transferred-while-in-setup must latch pending_transfer_activation",
@@ -933,7 +978,9 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     sec.enter_operational_for_test();
     // A surviving mesh peer so the election path is non-degraded and
     // can actually broadcast `TimeoutQuery` when the primary dies.
-    sec.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
 
     // A peer (sec-a) is promoted to primary via the real apply path.
     let promote = DistributedMessage::ClusterMutation {
@@ -1095,7 +1142,9 @@ async fn check_peer_timeouts_keys_on_receipt_not_wire_timestamp() {
     // A genuinely-dead peer (sec-z): backdate its receipt `Instant` past
     // the peer_timeout. This is real death — it MUST still be pruned.
     let dead_receipt = Instant::now() - Duration::from_secs(200);
-    sec.op_mut().peer_keepalives.insert("sec-z".into(), dead_receipt);
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-z".into(), dead_receipt);
 
     sec.check_peer_timeouts();
 
@@ -1137,8 +1186,12 @@ async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
     let mut sec = make_secondary(election_config("sec-a"));
     sec.enter_operational_for_test();
     // Two peers so peer_count = 2 → quorum = 2 (self + one agreeing peer).
-    sec.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
-    sec.op_mut().peer_keepalives.insert("sec-c".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-c".into(), std::time::Instant::now());
     sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
         new: "primary-orig".into(),
         epoch: 1,
@@ -1148,7 +1201,10 @@ async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
 
     tokio::time::sleep(PAST_DEATH).await;
     sec.run_election_tick(); // → Suspecting, broadcast TimeoutQuery
-    assert!(matches!(sec.op_mut().election, ElectionState::Suspecting { .. }));
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
     tokio::time::sleep(ONE_INTERVAL).await;
 
     // sec-b STILL sees the primary alive: it reports a tiny staleness age
@@ -1173,7 +1229,9 @@ async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
     // quorum. Re-arm a clean Suspecting with ONLY a fresh-age responder.
     let mut sec2 = make_secondary(election_config("sec-a"));
     sec2.enter_operational_for_test();
-    sec2.op_mut().peer_keepalives.insert("sec-b".into(), std::time::Instant::now());
+    sec2.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
     sec2.cluster_state.apply(ClusterMutation::PrimaryChanged {
         new: "primary-orig".into(),
         epoch: 1,
