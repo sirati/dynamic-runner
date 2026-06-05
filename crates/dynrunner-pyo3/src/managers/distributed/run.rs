@@ -75,13 +75,14 @@ impl PyDistributedManager {
             None,
         );
 
-        // Pre-compute per-secondary log directories under the GIL —
-        // `resolve_log_dir` calls into Python's `datetime` module —
+        // Pre-compute per-secondary log directories under the GIL
         // before detaching for the tokio runtime. Each secondary gets
-        // its own `{timestamp}/{secondary_id}` subdirectory so the
-        // default `worker_<id>.log` filename never collides across
-        // secondaries on a shared mount, and `create_dir_all` errors
-        // surface here at run start rather than as silent log loss.
+        // its own `{secondary_id}` subdirectory so the default
+        // `worker_<id>.log` filename never collides across secondaries
+        // on a shared mount, and `create_dir_all` errors surface here at
+        // run start rather than as silent log loss. (`resolve_log_dir`
+        // still imports Python's `datetime` for the `{timestamp}`
+        // placeholder, which the default template no longer uses.)
         // `log_path` (not `output_dir`) is the log-mount root — on
         // SLURM deployments it points at `/app/log-network` while
         // `output_dir` is `/app/out-network`. Single-host callers
