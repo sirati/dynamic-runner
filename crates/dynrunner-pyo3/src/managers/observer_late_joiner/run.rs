@@ -1,40 +1,36 @@
 //! `PyObserverLateJoiner::run` — reads the peer-info dir, dials into
-//! the mesh, restores the cluster snapshot, and drives the observation
-//! loop. Also exposes the `completed` getter.
+//! the mesh, restores the cluster snapshot, and drives the standalone
+//! observer. Also exposes the `completed` getter.
 
-use std::path::PathBuf;
+use std::time::Duration;
 
 use pyo3::prelude::*;
 
-use dynrunner_manager_distributed::{
-    RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
-    cluster_state::ClusterStateSnapshot, observer::run_observer_announcer,
+use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
+use dynrunner_manager_distributed::observer::{
+    ObserverConfig, ObserverTerminal, build_cold_join_observer,
 };
+use dynrunner_manager_distributed::primary::RunError;
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_slurm::read_peer_info_dir_v2;
 
-use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
-use crate::network::{detect_ipv4, detect_ipv6, gethostname};
-use crate::subprocess_factory::SubprocessWorkerFactory;
-
-use dynrunner_manager_distributed::task_completed::{run_collector, windowed_failure_collector};
-
-use dynrunner_manager_distributed::observer::failure_response::{
-    ErrorAggregationPolicy, InvalidTaskMonitorPolicy,
-};
-use dynrunner_manager_distributed::observer::reporting::{
-    SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter,
-};
 
 use super::PyObserverLateJoiner;
 use super::helpers::{map_read_dir_error, records_to_seed};
 
+/// Fleet-dead strand grace for a cold-join observer. There is no
+/// operator kwarg for this backstop; the single source of truth mirrors
+/// the primary's `PrimaryConfig` default (30s). It is the window after
+/// the LAST mesh peer leaves before a stranded observer exits, and
+/// doubles as the loop's re-check cadence.
+const OBSERVER_FLEET_DEAD_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[pymethods]
 impl PyObserverLateJoiner {
     /// Read the peer-info dir, dial into the mesh, restore the
-    /// cluster snapshot, and drive the observation loop.
+    /// cluster snapshot, and drive the standalone observer loop.
     fn run(&mut self, py: Python<'_>) -> PyResult<()> {
         // -- pre-detach: read peer-info dir (synchronous file I/O,
         // small enough that we don't bother offloading; surfacing
@@ -56,53 +52,29 @@ impl PyObserverLateJoiner {
         }
 
         let observer_id = self.observer_id.clone();
-        let estimator = self.topology.estimator.clone();
-        // `connect_timeout` is intentionally NOT plumbed: it gates
-        // the submitter-bound `NetworkClient` dial loop in the
-        // regular-secondary path, which an observer doesn't have
-        // (we hand SecondaryCoordinator a `NoPrimaryTransport` stub
-        // — see `no_primary.rs`). The observer's analogous budget
-        // lives in `DEFAULT_JOIN_TIMEOUT` on the peer-side
-        // `join_running_cluster` call below; tying the two
-        // together would conflate primary-handshake retry semantics
-        // with peer-mesh bootstrap rendezvous semantics.
-        let dist_peer_timeout = self.distributed_config.peer_timeout();
-        let dist_keepalive = self.distributed_config.keepalive_interval();
-        let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
-        let dist_retry_max_passes = self.distributed_config.retry_max_passes();
-        let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
-        let dist_primary_link_failure_threshold =
-            self.distributed_config.primary_link_failure_threshold();
-        let dist_primary_link_failure_window =
-            self.distributed_config.primary_link_failure_window();
-        let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
-        // Take the Python peer-lifecycle listener (if any) out of
-        // `self` so it can move into the detached tokio runtime.
-        // Wrapped through `PyPeerLifecycleListener::new` into a
-        // `Box<dyn LifecycleListener>` at the boundary so the
-        // manager-distributed registration API stays
-        // PyO3-agnostic.
-        let peer_lifecycle_listener = self
-            .peer_lifecycle_listener
-            .take()
-            .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
-        // Move the holdings set out of `self` so it can be drained into
-        // `attach_observer_announcer` on the tokio side. After this
-        // point `self.holdings` is empty; the observer is single-shot
-        // per `__init__` so a second `run()` would never make sense
-        // anyway (the snapshot RPC + restore latch are also one-shot).
+        // Strand-backstop + setup-deadline thresholds for the standalone
+        // observer's `ObserverConfig`. `peer_timeout` is the primary-silence
+        // backstop; `setup_promote_deadline` is plumbed for config-shape
+        // completeness but is inert here — `required_setup_on_promote=false`
+        // (a late-joiner joins an already-running cluster, it is never the
+        // setup-promoted node), so the deadline arm never arms.
+        let peer_timeout = self.distributed_config.peer_timeout();
+        let setup_promote_deadline = self.distributed_config.setup_promote_deadline();
+        // Move the holdings set out of `self` so it can be handed to the
+        // cold-join factory's announcer attach. After this point
+        // `self.holdings` is empty; the observer is single-shot per
+        // `__init__` so a second `run()` would never make sense anyway.
         let holdings = std::mem::take(&mut self.holdings);
-        let scheduler_config = self.scheduler_config.clone();
         let panik_watcher_paths = self.panik_watcher_paths.clone();
         let panik_watcher_poll_interval =
-            std::time::Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
+            Duration::from_secs_f64(self.panik_watcher_poll_interval_secs);
 
         // Terminal-outcome shapes for the observer late-joiner's run.
         // `Done` returns the observed-completion count; `Panik`
         // signals the outer scope to call `std::process::exit(137)`
-        // after the GIL is re-acquired. Same shape the regular
-        // secondary uses — keeps the two pyclasses' panik response
-        // structurally aligned.
+        // after the GIL is re-acquired; `Aborted` signals `exit(1)`.
+        // Same shape the regular secondary uses — keeps the two
+        // pyclasses' panik response structurally aligned.
         enum ObserverRunOutcome {
             Done(u32),
             Panik(std::path::PathBuf),
@@ -125,13 +97,10 @@ impl PyObserverLateJoiner {
                     //    The CN baked into the cert MUST match
                     //    `observer_id` because every dialing peer
                     //    validates the SAN against the logical id. The
-                    //    factory also builds the `PeerCertInfo` (cert +
-                    //    QUIC port) so the manager never reads them off a
-                    //    backend.
-                    let observer_bundle = transport_factory::observer_mesh::<RunnerIdentifier>(
+                    //    standalone observer holds this mesh transport
+                    //    directly (no cert bundle — it ships no PeerCertInfo).
+                    let mut peer_network = transport_factory::observer_mesh::<RunnerIdentifier>(
                         &observer_id,
-                        Some(detect_ipv4(None)),
-                        detect_ipv6(None),
                     )
                     .await
                     .map_err(|e| {
@@ -139,8 +108,6 @@ impl PyObserverLateJoiner {
                             "observer late-joiner: {e}"
                         ))
                     })?;
-                    let mut peer_network = observer_bundle.transport;
-                    let observer_cert_info = observer_bundle.peer_cert_info;
 
                     // 2. Bootstrap rendezvous: hand the seed list to the
                     //    trait default impl, which sequences the dial +
@@ -150,11 +117,9 @@ impl PyObserverLateJoiner {
                     // `is_observer = true`: this late-joiner is a strict
                     // observer. The flag rides the snapshot RPC so the
                     // responder records the joiner's ACTUAL role in the
-                    // replicated `PeerJoined` (R3's responder-carries-real-
-                    // role fix), rather than every late-joiner being
-                    // hardcoded as an observer.
-                    // `can_be_primary = false`: an observer can never host
-                    // the primary role (no workers, no dispatch authority).
+                    // replicated `PeerJoined`. `can_be_primary = false`:
+                    // an observer can never host the primary role (no
+                    // workers, no dispatch authority).
                     // `join_running_cluster` fans the snapshot request to
                     // every seed and returns ALL responders' payloads
                     // (multi-responder bootstrap). The first reachable seed
@@ -175,11 +140,13 @@ impl PyObserverLateJoiner {
 
                     // 3. Decode each snapshot. The wire frame is a String
                     //    (the protocol crate keeps `I` erased there); we
-                    //    materialise each back into the typed snapshot here
-                    //    so the manager-distributed crate gets the
-                    //    `ClusterStateSnapshot<RunnerIdentifier>` it
-                    //    expects. The caller `restore()`s each (Step 5
-                    //    below) — the lattice unions them.
+                    //    materialise each back into the typed snapshot here.
+                    //    A bootstrap-decode failure is FATAL: the observer
+                    //    requested these snapshots precisely to populate its
+                    //    CRDT, so a malformed bootstrap reply must not be
+                    //    swallowed (continuing on an empty CRDT would report
+                    //    a lie). The cold-join factory `restore()`s each — the
+                    //    lattice unions them.
                     let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> = snapshot_jsons
                         .iter()
                         .map(|snapshot_json| {
@@ -192,535 +159,79 @@ impl PyObserverLateJoiner {
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
-                    // 4. Construct the observer's coordinator. is_observer=true,
-                    //    num_workers=0; the Step 7 election filter + the
-                    //    self-exclusion guard inside `secondary/election.rs`
-                    //    together keep the observer out of every
-                    //    promote-to-primary path.
-                    let config = SecondaryConfig {
-                        secondary_id: observer_id.clone(),
-                        num_workers: 0,
-                        max_resources: dynrunner_core::ResourceMap::from([(
-                            dynrunner_core::ResourceKind::memory(),
-                            // 1 GiB: a marker value — the observer
-                            // doesn't run workers, so its resource map
-                            // is irrelevant to actual work, but the
-                            // worker-pool budget math (which never
-                            // triggers on an empty pool — see
-                            // `scheduler::check_resource_pressure`'s
-                            // `num_workers == 0` early return) reads it
-                            // for completeness.
-                            1024 * 1024 * 1024,
-                        )]),
-                        hostname: gethostname(),
-                        keepalive_interval: dist_keepalive,
-                        src_network: None,
-                        src_tmp: None,
-                        peer_timeout: dist_peer_timeout,
-                        keepalive_miss_threshold: dist_keepalive_miss_threshold,
-                        retry_max_passes: dist_retry_max_passes,
-                        oom_retry_max_passes: dist_oom_retry_max_passes,
-                        primary_link_failure_threshold: dist_primary_link_failure_threshold,
-                        primary_link_failure_window: dist_primary_link_failure_window,
-                        // Internal default (no operator kwarg for the
-                        // app-silence failover backstop); single source of
-                        // truth lives in the distributed crate. Inert for an
-                        // observer (its election tick is a no-op) but set for
-                        // config-shape completeness.
-                        primary_silence_backstop:
-                            dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
-                        unconfigured_deadline: dist_unconfigured_deadline,
-                        is_observer: true,
-                        // An observer can never host the primary role (no
-                        // workers, no dispatch authority): `false`.
-                        can_be_primary: false,
-                        // Observer has zero workers — the watcher's
-                        // decision arm short-circuits on an empty pool
-                        // and the sample arm reports the host reading
-                        // with `tracked_workers_count = 0`. Default
-                        // cadences mirror the live secondary path.
-                        resource_check_interval: std::time::Duration::from_millis(100),
-                        log_oom_watcher: false,
-                        promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
-                        // Observers never promote (the election filter +
-                        // setup-promote dispatch reject keep them off the
-                        // primary path), so the cap is structurally inert
-                        // — leave at the default `None` (unbounded).
-                        unfulfillable_reinject_max_per_task: None,
-                        // Observer runs zero workers (factory is a no-op
-                        // placeholder); nesting the workers cgroup would
-                        // be a write against a path no PID ever attaches
-                        // to. Leave unset.
-                        mem_manager_reserved_bytes: None,
-                        // Observer doesn't run workers; no per-task
-                        // memprofile to write. Leave unset.
-                        output_dir: None,
-                        // Observer doesn't run workers; no per-task
-                        // memuse rows to append. Leave unset.
-                        memuse_log_path: None,
+                    // 4. Build the standalone observer's config. No
+                    //    scheduler / worker / dispatch fields — an observer
+                    //    has none of those concerns; the config carries only
+                    //    the node identity, the strand-backstop thresholds,
+                    //    the (inert here) setup-promote deadline, and the
+                    //    panik trigger inputs.
+                    let config = ObserverConfig {
+                        node_id: observer_id.clone(),
+                        fleet_dead_timeout: OBSERVER_FLEET_DEAD_TIMEOUT,
+                        peer_timeout,
+                        setup_promote_deadline,
+                        // A late-joiner joins an already-running cluster; it
+                        // is never the setup-promoted node, so the deadline
+                        // arm is structurally inert.
+                        required_setup_on_promote: false,
+                        panik_watcher_paths,
+                        panik_watcher_poll_interval,
                     };
 
-                    // No-op factory: the run loop's only `factory`
-                    // consumer is `initialize_workers`, which is gated
-                    // by `!setup_phase_completed`. We're about to set
-                    // that latch to `true` via
-                    // `restore_from_snapshot_and_skip_setup`, so the
-                    // factory's `spawn_worker` is unreachable —
-                    // any factory satisfying the trait bound works.
-                    // We reuse the existing `SubprocessWorkerFactory`
-                    // with placeholder fields rather than adding a
-                    // dedicated `NoopWorkerFactory` because Step 11
-                    // (trait deletion in the unification refactor)
-                    // is about to remove the type-parameter that
-                    // forces a concrete factory here.
-                    let mut factory = SubprocessWorkerFactory {
-                        python_executable: PathBuf::new(),
-                        source_dir: PathBuf::new(),
-                        output_dir: PathBuf::new(),
-                        log_dir: PathBuf::new(),
-                        log_paths: Default::default(),
-                        // Empty registry — the observer's factory is
-                        // unreachable (snapshot-restore latches
-                        // setup_phase_completed=true before any
-                        // `initialize_workers` would consult it). Empty is
-                        // the correct placeholder; first_type_runtime()
-                        // would surface a clear error if a future code
-                        // path accidentally reached spawn.
-                        types: Default::default(),
-                        skip_existing: false,
-                        connection_mode: ConnectionMode::Socketpair,
-                        manual_start_worker: false,
-                        worker_spec: None,
-                        child_processes: Vec::new(),
-                    };
-
-                    // The observer holds its mesh `PeerTransport`
-                    // (`PeerNetwork`) DIRECTLY. A late-joining observer
-                    // never dialled an original primary, so there is no
-                    // bootstrap wire to fold in (and never was an `uplink`
-                    // leg): it bootstrapped onto the mesh via the snapshot
-                    // RPC and reaches the primary as a mesh peer once the
-                    // role cache warms from the replicated `PrimaryChanged`.
-                    let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
-                        SecondaryCoordinator::new(
-                            config,
-                            peer_network,
-                            scheduler_config.build_memory_scheduler(),
-                            estimator,
-                        );
-
-                    // Register the Python peer-lifecycle listener (if any)
-                    // BEFORE `run_until_setup_or_done` enters — the
-                    // coordinator's `register_lifecycle_listener` contract
-                    // requires pre-run registration because the listener
-                    // vector is `mem::take`-d into the spawned dispatcher
-                    // on first entry.
-                    if let Some(listener) = peer_lifecycle_listener {
-                        secondary.register_lifecycle_listener(listener);
-                    }
-
-                    // CertExchange path is skipped (setup_phase_completed
-                    // latched true), but PeerInfo broadcasts that arrive
-                    // post-restore still consult the local
-                    // `peer_cert_info` when this observer's id shows up
-                    // in their distribution. Populating it keeps the
-                    // broadcast handler symmetric — observers participate
-                    // in cert exchange so peers can dial back into the
-                    // observer (e.g. for snapshot RPCs from a later
-                    // joiner).
-                    secondary.set_peer_cert_info(observer_cert_info);
-
-                    // Wire the panik watcher in the same shape as the
-                    // regular secondary. The observer doesn't own
-                    // workers but still announces its own departure on
-                    // its own panik file: its `process_tasks` panik arm
-                    // emits a self-authored `PeerRemoved { SelfDeparture }`
-                    // (observability only — peers are not terminated) and
-                    // the post-loop scope below exits 137.
-                    let mut panik_watcher =
-                        dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
-                            dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
-                                paths: panik_watcher_paths,
-                                poll_interval: panik_watcher_poll_interval,
-                                // OBSERVER-role spawner: SIGTERM listening
-                                // OFF. The observer late-joiner doesn't
-                                // own SLURM-allocated workers and isn't
-                                // a target of the host shutdown-manager's
-                                // SIGTERM forwarding. Sentinel-file
-                                // trigger plus cluster-wide panik
-                                // broadcast cover its emergency-stop
-                                // needs.
-                                listen_for_sigterm: false,
-                            },
-                        );
-                    if let Some(rx) = panik_watcher.take_signal_rx() {
-                        secondary.register_panik_signal_rx(rx);
-                    }
-
-                    // Attach the resource-holdings announcer's hook +
-                    // outbox BEFORE the snapshot restore: the restore's
-                    // `cluster_state.restore` path fires
-                    // `fire_role_change_hooks` from inside its
-                    // `primary_epoch > local` branch, which we want to
-                    // count as the post-restore initial trigger. With
-                    // attach-then-restore the snapshot's apply naturally
-                    // emits the first `AnnounceTrigger` into the queue;
-                    // a separate explicit "fire one trigger" step would
-                    // duplicate that stimulus.
-                    //
-                    // The bundle carries the `AnnouncerHandle` (rx /
-                    // holdings / peer_id / primary_epoch_mirror — the
-                    // four `run_observer_announcer` inputs) plus the
-                    // production `PeerMeshAnnouncerSender` that forwards
-                    // each announce onto the coordinator-side outbox the
-                    // operational loop drains.
-                    let (announcer_handle, announcer_sender) =
-                        secondary.attach_observer_announcer(holdings);
-
-                    // 5. Install each collected snapshot AND latch
-                    //    setup_phase_completed=true. The single-method
-                    //    `restore_from_snapshot_and_skip_setup` is the
-                    //    only place outside the secondary crate allowed
-                    //    to touch the latch (see its doc-comment). Called
-                    //    once per responder's snapshot: `restore` is an
-                    //    idempotent / commutative lattice merge, so the
-                    //    union of every responder's view converges
-                    //    regardless of arrival order, and the (idempotent)
-                    //    lifecycle latch lands the same Operational shell
-                    //    each time — the union heals an incomplete first
-                    //    responder against a complete later one.
-                    for snap in snaps {
-                        secondary.restore_from_snapshot_and_skip_setup(snap);
-                    }
-
-                    // 5.5. Spawn the announcer task. The coordinator's
-                    //      `select!` arm drains the production sender's
-                    //      outbox onto `peer_transport.send`; here we just
-                    //      hand the task its four inputs (rx / holdings /
-                    //      peer_id / primary_epoch_mirror) plus the
-                    //      production sender, and store the JoinHandle for
-                    //      shutdown abort+join — same discipline as the
-                    //      peer-lifecycle dispatcher's cleanup.
-                    let announcer_task = tokio::task::spawn_local(run_observer_announcer(
-                        announcer_handle.rx,
-                        announcer_handle.holdings,
-                        announcer_handle.peer_id,
-                        announcer_sender,
-                        announcer_handle.primary_epoch_mirror,
-                    ));
-
-                    // 5.6. Spawn the observer-side periodic reporter
-                    //      (owner-decision C-4): the 10-minute CRDT-derived
-                    //      cluster-stats announcement + the 1-minute
-                    //      idle-secondary detector, emitting only to the
-                    //      importance channel. The reporter is a
-                    //      self-contained concern — it holds its OWN
-                    //      last-announcement delta baseline and per-secondary
-                    //      idle gates; nothing about reporting lives on the
-                    //      coordinator. It reads the CRDT through a
-                    //      `SharedSnapshotSource` cell.
-                    //
-                    //      # Live-snapshot feed
-                    //
-                    //      A zero-authority observer's `ClusterState` is
-                    //      owned `&mut` by `run_until_setup_or_done` for the
-                    //      whole run, so a concurrently-running reporter task
-                    //      cannot borrow it directly. The hand-off is the
-                    //      `SharedSnapshotSource` cell: the reporter task
-                    //      owns one clone and reads the most-recently
-                    //      published projection on each tick; THIS loop owns
-                    //      the other clone (`snapshot_publisher`) and pushes a
-                    //      fresh `StatsSnapshot::from_cluster_state(...)`
-                    //      projection at every point it legitimately holds
-                    //      `&secondary` — i.e. immediately below (the
-                    //      just-restored snapshot, the late-joiner's real
-                    //      starting view) and after each
-                    //      `run_until_setup_or_done` return (the SetupPending
-                    //      re-entry boundary). The projection is taken through
-                    //      the read-only `secondary.cluster_state()` accessor;
-                    //      the CRDT is never `Arc`-shared, so nothing about
-                    //      this feed touches the apply path or the operational
-                    //      loop.
-                    //
-                    //      Cadence note: a late-joiner restores a snapshot of
-                    //      an already-running cluster, so the initial publish
-                    //      below delivers REAL, typically-non-zero stats that
-                    //      the first 10-minute tick reports.
-                    //
-                    //      # Live mid-run refresh
-                    //
-                    //      The restore-time and post-`run_until_setup_or_done`
-                    //      publishes alone would leave the cell STATIC for the
-                    //      whole run (the observer holds `&mut secondary` across
-                    //      the entire run and `run_until_setup_or_done` returns
-                    //      only on Done), so the 10-minute stats would report
-                    //      the restore-time view until the run finished. The
-                    //      live refresh closes that gap WITHOUT `Arc`-sharing
-                    //      the CRDT or touching the apply path: the coordinator's
-                    //      `process_tasks` loop invokes a registered
-                    //      `on_cluster_state_refresh` callback on a modest
-                    //      periodic tick (it owns `&self.cluster_state` between
-                    //      applies), and the callback below projects + publishes
-                    //      the live CRDT into the SAME cell. The reporter task
-                    //      then reads the freshening cell on its own
-                    //      10-min/1-min cadence — no reporter change needed. See
-                    //      `register_cluster_state_refresh` and the periodic arm
-                    //      in `secondary/processing/process_tasks.rs`.
-                    let snapshot_source = SharedSnapshotSource::new(
-                        StatsSnapshot::from_cluster_state(secondary.cluster_state()),
+                    // 5. Cold-join: build the standalone ObserverCoordinator
+                    //    over the live mesh transport + the bootstrap
+                    //    snapshot(s). The factory installs the task-completed
+                    //    sender, attaches the resource-holdings announcer's
+                    //    role-change hook, then restores each snapshot (so the
+                    //    restore's role-change fire pushes the initial holdings
+                    //    announce into the registered channel), and spawns the
+                    //    panik watcher. The whole observation runtime —
+                    //    reporter, failure policies, announcer task, panik arm,
+                    //    teardown — lives inside `ObserverCoordinator::run`.
+                    let mut observer = build_cold_join_observer(
+                        peer_network,
+                        ClusterState::<RunnerIdentifier>::new(),
+                        config,
+                        snaps,
+                        holdings,
                     );
-                    // Clone the publish handle for THIS loop; the reporter
-                    // task consumes the other end. Both clones share one cell.
-                    let snapshot_publisher = snapshot_source.clone();
 
-                    // Live mid-run refresh: register the periodic publish
-                    // callback the coordinator's `process_tasks` loop invokes
-                    // between applies (see the live-refresh doc above). The
-                    // callback owns ANOTHER clone of the same cell and projects
-                    // the live CRDT into it on each tick, so the reporter sees
-                    // progress that lands DURING this observer's window — not
-                    // just the restore-time snapshot. Registered BEFORE the run
-                    // loop's first `run_until_setup_or_done` per the
-                    // `register_cluster_state_refresh` pre-run contract (the
-                    // slot is taken into the loop's local state on first entry).
-                    // The `StatsSnapshot` / projection concern stays entirely
-                    // on this side of the boundary; the coordinator only knows
-                    // it hands `&ClusterState` to a registered closure.
-                    let refresh_publisher = snapshot_source.clone();
-                    secondary.register_cluster_state_refresh(Box::new(move |cs| {
-                        refresh_publisher.publish(StatsSnapshot::from_cluster_state(cs));
-                    }));
-
-                    let (reporter_cancel_tx, reporter_cancel_rx) =
-                        tokio::sync::oneshot::channel::<()>();
-                    let reporter_task = tokio::task::spawn_local(run_reporter(
-                        snapshot_source,
-                        TokioClock,
-                        async move {
-                            let _ = reporter_cancel_rx.await;
-                        },
-                    ));
-
-                    // 5.7. Wire the two observer terminal-failure policies
-                    //      over the shared windowed-failure-collector. Each
-                    //      policy is built as a (listener, driver) pair: the
-                    //      listener is registered on the coordinator's
-                    //      task-completed fabric (so it fires off the apply
-                    //      path's terminal-failure events, on the dispatcher
-                    //      task) and the driver is spawned to own the policy's
-                    //      window timer. Both registrations happen BEFORE the
-                    //      run loop's first `run_until_setup_or_done` (which
-                    //      `mem::take`-s the listener vector into the
-                    //      dispatcher), same pre-run contract as the
-                    //      peer-lifecycle listener above.
-                    //
-                    //      Policy B (invalid_task monitor): arms a 1-minute
-                    //      window on the first `invalid_task` failure, then
-                    //      signals fatal-exit. Per owner decision only the
-                    //      OBSERVER exits on invalid_task — the cluster keeps
-                    //      running. The signal rides a dedicated mpsc consumed
-                    //      by the operational loop's fatal-exit arm (mirrors
-                    //      `register_panik_signal_rx`); the policy never calls
-                    //      `std::process::exit`.
-                    //
-                    //      Policy C (error aggregation): rolling-10-minute
-                    //      window, collects `min(1min, remainder)`, emits the
-                    //      deduped detail on the importance channel once per
-                    //      distinct message per rolling window, never exits.
-                    let (fatal_exit_tx, fatal_exit_rx) =
-                        tokio::sync::mpsc::unbounded_channel::<String>();
-                    secondary.register_fatal_exit_signal_rx(fatal_exit_rx);
-                    let (invalid_task_listener, invalid_task_driver) =
-                        windowed_failure_collector(InvalidTaskMonitorPolicy::new(fatal_exit_tx));
-                    secondary.register_task_completed_listener(invalid_task_listener);
-
-                    let (aggregation_listener, aggregation_driver) =
-                        windowed_failure_collector(ErrorAggregationPolicy::new());
-                    secondary.register_task_completed_listener(aggregation_listener);
-
-                    // Drive each policy's window timer. Same cancel-then-abort
-                    // teardown discipline as the announcer / reporter tasks
-                    // below (a graceful cancel lets the driver's select! break,
-                    // abort is the backstop, await synchronises termination so
-                    // a follow-on dispatcher run starts quiesced).
-                    let (invalid_task_cancel_tx, invalid_task_cancel_rx) =
-                        tokio::sync::oneshot::channel::<()>();
-                    let invalid_task_driver_task =
-                        tokio::task::spawn_local(run_collector(invalid_task_driver, async move {
-                            let _ = invalid_task_cancel_rx.await;
-                        }));
-                    let (aggregation_cancel_tx, aggregation_cancel_rx) =
-                        tokio::sync::oneshot::channel::<()>();
-                    let aggregation_driver_task =
-                        tokio::task::spawn_local(run_collector(aggregation_driver, async move {
-                            let _ = aggregation_cancel_rx.await;
-                        }));
-
-                    // 6. Drive the run loop. The first iteration's
-                    //    setup-skip guard fires immediately; subsequent
-                    //    iterations are `RunOutcome::Terminal` (projecting
-                    //    to `SecondaryTerminal::Done`) once the cluster
-                    //    broadcasts `RunComplete`. SetupPending
-                    //    is unreachable for an observer (only
-                    //    pre-staged-mode primaries emit the
-                    //    `InitialAssignment { pre_staged_mode: true }`
-                    //    that triggers it, and an observer is never the
-                    //    elected secondary).
-                    //
-                    // # Why a sub-block
-                    //
-                    // Wrapped in an inner async block whose result is
-                    // captured BEFORE the announcer-task cleanup so any
-                    // `?`-propagated error or early `Err`-return still
-                    // routes through the abort+await on
-                    // `announcer_task`. Without the wrapper an
-                    // error-return would skip the cleanup and leak the
-                    // announcer task into the next observer dispatcher
-                    // run.
-                    let loop_result: Result<ObserverRunOutcome, PyErr> = async {
-                        // `RunOutcome` adds the `PanikShutdown` arm but
-                        // both terminal arms (Done | Panik) still
-                        // terminate the loop — clippy still sees it as
-                        // never iterating. The loop is retained as
-                        // defensive scaffolding for a future "retry on
-                        // SetupPending" branch — same shape the in-process
-                        // distributed manager will need if observers ever
-                        // become promotable.
-                        #[allow(clippy::never_loop)]
-                        loop {
-                            let outcome = secondary
-                                .run_until_setup_or_done(&mut factory)
-                                .await
-                                .map_err(|e| {
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "observer late-joiner: secondary run loop failed: {e}"
-                                    ))
-                                })?;
-                            // The run loop just returned `&secondary` to us;
-                            // refresh the reporter's cell with the current
-                            // CRDT projection. On `Done` this is the terminal
-                            // view (the reporter's final pre-cancel tick can
-                            // still report a last delta); on the `SetupPending`
-                            // re-entry boundary it keeps the cell current
-                            // across the GIL round-trip.
-                            snapshot_publisher.publish(StatsSnapshot::from_cluster_state(
-                                secondary.cluster_state(),
-                            ));
-                            match outcome {
-                                RunOutcome::Terminal => {
-                                    // The per-secondary terminal is the
-                                    // single source of truth on the
-                                    // lifecycle; read it back to choose the
-                                    // boundary action.
-                                    match secondary.terminal() {
-                                        Some(SecondaryTerminal::Done) | None => break,
-                                        Some(SecondaryTerminal::Panik {
-                                            matched_path,
-                                            reason,
-                                        }) => {
-                                            tracing::warn!(
-                                                matched_path = %matched_path.display(),
-                                                reason = %reason,
-                                                "observer panik shutdown; propagating \
-                                                 to PyO3 boundary for exit(137)"
-                                            );
-                                            return Ok(ObserverRunOutcome::Panik(matched_path));
-                                        }
-                                        Some(SecondaryTerminal::Aborted { reason }) => {
-                                            // The primary broadcast `RunAborted`
-                                            // (#3a pre-phase duplicate). Propagate
-                                            // to the PyO3 boundary for exit(1) — an
-                                            // observer exits non-zero on a
-                                            // cluster-wide abort, same as the
-                                            // secondary.
-                                            tracing::error!(
-                                                reason = %reason,
-                                                "observer run aborted by primary; propagating \
-                                                 to PyO3 boundary for exit(1)"
-                                            );
-                                            return Ok(ObserverRunOutcome::Aborted(reason));
-                                        }
-                                        Some(SecondaryTerminal::Failed { reason }) => {
-                                            // `Failed` propagates as the run
-                                            // loop's `Err` (handled above), so
-                                            // this is unexpected on a
-                                            // `Terminal` — surface as an error.
-                                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                                format!("observer late-joiner: secondary failed: {reason}"),
-                                            ));
-                                        }
-                                    }
-                                }
-                                RunOutcome::SetupPending => {
-                                    // Defensive: a late-joiner observer
-                                    // should never see SetupPending — that
-                                    // outcome comes from an
-                                    // `InitialAssignment { pre_staged_mode:
-                                    // true }` arrival, which an observer
-                                    // cannot accept (the election filter +
-                                    // the apply-hook defensive reject keep
-                                    // observers off the promote path).
-                                    // Surface it as a typed error rather
-                                    // than retrying — silent re-entry on
-                                    // an unreachable branch would mask a
-                                    // protocol bug.
-                                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                        "observer late-joiner: secondary returned \
-                                     RunOutcome::SetupPending — unreachable for an \
-                                     observer (a PrimaryChanged naming it should be \
-                                     rejected); \
-                                     this indicates a protocol or election-filter \
-                                     regression",
-                                    ));
-                                }
-                            }
+                    // 6. Drive the single observer run loop. It returns the
+                    //    run terminal (Done / Aborted / Panik); the strand
+                    //    backstops (fleet-dead, primary-silence) surface as
+                    //    `Err(RunError)`, which we route to a non-zero exit.
+                    match observer.run().await {
+                        Ok(ObserverTerminal::Done) => {
+                            Ok(ObserverRunOutcome::Done(observer.completed_count() as u32))
                         }
-
-                        Ok(ObserverRunOutcome::Done(secondary.completed_count() as u32))
+                        Ok(ObserverTerminal::Aborted { reason }) => {
+                            // The primary broadcast `RunAborted` (#3a
+                            // pre-phase duplicate). Propagate to the PyO3
+                            // boundary for exit(1) — an observer exits
+                            // non-zero on a cluster-wide abort.
+                            tracing::error!(
+                                reason = %reason,
+                                "observer run aborted by primary; propagating \
+                                 to PyO3 boundary for exit(1)"
+                            );
+                            Ok(ObserverRunOutcome::Aborted(reason))
+                        }
+                        Ok(ObserverTerminal::Panik { matched_path }) => {
+                            tracing::warn!(
+                                matched_path = %matched_path.display(),
+                                "observer panik shutdown; propagating \
+                                 to PyO3 boundary for exit(137)"
+                            );
+                            Ok(ObserverRunOutcome::Panik(matched_path))
+                        }
+                        Err(e) => {
+                            // Strand backstop (fleet-dead / primary-silence)
+                            // or a fatal-exit policy. Surface as a typed
+                            // Python exception (non-zero exit) — the run was
+                            // stranded, not cleanly complete.
+                            Err(map_run_error(&e))
+                        }
                     }
-                    .await;
-
-                    // Announcer-task cleanup. The task is `spawn_local`-ed
-                    // on this LocalSet and holds a clone of the
-                    // coordinator-side outbox `mpsc::Sender`; the
-                    // coordinator itself holds another clone on
-                    // `announcer_outbox_tx`, so neither side observes a
-                    // closed-channel `None` on natural shutdown. The
-                    // explicit abort+await mirrors the peer-lifecycle
-                    // dispatcher's cleanup discipline (see
-                    // `SecondaryCoordinator::cleanup_lifecycle_dispatcher`):
-                    // `abort()` is the kill signal, `await` synchronises
-                    // with the task's actual termination so a follow-on
-                    // observer dispatcher run (test-driven; the
-                    // production single-shot Python wrapper exits after
-                    // this) starts with a quiesced runtime.
-                    announcer_task.abort();
-                    let _ = announcer_task.await;
-
-                    // Reporter-task cleanup. Signal cancel (graceful: the
-                    // driver's `select!` cancel arm wins and the loop
-                    // breaks), then await termination. `abort()` as a
-                    // backstop in case the cancel receiver was already
-                    // dropped. Same abort+await synchronisation discipline
-                    // as the announcer above so a follow-on dispatcher run
-                    // starts with a quiesced runtime.
-                    let _ = reporter_cancel_tx.send(());
-                    reporter_task.abort();
-                    let _ = reporter_task.await;
-
-                    // Failure-policy driver cleanup. Same cancel-then-abort
-                    // discipline as the reporter: cancel each driver gracefully
-                    // (its select! cancel arm breaks the loop), abort as a
-                    // backstop, await termination so a follow-on dispatcher run
-                    // starts quiesced.
-                    let _ = invalid_task_cancel_tx.send(());
-                    invalid_task_driver_task.abort();
-                    let _ = invalid_task_driver_task.await;
-                    let _ = aggregation_cancel_tx.send(());
-                    aggregation_driver_task.abort();
-                    let _ = aggregation_driver_task.await;
-
-                    loop_result
                 }))
             });
 
@@ -764,4 +275,14 @@ impl PyObserverLateJoiner {
     fn completed(&self) -> u32 {
         self.completed
     }
+}
+
+/// Map an observer-run `RunError` (strand backstop or fatal-exit policy)
+/// to a typed Python exception. A stranded observer exits non-zero — the
+/// run never reached a clean terminal, so swallowing the error to exit 0
+/// would report a lie.
+fn map_run_error(e: &RunError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "observer late-joiner: run did not reach a clean terminal: {e}"
+    ))
 }
