@@ -4,7 +4,8 @@
 //! compose in one [`Registry`]:
 //!
 //!   * a **full sink** that records every event (subject only to the
-//!     verbosity [`EnvFilter`]), and
+//!     verbosity ceiling — a [`LevelFilter`] resolved from the parsed
+//!     `--debug` flag, never from `RUST_LOG`/any env), and
 //!   * a **stdio sink** that, when *importance mode* is active, passes
 //!     ONLY events whose tracing target is [`IMPORTANT_TARGET`]; when
 //!     inactive it behaves exactly like the historical single `fmt`
@@ -16,7 +17,7 @@
 //!
 //! Selection is passed in EXPLICITLY by the Python side after argparse
 //! (`init_logging(...)` — see [`crate::logging::py_init_logging`]), never
-//! read from the environment. The three knobs the Python CLI surface owns:
+//! read from the environment. The knobs the Python CLI surface owns:
 //!
 //!   * `important_stdio_only` — enables importance mode.
 //!   * `full_log_file` — optional explicit path for a single full-log file
@@ -36,6 +37,11 @@
 //!     arg, the single-file knob is the submitter-only path. When neither
 //!     is set, the full log stays on stdout and shell/sbatch redirection
 //!     captures it, preserving today's single-stream behaviour.
+//!   * `debug` — the parsed `--debug` flag. Raises EVERY sink's verbosity
+//!     ceiling from the historical `info` to `debug`, so a `--debug` run
+//!     produces DEBUG lines in the full/per-role files (the secondary's
+//!     `secondary.log`), not just at the Python root logger. It is the only
+//!     verbosity knob — there is no `RUST_LOG` read.
 //!
 //! The subscriber is NOT installed at `_native` import — installing it
 //! there forced the config to be read from the environment before argparse
@@ -52,13 +58,13 @@ use std::path::PathBuf;
 use chrono::Local;
 use pyo3::prelude::*;
 use tracing::{Event, Metadata};
-use tracing_subscriber::filter::FilterFn;
+use tracing_subscriber::filter::{FilterFn, LevelFilter};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::Layer;
 
 /// Tracing target that marks an event as "important" (LLM-wake-worthy).
 /// Events emitted at this target reach stdio even in importance mode.
@@ -116,6 +122,9 @@ pub(crate) struct LogConfig {
     pub(crate) important_stdio_only: bool,
     /// Destination of the full sink.
     pub(crate) full_sink: FullSink,
+    /// Verbosity ceiling for every sink, resolved from the `--debug` flag:
+    /// `DEBUG` when debug is on, else the default `INFO`.
+    pub(crate) level: LevelFilter,
 }
 
 impl LogConfig {
@@ -126,10 +135,16 @@ impl LogConfig {
     /// `full_log_file` is the submitter-only `--important-stdio-only` path.
     /// Neither set → stdout (historical single-stream). Whitespace-only
     /// strings are treated as unset so an empty CLI value collapses cleanly.
+    ///
+    /// `debug` raises the verbosity ceiling on EVERY sink to `DEBUG`; off it
+    /// stays at the historical `INFO`. The level is parametric (from the
+    /// parsed `--debug` flag), never read from `RUST_LOG`/any env — matching
+    /// the explicit-parameter design of the rest of this module.
     pub(crate) fn new(
         important_stdio_only: bool,
         full_log_file: Option<String>,
         full_log_dir: Option<String>,
+        debug: bool,
     ) -> Self {
         let trimmed = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
         let full_sink = match trimmed(full_log_dir) {
@@ -142,7 +157,22 @@ impl LogConfig {
         Self {
             important_stdio_only,
             full_sink,
+            level: level_filter(debug),
         }
+    }
+}
+
+/// The verbosity ceiling for every layer, resolved from the explicit
+/// `--debug` flag: `DEBUG` when on, else the historical `INFO`. This is the
+/// single place verbosity is decided — parametric, never read from
+/// `RUST_LOG`/any env, consistent with this module's explicit-parameter
+/// design. A fresh `LevelFilter` is handed to each layer because filters are
+/// consumed on layer attachment.
+fn level_filter(debug: bool) -> LevelFilter {
+    if debug {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
     }
 }
 
@@ -156,27 +186,20 @@ pub(crate) fn important_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
     FilterFn::new(predicate as fn(&Metadata<'_>) -> bool)
 }
 
-/// Build an [`EnvFilter`] from `RUST_LOG`/default-env, falling back to
-/// `info`. A fresh instance is built per layer because `EnvFilter` is not
-/// `Clone` across layer attachment.
-fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
-}
-
 /// Build the full (everything) `fmt` layer over `writer`, filtered only by
-/// verbosity. Generic over the writer so tests can inject an in-memory
-/// buffer.
+/// verbosity (`level`). Generic over the writer so tests can inject an
+/// in-memory buffer.
 ///
 /// Returned as a boxed layer so the two-layer set has one uniform type
 /// regardless of the writer concretes.
-pub(crate) fn full_layer<S, W>(make_writer: W) -> Box<dyn Layer<S> + Send + Sync>
+pub(crate) fn full_layer<S, W>(make_writer: W, level: LevelFilter) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
-        .with_filter(env_filter())
+        .with_filter(level)
         .boxed()
 }
 
@@ -218,10 +241,12 @@ where
 /// Build a per-role full (everything) `fmt` layer over `writer`: verbose
 /// (RFC3339-UTC, target shown) like [`full_layer`], but additionally
 /// scope-gated to the role span named `role_span_name`. Used by the
-/// per-node-dir sink to split `primary.log` / `secondary.log`.
+/// per-node-dir sink to split `primary.log` / `secondary.log`. Verbosity is
+/// the explicit `level` so a `--debug` run reaches the per-role files.
 fn role_full_layer<S, W>(
     make_writer: W,
     role_span_name: &'static str,
+    level: LevelFilter,
 ) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -229,7 +254,7 @@ where
 {
     tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
-        .with_filter(env_filter())
+        .with_filter(level)
         .with_filter(RoleFilter { role_span_name })
         .boxed()
 }
@@ -268,6 +293,7 @@ impl FormatTime for LocalHhMm {
 pub(crate) fn stdio_layer<S, W>(
     make_writer: W,
     important_only: bool,
+    level: LevelFilter,
 ) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -284,13 +310,13 @@ where
             // target line forbids, and corruption when this sink is captured
             // to a file / sbatch log rather than a terminal).
             .with_ansi(false)
-            .with_filter(env_filter())
+            .with_filter(level)
             .with_filter(important_stdio_filter())
             .boxed()
     } else {
         tracing_subscriber::fmt::layer()
             .with_writer(make_writer)
-            .with_filter(env_filter())
+            .with_filter(level)
             .boxed()
     }
 }
@@ -330,20 +356,26 @@ where
     match &config.full_sink {
         FullSink::Stdout => {}
         FullSink::File(path) => {
-            layers.push(full_layer(open_append_create(path)));
+            layers.push(full_layer(open_append_create(path), config.level));
         }
         FullSink::PerNodeDir(dir) => {
             layers.push(role_full_layer(
                 open_append_create(&dir.join(PRIMARY_LOG_FILENAME)),
                 PRIMARY_ROLE_SPAN,
+                config.level,
             ));
             layers.push(role_full_layer(
                 open_append_create(&dir.join(SECONDARY_LOG_FILENAME)),
                 SECONDARY_ROLE_SPAN,
+                config.level,
             ));
         }
     }
-    layers.push(stdio_layer(io::stdout, config.important_stdio_only));
+    layers.push(stdio_layer(
+        io::stdout,
+        config.important_stdio_only,
+        config.level,
+    ));
     layers
 }
 
@@ -363,22 +395,26 @@ pub(crate) fn init_with(config: &LogConfig) {
 /// the config is chosen by parsed flags rather than read from the
 /// environment at import.
 ///
-/// Single concern: translate the three Python-side logging knobs into a
+/// Single concern: translate the Python-side logging knobs into a
 /// [`LogConfig`] and install it. `important_stdio_only` arms the stdio gate;
 /// `full_log_file` / `full_log_dir` choose the full sink (dir wins — see
-/// [`LogConfig::new`]).
+/// [`LogConfig::new`]); `debug` raises every sink's verbosity ceiling to
+/// `DEBUG` (the parsed `--debug` flag), so a `--debug` run produces DEBUG
+/// lines in the per-role/full sinks — not just at the Python root logger.
 #[pyfunction]
 #[pyo3(name = "init_logging", signature = (
     important_stdio_only = false,
     full_log_file = None,
     full_log_dir = None,
+    debug = false,
 ))]
 pub(crate) fn py_init_logging(
     important_stdio_only: bool,
     full_log_file: Option<String>,
     full_log_dir: Option<String>,
+    debug: bool,
 ) {
-    let config = LogConfig::new(important_stdio_only, full_log_file, full_log_dir);
+    let config = LogConfig::new(important_stdio_only, full_log_file, full_log_dir, debug);
     init_with(&config);
 }
 
@@ -421,6 +457,8 @@ mod tests {
 
     /// Drive a full + stdio layer set over in-memory buffers, emit one
     /// important and one normal event, and return (full, stdio) contents.
+    /// Verbosity stays at the historical `INFO` default for the
+    /// importance-mode/format tests.
     fn run_capture(important_only: bool) -> (String, String) {
         let full_buf = BufWriter::default();
         let stdio_buf = BufWriter::default();
@@ -428,8 +466,8 @@ mod tests {
         // `Vec<L>` implements `Layer<S>` uniformly, so the two boxed layers
         // attach in one `.with(...)`.
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
-            full_layer::<Registry, _>(full_buf.clone()),
-            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only),
+            full_layer::<Registry, _>(full_buf.clone(), LevelFilter::INFO),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), important_only, LevelFilter::INFO),
         ];
         let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
@@ -592,20 +630,75 @@ mod tests {
         );
     }
 
+    /// Drive a single full layer at `level` over an in-memory buffer, emit
+    /// one INFO and one DEBUG event, and return the captured contents. The
+    /// verbosity ceiling is the only variable under test.
+    fn run_capture_level(level: LevelFilter) -> String {
+        let full_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> =
+            vec![full_layer::<Registry, _>(full_buf.clone(), level)];
+        let subscriber = Registry::default().with(layers);
+        with_default(subscriber, || {
+            tracing::info!("an-info-line");
+            tracing::debug!("a-debug-line");
+        });
+        full_buf.contents()
+    }
+
+    #[test]
+    fn debug_flag_resolves_to_debug_level_else_info() {
+        // The `--debug` flag is the only verbosity knob: on → DEBUG ceiling,
+        // off → the historical INFO. Parametric, never from `RUST_LOG`.
+        assert_eq!(level_filter(true), LevelFilter::DEBUG);
+        assert_eq!(level_filter(false), LevelFilter::INFO);
+
+        // And it lands on the config every sink reads its level from.
+        let cfg = LogConfig::new(false, None, None, true);
+        assert_eq!(cfg.level, LevelFilter::DEBUG);
+        let cfg = LogConfig::new(false, None, None, false);
+        assert_eq!(cfg.level, LevelFilter::INFO);
+    }
+
+    #[test]
+    fn debug_true_emits_debug_lines_false_drops_them() {
+        // End-to-end through the real layer builder: with debug on, a DEBUG
+        // event reaches the sink (this is the `secondary.log` fix); with it
+        // off, the INFO ceiling drops it. The INFO line passes either way.
+        let debug_on = run_capture_level(level_filter(true));
+        assert!(
+            debug_on.contains("an-info-line"),
+            "INFO line missing under debug: {debug_on}"
+        );
+        assert!(
+            debug_on.contains("a-debug-line"),
+            "DEBUG line missing under --debug — verbosity ceiling not raised: {debug_on}"
+        );
+
+        let debug_off = run_capture_level(level_filter(false));
+        assert!(
+            debug_off.contains("an-info-line"),
+            "INFO line missing under default level: {debug_off}"
+        );
+        assert!(
+            !debug_off.contains("a-debug-line"),
+            "DEBUG line leaked at the default INFO ceiling: {debug_off}"
+        );
+    }
+
     #[test]
     fn config_dir_wins_over_file_and_whitespace_is_unset() {
         // `LogConfig::new` is the param contract the Python CLI feeds:
         // the per-node dir takes precedence over the single file, and a
         // whitespace-only value collapses to "unset" so an empty CLI value
         // is treated the same as an omitted one.
-        let cfg = LogConfig::new(true, Some("/x/full.log".into()), Some("/x/dir".into()));
+        let cfg = LogConfig::new(true, Some("/x/full.log".into()), Some("/x/dir".into()), false);
         assert!(matches!(cfg.full_sink, FullSink::PerNodeDir(_)));
         assert!(cfg.important_stdio_only);
 
-        let cfg = LogConfig::new(false, Some("/x/full.log".into()), None);
+        let cfg = LogConfig::new(false, Some("/x/full.log".into()), None, false);
         assert!(matches!(cfg.full_sink, FullSink::File(_)));
 
-        let cfg = LogConfig::new(false, Some("   ".into()), Some("\t".into()));
+        let cfg = LogConfig::new(false, Some("   ".into()), Some("\t".into()), false);
         assert!(
             matches!(cfg.full_sink, FullSink::Stdout),
             "whitespace-only knobs must collapse to the stdout single-stream"
@@ -616,7 +709,7 @@ mod tests {
     fn no_full_log_file_yields_a_single_stdout_stream() {
         // Default config (no file, gate off) must produce exactly one
         // layer — the historical single stdout stream, no duplication.
-        let config = LogConfig::new(false, None, None);
+        let config = LogConfig::new(false, None, None, false);
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
@@ -635,6 +728,7 @@ mod tests {
             true,
             Some(dir.path().join("full.log").display().to_string()),
             None,
+            false,
         );
         let layers = build_layers::<Registry>(&config);
         assert_eq!(layers.len(), 2, "expected full-file layer + stdio layer");
@@ -649,7 +743,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
-        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()));
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
@@ -675,8 +769,12 @@ mod tests {
         let primary_buf = BufWriter::default();
         let secondary_buf = BufWriter::default();
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
-            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
-            role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN, LevelFilter::INFO),
+            role_full_layer::<Registry, _>(
+                secondary_buf.clone(),
+                SECONDARY_ROLE_SPAN,
+                LevelFilter::INFO,
+            ),
         ];
         let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
@@ -727,8 +825,12 @@ mod tests {
         let primary_buf = BufWriter::default();
         let secondary_buf = BufWriter::default();
         let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
-            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
-            role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN, LevelFilter::INFO),
+            role_full_layer::<Registry, _>(
+                secondary_buf.clone(),
+                SECONDARY_ROLE_SPAN,
+                LevelFilter::INFO,
+            ),
         ];
         let subscriber = Registry::default().with(layers);
         with_default(subscriber, || {
