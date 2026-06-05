@@ -56,11 +56,14 @@
 //! window is dropped (the framework drives no run loop in that window, so
 //! nothing operator-relevant is lost).
 
+mod compact_format;
+
 use std::fs::OpenOptions;
 use std::io;
 use std::path::PathBuf;
 
 use chrono::Local;
+use compact_format::{CompactRoleFormat, RoleTagLayer};
 use pyo3::prelude::*;
 use tracing::{Event, Metadata};
 use tracing_subscriber::filter::{FilterFn, LevelFilter};
@@ -197,6 +200,11 @@ pub(crate) fn important_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
 /// owns only the "record everything that passes the global ceiling" concern.
 /// Generic over the writer so tests can inject an in-memory buffer.
 ///
+/// The line shape is the compact, human-readable per-role format
+/// ([`CompactRoleFormat`]) — the same shape the role-split files emit, so the
+/// submitter's single `full_log_file` reads identically. The submitter's
+/// only role is its own primary, so the role token resolves to `P-<node>`.
+///
 /// Returned as a boxed layer so the two-layer set has one uniform type
 /// regardless of the writer concretes.
 pub(crate) fn full_layer<S, W>(make_writer: W) -> Box<dyn Layer<S> + Send + Sync>
@@ -206,6 +214,9 @@ where
 {
     tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
+        .event_format(CompactRoleFormat)
+        // Plain text for the persisted full-log file (see `role_full_layer`).
+        .with_ansi(false)
         .boxed()
 }
 
@@ -244,13 +255,18 @@ where
     }
 }
 
-/// Build a per-role full (everything) `fmt` layer over `writer`: verbose
-/// (RFC3339-UTC, target shown) like [`full_layer`], but scope-gated to the
-/// role span named `role_span_name`. Used by the per-node-dir sink to split
-/// `primary.log` / `secondary.log`. The verbosity ceiling is the single
-/// global subscriber-level filter (see [`init_with`]); this layer owns only
-/// the ROLE-routing concern, so a `--debug` run reaches the per-role files
-/// via the global ceiling, never a per-layer level filter.
+/// Build a per-role full (everything) `fmt` layer over `writer`, scope-gated
+/// to the role span named `role_span_name`. Used by the per-node-dir sink to
+/// split `primary.log` / `secondary.log`. The verbosity ceiling is the
+/// single global subscriber-level filter (see [`init_with`]); this layer
+/// owns only the ROLE-routing concern, so a `--debug` run reaches the
+/// per-role files via the global ceiling, never a per-layer level filter.
+///
+/// The line shape is the compact, human-readable per-role format
+/// ([`CompactRoleFormat`]): `{h:mm:ss local} {LEVEL} {P|S}-{id}  {message}`
+/// with no target, no `dynrunner_role_*{…}:` span prefix, and no span-field
+/// dump. The role prefix is read off the [`RoleTagLayer`]-recorded tag, so
+/// the format itself is role-agnostic — both role files share one formatter.
 fn role_full_layer<S, W>(
     make_writer: W,
     role_span_name: &'static str,
@@ -261,6 +277,12 @@ where
 {
     tracing_subscriber::fmt::layer()
         .with_writer(make_writer)
+        .event_format(CompactRoleFormat)
+        // Plain text: these are persisted files, never a terminal, so the
+        // default `fmt` ANSI colour/dim escapes around the level/fields would
+        // corrupt the host-readable log (same reason the important-stdio sink
+        // sets `with_ansi(false)`).
+        .with_ansi(false)
         .with_filter(RoleFilter { role_span_name })
         .boxed()
 }
@@ -403,8 +425,16 @@ where
 /// `TRACE`). Hoisting the level to the registry makes the ceiling explicit
 /// and robust.
 pub(crate) fn init_with(config: &LogConfig) {
+    // The [`RoleTagLayer`] recognises each coordinator's role span at
+    // creation and records the `{P|S}-{id}` attribution the per-role/full
+    // file formatter ([`CompactRoleFormat`]) reads back. It owns only
+    // recognition (no filter, no format), so it is attached once globally —
+    // the tag lands in the shared per-span extensions every sink layer can
+    // read. Harmless when the full sink is stdout-only (no compact-format
+    // layer reads the tag), so it is unconditional.
     let _ = tracing_subscriber::registry()
         .with(config.level)
+        .with(RoleTagLayer)
         .with(build_layers(config))
         .try_init();
 }
@@ -624,19 +654,19 @@ mod tests {
             );
         }
 
-        // The full sink keeps the verbose default format for debugging:
-        // the same event carries the target and an RFC3339-UTC instant.
+        // The full sink now uses the SAME compact per-role format as the
+        // role-split files: no target (`module::path:`), no RFC3339-UTC `Z`.
         let full_line = full
             .lines()
             .find(|l| l.contains("wake-the-llm"))
             .unwrap_or_else(|| panic!("important line missing from full sink: {full}"));
         assert!(
-            full_line.contains(IMPORTANT_TARGET),
-            "full sink dropped the target — verbose format regressed: {full_line:?}"
+            !full_line.contains(IMPORTANT_TARGET),
+            "full sink still carries the target — compact format regressed: {full_line:?}"
         );
         assert!(
-            full_line.contains('Z'),
-            "full sink dropped the RFC3339-UTC stamp — verbose format regressed: {full_line:?}"
+            !full_line.contains('Z'),
+            "full sink still carries the RFC3339-UTC stamp — compact format regressed: {full_line:?}"
         );
     }
 
