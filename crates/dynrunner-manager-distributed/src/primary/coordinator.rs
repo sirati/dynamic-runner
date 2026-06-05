@@ -2978,6 +2978,18 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let mut fleet_dead_poll = tokio::time::interval(self.config.fleet_dead_timeout);
         fleet_dead_poll.tick().await;
 
+        // Anti-entropy cadence. On each tick this observer broadcasts its
+        // `StateDigest` so peers learn its view (and it pulls when a peer's
+        // digest shows the observer is behind — the apply-only observer's
+        // periodic catch-up beyond the one-shot bootstrap RPC). The period
+        // carries a deterministic per-node jitter (from `node_id`); the
+        // immediate first tick is consumed so the first broadcast lands one
+        // full period in.
+        let mut anti_entropy_tick =
+            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.node_id));
+        anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        anti_entropy_tick.tick().await;
+
         // Operator run-narration over the replicated CRDT. After this
         // bootstrap relocation the operator's process IS this observer, so
         // the run narrative (phase started / complete, the one-shot
@@ -3246,6 +3258,64 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                                         }
                                     }
                                 }
+                                MessageType::StateDigest => {
+                                    // Anti-entropy receive on the observer.
+                                    // Compare the peer's digest against the
+                                    // observer's apply-only mirror and pull a
+                                    // snapshot iff behind — the periodic
+                                    // catch-up beyond the one-shot bootstrap
+                                    // RPC. The compare + target selection live
+                                    // in `crate::anti_entropy` (shared across
+                                    // all three roles); this arm only owns the
+                                    // `send_to`. The pull's reply heals via the
+                                    // `ClusterSnapshot` recv arm above
+                                    // (idempotent `restore`), so a converged
+                                    // second round matches and pulls nothing.
+                                    // The observer NEVER re-broadcasts a peer's
+                                    // digest; it only sends its own request.
+                                    if let DistributedMessage::StateDigest {
+                                        digest,
+                                        sender_id,
+                                        ..
+                                    } = &m
+                                    {
+                                        let local = self.cluster_state.digest();
+                                        let requester =
+                                            crate::anti_entropy::RequesterIdentity {
+                                                node_id: &self.config.node_id,
+                                                // This tail is a strict
+                                                // observer: never primary-capable.
+                                                is_observer: true,
+                                                can_be_primary: false,
+                                            };
+                                        if let Some((destination, request)) =
+                                            crate::anti_entropy::reconcile_against_peer(
+                                                &local,
+                                                digest,
+                                                sender_id,
+                                                self.cluster_state.current_primary(),
+                                                &requester,
+                                                crate::primary::wire::timestamp_now(),
+                                            )
+                                        {
+                                            if let Err(e) =
+                                                self.send_to(destination, request).await
+                                            {
+                                                tracing::debug!(
+                                                    error = %e,
+                                                    "observer tail: anti-entropy snapshot \
+                                                     pull request send failed; a later \
+                                                     digest round retries"
+                                                );
+                                            } else {
+                                                tracing::debug!(
+                                                    "observer tail: behind peer digest; \
+                                                     requested snapshot pull"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                                 other => {
                                     tracing::trace!(
                                         msg_type = ?other,
@@ -3291,6 +3361,25 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // the loop so the top-of-loop dead-fleet grace check
                 // re-evaluates when there is no recv traffic to do so.
                 _ = fleet_dead_poll.tick() => {}
+                // Anti-entropy tick: broadcast the observer's digest so
+                // peers learn its view and it converges with the mesh. Pure
+                // EMIT of the role-agnostic frame from `crate::anti_entropy`;
+                // the receive-side compare+pull is the `StateDigest` recv arm
+                // above. `interval.tick` is cancel-safe (tokio docs).
+                _ = anti_entropy_tick.tick() => {
+                    let digest = self.cluster_state.digest();
+                    let frame = crate::anti_entropy::digest_broadcast(
+                        &self.config.node_id,
+                        crate::primary::wire::timestamp_now(),
+                        digest,
+                    );
+                    let _ = self
+                        .send_to(
+                            dynrunner_protocol_primary_secondary::Destination::All,
+                            frame,
+                        )
+                        .await;
+                }
             }
         }
     }

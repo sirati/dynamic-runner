@@ -121,6 +121,22 @@ fn roundtrip_all_message_types() {
             timestamp: 0.0,
             snapshot_json: "{}".into(),
         },
+        DistributedMessage::StateDigest {
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            digest: StateDigest {
+                tasks_count: 7,
+                tasks_hash: 0xDEAD_BEEF,
+                secondary_capacities_count: 2,
+                secondary_capacities_hash: 0x42,
+                task_outputs_count: 4,
+                task_outputs_hash: 0xABC,
+                phase_deps_count: 5,
+                primary_epoch: 3,
+                run_complete: true,
+                run_aborted: false,
+            },
+        },
         DistributedMessage::TaskComplete {
             sender_id: "s".into(),
             timestamp: 0.0,

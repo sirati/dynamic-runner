@@ -1,3 +1,4 @@
+pub mod anti_entropy;
 pub mod cluster_state;
 pub mod fulfillability_matcher;
 pub mod message_router;

@@ -542,6 +542,46 @@ where
                 }
                 Ok(())
             }
+            DistributedMessage::StateDigest { digest, sender_id, .. } => {
+                // Anti-entropy receive: compare the peer's digest against
+                // ours and pull a snapshot iff we are behind. The decision
+                // (compare + target selection + request construction) lives
+                // in `crate::anti_entropy` so primary / secondary / observer
+                // share ONE policy; this arm only owns the `send_to` edge.
+                // The pull's reply heals via the existing `ClusterSnapshot`
+                // recv arm above (idempotent `restore`), so a converged
+                // second round matches and pulls nothing (self-quiescing).
+                let local = self.cluster_state.digest();
+                let requester = crate::anti_entropy::RequesterIdentity {
+                    node_id: &self.config.secondary_id,
+                    is_observer: self.config.is_observer,
+                    can_be_primary: self.config.can_be_primary,
+                };
+                if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
+                    &local,
+                    &digest,
+                    &sender_id,
+                    self.cluster_state.current_primary(),
+                    &requester,
+                    timestamp_now(),
+                ) {
+                    if let Err(e) = self.send_to(destination, request).await {
+                        tracing::debug!(
+                            error = %e,
+                            peer = %sender_id,
+                            "anti-entropy: snapshot pull request send failed; \
+                             a later digest round retries"
+                        );
+                    } else {
+                        tracing::debug!(
+                            peer = %sender_id,
+                            "anti-entropy: local replica behind peer digest; \
+                             requested snapshot pull"
+                        );
+                    }
+                }
+                Ok(())
+            }
             DistributedMessage::ClusterMutation { mutations, .. } => {
                 // `apply_cluster_mutations` mirrors the batch and, for a
                 // `PrimaryChanged`, runs the unified primary-activation

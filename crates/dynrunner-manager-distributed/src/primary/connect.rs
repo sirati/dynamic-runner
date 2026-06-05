@@ -204,6 +204,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             MessageType::RequestClusterSnapshot => {
                 self.handle_request_cluster_snapshot(msg).await
             }
+            // Anti-entropy receive arm. A peer's periodic `StateDigest`;
+            // the primary compares it against its own and pulls a snapshot
+            // only if it is somehow behind (almost always a NoOp on the
+            // authoritative primary). See `handle_state_digest`.
+            MessageType::StateDigest => self.handle_state_digest(msg).await,
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

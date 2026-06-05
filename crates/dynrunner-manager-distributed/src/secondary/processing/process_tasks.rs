@@ -236,6 +236,19 @@ where
         // period in rather than firing on entry.
         cluster_state_refresh_interval.reset();
 
+        // Anti-entropy cadence. On each tick this secondary broadcasts its
+        // `StateDigest` so peers behind it pull a snapshot (and vice
+        // versa). The period carries a deterministic per-node jitter (from
+        // `secondary_id`) so the fleet's digests spread across the window
+        // instead of bursting together. `Skip` collapses a post-suspend
+        // backlog to one catch-up tick; `reset()` drops the immediate first
+        // tick so the first broadcast lands one full period in.
+        let mut anti_entropy_interval = tokio::time::interval(
+            crate::anti_entropy::tick_period(&self.config.secondary_id),
+        );
+        anti_entropy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        anti_entropy_interval.reset();
+
         // The secondary holds NO authority and processes NO command
         // channel: the externally-issued `PrimaryCommand`s
         // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
@@ -561,6 +574,20 @@ where
                     if let Some(callback) = on_cluster_state_refresh.as_ref() {
                         callback(&self.cluster_state);
                     }
+                }
+                // Anti-entropy tick: broadcast this secondary's digest so
+                // every peer can detect divergence and pull. Pure EMIT of
+                // the role-agnostic frame built by `crate::anti_entropy`;
+                // the receive-side compare+pull lives in the `StateDigest`
+                // router arm. `interval.tick` is cancel-safe (tokio docs).
+                _ = anti_entropy_interval.tick() => {
+                    let digest = self.cluster_state.digest();
+                    let frame = crate::anti_entropy::digest_broadcast(
+                        &self.config.secondary_id,
+                        crate::secondary::wire::timestamp_now(),
+                        digest,
+                    );
+                    let _ = self.send_to(Destination::All, frame).await;
                 }
             }
 

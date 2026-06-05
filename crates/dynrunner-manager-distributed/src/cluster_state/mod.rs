@@ -36,6 +36,7 @@ mod apply;
 mod apply_peer;
 mod apply_tasks;
 mod broadcast;
+mod digest;
 mod events;
 mod snapshot;
 mod state;

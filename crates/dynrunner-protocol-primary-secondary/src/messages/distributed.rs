@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
+use crate::messages::state_digest::StateDigest;
 
 /// The typed message enum. Each variant carries exactly the payload
 /// from the Python protocol, with `sender_id` and `timestamp` common fields.
@@ -261,6 +262,27 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
         snapshot_json: String,
+    },
+    /// Periodic anti-entropy fingerprint. Every role broadcasts its
+    /// [`StateDigest`] on the convergence cadence; a receiver compares
+    /// the carried digest against its own (`StateDigest::is_behind`) and,
+    /// when it finds the sender holds ledger data it is missing, pulls a
+    /// full snapshot via the existing `RequestClusterSnapshot` →
+    /// `ClusterSnapshot` → `restore()` path. The digest is the DETECTOR
+    /// only — it carries no task payloads (just per-field counts + `u64`
+    /// folds) and triggers no merge by itself, so steady-state cost is a
+    /// fixed handful of integers per node per period and a converged mesh
+    /// exchanges digests that match and pull nothing (self-quiescing).
+    ///
+    /// The digest is identifier-erased by construction (every member is a
+    /// `u64`/`bool` summary, never an `I`-typed payload), so the frame
+    /// carries the concrete [`StateDigest`] inline rather than a
+    /// JSON-erased string the way `ClusterSnapshot` carries its
+    /// `I`-parametric payload.
+    StateDigest {
+        sender_id: String,
+        timestamp: f64,
+        digest: StateDigest,
     },
     TaskComplete {
         sender_id: String,

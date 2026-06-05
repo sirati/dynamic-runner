@@ -122,6 +122,18 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
 
+        // Anti-entropy cadence. On each tick the primary broadcasts its
+        // `StateDigest` so any follower behind the authoritative ledger
+        // pulls a snapshot to converge. The period carries a deterministic
+        // per-node jitter (from `node_id`) so the fleet's digests spread
+        // across the window. `Skip` collapses a post-suspend backlog to one
+        // catch-up tick; the immediate first tick is consumed so the first
+        // broadcast lands one full period in.
+        let mut anti_entropy_tick =
+            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.node_id));
+        anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        anti_entropy_tick.tick().await;
+
         // One-shot gate on the single recv arm. Flips true the first
         // time `transport.recv_peer()` returns `None`. Mirrors
         // `SecondaryCoordinator.primary_disconnected` (see
@@ -520,6 +532,26 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     // declaration/requeue policy. See
                     // `process_heartbeat_tick` for detail.
                     self.process_heartbeat_tick().await?;
+                }
+                // Anti-entropy tick: broadcast the primary's digest so any
+                // follower behind the authoritative ledger pulls + converges.
+                // Pure EMIT of the role-agnostic frame from
+                // `crate::anti_entropy`; the receive-side compare+pull is in
+                // the primary `dispatch_message` `StateDigest` arm.
+                // `interval.tick` is cancel-safe (tokio docs).
+                _ = anti_entropy_tick.tick() => {
+                    let digest = self.cluster_state.digest();
+                    let frame = crate::anti_entropy::digest_broadcast(
+                        &self.config.node_id,
+                        crate::primary::wire::timestamp_now(),
+                        digest,
+                    );
+                    let _ = self
+                        .send_to(
+                            dynrunner_protocol_primary_secondary::Destination::All,
+                            frame,
+                        )
+                        .await;
                 }
                 req = async {
                     match respawn_request_rx.as_mut() {
