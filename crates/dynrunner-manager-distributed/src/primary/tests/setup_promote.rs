@@ -78,6 +78,31 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         // exits "all tasks completed or failed".
         let bin = make_binary("setup-discovered-task", 100);
         let hash = crate::primary::wire::compute_task_hash(&bin);
+        // Regression guard: the seed `TaskAdded` for a setup-discovered
+        // task must be keyed with the wire-canonical recipe, which folds
+        // `phase_id` into the hash. A prior secondary-side seed helper
+        // hashed only `path + identifier`; for any phase-bearing task
+        // that key DIVERGED from `compute_task_hash`, so every
+        // assignment/completion the promoted primary later originated
+        // (keyed by `compute_task_hash`) missed the ledger entry and the
+        // CRDT row stayed Pending forever. Pin that the canonical key is
+        // sensitive to `phase_id` — a path+identifier-only hash would
+        // collide a different-phase task here and would NOT match this
+        // value, which is the divergence the bug shipped on.
+        let bare_path_identifier_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            bin.path.hash(&mut h);
+            bin.identifier.hash(&mut h);
+            format!("{:016x}", h.finish())
+        };
+        assert_ne!(
+            hash, bare_path_identifier_hash,
+            "the canonical seed key must fold phase_id in; a path+\
+             identifier-only key is the drifted recipe that stranded \
+             setup-discovered tasks in the CRDT ledger",
+        );
         incoming_tx
             .send(DistributedMessage::ClusterMutation {
                 sender_id: "sec-promoted".into(),

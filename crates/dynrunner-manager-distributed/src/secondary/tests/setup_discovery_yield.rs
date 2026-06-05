@@ -149,3 +149,169 @@ async fn empty_discovery_latches_without_reyield() {
         })
         .await;
 }
+
+/// Wire-shape mirror: the secondary's `ingest_setup_discovery` seed key
+/// for a phase-bearing task MUST equal the key the promoted primary
+/// derives at assignment/completion time. Both sides are
+/// [`dynrunner_core::compute_task_hash`] — the single canonical recipe
+/// that folds `phase_id` into the hash. This asserts the keys match by
+/// mirroring the OTHER side's recipe (the primary's
+/// `compute_task_hash`), not by round-tripping the secondary's own seed.
+///
+/// The historical defect seeded with a path+identifier-only hash that
+/// dropped `phase_id`; for any phase-bearing task that key diverged from
+/// `compute_task_hash`, so this assertion would have caught it.
+#[tokio::test(flavor = "current_thread")]
+async fn seed_key_mirrors_primary_assignment_key() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+            sec.enter_operational_for_test();
+            sec.set_pre_staged_mode(true);
+
+            let bin = make_binary("phase-bearing-item", 1);
+            // The non-default phase_id is the load-bearing differentiator:
+            // a recipe that drops it would collide every phase and miss
+            // the primary's assignment key. `make_binary` already sets a
+            // non-empty phase_id; pin it explicitly here so the test's
+            // premise (phase-bearing task) is self-evident.
+            assert!(
+                !bin.phase_id.as_str().is_empty(),
+                "the seed task must carry a phase_id for this mirror to mean anything",
+            );
+
+            let mut deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            deps.insert(bin.phase_id.clone(), vec![]);
+            sec.ingest_setup_discovery(vec![bin.clone()], deps)
+                .await
+                .expect("ingest must succeed");
+
+            // The primary's assignment/completion paths key on
+            // `compute_task_hash` (see `lifecycle/dispatch.rs`,
+            // `task/request.rs`, `task/complete.rs`). The seed must land
+            // under that EXACT key for the ledger entry to be found.
+            let primary_key = dynrunner_core::compute_task_hash(&bin);
+            assert!(
+                sec.cluster_state.task_state(&primary_key).is_some(),
+                "the seed `TaskAdded` must be keyed by `compute_task_hash` \
+                 (the primary's assignment key); a divergent seed recipe \
+                 leaves the ledger entry unreachable by every later \
+                 assignment/completion mutation",
+            );
+
+            // Mirror-recipe divergence guard: a path+identifier-only hash
+            // (the drifted recipe) is NOT the seed key for a phase-bearing
+            // task — proving the canonical key is phase-sensitive.
+            let bare_path_identifier_hash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                bin.path.hash(&mut h);
+                bin.identifier.hash(&mut h);
+                format!("{:016x}", h.finish())
+            };
+            assert_ne!(
+                primary_key, bare_path_identifier_hash,
+                "the canonical recipe must fold phase_id in; the bare \
+                 path+identifier hash is the drifted recipe the bug shipped",
+            );
+            assert!(
+                sec.cluster_state.task_state(&bare_path_identifier_hash).is_none(),
+                "the ledger must NOT carry an entry under the bare \
+                 path+identifier key — if it did, the seed used the \
+                 drifted recipe and would strand the task",
+            );
+        })
+        .await;
+}
+
+/// End-to-end CRDT-terminal regression: seed via the REAL
+/// `ingest_setup_discovery` path, then apply a cross-process-style
+/// `TaskAssigned` + `TaskCompleted` keyed (as the promoted primary keys
+/// them) by `compute_task_hash`. The replicated `outcome_counts()` MUST
+/// reach `succeeded == total` with zero stranded (`counts().pending ==
+/// 0`).
+///
+/// Fails-before semantics: pre-fix the seed keyed the ledger by a
+/// path+identifier-only hash that dropped `phase_id`. The
+/// `compute_task_hash`-keyed `TaskCompleted` then found no matching
+/// entry (`apply` returns NoOp), so the CRDT row stayed `Pending`
+/// forever — `outcome_counts().succeeded == 0` and `pending == total`
+/// ("cluster routing collapsed"). Post-fix both sides share the
+/// canonical recipe, the completion lands, and the row reaches
+/// `Completed`. The `seed_key_mirrors_primary_assignment_key` test above
+/// pins the keys-match precondition that makes this terminal reachable.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+            sec.enter_operational_for_test();
+            sec.set_pre_staged_mode(true);
+
+            let binaries = vec![
+                make_binary("disc-0", 1),
+                make_binary("disc-1", 1),
+                make_binary("disc-2", 1),
+                make_binary("disc-3", 1),
+            ];
+            let total = binaries.len();
+
+            let mut deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            deps.insert(PhaseId::from("default"), vec![]);
+            sec.ingest_setup_discovery(binaries.clone(), deps)
+                .await
+                .expect("ingest must succeed");
+
+            // Before any completion: every discovered task sits Pending
+            // in the replicated ledger, none terminal.
+            assert_eq!(sec.cluster_state.outcome_counts().succeeded, 0);
+            assert_eq!(sec.cluster_state.counts().pending, total);
+
+            // Drive each task to terminal the way the promoted primary
+            // does it on the replicated CRDT: assign (Pending -> InFlight)
+            // then complete (InFlight -> Completed), keyed by
+            // `compute_task_hash` — the SAME recipe the assignment +
+            // completion wire paths use. This is the cross-process
+            // mutation the demolished band-aid keyed differently from the
+            // seed.
+            for bin in &binaries {
+                let key = dynrunner_core::compute_task_hash(bin);
+                sec.cluster_state.apply(ClusterMutation::<_>::TaskAssigned {
+                    hash: key.clone(),
+                    secondary: "sec-promoted".into(),
+                    worker: 0u32,
+                });
+                sec.cluster_state.apply(ClusterMutation::<_>::TaskCompleted {
+                    hash: key,
+                    result_data: None,
+                });
+            }
+
+            // CRDT-authoritative terminal: every task succeeded, none
+            // stranded. This is the read the demoted primary / observer
+            // terminal log line consumes (`outcome_counts`), NOT a
+            // per-node HashSet counter.
+            let outcome = sec.cluster_state.outcome_counts();
+            assert_eq!(
+                outcome.succeeded, total,
+                "every setup-discovered task must reach Completed in the \
+                 replicated ledger; succeeded < total means the completion \
+                 mutation missed the seed entry (divergent hash recipe)",
+            );
+            assert_eq!(
+                sec.cluster_state.counts().pending, 0,
+                "no task may be stranded Pending after every completion \
+                 lands; a non-zero count is the 'cluster routing \
+                 collapsed' symptom",
+            );
+            assert_eq!(
+                outcome.fail_retry + outcome.fail_oom + outcome.fail_final,
+                0,
+                "no task may be classified as failed in this happy path",
+            );
+        })
+        .await;
+}
