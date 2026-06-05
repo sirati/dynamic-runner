@@ -3,6 +3,7 @@
 //! step-for-step in the same order as the legacy Python
 //! `pipeline.py::run_slurm_pipeline`.
 
+use dynrunner_core::IMPORTANT_TARGET;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -46,6 +47,10 @@ pub(crate) fn run_slurm_pipeline<'py>(
     log.call_method1("info", (format!("Run ID: {run_id}"),))?;
 
     // ---- Gateway construction. ----
+    // A1 gateway-connect milestone (LLM-wake): direct importance emit so
+    // the dual-sink surfaces it on stdio under `--important-stdio-only`.
+    // Additive to the full-log `log.info` below.
+    tracing::info!(target: IMPORTANT_TARGET, "Connecting to gateway...");
     log.call_method1("info", ("Connecting to gateway...",))?;
     let pkg_gateway = py.import("dynamic_runner.packaging.gateway")?;
     let gateway_url = args.getattr("gateway")?;
