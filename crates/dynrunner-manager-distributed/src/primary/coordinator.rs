@@ -2722,7 +2722,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // PanikShutdown into `std::process::exit(137)` so the SLURM
         // wrapper reaps the container.
         if let Some((matched_path, reason)) = self.panik_outcome.take() {
-            tracing::warn!(
+            tracing::error!(
                 matched_path = %matched_path.display(),
                 reason = %reason,
                 "primary run aborted by panik signal; surfacing PanikShutdown"
@@ -2786,7 +2786,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // is Some and `run_retry_passes` bailed at the top of its
         // next iteration. Pick it up here.
         if let Some((matched_path, reason)) = self.panik_outcome.take() {
-            tracing::warn!(
+            tracing::error!(
                 matched_path = %matched_path.display(),
                 reason = %reason,
                 "primary run aborted by panik signal during retry passes; \

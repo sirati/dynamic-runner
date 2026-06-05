@@ -200,6 +200,7 @@ where
     pub(in crate::secondary) async fn handle_panik_signal(
         &mut self,
         matched_path: std::path::PathBuf,
+        sender_pid: Option<u32>,
         kill_grace: std::time::Duration,
     ) -> (std::path::PathBuf, String) {
         // Source dispatch on the watcher's documented predicate.
@@ -214,14 +215,23 @@ where
             format!("panik file: {}", matched_path.display())
         };
         if is_sigterm {
-            tracing::warn!(
+            // `sender_pid` is the load-bearing diagnostic: who sent the
+            // SIGTERM. `Some(0)` = kernel-originated (OOM-killer);
+            // `Some(pid)` names the sender (slurmstepd on SLURM
+            // TIMEOUT/scancel, the wrapper/shutdown-manager, etc.);
+            // `None` = sender capture was unavailable.
+            tracing::error!(
                 secondary = %self.config.secondary_id,
                 matched_path = %matched_path.display(),
-                "SIGTERM panik signal observed; local-only worker teardown \
-                 (no cluster broadcast — mesh remains free to re-elect)"
+                sender_pid = ?sender_pid,
+                "SIGTERM panik from pid={sender}; local-only worker teardown \
+                 (no cluster broadcast — mesh remains free to re-elect)",
+                sender = sender_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
             );
         } else {
-            tracing::warn!(
+            tracing::error!(
                 secondary = %self.config.secondary_id,
                 matched_path = %matched_path.display(),
                 "panik file observed; announcing self-departure and \

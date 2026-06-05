@@ -75,11 +75,91 @@
 //! cluster.
 
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+/// Sentinel for "no SIGTERM sender PID captured yet" in
+/// [`LAST_SIGTERM_SENDER_PID`]. `0` is a VALID `si_pid` (the kernel sets
+/// it to 0 for kernel-originated signals such as an OOM-kill), so the
+/// sentinel must be a value the kernel never reports as a sender PID.
+/// `pid_t` is signed; a negative sentinel can never collide with a real
+/// PID (which is always `>= 0`).
+const NO_SENDER_PID: i32 = i32::MIN;
+
+/// Process-static slot the [`SA_SIGINFO`] action stores the SIGTERM
+/// sender's `si_pid` into. Read by [`wait_for_sigterm_if_enabled`] once
+/// tokio's signal stream reports a SIGTERM (the registry runs both the
+/// store and tokio's self-pipe write in one multiplexed handler
+/// invocation, so the store is visible by the time the stream resolves).
+///
+/// A process-static is intrinsic to signal handling: the C handler
+/// signature carries no user context, so the captured PID has nowhere to
+/// live but a static. Scoped to this module; the only writer is the
+/// action installed by [`install_sigterm_sender_capture`].
+static LAST_SIGTERM_SENDER_PID: AtomicI32 = AtomicI32::new(NO_SENDER_PID);
+
+/// Install (once per process) a chained `SA_SIGINFO` action that records
+/// the SIGTERM sender's `si_pid` into [`LAST_SIGTERM_SENDER_PID`].
+///
+/// `signal_hook_registry::register_sigaction` registers under the SAME
+/// multiplexed C handler tokio uses for its own SIGTERM stream, so this
+/// action and tokio's self-pipe write both run on a single delivery —
+/// the watcher keeps tokio's `select!`-friendly stream for the async
+/// wakeup and reads the captured PID afterwards. The action body does
+/// nothing but a relaxed atomic store (async-signal-safe).
+///
+/// Idempotent via a `Once`: re-running the watcher (e.g. the secondary
+/// `SetupPending` caller-loop re-entry, or multiple in-process managers)
+/// must not stack duplicate actions. A failed install is logged and
+/// tolerated — the SIGTERM trigger still fires (tokio's stream is
+/// independent); only the sender-PID enrichment is lost, leaving the log
+/// to report `None`.
+fn install_sigterm_sender_capture() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // SAFETY: `register_sigaction` is unsafe because the action runs
+        // in signal context — our action is async-signal-safe (a single
+        // relaxed atomic store; no allocation, no lock, no shared state
+        // beyond the atomic). It installs via `SA_SIGINFO` and chains the
+        // previous handler (tokio's), so tokio's stream still wakes. The
+        // closure literal is lexically inside this `unsafe` block, so the
+        // `si_pid()` union-field read it makes is covered: `si_pid()` is
+        // valid for SIGTERM (a kill-class signal carrying its source), and
+        // the registry only dispatches this action for the signal it was
+        // registered under (SIGTERM), so the `siginfo_t` union
+        // discriminant matches.
+        let result = unsafe {
+            signal_hook_registry::register_sigaction(libc::SIGTERM, |info: &libc::siginfo_t| {
+                LAST_SIGTERM_SENDER_PID.store(info.si_pid(), Ordering::Relaxed);
+            })
+        };
+        if let Err(e) = result {
+            tracing::error!(
+                error = %e,
+                "panik watcher: failed to install SIGTERM sender-capture action; \
+                 sender PID will be unavailable in the panik log (trigger still active)"
+            );
+        }
+    });
+}
+
+/// Read and clear the last captured SIGTERM sender PID. Returns
+/// `Some(pid)` if the capture action recorded one (and resets the slot
+/// so a subsequent SIGTERM in the same process starts fresh), or `None`
+/// if no PID was captured (install failed, or the slot was never
+/// written). A captured `0` means a kernel-originated SIGTERM (e.g. the
+/// OOM-killer) — surfaced as `Some(0)`, distinct from `None`.
+fn take_sigterm_sender_pid() -> Option<u32> {
+    match LAST_SIGTERM_SENDER_PID.swap(NO_SENDER_PID, Ordering::Relaxed) {
+        NO_SENDER_PID => None,
+        pid => Some(pid as u32),
+    }
+}
 
 /// Sentinel `matched_path` carried by a [`PanikSignal`] that was
 /// triggered by SIGTERM rather than by a filesystem path. Documented
@@ -160,6 +240,14 @@ pub struct PanikSignal {
     /// the departure announcement's `SelfDeparture` reason so the
     /// terminal log shows which sentinel triggered the shutdown.
     pub matched_path: PathBuf,
+    /// PID of the process that sent the SIGTERM, when the trigger source
+    /// was SIGTERM and the kernel reported a sender. `Some(0)` is a
+    /// kernel-originated SIGTERM (e.g. the OOM-killer); `Some(pid > 0)`
+    /// names the sending process (slurmstepd on a SLURM TIMEOUT/scancel,
+    /// the wrapper/shutdown-manager, etc.). `None` for a filesystem-path
+    /// trigger (no signal) or when the sender could not be captured.
+    /// Load-bearing diagnostic: it reveals WHO killed the secondary.
+    pub sender_pid: Option<u32>,
 }
 
 /// Handle returned by [`spawn_panik_watcher`]. Hold for the lifetime
@@ -202,21 +290,26 @@ impl Drop for PanikWatcher {
     }
 }
 
-/// Future returning the path observed to exist by polling, or
-/// `pending()` forever when no paths are configured. Loops:
-/// stat every path, return first match; sleep `poll_interval`; repeat.
-/// Cancellation-safe at every yield (`tokio::time::sleep`).
-async fn wait_for_file_match(paths: Vec<PathBuf>, poll_interval: Duration) -> PathBuf {
+/// Future returning the path observed to exist by polling (with no
+/// sender PID — a file trigger carries no signal), or `pending()`
+/// forever when no paths are configured. Loops: stat every path, return
+/// first match; sleep `poll_interval`; repeat. Cancellation-safe at
+/// every yield (`tokio::time::sleep`). The `Option<u32>` second element
+/// keeps the two `select!` arms type-uniform; it is always `None` here.
+async fn wait_for_file_match(
+    paths: Vec<PathBuf>,
+    poll_interval: Duration,
+) -> (PathBuf, Option<u32>) {
     if paths.is_empty() {
         // Structurally present `select!` arm that never fires when
         // file-trigger is unconfigured. Keeps the spawn body
         // source-agnostic.
-        std::future::pending::<PathBuf>().await
+        std::future::pending::<(PathBuf, Option<u32>)>().await
     } else {
         loop {
             for path in &paths {
                 if std::fs::metadata(path).is_ok() {
-                    return path.clone();
+                    return (path.clone(), None);
                 }
             }
             tokio::time::sleep(poll_interval).await;
@@ -224,10 +317,19 @@ async fn wait_for_file_match(paths: Vec<PathBuf>, poll_interval: Duration) -> Pa
     }
 }
 
-/// Future returning [`sigterm_sentinel_path`] on first SIGTERM, or
-/// `pending()` forever when SIGTERM listening is disabled or the
-/// `tokio::signal::unix::signal(SignalKind::terminate())` install
-/// fails. Cancellation-safe (`Signal::recv` is documented as such).
+/// Future returning ([`sigterm_sentinel_path`], `Some(sender_pid)`) on
+/// first SIGTERM, or `pending()` forever when SIGTERM listening is
+/// disabled or the `tokio::signal::unix::signal(SignalKind::terminate())`
+/// install fails. Cancellation-safe (`Signal::recv` is documented as
+/// such).
+///
+/// Sender capture: alongside tokio's stream we install (once per
+/// process, via [`install_sigterm_sender_capture`]) a chained
+/// `SA_SIGINFO` action that records the delivery's `si_pid`. The
+/// `signal-hook-registry` master handler runs BOTH our action and
+/// tokio's self-pipe write on the same delivery, so by the time the
+/// stream resolves the captured PID is already stored — read it via
+/// [`take_sigterm_sender_pid`]. `None` if capture was unavailable.
 ///
 /// Install-failure handling: log at `tracing::error!` and degrade to
 /// `pending()`. File polling stays functional; the operator can still
@@ -236,10 +338,15 @@ async fn wait_for_file_match(paths: Vec<PathBuf>, poll_interval: Duration) -> Pa
 /// the sender, which the coordinator's `select!` would observe as a
 /// silent `RecvError` — indistinguishable from clean abort. Logging +
 /// pending is the explicit "degraded but still alive" shape.
-async fn wait_for_sigterm_if_enabled(enabled: bool) -> PathBuf {
+async fn wait_for_sigterm_if_enabled(enabled: bool) -> (PathBuf, Option<u32>) {
     if !enabled {
-        return std::future::pending::<PathBuf>().await;
+        return std::future::pending::<(PathBuf, Option<u32>)>().await;
     }
+    // Install the sender-capture action BEFORE the tokio stream so the
+    // `SA_SIGINFO` slot is armed for the very first delivery. Idempotent
+    // (Once-guarded); a failure here only loses the sender-PID
+    // enrichment, not the trigger.
+    install_sigterm_sender_capture();
     let mut stream = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
@@ -248,15 +355,17 @@ async fn wait_for_sigterm_if_enabled(enabled: bool) -> PathBuf {
                 "panik watcher: failed to install SIGTERM handler; \
                  SIGTERM trigger disabled (file trigger still active)"
             );
-            return std::future::pending::<PathBuf>().await;
+            return std::future::pending::<(PathBuf, Option<u32>)>().await;
         }
     };
     // `recv().await` returns `None` only when the stream is dropped,
     // which doesn't happen here because we own it on the stack.
     // First `Some(())` is the first SIGTERM delivered to this
-    // process after the handler was installed.
+    // process after the handler was installed. The capture action ran
+    // in the same multiplexed handler invocation, so the sender PID is
+    // already stored.
     let _ = stream.recv().await;
-    sigterm_sentinel_path()
+    (sigterm_sentinel_path(), take_sigterm_sender_pid())
 }
 
 /// Spawn the watcher task. Returns a [`PanikWatcher`] handle.
@@ -299,11 +408,14 @@ pub fn spawn_panik_watcher(cfg: PanikWatcherConfig) -> PanikWatcher {
         // dropped cleanly when the winner returns. Each arm returns
         // `PathBuf`; the task body is source-agnostic — adding a new
         // trigger means a new helper + a new `select!` arm.
-        let matched_path = tokio::select! {
+        let (matched_path, sender_pid) = tokio::select! {
             p = wait_for_file_match(cfg.paths, cfg.poll_interval) => p,
             p = wait_for_sigterm_if_enabled(cfg.listen_for_sigterm) => p,
         };
-        let _ = signal_tx.send(PanikSignal { matched_path });
+        let _ = signal_tx.send(PanikSignal {
+            matched_path,
+            sender_pid,
+        });
     });
     PanikWatcher {
         signal_rx: Some(signal_rx),
@@ -496,6 +608,16 @@ mod tests {
             .expect("sender must not drop before firing");
         assert_eq!(signal.matched_path, sigterm_sentinel_path());
         assert!(is_sigterm_signal(&signal.matched_path));
+        // The chained `SA_SIGINFO` action must have captured the sender
+        // PID. `raise` delivers a self-directed SIGTERM, so the recorded
+        // `si_pid` is this test process's own PID. The load-bearing
+        // diagnostic: a captured sender, not `None`.
+        let me = std::process::id();
+        assert_eq!(
+            signal.sender_pid,
+            Some(me),
+            "SIGTERM sender PID must be captured and equal this process's PID"
+        );
     }
 
     /// SIGTERM-and-file both enabled: SIGTERM arrives first; signal
@@ -552,6 +674,8 @@ mod tests {
             .expect("sender must not drop before firing");
         assert_eq!(signal.matched_path, path);
         assert!(!is_sigterm_signal(&signal.matched_path));
+        // A file trigger carries no signal, hence no sender PID.
+        assert_eq!(signal.sender_pid, None);
     }
 
     /// `listen_for_sigterm: false` does NOT install a tokio

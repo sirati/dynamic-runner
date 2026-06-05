@@ -618,7 +618,7 @@ impl PyObserverLateJoiner {
                                             matched_path,
                                             reason,
                                         }) => {
-                                            tracing::warn!(
+                                            tracing::error!(
                                                 matched_path = %matched_path.display(),
                                                 reason = %reason,
                                                 "observer panik shutdown; propagating \

@@ -212,14 +212,17 @@ where
                 );
             }
             DistributedMessage::TimeoutDetected {
+                sender_id,
                 timed_out_secondary_id,
                 last_seen,
                 ..
             } => {
                 tracing::warn!(
+                    detected_by = %sender_id,
                     timed_out = %timed_out_secondary_id,
                     last_seen,
-                    "peer timeout detected by another secondary"
+                    "primary reported a peer secondary's keepalive timeout (notification only; \
+                     removal flows via the replicated PeerRemoved ledger)"
                 );
             }
             DistributedMessage::TimeoutQuery {

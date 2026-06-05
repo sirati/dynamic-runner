@@ -382,7 +382,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         matched_path: std::path::PathBuf,
     ) -> (std::path::PathBuf, String) {
         let reason = format!("panik file: {}", matched_path.display());
-        tracing::warn!(
+        tracing::error!(
             node_id = %self.config.node_id,
             matched_path = %matched_path.display(),
             "panik signal observed on primary; announcing self-departure and exiting locally"

@@ -233,6 +233,7 @@ async fn panik_signal_acted_on_after_setup_pending_reentry() {
             // — it can only reach `Terminal` if the receiver survived.
             let _ = panik_tx.send(crate::panik_watcher::PanikSignal {
                 matched_path: expected_path.clone(),
+                sender_pid: None,
             });
 
             // Re-entry: with the panik receiver re-attached from

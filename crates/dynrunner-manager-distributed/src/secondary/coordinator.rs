@@ -1350,7 +1350,7 @@ where
                         // and waste teardown time). The PyO3 wrapper reads
                         // the `Panik` terminal and calls
                         // `std::process::exit(137)`.
-                        tracing::warn!(
+                        tracing::error!(
                             secondary = %self.config.secondary_id,
                             matched_path = %matched_path.display(),
                             reason = %reason,
