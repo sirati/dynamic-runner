@@ -110,10 +110,10 @@ impl StatsSnapshot {
     /// # Production caller is the live-feed seam
     ///
     /// This is the projection the observer run loop publishes into the
-    /// reporter's `SharedSnapshotSource` whenever it applies a mesh
-    /// broadcast. The producer is `observer_late_joiner/run.rs`, which
-    /// calls this on every CRDT-read tick and pushes the result into the
-    /// reporter's snapshot source (the reporter's own test suite also
+    /// reporter's `SharedSnapshotSource`. The producer is the
+    /// `ObserverCoordinator` run loop, which calls this on each iteration
+    /// and pushes the result into the reporter's snapshot source via
+    /// `SharedSnapshotSource::publish` (the reporter's own test suite also
     /// exercises it directly).
     pub fn from_cluster_state<I: Identifier>(state: &ClusterState<I>) -> Self {
         let outcome = state.outcome_counts();

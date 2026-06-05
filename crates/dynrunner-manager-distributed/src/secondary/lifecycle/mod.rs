@@ -101,7 +101,6 @@ use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 
-use super::ClusterStateRefreshFn;
 use super::PendingFirstBind;
 use super::SecondaryTerminal;
 use super::election::ElectionState;
@@ -454,11 +453,10 @@ impl Default for MeshFormation {
 /// The take-once runtime latches surrendered at the single
 /// [`SecondaryLifecycle::enter_operational`] boundary.
 ///
-/// These are the `Option<Receiver>` / `Option<callback>` slots the
-/// coordinator builds at construction and `take()`s once when it first
-/// reaches `process_tasks` (see the matching fields on
-/// [`super::SecondaryCoordinator`]: `announcer_outbox_rx`,
-/// `fatal_exit_signal_rx`, `on_cluster_state_refresh`).
+/// These are the `Option<Receiver>` slots the coordinator builds at
+/// construction and `take()`s once when it first reaches `process_tasks`
+/// (see the matching fields on [`super::SecondaryCoordinator`]:
+/// `announcer_outbox_rx`, `fatal_exit_signal_rx`).
 /// The `Configuring → Operational` transition is the ONE place they are
 /// consumed: the coordinator fills this carrier by `take()`-ing each
 /// `Option`, hands it to `enter_operational`, and gets the unwrapped values
@@ -496,14 +494,14 @@ impl Default for MeshFormation {
 /// `run_until_setup_or_done` and finds the lifecycle already `Operational`,
 /// so `enter_operational` is never called twice; and even if it were, the
 /// coordinator's `Option::take()` yields `None` on the second pass. For the
-/// three members carried here that `None` is benign — NOT because the
-/// capability is "optional", but because all three are OBSERVER-ONLY
+/// two members carried here that `None` is benign — NOT because the
+/// capability is "optional", but because both are OBSERVER-ONLY
 /// registrations (`attach_observer_announcer` / the observer's invalid-task
-/// `register_fatal_exit_signal_rx` / its `register_cluster_state_refresh`),
+/// `register_fatal_exit_signal_rx`),
 /// and an observer / late-joiner lands directly in `Operational` via
 /// `restore_from_snapshot_and_skip_setup` — it NEVER takes the
 /// `SetupPending` excursion, so its arms are never re-parked on re-entry.
-/// Modelling these three as a move-in / move-out carrier (NOT fields of
+/// Modelling these two as a move-in / move-out carrier (NOT fields of
 /// [`OperationalState`]) keeps them where they belong — local to the
 /// operational loop, not part of the resumable state data. The loopback
 /// inbound receiver and the panik signal receiver are the exceptions: each
@@ -527,10 +525,6 @@ pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// run-loop-external policy was attached.
     pub(in crate::secondary) fatal_exit_signal_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-
-    /// Periodic cluster-state refresh callback. `None` when no consumer
-    /// registered.
-    pub(in crate::secondary) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
 }
 
 impl<I: Identifier> OperationalLatches<I> {
@@ -549,7 +543,6 @@ impl<I: Identifier> OperationalLatches<I> {
         Self {
             announcer_outbox_rx: None,
             fatal_exit_signal_rx: None,
-            on_cluster_state_refresh: None,
         }
     }
 }
