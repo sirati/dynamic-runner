@@ -521,10 +521,14 @@ where
                 // the STEADY-STATE anti-entropy / late-heal pull sink — it
                 // runs inside the operational loop (`dispatch_message`), NOT
                 // the bootstrap constructor. A malformed snapshot here is
-                // WARN-and-keep, NOT fatal: the AE-3 recovery cadence re-pulls
-                // a fresh snapshot from a rotating responder on the next tick
-                // (≤ one cadence period), so one bad frame cannot wedge or
-                // corrupt the replica. The BOOTSTRAP decode (cold-join
+                // WARN-and-keep, NOT fatal: the secondary re-converges
+                // REACTIVELY — the next peer `StateDigest` broadcast feeds the
+                // digest arm below, which re-pulls a fresh snapshot iff the
+                // replica is still behind, so one bad frame cannot wedge or
+                // corrupt the replica. (The secondary has NO AE-3 timer
+                // cadence — that recovery-tick cadence is the OBSERVER's;
+                // here the inbound digest arm is the heal trigger.) The
+                // BOOTSTRAP decode (cold-join
                 // constructor) stays FATAL — a malformed INITIAL snapshot
                 // genuinely leaves the node with no starting state and must
                 // hard-fail there. The discriminator is WHICH FUNCTION the
@@ -538,8 +542,9 @@ where
                         tracing::warn!(
                             error = %e,
                             "ClusterSnapshot decode failed in the steady-state \
-                             anti-entropy sink; dropping the frame (the AE-3 \
-                             recovery cadence re-pulls a fresh snapshot next tick)"
+                             anti-entropy sink; dropped a malformed snapshot (the \
+                             next peer StateDigest broadcast will re-trigger \
+                             reconciliation via the reactive digest arm)"
                         );
                     }
                 }

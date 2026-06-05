@@ -869,6 +869,17 @@ where
     ) {
         let before = self.cluster_state.current_primary().map(str::to_owned);
         for m in mutations {
+            // Prune the departed peer's AE-3 recovery digest so the
+            // `peer_digests` store stays bounded by the LIVE roster (the
+            // recovery tick already excludes a departed id from routing via
+            // the roster intersection; this stops the store growing without
+            // bound over the run's lifetime). Mirrors the CRDT's own
+            // sticky-`Dead` peer_state removal: once `PeerRemoved` lands the
+            // id never re-enters the live roster, so dropping its last-seen
+            // digest is safe (a respawn requires a fresh id).
+            if let ClusterMutation::PeerRemoved { id, .. } = &m {
+                self.peer_digests.remove(id);
+            }
             self.cluster_state.apply(m);
         }
         let after = self.cluster_state.current_primary().map(str::to_owned);

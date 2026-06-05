@@ -1316,3 +1316,54 @@ async fn recovery_cadence_quiesces_when_converged() {
     .await
     .expect("the converged-quiesce observer must terminate");
 }
+
+/// L2a: a departed peer's AE-3 recovery digest is PRUNED from
+/// `peer_digests` when its `PeerRemoved` mutation is applied, so the store
+/// stays bounded by the live roster over the run's lifetime. A still-live
+/// peer's entry is untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn peer_digests_pruned_on_peer_removed() {
+    use dynrunner_protocol_primary_secondary::RemovalCause;
+    use dynrunner_protocol_primary_secondary::StateDigest;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, inbound_tx, _keepalive) = transport_with_peers("obs", 1);
+            let cs = ClusterState::<TestId>::new();
+            let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+
+            // Two recorded last-seen digests, one of which is about to depart.
+            observer
+                .peer_digests
+                .insert("departing-sec".to_string(), StateDigest::default());
+            observer
+                .peer_digests
+                .insert("live-sec".to_string(), StateDigest::default());
+
+            let mut primary_last_seen = std::time::Instant::now();
+            observer.on_cluster_mutation(
+                vec![ClusterMutation::PeerRemoved {
+                    id: "departing-sec".to_string(),
+                    cause: RemovalCause::KeepaliveMiss,
+                }],
+                &mut primary_last_seen,
+            );
+
+            assert!(
+                !observer.peer_digests.contains_key("departing-sec"),
+                "the departed peer's recovery digest must be pruned"
+            );
+            assert!(
+                observer.peer_digests.contains_key("live-sec"),
+                "a still-live peer's recovery digest must be retained"
+            );
+            assert_eq!(
+                observer.peer_digests.len(),
+                1,
+                "only the live peer's entry remains"
+            );
+            drop(inbound_tx);
+        })
+        .await;
+}

@@ -183,6 +183,13 @@ pub fn reconcile_against_peer<I>(
 ///
 /// # Different-responder rotation
 ///
+/// The candidate list is SORTED by peer id (a total order) before the
+/// cursor selects, so the rotation order is STABLE across ticks even though
+/// `peer_digests` arrives from the caller's unordered membership source (a
+/// `HashMap` iteration whose order may shuffle between ticks). Without the
+/// sort the cursor could land back on the same bad responder next tick;
+/// with it, `cursor` rotates through DISTINCT responders in a fixed order.
+///
 /// `cursor` is advanced on every call that has at least one candidate
 /// responder (whether or not it is the one chosen this tick), so a
 /// responder whose previous snapshot failed to decode — leaving the
@@ -209,7 +216,7 @@ pub fn plan_recovery_pull<I>(
     // hold ledger data the local replica lacks. A peer we are converged with
     // is not a candidate; if EVERY known peer is converged (or none has a
     // recorded digest), the candidate list is empty and we quiesce (C9).
-    let candidates: Vec<&str> = peer_digests
+    let mut candidates: Vec<&str> = peer_digests
         .iter()
         .filter(|(_, peer)| local.is_behind(peer))
         .map(|(id, _)| id.as_str())
@@ -217,6 +224,15 @@ pub fn plan_recovery_pull<I>(
     if candidates.is_empty() {
         return None;
     }
+    // Impose a TOTAL ORDER on the candidate list (by peer id) before the
+    // cursor selection. `peer_digests` arrives from the caller's
+    // unordered membership source (a `HashMap` iteration), so without this
+    // sort the candidate ORDER could shuffle between ticks and the cursor
+    // would not reliably skip the SAME bad responder next tick — defeating
+    // the wedge-prevention purpose of the rotation. Sorting by the stable
+    // peer id makes `cursor` rotate through DISTINCT responders in a fixed
+    // order across consecutive ticks.
+    candidates.sort_unstable();
     // Pick the rotation-current candidate, then ADVANCE the cursor so the
     // next tick targets a different responder (the different-responder-on-
     // malformed rule). The modulo keeps the index in range as the candidate
@@ -236,6 +252,7 @@ pub fn plan_recovery_pull<I>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn tick_period_is_deterministic_and_bounded() {
@@ -491,29 +508,56 @@ mod tests {
         }
     }
 
-    /// Different-responder rotation: two ahead peers, repeated ticks rotate
-    /// the responder so a single malformed responder cannot wedge recovery.
+    /// Different-responder rotation: three ahead peers fed in a NON-sorted
+    /// insertion order. Consecutive ticks must rotate through DISTINCT
+    /// responders in a DETERMINISTIC (sorted-by-id) order so a single
+    /// malformed responder cannot wedge recovery — and the order must be
+    /// stable across ticks even though the caller's membership source is
+    /// unordered (the candidate list is sorted before the cursor selects).
     #[test]
     fn recovery_rotates_responder_across_ticks() {
         let local = StateDigest::default();
-        // Both peers are ahead (each holds a distinct task set the local
-        // replica lacks), so both stay candidates across ticks.
+        // All three peers are ahead (each holds a distinct task set the local
+        // replica lacks), so all three stay candidates across ticks. The
+        // insertion order is deliberately NOT sorted to prove the rotation
+        // does not depend on the input order.
         let peers = vec![
+            ("peer-c".to_string(), ahead(1, 0x3)),
             ("peer-a".to_string(), ahead(1, 0x1)),
             ("peer-b".to_string(), ahead(1, 0x2)),
         ];
-        let mut cursor = 0usize;
-        let mut targets = Vec::new();
-        for _ in 0..2 {
+        let target_id = |peers: &[(String, StateDigest)], cursor: &mut usize| -> String {
             let (dst, _): (Destination, DistributedMessage<u32>) =
-                plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+                plan_recovery_pull(&local, peers, cursor, &requester(), 1.0)
                     .expect("still behind ⇒ pull");
-            targets.push(dst);
-        }
-        assert_ne!(
-            targets[0], targets[1],
-            "consecutive ticks must target DIFFERENT responders so one \
-             malformed responder cannot wedge recovery"
+            match dst {
+                Destination::Secondary(p) => p.into_string(),
+                other => panic!("expected Destination::Secondary, got {other:?}"),
+            }
+        };
+        // Six consecutive ticks: the rotation must visit the candidates in
+        // sorted-by-id order (a → b → c) and then wrap, deterministically.
+        let mut cursor = 0usize;
+        let seq: Vec<String> = (0..6).map(|_| target_id(&peers, &mut cursor)).collect();
+        assert_eq!(
+            seq,
+            vec!["peer-a", "peer-b", "peer-c", "peer-a", "peer-b", "peer-c"],
+            "rotation must visit DISTINCT responders in a deterministic \
+             sorted-by-id order and wrap (the wedge-prevention guarantee)"
         );
+        // Within one full cycle every candidate is visited exactly once — no
+        // responder is skipped or repeated before the others are tried.
+        let one_cycle: HashSet<&String> = seq[..3].iter().collect();
+        assert_eq!(
+            one_cycle.len(),
+            3,
+            "the first full cycle must cover all three distinct responders"
+        );
+        // Reproducible: a fresh cursor over the SAME (unordered) input yields
+        // the SAME sequence — the order is a function of the peer ids, not of
+        // HashMap iteration nondeterminism.
+        let mut cursor2 = 0usize;
+        let seq2: Vec<String> = (0..6).map(|_| target_id(&peers, &mut cursor2)).collect();
+        assert_eq!(seq, seq2, "rotation order must be reproducible across runs");
     }
 }
