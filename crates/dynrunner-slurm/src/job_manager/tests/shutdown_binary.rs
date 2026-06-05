@@ -85,8 +85,10 @@ impl Gateway for ShutdownBinaryRecordingGateway {
     }
 }
 
-/// Local source exists → upload issues exactly one
-/// `transfer_file(local, root/dynrunner-slurm-shutdown)` followed
+/// Local source exists and the gateway has no usable remote copy
+/// (this recording gateway returns empty `sha256sum` output → "no
+/// remote hash") → upload probes the remote hash, then issues exactly
+/// one `transfer_file(local, root/dynrunner-slurm-shutdown)` followed
 /// by one `chmod 755 root/dynrunner-slurm-shutdown` (in that order),
 /// returns `Ok(remote_path)`, and records the resolved path on the
 /// manager so subsequent wrapper renders pick it up via
@@ -123,21 +125,28 @@ async fn upload_shutdown_manager_binary_uploads_and_chmods() {
     let events = mgr.gateway().events();
     assert_eq!(
         events.len(),
-        2,
-        "upload must issue exactly one transfer_file + one chmod; got: {events:?}",
+        3,
+        "upload must issue exactly one sha256sum probe + one transfer_file \
+         + one chmod; got: {events:?}",
     );
     match &events[0] {
+        GatewayEvent::Command(cmd) => {
+            assert_eq!(cmd, &format!("sha256sum {expected_remote}"));
+        }
+        other => panic!("expected first event to be the sha256sum probe, got {other:?}"),
+    }
+    match &events[1] {
         GatewayEvent::TransferFile { local, remote } => {
             assert_eq!(local, &local_path);
             assert_eq!(remote, &expected_remote);
         }
-        other => panic!("expected first event to be TransferFile, got {other:?}"),
+        other => panic!("expected second event to be TransferFile, got {other:?}"),
     }
-    match &events[1] {
+    match &events[2] {
         GatewayEvent::Command(cmd) => {
             assert_eq!(cmd, &format!("chmod 755 {expected_remote}"));
         }
-        other => panic!("expected second event to be Command(chmod), got {other:?}"),
+        other => panic!("expected third event to be Command(chmod), got {other:?}"),
     }
 }
 

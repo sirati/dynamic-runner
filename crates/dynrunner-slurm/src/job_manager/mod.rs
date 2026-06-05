@@ -14,6 +14,9 @@
 //!   upload source binaries) that delegate to [`PodmanPackaging`].
 //! - [`lifecycle`] — SLURM-specific methods (prepare directories,
 //!   submit / cancel / status).
+//! - [`binary_upload`] — shared hash-conditional staging mechanics
+//!   for the two musl-static binaries below: skip the transfer when
+//!   the gateway already holds a byte-identical copy.
 //! - [`shutdown_binary`] — staging primitive for the
 //!   `dynrunner-slurm-shutdown` musl-static binary (uploaded to the
 //!   gateway alongside the per-job wrapper scripts so out-of-cgroup
@@ -25,6 +28,7 @@
 //!   full secondary lifecycle in place of the legacy inline bash).
 //! - [`tests`] — module-internal tests.
 
+mod binary_upload;
 mod images;
 mod lifecycle;
 mod manager;
