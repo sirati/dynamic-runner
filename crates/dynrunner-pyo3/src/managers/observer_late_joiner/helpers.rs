@@ -5,8 +5,11 @@
 
 use pyo3::prelude::*;
 
+use dynrunner_manager_distributed::cluster_state::ClusterStateSnapshot;
 use dynrunner_protocol_primary_secondary::PeerConnectionInfo;
 use dynrunner_slurm::{PeerInfoReadDirError, PeerInfoRecord};
+
+use crate::identifier::RunnerIdentifier;
 
 /// Translate a [`PeerInfoReadDirError`] into the right PyError shape
 /// for the operator. Single concern: error-mapping at the FFI
@@ -75,6 +78,37 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
                 ipv6: r.ipv6.clone(),
                 port: quic_port,
                 is_observer: r.is_observer.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+/// Decode every bootstrap snapshot reply (wire-erased JSON strings) into
+/// the typed [`ClusterStateSnapshot`] the cold-join factory restores.
+///
+/// # Single concern + the BOOTSTRAP-decode fatal discriminator (D-C / D3)
+///
+/// This is the COLD-JOIN bootstrap decode — the observer requested these
+/// snapshots precisely to populate its empty CRDT, so a malformed reply
+/// must HARD-FAIL here (an `Err` the constructor propagates with `?`),
+/// never be swallowed: continuing on an un-restored empty CRDT would make
+/// the observer report a lie (premature run-complete / wrong counts). This
+/// is the deliberate counterpart to the STEADY-STATE anti-entropy decode
+/// arm (`secondary/dispatch/router.rs` + the observer's `on_cluster_snapshot`),
+/// which is WARN-and-keep because the AE-3 recovery cadence re-pulls a
+/// fresh snapshot. The discriminator is WHICH FUNCTION the decode lives in:
+/// this bootstrap function = fatal; the steady-state loop arm = WARN.
+pub(super) fn decode_bootstrap_snapshots(
+    snapshot_jsons: &[String],
+) -> PyResult<Vec<ClusterStateSnapshot<RunnerIdentifier>>> {
+    snapshot_jsons
+        .iter()
+        .map(|snapshot_json| {
+            serde_json::from_str(snapshot_json).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "observer late-joiner: failed to decode ClusterStateSnapshot \
+                     from join_running_cluster reply: {e}"
+                ))
             })
         })
         .collect()
@@ -172,5 +206,31 @@ mod tests {
         let seed = records_to_seed(&[r]);
         assert_eq!(seed.len(), 1);
         assert!(!seed[0].is_observer);
+    }
+
+    /// BOOTSTRAP-decode fatal (D-C / D3): a malformed bootstrap snapshot
+    /// reply HARD-FAILS (the constructor's `?` propagates the `Err`). This
+    /// is the counterpart to the steady-state WARN arm — a cold-join MUST
+    /// hard-fail on a corrupt INITIAL snapshot rather than observe an empty
+    /// CRDT and report a lie.
+    #[test]
+    fn decode_bootstrap_snapshots_hard_fails_on_malformed() {
+        let result = decode_bootstrap_snapshots(&["{not valid json".to_string()]);
+        let err = result.expect_err("a malformed bootstrap snapshot must hard-fail");
+        assert!(
+            err.to_string().contains("failed to decode ClusterStateSnapshot"),
+            "the bootstrap-fatal error must name the decode failure: {err}"
+        );
+    }
+
+    /// The happy path: well-formed bootstrap snapshot JSON decodes into the
+    /// typed snapshot the cold-join factory restores.
+    #[test]
+    fn decode_bootstrap_snapshots_round_trips_valid_payload() {
+        use dynrunner_manager_distributed::cluster_state::ClusterState;
+        let json = serde_json::to_string(&ClusterState::<RunnerIdentifier>::new().snapshot())
+            .expect("snapshot serializes");
+        let snaps = decode_bootstrap_snapshots(&[json]).expect("valid snapshot decodes");
+        assert_eq!(snaps.len(), 1);
     }
 }

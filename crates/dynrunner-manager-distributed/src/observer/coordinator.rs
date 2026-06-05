@@ -211,6 +211,18 @@ where
     /// Policy B/D listeners. `None` only on the relocation path (the
     /// inherited dispatcher already owns the receiver).
     task_completed_rx: Option<mpsc::UnboundedReceiver<TaskCompletedEvent>>,
+    /// AE-3 recovery-cadence state: the LAST-SEEN [`StateDigest`] of each
+    /// peer that has broadcast one, keyed by sender-id. The timer-driven
+    /// recovery arm intersects this with the live roster (`current_primary`
+    /// ∪ alive secondaries) and asks [`anti_entropy::plan_recovery_pull`]
+    /// whether the replica is still behind any of them — the C9 quiesce
+    /// signal. Updated on every inbound `StateDigest` frame.
+    peer_digests: std::collections::HashMap<String, StateDigest>,
+    /// AE-3 responder rotation cursor (the different-responder-on-malformed
+    /// rotation). Advanced by [`anti_entropy::plan_recovery_pull`] on each
+    /// tick that has a candidate, so a malformed-snapshot responder is not
+    /// retried on the immediately-following tick.
+    recovery_cursor: usize,
 }
 
 impl<Tr, I> ObserverCoordinator<Tr, I>
@@ -317,6 +329,8 @@ where
             announcer_handle: Some(announcer_handle),
             setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
+            peer_digests: std::collections::HashMap::new(),
+            recovery_cursor: 0,
         }
     }
 
@@ -371,6 +385,8 @@ where
             announcer_handle: Some(announcer_handle),
             setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
+            peer_digests: std::collections::HashMap::new(),
+            recovery_cursor: 0,
         }
     }
 
@@ -603,6 +619,20 @@ where
             ae_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let _ = ae_tick.tick().await;
 
+            // AE-3 snapshot-recovery tick (D-C / C9): an INDEPENDENT timer,
+            // distinct from the digest broadcast above, on the SAME proven
+            // per-node-jittered period (bounded by `peer_timeout` so a
+            // configured period never exceeds the strand window). Each tick
+            // re-pulls a snapshot from a rotating known peer iff still behind
+            // its last-seen digest — this is what re-converges a WARN-dropped
+            // steady-state decode. Skip + immediate-tick-consume mirrors the
+            // digest cadence so the first recovery probe is one period out.
+            let recovery_period = anti_entropy::tick_period(&self.config.node_id)
+                .min(self.config.peer_timeout);
+            let mut recovery_tick = tokio::time::interval(recovery_period);
+            recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let _ = recovery_tick.tick().await;
+
             // Setup-promote deadline (§3): anchored at loop entry. A
             // one-shot consumed latch ensures the fire path runs at most
             // once. The arm is LIVE-gated on `setup_pending()` so it goes
@@ -653,6 +683,11 @@ where
                     // Anti-entropy tick (item 3): broadcast our digest.
                     _ = ae_tick.tick() => {
                         self.on_anti_entropy_tick().await;
+                    }
+                    // AE-3 recovery tick (D-C / C9): re-pull from a rotating
+                    // known peer iff still behind its last-seen digest.
+                    _ = recovery_tick.tick() => {
+                        self.on_recovery_tick().await;
                     }
                     // Setup-promote deadline (§3): LIVE-recompute at fire.
                     _ = tokio::time::sleep_until(setup_deadline_at.into()),
@@ -834,6 +869,17 @@ where
     ) {
         let before = self.cluster_state.current_primary().map(str::to_owned);
         for m in mutations {
+            // Prune the departed peer's AE-3 recovery digest so the
+            // `peer_digests` store stays bounded by the LIVE roster (the
+            // recovery tick already excludes a departed id from routing via
+            // the roster intersection; this stops the store growing without
+            // bound over the run's lifetime). Mirrors the CRDT's own
+            // sticky-`Dead` peer_state removal: once `PeerRemoved` lands the
+            // id never re-enters the live roster, so dropping its last-seen
+            // digest is safe (a respawn requires a fresh id).
+            if let ClusterMutation::PeerRemoved { id, .. } = &m {
+                self.peer_digests.remove(id);
+            }
             self.cluster_state.apply(m);
         }
         let after = self.cluster_state.current_primary().map(str::to_owned);
@@ -891,18 +937,20 @@ where
     /// `reconcile_against_peer` as-is; the observer owns only the `send_to`
     /// edge.
     async fn on_state_digest(&mut self, sender_id: &str, peer: &StateDigest) {
+        // Record this peer's last-seen digest for the AE-3 recovery cadence
+        // (the C9 quiesce signal: the timer arm pulls iff still behind one
+        // of these). Reactive single-frame reconciliation still runs below.
+        self.peer_digests.insert(sender_id.to_string(), *peer);
         let local = self.cluster_state.digest();
         let requester = RequesterIdentity {
             node_id: &self.config.node_id,
             is_observer: true,
             can_be_primary: false,
         };
-        let current_primary = self.cluster_state.current_primary().map(str::to_owned);
         let Some((dst, req)) = anti_entropy::reconcile_against_peer::<I>(
             &local,
             peer,
             sender_id,
-            current_primary.as_deref(),
             &requester,
             timestamp_now(),
         ) else {
@@ -926,6 +974,62 @@ where
             tracing::debug!(
                 error = %e,
                 "observer anti-entropy digest broadcast failed; next tick retries"
+            );
+        }
+    }
+
+    /// AE-3 recovery-cadence tick (D-C / C9): the TIMER-driven snapshot
+    /// recovery, distinct from the digest broadcast above. With ZERO
+    /// inbound traffic, re-pull a fresh snapshot from a rotating known peer
+    /// IFF the local replica is still behind that peer's last-seen digest.
+    /// This is what makes a WARN-dropped steady-state decode (the
+    /// non-latching `on_cluster_snapshot` arm) recover: the next tick re-
+    /// pulls until convergence. The role owns only the `send_to` edge +
+    /// the peer-digest store + the roster intersection; the convergence
+    /// detection, the C9 quiesce, and the responder rotation live in
+    /// [`anti_entropy::plan_recovery_pull`].
+    async fn on_recovery_tick(&mut self) {
+        // Known-peer roster = current_primary ∪ alive secondaries. Intersect
+        // it with the peers that have actually broadcast a digest, so the
+        // recovery arm only ever targets a peer we both KNOW and have a
+        // last-seen digest for. A digest from a peer no longer in the roster
+        // (departed) is excluded — we never resurrect a route to a dead peer.
+        let mut roster: HashSet<String> = self
+            .cluster_state
+            .alive_secondary_members()
+            .map(str::to_owned)
+            .collect();
+        if let Some(p) = self.cluster_state.current_primary() {
+            roster.insert(p.to_owned());
+        }
+        let peer_digests: Vec<(String, StateDigest)> = self
+            .peer_digests
+            .iter()
+            .filter(|(id, _)| roster.contains(id.as_str()))
+            .map(|(id, d)| (id.clone(), *d))
+            .collect();
+        let local = self.cluster_state.digest();
+        let requester = RequesterIdentity {
+            node_id: &self.config.node_id,
+            is_observer: true,
+            can_be_primary: false,
+        };
+        let Some((dst, req)) = anti_entropy::plan_recovery_pull::<I>(
+            &local,
+            &peer_digests,
+            &mut self.recovery_cursor,
+            &requester,
+            timestamp_now(),
+        ) else {
+            // C9: converged with every known peer (or none known yet) —
+            // quiesce, no pull this tick.
+            return;
+        };
+        if let Err(e) = self.send_to(dst, req).await {
+            tracing::warn!(
+                error = %e,
+                "observer AE-3 recovery snapshot pull failed; the next recovery \
+                 tick rotates to a different responder"
             );
         }
     }

@@ -155,7 +155,6 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             &local,
             &digest,
             &sender_id,
-            self.cluster_state.current_primary(),
             &requester,
             timestamp_now(),
         ) {
