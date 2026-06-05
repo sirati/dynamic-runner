@@ -10,6 +10,7 @@
 //! snapshot-healable convergence across a failover.
 
 use super::*;
+use super::super::CapabilityEntry;
 
 // ── CRD-2 / D-P: current_primary equal-epoch register ──
 
@@ -330,4 +331,153 @@ fn peer_removed_role_heals_across_failover() {
         "n's can_be_primary projection matches the promoted primary's after convergence"
     );
     assert!(!n.role_table().observers.contains("obs-1"));
+}
+
+// ── C6: merge_capability lattice order-independence (DIRECT) ──
+
+/// Build an `Advertised` capability entry tersely.
+fn adv(is_observer: bool, can_be_primary: bool, epoch: u64, seq: u32) -> CapabilityEntry {
+    CapabilityEntry::Advertised {
+        is_observer,
+        can_be_primary,
+        cap_version: TaskVersion {
+            primary_epoch: epoch,
+            seq,
+        },
+    }
+}
+
+/// `merge_capability` is a CRDT join: COMMUTATIVE, ASSOCIATIVE, and
+/// IDEMPOTENT. The existing `merge_is_total_and_commutative` pins only the
+/// per-TASK join; this pins the role-capability lattice's order-
+/// independence DIRECTLY (it was previously covered only indirectly via
+/// the failover-heal test). A representative cross-product over `{Departed,
+/// Advertised(is_observer, can_be_primary, cap_version)}` at several
+/// versions exercises every arm: the `Departed` absorbing element, the
+/// `is_observer` OR-ratchet, the `can_be_primary`-follows-higher-version
+/// rule, and `max(cap_version)`.
+///
+/// CRITICAL invariant the variant set honors (so the order-independence
+/// claim is over the lattice as PRODUCTION produces it, not a fictional
+/// one): `can_be_primary` is a function of `cap_version`. The primary
+/// stamps a STRICTLY HIGHER `cap_version` on every `SetCanBePrimary`
+/// (`broadcast.rs`), so two `Advertised` entries at the SAME `cap_version`
+/// ALWAYS carry the SAME `can_be_primary` bit. `merge_capability`'s tie
+/// rule (equal version → keep local's `can_be_primary`, the strict
+/// `iv > lv` gate) is commutative ONLY under that invariant — a
+/// hand-built equal-version pair with DIVERGENT `can_be_primary` (which
+/// production cannot mint) would expose the tie's local-bias and is
+/// excluded by construction. `is_observer` stays free across the set (it
+/// is a version-independent OR-ratchet).
+#[test]
+fn merge_capability_is_commutative_associative_idempotent() {
+    use super::super::merge::merge_capability;
+
+    // `can_be_primary` derived from the version so two same-version entries
+    // never disagree on it (the production invariant). `is_observer` is the
+    // free dimension. Versions span (0,0) < (1,0) < (2,0) < (2,5) so the
+    // higher-version `can_be_primary`-pick and `max(version)` arms fire.
+    let cbp_of = |epoch: u64, seq: u32| (epoch + u64::from(seq)) % 2 == 1;
+    let mut variants = vec![CapabilityEntry::Departed];
+    for (epoch, seq) in [(0u64, 0u32), (1, 0), (2, 0), (2, 5)] {
+        for is_observer in [false, true] {
+            variants.push(adv(is_observer, cbp_of(epoch, seq), epoch, seq));
+        }
+    }
+
+    // Idempotence: merge(x, x) == x for every variant.
+    for x in &variants {
+        assert_eq!(
+            merge_capability(x, x),
+            x.clone(),
+            "merge_capability is not idempotent for {x:?}"
+        );
+    }
+
+    // Commutativity: merge(a, b) == merge(b, a) for every ordered pair.
+    for a in &variants {
+        for b in &variants {
+            assert_eq!(
+                merge_capability(a, b),
+                merge_capability(b, a),
+                "merge_capability({a:?}, {b:?}) != merge_capability({b:?}, {a:?})"
+            );
+        }
+    }
+
+    // Associativity: merge(merge(a, b), c) == merge(a, merge(b, c)).
+    for a in &variants {
+        for b in &variants {
+            for c in &variants {
+                let left = merge_capability(&merge_capability(a, b), c);
+                let right = merge_capability(a, &merge_capability(b, c));
+                assert_eq!(
+                    left, right,
+                    "merge_capability is not associative for ({a:?}, {b:?}, {c:?})"
+                );
+            }
+        }
+    }
+}
+
+/// Pin the EXACT lattice outcomes `merge_capability` produces (read off
+/// `merge.rs::merge_capability`), arm by arm, so a future edit that
+/// silently changes a rule is caught — not just order-independence.
+#[test]
+fn merge_capability_pins_each_lattice_arm() {
+    use super::super::merge::merge_capability;
+
+    // 1. Departed is an absorbing element on BOTH sides.
+    assert_eq!(
+        merge_capability(&CapabilityEntry::Departed, &adv(true, true, 9, 9)),
+        CapabilityEntry::Departed,
+        "Departed ∨ Advertised = Departed"
+    );
+    assert_eq!(
+        merge_capability(&adv(true, true, 9, 9), &CapabilityEntry::Departed),
+        CapabilityEntry::Departed,
+        "Advertised ∨ Departed = Departed"
+    );
+    assert_eq!(
+        merge_capability(&CapabilityEntry::Departed, &CapabilityEntry::Departed),
+        CapabilityEntry::Departed,
+    );
+
+    // 2. is_observer is a pure upward OR-ratchet (version-independent).
+    //    A `false` observer at a HIGHER version never un-observes a `true`
+    //    at a lower version.
+    assert_eq!(
+        merge_capability(&adv(true, false, 1, 0), &adv(false, false, 5, 0)),
+        adv(true, false, 5, 0),
+        "is_observer ratchets up (OR) and never regresses, even at a higher incoming version"
+    );
+
+    // 3. can_be_primary follows the HIGHER cap_version: a newer
+    //    `can_be_primary=false` beats an older `true`.
+    assert_eq!(
+        merge_capability(&adv(false, true, 1, 0), &adv(false, false, 2, 0)),
+        adv(false, false, 2, 0),
+        "can_be_primary follows the higher cap_version (newer false wins)"
+    );
+    //    ...and an older `false` does NOT beat a newer `true`.
+    assert_eq!(
+        merge_capability(&adv(false, false, 1, 0), &adv(false, true, 2, 0)),
+        adv(false, true, 2, 0),
+        "can_be_primary follows the higher cap_version (newer true wins)"
+    );
+
+    // 4. Equal cap_version: can_be_primary keeps LOCAL (idempotent — the
+    //    same advertisement redelivered; the `iv > lv` gate is strict).
+    assert_eq!(
+        merge_capability(&adv(false, true, 2, 0), &adv(false, false, 2, 0)),
+        adv(false, true, 2, 0),
+        "at EQUAL cap_version, can_be_primary keeps local (strict `iv > lv` gate)"
+    );
+
+    // 5. cap_version is the max of the two (lexicographic on (epoch, seq)).
+    assert_eq!(
+        merge_capability(&adv(false, false, 2, 3), &adv(false, false, 2, 9)),
+        adv(false, false, 2, 9),
+        "cap_version = max((epoch, seq))"
+    );
 }
