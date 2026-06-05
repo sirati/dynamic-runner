@@ -1,11 +1,35 @@
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier};
-use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_protocol_primary_secondary::{MessageType, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::compute_task_hash;
+
+/// Render a drain-by-`MessageType` tally as a single diagnostic string:
+/// `[TaskRequest=N, Keepalive=M, ...]`, only non-zero types, sorted by
+/// count descending (ties broken by the type's `Debug` name for a
+/// stable order) so the dominant type a 570k+ drain is made of is the
+/// first field. Pure formatter — no I/O, no `&self` — so the drain loop
+/// can accumulate the map cheaply (one increment per frame) and hand it
+/// here once, and the format is unit-testable in isolation.
+fn format_drain_tally(by_type: &HashMap<MessageType, usize>) -> String {
+    let mut entries: Vec<(&MessageType, usize)> =
+        by_type.iter().map(|(ty, &n)| (ty, n)).collect();
+    // Count descending; `Debug`-name ascending as the stable tie-break.
+    entries.sort_by(|(a_ty, a_n), (b_ty, b_n)| {
+        b_n.cmp(a_n)
+            .then_with(|| format!("{a_ty:?}").cmp(&format!("{b_ty:?}")))
+    });
+    let body = entries
+        .iter()
+        .map(|(ty, n)| format!("{ty:?}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{body}]")
+}
 
 impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
     PrimaryCoordinator<Tr, S, E, I>
@@ -863,6 +887,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let deadline = Instant::now() + budget;
         let quiet_window = Duration::from_millis(50);
         let mut drained = 0usize;
+        // Per-`MessageType` tally, diagnostics-only: a consumer hit a
+        // 570k-640k drain with no way to see WHAT was drained. Accumulated
+        // here (one increment per frame) and rendered once after the drain
+        // — does not touch the drain count or behaviour.
+        let mut drained_by_type: HashMap<MessageType, usize> = HashMap::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -879,6 +908,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     // its command silently dropped when the coordinator
                     // is torn down — same behaviour as any other post-
                     // run handle write.
+                    //
+                    // Read the type BEFORE dispatch consumes `msg` —
+                    // diagnostics-only tally, no effect on dispatch.
+                    *drained_by_type.entry(msg.msg_type()).or_insert(0) += 1;
                     self.dispatch_message(msg, &mut None).await?;
                     drained += 1;
                 }
@@ -906,7 +939,61 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 fail_final = outcome.fail_final,
                 "drained pending wire messages before final accounting"
             );
+            // Additive diagnostic: per-MessageType breakdown of the same
+            // drain, so a dominant type (the 570k-640k case) is visible.
+            tracing::info!(
+                drained_by_type = %format_drain_tally(&drained_by_type),
+                "drained pending wire messages by type"
+            );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HashMap, MessageType, format_drain_tally};
+
+    fn tally(pairs: &[(MessageType, usize)]) -> HashMap<MessageType, usize> {
+        pairs.iter().cloned().collect()
+    }
+
+    #[test]
+    fn breakdown_reflects_counts_sorted_by_count_desc() {
+        // 3 TaskRequest + 1 Keepalive → both present, dominant first.
+        let by_type = tally(&[(MessageType::TaskRequest, 3), (MessageType::Keepalive, 1)]);
+        assert_eq!(
+            format_drain_tally(&by_type),
+            "[TaskRequest=3, Keepalive=1]"
+        );
+    }
+
+    #[test]
+    fn dominant_type_is_first_regardless_of_insertion() {
+        let by_type = tally(&[
+            (MessageType::Keepalive, 2),
+            (MessageType::ClusterMutation, 640_000),
+            (MessageType::TaskRequest, 5),
+        ]);
+        // The 640k dominant type leads; the rest follow by count desc.
+        assert_eq!(
+            format_drain_tally(&by_type),
+            "[ClusterMutation=640000, TaskRequest=5, Keepalive=2]"
+        );
+    }
+
+    #[test]
+    fn equal_counts_break_ties_by_name_for_stable_order() {
+        let by_type = tally(&[(MessageType::TaskRequest, 4), (MessageType::Keepalive, 4)]);
+        // Equal counts → ascending Debug-name: Keepalive before TaskRequest.
+        assert_eq!(
+            format_drain_tally(&by_type),
+            "[Keepalive=4, TaskRequest=4]"
+        );
+    }
+
+    #[test]
+    fn empty_tally_renders_empty_brackets() {
+        assert_eq!(format_drain_tally(&HashMap::new()), "[]");
     }
 }
