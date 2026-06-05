@@ -764,3 +764,183 @@ fn n_responder_union_order_independent() {
         assert_eq!(s.counts().pending, 1);
     }
 }
+
+// ── §5.3 #17: post-promotion accounting acceptance (asm-tokenizer #3 / #180) ──
+
+/// The named real-world repro: after a promotion, the demoted observer's
+/// `outcome_counts()` must AGREE with the promoted primary's once the two
+/// ledgers exchange snapshots over anti-entropy. Pre-fix the demoted node
+/// reported `succeeded` UNDERCOUNTED (the asm-tokenizer "succeeded=0/
+/// stranded=N" symptom) because a task that the promoted primary saw as
+/// `Completed` (a cross-secondary completion that reached the CRDT) was
+/// `Failed`/`Unfulfillable` on the demoted node's own ledger — the TS-1
+/// Failed-vs-Completed merge divergence. The CRDT terminal order
+/// (`Completed` dominates the failure-likes) makes the `restore()` merge
+/// — the SAME path the observer's `on_cluster_snapshot` anti-entropy heal
+/// drives in production — converge both sides to the real counts.
+///
+/// FAIL-BEFORE: the test asserts the RAW divergent ledgers DISAGREE first
+/// (so the assertion is meaningful — without convergence the counts
+/// differ), then converges via the real snapshot/restore lattice and
+/// asserts they AGREE on every `OutcomeSummary` bucket. It also pins the
+/// specific old-symptom-gone: the converged `succeeded` is the real N
+/// (every cross-secondary completion is counted), NOT the pre-fix
+/// undercount.
+#[test]
+fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
+    // Realistic post-promotion task set, by hash:
+    //   c1, c2  — genuinely Completed on BOTH replicas (no divergence).
+    //   f1      — genuinely Failed (NonRecoverable) on BOTH (a true failure).
+    //   d1      — DIVERGENT: Completed on the promoted primary,
+    //             Failed (Recoverable) on the demoted observer.
+    //   d2      — DIVERGENT: Completed on the promoted primary,
+    //             Unfulfillable ("stranded") on the demoted observer.
+    // The two `d*` are the TS-1 Failed-vs-Completed split that produced the
+    // `succeeded` undercount on the demoted side pre-fix.
+
+    // Builder for the AGREED tasks shared by both ledgers.
+    let add_agreed = |s: &mut ClusterState<RunnerIdentifier>| {
+        for h in ["c1", "c2", "f1", "d1", "d2"] {
+            s.apply(ClusterMutation::TaskAdded {
+                hash: h.into(),
+                task: mk_task(h),
+            });
+        }
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "c1".into(),
+            result_data: None,
+        });
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "c2".into(),
+            result_data: None,
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "f1".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "genuine-failure".into(),
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 1,
+            },
+        });
+    };
+
+    // The PROMOTED PRIMARY's ledger: d1, d2 reached Completed (the
+    // cross-secondary completions the primary's view has).
+    let mut primary = ClusterState::<RunnerIdentifier>::new();
+    add_agreed(&mut primary);
+    primary.apply(ClusterMutation::TaskCompleted {
+        hash: "d1".into(),
+        result_data: None,
+    });
+    primary.apply(ClusterMutation::TaskCompleted {
+        hash: "d2".into(),
+        result_data: None,
+    });
+
+    // The DEMOTED OBSERVER's ledger: d1, d2 are stuck at failure terminals
+    // (its local mirror never saw the cross-secondary completions) — the
+    // TS-1 divergence. `Failed { Recoverable }` → `fail_retry`;
+    // `Unfulfillable` → `fail_final` ("stranded").
+    let mut observer = ClusterState::<RunnerIdentifier>::new();
+    add_agreed(&mut observer);
+    observer.apply(ClusterMutation::TaskFailed {
+        hash: "d1".into(),
+        kind: ErrorType::Recoverable,
+        error: "transient".into(),
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
+    });
+    observer.apply(ClusterMutation::TaskFailed {
+        hash: "d2".into(),
+        kind: ErrorType::Unfulfillable {
+            reason: "no-toolchain".to_string().into(),
+        },
+        error: "unfulfillable".into(),
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
+    });
+
+    // ── FAIL-BEFORE: the raw divergent ledgers DISAGREE. ──
+    let primary_pre = primary.outcome_counts();
+    let observer_pre = observer.outcome_counts();
+    // The promoted primary has the real count: 4 succeeded (c1, c2, d1, d2),
+    // 1 genuine fail_final (f1 NonRecoverable).
+    assert_eq!(primary_pre.succeeded, 4, "promoted primary holds the real N");
+    // The demoted observer UNDERCOUNTS succeeded (the asm-tokenizer
+    // "succeeded too low / stranded=N" symptom): only c1, c2 succeeded on
+    // its ledger; d1, d2 are mis-accounted as failures.
+    assert_eq!(
+        observer_pre.succeeded, 2,
+        "pre-convergence the demoted observer undercounts succeeded (the #180 symptom)"
+    );
+    assert_ne!(
+        observer_pre, primary_pre,
+        "WITHOUT convergence the two sides' outcome_counts() DIVERGE — this is the bug"
+    );
+
+    // ── DRIVE CONVERGENCE via the real anti-entropy snapshot exchange. ──
+    // The promoted primary broadcasts its ClusterSnapshot; the demoted
+    // observer `restore()`s it — the exact `on_cluster_snapshot` heal path.
+    // Anti-entropy is bidirectional, so the primary also pulls the
+    // observer's snapshot; the terminal order must keep the primary's
+    // Completed view (no regression) either way.
+    observer.restore(primary.snapshot());
+    primary.restore(observer.snapshot());
+
+    // ── ASSERT: after convergence the two sides AGREE on every bucket. ──
+    let primary_post = primary.outcome_counts();
+    let observer_post = observer.outcome_counts();
+    assert_eq!(
+        observer_post.succeeded, primary_post.succeeded,
+        "post-convergence succeeded must agree (no desync)"
+    );
+    assert_eq!(
+        observer_post.fail_final, primary_post.fail_final,
+        "post-convergence fail_final (stranded) must agree (no desync)"
+    );
+    assert_eq!(
+        observer_post.fail_retry, primary_post.fail_retry,
+        "post-convergence fail_retry must agree (no desync)"
+    );
+    assert_eq!(
+        observer_post.fail_oom, primary_post.fail_oom,
+        "post-convergence fail_oom must agree (no desync)"
+    );
+    // Whole-struct equality is the single source of the "no desync" claim.
+    assert_eq!(
+        observer_post, primary_post,
+        "post-convergence the demoted observer and promoted primary outcome_counts() must be identical"
+    );
+
+    // ── OLD-SYMPTOM-GONE: the converged succeeded is the real N, not the
+    // pre-fix undercount. d1/d2's Completed superseded the demoted node's
+    // failure terminals, so the "stranded" tasks are now counted as wins. ──
+    assert_eq!(
+        observer_post.succeeded, 4,
+        "the converged demoted observer reports the REAL succeeded N (c1,c2,d1,d2), not the pre-fix undercount"
+    );
+    assert_eq!(
+        observer_post.fail_final, 1,
+        "only the genuine NonRecoverable failure (f1) remains fail_final — the d2 'stranded' was a real completion"
+    );
+    assert_eq!(
+        observer_post.fail_retry, 0,
+        "the d1 transient-failure view was superseded by its real Completion (no phantom retry-failure)"
+    );
+
+    // Digest-level convergence corroborates the count-level agreement: the
+    // two ledgers are now byte-identical CRDT states, neither is_behind the
+    // other.
+    assert_eq!(
+        observer.digest().tasks_hash,
+        primary.digest().tasks_hash,
+        "converged ledgers are digest-equal"
+    );
+    assert!(!observer.digest().is_behind(&primary.digest()));
+    assert!(!primary.digest().is_behind(&observer.digest()));
+}
