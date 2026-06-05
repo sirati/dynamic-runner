@@ -83,3 +83,32 @@ pub(crate) fn important_only() -> FilterFn<fn(&Metadata<'_>) -> bool> {
     }
     FilterFn::new(predicate as fn(&Metadata<'_>) -> bool)
 }
+
+/// Run `body` with an [`ImportantCapture`] installed as the thread-local
+/// default subscriber (filtered to the importance marker), returning every
+/// important event `body` emitted, in order.
+///
+/// `body` must produce its important events SYNCHRONOUSLY: the capture is
+/// reliable only when there is no `.await` between installing the subscriber
+/// and the emission. `tracing` caches a per-callsite `Interest` in a
+/// PROCESS-GLOBAL table; that cache is concurrently re-poisoned by sibling
+/// tests that install a `fmt::try_init` global subscriber (which has no
+/// interest in [`IMPORTANT_TARGET`], so a callsite it touches first caches
+/// `Interest::never`). The `with_default` install registers THIS subscriber
+/// and rebuilds the interest cache immediately before `body` runs, and a
+/// synchronous, yield-free `body` leaves no window for a concurrent
+/// re-poison before its emissions — so the capture is deterministic. A
+/// subscriber held across an `.await` (e.g. `set_default` around an async
+/// `run()`) exposes that window and flakes; drive the emission synchronously
+/// instead. This is the single owning helper for the capture-construction
+/// the importance tests share.
+pub(crate) fn capture_important(body: impl FnOnce()) -> Vec<CapturedEvent> {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = ImportantCapture::default();
+    let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
+    tracing::subscriber::with_default(subscriber, body);
+    capture.events()
+}

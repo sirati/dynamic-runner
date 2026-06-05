@@ -6,7 +6,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
+use dynrunner_manager_distributed::{
+    PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RunError,
+};
 
 use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
@@ -280,6 +282,20 @@ impl PyPrimaryCoordinator {
         // Python wrapper raises instead of returning exit 0.
         let mut duplicate_task_id_pre_phase: Option<RunError> = None;
 
+        // Relocated-observer strand carried out of the detached tokio
+        // runtime. `Some(RunError)` iff the submitter RELOCATED full
+        // authority onto a chosen compute peer and the standalone observer
+        // tail it then ran exited with a strand-backstop / fatal-exit `Err`
+        // (fleet-dead, primary-silence, or the invalid_task Policy-B fatal).
+        // Unlike a stay-local `RunError::Other` (legacy log-and-swallow ⇒
+        // exit 0), a relocated strand MUST surface non-zero — the run was
+        // genuinely stranded — so the GIL-side tail raises a
+        // `PyRuntimeError` on it. (Relocated panik / aborted / setup-deadline
+        // terminals are already mapped onto the structured `panik_shutdown` /
+        // `duplicate_task_id_pre_phase` / `setup_deadline_expired` markers by
+        // `PrimaryRunOutcome::from_observer`.)
+        let mut relocated_strand: Option<RunError> = None;
+
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -462,9 +478,43 @@ impl PyPrimaryCoordinator {
                 // phase_deps + lifecycle closures captured from the
                 // outer scope (5A built phase_deps; 5B built the
                 // GIL-reacquiring on_phase_* closures).
-                let result = primary
-                    .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
+                //
+                // `run_consuming` OWNS `primary` so a genuine bootstrap
+                // relocation can destructure it into the standalone
+                // observer's handoff (the submitter can never run the
+                // observer on its own primary). The post-run accounting the
+                // boundary used to read off `primary.completed_count()`
+                // travels back through the `PrimaryRunOutcome` — sourced from
+                // the primary's own ledger on the stay-local path, and from
+                // the observer's converged ledger on the relocated path.
+                let outcome = primary
+                    .run_consuming(rust_binaries, phase_deps, on_phase_start, on_phase_end)
                     .await;
+                // Whether the submitter stayed local or relocated, the
+                // structured exit contract rides on the inner `result`; the
+                // counts ride alongside. The two arms differ ONLY in how a
+                // generic `Err` is treated: a stay-local `Other` keeps the
+                // legacy log-and-swallow (⇒ exit 0), a relocated strand
+                // raises (⇒ non-zero).
+                let (result, relocated, c, f, s) = match outcome {
+                    Ok(PrimaryRunOutcome::Local {
+                        result,
+                        completed,
+                        failed,
+                        stranded,
+                    }) => (result, false, completed, failed, stranded),
+                    Ok(PrimaryRunOutcome::Relocated {
+                        result,
+                        completed,
+                        failed,
+                        stranded,
+                    }) => (result, true, completed, failed, stranded),
+                    // A `run_consuming` top-level `Err` (a pipeline error
+                    // before the fork resolved) consumed `primary`, so the
+                    // counts are unavailable — surface zeros and route the
+                    // error through the markers below.
+                    Err(e) => (Err(e), false, 0, 0, 0),
+                };
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary coordinator failed");
                 }
@@ -484,18 +534,23 @@ impl PyPrimaryCoordinator {
                     Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
                         duplicate_task_id_pre_phase = Some(e);
                     }
+                    Err(e @ RunError::Other(_)) if relocated => {
+                        // A relocated-observer strand (fleet-dead /
+                        // primary-silence / fatal-exit): raise, never swallow.
+                        relocated_strand = Some(e);
+                    }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow behaviour for
-                        // non-structured errors is preserved here:
-                        // these surface through the per-counter
+                        // non-structured STAY-LOCAL errors is preserved
+                        // here: these surface through the per-counter
                         // accounting below (stranded count + the
                         // log line above), not as a PyErr.
                     }
                 }
 
-                completed = primary.completed_count() as u32;
-                failed = primary.failed_count() as u32;
-                stranded = primary.stranded_count() as u32;
+                completed = c as u32;
+                failed = f as u32;
+                stranded = s as u32;
             }));
         });
 
@@ -565,6 +620,16 @@ impl PyPrimaryCoordinator {
             // exit 0. Sequenced alongside `setup_deadline_expired` (both
             // are structured pre-dispatch terminals with no per-task
             // breakdown) and BEFORE `cluster_collapsed`.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = relocated_strand {
+            // GIL is back. The submitter relocated full authority and the
+            // standalone observer tail it ran exited on a strand backstop
+            // (fleet-dead / primary-silence) or a Policy-B fatal-exit. Unlike
+            // a stay-local `Other`, this MUST surface non-zero — the run was
+            // genuinely stranded with no clean `RunComplete`. Raise the
+            // structured `Err`'s Display as a `PyRuntimeError`.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
