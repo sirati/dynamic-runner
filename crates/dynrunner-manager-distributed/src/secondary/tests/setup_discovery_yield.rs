@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use dynrunner_core::PhaseId;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 
-use super::super::test_helpers::{election_config, make_secondary_recording};
+use super::super::test_helpers::{
+    arm_designated_discoverer, election_config, make_secondary_recording, node_with_roster,
+};
 use super::processing::make_binary;
 
 /// Baseline: a non-pre-staged secondary NEVER yields. `pre_staged_mode`
@@ -41,15 +43,20 @@ async fn non_pre_staged_never_pending() {
     );
 }
 
-/// Pre-staged + empty ledger + not-yet-discovered → the yield fires.
+/// Pre-staged + empty ledger + not-yet-discovered + designated authority
+/// → the yield fires. The node must be the single designated discoverer
+/// (lowest-id eligible) AND the recognized current primary for the yield;
+/// `arm_designated_discoverer` seeds both axes through the real CRDT path.
 #[tokio::test(flavor = "current_thread")]
 async fn pre_staged_empty_ledger_is_pending() {
     let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 0);
     sec.enter_operational_for_test();
     sec.set_pre_staged_mode(true);
+    arm_designated_discoverer(&mut sec);
     assert!(
         sec.setup_discovery_pending(),
-        "pre-staged mode with an empty ledger must be setup-discovery pending",
+        "pre-staged mode with an empty ledger on the designated authority \
+         must be setup-discovery pending",
     );
 }
 
@@ -65,6 +72,7 @@ async fn ingest_with_items_clears_pending_and_broadcasts() {
             let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
             sec.enter_operational_for_test();
             sec.set_pre_staged_mode(true);
+            arm_designated_discoverer(&mut sec);
             assert!(sec.setup_discovery_pending());
 
             let mut deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
@@ -121,6 +129,7 @@ async fn empty_discovery_latches_without_reyield() {
             let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
             sec.enter_operational_for_test();
             sec.set_pre_staged_mode(true);
+            arm_designated_discoverer(&mut sec);
             assert!(sec.setup_discovery_pending());
 
             let mut deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
@@ -314,4 +323,122 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
             );
         })
         .await;
+}
+
+/// Acceptance #1 — exactly one node yields (designation). Three
+/// secondaries, all pre-staged, empty ledger, all `can_be_primary`, none
+/// observer, all alive in each one's membership mirror, and
+/// `current_primary = sec-a` on each. The lowest-id eligible node (sec-a)
+/// yields; the others do NOT. This is the core anti-multiplicity
+/// assertion: the multiplicity bug had every secondary yield.
+#[tokio::test(flavor = "current_thread")]
+async fn exactly_one_node_yields_by_designation() {
+    let roster = [("sec-a", true, false), ("sec-b", true, false), ("sec-c", true, false)];
+    let (sec_a, _la) = node_with_roster("sec-a", &roster, Some("sec-a"));
+    let (sec_b, _lb) = node_with_roster("sec-b", &roster, Some("sec-a"));
+    let (sec_c, _lc) = node_with_roster("sec-c", &roster, Some("sec-a"));
+
+    assert!(
+        sec_a.setup_discovery_pending(),
+        "the lowest-id eligible node (sec-a), being designated AND the \
+         recognized authority, must be the one that discovers",
+    );
+    assert!(
+        !sec_b.setup_discovery_pending(),
+        "sec-b is not the lowest-id designate — it must NOT yield \
+         (the multiplicity bug had it yield too)",
+    );
+    assert!(
+        !sec_c.setup_discovery_pending(),
+        "sec-c is not the lowest-id designate — it must NOT yield",
+    );
+}
+
+/// Acceptance #2 — the designated node skips until the authority is ready
+/// (ordering, axis 5). sec-a is the lowest-id designate but the
+/// post-promotion authority is not yet recognized (`current_primary =
+/// None`, then another node) → no yield. Only once `current_primary` is
+/// sec-a itself does the yield fire. Pins "no discovery into the void".
+#[tokio::test(flavor = "current_thread")]
+async fn designated_node_skips_until_authority_ready() {
+    let roster = [("sec-a", true, false), ("sec-b", true, false)];
+
+    // No recognized primary yet: designated, but axis (5) false.
+    let (sec_a_none, _l1) = node_with_roster("sec-a", &roster, None);
+    assert!(
+        !sec_a_none.setup_discovery_pending(),
+        "the designate must NOT discover before any authority is \
+         recognized — discovering here is 'into the void'",
+    );
+
+    // A different node is the recognized authority: still no yield (axis
+    // 5 requires current_primary == self).
+    let (sec_a_other, _l2) = node_with_roster("sec-a", &roster, Some("sec-b"));
+    assert!(
+        !sec_a_other.setup_discovery_pending(),
+        "the designate must NOT discover while another node holds the \
+         recognized authority",
+    );
+
+    // The designate has become the recognized authority: yield fires.
+    let (sec_a_ready, _l3) = node_with_roster("sec-a", &roster, Some("sec-a"));
+    assert!(
+        sec_a_ready.setup_discovery_pending(),
+        "once the designate is the recognized current primary, discovery \
+         fires — its ingest broadcast lands on its own live authority",
+    );
+}
+
+/// Acceptance #3 — re-designation on the designated node's death
+/// (self-healing). With both sec-a and sec-b eligible and sec-a the
+/// authority, only sec-a is pending. When sec-a dies (removed from sec-b's
+/// alive membership) and sec-b becomes the recognized authority, sec-b's
+/// `.min()` re-resolves to itself and it picks up discovery. No orphaned
+/// discovery if the designate dies pre-discovery.
+#[tokio::test(flavor = "current_thread")]
+async fn re_designation_on_designated_node_death() {
+    let roster = [("sec-a", true, false), ("sec-b", true, false)];
+
+    // Healthy: sec-a designated + authority → only sec-a pending.
+    let (sec_a, _la) = node_with_roster("sec-a", &roster, Some("sec-a"));
+    let (sec_b, _lb) = node_with_roster("sec-b", &roster, Some("sec-a"));
+    assert!(sec_a.setup_discovery_pending(), "sec-a is the live designate + authority");
+    assert!(!sec_b.setup_discovery_pending(), "sec-b defers to the lower-id designate");
+
+    // sec-a dies: sec-b's mirror loses sec-a from the alive set and sec-b
+    // becomes the recognized authority. sec-b is now the lowest-id alive
+    // eligible node → it re-resolves as designate and picks up discovery.
+    let after_death = [("sec-b", true, false)];
+    let (sec_b2, _lb2) = node_with_roster("sec-b", &after_death, Some("sec-b"));
+    assert!(
+        sec_b2.setup_discovery_pending(),
+        "on the designate's death the lowest-id rule re-resolves to the \
+         next eligible node (sec-b), which has an empty ledger and now \
+         holds the authority — discovery is not orphaned",
+    );
+}
+
+/// Acceptance #4 — an observer is never designated. The lowest-id node
+/// (sec-a) is an observer; the next-lowest eligible node (sec-b) is the
+/// one that yields, and the observer never does. Mirrors the election's
+/// observer self-exclusion and `select_bootstrap_primary`'s observer cut.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_is_never_designated() {
+    // sec-a is the lex-lowest id but an observer ⇒ excluded from the
+    // candidate set; sec-b is the lowest ELIGIBLE node and the authority.
+    let roster = [("sec-a", false, true), ("sec-b", true, false)];
+
+    let (sec_a, _la) = node_with_roster("sec-a", &roster, Some("sec-b"));
+    let (sec_b, _lb) = node_with_roster("sec-b", &roster, Some("sec-b"));
+
+    assert!(
+        !sec_a.setup_discovery_pending(),
+        "an observer must NEVER be the designated discoverer, even when it \
+         is the lex-lowest id",
+    );
+    assert!(
+        sec_b.setup_discovery_pending(),
+        "the lowest-id NON-observer eligible node yields when the observer \
+         is skipped",
+    );
 }

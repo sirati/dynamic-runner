@@ -401,6 +401,80 @@ where
     fired
 }
 
+/// Seed a secondary's replicated `cluster_state` mirror with one
+/// worker-secondary member through the REAL CRDT apply path the primary's
+/// fleet-connect originates (`PeerJoined` + `SecondaryCapacity`, see
+/// `primary/connect.rs`). The seeded member is alive, carries the given
+/// `can_be_primary` / `is_observer` projection, and advertises one
+/// worker (so it appears in `alive_secondary_members`).
+///
+/// Used by the setup-discovery designation tests to build the same
+/// membership view a node's mirror holds after the primary broadcasts the
+/// fleet roster — the input `is_designated_discoverer` reads.
+pub(super) fn seed_member<Tr, M, S, E>(
+    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+    id: &str,
+    can_be_primary: bool,
+    is_observer: bool,
+) where
+    Tr: PeerTransport<TestId>,
+    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
+    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
+    E: ResourceEstimator<TestId> + Clone,
+{
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    coord.cluster_state.apply(ClusterMutation::PeerJoined {
+        peer_id: id.into(),
+        is_observer,
+        can_be_primary,
+    });
+    coord.cluster_state.apply(ClusterMutation::SecondaryCapacity {
+        secondary: id.into(),
+        worker_count: 1,
+        resources: vec![],
+    });
+}
+
+/// Set the recognized post-promotion authority on a secondary's mirror
+/// through the REAL `PrimaryChanged` apply path (epoch 1, advisory
+/// `Transferred` reason — the bootstrap-relocate shape). `is_designated_
+/// discoverer`'s sibling axis (5) reads `current_primary()`.
+pub(super) fn set_current_primary<Tr, M, S, E>(
+    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+    id: &str,
+) where
+    Tr: PeerTransport<TestId>,
+    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
+    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
+    E: ResourceEstimator<TestId> + Clone,
+{
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
+    coord.cluster_state.apply(ClusterMutation::<TestId>::PrimaryChanged {
+        new: id.into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Transferred,
+    });
+}
+
+/// Arm a pre-staged secondary as the SINGLE designated discoverer AND the
+/// recognized authority: seed it as the sole alive, `can_be_primary`,
+/// non-observer worker-secondary member and set `current_primary` to
+/// itself. After this the node satisfies axes (4) + (5) of
+/// `setup_discovery_pending`, so the legacy single-node yield tests (which
+/// predate the designation gate) hold their original intent.
+pub(super) fn arm_designated_discoverer<Tr, M, S, E>(
+    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+) where
+    Tr: PeerTransport<TestId>,
+    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
+    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
+    E: ResourceEstimator<TestId> + Clone,
+{
+    let self_id = coord.config.secondary_id.clone();
+    seed_member(coord, &self_id, true, false);
+    set_current_primary(coord, &self_id);
+}
+
 /// Construct a SecondaryCoordinator over the unified transport with a
 /// [`RecordingPeer`] mesh stub, returning the coordinator + the shared
 /// broadcast log so a test can assert on the messages the failover
@@ -430,4 +504,37 @@ pub(super) fn make_secondary_recording(
         FixedEstimator(100),
     );
     (coord, log)
+}
+
+/// Build a pre-staged, operational secondary whose replicated mirror holds
+/// the given fleet `roster` (each `(id, can_be_primary, is_observer)`
+/// seeded through the real `PeerJoined` + `SecondaryCapacity` apply path)
+/// and the given recognized `current_primary`. This is the membership view
+/// a node's mirror holds after the primary broadcasts the fleet roster —
+/// the exact input `setup_discovery_pending`'s designation axes read.
+#[allow(clippy::type_complexity)]
+pub(super) fn node_with_roster(
+    self_id: &str,
+    roster: &[(&str, bool, bool)],
+    current_primary: Option<&str>,
+) -> (
+    SecondaryCoordinator<
+        TestTransport<RecordingPeer<TestId>>,
+        ChannelManagerEnd,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
+) {
+    let (mut sec, log) = make_secondary_recording(election_config(self_id), roster.len());
+    sec.enter_operational_for_test();
+    sec.set_pre_staged_mode(true);
+    for (id, can_be_primary, is_observer) in roster {
+        seed_member(&mut sec, id, *can_be_primary, *is_observer);
+    }
+    if let Some(p) = current_primary {
+        set_current_primary(&mut sec, p);
+    }
+    (sec, log)
 }
