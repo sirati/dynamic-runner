@@ -6,8 +6,8 @@
 //! is observing: both the secondary late-joiner (a peer-mesh-only
 //! participant that joined via the snapshot RPC) AND the
 //! relocated-submitter primary tail (the bootstrap-primary that handed
-//! its role to a compute secondary and runs `run_as_observer`) consume
-//! them. They have no place inside the generic `secondary/` tree.
+//! its role to a compute secondary and runs the relocation observer tail)
+//! consume them. They have no place inside the generic `secondary/` tree.
 //!
 //!   * [`announcer`]        — the resource-holdings broadcaster.
 //!   * [`reporting`]        — the CRDT-derived periodic-stats + idle

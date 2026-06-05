@@ -13,7 +13,7 @@
 //! # Why narrate from the CRDT, not from the primary
 //!
 //! After a bootstrap relocation the operator's process steps down to an
-//! observer ([`crate::PrimaryCoordinator::run_as_observer`]) and the new
+//! observer (the relocation observer tail) and the new
 //! primary lives on a DIFFERENT node. A narrative emitted by the primary
 //! then goes to that other node's stdout — invisible to the operator who
 //! launched the job. The CRDT, by contrast, is replicated to every node:
