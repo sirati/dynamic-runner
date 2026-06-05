@@ -1,18 +1,31 @@
-//! Observer-specific subsystems.
+//! Observer-mode coordinator components.
 //!
-//! Single concern of this module: house the components that exist
-//! ONLY for observer-mode coordinators (peer-mesh-only participants
-//! that joined via the late-joiner snapshot RPC) and therefore have
-//! no place inside the generic `secondary/` tree. The first such
-//! component is [`announcer`], the resource-holdings broadcaster.
+//! Single concern of this module: house the components that exist for
+//! observer-mode operation — a node that holds the replicated CRDT and
+//! carries zero authority. These are role-agnostic about WHICH process
+//! is observing: both the secondary late-joiner (a peer-mesh-only
+//! participant that joined via the snapshot RPC) AND the
+//! relocated-submitter primary tail (the bootstrap-primary that handed
+//! its role to a compute secondary and runs `run_as_observer`) consume
+//! them. They have no place inside the generic `secondary/` tree.
+//!
+//!   * [`announcer`]        — the resource-holdings broadcaster.
+//!   * [`reporting`]        — the CRDT-derived periodic-stats + idle
+//!     reporter (the operator's "wake-an-LLM" feed).
+//!   * [`failure_response`] — the terminal-failure policies (error
+//!     aggregation + the invalid_task fatal-exit monitor).
 //!
 //! See each submodule's header for its concern.
 
 pub mod announcer;
+pub mod failure_response;
 pub mod lifecycle;
+pub mod reporting;
 
 pub use announcer::{
     AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender, PeerMeshAnnouncerSender,
     PeerResourceHoldingsUpdatedPayload, run_observer_announcer,
 };
+pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
+pub use reporting::{Reporter, SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};

@@ -21,10 +21,15 @@ use crate::subprocess_factory::SubprocessWorkerFactory;
 
 use dynrunner_manager_distributed::task_completed::{run_collector, windowed_failure_collector};
 
+use dynrunner_manager_distributed::observer::failure_response::{
+    ErrorAggregationPolicy, InvalidTaskMonitorPolicy,
+};
+use dynrunner_manager_distributed::observer::reporting::{
+    SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter,
+};
+
 use super::PyObserverLateJoiner;
-use super::failure_policies::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use super::helpers::{map_read_dir_error, records_to_seed};
-use super::reporter::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 
 #[pymethods]
 impl PyObserverLateJoiner {

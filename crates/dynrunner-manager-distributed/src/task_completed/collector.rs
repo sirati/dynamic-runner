@@ -9,7 +9,7 @@
 //! window elapses.
 //!
 //! This is ONE primitive with two thin policies layered on top (each in
-//! its owning module, `observer_late_joiner`): the invalid_task monitor
+//! its owning module, `crate::observer::failure_response`): the invalid_task monitor
 //! (1-minute window → fatal-exit signal, one-shot) and the error
 //! aggregator (rolling-10-minute window, collect `min(1min, remainder)`,
 //! dedup-print, no exit, reset per rolling window). NOTHING here knows

@@ -26,7 +26,8 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::Identifier;
-use dynrunner_manager_distributed::{ClusterState, TaskState};
+
+use crate::{ClusterState, TaskState};
 
 /// One flat projection of the CRDT at an instant. Every field is a
 /// non-negative count except `per_secondary_in_flight`, which the idle

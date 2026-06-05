@@ -6,7 +6,7 @@
 //! per owner-decisions B and C-5 it is also the node that reacts to
 //! terminal failures. Both reactions are thin POLICIES over the ONE
 //! shared windowed-failure-collector primitive
-//! ([`dynrunner_manager_distributed::task_completed::collector`]): the
+//! ([`crate::task_completed::collector`]): the
 //! collector owns the window/dedup mechanics, these policies own only
 //! WHICH failures count, HOW LONG the window is, and WHAT happens when it
 //! elapses.
@@ -27,10 +27,12 @@
 //! signal handle. They share NO state with each other and hold NO
 //! coordinator reference — the collector's listener/driver split keeps
 //! all the threading concerns in the primitive. The integration site
-//! (`observer_late_joiner/run.rs`) builds each policy's collector,
-//! registers the listener via `register_task_completed_listener`, and
-//! spawns the driver; Policy B's fatal-exit receiver is consumed by the
-//! operational loop exactly like the panik signal.
+//! (the secondary late-joiner observer loop, and the relocated-submitter
+//! primary tail) builds each policy's collector, registers the listener
+//! via `register_task_completed_listener`, and spawns the driver; Policy
+//! B's fatal-exit receiver is consumed by the operational loop exactly
+//! like the panik signal (Policy B stays late-joiner-only — the primary
+//! tail has no fatal-exit channel).
 
 pub mod aggregation;
 pub mod invalid_task;

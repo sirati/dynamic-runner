@@ -20,10 +20,10 @@
 //! site's concern and the reporter logic is testable in isolation).
 //!
 //! Sub-modules, each a single concern:
-//!   * [`stats`]  — project `&ClusterState` → [`StatsSnapshot`] (pure).
-//!   * [`format`] — delta + the `>0`-and-changed inclusion rule (pure).
-//!   * [`idle`]   — the idle-secondary gate state machine (pure).
-//!   * [`run`]    — the two-cadence driver + importance-channel emit.
+//!   * [`stats`]    — project `&ClusterState` → [`StatsSnapshot`] (pure).
+//!   * [`format`]   — delta + the `>0`-and-changed inclusion rule (pure).
+//!   * [`idle`]     — the idle-secondary gate state machine (pure).
+//!   * [`reporter`] — the two-cadence driver + importance-channel emit.
 //!
 //! # Occupancy stats (Part-C addon, now implemented)
 //!
@@ -41,16 +41,21 @@
 
 pub mod format;
 pub mod idle;
-pub mod run;
+pub mod reporter;
 pub mod stats;
 
 #[cfg(test)]
 mod tests;
 
-// The integration site (`observer_late_joiner/run.rs`) wires the
-// reporter with these. The `Clock` / `CrdtSnapshotSource` traits stay
-// `pub` in `run` (the seam contracts; the test suite + a future live
-// producer name them) but are not re-exported here until an external
-// caller needs them by short name.
-pub use run::{SharedSnapshotSource, TokioClock, run_reporter};
+// Both integration sites (the secondary late-joiner and the
+// relocated-submitter primary tail) wire the reporter with these. The
+// seam contracts (`Clock` / `CrdtSnapshotSource`), the reusable
+// `Reporter` state machine, and the two cadence constants are
+// re-exported here so a caller that drives the cadences inline (the
+// primary tail's `select!` arms) reaches them by short name without
+// descending into `reporter`.
+pub use reporter::{
+    Clock, CrdtSnapshotSource, IDLE_INTERVAL, Reporter, STATS_INTERVAL, SharedSnapshotSource,
+    TokioClock, run_reporter,
+};
 pub use stats::StatsSnapshot;

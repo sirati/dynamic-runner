@@ -35,9 +35,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use dynrunner_core::IMPORTANT_TARGET;
-use dynrunner_manager_distributed::task_completed::{
-    CollectedFailure, CollectorPolicy, TaskCompletedEvent,
-};
+
+use crate::task_completed::{CollectedFailure, CollectorPolicy, TaskCompletedEvent};
 
 /// The outer rolling window: dedup memory + window-boundary cadence.
 pub const ROLLING_WINDOW: Duration = Duration::from_secs(600);

@@ -30,9 +30,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 
 use dynrunner_core::IMPORTANT_TARGET;
-use dynrunner_manager_distributed::task_completed::{
-    CollectedFailure, CollectorPolicy, TaskCompletedEvent,
-};
+
+use crate::task_completed::{CollectedFailure, CollectorPolicy, TaskCompletedEvent};
 
 /// The invalid_task collection window: a batch of invalid tasks that
 /// land within a minute of the first are all collected before the
