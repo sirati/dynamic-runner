@@ -383,6 +383,7 @@ where
             peer_id: self_id,
             is_observer: false,
             can_be_primary: true,
+            cap_version: Default::default(),
         },
     );
     let fired = Rc::new(std::cell::Cell::new(false));
@@ -427,6 +428,7 @@ pub(super) fn seed_member<Tr, M, S, E>(
         peer_id: id.into(),
         is_observer,
         can_be_primary,
+        cap_version: Default::default(),
     });
     coord.cluster_state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.into(),

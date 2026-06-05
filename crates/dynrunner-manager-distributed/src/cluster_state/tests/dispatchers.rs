@@ -33,6 +33,7 @@ async fn apply_peer_joined_emits_event_through_dispatcher() {
             peer_id: "peer-x".into(),
             is_observer: false,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::Applied
     );

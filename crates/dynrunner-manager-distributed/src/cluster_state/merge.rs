@@ -18,6 +18,8 @@
 //!     `merge_task_state`.
 //!   * `// === primary register ===` — `primary_register_adopt`.
 //!   * `// === phase_deps ===` — `canonical_phase_deps_hash`.
+//!   * `// === capabilities ===` — `merge_capability`,
+//!     `capability_fold` (the 2P-set merge + its digest projection).
 //!
 //! The resets-are-not-joins boundary (DRAWN ONCE here): `merge_task_state`
 //! is the MONOTONE join. Authoritative rank-DROP resets
@@ -36,7 +38,9 @@ use dynrunner_core::{Identifier, PhaseId, TaskOutputs, TaskVersion};
 
 use super::ClusterState;
 use super::TaskState;
-use super::types::{FailedLikeRank, JoinBand, NonTerminalRank, TaskJoinKey, TerminalRank};
+use super::types::{
+    CapabilityEntry, FailedLikeRank, JoinBand, NonTerminalRank, TaskJoinKey, TerminalRank,
+};
 use crate::task_completed::TaskCompletedEvent;
 
 // === per-task join ===
@@ -286,11 +290,6 @@ impl<I: Identifier> ClusterState<I> {
 /// convention, so the CRDT register agrees with the leader the election
 /// would pick — and BOTH replicas of an equal-epoch split converge to the
 /// same id in one round.
-///
-/// Carried in this module ready for wave B to wire the apply
-/// `PrimaryChanged` arm + restore primary branch onto it; unused by the
-/// wave-A task-state core.
-#[allow(dead_code)]
 pub(super) fn primary_register_adopt(
     local_epoch: u64,
     local_id: Option<&str>,
@@ -319,11 +318,6 @@ pub(super) fn primary_register_adopt(
 /// insertion order produce the same hash, and a divergent-but-equal-count
 /// graph produces a DIFFERENT hash (which the count-only digest line
 /// could not see).
-///
-/// Carried in this module ready for wave B to wire the restore
-/// deterministic merge + the digest `phase_deps_hash` onto it; unused by
-/// the wave-A task-state core.
-#[allow(dead_code)]
 pub(super) fn canonical_phase_deps_hash(deps: &HashMap<PhaseId, Vec<PhaseId>>) -> u64 {
     let mut entries: Vec<(&PhaseId, Vec<&PhaseId>)> = deps
         .iter()
@@ -335,4 +329,73 @@ pub(super) fn canonical_phase_deps_hash(deps: &HashMap<PhaseId, Vec<PhaseId>>) -
         .collect();
     entries.sort_by(|a, b| a.0.cmp(b.0));
     hash_one(&entries)
+}
+
+// === capabilities ===
+
+/// 2P-set merge of one peer's role capability (C6). The SINGLE place the
+/// capability lattice join order is spelled, consumed by apply's peer
+/// arms (against the local entry) and restore's per-id loop:
+///   * `Departed ∨ _ = Departed` (the tombstone dominates — a genuine
+///     departure is monotone and cannot be undone by a stale advertise);
+///   * `Advertised ∨ Advertised = Advertised { is_observer: a || b
+///     (upward ratchet — an observer never un-observes), can_be_primary:
+///     <bit of the higher cap_version> (a newer `SetCanBePrimary(false)`
+///     beats an older `true`), cap_version: max(a, b) }`.
+///
+/// Commutative / associative / idempotent: `Departed` is an absorbing
+/// element; the `Advertised` fold is field-wise OR + a max-versioned
+/// pick, all of which are order-independent. Returns the merged entry so
+/// the caller writes it back into the `capabilities` map.
+pub(super) fn merge_capability(local: &CapabilityEntry, incoming: &CapabilityEntry) -> CapabilityEntry {
+    match (local, incoming) {
+        // The tombstone absorbs everything (genuine departure dominates).
+        (CapabilityEntry::Departed, _) | (_, CapabilityEntry::Departed) => CapabilityEntry::Departed,
+        (
+            CapabilityEntry::Advertised {
+                is_observer: lo,
+                can_be_primary: lc,
+                cap_version: lv,
+            },
+            CapabilityEntry::Advertised {
+                is_observer: io,
+                can_be_primary: ic,
+                cap_version: iv,
+            },
+        ) => {
+            // `can_be_primary` follows the higher cap_version; a TOTAL tie
+            // keeps `local` (idempotent — the same advertisement
+            // redelivered). `is_observer` ratchets up (OR), so it needs no
+            // version.
+            let can_be_primary = if iv > lv { *ic } else { *lc };
+            CapabilityEntry::Advertised {
+                is_observer: *lo || *io,
+                can_be_primary,
+                cap_version: (*lv).max(*iv),
+            }
+        }
+    }
+}
+
+/// Order-independent digest fold over the `capabilities` 2P-set (C6 — the
+/// snapshot-healable CRDT, so folding it is detect-WITH-heal, not the R2
+/// no-op pull loop). Per-entry hash of `(id, is_observer, can_be_primary,
+/// cap_version, is_departed)`; the caller XOR-folds these so the result is
+/// invariant under iteration order. A `Departed` tombstone folds with its
+/// distinct `is_departed` flag so a node that converged the tombstone
+/// differs from one that still holds the `Advertised`.
+pub(super) fn capability_fold(id: &str, entry: &CapabilityEntry) -> u64 {
+    match entry {
+        CapabilityEntry::Advertised {
+            is_observer,
+            can_be_primary,
+            cap_version,
+        } => hash_one((id, *is_observer, *can_be_primary, *cap_version, false)),
+        CapabilityEntry::Departed => {
+            // `(false, false, default version, is_departed=true)` — the
+            // payload bits are inert under the tombstone; the `true`
+            // departed flag is what distinguishes it from any Advertised.
+            hash_one((id, false, false, TaskVersion::default(), true))
+        }
+    }
 }

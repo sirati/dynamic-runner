@@ -46,6 +46,14 @@ pub enum RemovalCause {
     /// `"panik file: <path>"` / `"panik SIGTERM (per-host)"`),
     /// byte-capped identically to `FatalError`.
     SelfDeparture(BoundedString<1024>),
+    /// Post-mesh roster RE-EMIT of an already-departed id (C6/B5): the
+    /// primary's `rebroadcast_full_roster` re-emits a `PeerRemoved` for
+    /// each `Departed`-tombstoned id in the `capabilities` 2P-set so a
+    /// reconnecting node's LIVENESS view catches up. The original
+    /// detection cause is not retained on the tombstone, so this cause
+    /// names the re-emit itself — observability-only and idempotent at the
+    /// sticky receiver (a node that already buried the id NoOps).
+    RosterReemit,
 }
 
 #[cfg(test)]

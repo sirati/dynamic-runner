@@ -135,6 +135,7 @@ mod tests {
                     peer_id: "obs-1".into(),
                     is_observer: true,
                     can_be_primary: false,
+                    cap_version: Default::default(),
                 }),
                 ApplyOutcome::Applied
             );

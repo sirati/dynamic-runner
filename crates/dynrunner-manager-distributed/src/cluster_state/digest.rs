@@ -58,14 +58,23 @@ impl<I: Identifier> ClusterState<I> {
         let ClusterState {
             // ── replicated (summarised) ──
             tasks,
-            current_primary: _current_primary,
+            current_primary,
             primary_epoch,
             phase_deps,
             run_complete,
             run_aborted,
+            // The role-CAPABILITY 2P-set IS summarised (C6): it is a
+            // proper CRDT (merged monotonically in `restore`), so folding
+            // it is detect-WITH-heal — a flagged divergence is one a
+            // snapshot pull's `restore` of the 2P-set actually heals.
+            capabilities,
             // ── replicated but DELIBERATELY EXCLUDED from the digest ──
-            // (membership/role sets — non-monotone-via-removal and not
-            // snapshot-healable; see the classification comment below.)
+            // `role_table` is a node-local PROJECTION of `capabilities ×
+            // peer_state-alive` (rebuilt by `reproject_roles`), so it
+            // carries no convergence signal of its own. `peer_state`
+            // LIVENESS is intentionally divergent (honest-liveness; each
+            // node owns its view) and not snapshot-healable for Dead ids,
+            // so it stays excluded (see the classification comment below).
             role_table: _role_table,
             peer_state: _peer_state,
             peer_holdings: _peer_holdings,
@@ -85,39 +94,27 @@ impl<I: Identifier> ClusterState<I> {
             task_seq: _task_seq,
         } = self;
 
-        // `current_primary` is summarised via `primary_epoch` (the
-        // epoch+identity move together on the `PrimaryChanged`/restore
-        // path; a higher epoch is the monotone divergence signal). It
-        // needs no separate digest field. `peer_holdings` is steady-state
-        // best-effort metadata reconstructed from live announces and is
-        // NOT carried in the digest: it is not a convergence-critical
-        // ledger (a stale holdings map self-heals on the next per-peer
-        // announce), and including it would add periodic churn without a
-        // correctness payoff.
+        // `peer_holdings` is steady-state best-effort metadata
+        // reconstructed from live announces and is NOT carried in the
+        // digest: it is not a convergence-critical ledger (a stale
+        // holdings map self-heals on the next per-peer announce), and
+        // including it would add periodic churn without a correctness
+        // payoff.
         //
-        // `role_table` (the `observers` + `can_be_primary` id sets) and
-        // `peer_state` (the alive/dead membership ledger) are EXCLUDED from
-        // the digest for the SAME class of reason `peer_holdings` is, for
-        // two independent causes:
-        //   1. Non-monotone-via-removal + NOT snapshot-healable. The live
-        //      apply path REMOVES ids (`PeerRemoved` drops from
-        //      `observers`/`can_be_primary`; `SetCanBePrimary(false)`
-        //      removes), but `restore()` is additive/sticky — it replaces a
-        //      role set only when local is empty (else keeps local) and
-        //      inserts alive entries only into VACANT slots (a local `Dead`
-        //      is sticky, never resurrected). A pull can therefore never
-        //      reconcile a stale extra id, so summarising these would loop a
-        //      no-op pull every cadence tick.
-        //   2. They converge over their OWN paths. Additions flow via the
-        //      live `PeerJoined`/`PeerRemoved`/`SetCanBePrimary` broadcasts
-        //      plus the post-mesh `rebroadcast_full_roster` re-emit; and the
-        //      alive-set divergence is INTENTIONAL per the honest-liveness
-        //      design (each node owns its own liveness view), so anti-
-        //      entropy must NOT force-converge it — it must never resurrect
-        //      a peer a node correctly buried as dead.
-        // All three are bound above so the destructure stays exhaustive;
-        // their EXCLUSION from the digest is the deliberate classification
-        // this comment records. (See `StateDigest::is_behind` for the
+        // `role_table` (the `observers` + `can_be_primary` id sets) is a
+        // node-local PROJECTION of `capabilities × peer_state-alive`
+        // (rebuilt by `reproject_roles`), so it carries no convergence
+        // signal of its OWN — the capability convergence is captured by
+        // the `capabilities_hash` below, and the alive composition is
+        // node-local liveness. `peer_state` (the alive/dead membership
+        // ledger) is EXCLUDED because the alive-set divergence is
+        // INTENTIONAL per the honest-liveness design (each node owns its
+        // own liveness view), so anti-entropy must NOT force-converge it —
+        // it must never resurrect a peer a node correctly buried as dead;
+        // and Dead ids are not snapshotted, so a Dead-set divergence is not
+        // snapshot-healable. All are bound above so the destructure stays
+        // exhaustive; their EXCLUSION is the deliberate classification this
+        // comment records. (See `StateDigest::is_behind` for the
         // mirror-image rationale on the detector side.)
 
         // Tasks: count + order-independent XOR-fold of a per-entry hash
@@ -141,12 +138,26 @@ impl<I: Identifier> ClusterState<I> {
             secondary_capacities_hash ^= hash_one(key);
         }
 
-        // Keyed-output cache: count + XOR-fold over the KEYS (per-key
-        // first-write-wins, so the key-set identity detects a missing
-        // entry).
+        // Keyed-output cache: count + KEY+VALUE-content-hash fold (AE-5).
+        // Was key-only; now also folds the output VALUE so a divergent
+        // value at an equal key is detected (the apply/restore
+        // first-write-wins makes the value equal-by-construction once
+        // converged, but a genuine pre-convergence value split is now
+        // visible). `TaskOutputs` is `Hash`-able by its content.
         let mut task_outputs_hash = 0u64;
-        for key in task_outputs.keys() {
-            task_outputs_hash ^= hash_one(key);
+        for (key, value) in task_outputs {
+            task_outputs_hash ^= hash_one((key, value));
+        }
+
+        // Capabilities: count + XOR-fold over the 2P-set entries (C6),
+        // derived from the SHARED `capability_fold` projection so a
+        // divergence the merge would heal is one the digest sees. Folds
+        // `(id, is_observer, can_be_primary, cap_version, is_departed)`
+        // per entry — detect-WITH-heal (the 2P-set merges monotonically in
+        // `restore`, so a flagged divergence a snapshot pull resolves).
+        let mut capabilities_hash = 0u64;
+        for (id, entry) in capabilities {
+            capabilities_hash ^= super::merge::capability_fold(id, entry);
         }
 
         StateDigest {
@@ -157,6 +168,21 @@ impl<I: Identifier> ClusterState<I> {
             task_outputs_count: task_outputs.len() as u64,
             task_outputs_hash,
             phase_deps_count: phase_deps.len() as u64,
+            // CRD-3/D-G: the canonical order-independent content hash of
+            // the static phase-dependency graph, so a divergent-but-equal-
+            // count graph is detected (the count-only line could not see
+            // it). Shares the one `canonical_phase_deps_hash` helper with
+            // the restore deterministic merge.
+            phase_deps_hash: super::merge::canonical_phase_deps_hash(phase_deps),
+            // CRD-2/D-P: the current-primary identity hash, so a same-epoch
+            // DIFFERENT-identity split is detectable (a higher epoch is
+            // caught by `primary_epoch` alone, but two replicas at the same
+            // epoch with different `current_primary` carry the same epoch —
+            // only this hash separates them; restore's lower-id-wins then
+            // converges both in one round).
+            current_primary_hash: hash_one(current_primary),
+            capabilities_count: capabilities.len() as u64,
+            capabilities_hash,
             primary_epoch: *primary_epoch,
             run_complete: *run_complete,
             run_aborted: run_aborted.is_some(),

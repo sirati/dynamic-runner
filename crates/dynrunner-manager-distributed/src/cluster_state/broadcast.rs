@@ -31,9 +31,13 @@ impl<I: Identifier> ClusterState<I> {
     /// the cold-start non-terminal version) and a legacy pre-field sender
     /// both carry — so a stamped update always wins its first apply.
     /// Total order is lexicographic `(primary_epoch, seq)`, so each
-    /// subsequent stamp for the same hash strictly exceeds the prior, and
+    /// subsequent stamp for the same key strictly exceeds the prior, and
     /// a post-promotion stamp (higher `primary_epoch`) exceeds every
     /// pre-promotion version regardless of the local `seq` cold-start.
+    ///
+    /// The key is a task content hash for per-task versions and a peer id
+    /// for capability `cap_version`s (C6); the per-key monotone counter is
+    /// generic over the key string — only monotonicity-per-key matters.
     pub(super) fn next_task_version(&mut self, hash: &str) -> TaskVersion {
         let seq = self
             .task_seq
@@ -48,12 +52,13 @@ impl<I: Identifier> ClusterState<I> {
 }
 
 /// Stamp the originator's `TaskVersion` onto every version-bearing
-/// mutation in `mutations`, BEFORE the apply+filter loop (B3). The ONE
-/// choke point both originator paths route through, so a forgotten stamp
-/// at any `failed.rs`/`handler.rs`/`mutations.rs`/`coordinator.rs`
-/// origination site is impossible — those sites build the mutation with
-/// `version: Default::default()` and this pass overwrites it with the
-/// minted version.
+/// mutation in `mutations` (the per-task `version` AND the capability
+/// `cap_version`), BEFORE the apply+filter loop (B3). The ONE choke point
+/// both originator paths route through, so a forgotten stamp at any
+/// `failed.rs`/`handler.rs`/`mutations.rs`/`coordinator.rs` origination
+/// site is impossible — those sites build the mutation with
+/// `version: Default::default()` (or `cap_version: Default::default()`)
+/// and this pass overwrites it with the minted version.
 ///
 /// Compile guard (B3): the match is EXHAUSTIVE over `ClusterMutation`.
 /// The version-bearing variants are matched by DESTRUCTURING their
@@ -78,11 +83,28 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::TaskRequeued { hash, version } => {
                 *version = state.next_task_version(hash);
             }
+            // Capability mutations carry the SAME monotone stamp keyed by
+            // PEER id (C6): the `cap_version` arbitrates a `can_be_primary`
+            // flip-back so a missed `SetCanBePrimary(false)` heals. Keyed
+            // by `peer_id` (not a task hash), but the per-key
+            // `next_task_version` counter is generic over the key string.
+            ClusterMutation::PeerJoined {
+                peer_id,
+                cap_version,
+                ..
+            }
+            | ClusterMutation::SetCanBePrimary {
+                peer_id,
+                cap_version,
+                ..
+            } => {
+                *cap_version = state.next_task_version(peer_id);
+            }
             // The genuinely version-LESS variants, listed EXPLICITLY (B3
             // invariant: this arm must NEVER swallow a version-bearing
             // variant). `TaskAdded` (vacant-insert), `TaskCompleted`
             // (idempotent + rank-dominant), `TaskBlocked` (cascade-pause
-            // keyed on `on`), and every non-task mutation.
+            // keyed on `on`), and every non-versioned non-task mutation.
             ClusterMutation::TaskAdded { .. }
             | ClusterMutation::TaskCompleted { .. }
             | ClusterMutation::TaskBlocked { .. }
@@ -90,8 +112,6 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::RunComplete
             | ClusterMutation::RunAborted { .. }
-            | ClusterMutation::PeerJoined { .. }
-            | ClusterMutation::SetCanBePrimary { .. }
             | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::SecondaryCapacity { .. }

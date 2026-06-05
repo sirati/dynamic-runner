@@ -111,6 +111,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                         peer_id: id.into(),
                         is_observer: false,
                         can_be_primary: false,
+                        cap_version: Default::default(),
                     });
                     cs.apply(ClusterMutation::SecondaryCapacity {
                         secondary: id.into(),
@@ -157,6 +158,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                     peer_id: "sec-0".into(),
                     is_observer: false,
                     can_be_primary: true,
+                    cap_version: Default::default(),
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "sec-0".into(),

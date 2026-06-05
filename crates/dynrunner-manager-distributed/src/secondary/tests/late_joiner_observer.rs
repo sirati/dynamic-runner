@@ -70,19 +70,31 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
     };
     tasks.insert("task-1".to_string(), mk_pending("/tmp/task-1", "task-1"));
     tasks.insert("task-2".to_string(), mk_pending("/tmp/task-2", "task-2"));
-    let mut observers = HashSet::new();
-    observers.insert("observer-peer".to_string());
+    // C6: the observer rides the `capabilities` 2P-set as an
+    // `Advertised { is_observer: true }`, AND must be ALIVE for the
+    // `role_table().observers` projection (capability × local-alive) to
+    // include it — so seed `alive_members` with the same id.
+    let mut capabilities = HashMap::new();
+    capabilities.insert(
+        "observer-peer".to_string(),
+        crate::cluster_state::CapabilityEntry::Advertised {
+            is_observer: true,
+            can_be_primary: false,
+            cap_version: Default::default(),
+        },
+    );
+    let mut alive_members = HashSet::new();
+    alive_members.insert("observer-peer".to_string());
     crate::cluster_state::ClusterStateSnapshot {
         tasks,
         current_primary: Some("primary-peer".to_string()),
         primary_epoch: 7,
         phase_deps: HashMap::new(),
-        observers,
-        can_be_primary: Default::default(),
+        capabilities,
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
         secondary_capacities: HashMap::new(),
-        alive_members: Default::default(),
+        alive_members,
         run_complete: false,
         run_aborted: None,
     }

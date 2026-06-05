@@ -304,6 +304,21 @@ impl<I: Identifier> ClusterState<I> {
         self.role_table.can_be_primary.contains(peer_id)
     }
 
+    /// The peer ids the `capabilities` 2P-set holds as `Departed`
+    /// tombstones — the AUTHORITATIVE departure view (a genuine
+    /// `PeerRemoved` wrote each one). The post-mesh roster re-emit
+    /// (`rebroadcast_full_roster`) iterates these to re-emit a
+    /// `PeerRemoved` per departed id so a reconnecting node's LIVENESS
+    /// view catches up (B5/C6 — the 2P-set view, NOT `self.secondaries`,
+    /// which has already dropped them). Capability convergence itself no
+    /// longer hinges on this re-emit: it rides the snapshot-healable
+    /// 2P-set + the digest's `capabilities_hash`.
+    pub fn departed_capability_ids(&self) -> impl Iterator<Item = &str> {
+        self.capabilities.iter().filter_map(|(id, entry)| {
+            matches!(entry, super::types::CapabilityEntry::Departed).then_some(id.as_str())
+        })
+    }
+
     /// Resolve a dependency's full `(phase_id, task_id)` identity to its
     /// wire-canonical hash via a linear scan over `self.tasks`. Returns
     /// `None` if no entry in the ledger carries that exact identity.

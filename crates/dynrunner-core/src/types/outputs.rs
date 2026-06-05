@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// Keys are deliberately stable-sorted (`BTreeMap`) so the wire bytes are
 /// deterministic for a given accumulator content — useful for diff-based
 /// replay tests and for the CRDT-replicated `TaskCompleted` mutation.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TaskOutputs(pub BTreeMap<String, ResultValue>);
 
 /// One published value. Either inlined into the wire JSON or a path
@@ -33,7 +33,7 @@ pub struct TaskOutputs(pub BTreeMap<String, ResultValue>);
 /// side reads `result["kind"]` and `result["value"]` directly. Keep this
 /// attribute exactly as-is — switching to `tag = "kind"` alone breaks
 /// `serde_json::to_string` at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ResultValue {
     /// Inline string value. Soft-cap warns at >64 KiB per value

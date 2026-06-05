@@ -182,6 +182,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // A node setting its own primary-capability marker from its
             // lifecycle is Leaf 3's concern.
             can_be_primary: false,
+            // Stamped at the origination choke point.
+            cap_version: Default::default(),
         }])
         .await;
     }
@@ -238,20 +240,50 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// record applies it and converges. Zero new merge logic — the
     /// existing lattice does all the reconciliation.
     pub(crate) async fn rebroadcast_full_roster(&mut self) {
+        // Collect the AUTHORITATIVE departure view (the `capabilities`
+        // 2P-set's Departed tombstones — NOT `self.secondaries`, which has
+        // already dropped them) before the `self.secondaries` borrow below.
+        // A reconnecting node that missed a `PeerRemoved` learns the
+        // departure from this re-emit (the LIVENESS catch-up); capability
+        // correctness already rides the snapshot-healable 2P-set + digest.
+        let departed_ids: Vec<String> = self
+            .cluster_state
+            .departed_capability_ids()
+            .map(|id| id.to_string())
+            .collect();
         // Build the full roster batch under the immutable borrow of
         // `self.secondaries`. Two mutations per secondary: the membership
-        // `PeerJoined` and the static `SecondaryCapacity`.
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(self.secondaries.len() * 2);
+        // `PeerJoined` and the static `SecondaryCapacity`. A `PeerRemoved`
+        // per Departed-tombstoned id is appended after.
+        let mut mutations: Vec<ClusterMutation<I>> =
+            Vec::with_capacity(self.secondaries.len() * 2 + departed_ids.len());
         for conn in self.secondaries.values() {
             mutations.push(ClusterMutation::PeerJoined {
                 peer_id: conn.id().to_string(),
                 is_observer: conn.is_observer(),
                 can_be_primary: conn.can_be_primary(),
+                // Pure RE-EMISSION (does NOT route through the choke
+                // point), so the conservative `(0, 0)` minimum: a
+                // converged capability holds a strictly-higher stamped
+                // version, so `merge_capability` keeps it and the receiver
+                // NoOps (no amplification). A node missing the capability
+                // entirely adopts this baseline and converges the rest via
+                // the digest + snapshot pull.
+                cap_version: Default::default(),
             });
             mutations.push(ClusterMutation::SecondaryCapacity {
                 secondary: conn.id().to_string(),
                 worker_count: conn.num_workers(),
                 resources: conn.resources().to_vec(),
+            });
+        }
+        // Re-emit a `PeerRemoved` per Departed-tombstoned id (LIVENESS
+        // catch-up). The receiver's `apply_peer_removed` is sticky/
+        // idempotent — a node that already buried the id NoOps it.
+        for id in departed_ids {
+            mutations.push(ClusterMutation::PeerRemoved {
+                id,
+                cause: RemovalCause::RosterReemit,
             });
         }
         if mutations.is_empty() {

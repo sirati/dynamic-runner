@@ -61,6 +61,7 @@ fn find_peer_joined(
                     peer_id,
                     is_observer,
                     can_be_primary,
+                    ..
                 } => Some((peer_id.clone(), *is_observer, *can_be_primary)),
                 _ => None,
             })

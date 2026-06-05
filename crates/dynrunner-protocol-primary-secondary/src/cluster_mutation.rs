@@ -268,8 +268,10 @@ pub enum ClusterMutation<I> {
         version: TaskVersion,
     },
     /// A peer has joined the cluster. The apply rule maintains the
-    /// replicated `peer_state` map on `ClusterState` and the legacy
-    /// `RoleTable.observers` projection that election filtering reads.
+    /// replicated `peer_state` LIVENESS map on `ClusterState` and merges
+    /// the join's `(is_observer, can_be_primary)` advertisement into the
+    /// replicated `capabilities` 2P-set (C6 — the SINGLE source of truth
+    /// for role capabilities, decoupled from liveness).
     ///
     /// Receiver semantics (see `ClusterState::apply`):
     ///
@@ -280,23 +282,24 @@ pub enum ClusterMutation<I> {
     ///   preserving any existing pubkey/endpoint metadata) and a
     ///   `PeerLifecycleEvent::Added` is enqueued on the dispatcher
     ///   channel.
-    /// - When `is_observer = true` and the id was not already in
-    ///   `RoleTable.observers`, the set is widened and role-change
-    ///   hooks fire. `is_observer = false` is a no-op against the
-    ///   observer set — only the matching `PeerRemoved` removes peers
-    ///   from it.
+    /// - The `(is_observer, can_be_primary, cap_version)` advertisement
+    ///   is merged into the `capabilities` 2P-set (`is_observer` ratchets
+    ///   up; `can_be_primary` follows the higher `cap_version`). The
+    ///   `RoleTable.observers` / `RoleTable.can_be_primary` sets are then
+    ///   re-projected from `capability × local-alive` and role-change
+    ///   hooks fire when a role-bearing mutation applied.
     ///
-    /// This variant is the single-writer cutover for
-    /// `RoleTable.observers` and the authoritative source of "this
-    /// peer is alive" in the replicated ledger.
+    /// This variant is the authoritative source of "this peer is alive"
+    /// in the replicated ledger and one of the writers of the capability
+    /// 2P-set (the other is `SetCanBePrimary`).
     ///
-    /// `can_be_primary` is the SEPARATE, EXPLICIT per-peer capability
-    /// the joining peer advertises — the exact twin of `is_observer`.
-    /// When `true` the apply rule records the id into
-    /// `RoleTable.can_be_primary` (the single source of truth for "may
-    /// this peer ever host the primary"). It is NOT deduced from
-    /// membership/liveness/observer status, and a runtime
-    /// [`Self::SetCanBePrimary`] can flip it at any time after join.
+    /// `can_be_primary` is the SEPARATE, EXPLICIT per-peer capability the
+    /// joining peer advertises — the twin of `is_observer`. It is NOT
+    /// deduced from membership/liveness/observer status; a runtime
+    /// [`Self::SetCanBePrimary`] can flip it at any time after join. The
+    /// `RoleTable.can_be_primary` projection ANDs in the LOCAL alive bit
+    /// at read time, so a pre-armed capability for a not-yet-alive peer is
+    /// held in the 2P-set and projects in once the peer is Alive.
     /// `#[serde(default)]` (defaulting `false`) keeps wire compat with a
     /// peer that predates the field — a missing field decodes as "not
     /// primary-capable", the conservative default.
@@ -305,23 +308,44 @@ pub enum ClusterMutation<I> {
         is_observer: bool,
         #[serde(default)]
         can_be_primary: bool,
+        /// Primary-stamped capability version (C6 / D-V). Stamped at the
+        /// origination choke point and merged into the receiver's
+        /// `capabilities` 2P-set; the higher `cap_version` arbitrates a
+        /// `can_be_primary` flip-back so a missed `SetCanBePrimary(false)`
+        /// heals. `is_observer` is a pure OR ratchet and ignores it.
+        /// `#[serde(default)]` decodes a pre-field sender's frame to the
+        /// `(0, 0)` strict minimum (it loses to any stamped version, so a
+        /// legacy re-emit never regresses a converged capability).
+        #[serde(default)]
+        cap_version: TaskVersion,
     },
-    /// Runtime update of a peer's [`RoleTable.can_be_primary`] capability
-    /// — the dedicated mutation that lets a CLIENT permit/forbid a
-    /// specific peer from ever hosting the primary at any point in the
-    /// run, independent of the join-time `PeerJoined { can_be_primary }`
-    /// advertisement.
+    /// Runtime update of a peer's primary-capability — the dedicated
+    /// mutation that lets a CLIENT permit/forbid a specific peer from ever
+    /// hosting the primary at any point in the run, independent of the
+    /// join-time `PeerJoined { can_be_primary }` advertisement.
     ///
     /// Originated by the primary's command channel
     /// (`PrimaryCommand::SetCanBePrimary`, exposed through the framework
     /// client API) and broadcast over the canonical
     /// `apply_and_broadcast_cluster_mutations` path so every replica's
-    /// `RoleTable.can_be_primary` set converges. `can_be_primary = true`
-    /// inserts the id; `false` removes it. Idempotent: re-applying the
-    /// same value is a NoOp.
+    /// `capabilities` 2P-set converges. The apply rule merges an
+    /// `Advertised { can_be_primary, cap_version }` into the 2P-set (the
+    /// higher `cap_version` wins, so a newer `false` beats an older
+    /// `true`); the `RoleTable.can_be_primary` projection is then rebuilt
+    /// from `capability × local-alive`. Idempotent: re-applying a value
+    /// that does not change the merged entry is a NoOp.
     SetCanBePrimary {
         peer_id: String,
         can_be_primary: bool,
+        /// Primary-stamped capability version (C6 / D-V). Stamped at the
+        /// origination choke point and merged into the receiver's
+        /// `capabilities` 2P-set: the higher `cap_version` wins, so a
+        /// newer `false` beats an older `true` (and a re-converging node
+        /// adopts the latest value, not a stale one). `#[serde(default)]`
+        /// decodes a pre-field sender's frame to the `(0, 0)` strict
+        /// minimum.
+        #[serde(default)]
+        cap_version: TaskVersion,
     },
     /// A peer has been removed from the cluster (authoritative
     /// observation by the primary; `cause` carries the reason — see

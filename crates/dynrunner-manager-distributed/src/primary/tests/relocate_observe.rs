@@ -186,6 +186,7 @@ async fn relocate_falls_back_when_candidate_became_observer() {
                     peer_id: "sec-0".into(),
                     is_observer: true,
                     can_be_primary: false,
+                    cap_version: Default::default(),
                 });
             assert!(
                 coordinator
