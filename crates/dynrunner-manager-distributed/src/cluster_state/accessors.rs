@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
-use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{RoleTable, RunMilestoneKind, SecondaryCapacityRecord};
 
 use super::{ClusterState, OutcomeSummary, PhaseRollup, StateCounts, TaskState};
 
@@ -483,6 +483,22 @@ impl<I: Identifier> ClusterState<I> {
             .values()
             .map(|c| u64::from(c.worker_count))
             .sum()
+    }
+
+    /// Borrow the replicated grow-only set of reached run-milestones (A7).
+    /// Each element is a `(RunMilestoneKind, PhaseId)` pair the promoted
+    /// primary originated at a phase-task-spawning or retry-pass-start
+    /// point. Monotone (grow-only): an element, once present, never leaves.
+    ///
+    /// This is the EDGE-SET the Wave-3b narrator diffs: it holds its own
+    /// accumulated `HashSet<(RunMilestoneKind, PhaseId)>`, and on each
+    /// observe it emits a line for every element in THIS set not yet in
+    /// its accumulator — the same `HashSet::insert` edge pattern the
+    /// phase-started / phase-complete projection uses, but driven off the
+    /// replicated milestone facts rather than inferred from per-task
+    /// state deltas.
+    pub fn run_milestones(&self) -> &std::collections::HashSet<(RunMilestoneKind, PhaseId)> {
+        &self.run_milestones
     }
 }
 

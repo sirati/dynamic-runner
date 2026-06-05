@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs};
-use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
+use dynrunner_protocol_primary_secondary::{RunMilestoneKind, SecondaryCapacityRecord};
 use serde::{Deserialize, Serialize};
 
 use super::ClusterState;
@@ -98,6 +98,14 @@ use super::types::{CapabilityEntry, PeerEntry, PeerState};
 ///   first `Some(reason)` and never overwrites an already-`Some` local
 ///   value. Carried so a node seeded from a snapshot learns the run is
 ///   already over / aborted without waiting for a re-broadcast.
+/// - `run_milestones` (A7): grow-only set UNION merge — every incoming
+///   `(kind, phase)` is inserted, never removed (mirroring the
+///   `RunMilestone` apply arm's `HashSet::insert`). Idempotent +
+///   order-insensitive: re-restoring inserts nothing new, and the union
+///   converges regardless of (live-broadcast, snapshot) arrival order.
+///   Carried so a late-joining / freshly-promoted observer holds the full
+///   reached-milestone set the moment it restores — the set IS
+///   snapshot-healable (detect-WITH-heal via the digest fold).
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -184,6 +192,23 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-feature shape).
     #[serde(default)]
     pub secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
+    /// Replicated grow-only set of reached run-milestones (A7), one
+    /// `(RunMilestoneKind, PhaseId)` element per phase-task-spawning /
+    /// retry-pass-start marker the promoted primary has originated.
+    /// Carried so a late-joining / freshly-promoted observer holds the
+    /// full reached-milestone set immediately on snapshot-restore, before
+    /// any live `RunMilestone` broadcast reaches it.
+    ///
+    /// Merge rule on `restore`: grow-only set UNION (insert every incoming
+    /// element; never remove), mirroring the `RunMilestone` apply arm.
+    /// Idempotent + order-insensitive — the union is the same regardless
+    /// of (live-broadcast, snapshot) arrival order.
+    ///
+    /// `#[serde(default)]` keeps wire compat with pre-feature senders
+    /// (missing field deserializes as an empty set, identical to the
+    /// pre-feature shape).
+    #[serde(default)]
+    pub run_milestones: HashSet<(RunMilestoneKind, PhaseId)>,
     /// Projected alive-membership set: the ids whose `peer_state` entry
     /// is `Alive`. A PROJECTION of the module-private `peer_state` map
     /// (only `HashSet<String>` crosses the wire — `PeerEntry`/`PeerState`
@@ -257,6 +282,7 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            run_milestones,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -298,6 +324,11 @@ impl<I: Identifier> ClusterState<I> {
             // promoted primary and late-joining observers reconstruct
             // the full worker roster on snapshot-restore.
             secondary_capacities: secondary_capacities.clone(),
+            // Grow-only reached-milestone set (A7) — carried so a late-
+            // joining / freshly-promoted observer holds the full set the
+            // moment it restores, and the narrator projects it off the
+            // converged ledger.
+            run_milestones: run_milestones.clone(),
             // Project the alive-membership set out of `peer_state`:
             // ONLY ids whose entry is `Alive` (Dead is sticky-local;
             // absence must not be read as Dead). `PeerEntry`/`PeerState`
@@ -389,6 +420,7 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            run_milestones,
             alive_members,
             run_complete,
             run_aborted,
@@ -528,6 +560,13 @@ impl<I: Identifier> ClusterState<I> {
         for (secondary, record) in secondary_capacities {
             self.secondary_capacities.entry(secondary).or_insert(record);
         }
+        // Run-milestone set merge (A7): grow-only set UNION. Insert every
+        // incoming `(kind, phase)`; the set never shrinks, so the union
+        // converges regardless of (live-broadcast, snapshot) arrival order
+        // and a re-restore inserts nothing new (idempotent). Mirrors the
+        // `RunMilestone` apply arm's `HashSet::insert` — apply == restore
+        // by construction.
+        self.run_milestones.extend(run_milestones);
         // Alive-membership merge: Dead-wins / sticky-removal, mirroring
         // the `PeerJoined`/`PeerRemoved` apply rules in `apply_peer.rs`.
         // For each incoming alive id insert a fresh `Alive` entry ONLY

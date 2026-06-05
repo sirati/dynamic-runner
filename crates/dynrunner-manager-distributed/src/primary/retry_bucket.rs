@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use dynrunner_core::{
     ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo,
 };
-use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_protocol_primary_secondary::{PeerTransport, RunMilestoneKind};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -82,6 +82,16 @@ impl BucketKind {
         match self {
             BucketKind::Recoverable => config.retry_max_passes,
             BucketKind::Oom => config.oom_retry_max_passes,
+        }
+    }
+
+    /// The A7 run-milestone kind a retry-pass-start of this bucket records.
+    /// The single mapping point so the milestone-emit site never re-spells
+    /// the bucket→milestone correspondence.
+    fn milestone_kind(self) -> RunMilestoneKind {
+        match self {
+            BucketKind::Recoverable => RunMilestoneKind::ErrorRetryPassStart,
+            BucketKind::Oom => RunMilestoneKind::OomRetryPassStart,
         }
     }
 }
@@ -316,6 +326,17 @@ where
             // test pins it load-bearing).
             self.cluster_state
                 .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+            // A7: a retry pass for this phase actually opened (≥1 task
+            // reinjected) — record the error- / OOM-retry-pass-start
+            // milestone as a replicated grow-only set fact so the
+            // observer surfaces it from the converged CRDT. Gated on
+            // `reinjected` (an empty / budget-exhausted bucket is NOT a
+            // pass and emits nothing); idempotent across the per-phase
+            // re-entry the operational loop drives (the apply NoOps a
+            // re-reached `(kind, phase)`, so a multi-iteration OOM bucket
+            // surfaces the milestone once per phase, not per iteration).
+            self.originate_run_milestone(kind.milestone_kind(), phase.clone())
+                .await;
         } else if matches!(kind, BucketKind::Oom) {
             // No reinjection happened — either empty candidates or
             // budget exhausted. Lift the single-worker dispatch-shape

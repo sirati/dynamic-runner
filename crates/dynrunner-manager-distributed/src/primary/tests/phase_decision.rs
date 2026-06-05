@@ -172,8 +172,8 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
 /// `fire_initial_phase_starts` emits `PhaseStartedNeedsWorkers { min: 1 }`
 /// for a newly-started phase that carries pending work, and emits nothing
 /// further when re-run (idempotent: only newly-inserted phases emit).
-#[test]
-fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
+#[tokio::test(flavor = "current_thread")]
+async fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
     let mut primary = make_primary();
 
     // Seed a completed `build`-phase prereq plus two `compile`-phase
@@ -211,7 +211,7 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
         .cluster_state_mut_for_test()
         .install_worker_mgmt_sender(tx);
 
-    primary.fire_initial_phase_starts();
+    primary.fire_initial_phase_starts().await;
 
     // Exactly one signal: `compile` started with min == 1 (it has work);
     // `build` is already terminal/done so it is not a newly-active phase.
@@ -230,7 +230,7 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
 
     // Re-firing is idempotent: `compile` is already in
     // `phase_started_emitted`, so no further signal.
-    primary.fire_initial_phase_starts();
+    primary.fire_initial_phase_starts().await;
     assert!(
         rx.try_recv().is_err(),
         "re-running fire_initial_phase_starts emits nothing for already-started phases"
@@ -242,10 +242,10 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
 /// insert edge), and re-firing emits nothing — pinning that the
 /// phase-start/phase-transition important event tracks the same
 /// once-per-phase transition as the worker-management signal.
-#[test]
-fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
+#[tokio::test(flavor = "current_thread")]
+async fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
     use crate::test_capture::{ImportantCapture, important_only};
-    use tracing::subscriber::with_default;
+    use tracing::subscriber::set_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
 
@@ -282,11 +282,17 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
 
     let capture = ImportantCapture::default();
     let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
-    with_default(subscriber, || {
-        primary.fire_initial_phase_starts();
+    // `set_default` (not `with_default`) so the subscriber is held across
+    // the `.await` inside `fire_initial_phase_starts` — the milestone
+    // origination it now drives broadcasts via an async send. The
+    // `current_thread` runtime keeps the emit on this thread, so the
+    // important "starting job phase" event reaches THIS subscriber.
+    {
+        let _guard = set_default(subscriber);
+        primary.fire_initial_phase_starts().await;
         // Idempotent re-fire emits no further important event.
-        primary.fire_initial_phase_starts();
-    });
+        primary.fire_initial_phase_starts().await;
+    }
 
     let msgs = capture.messages();
     assert_eq!(

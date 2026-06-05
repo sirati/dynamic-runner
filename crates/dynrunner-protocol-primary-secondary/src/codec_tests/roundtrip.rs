@@ -75,6 +75,8 @@ fn roundtrip_state_digest_payload() {
         current_primary_hash: 0xCCCC_DDDD,
         capabilities_count: 4,
         capabilities_hash: 0xEEEE_FFFF,
+        run_milestones_count: 5,
+        run_milestones_hash: 0x1357_2468,
         primary_epoch: 42,
         run_complete: true,
         run_aborted: true,
