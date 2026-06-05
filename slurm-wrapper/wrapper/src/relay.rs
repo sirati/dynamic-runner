@@ -530,6 +530,7 @@ mod tests {
             shutdown_log_path: dir.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: dir.join("shutdown-manager.pid"),
             local_image: dir.join("image.tar"),
+            image_cache_root: dir.join("imgcache"),
         }
     }
 

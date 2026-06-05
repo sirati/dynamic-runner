@@ -515,9 +515,14 @@ def add_framework_arguments(
         default=None,
         help=(
             "Per-secondary SLURM memory request (sbatch --mem, e.g. '60G'). "
-            "When unset, no --mem flag is emitted and SLURM falls back to "
-            "DefMemPerNode — which on some clusters (notably LMU Krater) is "
-            "1 MB and instantly OOMs every worker."
+            "Leave UNSET to emit no --mem flag, so each worker gets the whole "
+            "node — the correct choice on RealMemory clusters, and the ONLY "
+            "choice where any --mem would fail sbatch with 'cannot be "
+            "satisfied' (e.g. RealMemory=1MB configs). Set it only on clusters "
+            "whose DefMemPerNode is tiny AND where the requested --mem is "
+            "actually satisfiable (e.g. LMU Krater, DefMemPerNode=1MB), since "
+            "there the unset fallback to DefMemPerNode instantly OOMs every "
+            "worker."
         ),
     )
     parser.add_argument(

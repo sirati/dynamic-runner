@@ -5,7 +5,7 @@
 //! role's digest-broadcast frame, and the receive-side decision of
 //! WHETHER and WHERE to pull a snapshot when a peer's digest shows the
 //! local replica is behind. Every role (primary `operational_loop`,
-//! secondary `process_tasks`, observer `run_as_observer`) drives its own
+//! secondary `process_tasks`, the relocation observer tail) drives its own
 //! `tokio::time::interval` from [`tick_period`], broadcasts the frame from
 //! [`digest_broadcast`] on each tick, and feeds a received digest to
 //! [`reconcile_against_peer`]. The role owns ONLY its `send_to` edge; the
