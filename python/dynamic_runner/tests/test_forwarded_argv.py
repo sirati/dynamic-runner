@@ -130,6 +130,16 @@ class FilterFrameworkArgvTests(unittest.TestCase):
         ]
         self.assertEqual(filter_framework_argv(argv), ["--debug", "--platform", "x64"])
 
+    def test_debug_forwarded_to_secondary(self) -> None:
+        # `--debug` is a framework flag but NEITHER framework-regenerated NOR
+        # submitter-local, so it must reach the secondary verbatim — that is
+        # what lets the secondary's `setup_logging` raise its own Rust sink
+        # (per-role `secondary.log`) to DEBUG. Pinned explicitly so a future
+        # reclassification that strips it can't regress on-cluster
+        # debuggability silently.
+        argv = ["--debug", "--platform", "x64"]
+        self.assertEqual(filter_framework_argv(argv), argv)
+
     def test_unknown_flags_pass_through_verbatim(self) -> None:
         # Flags the framework doesn't know about (task-side or
         # consumer-added) pass through unchanged. The secondary's

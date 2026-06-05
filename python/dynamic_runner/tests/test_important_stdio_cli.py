@@ -182,6 +182,22 @@ class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
         self.assertIsNone(call["full_log_file"])
         self.assertIsNone(call["full_log_dir"])
 
+    def test_debug_flag_threads_into_init_logging(self) -> None:
+        # `--debug` must reach the Rust subscriber via the init_logging
+        # `debug` param — not just the Python root logger. Without this the
+        # secondary's per-role `secondary.log` stayed INFO-only on a
+        # `--debug` run (the on-cluster bug).
+        logging_setup.setup_logging(_parse(["--debug"]))
+        self.assertEqual(len(self.init_calls), 1)
+        self.assertTrue(self.init_calls[0]["debug"])
+
+    def test_no_debug_flag_passes_debug_false(self) -> None:
+        # Absent `--debug`, the param defaults to False so the Rust sinks
+        # keep the historical INFO ceiling.
+        logging_setup.setup_logging(_parse([]))
+        self.assertEqual(len(self.init_calls), 1)
+        self.assertFalse(self.init_calls[0]["debug"])
+
     def test_flag_on_arms_importance_via_param_no_env(self) -> None:
         # Headline: --important-stdio-only arms importance via the
         # init_logging PARAM, and NO logging env var is set as a side

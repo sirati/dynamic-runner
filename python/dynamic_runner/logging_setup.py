@@ -112,6 +112,7 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     important_stdio_only = bool(getattr(args, "important_stdio_only", False))
     full_log_file = getattr(args, "full_log_file", None)
     full_log_dir = getattr(args, "full_log_dir", None)
+    debug = bool(getattr(args, "debug", False))
 
     # Deferred native subscriber install — explicit params, after argparse.
     # Local import: the native function lives on the package's re-exported
@@ -119,10 +120,17 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     # (like the test harness) that import `logging_setup` in isolation.
     from . import init_logging
 
+    # `--debug` raises BOTH the Python root logger (below) AND the Rust
+    # subscriber's verbosity ceiling: without the param the per-role/full
+    # sinks stay INFO-only, so a `--debug` secondary's `secondary.log`
+    # carried no DEBUG lines. Forwarded verbatim to secondaries (it is
+    # neither framework-regenerated nor submitter-local), so this same path
+    # raises the secondary's sink too.
     init_logging(
         important_stdio_only=important_stdio_only,
         full_log_file=full_log_file,
         full_log_dir=full_log_dir,
+        debug=debug,
     )
 
     if getattr(args, "secondary", None):
@@ -132,7 +140,7 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     else:
         prefix = ""
 
-    log_level = logging.DEBUG if getattr(args, "debug", False) else logging.INFO
+    log_level = logging.DEBUG if debug else logging.INFO
     logger = logging.getLogger()
     logger.setLevel(log_level)
 
