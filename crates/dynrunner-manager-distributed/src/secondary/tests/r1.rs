@@ -580,6 +580,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                         peer_id: peer_id.clone(),
                         is_observer: false,
                         can_be_primary: false,
+                        cap_version: Default::default(),
                     },
                 );
                 secondary.cluster_state.apply(

@@ -364,6 +364,132 @@ fn roundtrip_task_reinjected_with_version() {
     }
 }
 
+/// `PeerJoined` round-trips carrying a NON-DEFAULT `cap_version` (C6 — the
+/// capability version that arbitrates a `can_be_primary` flip-back).
+#[test]
+fn roundtrip_peer_joined_with_cap_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::PeerJoined {
+        peer_id: "compute-1".into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: TaskVersion {
+            primary_epoch: 7,
+            seq: 3,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerJoined {
+            peer_id,
+            is_observer,
+            can_be_primary,
+            cap_version,
+        } => {
+            assert_eq!(peer_id, "compute-1");
+            assert!(!is_observer);
+            assert!(can_be_primary);
+            assert_eq!(
+                cap_version,
+                TaskVersion {
+                    primary_epoch: 7,
+                    seq: 3
+                }
+            );
+        }
+        _ => panic!("expected PeerJoined"),
+    }
+}
+
+/// Backward-compat: a sender that predates the `cap_version` field emits a
+/// `PeerJoined` with only `{ peer_id, is_observer, can_be_primary }` (or
+/// even without `can_be_primary`). `#[serde(default)]` must decode
+/// `cap_version` as the `(0, 0)` strict minimum, so a legacy re-emit loses
+/// to any stamped version and never regresses a converged capability.
+#[test]
+fn legacy_peer_joined_decodes_cap_version_as_default() {
+    let legacy = serde_json::json!({
+        "PeerJoined": { "peer_id": "legacy-peer", "is_observer": true }
+    });
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
+
+    match decoded {
+        ClusterMutation::PeerJoined {
+            peer_id,
+            is_observer,
+            can_be_primary,
+            cap_version,
+        } => {
+            assert_eq!(peer_id, "legacy-peer");
+            assert!(is_observer);
+            // can_be_primary also serde(default) → false.
+            assert!(!can_be_primary);
+            assert_eq!(cap_version, TaskVersion::default());
+        }
+        _ => panic!("expected PeerJoined"),
+    }
+}
+
+/// `SetCanBePrimary` round-trips carrying a NON-DEFAULT `cap_version`.
+#[test]
+fn roundtrip_set_can_be_primary_with_cap_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SetCanBePrimary {
+        peer_id: "p".into(),
+        can_be_primary: false,
+        cap_version: TaskVersion {
+            primary_epoch: 4,
+            seq: 9,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+            cap_version,
+        } => {
+            assert_eq!(peer_id, "p");
+            assert!(!can_be_primary);
+            assert_eq!(
+                cap_version,
+                TaskVersion {
+                    primary_epoch: 4,
+                    seq: 9
+                }
+            );
+        }
+        _ => panic!("expected SetCanBePrimary"),
+    }
+}
+
+/// Backward-compat: a `SetCanBePrimary` from a pre-`cap_version` sender
+/// (only `{ peer_id, can_be_primary }`) decodes `cap_version` as `(0, 0)`.
+#[test]
+fn legacy_set_can_be_primary_decodes_cap_version_as_default() {
+    let legacy = serde_json::json!({
+        "SetCanBePrimary": { "peer_id": "p", "can_be_primary": true }
+    });
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
+
+    match decoded {
+        ClusterMutation::SetCanBePrimary {
+            peer_id,
+            can_be_primary,
+            cap_version,
+        } => {
+            assert_eq!(peer_id, "p");
+            assert!(can_be_primary);
+            assert_eq!(cap_version, TaskVersion::default());
+        }
+        _ => panic!("expected SetCanBePrimary"),
+    }
+}
+
 /// Backward-compat: a sender that predates the reset `version` field emits
 /// `TaskRequeued` / `TaskReinjected` with only `{ hash }`; the field must
 /// decode to the `(0, 0)` strict minimum.

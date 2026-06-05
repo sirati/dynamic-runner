@@ -135,6 +135,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             peer_id: "obs-1".into(),
             is_observer: true,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -150,6 +151,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             peer_id: "obs-1".into(),
             is_observer: true,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -160,6 +162,7 @@ fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
             peer_id: "obs-2".into(),
             is_observer: true,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -194,6 +197,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             peer_id: "obs-1".into(),
             is_observer: true,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -207,6 +211,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             peer_id: "obs-1".into(),
             is_observer: false,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::NoOp
     );
@@ -223,6 +228,7 @@ fn peer_joined_non_observer_does_not_remove_existing_observer() {
             peer_id: "never-joined".into(),
             is_observer: false,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::Applied
     );
@@ -279,11 +285,13 @@ fn peer_joined_records_can_be_primary_capability() {
         peer_id: "capable".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "incapable".into(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
 
     assert!(
@@ -302,75 +310,129 @@ fn peer_joined_records_can_be_primary_capability() {
     assert!(!s.role_table().can_be_primary.contains("incapable"));
 }
 
-/// `SetCanBePrimary` updates a peer's capability at runtime — both
-/// granting it to a peer that joined without it and revoking it — and
-/// is idempotent (re-applying the current value is a NoOp). Decoupled
-/// from membership: the apply rule does not gate on `peer_state`.
+/// `SetCanBePrimary` updates a peer's capability at runtime (C6) — both
+/// granting it and revoking it — arbitrated by the monotone `cap_version`
+/// (a newer `false` beats an older `true`). The `can_be_primary(id)`
+/// PROJECTION ANDs in the LOCAL alive bit, so the peer is JOINED first to
+/// make it alive. (Capability is decoupled from membership at the APPLY
+/// level — the merge does not gate on `peer_state` — but the read-side
+/// projection requires liveness, so a runtime grant only becomes visible
+/// for an alive peer.) Explicit increasing `cap_version`s model the
+/// monotone stamp the origination choke point mints in production.
 #[test]
 fn set_can_be_primary_updates_capability_at_runtime() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
+    // Join `p` (alive) so the projection can include it once granted.
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "p".into(),
+        is_observer: false,
+        can_be_primary: false,
+        cap_version: TaskVersion {
+            primary_epoch: 0,
+            seq: 1,
+        },
+    });
+    assert!(!s.can_be_primary("p"));
 
-    // Grant to a peer that never advertised it at join.
+    // Grant at runtime (higher cap_version).
     let granted = s.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "p".into(),
         can_be_primary: true,
+        cap_version: TaskVersion {
+            primary_epoch: 0,
+            seq: 2,
+        },
     });
     assert_eq!(granted, ApplyOutcome::Applied);
     assert!(s.can_be_primary("p"));
 
-    // Re-granting the same value is a NoOp.
+    // Re-applying the SAME (value, version) is a NoOp (idempotent merge).
     let again = s.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "p".into(),
         can_be_primary: true,
+        cap_version: TaskVersion {
+            primary_epoch: 0,
+            seq: 2,
+        },
     });
     assert_eq!(again, ApplyOutcome::NoOp);
 
-    // Revoke at runtime.
+    // Revoke at runtime (a STILL-HIGHER cap_version beats the grant).
     let revoked = s.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "p".into(),
         can_be_primary: false,
+        cap_version: TaskVersion {
+            primary_epoch: 0,
+            seq: 3,
+        },
     });
     assert_eq!(revoked, ApplyOutcome::Applied);
     assert!(!s.can_be_primary("p"));
 
-    // Revoking an already-absent id is a NoOp.
-    let revoke_absent = s.apply(ClusterMutation::SetCanBePrimary {
+    // A STALE revoke (lower version than the current entry) loses → NoOp.
+    let stale = s.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "p".into(),
         can_be_primary: false,
+        cap_version: TaskVersion {
+            primary_epoch: 0,
+            seq: 1,
+        },
     });
-    assert_eq!(revoke_absent, ApplyOutcome::NoOp);
+    assert_eq!(stale, ApplyOutcome::NoOp);
 }
 
-/// The primary-capability set round-trips through a snapshot: a
-/// freshly-restored late-joiner (empty local capability set) picks up
-/// the originator's `can_be_primary` ids on `restore`. Mirrors the
-/// `observers` first-bootstrap-replace contract.
+/// The primary-capability 2P-set round-trips through a snapshot: a
+/// freshly-restored late-joiner picks up the originator's converged
+/// `capabilities` on `restore` (C6). The `can_be_primary(id)` PROJECTION
+/// ANDs in the LOCAL alive bit — so a joined-and-alive capable peer
+/// projects in, while a pre-armed capability for a never-joined (not
+/// alive) peer is carried in the 2P-set but does NOT project until the
+/// peer is also alive.
 #[test]
-fn snapshot_round_trips_can_be_primary() {
+fn snapshot_round_trips_capability_2p_set() {
     let mut origin = ClusterState::<RunnerIdentifier>::new();
+    // compute-a JOINS (alive) with capability → projects into can_be_primary.
     origin.apply(ClusterMutation::PeerJoined {
         peer_id: "compute-a".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
+    // compute-b is pre-armed via SetCanBePrimary WITHOUT a join → the
+    // capability is held in the 2P-set but it is not alive, so it does NOT
+    // project on the originator either.
     origin.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "compute-b".into(),
         can_be_primary: true,
+        cap_version: Default::default(),
     });
+    assert!(origin.can_be_primary("compute-a"));
+    assert!(
+        !origin.can_be_primary("compute-b"),
+        "a pre-armed capability for a never-joined (not-alive) peer must not project"
+    );
 
     let snap = origin.snapshot();
-    assert!(snap.can_be_primary.contains("compute-a"));
-    assert!(snap.can_be_primary.contains("compute-b"));
+    // The 2P-set carries BOTH capability entries (the replicated truth);
+    // the projection liveness AND is applied at read time, not in storage.
+    assert!(snap.capabilities.contains_key("compute-a"));
+    assert!(snap.capabilities.contains_key("compute-b"));
 
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
     assert!(!joiner.can_be_primary("compute-a"));
     joiner.restore(snap);
 
+    // After restore the joiner has converged the 2P-set AND the alive
+    // membership (compute-a was alive on origin, so it rode `alive_members`),
+    // so compute-a projects in; compute-b (never alive) does not.
     assert!(
         joiner.can_be_primary("compute-a"),
-        "snapshot restore must carry the capability set to a late-joiner"
+        "snapshot restore must converge the capability 2P-set + alive bit"
     );
-    assert!(joiner.can_be_primary("compute-b"));
+    assert!(
+        !joiner.can_be_primary("compute-b"),
+        "a never-alive pre-armed capability stays held but unprojected after restore"
+    );
 }
 
 /// `PeerRemoved` clears a peer's primary-capability — the exact twin of
@@ -383,6 +445,7 @@ fn peer_removed_clears_can_be_primary() {
         peer_id: "doomed".into(),
         is_observer: false,
         can_be_primary: true,
+        cap_version: Default::default(),
     });
     assert!(s.can_be_primary("doomed"));
 

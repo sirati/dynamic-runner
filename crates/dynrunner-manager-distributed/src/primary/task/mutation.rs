@@ -117,6 +117,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             peer_id: sender_id,
             is_observer,
             can_be_primary,
+            // Stamped at the origination choke point.
+            cap_version: Default::default(),
         }])
         .await;
     }

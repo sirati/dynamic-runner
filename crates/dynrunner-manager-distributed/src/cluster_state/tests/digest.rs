@@ -88,17 +88,14 @@ fn same_count_state_advance_changes_fold() {
     assert!(stale.is_behind(&advanced));
 }
 
-/// A divergence that exists ONLY in the observer set does NOT make a
-/// replica "behind": the membership/role sets are excluded from the
-/// anti-entropy detector. They are non-monotone-via-removal and the
-/// additive/sticky `restore()` cannot reconcile a stale entry, so flagging
-/// them would loop a no-op pull forever; their additions converge over the
-/// live `PeerJoined`/`PeerRemoved` broadcasts + roster re-emit instead.
-///
-/// (Under the older detector this case flagged `is_behind` and triggered a
-/// permanent pull loop — this test pins that it no longer does.)
+/// A divergence in the role-capability 2P-set IS detected by the
+/// anti-entropy detector (C6 — reversed from the pre-C6 detector, which
+/// excluded role sets). The capability lattice is a proper CRDT (merged
+/// monotonically by `merge_capability` in `restore`), so folding it is
+/// detect-WITH-heal: a flagged divergence is one a snapshot pull resolves,
+/// NOT the R2 no-op loop the old projection-only design had to avoid.
 #[test]
-fn observer_only_divergence_is_not_behind() {
+fn observer_capability_divergence_detected_and_heals() {
     // Two replicas with the SAME task ledger.
     let mut a = ClusterState::<RunnerIdentifier>::new();
     let mut b = ClusterState::<RunnerIdentifier>::new();
@@ -108,32 +105,32 @@ fn observer_only_divergence_is_not_behind() {
             task: mk_task("t"),
         });
     }
-    // `a` knows an observer that `b` does not — a pure observer-set
-    // divergence with identical tasks.
+    // `a` knows an observer capability that `b` does not — a capability
+    // 2P-set divergence with identical tasks.
     a.apply(ClusterMutation::PeerJoined {
         peer_id: "obs-x".into(),
         is_observer: true,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
-    assert!(a.role_table().observers.contains("obs-x"));
-    assert!(!b.role_table().observers.contains("obs-x"));
 
-    // The digests are equal (observers are not summarised) and neither side
-    // is behind — no pull on an observer-only difference.
+    // The digests DIFFER (the capability fold is summarised) and `b` is
+    // behind `a` — the missing capability drives a pull.
+    assert_ne!(a.digest(), b.digest());
+    assert!(b.digest().is_behind(&a.digest()));
+
+    // Pull: the snapshot's capability 2P-set merges into `b` and converges
+    // the digest (detect-WITH-heal — no permanent no-op loop).
+    b.restore(a.snapshot());
     assert_eq!(a.digest(), b.digest());
     assert!(!b.digest().is_behind(&a.digest()));
-    assert!(!a.digest().is_behind(&b.digest()));
 }
 
-/// A divergence that exists ONLY in the primary-capability set does NOT
-/// make a replica "behind", for the same reason as observers: the live
-/// `SetCanBePrimary(false)`/`PeerRemoved` path REMOVES ids, and `restore()`
-/// replaces the capability set only when local is empty — a stale entry is
-/// never snapshot-healable, so anti-entropy must not flag it.
-///
-/// (The older detector flagged this and looped a no-op pull; pinned fixed.)
+/// A divergence in the `can_be_primary` capability is detected and heals,
+/// the same way the observer capability does (C6) — the capability 2P-set
+/// is the SINGLE replicated source and is snapshot-healable.
 #[test]
-fn can_be_primary_only_divergence_is_not_behind() {
+fn can_be_primary_capability_divergence_detected_and_heals() {
     let mut a = ClusterState::<RunnerIdentifier>::new();
     let mut b = ClusterState::<RunnerIdentifier>::new();
     for s in [&mut a, &mut b] {
@@ -142,31 +139,33 @@ fn can_be_primary_only_divergence_is_not_behind() {
             task: mk_task("t"),
         });
     }
-    // `a` granted a peer primary-capability that `b` has not seen — a pure
-    // can_be_primary divergence with identical tasks.
+    // `a` granted a peer primary-capability that `b` has not seen — a
+    // capability 2P-set divergence with identical tasks.
     a.apply(ClusterMutation::SetCanBePrimary {
         peer_id: "cap-x".into(),
         can_be_primary: true,
+        cap_version: Default::default(),
     });
-    assert!(a.can_be_primary("cap-x"));
-    assert!(!b.can_be_primary("cap-x"));
 
+    assert_ne!(a.digest(), b.digest());
+    assert!(b.digest().is_behind(&a.digest()));
+
+    b.restore(a.snapshot());
     assert_eq!(a.digest(), b.digest());
     assert!(!b.digest().is_behind(&a.digest()));
-    assert!(!a.digest().is_behind(&b.digest()));
 }
 
-/// A divergence that exists ONLY in the alive-member set does NOT make a
-/// replica "behind" — and this exclusion is INTENTIONAL per the honest-
-/// liveness design, not merely a snapshot-healability concession. Each node
-/// owns its own liveness view: a node that locally buried a peer as Dead
-/// legitimately disagrees with a node still holding it Alive. Anti-entropy
-/// must NEVER force-converge that — it must never resurrect a peer a node
-/// correctly detected as dead. So a same-`tasks` state that differs ONLY in
-/// `alive_members` is NOT behind. This documents the known, deliberate
-/// limitation: alive-member divergence never drives a pull.
+/// The residual LIVENESS divergence after a capability tombstone converges
+/// does NOT drive further pulls — honest-liveness (C6). A `PeerRemoved`
+/// writes BOTH a capability `Departed` tombstone (a converging fact, folded
+/// into the digest) AND a `peer_state` Dead bit (node-local, NOT folded).
+/// Once the tombstone converges via pull, the two replicas still disagree
+/// on the `peer_state` alive/dead bit — `a` holds w1 Alive, `b` holds it
+/// Dead — and anti-entropy must NEVER force-converge that (it must never
+/// resurrect a peer `b` correctly buried). So post-convergence the digests
+/// match and neither is behind, even though the liveness views diverge.
 #[test]
-fn alive_member_only_divergence_is_not_behind() {
+fn residual_liveness_divergence_is_not_behind() {
     let mut a = ClusterState::<RunnerIdentifier>::new();
     let mut b = ClusterState::<RunnerIdentifier>::new();
     for s in [&mut a, &mut b] {
@@ -174,27 +173,34 @@ fn alive_member_only_divergence_is_not_behind() {
             hash: "t".into(),
             task: mk_task("t"),
         });
-        // Both saw the peer join (Alive).
+        // Both saw the peer join (Alive + an Advertised capability entry).
         s.apply(ClusterMutation::PeerJoined {
             peer_id: "w1".into(),
             is_observer: false,
             can_be_primary: false,
+            cap_version: Default::default(),
         });
     }
-    // `b` locally detected `w1` as dead (its own liveness view) and buried
-    // it; `a` still holds it Alive. The alive-member sets now diverge while
-    // the task ledger is identical.
+    // `b` locally detected `w1` as dead and buried it: this writes a
+    // capability `Departed` tombstone AND marks `peer_state` Dead.
     b.apply(ClusterMutation::PeerRemoved {
         id: "w1".into(),
         cause: RemovalCause::KeepaliveMiss,
     });
+    // The capability tombstone is a converging fact, so `a` IS behind `b`
+    // until it pulls (detect-WITH-heal).
+    assert!(a.digest().is_behind(&b.digest()));
+    a.restore(b.snapshot());
 
-    // `b` (fewer alive) must NOT be behind `a` (still holds w1 Alive):
-    // anti-entropy must never resurrect the peer `b` correctly buried.
+    // After convergence: capability matches (both hold w1 Departed). The
+    // LIVENESS still diverges — `a` holds w1 Alive (restore never buries),
+    // `b` holds it Dead — but liveness is NOT folded, so the digests match
+    // and neither drives a further pull.
+    assert!(a.is_peer_alive("w1"), "restore must NOT bury a's live peer");
+    assert!(!b.is_peer_alive("w1"), "b correctly holds w1 dead");
     assert_eq!(a.digest(), b.digest());
-    assert!(!b.digest().is_behind(&a.digest()));
-    // And symmetrically `a` is not driven to drop a live peer either.
     assert!(!a.digest().is_behind(&b.digest()));
+    assert!(!b.digest().is_behind(&a.digest()));
 }
 
 /// The full detect → pull → converge → quiesce cycle the cadence drives:

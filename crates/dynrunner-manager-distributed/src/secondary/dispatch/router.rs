@@ -502,6 +502,9 @@ where
                         // an observer late-joiner `false`. Record that truth
                         // in the replicated `RoleTable.can_be_primary`.
                         can_be_primary,
+                        // Stamped at the origination choke point
+                        // (`apply_and_broadcast_mutations` → `stamp_versions`).
+                        cap_version: Default::default(),
                     }])
                     .await;
                 Ok(())

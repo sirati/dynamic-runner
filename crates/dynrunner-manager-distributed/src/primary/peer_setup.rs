@@ -71,6 +71,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 // Observers are never primary-capable; the conservative
                 // `false` is also the correct steady-state value here.
                 can_be_primary: false,
+                // Stamped at the origination choke point.
+                cap_version: Default::default(),
             })
             .collect();
 

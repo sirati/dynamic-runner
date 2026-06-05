@@ -355,6 +355,8 @@ where
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::SetCanBePrimary {
             peer_id,
             can_be_primary,
+            // Stamped at the origination choke point.
+            cap_version: Default::default(),
         }])
         .await;
         Ok(())

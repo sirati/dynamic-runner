@@ -808,6 +808,7 @@ fn seed_cluster_secondary(
         peer_id: id.to_string(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     let _ = state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.to_string(),

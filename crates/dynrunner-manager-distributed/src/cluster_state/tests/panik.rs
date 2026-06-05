@@ -41,6 +41,7 @@ async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
         peer_id: "self-node".into(),
         is_observer: false,
         can_be_primary: false,
+        cap_version: Default::default(),
     });
     // Drain the Added event.
     let _ = rx.try_recv();
@@ -147,6 +148,7 @@ fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
             peer_id: "never-joined".into(),
             is_observer: false,
             can_be_primary: false,
+            cap_version: Default::default(),
         }),
         ApplyOutcome::NoOp,
     );

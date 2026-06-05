@@ -61,13 +61,36 @@ pub struct StateDigest {
     /// Number of keyed task-output cache entries.
     #[serde(default)]
     pub task_outputs_count: u64,
-    /// XOR-fold over the keyed-output cache keys (per-key first-write-
-    /// wins, so the key-set identity detects a missing entry).
+    /// XOR-fold over the keyed-output cache KEY+VALUE pairs (AE-5): a
+    /// divergent output value at an equal key produces a different fold,
+    /// so a value split is detected (was key-only).
     #[serde(default)]
     pub task_outputs_hash: u64,
     /// Number of phases in the static dependency graph.
     #[serde(default)]
     pub phase_deps_count: u64,
+    /// Order-independent canonical content hash of the static
+    /// phase-dependency graph (CRD-3/D-G). Distinct from the count: a
+    /// divergent-but-equal-count graph (e.g. two replicas that diverged
+    /// across a partition) has the SAME `phase_deps_count` but a DIFFERENT
+    /// hash, which the count-only compare could not see (R5).
+    #[serde(default)]
+    pub phase_deps_hash: u64,
+    /// Hash of the `current_primary` identity (CRD-2/D-P). A same-epoch
+    /// DIFFERENT-identity split carries the SAME `primary_epoch`, so only
+    /// this hash distinguishes the two replicas; the restore lower-id-wins
+    /// rule then converges both in one round.
+    #[serde(default)]
+    pub current_primary_hash: u64,
+    /// Number of entries in the role-capability 2P-set (C6).
+    #[serde(default)]
+    pub capabilities_count: u64,
+    /// XOR-fold over the role-capability 2P-set entries
+    /// `(id, is_observer, can_be_primary, cap_version, is_departed)` (C6).
+    /// The 2P-set IS snapshot-healable, so a flagged divergence is one a
+    /// snapshot pull's `restore` actually heals (detect-WITH-heal).
+    #[serde(default)]
+    pub capabilities_hash: u64,
     /// Replicated primary epoch (monotone scalar; higher wins).
     #[serde(default)]
     pub primary_epoch: u64,
@@ -97,41 +120,41 @@ impl StateDigest {
     ///   share, so pulling is always safe). A peer with FEWER entries is
     ///   behind, not ahead, so it never triggers a local pull (the peer's
     ///   own digest round will pull from us).
-    /// - `primary_epoch`: ahead iff strictly higher (the `restore` epoch
-    ///   merge is `>` wins).
+    /// - `phase_deps` (CRD-3/D-G): ahead iff the peer holds MORE phases OR
+    ///   the same count with a DIVERGENT content hash (the count-OR-hash
+    ///   compare — R5: the count-only line left a divergent-but-equal-count
+    ///   graph digest-invisible). The restore content-hash merge reconciles
+    ///   it deterministically (lower hash wins) regardless of pull order.
+    /// - `capabilities` (C6): the role-capability 2P-set IS snapshot-
+    ///   healable, so it is COMPARED here (detect-WITH-heal). Ahead iff the
+    ///   peer holds MORE entries OR the same count with a divergent fold.
+    ///   A flagged divergence is one a snapshot pull's `restore` of the
+    ///   2P-set actually resolves — no R2 no-op loop.
+    /// - `primary_epoch` + `current_primary_hash` (CRD-2/D-P): ahead iff
+    ///   the peer's epoch is strictly higher, OR the epochs are EQUAL but
+    ///   the `current_primary_hash` DIFFERS (a same-epoch identity split).
+    ///   Restore's deterministic lower-id-wins converges both replicas in
+    ///   one round; both sides pulling on the equal-epoch divergence is the
+    ///   intended bilateral convergence (C5).
     /// - `run_complete` / `run_aborted`: ahead iff the peer's latch is set
     ///   while ours is not (`false → true` ratchet; the reason string is
     ///   irrelevant to the detector).
     ///
-    /// The detector compares ONLY the monotone, snapshot-healable ledger
-    /// fields. The membership/role sets (`observers`, `can_be_primary`, the
-    /// alive-member set) are DELIBERATELY EXCLUDED — carried by neither the
-    /// digest nor this comparison — for two independent reasons:
+    /// The detector compares the monotone, snapshot-healable ledger
+    /// fields INCLUDING the capability 2P-set (C6 — it heals via snapshot).
+    /// The alive-member LIVENESS set stays DELIBERATELY EXCLUDED:
     ///
-    /// 1. They are non-monotone-via-removal and NOT snapshot-healable. The
-    ///    live apply path REMOVES ids (`PeerRemoved` drops a peer from
-    ///    `can_be_primary`/`observers`; `SetCanBePrimary(false)` removes),
-    ///    but `ClusterState::restore` is additive/sticky: it replaces the
-    ///    role sets only when the local set is empty (else keeps local) and
-    ///    inserts alive entries only into VACANT membership slots (a local
-    ///    `Dead` id is sticky and never resurrected). So a node holding a
-    ///    stale extra id can never reconcile it by pulling — flagging these
-    ///    would produce a PERMANENT no-op pull loop (a pull every cadence
-    ///    tick that `restore()` cannot heal).
-    /// 2. They converge via their OWN paths, not anti-entropy. Additions
-    ///    flow over the live `PeerJoined`/`PeerRemoved`/`SetCanBePrimary`
-    ///    broadcasts plus the post-mesh `rebroadcast_full_roster` re-emit.
-    ///    And the alive-member divergence is INTENTIONAL per the honest-
+    /// 1. The alive-member divergence is INTENTIONAL per the honest-
     ///    liveness design — each node owns its own liveness view, so two
     ///    nodes legitimately disagree on whether a peer is alive; anti-
     ///    entropy must NEVER force-converge that (it must never resurrect a
-    ///    peer a node correctly buried as dead).
-    ///
-    /// (Removing a stale role-set id thus relies on deliver-once live
-    /// broadcast + the roster re-emit, not anti-entropy. Closing that gap —
-    /// a node that missed a single `PeerRemoved`/`SetCanBePrimary(false)`
-    /// while disconnected — would need a tombstone or version-vector in the
-    /// CRDT algebra, out of this delivery-layer detector's scope.)
+    ///    peer a node correctly buried as dead). Dead ids are not
+    ///    snapshotted, so a Dead-set divergence is not snapshot-healable.
+    /// 2. The `RoleTable.observers`/`can_be_primary` SETS are node-local
+    ///    PROJECTIONS of `capabilities × peer_state-alive` — the capability
+    ///    convergence is captured by `capabilities_hash`, and the alive
+    ///    composition is the node-local liveness above, so there is no
+    ///    separate role-set digest field.
     ///
     /// Symmetric quiescence: when the two replicas are converged every
     /// compared field is equal and this returns `false`, so a steady-state
@@ -150,10 +173,26 @@ impl StateDigest {
                 other.task_outputs_count,
                 other.task_outputs_hash,
             )
-            // `phase_deps` is static (set-once); a count-only compare
-            // suffices and there is no separate fold to carry.
-            || other.phase_deps_count > self.phase_deps_count
+            // CRD-3/D-G: count-OR-hash (R5 — the count-only compare left a
+            // divergent-but-equal-count graph invisible).
+            || field_behind(
+                self.phase_deps_count,
+                self.phase_deps_hash,
+                other.phase_deps_count,
+                other.phase_deps_hash,
+            )
+            // C6: the snapshot-healable capability 2P-set (detect-WITH-heal).
+            || field_behind(
+                self.capabilities_count,
+                self.capabilities_hash,
+                other.capabilities_count,
+                other.capabilities_hash,
+            )
+            // CRD-2/D-P: higher epoch, OR equal epoch with a divergent
+            // current-primary identity (the same-epoch split).
             || other.primary_epoch > self.primary_epoch
+            || (other.primary_epoch == self.primary_epoch
+                && other.current_primary_hash != self.current_primary_hash)
             || (other.run_complete && !self.run_complete)
             || (other.run_aborted && !self.run_aborted)
     }
@@ -229,5 +268,84 @@ mod tests {
         // Latch ratchet is one-directional: a set-local vs unset-peer is
         // NOT behind.
         assert!(!peer.is_behind(&local));
+    }
+
+    /// CRD-2/D-P: at EQUAL epoch a DIFFERENT `current_primary_hash` makes
+    /// BOTH sides behind (the same-epoch identity split — bilateral, C5).
+    #[test]
+    fn equal_epoch_divergent_primary_hash_is_behind_both_ways() {
+        let a = StateDigest {
+            primary_epoch: 9,
+            current_primary_hash: 0xAAAA,
+            ..Default::default()
+        };
+        let b = StateDigest {
+            primary_epoch: 9,
+            current_primary_hash: 0xBBBB,
+            ..Default::default()
+        };
+        assert!(a.is_behind(&b));
+        assert!(b.is_behind(&a));
+        // A higher epoch dominates the hash compare (epoch wins outright).
+        let higher = StateDigest {
+            primary_epoch: 10,
+            current_primary_hash: 0xAAAA,
+            ..Default::default()
+        };
+        assert!(a.is_behind(&higher));
+        assert!(!higher.is_behind(&a));
+    }
+
+    /// CRD-3/D-G (R5): a divergent-but-equal-COUNT phase graph is detected
+    /// via the `phase_deps_hash` — the count-only compare could not.
+    #[test]
+    fn equal_count_divergent_phase_deps_hash_is_behind() {
+        let a = StateDigest {
+            phase_deps_count: 1,
+            phase_deps_hash: 0x1111,
+            ..Default::default()
+        };
+        let b = StateDigest {
+            phase_deps_count: 1,
+            phase_deps_hash: 0x2222,
+            ..Default::default()
+        };
+        assert!(a.is_behind(&b));
+        assert!(b.is_behind(&a));
+        // Equal count AND equal hash → not behind.
+        let same = StateDigest {
+            phase_deps_count: 1,
+            phase_deps_hash: 0x1111,
+            ..Default::default()
+        };
+        assert!(!a.is_behind(&same));
+    }
+
+    /// C6: a divergent capability 2P-set fold makes the lagging side
+    /// behind (detect-WITH-heal — the snapshot pull reconciles it). Both
+    /// count-ahead and equal-count-divergent-fold trigger.
+    #[test]
+    fn capability_divergence_is_behind() {
+        let local = StateDigest {
+            capabilities_count: 1,
+            capabilities_hash: 0xCAFE,
+            ..Default::default()
+        };
+        // Peer holds MORE capability entries → local behind.
+        let more = StateDigest {
+            capabilities_count: 2,
+            capabilities_hash: 0xBEEF,
+            ..Default::default()
+        };
+        assert!(local.is_behind(&more));
+        assert!(!more.is_behind(&local));
+        // Equal count, divergent fold → both behind.
+        let diverged = StateDigest {
+            capabilities_count: 1,
+            capabilities_hash: 0xDEAD,
+            ..Default::default()
+        };
+        assert!(local.is_behind(&diverged));
+        assert!(diverged.is_behind(&local));
     }
 }

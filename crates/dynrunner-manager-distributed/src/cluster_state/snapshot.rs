@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ClusterState;
 use super::TaskState;
-use super::types::{PeerEntry, PeerState};
+use super::merge::merge_capability;
+use super::types::{CapabilityEntry, PeerEntry, PeerState};
 
 /// Serializable snapshot of an entire `ClusterState`. Used by the
 /// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
@@ -35,20 +36,22 @@ use super::types::{PeerEntry, PeerState};
 ///   `TaskCompletedEvent` and folds co-present outputs, exactly-once
 ///   (re-restore yields a NoOp).
 /// - `(current_primary, primary_epoch)`: higher epoch wins.
-/// - `phase_deps`: replaced if local is empty, otherwise kept (the
-///   graph is static for the run's lifetime).
-/// - `observers`: replaced if local is empty, otherwise kept. The
-///   live mutation path (`ClusterMutation::PeerJoined { is_observer
-///   = true }` broadcasts) inserts into the set with set semantics,
-///   so a snapshot is authoritative for the late-joiner's first-
-///   bootstrap and inert thereafter. A broader merge rule (union,
-///   or epoch-tagged replace) would be over-engineering today —
-///   subsequent `PeerJoined` broadcasts converge any divergence
-///   between snapshot-restored and live-applied observers via the
-///   apply rule's idempotent insert. `#[serde(default)]` keeps wire
-///   compat with pre-Step-8 senders (snapshots from a peer running
-///   an older crate omit the field; deserialize defaults to an
-///   empty set, identical to the pre-Step-8 shape).
+/// - `phase_deps`: CRD-3 deterministic content-hash merge. Replaced if
+///   local is empty (first-bootstrap); if both non-empty and the
+///   canonical (order-independent) content hash DIFFERS, the LOWER
+///   content-hash graph is adopted so two replicas that diverged across a
+///   partition reconcile to the SAME graph regardless of pull order.
+/// - `capabilities`: per-id 2P-set merge via `merge_capability` (C6 —
+///   the SINGLE replicated source of `is_observer`/`can_be_primary`).
+///   Monotone: a `Departed` tombstone sticks, `Advertised` ratchets
+///   `is_observer` up and follows the higher `cap_version` for
+///   `can_be_primary`. After merging, the `RoleTable.observers` /
+///   `RoleTable.can_be_primary` projections are rebuilt from
+///   `capability × local-alive` (`reproject_roles`). Because the 2P-set
+///   IS snapshot-healable, the digest folds it (detect-WITH-heal) — a
+///   flagged capability divergence converges in one pull.
+///   `#[serde(default)]` keeps wire compat with a pre-field sender (a
+///   missing field decodes as an empty map).
 /// - `peer_holdings`: replaced if local is empty, otherwise kept —
 ///   same first-bootstrap-only contract as `observers`. The live
 ///   `PeerResourceHoldingsUpdated` apply path is the steady-state
@@ -85,9 +88,10 @@ use super::types::{PeerEntry, PeerState};
 ///   (`is_peer_alive` → `alive_secondary_members` →
 ///   `alive_remote_secondary_count`) the moment it restores — without
 ///   it `peer_state` stays empty and the count is a false zero from
-///   tick 0. The inserted entry's `is_observer` is reconstructed from
-///   the co-restored `observers` set so alive-state and observer-flag
-///   transfer cohesively.
+///   tick 0. The inserted entry holds ONLY liveness; the role
+///   capabilities ride the separate `capabilities` 2P-set (C6) and the
+///   `RoleTable` projections are rebuilt from `capability × alive` after
+///   both merge.
 /// - `run_complete` / `run_aborted`: sticky-monotonic merge, mirroring
 ///   the `RunComplete`/`RunAborted` apply arms. `run_complete` ratchets
 ///   `false → true` only (never regresses); `run_aborted` latches the
@@ -105,28 +109,25 @@ pub struct ClusterStateSnapshot<I> {
     pub current_primary: Option<String>,
     pub primary_epoch: u64,
     pub phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
-    /// Replicated observer set (Step 7's `RoleTable.observers`). A
-    /// late-joiner needs this immediately to apply the election
-    /// filter (`secondary::election::lowest_alive` skips observers);
-    /// the live PeerInfo broadcast that arrives shortly after will
-    /// supersede it, but in the gap between snapshot-restore and
-    /// the next PeerInfo broadcast, the joiner would otherwise
-    /// promote an observer candidate.
+    /// Replicated role-capability 2P-set (C6) — the SINGLE source of
+    /// `is_observer` / `can_be_primary`, carried so a late-joiner /
+    /// reconnecting node converges the full capability roster (including
+    /// `Departed` tombstones) the moment it restores. Merged per-id via
+    /// `merge_capability` on `restore` (monotone — Departed sticks,
+    /// Advertised ratchets), then the `RoleTable.observers` /
+    /// `RoleTable.can_be_primary` projections are rebuilt from
+    /// `capability × local-alive` (`reproject_roles`). This is the
+    /// failover-safe heal channel for capability: a promoted primary
+    /// inherits the full capability roster from the snapshot it restores
+    /// at promotion, so a capability divergence converges in one
+    /// anti-entropy round regardless of who is primary.
+    ///
+    /// `#[serde(default)]` keeps wire compat with a pre-field sender
+    /// (missing field decodes as an empty map, the conservative pre-field
+    /// shape — a node with no capability info projects empty role sets,
+    /// which the live `PeerJoined` broadcasts then populate).
     #[serde(default)]
-    pub observers: HashSet<String>,
-    /// Replicated primary-capability set (`RoleTable.can_be_primary`).
-    /// Carried so a late-joiner / reconnecting node sees which peers may
-    /// host the primary the moment it restores a snapshot — before any
-    /// live `PeerJoined { can_be_primary }` / `SetCanBePrimary` mutation
-    /// reaches it. Replaced on `restore` when local is empty; otherwise
-    /// kept — the same first-bootstrap-only contract as `observers`
-    /// (the live `PeerJoined`/`SetCanBePrimary` apply path is the
-    /// steady-state writer; subsequent broadcasts converge any
-    /// divergence via the idempotent set ops). `#[serde(default)]`
-    /// keeps wire compat with a peer that predates the field (missing
-    /// field decodes as an empty set, the conservative pre-field shape).
-    #[serde(default)]
-    pub can_be_primary: HashSet<String>,
+    pub capabilities: HashMap<String, CapabilityEntry>,
     /// Replicated per-peer holdings map. Carried so a late-joiner
     /// sees the current set of opaque resource strings each peer
     /// announces before any live `PeerResourceHoldingsUpdated`
@@ -250,8 +251,9 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
-            role_table,
+            role_table: _role_table,
             peer_state,
+            capabilities,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -278,17 +280,12 @@ impl<I: Identifier> ClusterState<I> {
             current_primary: current_primary.clone(),
             primary_epoch: *primary_epoch,
             phase_deps: phase_deps.clone(),
-            // Carry the replicated observer set through the snapshot
-            // so a late-joiner can populate `RoleTable.observers`
-            // before any `PeerJoined` mutation arrives. The set is
-            // the same one the `PeerJoined { is_observer = true }`
-            // apply rule writes; the snapshot is authoritative for
-            // first-bootstrap and inert thereafter.
-            observers: role_table.observers.clone(),
-            // Replicated primary-capability set — same first-bootstrap-
-            // only contract as `observers`. Carried so a late-joiner
-            // sees which peers may host the primary on snapshot-restore.
-            can_be_primary: role_table.can_be_primary.clone(),
+            // Carry the replicated role-capability 2P-set (the SINGLE
+            // source of `is_observer`/`can_be_primary`) through the
+            // snapshot so a late-joiner / promoted primary converges the
+            // full capability roster — including `Departed` tombstones —
+            // and rebuilds its `RoleTable` projections from it on restore.
+            capabilities: capabilities.clone(),
             // Per-peer holdings — same first-bootstrap-only
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
@@ -388,8 +385,7 @@ impl<I: Identifier> ClusterState<I> {
             current_primary,
             primary_epoch,
             phase_deps,
-            observers,
-            can_be_primary,
+            capabilities,
             peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -397,15 +393,6 @@ impl<I: Identifier> ClusterState<I> {
             run_complete,
             run_aborted,
         } = snap;
-        // Capture the snapshot's authoritative observer set BEFORE the
-        // observer-set branch below may move `observers` into the
-        // role table. The alive-membership merge (at the tail of this
-        // method) reads it to reconstruct each newly-inserted
-        // `PeerEntry`'s `is_observer` flag, so alive-state and
-        // observer-flag transfer cohesively regardless of whether the
-        // local observer set was already populated (in which case the
-        // branch keeps local and does NOT consume `observers`).
-        let restored_observers = observers.clone();
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
         // construction (no second hand-rolled rank). The co-present output
@@ -427,7 +414,28 @@ impl<I: Identifier> ClusterState<I> {
                 self.emit_task_completed_event(ev);
             }
         }
-        if primary_epoch > self.primary_epoch {
+        // Primary register: CRD-2/D-P adopt rule, applied IDENTICALLY to
+        // the live `PrimaryChanged` apply arm (`primary_register_adopt`):
+        // higher epoch wins; equal epoch → lex-lower id wins. The
+        // equal-epoch tie-break heals a same-epoch identity split BOTH
+        // ways in one round (each replica pulls the other, both adopt the
+        // lower id), where the prior strict-`>` gate kept local and never
+        // converged.
+        if super::merge::primary_register_adopt(
+            self.primary_epoch,
+            self.current_primary.as_deref(),
+            primary_epoch,
+            // `primary_register_adopt`'s `inc_id` is only consulted at
+            // equal epoch; a `None` snapshot primary at a higher epoch
+            // still adopts (epoch dominates), and a `None` at equal epoch
+            // never wins (a `None` inc loses to any `Some` local). Use an
+            // empty-str sentinel when the snapshot carries no primary —
+            // safe because at a higher epoch the id is not read, and at
+            // equal epoch a real local `Some` id is never lex-greater than
+            // the empty string, so it never wrongly adopts a `None`.
+            current_primary.as_deref().unwrap_or(""),
+        ) && current_primary.is_some()
+        {
             self.primary_epoch = primary_epoch;
             // Mirror update on the snapshot-merge path mirrors the live
             // `PrimaryChanged` apply rule — same `Release` ordering, same
@@ -447,33 +455,41 @@ impl<I: Identifier> ClusterState<I> {
             self.role_table.primary = current_primary;
             self.fire_role_change_hooks();
         }
+        // Phase deps: CRD-3/D-G deterministic content-hash merge. Adopt if
+        // local is empty (first-bootstrap); if BOTH are non-empty and the
+        // canonical (order-independent) content hash DIFFERS, adopt the
+        // LOWER content-hash graph so two replicas that diverged across a
+        // partition reconcile to the SAME graph regardless of pull order.
+        // (Apply's `PhaseDepsSet` arm flags the divergence loudly; this is
+        // the separate reconciliation layer — both share the one
+        // `canonical_phase_deps_hash` helper.)
         if self.phase_deps.is_empty() {
             self.phase_deps = phase_deps;
+        } else if !phase_deps.is_empty() {
+            let local_hash = super::merge::canonical_phase_deps_hash(&self.phase_deps);
+            let inc_hash = super::merge::canonical_phase_deps_hash(&phase_deps);
+            if inc_hash < local_hash {
+                self.phase_deps = phase_deps;
+            }
         }
-        // Observer set: replace if local is empty (first-bootstrap
-        // case), otherwise keep local. The live `PeerJoined` apply
-        // path is the steady-state writer (set-semantics insert);
-        // this branch only fires on the late-joiner's very first
-        // restore, before any `PeerJoined` mutation arrives. Firing
-        // the role-change hooks when the set actually changes keeps
-        // the transport's write-through cache coherent on the
-        // snapshot path the same way `PeerJoined` does on the live
-        // path.
-        if self.role_table.observers.is_empty() && !observers.is_empty() {
-            self.role_table.observers = observers;
-            self.fire_role_change_hooks();
-        }
-        // Primary-capability set: replace if local is empty (first-
-        // bootstrap), otherwise keep local — the same contract as
-        // `observers`. The live `PeerJoined { can_be_primary }` /
-        // `SetCanBePrimary` apply path is the steady-state writer; this
-        // branch only fires on the very first restore before any such
-        // mutation arrives. Fire the role-change hooks on a genuine
-        // change so the write-through cache stays coherent on the
-        // snapshot path the same way the live apply does.
-        if self.role_table.can_be_primary.is_empty() && !can_be_primary.is_empty() {
-            self.role_table.can_be_primary = can_be_primary;
-            self.fire_role_change_hooks();
+        // Capabilities: per-id 2P-set merge (C6). Monotone — `Departed`
+        // sticks, `Advertised` ratchets `is_observer` and follows the
+        // higher `cap_version` for `can_be_primary`. After merging, the
+        // `RoleTable.observers` / `RoleTable.can_be_primary` projections
+        // are rebuilt from `capability × local-alive` (`reproject_roles`,
+        // below, after the alive-membership merge so the alive bit is
+        // current). The 2P-set IS snapshot-healable, so a capability
+        // divergence the digest flagged converges here in one pull.
+        let mut capabilities_changed = false;
+        for (id, incoming) in capabilities {
+            let merged = match self.capabilities.get(&id) {
+                Some(local) => merge_capability(local, &incoming),
+                None => incoming,
+            };
+            if self.capabilities.get(&id) != Some(&merged) {
+                self.capabilities.insert(id, merged);
+                capabilities_changed = true;
+            }
         }
         // Peer-holdings map: same first-bootstrap-only contract
         // as `observers` and `phase_deps`. The live
@@ -520,21 +536,29 @@ impl<I: Identifier> ClusterState<I> {
         // `apply_peer_joined` drops a join for a `Dead` id, and as a
         // never-restore on an already-`Alive` local entry is a no-op).
         // The `Entry::Vacant` guard makes this idempotent + order-
-        // insensitive. The inserted entry's `is_observer` is
-        // reconstructed from the snapshot's authoritative `observers`
-        // set (via the `restored_observers` clone captured before the
-        // observer-set branch above may have moved it into the role
-        // table) so alive-state and observer-flag transfer cohesively.
+        // insensitive. The entry holds ONLY liveness (C6); the role
+        // capabilities ride the separate `capabilities` 2P-set merged
+        // above, and the `RoleTable` projections are rebuilt from
+        // `capability × alive` by `reproject_roles` below.
+        let mut alive_changed = false;
         for id in alive_members {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id.clone())
-            {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id) {
                 e.insert(PeerEntry {
                     state: PeerState::Alive,
                     pubkey: None,
                     endpoint: None,
-                    is_observer: restored_observers.contains(&id),
                 });
+                alive_changed = true;
             }
+        }
+        // Rebuild the role projections from the post-merge capability
+        // 2P-set + the post-merge alive bit, firing the role-change hooks,
+        // whenever EITHER changed. The SOLE producer of the `RoleTable`
+        // role sets, identical to the live apply path — so a snapshot-
+        // restored node and a live-applied node converge to the same
+        // projections.
+        if capabilities_changed || alive_changed {
+            self.reproject_roles();
         }
         // Run latches: sticky-monotonic, mirroring the `RunComplete` /
         // `RunAborted` apply arms. `run_complete` ratchets false→true

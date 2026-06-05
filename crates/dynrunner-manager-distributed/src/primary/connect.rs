@@ -318,6 +318,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     // replicated `RoleTable.can_be_primary` so
                     // `select_bootstrap_primary` reads the explicit marker.
                     can_be_primary,
+                    // Stamped at the origination choke point
+                    // (`apply_locally_for_broadcast` → `stamp_versions`).
+                    cap_version: Default::default(),
                 },
                 ClusterMutation::SecondaryCapacity {
                     secondary: secondary_id,

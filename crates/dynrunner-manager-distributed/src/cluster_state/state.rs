@@ -19,7 +19,7 @@ use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
-use super::types::{PeerEntry, RoleChangeHook, TaskState};
+use super::types::{CapabilityEntry, PeerEntry, RoleChangeHook, TaskState};
 
 /// The replicated cluster-state CRDT.
 pub struct ClusterState<I> {
@@ -81,12 +81,16 @@ pub struct ClusterState<I> {
     /// does not own. Tests that need hooks on a cloned state must
     /// re-register on the clone.
     pub(super) role_change_hooks: Vec<RoleChangeHook>,
-    /// Per-id liveness ledger maintained by the `PeerJoined` and
-    /// `PeerRemoved` apply rules. The `RoleTable.observers` set is a
-    /// projection of this map (the subset whose entries are
-    /// `Alive { is_observer: true }`); the map itself is the
-    /// authoritative "have we ever seen this id, and is it currently
-    /// alive or dead-forever" answer.
+    /// Per-id LIVENESS ledger (only) maintained by the `PeerJoined` and
+    /// `PeerRemoved` apply rules. Holds the alive/dead bit; the role
+    /// capabilities (`is_observer` / `can_be_primary`) live in the
+    /// separate replicated `capabilities` 2P-set (C6 — one source of
+    /// truth, no CRD-4). The `RoleTable.observers` / `RoleTable.can_be_primary`
+    /// sets are READ-TIME projections of `capabilities × this map's Alive
+    /// bit` (`reproject_roles`); this map is the authoritative "have we
+    /// ever seen this id, and is it currently alive or dead-forever"
+    /// liveness answer, composed with — never merged into — the capability
+    /// set at projection time.
     ///
     /// Skipped from `Clone` (a cloned replica is a fresh node-local view
     /// paired with the node-local `lifecycle_tx` dispatcher channel, and
@@ -100,8 +104,27 @@ pub struct ClusterState<I> {
     /// (Dead-wins / sticky: a local `Dead` is never resurrected; absence
     /// is not read as Dead — honest-liveness). Dead ids are NOT
     /// snapshotted. The steady-state writers remain the live
-    /// `PeerJoined`/`PeerRemoved` broadcasts.
+    /// `PeerJoined`/`PeerRemoved` broadcasts. Liveness is INTENTIONALLY
+    /// excluded from the digest (each node owns its own view); only
+    /// capability converges via anti-entropy.
     pub(super) peer_state: HashMap<String, PeerEntry>,
+    /// Replicated role-capability 2P-set (C6) — the SINGLE source of
+    /// truth for `is_observer` / `can_be_primary`, decoupled from
+    /// liveness. Keyed by peer id; each entry is `Advertised { .. } |
+    /// Departed` (a tombstone written on a genuine `PeerRemoved`). Merged
+    /// monotonically via `merge_capability` (apply's peer arms +
+    /// restore's per-id loop) and folded into the digest
+    /// (`capabilities_hash`) — the 2P-set IS snapshot-healable, so a
+    /// flagged divergence is one a pull's `restore` actually heals
+    /// (detect-WITH-heal). The `RoleTable.observers` /
+    /// `RoleTable.can_be_primary` sets are read-time projections of this
+    /// map AND the local `peer_state` Alive bit (`reproject_roles`); this
+    /// map alone is replicated, the projections are node-local derived.
+    ///
+    /// Replicated CRDT data — clone preserves it (matches `tasks`,
+    /// `peer_holdings`, `task_outputs`). Round-trips through
+    /// `snapshot`/`restore`.
+    pub(super) capabilities: HashMap<String, CapabilityEntry>,
     /// Sender end of the peer-lifecycle dispatcher mpsc. Installed
     /// via [`Self::install_lifecycle_sender`] when the coordinator
     /// wires its dispatcher task; `None` while no coordinator has
@@ -236,6 +259,8 @@ where
             role_change_hooks: Vec::new(),
             // Deliberately not cloned — see field doc.
             peer_state: HashMap::new(),
+            // Replicated CRDT data — clone preserves it.
+            capabilities: self.capabilities.clone(),
             // Deliberately not cloned — see field doc.
             lifecycle_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
@@ -272,6 +297,7 @@ where
             .field("role_table", &self.role_table)
             .field("role_change_hooks", &self.role_change_hooks.len())
             .field("peer_state", &self.peer_state)
+            .field("capabilities", &self.capabilities)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
             .field("worker_mgmt_tx", &self.worker_mgmt_tx.is_some())
@@ -297,6 +323,7 @@ impl<I> Default for ClusterState<I> {
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),
+            capabilities: HashMap::new(),
             lifecycle_tx: None,
             matcher_trigger_tx: None,
             worker_mgmt_tx: None,
