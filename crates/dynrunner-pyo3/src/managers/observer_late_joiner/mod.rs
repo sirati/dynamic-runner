@@ -18,42 +18,41 @@
 //!    the shared default budget; the trait's default impl dials,
 //!    sends `RequestClusterSnapshot` to the first reachable seed peer,
 //!    and returns the serialized snapshot JSON.
-//! 4. Deserialize the snapshot, construct a [`SecondaryCoordinator`]
-//!    paired with [`NoPrimaryTransport`] (peer-only mesh participant;
-//!    see `no_primary.rs` for the design rationale), call
-//!    [`SecondaryCoordinator::restore_from_snapshot_and_skip_setup`]
-//!    to install the snapshot AND latch `setup_phase_completed=true`,
-//!    then run [`SecondaryCoordinator::run_until_setup_or_done`]
-//!    until it returns `RunOutcome::Terminal` (the clean-finish case
-//!    projecting to `SecondaryTerminal::Done`).
+//! 4. Deserialize the snapshot(s) — a decode failure is FATAL — and
+//!    cold-join the standalone
+//!    [`dynrunner_manager_distributed::observer::ObserverCoordinator`]
+//!    via [`dynrunner_manager_distributed::observer::build_cold_join_observer`],
+//!    then drive its single
+//!    [`dynrunner_manager_distributed::observer::ObserverCoordinator::run`]
+//!    loop until it returns a terminal (`Done` / `Aborted` / `Panik`) or a
+//!    strand backstop surfaces an `Err`.
 //!
 //! # Module boundary
 //!
 //! This module owns ONLY the dispatcher glue. The bootstrap RPC
-//! (`join_running_cluster`), the snapshot install
-//! (`cluster_state.restore`), and the setup-skip latch
-//! (`setup_phase_completed=true`) all live in the protocol /
-//! manager-distributed crates that are the canonical owners of those
-//! concerns; this module just sequences the existing primitives.
+//! (`join_running_cluster`), the snapshot install (`cluster_state.restore`),
+//! and the whole observation runtime (reporter, failure policies, announcer,
+//! panik arm, strand backstops, teardown) all live in the protocol /
+//! manager-distributed crates that own those concerns; this wrapper just
+//! reads the seed, runs the bootstrap RPC, and hands the decoded snapshots to
+//! the cold-join factory.
 //!
-//! # Why a dedicated pyclass (not a flag on `RustSecondaryCoordinator`)
+//! # Why a dedicated pyclass
 //!
-//! A late-joiner has fundamentally different inputs than a normal
+//! A late-joiner observer has fundamentally different inputs than a normal
 //! secondary:
 //!   - no `primary_url` (the observer never speaks primary protocol),
 //!   - no `secondary_id` from argv (the observer picks its own id;
 //!     it's a peer-mesh participant, not a SLURM-spawned worker),
-//!   - no worker count (`num_workers=0` is structural, not a knob),
+//!   - no worker count / scheduler / estimator (a zero-authority observer
+//!     runs no workers and holds no scheduler),
 //!   - peer-info-dir replaces the primary's `PeerInfo` broadcast
 //!     as the initial seed source.
 //!
-//! Cramming these into `PySecondaryCoordinator` would require
-//! `Option<>`-everywhere on construction args + a "late-joiner mode"
-//! `if` cascade across `run()`. A sibling pyclass with its own
-//! `new` / `run` shape keeps the two concerns visibly separate while
-//! still sharing the load-bearing run loop (one
-//! `secondary.run_until_setup_or_done(&mut factory)` call serves both
-//! flavours; the setup-skip latch handles all the conditional state).
+//! A sibling pyclass with its own `new` / `run` shape keeps the observer
+//! dispatch visibly separate from the secondary's, constructing the
+//! standalone [`dynrunner_manager_distributed::observer::ObserverCoordinator`]
+//! (the ONE observer impl) rather than a secondary in an observer mode.
 //!
 //! # File split
 //!
@@ -68,8 +67,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::config::distributed::DistributedConfig;
-use crate::config::scheduler::SchedulerConfig;
-use crate::task_def::LoadedTopology;
 
 mod helpers;
 mod new;
@@ -77,11 +74,13 @@ mod run;
 
 /// Late-joining observer dispatcher.
 ///
-/// Construction parses the task_definition (to recover the resource
-/// estimator and phase-deps the run loop needs) and stashes the
-/// caller's configuration knobs. The actual peer-join + snapshot
-/// restore + observation loop runs inside [`PyObserverLateJoiner::run`]
-/// (under `py.detach`).
+/// Construction stashes the caller's configuration knobs; the actual
+/// peer-join + snapshot restore + observation loop runs inside
+/// [`PyObserverLateJoiner::run`] (under `py.detach`), which cold-joins the
+/// standalone
+/// [`dynrunner_manager_distributed::observer::ObserverCoordinator`]. A
+/// zero-authority observer needs no estimator / scheduler / worker config —
+/// it holds the replicated CRDT and narrates the run from it.
 #[pyclass(name = "RustObserverLateJoiner")]
 pub(crate) struct PyObserverLateJoiner {
     /// Logical peer-id this observer registers under in the mesh.
@@ -95,46 +94,22 @@ pub(crate) struct PyObserverLateJoiner {
     /// files. Read once at the start of `run()` to build the seed
     /// list for [`PeerTransport::join_running_cluster`].
     pub(super) peer_info_dir: PathBuf,
-    /// Held for the estimator / phase-deps the SecondaryCoordinator
-    /// needs to drive its run loop. We deliberately use the lighter
-    /// [`LoadedTopology`] (no `build_worker_command_args` invocation,
-    /// no path-resolution side effects) rather than the heavier
-    /// [`crate::task_def::LoadedTaskDefinition`] because the observer
-    /// has `num_workers = 0` — no worker subprocess will ever spawn,
-    /// so the per-type cmd_args are useless and asking Python to
-    /// build them would be a wasted excursion.
-    pub(super) topology: LoadedTopology,
     pub(super) distributed_config: DistributedConfig,
-    /// Optional Python peer-lifecycle listener supplied at `__init__`.
-    /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
-    /// bridged through
-    /// `crate::peer_lifecycle_bridge::PyPeerLifecycleListener` and
-    /// registered on the inner observer-mode `SecondaryCoordinator`
-    /// at `run()` start. Constructor-only; see the matching field
-    /// on `PyPrimaryCoordinator` for the rationale.
-    pub(super) peer_lifecycle_listener: Option<Py<PyAny>>,
     /// Static set of `holdings` this observer advertises to the
     /// cluster (e.g. asm-dataset-nix passes the local Nix-store
-    /// outpaths it can serve). Drained into the observer-side
-    /// announcer at `run()` time so a `PrimaryChanged` mutation
-    /// triggers a `PeerResourceHoldingsUpdated` broadcast carrying
-    /// the cluster's current `primary_epoch`. Defaults to empty
-    /// when the kwarg is omitted — a consumer that doesn't host
-    /// any resources simply never announces anything, which is the
-    /// correct shape for a pure observer.
+    /// outpaths it can serve). Handed to the cold-join factory's
+    /// announcer attach at `run()` time so the bootstrap restore's
+    /// `PrimaryChanged` apply triggers a `PeerResourceHoldingsUpdated`
+    /// broadcast carrying the cluster's current `primary_epoch`.
+    /// Defaults to empty when the kwarg is omitted — a consumer that
+    /// doesn't host any resources simply never announces anything, which
+    /// is the correct shape for a pure observer.
     ///
     /// Stored as `HashSet` to deduplicate at the boundary; the
     /// announcer's `build_payload` sorts before send so the wire
     /// order is stable regardless of insertion sequence on the
     /// Python side.
     pub(super) holdings: std::collections::HashSet<String>,
-    /// Scheduler tuning forwarded into the observer-mode
-    /// `SecondaryCoordinator`'s inner `ResourceStealingScheduler`. The
-    /// observer never spawns workers (`num_workers = 0`), but the
-    /// coordinator still constructs the scheduler at run start — keep
-    /// the tuning surface consistent with the other Rust manager-hosting
-    /// pyclasses so a single CLI flag pair drives every node uniformly.
-    pub(super) scheduler_config: SchedulerConfig,
     /// Panik-watcher paths — same shape as on
     /// `PySecondaryCoordinator`. An observer that runs on its own
     /// host can be told to bail by a per-host panik file; observers
@@ -152,23 +127,18 @@ pub(crate) struct PyObserverLateJoiner {
 #[pyfunction]
 #[pyo3(signature = (
     peer_info_dir,
-    task_definition,
     observer_id = None,
     distributed_config = None,
     holdings = None,
-    scheduler_config = None,
     panik_watcher_paths = None,
     panik_watcher_poll_interval_secs = 10.0,
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_observer_late_joiner<'py>(
     py: Python<'py>,
     peer_info_dir: PathBuf,
-    task_definition: &Bound<'py, PyAny>,
     observer_id: Option<String>,
     distributed_config: Option<DistributedConfig>,
     holdings: Option<Vec<String>>,
-    scheduler_config: Option<SchedulerConfig>,
     panik_watcher_paths: Option<Vec<PathBuf>>,
     panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
@@ -182,9 +152,6 @@ pub(crate) fn run_observer_late_joiner<'py>(
     if let Some(h) = holdings.as_ref() {
         kwargs.set_item("holdings", h.clone())?;
     }
-    if let Some(sc) = scheduler_config.as_ref() {
-        kwargs.set_item("scheduler_config", sc.clone())?;
-    }
     if let Some(paths) = panik_watcher_paths.as_ref() {
         kwargs.set_item("panik_watcher_paths", paths.clone())?;
     }
@@ -197,7 +164,7 @@ pub(crate) fn run_observer_late_joiner<'py>(
     // so the wiring stays uniform across runner modes.
     let module = py.import("dynamic_runner")?;
     let cls = module.getattr("RustObserverLateJoiner")?;
-    let args = (peer_info_dir, task_definition.clone());
+    let args = (peer_info_dir,);
     let observer = cls.call(args, Some(&kwargs))?;
     observer.call_method0("run")?;
 

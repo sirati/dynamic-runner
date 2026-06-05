@@ -1,6 +1,6 @@
 //! CRDT convergence-robustness coverage.
 //!
-//! Three primary-side behaviors, all additive to the DELIVERY layer (the
+//! Primary-side behaviors, all additive to the DELIVERY layer (the
 //! apply/merge/snapshot algebra is untouched):
 //!
 //!   (a) `rebroadcast_full_roster` re-emits the FULL per-secondary roster
@@ -8,12 +8,7 @@
 //!       an INCOMPLETE `secondary_capacities` mirror (so it rebuilds the
 //!       full worker roster + correct `alive_remote_secondary_count`, no
 //!       premature fleet-dead).
-//!   (b) `run_as_observer` requests a cluster snapshot from the primary on
-//!       entry and `restore()`s the reply — fixes #187 (the setup-defer
-//!       all-zeros observer summary). Plus the negative control: with NO
-//!       reply the observer still terminates via the setup-promote-deadline
-//!       backstop.
-//!   (c) the primary ANSWERS `RequestClusterSnapshot` (unicasts a
+//!   (b) the primary ANSWERS `RequestClusterSnapshot` (unicasts a
 //!       `ClusterSnapshot` of its complete ledger + originates the
 //!       requester's `PeerJoined`).
 
@@ -21,7 +16,7 @@ use super::*;
 
 use crate::primary::wire::compute_task_hash;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
-use dynrunner_protocol_primary_secondary::{MessageType, PrimaryChangeReason};
+use dynrunner_protocol_primary_secondary::MessageType;
 
 /// One advertised-memory resource amount (bytes), mirroring the live
 /// welcome shape (a single `memory` `ResourceAmount`).
@@ -313,147 +308,6 @@ async fn primary_answers_request_cluster_snapshot() {
             assert!(
                 primary.cluster_state_for_test().can_be_primary("sec-0"),
                 "the requester's declared can_be_primary must be recorded"
-            );
-        })
-        .await;
-}
-
-/// (b) Observer snapshot-recovery (#187 fix). The submitter runs
-/// `run_as_observer` with an EMPTY ledger but a named primary; on entry it
-/// requests a snapshot from the primary and `restore()`s the reply —
-/// healing the all-zeros summary. The reply carries completed tasks + the
-/// `RunComplete` latch, so the loop's first iteration exits Ok with a
-/// non-zero completion count.
-#[tokio::test(flavor = "current_thread")]
-async fn observer_recovers_from_snapshot_reply() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            // Build the snapshot the primary would answer with: two
-            // completed tasks + the RunComplete latch.
-            let snapshot_json = {
-                let mut donor = crate::cluster_state::ClusterState::<TestId>::new();
-                for name in ["t1", "t2"] {
-                    let task = make_binary(name, 100);
-                    let hash = compute_task_hash(&task);
-                    donor.apply(ClusterMutation::TaskAdded {
-                        hash: hash.clone(),
-                        task,
-                    });
-                    donor.apply(ClusterMutation::TaskCompleted {
-                        hash,
-                        result_data: None,
-                    });
-                }
-                donor.apply(ClusterMutation::RunComplete);
-                serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
-            };
-
-            // Observer transport: an outbox to the named primary (so the
-            // recovery RPC's `Destination::Primary` send succeeds) + an
-            // inbound the test feeds the `ClusterSnapshot` reply into.
-            let (to_primary_tx, _to_primary_rx) = tokio_mpsc::unbounded_channel();
-            let (inbound_tx, inbound_rx) = tokio_mpsc::unbounded_channel();
-            let mut outgoing = HashMap::new();
-            outgoing.insert("promoted-sec".to_string(), to_primary_tx);
-            let transport =
-                ChannelPeerTransport::from_raw_channels("submitter".into(), outgoing, inbound_rx);
-            let mut observer: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-                test_primary_config(),
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-            // A named current primary (the promoted secondary) so the
-            // recovery RPC fires; the submitter is NOT the primary.
-            {
-                let cs = observer.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::PrimaryChanged {
-                    new: "promoted-sec".into(),
-                    epoch: 2,
-                    reason: PrimaryChangeReason::Election,
-                });
-            }
-            // Pre-feed the ClusterSnapshot reply so the bounded recovery
-            // recv picks it up on entry.
-            inbound_tx
-                .send(DistributedMessage::ClusterSnapshot {
-                    sender_id: "promoted-sec".into(),
-                    timestamp: 0.0,
-                    snapshot_json,
-                })
-                .unwrap();
-
-            // Empty ledger BEFORE recovery — the all-zeros symptom.
-            assert_eq!(
-                observer.cluster_state_for_test().outcome_counts().succeeded,
-                0,
-                "pre-recovery the observer's ledger is empty (the #187 symptom)"
-            );
-
-            let result = observer.run_as_observer().await;
-            assert!(
-                result.is_ok(),
-                "observer must exit Ok after recovery: {result:?}"
-            );
-            assert_eq!(
-                observer.cluster_state_for_test().outcome_counts().succeeded,
-                2,
-                "recovery must restore the completed-task count (non-zero summary)"
-            );
-        })
-        .await;
-}
-
-/// (b) Negative control: with NO snapshot reply, the observer still
-/// terminates — via the setup-promote-deadline backstop. The recovery
-/// request is fire-and-forget (the reply, if any, heals through the
-/// loop's `ClusterSnapshot` arm), so a missing reply cannot deadlock:
-/// the loop's hard deadline arm fires regardless.
-#[tokio::test(flavor = "current_thread")]
-async fn observer_no_reply_still_terminates_via_deadline() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (to_primary_tx, _to_primary_rx) = tokio_mpsc::unbounded_channel();
-            // Inbound kept open (sender held) but NEVER fed — the recovery
-            // recv must time out on its bounded budget, not block forever.
-            let (_inbound_tx, inbound_rx) =
-                tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-            let mut outgoing = HashMap::new();
-            outgoing.insert("promoted-sec".to_string(), to_primary_tx);
-            let transport =
-                ChannelPeerTransport::from_raw_channels("submitter".into(), outgoing, inbound_rx);
-            let config = PrimaryConfig {
-                // Setup-defer mode + empty ledger ⇒ `setup_pending()` true,
-                // arming the setup-promote-deadline backstop.
-                required_setup_on_promote: true,
-                setup_promote_deadline: Duration::from_millis(200),
-                // Keep fleet-dead far out so the deadline arm is the one
-                // that fires (peer_count() == 1 here anyway, so fleet-dead
-                // never arms).
-                fleet_dead_timeout: Duration::from_secs(60),
-                ..test_primary_config()
-            };
-            let mut observer: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-                config,
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-            {
-                let cs = observer.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::PrimaryChanged {
-                    new: "promoted-sec".into(),
-                    epoch: 2,
-                    reason: PrimaryChangeReason::Election,
-                });
-            }
-
-            let result = observer.run_as_observer().await;
-            assert!(
-                result.is_err(),
-                "with no reply + setup pending, the observer must exit via the deadline arm"
             );
         })
         .await;

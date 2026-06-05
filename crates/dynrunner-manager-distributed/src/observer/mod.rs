@@ -6,8 +6,8 @@
 //! is observing: both the secondary late-joiner (a peer-mesh-only
 //! participant that joined via the snapshot RPC) AND the
 //! relocated-submitter primary tail (the bootstrap-primary that handed
-//! its role to a compute secondary and runs `run_as_observer`) consume
-//! them. They have no place inside the generic `secondary/` tree.
+//! its role to a compute secondary and runs the relocation observer tail)
+//! consume them. They have no place inside the generic `secondary/` tree.
 //!
 //!   * [`announcer`]        — the resource-holdings broadcaster.
 //!   * [`reporting`]        — the CRDT-derived periodic-stats + idle
@@ -18,6 +18,7 @@
 //! See each submodule's header for its concern.
 
 pub mod announcer;
+pub mod coordinator;
 pub mod failure_response;
 pub mod lifecycle;
 pub mod reporting;
@@ -25,6 +26,10 @@ pub mod reporting;
 pub use announcer::{
     AnnounceTrigger, AnnouncerOutboxItem, AnnouncerSender, PeerMeshAnnouncerSender,
     PeerResourceHoldingsUpdatedPayload, run_observer_announcer,
+};
+pub use coordinator::{
+    ObserverConfig, ObserverCoordinator, ObserverHandoff, ObserverTerminal,
+    build_cold_join_observer,
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};

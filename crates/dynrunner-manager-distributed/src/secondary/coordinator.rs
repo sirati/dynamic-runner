@@ -592,15 +592,74 @@ where
         self.lifecycle.set_pre_staged_mode(on);
     }
 
+    /// `true` iff this node is the single deterministically-designated
+    /// setup-discovery node — the lowest-id alive, non-observer,
+    /// `can_be_primary` worker-secondary in the replicated membership
+    /// mirror.
+    ///
+    /// This is the SAME candidate set + `.min()` rule the primary's
+    /// `select_bootstrap_primary` (primary/coordinator.rs) applies to
+    /// pick the bootstrap-promotion target, computed here against the
+    /// secondary's own replicated `cluster_state`:
+    ///   - [`ClusterState::alive_secondary_members`] — advertised
+    ///     worker-secondary capacity (`worker_count > 0`) AND alive; the
+    ///     faithful liveness signal in the SETUP window where no
+    ///     operational keepalive map exists yet (exactly the substitution
+    ///     the secondary election makes in its cold-start branch,
+    ///     `alive_secondary_ids`).
+    ///   - `role_table().observers` excluded — an observer hosts no
+    ///     workers and can never become primary, mirroring the election's
+    ///     observer self-exclusion and `select_bootstrap_primary`'s
+    ///     defensive cut.
+    ///   - [`ClusterState::can_be_primary`] — the explicit replicated
+    ///     capability marker; only a peer that declared it can host the
+    ///     primary on demand is eligible.
+    ///
+    /// The primary's selection ALSO filters `mesh_ready_secondaries` /
+    /// `transport.has_peer`, which a secondary cannot read for its peers;
+    /// its membership/liveness mirror is the faithful analogue (the same
+    /// substitution `alive_secondary_ids` makes). The designated
+    /// discoverer is therefore the SAME node `select_bootstrap_primary`
+    /// promotes — discovery and promotion re-coupled through one
+    /// deterministic rule, with no cross-call between the two concerns.
+    ///
+    /// Self-healing: if the designated node dies before discovering, the
+    /// `.min()` re-resolves to the next eligible node on the next tick
+    /// (the predicate is re-evaluated every loop iteration), and that
+    /// node's empty-ledger axis is still true, so it picks up discovery —
+    /// the same liveness-driven re-resolution the election has.
+    fn is_designated_discoverer(&self) -> bool {
+        let observers = &self.cluster_state.role_table().observers;
+        let designated = self
+            .cluster_state
+            .alive_secondary_members()
+            .filter(|id| !observers.contains(*id))
+            .filter(|id| self.cluster_state.can_be_primary(id))
+            .min();
+        designated == Some(self.config.secondary_id.as_str())
+    }
+
     /// Single source of truth for the setup-discovery `SetupPending`
     /// yield discriminator.
     ///
     /// `true` iff (a) the authority deferred discovery
     /// (`pre_staged_mode`, set from the empty `InitialAssignment` the
-    /// submitter sends when it has no local corpus view), (b) the
-    /// replicated ledger is still empty (`cluster_state.task_count()
-    /// == 0` — no node has seeded it yet), and (c) this node hasn't
-    /// already run its own discovery pass ([`Self::setup_discovery_done`]).
+    /// submitter sends when it has no local corpus view), (b) this node
+    /// hasn't already run its own discovery pass
+    /// ([`Self::setup_discovery_done`]), (c) the replicated ledger is
+    /// still empty (`cluster_state.task_count() == 0` — no node has
+    /// seeded it yet), (d) this node is the single deterministically-
+    /// designated discoverer ([`Self::is_designated_discoverer`]), and
+    /// (e) this node is the recognized post-promotion authority
+    /// (`cluster_state.current_primary() == self`).
+    ///
+    /// Axes (d) and (e) together make discovery run on EXACTLY ONE node
+    /// and only AFTER that node has become the authority: the designated
+    /// discoverer is the same lowest-id-eligible node
+    /// `select_bootstrap_primary` promotes (axis d), and axis (e) holds
+    /// the yield until that node's own `PrimaryChanged` has propagated —
+    /// so its `ingest_setup_discovery` broadcast is consumed by its own
+    /// already-operational co-located primary, never into the void.
     ///
     /// `process_tasks` consults this once per tick and yields
     /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
@@ -608,14 +667,16 @@ where
     /// corpus and feed the result back via
     /// [`Self::ingest_setup_discovery`]. The predicate is self-clearing
     /// on every axis: a non-empty ledger (this node's own ingest or a
-    /// peer's broadcast) flips (b) false, and `ingest_setup_discovery`
-    /// flips (c) true — so the yield FIRES AT MOST ONCE per node and an
+    /// peer's broadcast) flips (c) false, and `ingest_setup_discovery`
+    /// flips (b) true — so the yield FIRES AT MOST ONCE per node and an
     /// empty discovery never re-yields. Legacy / failover runs leave
     /// `pre_staged_mode` false, so the predicate is always false there.
     pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
         self.lifecycle.pre_staged_mode()
             && !self.lifecycle.setup_discovery_done()
             && self.cluster_state.task_count() == 0
+            && self.is_designated_discoverer()
+            && self.cluster_state.current_primary() == Some(self.config.secondary_id.as_str())
     }
 
     pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {

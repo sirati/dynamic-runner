@@ -1,8 +1,8 @@
 //! Manager-layer END-TO-END proof of the full bootstrap hand-off.
 //!
-//! Unlike [`relocate_observe`] (which drives `relocate_primary_to` /
-//! `run_as_observer` in isolation) and [`select_bootstrap`] (which unit-
-//! tests the selection policy), these tests stand up a RUNNING channel
+//! Unlike [`relocate_observe`] (which drives `relocate_primary_to` in
+//! isolation) and [`select_bootstrap`] (which unit-tests the selection
+//! policy), these tests stand up a RUNNING channel
 //! mesh — a submitter primary + ≥2 PRIMARY-CAPABLE secondaries — and let
 //! the submitter's own `run()` bootstrap fork relocate authority onto the
 //! lowest-id capable peer. That peer's on-demand-built `PrimaryCoordinator`
@@ -18,6 +18,8 @@
 //! bounded settle windows the coordinators already use.
 
 use super::*;
+
+use crate::primary::coordinator::PrimaryRunOutcome;
 
 /// Per-peer inbound senders keyed by peer id — the shared fan-in table
 /// every peer copies its `outgoing` from.
@@ -65,190 +67,6 @@ fn submitter_config(num_secondaries: u32) -> PrimaryConfig {
         peer_timeout: Duration::from_secs(10),
         ..test_primary_config()
     }
-}
-
-/// HEADLINE: submitter + 2 primary-capable secondaries over a channel mesh.
-/// The submitter bootstraps, then its `run()` fork relocates FULL authority
-/// to the lowest-id capable peer (`sec-0`), and becomes an observer. The
-/// chosen peer's on-demand `PrimaryCoordinator` dispatches the residual
-/// workload and finalizes the run; the submitter-observer exits on the
-/// `RunComplete` it broadcasts.
-///
-/// Asserts the proof of a REAL hand-off, not a totals reconcile:
-///   (a) the CHOSEN peer's own co-located primary credited ALL tasks to its
-///       OWN replicated ledger (`ActivatedPrimaryResult` == total) — per-
-///       host primary attribution, captured the instant `run_activated`
-///       returned;
-///   (b) the submitter ran the OBSERVER tail: `run()` returned `Ok`, it
-///       NEVER pinned itself as local primary (`primary_id == None` — the
-///       relocate path never calls `activate_local_primary`), and its
-///       replicated-ledger `completed_count()` == total (it observed every
-///       terminal off the CRDT, not a pool it dispatched from);
-///   (c) the chosen peer holds authority: `current_primary()` is the
-///       lowest-id capable peer (`sec-0`), and the epoch advanced past the
-///       bootstrap pin's 0 — the submitter's Transferred announce was epoch
-///       1 (unit-pinned in `relocate_observe`), and the chosen peer's own
-///       `activate_local_primary` then re-asserts authority via an Election
-///       self-announce at the next epoch, so the OBSERVED final epoch is ≥ 1;
-///   (d) all tasks completed — the per-secondary own-work counts partition
-///       the full set across REAL workers (proving the chosen primary truly
-///       dispatched to the loopback + the wire, not that totals merely
-///       agree).
-#[tokio::test(flavor = "current_thread")]
-async fn e2e_relocation_chosen_peer_dispatches_and_submitter_observes() {
-    let _ = tracing_subscriber::fmt::try_init();
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            const NUM_TASKS: usize = 10;
-            // 2 secondaries × 2 workers = 4 initial-assignment slots, so the
-            // submitter's one-per-worker initial assignment can place at
-            // most 4 of the 10 tasks; the residual ≥6 MUST be dispatched by
-            // the chosen peer's on-demand primary AFTER relocation. That is
-            // what makes (a)/(d) a genuine dispatch proof.
-            let (senders, mut receivers) = mesh_channels(&["primary", "sec-0", "sec-1"]);
-
-            // Short keepalive so the two secondaries recognise each other as
-            // alive fast (full mesh → MeshReady → the submitter releases its
-            // relocation fork promptly), and a per-task latency so the
-            // workload stays in-flight ACROSS the relocation window — the
-            // residual tasks are then dispatched by the chosen peer's
-            // on-demand primary, not raced-to-completion by the submitter.
-            let keepalive = Duration::from_millis(10);
-            // Every task path is `/tmp/bin_N`; the substring `"bin_"` matches
-            // all, giving each a uniform bounded latency.
-            let slow = || vec![("bin_".to_string(), Duration::from_millis(80))];
-
-            // Primary-capable secondaries: each gets its own inbound rx + an
-            // outgoing table to every other peer (incl. the submitter keyed
-            // "primary"). They join can_be_primary=true and arm the channel-
-            // mesh on-demand activator.
-            let (sec0_handle, sec0_primary_result) = spawn_real_secondary_primary_capable(
-                "sec-0".into(),
-                2,
-                big_ram(),
-                keepalive,
-                slow(),
-                receivers.remove("sec-0").unwrap(),
-                outgoing_for("sec-0", &senders),
-            );
-            let (sec1_handle, sec1_primary_result) = spawn_real_secondary_primary_capable(
-                "sec-1".into(),
-                2,
-                big_ram(),
-                keepalive,
-                slow(),
-                receivers.remove("sec-1").unwrap(),
-                outgoing_for("sec-1", &senders),
-            );
-
-            // Submitter transport: outgoing to both secondaries, inbound is
-            // its own mesh receiver.
-            let submitter_inbound_rx = receivers.remove("primary").unwrap();
-            let transport = ChannelPeerTransport::from_raw_channels(
-                "primary".into(),
-                outgoing_for("primary", &senders),
-                submitter_inbound_rx,
-            );
-            // Drop the unused fan-in senders so no stray sender keeps a
-            // receiver alive past its peer's exit.
-            drop(senders);
-
-            let mut submitter = PrimaryCoordinator::new(
-                submitter_config(2),
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-
-            let binaries: Vec<TaskInfo<TestId>> = (0..NUM_TASKS)
-                .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
-                .collect();
-
-            {
-                let (deps, ops, ope) = noop_phase_args();
-                submitter
-                    .run(binaries, deps, ops, ope)
-                    .await
-                    .expect("submitter run (bootstrap → relocate → observer) must return Ok");
-            }
-
-            // (b) The submitter ran the OBSERVER tail: the relocate path
-            // took the `run_as_observer` branch (NOT the operational loop)
-            // and never called `activate_local_primary`, so it never pinned
-            // itself as the local primary — yet its replicated ledger
-            // observed every terminal off the CRDT broadcasts.
-            assert_eq!(
-                submitter.primary_id, None,
-                "the submitter must NOT have pinned itself as local primary — \
-                 relocation runs the observer tail, never activate_local_primary"
-            );
-            assert_eq!(
-                submitter.completed_count(),
-                NUM_TASKS,
-                "the submitter-observer's replicated ledger must observe every completion"
-            );
-            assert_eq!(submitter.failed_count(), 0, "no task may fail");
-
-            // (c) The chosen peer holds authority. The bootstrap pin was not
-            // an announce (epoch 0); the submitter's Transferred announce
-            // took it to 1, then the chosen peer's own activate_local_primary
-            // re-asserts via an Election self-announce at the next epoch — so
-            // the observed final epoch advanced past 0 and `current_primary`
-            // is the chosen lowest-id peer.
-            assert_eq!(
-                submitter.cluster_state_for_test().current_primary(),
-                Some("sec-0"),
-                "the lowest-id capable peer must be the chosen primary"
-            );
-            assert!(
-                submitter.cluster_state_for_test().primary_epoch() >= 1,
-                "the epoch must advance past the bootstrap pin (0) once the chosen \
-                 peer is named + asserts its own authority"
-            );
-
-            // Drop the submitter so its mesh senders close, letting the
-            // secondaries' own `run()` loops wind down once the run is over.
-            drop(submitter);
-
-            let sec0_own = sec0_handle.await.unwrap();
-            let sec1_own = sec1_handle.await.unwrap();
-
-            // (a) Per-host primary attribution: the CHOSEN peer (sec-0) built
-            // a co-located primary on demand and its OWN replicated ledger
-            // credited ALL tasks. sec-1 was never named primary, so its
-            // activator never fired.
-            assert_eq!(
-                sec0_primary_result.get(),
-                Some(NUM_TASKS),
-                "the CHOSEN peer's on-demand co-located primary must have credited \
-                 every task to its OWN ledger (per-host dispatch proof, not a totals \
-                 reconcile)"
-            );
-            assert_eq!(
-                sec1_primary_result.get(),
-                None,
-                "a non-chosen primary-capable secondary must never build a primary"
-            );
-
-            // (d) Real dispatch to real workers: the per-secondary own-work
-            // counts partition the full task set across the loopback (sec-0)
-            // and the wire (sec-1). A non-zero sec-1 count proves the chosen
-            // primary dispatched OVER THE MESH to a remote secondary, not
-            // only to its own loopback.
-            assert_eq!(
-                sec0_own + sec1_own,
-                NUM_TASKS,
-                "every task must run on exactly one secondary's worker; own-work \
-                 counts sec0={sec0_own}, sec1={sec1_own} must partition all tasks"
-            );
-            assert!(
-                sec1_own > 0,
-                "the chosen primary must have dispatched at least one task OVER THE \
-                 MESH to the remote secondary (sec-1), not only to its own loopback"
-            );
-        })
-        .await;
 }
 
 /// NO-CAPABLE-PEER: submitter + 2 secondaries that join `can_be_primary =
@@ -345,69 +163,64 @@ async fn e2e_no_capable_peer_submitter_stays_primary() {
         .await;
 }
 
-/// RELOCATION single-emit guard for the "initial setup done" milestone.
+/// HEADLINE: submitter + 2 primary-capable secondaries over a channel mesh.
+/// The submitter bootstraps, then its `run_consuming()` bootstrap fork
+/// relocates FULL authority to the lowest-id capable peer (`sec-0`), DROPS
+/// its own `PrimaryCoordinator` BY VALUE into the standalone observer's
+/// handoff, and runs the observer tail. The chosen peer's on-demand
+/// `PrimaryCoordinator` dispatches the residual workload and finalizes the
+/// run; the submitter-observer exits on the `RunComplete` it broadcasts.
 ///
-/// The submitter emits "initial setup done" once in `run_pipeline`, placed
-/// BEFORE the bootstrap hand-off fork. When authority RELOCATES to a chosen
-/// peer, that peer's on-demand primary enters via `run_activated` /
-/// `run_activated_pipeline`, which bypasses `run_pipeline` (and therefore
-/// the emit) entirely — it inherits the formed mesh and resumes from the
-/// restored snapshot. So even though TWO `PrimaryCoordinator`s run during a
-/// relocating run (the submitter's, then the chosen peer's on-demand one),
-/// "initial setup done" must be captured EXACTLY ONCE.
-///
-/// Path this drives: the FULL bootstrap → relocate hand-off (the same
-/// `Some(chosen)` → `relocate_primary_to` → `run_as_observer` fork the
-/// headline e2e test exercises). The submitter relocates to the lowest-id
-/// capable peer (`sec-0`), whose on-demand primary dispatches the residual
-/// workload via `run_activated_pipeline` — the path that must NOT re-emit.
-///
-/// Why the assertion is REAL (not a tautology): every coordinator in this
-/// test — the submitter, both secondaries, and the chosen peer's on-demand
-/// activated primary — runs on the SAME `current_thread` `LocalSet`, under
-/// a `set_default` thread-local `ImportantCapture` subscriber. So if the
-/// relocated primary's `run_activated_pipeline` ever emitted "initial setup
-/// done" (e.g. if the emit were moved into the shared
-/// `run_operational_and_finalize` tail, or duplicated onto the activation
-/// path), the capture WOULD record a second occurrence and `count == 1`
-/// would fail. The assertion fires off the activated path actually running:
-/// the headline-test invariants (relocation happened, the chosen peer's own
-/// ledger credited every task) are re-checked here so a regression that
-/// silently skips relocation can't make the count==1 pass vacuously.
+/// Asserts the proof of a REAL handoff, not a totals reconcile:
+///   (a) the CHOSEN peer's own co-located primary credited ALL tasks to its
+///       OWN replicated ledger (`ActivatedPrimaryResult` == total) — per-
+///       host primary attribution, captured the instant `run_activated`
+///       returned;
+///   (b) the submitter's `PrimaryCoordinator` was CONSUMED by value into the
+///       observer: `run_consuming` takes `submitter` by move (the binding is
+///       gone after the call — a compile-checked move, not a `mem::take`
+///       hollow shell), and the relocated outcome's accounting is re-sourced
+///       from the OBSERVER's converged `cluster_state`
+///       (`PrimaryRunOutcome::Relocated { completed, .. }` == total), proving
+///       the observer took over the moved-in ledger;
+///   (c) the run exited cleanly on the chosen peer's `RunComplete`:
+///       `result == Ok(())` (the observer's `Done` terminal), `failed == 0`,
+///       `stranded == 0` (an observer never dispatches);
+///   (d) the transport + peer set rode across by value (no re-dial): the
+///       observer drove anti-entropy / snapshot recovery over the SAME mesh
+///       the submitter held, and real dispatch reached BOTH the chosen
+///       peer's loopback AND the remote secondary over the wire — the
+///       per-secondary own-work counts partition the full task set with a
+///       non-zero remote share.
 #[tokio::test(flavor = "current_thread")]
-async fn initial_setup_done_emitted_once_across_relocation() {
-    use crate::test_capture::{ImportantCapture, important_only};
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
+async fn e2e_relocation_chosen_peer_dispatches_and_submitter_observes() {
+    let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // Capture only importance-target events, scoped to this test's
-            // thread for the lifetime of the run. `set_default` (not
-            // `with_default`) so the subscriber is held across the `.await`;
-            // `current_thread` + `LocalSet` keep every spawned coordinator
-            // (submitter, secondaries, AND the chosen peer's on-demand
-            // activated primary) on this thread, so an "initial setup done"
-            // emit from ANY of them is reached. See `phase_ordering.rs` for
-            // the same discipline.
-            let capture = ImportantCapture::default();
-            let subscriber =
-                Registry::default().with(capture.clone().with_filter(important_only()));
-            let _guard = tracing::subscriber::set_default(subscriber);
-
             const NUM_TASKS: usize = 10;
             // 2 secondaries × 2 workers = 4 initial-assignment slots, so the
-            // submitter places at most 4 of 10 tasks; the residual ≥6 MUST
-            // be dispatched by the chosen peer's on-demand primary AFTER
-            // relocation — that on-demand primary is the `run_activated`
-            // path that must NOT re-emit "initial setup done".
+            // submitter's one-per-worker initial assignment can place at
+            // most 4 of the 10 tasks; the residual ≥6 MUST be dispatched by
+            // the chosen peer's on-demand primary AFTER relocation. That is
+            // what makes (a)/(d) a genuine dispatch proof.
             let (senders, mut receivers) = mesh_channels(&["primary", "sec-0", "sec-1"]);
 
+            // Short keepalive so the two secondaries recognise each other as
+            // alive fast (full mesh → MeshReady → the submitter releases its
+            // relocation fork promptly), and a per-task latency so the
+            // workload stays in-flight ACROSS the relocation window — the
+            // residual tasks are then dispatched by the chosen peer's
+            // on-demand primary, not raced-to-completion by the submitter.
             let keepalive = Duration::from_millis(10);
+            // Every task path is `/tmp/bin_N`; the substring `"bin_"` matches
+            // all, giving each a uniform bounded latency.
             let slow = || vec![("bin_".to_string(), Duration::from_millis(80))];
 
+            // Primary-capable secondaries: each gets its own inbound rx + an
+            // outgoing table to every other peer (incl. the submitter keyed
+            // "primary"). They join can_be_primary=true and arm the channel-
+            // mesh on-demand activator.
             let (sec0_handle, sec0_primary_result) = spawn_real_secondary_primary_capable(
                 "sec-0".into(),
                 2,
@@ -427,15 +240,19 @@ async fn initial_setup_done_emitted_once_across_relocation() {
                 outgoing_for("sec-1", &senders),
             );
 
+            // Submitter transport: outgoing to both secondaries, inbound is
+            // its own mesh receiver.
             let submitter_inbound_rx = receivers.remove("primary").unwrap();
             let transport = ChannelPeerTransport::from_raw_channels(
                 "primary".into(),
                 outgoing_for("primary", &senders),
                 submitter_inbound_rx,
             );
+            // Drop the unused fan-in senders so no stray sender keeps a
+            // receiver alive past its peer's exit.
             drop(senders);
 
-            let mut submitter = PrimaryCoordinator::new(
+            let submitter = PrimaryCoordinator::new(
                 submitter_config(2),
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -446,49 +263,60 @@ async fn initial_setup_done_emitted_once_across_relocation() {
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
                 .collect();
 
-            {
-                let (deps, ops, ope) = noop_phase_args();
-                submitter
-                    .run(binaries, deps, ops, ope)
-                    .await
-                    .expect("submitter run (bootstrap → relocate → observer) must return Ok");
-            }
+            // `run_consuming` takes `submitter` BY VALUE — after this call
+            // the binding is gone (a compile-checked move into the observer
+            // handoff, NOT a `mem::take` hollow shell). The post-run
+            // accounting travels back through the returned outcome.
+            let (deps, ops, ope) = noop_phase_args();
+            let outcome = submitter
+                .run_consuming(binaries, deps, ops, ope)
+                .await
+                .expect("submitter run (bootstrap → relocate → observer) must return Ok");
 
-            // Re-assert that a REAL relocation happened so the single-emit
-            // count below can't pass vacuously: a regression that skipped
-            // relocation (submitter stays primary) would emit exactly once
-            // too, but would NOT exercise the activated-path bypass this
-            // test guards. The submitter must have observed (never pinned
-            // itself local) and the chosen peer must hold authority.
+            // (b)/(c) The submitter RELOCATED: its `PrimaryCoordinator` was
+            // consumed into the observer handoff, the observer drove the
+            // moved-in ledger to terminal, and the accounting is re-sourced
+            // from the observer's converged `cluster_state`.
+            let PrimaryRunOutcome::Relocated {
+                result,
+                completed,
+                failed,
+                stranded,
+            } = outcome
+            else {
+                panic!(
+                    "the submitter must have RELOCATED (observer tail), not stayed local: {outcome:?}"
+                );
+            };
+            result.expect("the observer must exit cleanly on the chosen peer's RunComplete (Done)");
             assert_eq!(
-                submitter.primary_id, None,
-                "the submitter must have relocated (observer tail), not stayed local primary"
+                completed, NUM_TASKS,
+                "the relocated outcome's completed count must be re-sourced from the \
+                 observer's converged ledger (every completion observed off the CRDT)"
             );
+            assert_eq!(failed, 0, "no task may fail");
             assert_eq!(
-                submitter.completed_count(),
-                NUM_TASKS,
-                "the submitter-observer's replicated ledger must observe every completion"
-            );
-            assert_eq!(
-                submitter.cluster_state_for_test().current_primary(),
-                Some("sec-0"),
-                "the lowest-id capable peer must be the chosen primary"
+                stranded, 0,
+                "an observer never dispatches — it can strand nothing"
             );
 
-            drop(submitter);
+            // Drop the secondary handles' join so the secondaries' own
+            // `run()` loops wind down once the run is over (the submitter's
+            // transport was already dropped inside `run_consuming` when the
+            // observer's single-teardown ran, closing its mesh senders).
+            let sec0_own = sec0_handle.await.unwrap();
+            let sec1_own = sec1_handle.await.unwrap();
 
-            let _sec0_own = sec0_handle.await.unwrap();
-            let _sec1_own = sec1_handle.await.unwrap();
-
-            // The chosen peer's on-demand primary actually ran the activated
-            // path (credited every task to its own ledger) — proving the
-            // `run_activated_pipeline` bypass was truly exercised, so the
-            // count==1 assertion below is a real negative control on it.
+            // (a) Per-host primary attribution: the CHOSEN peer (sec-0) built
+            // a co-located primary on demand and its OWN replicated ledger
+            // credited ALL tasks. sec-1 was never named primary, so its
+            // activator never fired.
             assert_eq!(
                 sec0_primary_result.get(),
                 Some(NUM_TASKS),
-                "the CHOSEN peer's on-demand primary must have run the activated path \
-                 (credited every task to its OWN ledger)"
+                "the CHOSEN peer's on-demand co-located primary must have credited \
+                 every task to its OWN ledger (per-host dispatch proof, not a totals \
+                 reconcile)"
             );
             assert_eq!(
                 sec1_primary_result.get(),
@@ -496,23 +324,158 @@ async fn initial_setup_done_emitted_once_across_relocation() {
                 "a non-chosen primary-capable secondary must never build a primary"
             );
 
-            // The invariant: across the WHOLE relocating run — two
-            // coordinators, submitter + chosen-peer's on-demand primary —
-            // "initial setup done" was emitted EXACTLY ONCE. The submitter
-            // emits it before relocating; the relocated primary
-            // (`run_activated_pipeline`) must NOT emit a second.
-            let setup_done_count = capture
+            // (d) Real dispatch to real workers over the moved-across mesh:
+            // the per-secondary own-work counts partition the full task set
+            // across the loopback (sec-0) and the wire (sec-1). A non-zero
+            // sec-1 count proves the chosen primary dispatched OVER THE MESH
+            // (the peer set the observer inherited by value, no re-dial) to a
+            // remote secondary, not only to its own loopback.
+            assert_eq!(
+                sec0_own + sec1_own,
+                NUM_TASKS,
+                "every task must run on exactly one secondary's worker; own-work \
+                 counts sec0={sec0_own}, sec1={sec1_own} must partition all tasks"
+            );
+            assert!(
+                sec1_own > 0,
+                "the chosen primary must have dispatched at least one task OVER THE \
+                 MESH to the remote secondary (sec-1), not only to its own loopback"
+            );
+        })
+        .await;
+}
+
+/// RELOCATION single-emit guard for the "initial setup done" milestone,
+/// across the by-value handoff.
+///
+/// The submitter emits "initial setup done" once in `run_pipeline`, placed
+/// BEFORE the bootstrap hand-off fork. When authority RELOCATES to a chosen
+/// peer, that peer's on-demand primary enters via `run_activated` /
+/// `run_activated_pipeline`, which bypasses `run_pipeline` (and therefore
+/// the emit) entirely. So even though TWO `PrimaryCoordinator`s run during a
+/// relocating run (the submitter's, then the chosen peer's on-demand one) —
+/// AND the submitter then becomes a standalone observer that narrates the
+/// run — "initial setup done" must be captured EXACTLY ONCE.
+///
+/// Why the assertion is REAL (not a tautology): every coordinator in this
+/// test — the submitter, both secondaries, the chosen peer's on-demand
+/// activated primary, and the submitter's relocated observer — runs on the
+/// SAME `current_thread` `LocalSet`, under a `set_default` thread-local
+/// `ImportantCapture` subscriber. So a second emit from ANY of them (e.g. if
+/// the emit were duplicated onto the activation path, or the observer
+/// re-emitted it) WOULD be recorded and `count == 1` would fail. The headline
+/// invariants (relocation happened, the chosen peer's own ledger credited
+/// every task) are re-checked so a regression that silently skips relocation
+/// can't make the count==1 pass vacuously.
+#[tokio::test(flavor = "current_thread")]
+async fn initial_setup_done_emitted_once_across_relocation() {
+    use crate::test_capture::{ImportantCapture, important_only};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let capture = ImportantCapture::default();
+            let subscriber =
+                Registry::default().with(capture.clone().with_filter(important_only()));
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            const NUM_TASKS: usize = 10;
+            let (senders, mut receivers) = mesh_channels(&["primary", "sec-0", "sec-1"]);
+
+            let keepalive = Duration::from_millis(10);
+            let slow = || vec![("bin_".to_string(), Duration::from_millis(80))];
+
+            let (sec0_handle, sec0_primary_result) = spawn_real_secondary_primary_capable(
+                "sec-0".into(),
+                2,
+                big_ram(),
+                keepalive,
+                slow(),
+                receivers.remove("sec-0").unwrap(),
+                outgoing_for("sec-0", &senders),
+            );
+            let (sec1_handle, _sec1_primary_result) = spawn_real_secondary_primary_capable(
+                "sec-1".into(),
+                2,
+                big_ram(),
+                keepalive,
+                slow(),
+                receivers.remove("sec-1").unwrap(),
+                outgoing_for("sec-1", &senders),
+            );
+
+            let submitter_inbound_rx = receivers.remove("primary").unwrap();
+            let transport = ChannelPeerTransport::from_raw_channels(
+                "primary".into(),
+                outgoing_for("primary", &senders),
+                submitter_inbound_rx,
+            );
+            drop(senders);
+
+            let submitter = PrimaryCoordinator::new(
+                submitter_config(2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..NUM_TASKS)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
+                .collect();
+
+            let (deps, ops, ope) = noop_phase_args();
+            let outcome = submitter
+                .run_consuming(binaries, deps, ops, ope)
+                .await
+                .expect("submitter run (bootstrap → relocate → observer) must return Ok");
+
+            // Re-assert that a REAL relocation happened so the single-emit
+            // count below can't pass vacuously: a regression that skipped
+            // relocation (submitter stays primary) would emit exactly once
+            // too, but would NOT exercise the activated-path bypass + the
+            // observer tail this test guards.
+            let PrimaryRunOutcome::Relocated {
+                result, completed, ..
+            } = outcome
+            else {
+                panic!("the submitter must have relocated (observer tail): {outcome:?}");
+            };
+            result.expect("the observer must exit cleanly (Done)");
+            assert_eq!(
+                completed, NUM_TASKS,
+                "the relocated observer's converged ledger must observe every completion"
+            );
+
+            let _ = sec0_handle.await;
+            let _ = sec1_handle.await;
+
+            // The chosen peer's on-demand co-located primary credited every
+            // task to its OWN ledger — the cell is set the instant
+            // `run_activated` returns, which is only reached once the handle
+            // above is joined.
+            assert_eq!(
+                sec0_primary_result.get(),
+                Some(NUM_TASKS),
+                "the chosen peer must hold authority + credit every task to its own ledger"
+            );
+
+            // The load-bearing assertion: "initial setup done" was captured
+            // EXACTLY ONCE across the entire relocating run (the submitter's
+            // single emit before the fork; never re-emitted by the activated
+            // primary's `run_activated` path nor by the observer tail).
+            let count = capture
                 .messages()
                 .iter()
                 .filter(|m| m.contains("initial setup done"))
                 .count();
             assert_eq!(
-                setup_done_count,
-                1,
-                "'initial setup done' must be emitted EXACTLY ONCE across a relocating \
-                 run — the submitter emits it before hand-off; the relocated primary's \
-                 `run_activated_pipeline` must not re-emit; got {:?}",
-                capture.messages()
+                count, 1,
+                "\"initial setup done\" must be emitted EXACTLY ONCE across a relocating \
+                 run (got {count}); the activated primary's run_activated path and the \
+                 observer tail must NOT re-emit it"
             );
         })
         .await;

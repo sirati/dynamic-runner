@@ -32,7 +32,6 @@
 use std::path::PathBuf;
 
 use dynrunner_gateway::traits::Gateway;
-use tracing;
 
 use super::types::{SlurmError, SlurmJobManager};
 
@@ -51,73 +50,38 @@ impl<G: Gateway> SlurmJobManager<G> {
     ///   [`SlurmError::WrapperBinaryNotFound`] — the caller already
     ///   decided this is the binary to deploy, so a missing source
     ///   deserves a hard failure rather than a silent skip.
-    /// * Transfers the binary to
-    ///   `<root_folder>/dynrunner-slurm-wrapper` via the gateway's
-    ///   `transfer_file` primitive (same path the per-job wrapper
-    ///   scripts land under).
-    /// * `chmod 755`s the remote file. Mirrors `submit_job`'s
-    ///   `chmod +x` step for `job_<name>.sh`; uses an explicit `755`
-    ///   so the bit pattern is operator-visible in the rendered
-    ///   command (operator-readable artifacts on a shared NFS folder
-    ///   benefit from the explicit mode).
+    /// * Stages the binary at `<root_folder>/dynrunner-slurm-wrapper`
+    ///   hash-conditionally (see
+    ///   [`SlurmJobManager::upload_binary_hash_conditional`]): the
+    ///   transfer is skipped when the gateway already holds a
+    ///   byte-identical copy, and `chmod 755`d on either branch.
     /// * Records the resolved remote path on the manager so wrapper
     ///   renders (both initial cohort and respawn) read it back via
     ///   [`SlurmJobManager::wrapper_bin_remote_path`].
     ///
     /// Returns the resolved remote path on success. There is no
-    /// "skip" branch: the SLURM dispatch path always renders the stub
-    /// against this binary, so a missing source is a hard failure, not
-    /// a silent fall-back to the legacy bash body. Source resolution
-    /// (env-var override vs wheel-bundled artifact) is the Python
-    /// bridge's concern; this primitive only uploads what it was given.
+    /// "missing source is fine" branch: the SLURM dispatch path always
+    /// renders the stub against this binary, so a missing source is a
+    /// hard failure, not a silent fall-back to the legacy bash body.
+    /// Source resolution (env-var override vs wheel-bundled artifact)
+    /// is the Python bridge's concern; this primitive only uploads what
+    /// it was given.
     ///
-    /// Idempotency: this is a write-once per `SlurmJobManager`
-    /// lifetime. Calling twice re-uploads the same artifact — same
-    /// shape as the image-transfer and source-binary upload paths
-    /// (neither has a "skip if exists" short-circuit; that's a
-    /// gateway-layer concern, not a manager-layer concern).
+    /// Idempotency: calling twice re-stages the same artifact. The
+    /// hash-conditional gate makes the second call a no-op transfer
+    /// (cache hit) rather than re-pushing the bytes — and a changed or
+    /// corrupted/partial remote forces a re-upload.
     pub async fn upload_wrapper_binary_from(
         &mut self,
         local: PathBuf,
     ) -> Result<String, SlurmError> {
-        if !local.exists() {
-            return Err(SlurmError::WrapperBinaryNotFound(local));
-        }
-
-        // Remote layout mirrors `submit_job`'s `job_<name>.sh`
-        // placement: directly under `root_folder`, no nested
-        // subfolder. Keeps the shared-NFS layout flat and predictable
-        // (one operator-visible directory holds every per-run
-        // gateway-side artifact: wrappers, image tarball, the
-        // wrapper binary).
-        let remote_path = format!(
-            "{}/{}",
-            self.config.root_folder, WRAPPER_BIN_REMOTE_BASENAME
-        );
-
-        self.gateway
-            .transfer_file(local.as_path(), &remote_path)
+        let remote_path = self
+            .upload_binary_hash_conditional(
+                local.as_path(),
+                WRAPPER_BIN_REMOTE_BASENAME,
+                SlurmError::WrapperBinaryNotFound,
+            )
             .await?;
-
-        // Explicit `chmod 755` rather than `chmod +x`: the binary
-        // lives on a shared NFS folder, and the explicit mode makes
-        // the rendered command operator-readable when audited. Mirror
-        // of `submit_job`'s chmod step, modulo the literal mode bits.
-        let chmod_cmd = format!("chmod 755 {remote_path}");
-        let result = self.gateway.execute_command(&chmod_cmd, None).await?;
-        if !result.success() {
-            return Err(SlurmError::Command(format!(
-                "chmod 755 on uploaded wrapper binary failed: {}",
-                result.stderr
-            )));
-        }
-
-        tracing::info!(
-            local = %local.display(),
-            remote = %remote_path,
-            "uploaded wrapper binary",
-        );
-
         self.wrapper_bin_remote_path = Some(remote_path.clone());
         Ok(remote_path)
     }

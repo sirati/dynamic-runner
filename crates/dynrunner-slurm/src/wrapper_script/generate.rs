@@ -954,6 +954,7 @@ fn generate_wrapper_stub(cfg: &WrapperScriptConfig<'_>, bin: &Path, rnd_suffix: 
         secondary_id: cfg.secondary_id.to_string(),
         image_path: cfg.image_path.to_string(),
         image_tar_basename: cfg.image_tar_basename.to_string(),
+        image_digest: cfg.image_digest.to_string(),
         image_name: cfg.image_name.to_string(),
         image_tag: cfg.image_tag.to_string(),
         load_command: cfg.load_command.to_string(),

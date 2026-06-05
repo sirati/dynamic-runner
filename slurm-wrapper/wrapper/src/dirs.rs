@@ -59,6 +59,16 @@ pub struct Layout {
     pub shutdown_log_path: PathBuf, // <shutdown_log_dir>/shutdown-manager.log
     pub shutdown_pid_file: PathBuf, // <rndtmp>/shutdown-manager.pid  (:250)
     pub local_image: PathBuf,       // <rndtmp>/<image_tar_basename>  (:696)
+    /// Node-local image-cache ROOT: `/tmp/<name_prefix>-imgcache`.
+    /// Deliberately OUTSIDE the per-job `rndtmp` (which is deleted on
+    /// teardown) so the content-addressed cache it holds outlives a
+    /// single job and is reused by every secondary on the node. The
+    /// digest-named cache entry lives at `<image_cache_root>/<digest>.tar`
+    /// (`image.rs` owns that policy). Prefixed by `name_prefix` so
+    /// co-located consumers never collide. Held on `Layout` so the
+    /// node-path-derivation concern owns ALL node paths in one place and
+    /// tests can redirect the root.
+    pub image_cache_root: PathBuf, // /tmp/<name_prefix>-imgcache
 }
 
 impl Layout {
@@ -89,6 +99,10 @@ impl Layout {
         // SHOULD be removed when the scratch tree is torn down.
         let shutdown_pid_file = rndtmp.join("shutdown-manager.pid");
         let local_image = rndtmp.join(&cfg.image_tar_basename);
+        // Node-local image cache root: sibling of the per-job rndtmp
+        // under /tmp, NOT under it — it must survive the per-job teardown
+        // so later secondaries reuse the cached tarball (see field doc).
+        let image_cache_root = PathBuf::from(format!("/tmp/{}-imgcache", cfg.name_prefix));
 
         Self {
             rndtmp,
@@ -105,6 +119,7 @@ impl Layout {
             shutdown_log_path,
             shutdown_pid_file,
             local_image,
+            image_cache_root,
         }
     }
 
@@ -159,6 +174,7 @@ mod tests {
             secondary_id: secondary_id.to_string(),
             image_path: "/staged/img.tar".to_string(),
             image_tar_basename: basename.to_string(),
+            image_digest: "a1b2c3d4e5f6".to_string(),
             image_name: "img".to_string(),
             image_tag: "latest".to_string(),
             load_command: "true".to_string(),
@@ -216,6 +232,14 @@ mod tests {
             PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.pid")
         );
         assert_eq!(l.local_image, PathBuf::from("/tmp/asm-2f1d4e89/img.tar"));
+        // Image cache root is a SIBLING of the per-job rndtmp under /tmp
+        // (prefix-scoped, NOT under rndtmp) so it survives per-job
+        // teardown and is shared across secondaries on the node.
+        assert_eq!(
+            l.image_cache_root,
+            PathBuf::from("/tmp/asm-imgcache"),
+            "image cache root must be /tmp/<name_prefix>-imgcache, outside rndtmp"
+        );
     }
 
     /// The reaper-panik sentinel's HOST path lives under the per-node
@@ -266,6 +290,7 @@ mod tests {
             shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("img.tar"),
+            image_cache_root: root.join("imgcache"),
         };
 
         layout.create_dirs().unwrap();
