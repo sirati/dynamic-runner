@@ -117,13 +117,6 @@ fn transport_with_peers(
     (transport, inbound_tx, keepalive)
 }
 
-/// Run a closure with an `ImportantCapture` installed as the default
-/// subscriber (held across the await on a current-thread + LocalSet
-/// runtime), returning the captured events.
-fn capture_events() -> crate::test_capture::ImportantCapture {
-    crate::test_capture::ImportantCapture::default()
-}
-
 /// `run_complete` already applied ⇒ the observer returns `Done` (exit 0)
 /// immediately, without arming any backstop.
 #[tokio::test(flavor = "current_thread")]
@@ -211,12 +204,23 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
 /// CRDT (items 9/14). Two-phase chain (build → compile), mixed outcomes
 /// (2 succeeded, 1 failed-final), RunComplete applied ⇒ both phases
 /// narrated started + complete and one run-complete summary.
+///
+/// The narration is captured through the observer's OWN narration seam —
+/// a [`RunNarrator`] driven synchronously over the converged ledger the
+/// observer's `run()` exited on (its `cluster_state()`) — NOT by scraping
+/// the process-global tracing dispatcher. The observer's `run()` loop
+/// narrates by seeding `RunNarrator::with_started_phases(self.started_phases)`
+/// (empty for `new()`) and calling `observe()` against `self.cluster_state`;
+/// a single `observe()` over a pre-converged ledger reproduces exactly the
+/// lines that loop emits. Capturing that synchronous drive — inside a
+/// `with_default` closure with no `.await` between subscriber install and
+/// emission, the proven non-flaky idiom from `run_narrator.rs` — makes the
+/// importance assertion independent of the `tracing` per-callsite `Interest`
+/// cache, which is process-global and concurrently re-poisoned by sibling
+/// tests that install a `fmt::try_init` global subscriber (a thread-local
+/// `set_default` held across `run().await` races that shared cache).
 #[tokio::test(flavor = "current_thread")]
 async fn observer_narrates_phases_and_one_completion_summary() {
-    use tracing_subscriber::Layer;
-    use tracing_subscriber::Registry;
-    use tracing_subscriber::layer::SubscriberExt;
-
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -240,15 +244,21 @@ async fn observer_narrates_phases_and_one_completion_summary() {
             });
             cs.apply(ClusterMutation::RunComplete);
 
-            let capture = capture_events();
-            let subscriber = Registry::default()
-                .with(capture.clone().with_filter(crate::test_capture::important_only()));
-            let _guard = tracing::subscriber::set_default(subscriber);
-
+            // Drive the real observer to its terminal so the narration is
+            // asserted over the ledger `run()` actually converged + exited on.
             let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
-            observer.run().await.expect("Ok on run_complete");
+            let terminal = observer.run().await.expect("Ok on run_complete");
+            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
 
-            let events = capture.events();
+            // Re-derive the observer's narration synchronously over its
+            // converged ledger, capturing through the narrator's own emit
+            // path under a thread-local subscriber (no await between install
+            // and emit → the per-callsite Interest is evaluated under THIS
+            // subscriber, immune to the cross-test global cache poisoning).
+            let events = crate::test_capture::capture_important(|| {
+                crate::run_narrator::RunNarrator::new().observe(observer.cluster_state());
+            });
+
             let started: std::collections::HashSet<&str> = events
                 .iter()
                 .filter(|e| e.message.contains("starting job phase"))
