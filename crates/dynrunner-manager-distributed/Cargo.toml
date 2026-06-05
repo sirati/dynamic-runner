@@ -31,6 +31,13 @@ dynrunner-transport-channel = { workspace = true }
 # cascade as a sentinel-file trigger. Not in the workspace base
 # feature set because this crate is currently the only consumer.
 tokio = { workspace = true, features = ["signal"] }
+# `panik_watcher::wait_for_sigterm_if_enabled` records the SIGTERM
+# sender PID via a chained `SA_SIGINFO` action. `signal-hook-registry`
+# multiplexes it alongside tokio's own SIGTERM handler (same registry),
+# and `libc` supplies the `siginfo_t::si_pid()` accessor read in the
+# action.
+libc = { workspace = true }
+signal-hook-registry = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

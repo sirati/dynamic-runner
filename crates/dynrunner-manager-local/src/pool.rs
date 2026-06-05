@@ -790,7 +790,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             }
         }
         if escalated > 0 {
-            tracing::warn!(
+            tracing::error!(
                 escalated,
                 workers = count,
                 "kill_all_workers_with_grace: SIGKILL escalation fired \

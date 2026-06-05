@@ -502,6 +502,7 @@ where
                         let (matched_path, reason) = self
                             .handle_panik_signal(
                                 signal.matched_path,
+                                signal.sender_pid,
                                 PANIK_KILL_GRACE,
                             )
                             .await;
