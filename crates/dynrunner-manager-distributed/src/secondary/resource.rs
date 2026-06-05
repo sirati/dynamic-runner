@@ -61,7 +61,60 @@ where
         })?;
         match target {
             SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
-            SendTarget::Broadcast => self.transport.broadcast(msg).await,
+            // Broadcast egress + the co-located self-loopback leg.
+            //
+            // `transport.broadcast` fans the frame to REMOTE peers only —
+            // a node has no self-connection (`PeerNetwork::broadcast`
+            // iterates `self.connections`, which never holds the host's
+            // own id). So a `Destination::All` frame this node ORIGINATES
+            // (TaskAdded from `ingest_setup_discovery`, Keepalive from
+            // `send_keepalive`, RunComplete, PeerRemoved) never reaches a
+            // co-located `PrimaryCoordinator` sharing this host, because
+            // that primary is fed ONLY by the secondary's ingress demux of
+            // frames received FROM remote peers — its own outbound
+            // broadcast is not looped back. The receive-side demux's
+            // assumption that "the co-located primary observes the CRDT via
+            // its own mesh-member broadcast receipt" holds for a peer's
+            // broadcast but NOT for a self-originated one.
+            //
+            // This is the symmetric counterpart of the primary's own
+            // broadcast-loopback leg (`PrimaryCoordinator::send_to`'s
+            // `SendTarget::Broadcast` arm, which pushes into
+            // `colocated_loopback_tx` before `transport.broadcast`): the
+            // broadcast direction from the secondary simply lacked its
+            // loopback leg. When a co-located primary is composed
+            // (`colocated_primary_inbound_tx.is_some()`) AND this node holds
+            // the primary role (`current_primary() == self` — the SAME gate
+            // the ingress demux uses), push the frame into the co-located
+            // primary's inbound (CH2) so its `recv_peer` drains it through
+            // the identical `dispatch_message` path a remote peer's
+            // broadcast would. The primary applies cluster mutations
+            // idempotently and never re-broadcasts on apply
+            // (`handle_cluster_mutation`), and credits a looped-back
+            // Keepalive via `record_keepalive` — no re-broadcast storm, no
+            // self-death.
+            //
+            // GENERAL by construction: this arm is the SINGLE home for
+            // EVERY `Destination::All` frame, so the loopback covers all of
+            // them uniformly — never per-frame special-cased. `None` (no
+            // co-located primary composed — every non-pyo3 path) leaves the
+            // leg inert, exactly as before.
+            SendTarget::Broadcast => {
+                if self.colocated_primary_inbound_tx.is_some()
+                    && self.cluster_state.current_primary()
+                        == Some(self.config.secondary_id.as_str())
+                    && let Some(tx) = self.colocated_primary_inbound_tx.as_ref()
+                {
+                    // Unbounded; a closed receiver means the co-located
+                    // primary is gone (host tearing down) — drop best-effort.
+                    let _ = tx.send(msg.clone());
+                    tracing::trace!(
+                        "self-originated Destination::All frame looped back to co-located \
+                         primary inbound (CH2)"
+                    );
+                }
+                self.transport.broadcast(msg).await
+            }
             // Loopback: the resolved primary host id == this node's id —
             // a self-promoted secondary addressing `Destination::Primary`
             // while its co-located primary holds authority. In-process

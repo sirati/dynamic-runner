@@ -49,6 +49,11 @@
 //!   yield discriminator + the fire-once latch (`ingest_setup_discovery`
 //!   broadcasts `PhaseDepsSet + TaskAdded`, seeds the local ledger, and
 //!   suppresses re-yield even on an empty discovery).
+//! - [`colocated_broadcast_loopback`] — the secondary's `Destination::All`
+//!   egress also reaches a co-located primary's inbound (CH2): the
+//!   symmetric broadcast-loopback leg. Every self-originated broadcast
+//!   (TaskAdded batch + Keepalive) is looped back when `current_primary()
+//!   == self`, gated off otherwise; fixes the pre-staged silent zero-run.
 //! - [`colocated_loopback_resumes_across_setup_pending`] — a co-located
 //!   secondary observes its own primary's `RunComplete` over the loopback
 //!   AFTER a `SetupPending` yield/re-entry; the loopback receiver is
@@ -61,6 +66,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod colocated_broadcast_loopback;
 mod colocated_loopback_resumes_across_setup_pending;
 mod honest_liveness;
 mod keepalive_emission;
