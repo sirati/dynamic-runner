@@ -14,10 +14,14 @@
 //! Relocated here from the removed `secondary/primary/*` mirror: these
 //! three functions are NOT mirror logic (they originate cluster state
 //! on the live-secondary side and serve the pyo3 + panik surfaces), so
-//! they survive the mirror demolition. The two free pool helpers
-//! `task_file_hash` and `cascade_drain_done` also relocate here (they
-//! were free functions in the removed `secondary/primary/mod.rs`); the
-//! symmetric primary-side hydration re-uses `cascade_drain_done`.
+//! they survive the mirror demolition. The free pool helper
+//! `cascade_drain_done` also relocates here (it was a free function in
+//! the removed `secondary/primary/mod.rs`); the symmetric primary-side
+//! hydration re-uses it. `ingest_setup_discovery` keys its seed
+//! `TaskAdded`s with the wire-canonical [`dynrunner_core::compute_task_hash`]
+//! — the SAME recipe the primary's assignment + completion paths use —
+//! so a setup-defer-discovered task's ledger key matches the
+//! promoted primary's later assignment/completion key.
 
 use std::collections::HashMap;
 
@@ -31,21 +35,6 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
 use crate::cluster_state::apply_locally_for_broadcast;
-
-/// Stable hash of a `TaskInfo`'s path+identifier, matching the wire
-/// `file_hash` shape used elsewhere in the secondary. Pulled out as a
-/// free function so the originating paths agree on the key space
-/// without duplicating the hashing recipe.
-///
-/// Relocated faithfully from the removed `secondary/primary/mod.rs`.
-pub(super) fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    item.path.hash(&mut h);
-    item.identifier.hash(&mut h);
-    format!("{:016x}", h.finish())
-}
 
 /// Run the phase-lifecycle drain cascade on a pool until quiescent.
 /// Each iteration:
@@ -328,7 +317,7 @@ where
         mutations.push(ClusterMutation::PhaseDepsSet { deps: phase_deps });
         for b in &binaries {
             mutations.push(ClusterMutation::TaskAdded {
-                hash: task_file_hash(b),
+                hash: dynrunner_core::compute_task_hash(b),
                 task: b.clone(),
             });
         }
