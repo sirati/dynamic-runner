@@ -201,9 +201,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // the secondary router answered this — a request addressed at
             // the primary fell through the catch-all and timed out. See
             // `handle_request_cluster_snapshot`.
-            MessageType::RequestClusterSnapshot => {
-                self.handle_request_cluster_snapshot(msg).await
-            }
+            MessageType::RequestClusterSnapshot => self.handle_request_cluster_snapshot(msg).await,
             // Anti-entropy receive arm. A peer's periodic `StateDigest`;
             // the primary compares it against its own and pulls a snapshot
             // only if it is somehow behind (almost always a NoOp on the

@@ -102,7 +102,7 @@ where
         let unfulfillable: Vec<String> = {
             let mut accepts: Vec<String> = Vec::new();
             for (hash, state) in self.cluster_state.tasks_iter() {
-                let TaskState::Unfulfillable { task, reason } = state else {
+                let TaskState::Unfulfillable { task, reason, .. } = state else {
                     continue;
                 };
                 // Per-task panic isolation: a Rust matcher that

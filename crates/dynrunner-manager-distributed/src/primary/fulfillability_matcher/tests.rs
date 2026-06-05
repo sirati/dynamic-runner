@@ -123,6 +123,7 @@ fn seed_tasks(
                             reason: format!("missing-resource-for-{name}").into(),
                         },
                         error: format!("unfulfillable {name}"),
+                        version: Default::default(),
                     });
             }
             "Failed_NonRecoverable" => {
@@ -132,6 +133,7 @@ fn seed_tasks(
                         hash: hash.clone(),
                         kind: ErrorType::NonRecoverable,
                         error: format!("nonrecoverable {name}"),
+                        version: Default::default(),
                     });
             }
             "Completed" => {

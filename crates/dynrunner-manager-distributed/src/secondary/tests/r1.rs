@@ -7,8 +7,8 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::super::test_helpers::channel_mesh_to_primary;
+use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::super::*;
 use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
@@ -137,12 +137,13 @@ async fn r1_promotion_on_no_route_count_axis() {
     // Post-uniform-announce a secondary knows the primary's identity
     // before it can suspect its death; the Suspecting `TimeoutQuery`
     // names it. Install it via the real apply path.
-    sec.cluster_state
-        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+    sec.cluster_state.apply(
+        dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
             new: "primary-orig".into(),
             epoch: 1,
             reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-        });
+        },
+    );
     sec.record_primary_message();
 
     // Drive the count-axis via the SEND-SIDE probe: each

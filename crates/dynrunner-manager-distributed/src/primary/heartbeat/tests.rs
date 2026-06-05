@@ -59,6 +59,7 @@ fn task(label: &str, depends_on: &[(&str, &str)]) -> TaskInfo<TestId> {
             })
             .collect(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -150,6 +151,7 @@ async fn dead_secondary_requeues_in_flight_task() {
         task_id: "victim".into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     };
     primary.stage_in_flight_for_test("dead-sec".into(), 0, in_flight.clone());
@@ -158,7 +160,11 @@ async fn dead_secondary_requeues_in_flight_task() {
     // staged tick declares the secondary dead, then drive one tick.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let report = primary.collect_heartbeat_report();
-    assert_eq!(report.silences.len(), 1, "one Operational secondary tracked");
+    assert_eq!(
+        report.silences.len(),
+        1,
+        "one Operational secondary tracked"
+    );
     assert_eq!(report.silences[0].secondary_id, "dead-sec");
     primary.process_heartbeat_tick().await.unwrap();
 
@@ -236,6 +242,7 @@ fn register_operational_secondary<Tr, S, E>(
             task_id: in_flight_label.into(),
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
             resolved_path: None,
         },
     );
@@ -572,6 +579,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
         task_id: "victim".into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     };
     let victim_hash = primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
@@ -587,6 +595,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
             hash: victim_hash.clone(),
             secondary: "dead-sec".into(),
             worker: 0,
+            version: Default::default(),
         });
     }
     assert!(
@@ -932,8 +941,10 @@ async fn oracle_false_corners() {
             .begin_peer_discovery()
             .peers_ready()
             .assignments_sent();
-        p.secondaries
-            .insert("dead-sec".into(), SecondaryConnectionState::Operational(conn));
+        p.secondaries.insert(
+            "dead-sec".into(),
+            SecondaryConnectionState::Operational(conn),
+        );
         p.seed_keepalive("dead-sec");
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(
@@ -997,14 +1008,18 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
-    primary
-        .secondaries
-        .insert("sec-b".into(), SecondaryConnectionState::Operational(sec_b_conn));
+    primary.secondaries.insert(
+        "sec-b".into(),
+        SecondaryConnectionState::Operational(sec_b_conn),
+    );
     primary.seed_keepalive("sec-b");
     primary.register_idle_worker_for_test(
         "sec-b".into(),
         1,
-        ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]),
+        ResourceMap::from([(
+            dynrunner_core::ResourceKind::memory(),
+            1024 * 1024 * 1024u64,
+        )]),
     );
 
     // Install the worker-management bus so the requeue path's re-emitted

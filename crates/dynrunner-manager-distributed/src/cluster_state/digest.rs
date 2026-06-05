@@ -23,7 +23,6 @@ use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::StateDigest;
 
 use super::ClusterState;
-use super::TaskState;
 
 /// Hash a single hashable value to a `u64` via the standard library's
 /// default hasher. Stable within a process build; the digest is only ever
@@ -34,24 +33,6 @@ fn hash_one<H: Hash>(value: H) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()
-}
-
-/// Per-task-state rank used in the task fold so a replica whose entry
-/// advanced to a stronger state (e.g. `Pending` → `Completed` for the
-/// same key) produces a different fold even at an unchanged count. The
-/// ranking mirrors the snapshot merge's `task_state_rank` ordering
-/// (Pending < Blocked < InFlight < terminals) — divergence detection only
-/// needs the ranks to DIFFER when the states differ, which this provides.
-fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
-    match s {
-        TaskState::Pending { .. } => 0,
-        TaskState::Blocked { .. } => 1,
-        TaskState::InFlight { .. } => 2,
-        TaskState::Completed { .. } => 3,
-        TaskState::Failed { .. } => 4,
-        TaskState::Unfulfillable { .. } => 5,
-        TaskState::InvalidTask { .. } => 6,
-    }
 }
 
 impl<I: Identifier> ClusterState<I> {
@@ -99,6 +80,9 @@ impl<I: Identifier> ClusterState<I> {
             matcher_trigger_tx: _matcher_trigger_tx,
             worker_mgmt_tx: _worker_mgmt_tx,
             task_completed_tx: _task_completed_tx,
+            // node-local: the originator's per-hash version counter carries
+            // no convergence signal (each replica mints its own).
+            task_seq: _task_seq,
         } = self;
 
         // `current_primary` is summarised via `primary_epoch` (the
@@ -137,12 +121,16 @@ impl<I: Identifier> ClusterState<I> {
         // mirror-image rationale on the detector side.)
 
         // Tasks: count + order-independent XOR-fold of a per-entry hash
-        // that combines the task's wire-hash KEY with its state-RANK, so a
-        // same-key entry that advanced to a stronger state changes the
-        // fold even at an unchanged count.
+        // that combines the task's wire-hash KEY with the SHARED
+        // `hashable_join_key` projection of its state. The fold derives
+        // from the SAME `task_join_key` the merge comparator uses, so a
+        // divergence the merge would heal is one the digest can see (and
+        // vice versa) — a same-key entry that advanced to a stronger state,
+        // OR two divergent failure records at equal rank (the version +
+        // payload content hash discriminate them, C4), changes the fold.
         let mut tasks_hash = 0u64;
         for (key, state) in tasks {
-            tasks_hash ^= hash_one((key, task_state_rank(state)));
+            tasks_hash ^= hash_one((key, super::merge::hashable_join_key(state)));
         }
 
         // Per-secondary capacity: count + XOR-fold over the KEYS. Capacity

@@ -179,6 +179,7 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
                     task_id: "task-A".to_string(),
                     task_depends_on: vec![],
                     preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+                    preferred_version: Default::default(),
                     resolved_path: None,
                 };
             secondary.notify_sampler_assigned(0, &binary);

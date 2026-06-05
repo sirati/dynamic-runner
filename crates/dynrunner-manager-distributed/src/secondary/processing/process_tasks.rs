@@ -243,9 +243,8 @@ where
         // instead of bursting together. `Skip` collapses a post-suspend
         // backlog to one catch-up tick; `reset()` drops the immediate first
         // tick so the first broadcast lands one full period in.
-        let mut anti_entropy_interval = tokio::time::interval(
-            crate::anti_entropy::tick_period(&self.config.secondary_id),
-        );
+        let mut anti_entropy_interval =
+            tokio::time::interval(crate::anti_entropy::tick_period(&self.config.secondary_id));
         anti_entropy_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         anti_entropy_interval.reset();
 
@@ -716,7 +715,10 @@ where
             // `run_complete()` first — it borrows `cluster_state`, a
             // disjoint field from the operational state.)
             let run_complete = self.cluster_state.run_complete();
-            let no_active_tasks = self.op_ref().map(|op| op.active_tasks.is_empty()).unwrap_or(true);
+            let no_active_tasks = self
+                .op_ref()
+                .map(|op| op.active_tasks.is_empty())
+                .unwrap_or(true);
             if run_complete && no_active_tasks {
                 tracing::info!("RunComplete signal received from primary; exiting");
                 break;
@@ -761,7 +763,12 @@ where
                 // replaced, so the worker doesn't get a chance
                 // to react.
                 self.op_mut().pool.workers[wid as usize].kill_subprocess();
-                if let Err(e) = self.op_mut().pool.restart_worker_async(wid, factory, false).await {
+                if let Err(e) = self
+                    .op_mut()
+                    .pool
+                    .restart_worker_async(wid, factory, false)
+                    .await
+                {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }

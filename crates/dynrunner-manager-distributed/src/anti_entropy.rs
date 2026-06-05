@@ -64,7 +64,11 @@ pub fn tick_period(node_id: &str) -> Duration {
 /// Build this node's anti-entropy broadcast frame from its current
 /// `digest`. Sent to [`Destination::All`] on each cadence tick so every
 /// peer can compare and pull if behind.
-pub fn digest_broadcast<I>(node_id: &str, timestamp: f64, digest: StateDigest) -> DistributedMessage<I> {
+pub fn digest_broadcast<I>(
+    node_id: &str,
+    timestamp: f64,
+    digest: StateDigest,
+) -> DistributedMessage<I> {
     DistributedMessage::StateDigest {
         sender_id: node_id.to_string(),
         timestamp,

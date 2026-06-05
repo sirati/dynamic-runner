@@ -21,5 +21,5 @@ pub use traits::{MessageReceiver, MessageSender};
 pub use types::{
     AffinityId, DonePayload, ErrorType, FailedTask, Identifier, PhaseId, ResourceAmount,
     ResourceKind, ResourceMap, ResultValue, RunnerIdentifier, SoftPreferredSecondaries, TaskDep,
-    TaskInfo, TaskInput, TaskOutputs, TaskResult, TypeId, WorkerId, check_soft_caps,
+    TaskInfo, TaskInput, TaskOutputs, TaskResult, TaskVersion, TypeId, WorkerId, check_soft_caps,
 };

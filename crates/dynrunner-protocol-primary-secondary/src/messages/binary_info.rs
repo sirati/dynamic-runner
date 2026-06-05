@@ -116,6 +116,14 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             task_id,
             task_depends_on,
             preferred_secondaries,
+            // ── not transferred on the dispatch descriptor ──
+            // The preferred-metadata convergence version is a CRDT-ledger
+            // concern that rides the `ClusterMutation`/snapshot path, not
+            // the primary↔secondary dispatch descriptor. `to_task_info`
+            // resets it to the `(0, 0)` default on the dispatch round-trip
+            // (the worker never reads it), so it is intentionally dropped
+            // here.
+            preferred_version: _preferred_version,
             // ── node-local: not transferred ──
             // `#[serde(skip)]` on the struct — the local on-disk resolved
             // location is host-specific and the receiving secondary
@@ -164,6 +172,9 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             task_id: self.task_id.clone(),
             task_depends_on: self.task_depends_on.clone(),
             preferred_secondaries: self.preferred_secondaries.clone(),
+            // Reset on the dispatch round-trip — see the destructure note
+            // above; the preferred-metadata version rides the CRDT path.
+            preferred_version: Default::default(),
             resolved_path: None,
         }
     }

@@ -361,10 +361,7 @@ where
                     // bounds arithmetic or index. Report backpressure to
                     // the primary keyed by the ORIGINAL wire `worker_id`
                     // (there is no chosen slot).
-                    tracing::warn!(
-                        worker_id,
-                        "no idle worker available for task assignment"
-                    );
+                    tracing::warn!(worker_id, "no idle worker available for task assignment");
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -542,7 +539,9 @@ where
                 }
                 Ok(())
             }
-            DistributedMessage::StateDigest { digest, sender_id, .. } => {
+            DistributedMessage::StateDigest {
+                digest, sender_id, ..
+            } => {
                 // Anti-entropy receive: compare the peer's digest against
                 // ours and pull a snapshot iff we are behind. The decision
                 // (compare + target selection + request construction) lives

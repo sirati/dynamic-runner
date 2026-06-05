@@ -250,11 +250,8 @@ async fn demoted_primary_relays_unassignable_request_to_remote_primary() {
             outgoing.insert("remote-primary".to_string(), to_remote_tx);
             // Keep the inbound alive for the lifetime of the test.
             let _incoming_tx = incoming_tx;
-            let transport = ChannelPeerTransport::from_raw_channels(
-                "primary".into(),
-                outgoing,
-                incoming_rx,
-            );
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let mut primary: TestPrimary = PrimaryCoordinator::new(
                 PrimaryConfig::default(),
                 transport,
@@ -280,11 +277,14 @@ async fn demoted_primary_relays_unassignable_request_to_remote_primary() {
 
             // The relay fired: the remote primary's inbox holds the
             // forwarded TaskRequest.
-            let relayed = to_remote_rx
-                .try_recv()
-                .expect("demoted primary must relay the unassignable TaskRequest to the remote primary");
+            let relayed = to_remote_rx.try_recv().expect(
+                "demoted primary must relay the unassignable TaskRequest to the remote primary",
+            );
             assert!(
-                matches!(relayed, DistributedMessage::TaskRequest { worker_id: 0, .. }),
+                matches!(
+                    relayed,
+                    DistributedMessage::TaskRequest { worker_id: 0, .. }
+                ),
                 "the relayed frame must be the own-worker TaskRequest; got {relayed:?}"
             );
             assert!(

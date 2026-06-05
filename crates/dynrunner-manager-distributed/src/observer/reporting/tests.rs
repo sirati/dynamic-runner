@@ -42,6 +42,7 @@ fn task(task_id: &str, phase: &str, deps: &[&str]) -> TaskInfo<()> {
             })
             .collect(),
         preferred_secondaries: Default::default(),
+        preferred_version: Default::default(),
         resolved_path: None,
     }
 }
@@ -80,6 +81,7 @@ fn seed_state(
                     hash: hash.clone(),
                     secondary: secondary.to_string(),
                     worker: *worker,
+                    version: Default::default(),
                 });
             }
             Seed::Completed => {
@@ -93,6 +95,7 @@ fn seed_state(
                     hash: hash.clone(),
                     kind: kind.clone(),
                     error: "x".to_string(),
+                    version: Default::default(),
                 });
             }
             Seed::Blocked { on } => {

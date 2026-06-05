@@ -162,7 +162,7 @@ impl StatsSnapshot {
                         .or_insert(0) += 1;
                     busy_worker_slots.insert((secondary.as_str(), *worker));
                 }
-                TaskState::Pending { task } => {
+                TaskState::Pending { task, .. } => {
                     let deps_satisfied = task
                         .task_depends_on
                         .iter()
@@ -234,7 +234,7 @@ fn task_id_of<I>(state: &TaskState<I>) -> &str {
 
 fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
     match state {
-        TaskState::Pending { task }
+        TaskState::Pending { task, .. }
         | TaskState::InFlight { task, .. }
         | TaskState::Completed { task }
         | TaskState::Failed { task, .. }

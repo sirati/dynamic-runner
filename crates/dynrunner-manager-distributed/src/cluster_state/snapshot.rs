@@ -9,13 +9,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
+use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs};
 use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
 use serde::{Deserialize, Serialize};
 
-use super::types::{PeerEntry, PeerState};
 use super::ClusterState;
 use super::TaskState;
+use super::types::{PeerEntry, PeerState};
 
 /// Serializable snapshot of an entire `ClusterState`. Used by the
 /// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
@@ -24,10 +24,16 @@ use super::TaskState;
 ///
 /// Merge semantics on the receiver side (see `ClusterState::restore`):
 ///
-/// - Per task: terminal states (`Completed` / `Failed`) win over
-///   non-terminal; among non-terminals, `InFlight` wins over `Pending`.
-///   When local and incoming are both terminal, local wins (first-seen
-///   terminal is canonical, mirroring the live `apply` rules).
+/// - Per task: routed through the SHARED `merge_task_state` join (the
+///   SAME canonical `task_join_key` order `apply` and the digest use, so
+///   apply == restore == digest by construction). Band-first
+///   (any terminal beats any non-terminal regardless of version), then
+///   within the terminal band `{Failed, Unfulfillable} < Completed <
+///   InvalidTask` (D-T) with the per-task version + payload content hash
+///   settling same-rank divergence, and within the non-terminal band the
+///   version arbitrates before rank (C3). A winning terminal emits its
+///   `TaskCompletedEvent` and folds co-present outputs, exactly-once
+///   (re-restore yields a NoOp).
 /// - `(current_primary, primary_epoch)`: higher epoch wins.
 /// - `phase_deps`: replaced if local is empty, otherwise kept (the
 ///   graph is static for the run's lifetime).
@@ -224,29 +230,6 @@ fn migrate_unphased_deps<I>(snap: &mut ClusterStateSnapshot<I>) {
     }
 }
 
-fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
-    match s {
-        // Pending and Blocked are both non-dispatching states; Blocked
-        // ranks above Pending because it carries the cascade prereq
-        // identity (`on`) — a snapshot's Blocked should not be silently
-        // overwritten by a stale peer's Pending observation.
-        TaskState::Pending { .. } => 0,
-        TaskState::Blocked { .. } => 1,
-        // An active dispatch (InFlight) supersedes cascade-paused
-        // observers — if any peer saw the worker pick the task up, that
-        // happens-after the cascade decision.
-        TaskState::InFlight { .. } => 2,
-        // All terminals share the strongest rank. Convergence among
-        // terminals follows the per-arm rules in `apply` (Completed
-        // never regresses; Failed/Unfulfillable/InvalidTask lock out
-        // incoming TaskFailed for their own hash).
-        TaskState::Completed { .. }
-        | TaskState::Failed { .. }
-        | TaskState::Unfulfillable { .. }
-        | TaskState::InvalidTask { .. } => 3,
-    }
-}
-
 impl<I: Identifier> ClusterState<I> {
     /// Take a snapshot of the whole state. The snapshot is a deep
     /// clone — applying further mutations to `self` after this call
@@ -285,6 +268,10 @@ impl<I: Identifier> ClusterState<I> {
             matcher_trigger_tx: _matcher_trigger_tx,
             worker_mgmt_tx: _worker_mgmt_tx,
             task_completed_tx: _task_completed_tx,
+            // node-local: the originator's per-hash version counter is not
+            // part of the converged ledger (each replica mints its own on
+            // origination; a restoring replica cold-starts it).
+            task_seq: _task_seq,
         } = self;
         ClusterStateSnapshot {
             tasks: tasks.clone(),
@@ -344,7 +331,36 @@ impl<I: Identifier> ClusterState<I> {
     /// mutation; merging keeps the strictly stronger of (local,
     /// snapshot) per the lattice and stays correct under arbitrary
     /// interleaving of live broadcasts and snapshot delivery.
-    pub fn restore(&mut self, mut snap: ClusterStateSnapshot<I>) {
+    /// Convenience wrapper around [`Self::restore_collecting_resumed`]
+    /// for callers that do NOT own a dispatch pool — every non-pool
+    /// caller (secondary, observer, late-joiner) keeps calling this
+    /// unchanged. It allocates a throwaway `resumed` buffer and discards
+    /// it. Mirrors the existing `apply` / `apply_with_resumed_blocked`
+    /// split exactly (one canonical opt-in pattern, no new shape for the
+    /// callers that don't consume the resumed surface).
+    pub fn restore(&mut self, snap: ClusterStateSnapshot<I>) {
+        let mut _resumed_scratch: Vec<TaskInfo<I>> = Vec::new();
+        self.restore_collecting_resumed(snap, &mut _resumed_scratch);
+    }
+
+    /// Merge a snapshot AND surface the cross-task `Blocked → Pending`
+    /// auto-resumes (TS-2 on the restore path) into `resumed` for the
+    /// caller to re-inject into its live `PendingPool`. Only the
+    /// pool-owning primary path reads `resumed`; the convenience
+    /// [`Self::restore`] discards it.
+    ///
+    /// Each per-task `(hash, incoming)` routes through the SHARED
+    /// [`Self::merge_task_state`] join (the SAME order apply uses), so the
+    /// restore lattice is no longer a second hand-rolled rank: a terminal
+    /// that wins the join emits its `TaskCompletedEvent` via the same
+    /// sink as apply (TS-5, exactly-once — a re-restore yields `NoOp`
+    /// because the key no longer dominates), records co-present outputs
+    /// (TS-3), and resumes blocked dependents (TS-2).
+    pub fn restore_collecting_resumed(
+        &mut self,
+        mut snap: ClusterStateSnapshot<I>,
+        resumed: &mut Vec<TaskInfo<I>>,
+    ) {
         // Migration shim (snapshot-ONLY): a legacy snapshot predates the
         // `(phase_id, task_id)` dep identity, so its deps decode with the
         // migration sentinel (empty `PhaseId`). Inject the enclosing
@@ -390,16 +406,25 @@ impl<I: Identifier> ClusterState<I> {
         // local observer set was already populated (in which case the
         // branch keeps local and does NOT consume `observers`).
         let restored_observers = observers.clone();
+        // Per-task restore now routes through the SHARED `merge_task_state`
+        // join — the SAME order apply uses, so apply == restore by
+        // construction (no second hand-rolled rank). The co-present output
+        // is read from the snapshot's content-hash-keyed `task_outputs`
+        // cache (F16/C7 — keyed by content hash, NOT task_id) so a
+        // newly-completed restore folds its outputs into the same merge.
+        // `merge_task_state`'s first-write-wins `record_task_outputs_value`
+        // means a winning terminal does not clobber a local output entry a
+        // live broadcast already populated. The `Applied { event }` emit
+        // rides the SAME `emit_task_completed_event` sink as apply (TS-5),
+        // and a re-restore yields `NoOp` (the key no longer dominates) so
+        // the event fires exactly once.
         for (hash, incoming) in tasks {
-            match self.tasks.get(&hash) {
-                None => {
-                    self.tasks.insert(hash, incoming);
-                }
-                Some(local) => {
-                    if task_state_rank(&incoming) > task_state_rank(local) {
-                        self.tasks.insert(hash, incoming);
-                    }
-                }
+            let co_present_outputs = task_outputs.get(&hash).cloned();
+            if let super::merge::MergeOutcome::Applied {
+                event: Some(ev), ..
+            } = self.merge_task_state(&hash, incoming, co_present_outputs, resumed)
+            {
+                self.emit_task_completed_event(ev);
             }
         }
         if primary_epoch > self.primary_epoch {
@@ -501,7 +526,8 @@ impl<I: Identifier> ClusterState<I> {
         // observer-set branch above may have moved it into the role
         // table) so alive-state and observer-flag transfer cohesively.
         for id in alive_members {
-            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id.clone()) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.peer_state.entry(id.clone())
+            {
                 e.insert(PeerEntry {
                     state: PeerState::Alive,
                     pubkey: None,

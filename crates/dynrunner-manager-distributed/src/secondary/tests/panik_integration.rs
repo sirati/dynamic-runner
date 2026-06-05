@@ -82,11 +82,12 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
             // (`apply_and_broadcast_mutations`), which the mesh fans out to
             // the observed peer (the primary is excluded), so drain
             // `mesh_observer_rx` to assert it.
-            let (unified, mut mesh_observer_rx) = super::super::test_helpers::channel_mesh_with_observed_peer(
-                "sec-panik",
-                sec_to_pri_tx,
-                pri_to_sec_rx,
-            );
+            let (unified, mut mesh_observer_rx) =
+                super::super::test_helpers::channel_mesh_with_observed_peer(
+                    "sec-panik",
+                    sec_to_pri_tx,
+                    pri_to_sec_rx,
+                );
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik".into(),
@@ -341,11 +342,12 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
             // Channel-backed mesh with the primary folded in + one observed
             // peer, so the test can assert the SIGTERM branch broadcasts
             // NOTHING onto the mesh (nothing lands in `mesh_observer_rx`).
-            let (unified, mut mesh_observer_rx) = super::super::test_helpers::channel_mesh_with_observed_peer(
-                "sec-panik-sigterm",
-                sec_to_pri_tx,
-                pri_to_sec_rx,
-            );
+            let (unified, mut mesh_observer_rx) =
+                super::super::test_helpers::channel_mesh_with_observed_peer(
+                    "sec-panik-sigterm",
+                    sec_to_pri_tx,
+                    pri_to_sec_rx,
+                );
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik-sigterm".into(),

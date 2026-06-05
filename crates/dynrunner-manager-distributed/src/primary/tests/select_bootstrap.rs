@@ -22,8 +22,12 @@ use dynrunner_protocol_primary_secondary::PeerId;
 /// range is an unconfirmed peer (`has_peer == false`).
 fn coordinator_with_confirmed_peers(
     confirmed_peers: u32,
-) -> PrimaryCoordinator<ChannelPeerTransport<TestId>, ResourceStealingScheduler, FixedEstimator, TestId>
-{
+) -> PrimaryCoordinator<
+    ChannelPeerTransport<TestId>,
+    ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+> {
     let (transport, _ends) = setup_test(confirmed_peers);
     PrimaryCoordinator::new(
         PrimaryConfig {

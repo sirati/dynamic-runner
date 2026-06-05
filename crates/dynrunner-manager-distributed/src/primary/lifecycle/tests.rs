@@ -260,7 +260,9 @@ async fn activate_local_primary_announces_primary_changed() {
                 .borrow()
                 .iter()
                 .filter_map(|m| match m {
-                    DistributedMessage::ClusterMutation { mutations, .. } => Some(mutations.clone()),
+                    DistributedMessage::ClusterMutation { mutations, .. } => {
+                        Some(mutations.clone())
+                    }
                     _ => None,
                 })
                 .flatten()
@@ -628,6 +630,7 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
+                    version: Default::default(),
                 },
             );
             coordinator.failed_tasks.insert(
@@ -704,6 +707,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
+                    version: Default::default(),
                 },
             );
             coordinator.failed_tasks.insert(
@@ -737,6 +741,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                     hash: hash.clone(),
                     kind: ErrorType::Recoverable,
                     error: "transient".into(),
+                    version: Default::default(),
                 },
             );
             coordinator
@@ -864,8 +869,8 @@ fn prime_pool_with_queued(
     count: usize,
 ) {
     let phase = dynrunner_core::PhaseId::from("default");
-    let mut pool = PendingPool::<TestId>::new([phase.clone()], HashMap::new())
-        .expect("default-phase pool");
+    let mut pool =
+        PendingPool::<TestId>::new([phase.clone()], HashMap::new()).expect("default-phase pool");
     let binaries: Vec<dynrunner_core::TaskInfo<TestId>> = (0..count)
         .map(|i| make_binary(&format!("bin_{i}"), 50 + i as u64 * 10))
         .collect();
@@ -1009,7 +1014,9 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
             seed_cluster_secondary(&mut primary, "sec-0", 4);
             seed_cluster_secondary(&mut primary, "sec-1", 4);
             assert_eq!(
-                primary.cluster_state_for_test().alive_remote_secondary_count(),
+                primary
+                    .cluster_state_for_test()
+                    .alive_remote_secondary_count(),
                 2,
                 "two alive remote worker-secondaries must be counted"
             );

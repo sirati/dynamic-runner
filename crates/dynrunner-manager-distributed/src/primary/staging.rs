@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 
 use dynrunner_core::{Identifier, TaskInfo, TypeId};
-use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    Destination, DistributedMessage, PeerId, PeerTransport,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::PrimaryCoordinator;
