@@ -9,6 +9,21 @@ use dynrunner_core::IMPORTANT_TARGET;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 
+use super::image_build::ImageBuild;
+
+/// Whether the run is building the image (backgrounded) or skipping the
+/// build (`--skip-image-build`). Lets `run_preparation` defer the
+/// metadata resolution to a single match arm at the submit-loop's edge
+/// without re-checking `skip_image_build` there.
+enum ImageBuildPhase {
+    /// Real-build path: the build is in flight on a background thread;
+    /// `join` yields the metadata or propagates the build error.
+    Building(ImageBuild),
+    /// `--skip-image-build`: metadata is synthesised inline from local
+    /// paths at the resolution site (no background work).
+    Skipped,
+}
+
 /// Mirrors the shape of the legacy Python
 /// ``packaging.preparation.PreparationResult`` so downstream consumers
 /// of the SLURM-pipeline (today: ``drive_rust_primary``) keep reading
@@ -115,111 +130,130 @@ pub(super) fn run_preparation<'py>(
     let base_log_dir: String = slurm_config.call_method0("get_log_dir")?.str()?.extract()?;
     let run_log_dir = format!("{base_log_dir}/{run_id}");
 
-    // Directory prep (gateway-side mkdir for image / srcbins / output
-    // / log roots) — delegated to the Rust job_manager.
-    job_manager.call_method0("prepare_directories")?;
-    gateway.call_method1("create_directory", (&run_log_dir,))?;
+    // Gateway run-log path milestone (LLM-wake): emit as soon as the
+    // run-log dir is decided — the earliest point it is known — so an
+    // operator watching `--important-stdio-only` learns where the run's
+    // gateway-side logs land before any of the longer setup steps run.
+    // Dual-sink: the importance target also reaches the normal log.
+    tracing::info!(
+        target: IMPORTANT_TARGET,
+        "run logs: {run_log_dir}",
+    );
 
-    // Stage the `dynrunner-slurm-shutdown` musl-static binary on the
-    // gateway so per-job wrapper scripts can spawn it via
-    // `systemd-run --user --unit` (service mode) and have it survive
-    // cgroup teardown. The Python bridge resolves the local source path
-    // (`DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` override > wheel-bundled
-    // artifact under `dynamic_runner/_shutdown_manager/`) and raises
-    // a `RuntimeError` when neither is available — orphan-container
-    // cleanup is no longer opt-in.
-    //
-    // The resolved gateway-side path is stored on the Rust manager
-    // and surfaced via the `shutdown_manager_remote_path` getter so
-    // every wrapper render in this run (initial cohort + respawn)
-    // sees the same path without re-uploading the binary.
-    let shutdown_manager_remote_path: Option<String> = job_manager
-        .call_method0("upload_shutdown_manager_binary")?
-        .extract()?;
-
-    // Stage the `dynrunner-slurm-wrapper` musl-static binary on the
-    // gateway so each per-job wrapper-script stub can `exec` it to run
-    // the full secondary lifecycle (replacing the legacy inline bash).
-    // Same bridge contract as the shutdown-manager upload: the Python
-    // side resolves the local source path
-    // (`DYNRUNNER_SLURM_WRAPPER_BIN_SOURCE` override > wheel-bundled
-    // artifact under `dynamic_runner/_wrapper_manager/`) and raises on
-    // missing source. The resolved gateway-side path is stored on the
-    // Rust manager and surfaced via `wrapper_bin_remote_path` so every
-    // wrapper render in this run (initial cohort + respawn) emits the
-    // stub against the same binary path.
-    let wrapper_bin_remote_path: Option<String> = job_manager
-        .call_method0("upload_wrapper_binary")?
-        .extract()?;
-
-    // Image build + transfer, or skip-build path. Mirrors the legacy
-    // `_prepare_docker_images` helper: both paths produce a
-    // `PodmanImageMetadata` instance with `remote_path`, `image_hash`,
-    // `uploaded` fields that the wrapper-script generator reads.
-    let image_metadata = if skip_image_build {
-        log.call_method1(
-            "info",
-            ("Skipping image build and transfer (--skip-image-build)",),
-        )?;
-        let image_dir = job_manager.call_method1(
-            "_expand_path",
-            (slurm_config.call_method0("get_image_dir")?,),
-        )?;
-        let pathlib = py.import("pathlib")?;
-        let image_dir_path = pathlib.getattr("Path")?.call1((image_dir,))?;
-        let image_tar_basename = deployment.getattr("image_tar_basename")?;
-        let image_path = image_dir_path.call_method1("__truediv__", (image_tar_basename,))?;
-        log.call_method1("info", (format!("Assuming image exists at: {image_path}"),))?;
-        let podman_module = py.import("dynamic_runner.packaging.podman")?;
-        let metadata_cls = podman_module.getattr("PodmanImageMetadata")?;
-        let metadata_kwargs = PyDict::new(py);
-        metadata_kwargs.set_item("remote_path", image_path)?;
-        metadata_kwargs.set_item("image_hash", "")?;
-        metadata_kwargs.set_item("uploaded", false)?;
-        metadata_cls.call((), Some(&metadata_kwargs))?
+    // Kick off the container image build/transfer on a background
+    // thread BEFORE the gateway-independent setup work below, so the
+    // long-pole local nix build overlaps the binary uploads + dir prep.
+    // The real-build branch is the only one worth backgrounding; the
+    // `--skip-image-build` branch just synthesises metadata from local
+    // paths (cheap, GIL-bound, no importance emit) so it stays inline
+    // and is joined immediately. See `image_build::ImageBuild`.
+    let image_build = if skip_image_build {
+        ImageBuildPhase::Skipped
     } else {
         let project_root = py
             .import("pathlib")?
             .getattr("Path")?
             .call0()?
             .call_method0("cwd")?;
-        // A2 build-start milestone (LLM-wake): occurrence point is the start
-        // of the container image build+transfer. Direct importance emit so
-        // the dual-sink surfaces it on stdio under `--important-stdio-only`.
-        // Only on the real-build branch — the `--skip-image-build` arm above
-        // never builds. Additive to the `log.info` lines.
-        tracing::info!(
-            target: IMPORTANT_TARGET,
-            "Building and transferring container image...",
-        );
-        let metadata = job_manager.call_method1("build_and_transfer_images", (project_root,))?;
-        let uploaded: bool = metadata.getattr("uploaded")?.extract().unwrap_or(false);
-        let remote_path = metadata.getattr("remote_path")?;
-        // A3 image-ready milestone (LLM-wake): occurrence point is the
-        // image-transfer result. `uploaded` discriminates an actual upload
-        // (cache miss) from a reused remote artifact (cache hit); both are
-        // the "image is now on the gateway" milestone. Same importance target.
-        tracing::info!(
-            target: IMPORTANT_TARGET,
-            remote_path = %remote_path,
-            uploaded,
-            "container image ready on gateway",
-        );
-        let image_hash: String = metadata
-            .getattr("image_hash")
-            .and_then(|v| v.extract())
-            .unwrap_or_default();
-        log.call_method1(
-            "info",
-            (format!(
-                "Image {} at: {}",
-                if uploaded { "uploaded" } else { "reused" },
-                remote_path
-            ),),
-        )?;
-        log.call_method1("info", (format!("Image hash: {image_hash}"),))?;
-        metadata
+        ImageBuildPhase::Building(ImageBuild::spawn(
+            job_manager.clone().unbind(),
+            project_root.unbind(),
+            log.clone().unbind(),
+        ))
     };
+
+    // ---- Gateway-independent setup work, overlapping the build. ----
+    //
+    // Run as a fallible inner block so that — whatever its outcome —
+    // the background build is joined BEFORE we leave the function. A
+    // bare `?` here would short-circuit out while the build thread is
+    // still in flight, detaching it onto a gateway that teardown is
+    // about to disconnect. Joining first reaps the thread cleanly. The
+    // independent-work error takes precedence over the build's result
+    // (the build outcome is irrelevant once setup has already failed).
+    let independent: PyResult<(Option<String>, Option<String>)> = (|| {
+        // Directory prep (gateway-side mkdir for image / srcbins /
+        // output / log roots) — delegated to the Rust job_manager.
+        job_manager.call_method0("prepare_directories")?;
+        gateway.call_method1("create_directory", (&run_log_dir,))?;
+
+        // Stage the `dynrunner-slurm-shutdown` musl-static binary on the
+        // gateway so per-job wrapper scripts can spawn it via
+        // `systemd-run --user --unit` (service mode) and have it survive
+        // cgroup teardown. The Python bridge resolves the local source
+        // path (`DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` override >
+        // wheel-bundled artifact under `dynamic_runner/_shutdown_manager/`)
+        // and raises a `RuntimeError` when neither is available —
+        // orphan-container cleanup is no longer opt-in.
+        //
+        // The resolved gateway-side path is stored on the Rust manager
+        // and surfaced via the `shutdown_manager_remote_path` getter so
+        // every wrapper render in this run (initial cohort + respawn)
+        // sees the same path without re-uploading the binary.
+        let shutdown_manager_remote_path: Option<String> = job_manager
+            .call_method0("upload_shutdown_manager_binary")?
+            .extract()?;
+
+        // Stage the `dynrunner-slurm-wrapper` musl-static binary on the
+        // gateway so each per-job wrapper-script stub can `exec` it to
+        // run the full secondary lifecycle (replacing the legacy inline
+        // bash). Same bridge contract as the shutdown-manager upload:
+        // the Python side resolves the local source path
+        // (`DYNRUNNER_SLURM_WRAPPER_BIN_SOURCE` override > wheel-bundled
+        // artifact under `dynamic_runner/_wrapper_manager/`) and raises
+        // on missing source. The resolved gateway-side path is stored on
+        // the Rust manager and surfaced via `wrapper_bin_remote_path` so
+        // every wrapper render in this run (initial cohort + respawn)
+        // emits the stub against the same binary path.
+        let wrapper_bin_remote_path: Option<String> = job_manager
+            .call_method0("upload_wrapper_binary")?
+            .extract()?;
+
+        Ok((shutdown_manager_remote_path, wrapper_bin_remote_path))
+    })();
+
+    // Resolve the image metadata. The background build (real-build
+    // path) is awaited HERE — right after the independent work above,
+    // before the submit-loop (its first consumer) — so the build has
+    // overlapped the dir prep + binary uploads, while a build failure
+    // still aborts preparation at the same point the synchronous
+    // version did (the join re-raises the build's `PyErr`). Joining
+    // unconditionally (even when `independent` errored) reaps the build
+    // thread before teardown. The skip-build path synthesises the
+    // metadata from local paths inline. Both produce a
+    // `PodmanImageMetadata` with `remote_path`, `image_hash`,
+    // `uploaded` fields that the wrapper-script generator reads.
+    let image_result: PyResult<Bound<'py, PyAny>> = match image_build {
+        ImageBuildPhase::Building(build) => build.join(py).map(|m| m.into_bound(py)),
+        ImageBuildPhase::Skipped => (|| {
+            log.call_method1(
+                "info",
+                ("Skipping image build and transfer (--skip-image-build)",),
+            )?;
+            let image_dir = job_manager.call_method1(
+                "_expand_path",
+                (slurm_config.call_method0("get_image_dir")?,),
+            )?;
+            let pathlib = py.import("pathlib")?;
+            let image_dir_path = pathlib.getattr("Path")?.call1((image_dir,))?;
+            let image_tar_basename = deployment.getattr("image_tar_basename")?;
+            let image_path = image_dir_path.call_method1("__truediv__", (image_tar_basename,))?;
+            log.call_method1("info", (format!("Assuming image exists at: {image_path}"),))?;
+            let podman_module = py.import("dynamic_runner.packaging.podman")?;
+            let metadata_cls = podman_module.getattr("PodmanImageMetadata")?;
+            let metadata_kwargs = PyDict::new(py);
+            metadata_kwargs.set_item("remote_path", image_path)?;
+            metadata_kwargs.set_item("image_hash", "")?;
+            metadata_kwargs.set_item("uploaded", false)?;
+            metadata_cls.call((), Some(&metadata_kwargs))
+        })(),
+    };
+
+    // Independent-work failure is primary; the build outcome (whether
+    // it succeeded or failed) is moot once setup has already failed, so
+    // its result is dropped here after the join above reaped the thread.
+    let (shutdown_manager_remote_path, wrapper_bin_remote_path) = independent?;
+    let image_metadata = image_result?;
 
     // Sbatch submit-loop. The gateway host the secondaries dial back
     // through is the user-given `gateway.host` verbatim (no
