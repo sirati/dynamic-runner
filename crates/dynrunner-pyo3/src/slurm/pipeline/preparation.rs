@@ -283,8 +283,11 @@ pub(super) fn run_preparation<'py>(
 
         let submit_kwargs = PyDict::new(py);
         submit_kwargs.set_item("run_log_dir", &run_log_dir)?;
-        let job_id =
-            job_manager.call_method("submit_job", (&wrapper, &job_name), Some(&submit_kwargs))?;
+        let job_id = job_manager.call_method(
+            "submit_job",
+            (&wrapper, &job_name, &secondary_id),
+            Some(&submit_kwargs),
+        )?;
         log.call_method1(
             "info",
             (format!("Submitted job {job_id} for {secondary_id}"),),

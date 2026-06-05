@@ -408,17 +408,19 @@ def add_framework_arguments(
         default=None,
         help=(
             "Per-run log-mount root. The framework anchors per-secondary "
-            "log directories (`{timestamp}/{secondary_id}/worker_*.log` by "
-            "default) under this path; falls back to the output dir when "
-            "unset. The SLURM wrapper passes `--log-dir=/app/log-network` "
-            "so worker logs land under the dedicated log-mount tree "
-            "instead of the output-mount tree. In SLURM deployments the "
-            "wrapper also anchors the framework's own runner log here, "
-            "split by role per node (`{secondary_id}/primary.log` and "
-            "`{secondary_id}/secondary.log`), so a relocated/co-located "
-            "primary's full log is persisted host-readably and isolated "
-            "from its host secondary's rather than living only in the "
-            "container's journald."
+            "log directories (`{secondary_id}/worker_*.log` by default) "
+            "under this path; falls back to the output dir when unset. The "
+            "SLURM wrapper passes `--log-dir=/app/log-network` so worker "
+            "logs land under the dedicated log-mount tree instead of the "
+            "output-mount tree. In SLURM deployments the wrapper also "
+            "anchors the framework's own runner log here, split by role "
+            "per node (`{secondary_id}/primary.log` and "
+            "`{secondary_id}/secondary.log`), so worker logs, role logs, "
+            "and sbatch's own `slurm_<jobid>.{out,err}` all share one "
+            "per-secondary folder and a relocated/co-located primary's "
+            "full log is persisted host-readably and isolated from its "
+            "host secondary's rather than living only in the container's "
+            "journald."
         ),
     )
     parser.add_argument(
