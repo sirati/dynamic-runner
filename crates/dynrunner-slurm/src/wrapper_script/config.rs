@@ -47,6 +47,14 @@ pub struct WrapperScriptConfig<'a> {
     /// /tmp copy. Mirrors `TaskDeploymentSpec.image_tar_basename`
     /// (typically `<image_name>.tar`).
     pub image_tar_basename: &'a str,
+    /// SHA-256 (hex) of the image tarball
+    /// (`PodmanImageMetadata.image_hash`). Threaded into the wrapper
+    /// binary's [`WrapperConfig::image_digest`] as the content key for
+    /// the node-local image cache (the binary's `image.rs` reuses a
+    /// digest-keyed node-local copy instead of re-reading the shared-FS
+    /// tarball per secondary). Empty string disables the cache. Only the
+    /// binary stub path consumes it; the legacy bash body ignores it.
+    pub image_digest: &'a str,
     /// Bash snippet that loads the image into podman storage. The
     /// caller pre-substitutes `$LOCAL_IMAGE`, `$PODMAN_STORAGE`,
     /// `$PODMAN_RUN`; the generator emits this verbatim inside the
