@@ -180,7 +180,6 @@ pub(super) fn spawn_real_secondary_with_src_network(
             primary_link_failure_window: Duration::from_secs(30),
             primary_silence_backstop: Duration::from_secs(120),
             unconfigured_deadline: Duration::from_secs(600),
-            is_observer: false,
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
@@ -242,7 +241,6 @@ pub(super) fn spawn_real_secondary_slow(
             primary_link_failure_window: Duration::from_secs(30),
             primary_silence_backstop: Duration::from_secs(120),
             unconfigured_deadline: Duration::from_secs(600),
-            is_observer: false,
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
@@ -377,7 +375,6 @@ pub(super) fn spawn_real_secondary_primary_capable(
             primary_link_failure_window: Duration::from_secs(30),
             primary_silence_backstop: Duration::from_secs(120),
             unconfigured_deadline: Duration::from_secs(600),
-            is_observer: false,
             // Opt-in primary capability: advertised in `SecondaryWelcome`,
             // recorded by the submitter as `PeerJoined { can_be_primary:
             // true }`, so `select_bootstrap_primary` may relocate to it.
@@ -506,7 +503,6 @@ pub(super) fn spawn_real_secondary_flaky(
             primary_link_failure_window: Duration::from_secs(30),
             primary_silence_backstop: Duration::from_secs(120),
             unconfigured_deadline: Duration::from_secs(600),
-            is_observer: false,
             can_be_primary: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,

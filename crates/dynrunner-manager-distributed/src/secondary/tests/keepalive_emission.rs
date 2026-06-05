@@ -64,23 +64,3 @@ async fn keepalive_still_emitted_when_mesh_degraded() {
     );
     assert!(matches!(recorded[0], DistributedMessage::Keepalive { .. }));
 }
-
-/// A pure observer emits NOTHING — keepalive included. The single
-/// role-gate lives in `send_keepalive`; this pins the emission side of it.
-#[tokio::test(flavor = "current_thread")]
-async fn observer_emits_no_keepalive() {
-    let mut config = election_config("obs-0");
-    config.is_observer = true;
-    config.num_workers = 0;
-    let (mut sec, log) = make_secondary_recording(config, 1);
-    sec.enter_operational_for_test();
-    sec.set_bootstrap_primary_id("primary".to_string());
-
-    sec.send_keepalive().await;
-
-    assert!(
-        log.borrow().is_empty(),
-        "an observer must originate NO keepalive; got {:?}",
-        log.borrow()
-    );
-}

@@ -138,7 +138,6 @@ async fn panik_signal_acted_on_after_setup_pending_reentry() {
                 primary_link_failure_window: Duration::from_secs(30),
                 primary_silence_backstop: Duration::from_secs(120),
                 unconfigured_deadline: Duration::from_secs(600),
-                is_observer: false,
                 can_be_primary: true,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,

@@ -431,54 +431,6 @@ async fn split_brain_lowest_id_wins() {
     );
 }
 
-/// Observer non-participation (pure-observer role): a secondary
-/// with `is_observer = true` is a passive bystander with ZERO
-/// authority/responsibility — it does NOT participate in failover
-/// at all. Even when its id is lex-lowest in the alive set and the
-/// primary goes silent, its election tick is a complete no-op: it
-/// never suspects, never broadcasts a TimeoutQuery / PromotionVote,
-/// never enters Candidate or Voting. The cluster's failover is
-/// driven entirely by the NON-observer peers (sec-b self-elects on
-/// its own tick); the observer just observes the resulting
-/// `PrimaryChanged`. This is the "observer originates NOTHING"
-/// invariant applied to the failover concern.
-#[tokio::test(flavor = "current_thread")]
-async fn observer_election_tick_is_a_no_op_even_when_lowest_id() {
-    use super::super::test_helpers::{election_config, make_secondary};
-
-    let mut cfg = election_config("obs-a");
-    cfg.is_observer = true;
-    let mut sec = make_secondary(cfg);
-    sec.enter_operational_for_test();
-
-    // obs-a is lex-lowest in the alive set (obs-a < sec-b). Under
-    // the OLD model this would drive an election; under the
-    // pure-observer model it originates nothing.
-    sec.op_mut()
-        .peer_keepalives
-        .insert("sec-b".into(), std::time::Instant::now());
-    sec.record_primary_message();
-
-    // Primary goes silent — a worker secondary would suspect here.
-    tokio::time::sleep(PAST_DEATH).await;
-    let actions_1 = sec.run_election_tick();
-    tokio::time::sleep(ONE_INTERVAL).await;
-    sec.record_timeout_response("sec-b".into(), None);
-    let actions_2 = sec.run_election_tick();
-
-    // The observer stayed Normal across both ticks and originated
-    // NOTHING.
-    assert!(
-        matches!(sec.op_mut().election, ElectionState::Normal),
-        "observer must stay Normal (no failover participation); got {:?}",
-        std::mem::discriminant(&sec.op_mut().election),
-    );
-    assert!(
-        actions_1.broadcast.is_empty() && actions_2.broadcast.is_empty(),
-        "observer election tick must originate no broadcast",
-    );
-}
-
 // ── Failover terminal action: record_promotion_confirm → activation ──
 
 use super::super::test_helpers::make_secondary_recording;
@@ -720,49 +672,6 @@ async fn wake_frame_double_apply_is_fire_once() {
         build_count.get(),
         1,
         "no second build; the activator was consumed on the first apply",
-    );
-}
-
-/// The observer-not-primary guard moved into the apply hook: applying
-/// `PrimaryChanged` naming an observer (here, self when `is_observer`)
-/// is REJECTED — `current_primary` is NOT installed and the on-demand
-/// build does not run. The hook returns `false` (no genuine advance).
-#[tokio::test(flavor = "current_thread")]
-async fn wake_frame_self_observer_is_rejected() {
-    use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut cfg = election_config("obs-a");
-    cfg.is_observer = true;
-    let (mut sec, _log) = make_secondary_recording(cfg, 1);
-    sec.enter_operational_for_test();
-    // Register a build-recording activator (without `arm_primary_activator`,
-    // which would mark the node non-observer/capable — contradicting this
-    // observer fixture). The observer guard must reject before any build.
-    let built = std::rc::Rc::new(std::cell::Cell::new(false));
-    {
-        let b = built.clone();
-        sec.register_primary_activator(Box::new(move |_snap| {
-            b.set(true);
-            tokio::spawn(async {})
-        }));
-    }
-
-    let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
-        new: "obs-a".into(),
-        epoch: 1,
-        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-    }]);
-
-    assert!(
-        !changed,
-        "naming an observer is rejected — no genuine advance"
-    );
-    assert!(
-        sec.cluster_state.current_primary().is_none(),
-        "an observer must NOT be installed as current primary",
-    );
-    assert!(
-        !built.get(),
-        "the on-demand build must NOT run for a rejected observer naming",
     );
 }
 

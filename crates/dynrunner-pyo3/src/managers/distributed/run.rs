@@ -372,7 +372,6 @@ impl PyDistributedManager {
                             primary_silence_backstop:
                                 dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                             unconfigured_deadline: dist_unconfigured_deadline,
-                            is_observer: false,
                             // In-process distributed manager: secondaries
                             // hold a channel mesh with ONLY the primary
                             // folded in (no peer-to-peer mesh among

@@ -314,7 +314,6 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // never sit in the unconfigured states long enough for this to
         // fire, so the 10-min default is well outside any test budget.
         unconfigured_deadline: Duration::from_secs(600),
-        is_observer: false,
         can_be_primary: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,

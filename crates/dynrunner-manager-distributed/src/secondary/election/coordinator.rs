@@ -165,18 +165,6 @@ where
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {
         let mut actions = ElectionTickActions::default();
-        // Strict-observer suppression: an observer is a passive bystander
-        // with ZERO authority/responsibility. It never participates in
-        // failover — it doesn't suspect a silent primary, doesn't
-        // broadcast TimeoutQuery / PromotionVote, and can never become a
-        // candidate. Its only cue is the replicated `run_complete()`.
-        // This is the failover concern's own role-gate (the election
-        // module OWNS failover), matching `send_keepalive`'s and
-        // `report_mesh_ready_if_needed`'s self-gates — not a scattered
-        // cross-concern branch.
-        if self.config.is_observer {
-            return actions;
-        }
         if matches!(
             self.op_ref().map(|op| &op.election),
             Some(ElectionState::Promoted)
@@ -207,7 +195,6 @@ where
             .collect();
         let mesh_degraded = self.mesh.degraded;
         let secondary_id = self.config.secondary_id.clone();
-        let is_observer = self.config.is_observer;
 
         // Honest liveness — by SOURCE, not by a bare receive-staleness
         // clock. The decision to suspect the primary and start a failover
@@ -379,35 +366,30 @@ where
                     tracing::info!(agreeing, quorum, "no quorum on primary death; waiting");
                     return actions;
                 }
-                // Task #36 / Step 7: filter observer peers from
-                // candidate selection. An observer in the alive set
-                // with a lex-low ID would otherwise be deferred-to by
-                // non-observer peers; the observer would then refuse
-                // self-promotion (#35 self-skip), stalling the
-                // cluster. Filtering at the peer-side complements
-                // the observer's self-exclusion: both sides agree
-                // observers can't be candidates. The #35 self-only
-                // guard below (`is_observer && we_lead`) becomes
-                // belt-and-suspenders once `RoleTable.observers` is
-                // populated end-to-end, but stays in place for the
-                // pre-PeerInfo window (election can run before the
-                // first PeerInfo arrives in adversarial timings).
+                // Filter observer peers from candidate selection. An
+                // observer in the alive set with a lex-low ID would
+                // otherwise be deferred-to by non-observer peers; the
+                // observer (a standalone ObserverCoordinator) is never a
+                // candidate, so deferring to it would stall the cluster.
                 //
                 // Read source: `cluster_state.role_table().observers`
-                // is the replicated single source of truth (Step 7,
-                // Decision G). Populated by the `ClusterMutation::
-                // PeerJoined { is_observer: true }` apply rule —
-                // originated by the primary in
-                // `primary/peer_setup.rs::send_peer_lists` and
-                // replicated to every node via the standard CRDT
-                // broadcast path.
+                // is the replicated single source of truth. Populated by
+                // the `ClusterMutation::PeerJoined { is_observer: true }`
+                // apply rule — originated by the primary in
+                // `primary/peer_setup.rs::send_peer_lists` and replicated
+                // to every node via the standard CRDT broadcast path. This
+                // peer-side filter is the sole observer guard: a compute
+                // SecondaryCoordinator is never itself an observer (the
+                // observer role IS the ObserverCoordinator), so `self` is
+                // always a legitimate candidate and is included
+                // unconditionally.
                 // `observers` + `live_peers` were snapshotted above (both
                 // were `&self`/`cluster_state` reads that cannot coexist
                 // with the `&mut op` borrow held by this match).
                 let lowest_alive = live_peers
                     .iter()
                     .filter(|id| !observers.contains(*id))
-                    .chain(std::iter::once(&secondary_id).filter(|_| !is_observer))
+                    .chain(std::iter::once(&secondary_id))
                     .min()
                     .cloned();
                 let we_lead = lowest_alive
@@ -415,50 +397,7 @@ where
                     .map(|id| id == &secondary_id)
                     .unwrap_or(false);
                 let round = next_round(&op.election);
-                // Observer self-exclusion (#35): even when our id is
-                // the lex-lowest in the alive set, an observer MUST
-                // NOT self-promote. Observers are non-candidates by
-                // design — they receive cluster updates but cannot
-                // host the primary role (no workers, no dispatch
-                // authority). The full fortification (peers also
-                // skipping observers when picking `lowest_alive`)
-                // needs `PeerConnectionInfo.is_observer`, tracked as
-                // a follow-up; until that lands the observer
-                // self-policing is the load-bearing guard.
-                //
-                // If we_lead but is_observer, we defer to the NEXT-
-                // lowest-id peer that ISN'T us — that peer will
-                // self-promote on its own tick. If we're the only
-                // alive secondary (peer_keepalives empty), there's
-                // no candidate at all and we stay Voting (effectively
-                // waiting for another secondary to come online); the
-                // peer_mesh_degraded guard above catches the
-                // pathological "alone and primary's dead" case.
-                if is_observer && we_lead {
-                    let next_lowest = live_peers.iter().min().cloned();
-                    tracing::info!(
-                        observer = %secondary_id,
-                        ?next_lowest,
-                        round,
-                        "observer would have self-promoted by lowest-id but \
-                         is non-candidate; deferring to next-lowest peer \
-                         (peers without observer-awareness will need to \
-                         self-promote on their own ticks)"
-                    );
-                    if let Some(candidate) = next_lowest {
-                        // No transitional routing target: `Role::Primary`
-                        // is re-pointed only by the winner's
-                        // authoritative `PrimaryChanged` (broadcast +
-                        // applied after winning), never by an in-flight
-                        // Voting transition. See the P2
-                        // drop-the-transitional-hint design.
-                        op.election = ElectionState::Voting { round, candidate };
-                    }
-                    // No next_lowest = we're the only one alive AND
-                    // we're an observer. Don't transition; let the
-                    // peer-mesh-degraded path catch this in a future
-                    // tick (or a new secondary arrival fixes it).
-                } else if we_lead {
+                if we_lead {
                     tracing::info!(round, "self-promoting");
                     op.election = ElectionState::Candidate {
                         round,

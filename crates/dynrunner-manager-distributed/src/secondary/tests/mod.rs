@@ -48,10 +48,6 @@
 //!   wiring contract (the separate resource-provider capability).
 //! - [`panik_integration`] — panik self-departure + worker teardown.
 //! - [`memprofile_hook`] — sampler lifecycle hooks.
-//! - [`pure_observer`] — the strict pure-observer role: originates
-//!   NOTHING, holds the FULL CRDT, exits ONLY on `run_complete()`;
-//!   late-joining observer AND worker each get the full snapshot with
-//!   the CORRECT role; N concurrent observers.
 //! - [`setup_discovery_yield`] — the pre-staged-mode `SetupPending`
 //!   yield discriminator + the fire-once latch (`ingest_setup_discovery`
 //!   broadcasts `PhaseDepsSet + TaskAdded`, seeds the local ledger, and
@@ -81,6 +77,5 @@ mod panik_integration;
 mod panik_resumes_across_setup_pending;
 mod peer_mesh_watchdog;
 mod processing;
-mod pure_observer;
 mod r1;
 mod setup_discovery_yield;

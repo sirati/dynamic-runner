@@ -817,15 +817,17 @@ where
     ) {
         self.cluster_state.restore(snap);
         // Land the lifecycle directly in `Operational` with an EMPTY pool
-        // (a pure observer / late-joiner runs no workers). This replaces
-        // the old `setup_phase_completed = true` bool poke: the lifecycle
-        // projection `setup_phase_completed()` is true for `Operational`,
-        // so the next `run_until_setup_or_done` skips the
-        // welcome/cert/wait-for-setup handshake and routes straight to
-        // `process_tasks`. Observer non-candidacy is a role capability
-        // gate (the election machine refuses `Candidate` when
-        // `config.is_observer`), NOT a parallel lifecycle variant — hence
-        // a direct `Operational` construction.
+        // (a re-bootstrapping late-joiner runs no workers until it pulls
+        // its own). This replaces the old `setup_phase_completed = true`
+        // bool poke: the lifecycle projection `setup_phase_completed()` is
+        // true for `Operational`, so the next `run_until_setup_or_done`
+        // skips the welcome/cert/wait-for-setup handshake and routes
+        // straight to `process_tasks`. Observer non-candidacy is enforced
+        // entirely peer-side (the election machine filters peers in the
+        // replicated `RoleTable.observers` from candidate selection); a
+        // standalone observer is the `ObserverCoordinator`, not a lifecycle
+        // variant of this coordinator — hence a direct `Operational`
+        // construction.
         //
         // The take-once runtime latches are NOT consumed here: they stay
         // on the coordinator's `Option` fields and are surrendered at the
@@ -996,9 +998,9 @@ where
     /// starts `Connecting`, where no operational state exists) and then
     /// reach the operational fields; they must call this first so
     /// [`Self::op_mut`] / [`Self::op_ref`] / [`Self::pool_mut`] resolve.
-    /// Election semantics are identical to the observer construction —
-    /// `config.is_observer` (not the state shape) is what gates candidacy
-    /// — so reusing `operational_observer` is faithful.
+    /// Election semantics depend on the peer-side `RoleTable.observers`
+    /// filter (not the state shape), so reusing the empty-pool
+    /// `operational_observer` lifecycle constructor here is faithful.
     ///
     /// `take`-s the take-once latch `Option` fields (matching the single
     /// `enter_operational` consumption boundary) and discards them; tests

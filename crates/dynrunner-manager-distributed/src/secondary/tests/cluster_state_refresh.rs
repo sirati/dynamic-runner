@@ -4,10 +4,12 @@
 //!
 //! Single concern of this file: pin the live mid-run refresh seam
 //! (`register_cluster_state_refresh` + the periodic-tick arm in
-//! `process_tasks`). The observer holds `&mut cluster_state` for the
-//! whole run, so a concurrently-running consumer (the PyO3 observer's
-//! live-snapshot feed) can only observe the freshening CRDT through this
-//! callback. The test:
+//! `process_tasks`). The coordinator holds `&mut cluster_state` for the
+//! whole run, so a concurrently-running consumer (the PyO3 live-snapshot
+//! feed) can only observe the freshening CRDT through this callback. A
+//! 0-worker secondary is the substrate here purely because its empty pool
+//! keeps the loop parked in `process_tasks` so the periodic tick fires;
+//! the refresh seam itself is role-agnostic. The test:
 //!   1. seeds the CRDT (a restored snapshot with a known terminal count),
 //!   2. registers a CAPTURING callback that records what it observed,
 //!   3. drives `process_tasks` under a PAUSED clock and advances past the
@@ -74,7 +76,7 @@ fn snapshot_with_completed(
         current_primary: Some("primary-peer".to_string()),
         primary_epoch: 3,
         phase_deps: HashMap::new(),
-        observers: std::iter::once("observer-1".to_string()).collect(),
+        observers: Default::default(),
         can_be_primary: Default::default(),
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
@@ -95,8 +97,7 @@ async fn refresh_callback_fires_on_tick_with_live_cluster_state() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut config = election_config("observer-1");
-            config.is_observer = true;
+            let mut config = election_config("zero-worker-1");
             config.num_workers = 0;
             let mut sec = make_secondary(config);
 
@@ -192,8 +193,7 @@ async fn no_callback_registered_is_inert() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut config = election_config("observer-2");
-            config.is_observer = true;
+            let mut config = election_config("zero-worker-2");
             config.num_workers = 0;
             let mut sec = make_secondary(config);
             sec.restore_from_snapshot_and_skip_setup(snapshot_with_completed(1));

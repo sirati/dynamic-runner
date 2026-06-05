@@ -553,7 +553,11 @@ where
                 let local = self.cluster_state.digest();
                 let requester = crate::anti_entropy::RequesterIdentity {
                     node_id: &self.config.secondary_id,
-                    is_observer: self.config.is_observer,
+                    // Wire role advertisement: a compute SecondaryCoordinator
+                    // is never an observer (the observer role IS the
+                    // standalone ObserverCoordinator), so the anti-entropy
+                    // requester always declares `false`.
+                    is_observer: false,
                     can_be_primary: self.config.can_be_primary,
                 };
                 if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(

@@ -9,17 +9,19 @@ use dynrunner_scheduler::ResourceStealingScheduler;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-/// Construct a 3-node-mesh-analogous joiner: a single
-/// `SecondaryCoordinator` configured as observer
-/// (`is_observer=true`, `num_workers=0`). The "rest of the cluster"
-/// shows up purely as the snapshot the test hands it. The
-/// `NoPeers` mesh stub (peer_count=0) is what `make_secondary`
-/// uses elsewhere; the late-joiner code path the test cares about
-/// (restore + skip-setup) runs to completion regardless of peer
-/// reachability — peer membership is asserted on the role-table
-/// side, not the transport side.
-fn make_observer_secondary(
-    observer_id: &str,
+/// Construct a 0-worker late-joiner: a single `SecondaryCoordinator`
+/// with `num_workers=0` (the substrate the standalone observer is built
+/// on — see `observer/lifecycle.rs`). The "rest of the cluster" shows up
+/// purely as the snapshot the test hands it. The `NoPeers` mesh stub
+/// (peer_count=0) is what `make_secondary` uses elsewhere; the
+/// late-joiner code path the test cares about (restore + skip-setup) runs
+/// to completion regardless of peer reachability — peer membership is
+/// asserted on the role-table side, not the transport side. There is no
+/// observer MODE on the coordinator: observer-ness is the standalone
+/// `ObserverCoordinator` role plus the peer-side `RoleTable.observers`
+/// filter, never a `config` flag.
+fn make_zero_worker_late_joiner(
+    node_id: &str,
 ) -> SecondaryCoordinator<
     TestTransport<NoPeers>,
     dynrunner_transport_channel::ChannelManagerEnd,
@@ -27,13 +29,12 @@ fn make_observer_secondary(
     FixedEstimator,
     TestId,
 > {
-    // The observer holds the `NoPeers` mesh stub directly; it restores
-    // from a snapshot, skips setup, and reads its terminal cue from
+    // The node holds the `NoPeers` mesh stub directly; it restores from a
+    // snapshot, skips setup, and reads its terminal cue from
     // `cluster_state` (RunComplete applied directly) — it never needs a
     // primary uplink inbound, so dropping the uplink does not change what
-    // the late-joiner-observer test exercises.
-    let mut config = election_config(observer_id);
-    config.is_observer = true;
+    // the late-joiner test exercises.
+    let mut config = election_config(node_id);
     config.num_workers = 0;
     SecondaryCoordinator::new(
         config,
@@ -95,7 +96,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
 /// welcome / cert-exchange / wait-for-setup phases.
 #[test]
 fn restore_installs_snapshot_and_latches_setup_completed() {
-    let mut sec = make_observer_secondary("observer-1");
+    let mut sec = make_zero_worker_late_joiner("late-joiner-1");
 
     // Pre-condition: every field this test asserts is at its
     // freshly-constructed default. Pinning the pre-conditions
@@ -143,7 +144,7 @@ fn restore_installs_snapshot_and_latches_setup_completed() {
 /// receives real data and not a placeholder.
 #[test]
 fn cluster_state_accessor_reflects_restored_snapshot() {
-    let mut sec = make_observer_secondary("observer-1");
+    let mut sec = make_zero_worker_late_joiner("late-joiner-1");
     // Pre-restore: a fresh coordinator's CRDT is empty, so a
     // projection here is the all-zero default (reporter stays silent).
     assert_eq!(sec.cluster_state().task_count(), 0);
@@ -175,7 +176,7 @@ fn cluster_state_accessor_reflects_restored_snapshot() {
 /// or re-broadcast).
 #[test]
 fn restore_is_idempotent_on_second_call() {
-    let mut sec = make_observer_secondary("observer-1");
+    let mut sec = make_zero_worker_late_joiner("late-joiner-1");
     sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
     let tasks_after_first = sec.cluster_state.task_count();
     let epoch_after_first = sec.cluster_state.primary_epoch();
@@ -188,26 +189,6 @@ fn restore_is_idempotent_on_second_call() {
     assert!(sec.lifecycle.setup_phase_completed(), "latch stays true");
     assert_eq!(sec.cluster_state.task_count(), tasks_after_first);
     assert_eq!(sec.cluster_state.primary_epoch(), epoch_after_first);
-}
-
-/// Observer config sanity: an observer's `is_observer=true` flag
-/// reaches the coordinator's `config` so downstream consumers
-/// (the election filter at `election.rs::run_election_tick`'s
-/// `we_lead` branch, the `PrimaryChanged` apply-hook defensive
-/// reject at `dispatch/helpers.rs::apply_primary_changed`) see the
-/// flag.
-#[test]
-fn observer_config_propagated_to_coordinator() {
-    let sec = make_observer_secondary("observer-1");
-    assert!(
-        sec.config.is_observer,
-        "observer flag must be readable on the coordinator's config — \
-             election + dispatch defensive paths both consult it"
-    );
-    assert_eq!(
-        sec.config.num_workers, 0,
-        "observer's num_workers must be 0 (no work to take on)"
-    );
 }
 
 /// After restore, `run_until_setup_or_done` skips the entire setup
@@ -229,7 +210,7 @@ async fn observer_skips_setup_and_exits_on_run_complete() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut sec = make_observer_secondary("observer-1");
+            let mut sec = make_zero_worker_late_joiner("late-joiner-1");
             sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
             // Deterministic exit cue: the cluster has declared the
             // run finished. The observer's SOLE exit cue is

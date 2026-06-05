@@ -84,6 +84,9 @@ pub fn digest_broadcast<I>(
 /// `is_observer` / `can_be_primary` its advertised role + capability.
 pub struct RequesterIdentity<'a> {
     pub node_id: &'a str,
+    /// Wire role advertisement only; there is NO observer MODE on a
+    /// coordinator — the observer role IS the standalone
+    /// `ObserverCoordinator`, which stamps `true` here on its pulls.
     pub is_observer: bool,
     pub can_be_primary: bool,
 }
