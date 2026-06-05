@@ -20,14 +20,13 @@ name = "dynrunner_slurm_shutdown"
 path = "src/lib.rs"
 
 [dependencies]
-# Single signal-safe atomic-flag dependency. Default features disabled to
-# avoid pulling in optional integrations (channel, iterator, extended-siginfo).
-# We only need low_level::register.
-signal-hook = { version = "0.3", default-features = false }
-# libc is used by `process_probe::KillProbe` for `kill(pid, 0)` and
-# `__errno_location`. Already pulled in transitively by signal-hook;
-# declared explicitly here so the dependency edge is visible at the
-# crate boundary.
+# libc is the only runtime dependency:
+#   * `signals` installs SA_SIGINFO handlers via `sigaction(2)` and reads
+#     `siginfo_t.si_pid` to report which process sent each signal;
+#   * `process_probe::KillProbe` uses `kill(pid, 0/sig)` + `__errno_location`.
+# `default-features = false` keeps the static binary minimal (no std-feature
+# pull-ins we don't use); `sigaction`/`siginfo_t`/`kill` are all available
+# without optional features.
 libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]

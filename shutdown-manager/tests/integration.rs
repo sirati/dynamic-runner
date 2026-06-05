@@ -780,3 +780,116 @@ fn orphan_survives_reap_and_panik_window_stays_orphan_exit_nonzero() {
         backend.calls()
     );
 }
+
+/// Test 14: signal-source observability, end-to-end through the binary.
+/// Deliver a real SIGTERM to the running manager (from THIS test
+/// process) and assert the persistent log records WHO sent it — the
+/// sender pid resolved to the test binary's comm + full cmdline — and
+/// WHY the teardown started.
+///
+/// Subprocess (not a unit test of the helper) because the load-bearing
+/// chain is `sigaction(SA_SIGINFO)` → handler captures `si_pid` →
+/// `describe_last_signal` resolves `/proc/<sender>` → the line reaches
+/// the operator's log. Only running the real binary exercises that the
+/// SA_SIGINFO handler is actually installed and that the kernel fills in
+/// the sender pid.
+#[test]
+fn sigterm_reports_sender_pid_and_cmdline_in_log() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let bin = env!("CARGO_BIN_EXE_dynrunner-slurm-shutdown");
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("shutdown-manager.log");
+    let pid_path = dir.path().join("shutdown.pid");
+    let tmp_prefix = dir.path().join("asm-XXX");
+    let storage_root = dir.path().join("podman-root");
+    let runroot = dir.path().join("podman-run");
+
+    // No --wrapper-pid: we want the SIGTERM (not wrapper-monitor) to be
+    // the trigger, so the source describer reports the signal sender.
+    let mut child = Command::new(bin)
+        .args([
+            "--container-name",
+            "ctr-does-not-exist",
+            "--storage-root",
+            storage_root.to_str().unwrap(),
+            "--runroot",
+            runroot.to_str().unwrap(),
+            "--tmp-prefix",
+            tmp_prefix.to_str().unwrap(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--poll-interval-secs",
+            "1",
+            "--idle-shutdown-secs",
+            "60",
+            // a real binary that is NOT podman, so backend calls fail
+            // fast (irrelevant — the source line is emitted regardless).
+            "--podman-path",
+            "/usr/bin/false",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn shutdown-manager binary");
+
+    // Wait until the manager has installed its handlers (the "starting"
+    // line is logged immediately before signal-install, so once it is
+    // present the SA_SIGINFO handler is in place by the next line).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let c = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if c.contains("starting; container=") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Small extra beat so install() has certainly returned.
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Deliver SIGTERM FROM this test process so the manager's handler
+    // captures our pid as the sender.
+    let child_pid = child.id() as i32;
+    // SAFETY: kill(2) on a child pid we just spawned; SIGTERM delivers a
+    // real signal the manager's SA_SIGINFO handler will record.
+    let rc = unsafe { libc::kill(child_pid, libc::SIGTERM) };
+    assert_eq!(rc, 0, "kill(child, SIGTERM) failed");
+
+    // Wait for the source line to appear, then reap.
+    let me = std::process::id();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains("received SIGTERM from pid=") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        contents.contains("received SIGTERM from pid="),
+        "log must record the signal name + sender pid; contents:\n{contents}",
+    );
+    assert!(
+        contents.contains(&format!("pid={}", me)),
+        "log must report THIS test process ({me}) as the SIGTERM sender; \
+         contents:\n{contents}",
+    );
+    assert!(
+        contents.contains("initiating teardown because"),
+        "log must state WHY the manager tore down; contents:\n{contents}",
+    );
+    // The sender resolution must include the (comm: "cmdline") shape —
+    // the test runner has a non-empty /proc/<pid>/comm and cmdline.
+    assert!(
+        contents.contains(": \""),
+        "log must resolve the sender to (comm: \"cmdline\"); contents:\n{contents}",
+    );
+}
