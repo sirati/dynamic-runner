@@ -204,6 +204,126 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     pub(super) task: TaskInfo<I>,
 }
 
+/// Post-bootstrap fork DECISION returned by
+/// [`PrimaryCoordinator::run_pipeline`].
+///
+/// The pipeline body runs through `&mut self`, so it can never move `self`
+/// out — it can only signal which regime the run took. The owned-`self`
+/// [`PrimaryCoordinator::run_consuming`] consumes this decision and, on
+/// [`PostBootstrap::Relocate`], destructures `self` into an
+/// [`crate::observer::ObserverHandoff`] (the relinquished submitter becomes
+/// the standalone observer). There is no payload on either arm: the
+/// stay-local arm has already run the operational loop to completion (and
+/// left the accounting on `self.cluster_state`); the relocate arm leaves
+/// `self` intact for the caller's by-value handoff. Neither arm carries the
+/// transport/identifier, so the enum is plain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostBootstrap {
+    /// The submitter stayed the local primary (single-node / no capable
+    /// peer / chosen candidate evaporated) and ran the operational loop to
+    /// completion in-place. The caller reads the accounting off
+    /// `self.cluster_state` and tears the dispatchers down in-place.
+    StayLocal,
+    /// The submitter relinquished full authority onto a chosen compute peer
+    /// and dropped its own `Role::Primary`. The caller must destructure
+    /// `self` into an [`crate::observer::ObserverHandoff`] and run the
+    /// standalone observer tail; the dispatcher handles ride across (NOT
+    /// cleaned in-place).
+    Relocate,
+}
+
+/// The post-run accounting surfaced by
+/// [`PrimaryCoordinator::run_consuming`] for BOTH the stay-local and
+/// relocated paths.
+///
+/// After the owned-`self` `run_consuming` returns, the submitter binding is
+/// gone — so the post-run counts the PyO3 boundary used to read off
+/// `primary.completed_count()` must travel back through this value. On the
+/// stay-local path they are read off this coordinator's own
+/// `cluster_state`; on the relocated path they are re-sourced from the
+/// observer's moved-in (converged) `cluster_state`. The `result` carries
+/// the structured exit contract: `Ok(())` ⇒ exit 0, an `Err` ⇒ a non-zero
+/// exit at the PyO3 boundary (the relocated arm maps the observer terminal
+/// onto the same `RunError` shape the boundary already translates).
+#[derive(Debug)]
+pub enum PrimaryRunOutcome {
+    /// The submitter stayed (or fell back to) the local primary. `result`
+    /// follows the in-place pipeline outcome; the counts come from the
+    /// primary's own replicated ledger. The PyO3 boundary applies its
+    /// legacy per-variant exit mapping (`Other`/`Ok` ⇒ swallow/exit 0).
+    Local {
+        result: Result<(), RunError>,
+        completed: usize,
+        failed: usize,
+        stranded: usize,
+    },
+    /// The submitter relocated and ran the standalone observer tail.
+    /// `result` is the observer terminal mapped onto the exit contract
+    /// (`Done` ⇒ `Ok`, `Panik` ⇒ `PanikShutdown`, `Aborted` ⇒ a
+    /// non-zero-mapping `RunError`, and any strand-backstop / fatal-exit
+    /// `Err` propagated as-is). The counts are re-sourced from the
+    /// observer's converged `cluster_state` (`stranded` is always 0 — an
+    /// observer never dispatched). The PyO3 boundary RAISES on any `Err`
+    /// here (a relocated strand must never swallow to exit 0).
+    Relocated {
+        result: Result<(), RunError>,
+        completed: usize,
+        failed: usize,
+        stranded: usize,
+    },
+}
+
+impl PrimaryRunOutcome {
+    /// Build the relocated outcome from the finished observer + its run
+    /// terminal. Re-sources the post-run counts from the observer's
+    /// moved-in (converged) `cluster_state` — the SAME CRDT reader
+    /// (`outcome_counts()`) the primary's own `completed_count`/
+    /// `failed_count` route through — and maps the observer terminal onto
+    /// the structured exit contract.
+    fn from_observer<Tr, I>(
+        observer: &crate::observer::ObserverCoordinator<Tr, I>,
+        terminal: Result<crate::observer::ObserverTerminal, RunError>,
+    ) -> Self
+    where
+        Tr: PeerTransport<I>,
+        I: Identifier,
+    {
+        let result = match terminal {
+            Ok(crate::observer::ObserverTerminal::Done) => Ok(()),
+            // Panik ⇒ the SAME `PanikShutdown` the PyO3 boundary already
+            // maps to `exit(137)`; carry the matched path so the wrapper's
+            // structured-panik arm fires.
+            Ok(crate::observer::ObserverTerminal::Panik { matched_path }) => {
+                Err(RunError::PanikShutdown {
+                    matched_path,
+                    reason: "observer panik".to_string(),
+                })
+            }
+            // Aborted ⇒ a structured non-zero terminal. `run_aborted`'s
+            // sole originator today is the pre-phase duplicate-task-id
+            // case, so reuse that structured variant (the PyO3 boundary
+            // raises a `PyRuntimeError` on it → non-zero exit), carrying
+            // the abort reason.
+            Ok(crate::observer::ObserverTerminal::Aborted { reason }) => {
+                Err(RunError::DuplicateTaskIdPrePhase { reason })
+            }
+            // Strand backstops / fatal-exit: propagate the `Err` as-is.
+            // The PyO3 boundary raises on ANY relocated `Err` so a
+            // fleet-dead / primary-silence strand surfaces non-zero (it
+            // must NOT take the legacy `Other` ⇒ swallow path).
+            Err(e) => Err(e),
+        };
+        PrimaryRunOutcome::Relocated {
+            result,
+            // Re-sourced from the observer's converged ledger through the
+            // SAME surface shape the primary exposes.
+            completed: observer.completed_count(),
+            failed: observer.failed_count(),
+            stranded: observer.stranded_count(),
+        }
+    }
+}
+
 /// The primary coordinator: orchestrates work across secondaries.
 ///
 /// Generic over ONE `Tr: PeerTransport<I>`. Every primary send goes
@@ -2253,29 +2373,215 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let result = self
                 .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
                 .await;
-            self.cleanup_lifecycle_dispatcher().await;
-            // Independent of `cleanup_lifecycle_dispatcher` — the two
-            // dispatchers own independent channels + listener vectors;
-            // both run from spawn-at-`run()`-start to abort-at-`run()`-
-            // exit and both must be joined before `run()` returns so the
-            // PyO3 wrapper / SLURM pipeline don't leak them.
-            self.cleanup_task_completed_dispatcher().await;
-            result
+            // Cleanup BOTH dispatchers on every stay-local exit (Ok or
+            // Err). The two dispatchers own independent channels + listener
+            // vectors; both run from spawn-at-`run()`-start to
+            // abort-at-`run()`-exit and both must be joined before `run()`
+            // returns so the PyO3 wrapper / SLURM pipeline don't leak them.
+            self.cleanup_run_dispatchers().await;
+            match result {
+                Ok(PostBootstrap::StayLocal) => Ok(()),
+                // The `&mut self` entry cannot surrender `self` to an
+                // observer, so a genuine relocation is unreachable through
+                // it. Relocation-capable callers (the PyO3 boundary, the
+                // relocation e2e) use [`Self::run_consuming`], which owns
+                // `self` and performs the by-value [`Self::into_observer_handoff`].
+                Ok(PostBootstrap::Relocate) => Err(RunError::Other(
+                    "primary relocated to a chosen peer but was driven through the \
+                     non-consuming run() entry; use run_consuming() for a \
+                     relocation-capable run"
+                        .to_string(),
+                )),
+                Err(e) => Err(e),
+            }
         }
         .instrument(span)
         .await
     }
 
+    /// Owned-`self` run entry for relocation-capable callers (the PyO3
+    /// boundary + the relocation e2e).
+    ///
+    /// Mirrors [`Self::run`] but OWNS `self`, so on a successful relocation
+    /// it can destructure `self` into an [`ObserverHandoff`] and drive the
+    /// standalone [`crate::observer::ObserverCoordinator`] to its terminal.
+    /// Returns a [`PrimaryRunOutcome`] that surfaces the post-run accounting
+    /// (`completed`/`failed`/`stranded`) for BOTH paths through a SINGLE
+    /// surface — sourced from this coordinator's own `cluster_state` on the
+    /// stay-local path, and from the observer's moved-in (converged)
+    /// `cluster_state` on the relocated path — plus the structured
+    /// exit-contract `result` (the observer terminal mapped onto the same
+    /// `RunError`-or-`Ok` shape the PyO3 boundary already maps to exit
+    /// codes).
+    pub async fn run_consuming(
+        mut self,
+        binaries: Vec<TaskInfo<I>>,
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) -> Result<PrimaryRunOutcome, RunError>
+    where
+        // The relocated arm spawns the standalone observer's tasks
+        // (`ObserverCoordinator::run` requires `Self: 'static`), which the
+        // moved-in transport/identifier must outlive.
+        Tr: 'static,
+        I: 'static,
+    {
+        let span = tracing::info_span!(
+            dynrunner_core::PRIMARY_ROLE_SPAN,
+            kind = "primary",
+            node = %self.config.node_id
+        );
+        async move {
+            let fork = self
+                .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
+                .await;
+            match fork {
+                Ok(PostBootstrap::StayLocal) => {
+                    // Stay-local: tear the dispatchers down in-place (same
+                    // contract as `run`), read the counts off this
+                    // coordinator's own replicated ledger, then drop `self`.
+                    self.cleanup_run_dispatchers().await;
+                    Ok(PrimaryRunOutcome::Local {
+                        result: Ok(()),
+                        completed: self.completed_count(),
+                        failed: self.failed_count(),
+                        stranded: self.stranded_count(),
+                    })
+                }
+                Err(e) => {
+                    // A stay-local pipeline error: still tear down the
+                    // in-place dispatchers, surface the counts gathered so
+                    // far, and carry the error through `result`.
+                    self.cleanup_run_dispatchers().await;
+                    Ok(PrimaryRunOutcome::Local {
+                        result: Err(e),
+                        completed: self.completed_count(),
+                        failed: self.failed_count(),
+                        stranded: self.stranded_count(),
+                    })
+                }
+                Ok(PostBootstrap::Relocate) => {
+                    // Relocated: destructure `self` into the handoff (the
+                    // two dispatcher handles ride across — DO NOT clean them
+                    // here) and run the standalone observer to its terminal.
+                    let handoff = self.into_observer_handoff();
+                    let mut observer =
+                        crate::observer::ObserverCoordinator::from_handoff(handoff);
+                    let terminal = observer.run().await;
+                    Ok(PrimaryRunOutcome::from_observer(&observer, terminal))
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Tear down both run-spawned dispatchers (peer-lifecycle +
+    /// task-completion) on a stay-local exit. The single in-place cleanup
+    /// choke point both `run` and `run_consuming`'s stay-local arms share —
+    /// keeps the abort+join discipline in one home. NOT called on the
+    /// relocated path: there the handles ride across into the observer's
+    /// single-teardown via [`Self::into_observer_handoff`].
+    async fn cleanup_run_dispatchers(&mut self) {
+        self.cleanup_lifecycle_dispatcher().await;
+        self.cleanup_task_completed_dispatcher().await;
+    }
+
+    /// Consume this primary BY VALUE into the standalone observer's
+    /// hand-off payload.
+    ///
+    /// Called ONLY on the genuine relocation path (the submitter
+    /// relinquished full authority onto a chosen compute peer and dropped
+    /// its own `Role::Primary`). A FULL DESTRUCTURE drops the scheduler
+    /// `S`, the estimator `E`, the worker pool, the secondary table, and
+    /// every other primary-only concern structurally — the
+    /// `PrimaryCoordinator<Tr, S, E, I>` becomes an
+    /// [`ObserverHandoff<Tr, I>`], a strictly smaller, zero-authority
+    /// payload. No `mem::take` / `Option::take` is used on any field of
+    /// `self`; the move is compiler-checked by the destructure pattern.
+    ///
+    /// Carries across exactly what the observer needs to resume without
+    /// dropping a live event: the mesh `transport`, the replicated
+    /// `cluster_state` (with its already-installed `task_completed_tx`),
+    /// the node id, the deadlines as an [`ObserverConfig`], the
+    /// `started_phases` narration seed (the `phase_started_emitted` set),
+    /// the STABLE `required_setup_on_promote` config bool (the observer
+    /// recomputes `setup_pending` LIVE — never a frozen snapshot), the
+    /// panik signal receiver, and the two dispatcher join handles. The
+    /// `holdings` are empty: the submitter primary advertised no
+    /// resource-holdings (workers run on secondaries).
+    fn into_observer_handoff(self) -> crate::observer::ObserverHandoff<Tr, I> {
+        // Full destructure: every field NOT named below is dropped by the
+        // `..` — scheduler/estimator/pool/secondaries/etc. — so the larger
+        // `PrimaryCoordinator` is structurally consumed.
+        let Self {
+            config,
+            transport,
+            cluster_state,
+            phase_started_emitted,
+            lifecycle_dispatcher_handle,
+            task_completed_dispatcher_handle,
+            panik_signal_rx,
+            ..
+        } = self;
+
+        crate::observer::ObserverHandoff {
+            transport,
+            cluster_state,
+            node_id: config.node_id.clone(),
+            deadlines: crate::observer::ObserverConfig {
+                node_id: config.node_id,
+                fleet_dead_timeout: config.fleet_dead_timeout,
+                peer_timeout: config.peer_timeout,
+                setup_promote_deadline: config.setup_promote_deadline,
+                required_setup_on_promote: config.required_setup_on_promote,
+                // The submitter's panik watcher already ran; its signal
+                // receiver rides across directly (below), so the observer
+                // does NOT re-spawn a watcher from these — they are inert
+                // on the relocation path.
+                panik_watcher_paths: Vec::new(),
+                panik_watcher_poll_interval: Duration::from_secs(60),
+            },
+            started_phases: phase_started_emitted,
+            required_setup_on_promote: config.required_setup_on_promote,
+            panik_signal_rx,
+            // The dispatchers are spawned unconditionally at `run_pipeline`
+            // entry (`spawn_run_dispatchers`), so both handles are present
+            // at the relocate point. Carried so the observer's
+            // single-teardown ABORTS them cleanly (the inherited
+            // task-completed dispatcher is superseded by the observer's own
+            // fresh channel in `from_handoff`; see its reconciliation note).
+            task_completed_dispatcher_handle: task_completed_dispatcher_handle
+                .expect("task-completed dispatcher spawned at run_pipeline entry"),
+            lifecycle_dispatcher_handle: lifecycle_dispatcher_handle
+                .expect("peer-lifecycle dispatcher spawned at run_pipeline entry"),
+            holdings: HashSet::new(),
+        }
+    }
+
     /// Original `run()` body, factored out so the public `run` wrapper
     /// can drive cleanup-on-exit regardless of how this function
     /// returns. See [`Self::run`] for the rationale.
+    ///
+    /// Returns the post-bootstrap fork DECISION (not the relinquished
+    /// `self`): the body runs the whole pipeline through `&mut self`, so
+    /// it can never move `self` out (that is the owned-self
+    /// [`Self::run`]'s job). On a successful relocation it returns
+    /// [`PostBootstrap::Relocate`] WITHOUT touching the dispatcher
+    /// cleanup — the owned-self caller then destructures `self` into the
+    /// [`ObserverHandoff`] so the two dispatcher handles ride across into
+    /// the observer's single-teardown rather than being aborted here. On
+    /// every stay-local outcome (single-node / no capable peer / chosen
+    /// candidate evaporated) it runs the operational loop to completion
+    /// and returns [`PostBootstrap::StayLocal`].
     async fn run_pipeline(
         &mut self,
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
-    ) -> Result<(), RunError> {
+    ) -> Result<PostBootstrap, RunError> {
         // Reset the stranded counter so a previous run's residue
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
@@ -2688,14 +2994,25 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         match self.select_bootstrap_primary() {
             None => {
                 self.activate_local_primary().await?;
-                self.run_operational_and_finalize(total).await
+                self.run_operational_and_finalize(total).await?;
+                Ok(PostBootstrap::StayLocal)
             }
             Some(chosen) => match self.relocate_primary_to(chosen).await? {
-                RelocationOutcome::Relocated => unimplemented!(
-                    "relocation→observer handoff implemented in Wave 1b \
-                     (standalone ObserverCoordinator)"
-                ),
-                RelocationOutcome::FellBackToLocal => self.run_operational_and_finalize(total).await,
+                // The submitter relinquished full authority onto the
+                // chosen compute peer and dropped its own `Role::Primary`.
+                // It must now run the standalone observer tail — but the
+                // observer needs `self` BY VALUE (the moved-across
+                // transport + cluster_state), which this `&mut self` body
+                // cannot surrender. Signal the fork; the owned-self
+                // `run`/`run_consuming` caller performs the destructuring
+                // handoff. Crucially we do NOT fall through to the
+                // dispatcher cleanup here — the two dispatcher handles ride
+                // across into the observer's single-teardown.
+                RelocationOutcome::Relocated => Ok(PostBootstrap::Relocate),
+                RelocationOutcome::FellBackToLocal => {
+                    self.run_operational_and_finalize(total).await?;
+                    Ok(PostBootstrap::StayLocal)
+                }
             },
         }
     }
@@ -2966,8 +3283,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         );
         async {
             let result = self.run_activated_pipeline(snapshot).await;
-            self.cleanup_lifecycle_dispatcher().await;
-            self.cleanup_task_completed_dispatcher().await;
+            self.cleanup_run_dispatchers().await;
             result
         }
         .instrument(span)

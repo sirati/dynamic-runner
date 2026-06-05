@@ -240,14 +240,36 @@ where
         )
     }
 
-    /// Relocation constructor: continue from a handed-off context (a LATER
-    /// wave constructs the [`ObserverHandoff`]). The inherited dispatchers,
-    /// the panik receiver, and the narration seed carry across so the
-    /// observer resumes without dropping a live event.
+    /// Relocation constructor: continue from a handed-off context (the
+    /// relocation wave constructs the [`ObserverHandoff`]). The panik
+    /// receiver and the narration seed carry across so the observer resumes
+    /// without dropping a live event.
+    ///
+    /// # Dispatcher / listener reconciliation (the inherited-vs-own tension)
+    ///
+    /// The inherited `task_completed_dispatcher_handle` was spawned by the
+    /// PRIMARY with the PRIMARY's listener vector baked in at spawn time, so
+    /// the observer's Policy B (invalid_task fatal-exit) and Policy D (error
+    /// aggregation) listeners CANNOT be grafted onto it. Resolution: mirror
+    /// the cold-join [`Self::new`] ordering — install a FRESH
+    /// `task_completed` channel on the moved-in `cluster_state` (which
+    /// REPLACES the inherited sender, so subsequent apply-path events route
+    /// to the observer's own receiver) and set `task_completed_rx = Some`,
+    /// so [`Self::run`] registers the observer's OWN Policy B/D listeners and
+    /// spawns the observer's OWN dispatcher. The inherited primary dispatcher
+    /// handle is carried in `inherited_task_completed_dispatcher` ONLY so the
+    /// observer's single-teardown ABORTS it cleanly (it is otherwise
+    /// orphaned — its sender was just replaced). No applies happen during
+    /// this cutover window (the observer is not yet in its run loop), so no
+    /// event is lost between the sender swap and the dispatcher spawn.
+    ///
+    /// (Events that were mid-flight inside the primary's dispatcher at
+    /// teardown are recovered later by the CRDT track's restore-emit over the
+    /// converged state — this is noted, NOT depended on here.)
     pub fn from_handoff(handoff: ObserverHandoff<Tr, I>) -> Self {
         let ObserverHandoff {
             transport,
-            cluster_state,
+            mut cluster_state,
             node_id,
             deadlines,
             started_phases,
@@ -257,6 +279,12 @@ where
             lifecycle_dispatcher_handle,
             holdings,
         } = handoff;
+        // Install a FRESH task-completed channel on the moved-in
+        // `cluster_state`, REPLACING the inherited primary sender (see the
+        // reconciliation note above). The receiver feeds the observer's own
+        // dispatcher, which `run` spawns with the Policy B/D listeners.
+        let (task_tx, task_rx) = mpsc::unbounded_channel::<TaskCompletedEvent>();
+        cluster_state.install_task_completed_sender(task_tx);
         Self {
             transport,
             cluster_state,
@@ -266,15 +294,16 @@ where
                 ..deadlines
             },
             started_phases,
+            // The inherited primary dispatcher is now orphaned (its sender
+            // was replaced above); carry it ONLY so single-teardown aborts
+            // it. The observer's own dispatcher is spawned by `run` from
+            // `task_completed_rx`.
             inherited_task_completed_dispatcher: Some(task_completed_dispatcher_handle),
             lifecycle_dispatcher_handle: Some(lifecycle_dispatcher_handle),
             panik_signal_rx,
             holdings,
             setup_deadline_elapsed: None,
-            // Relocation inherits a live dispatcher that already owns its
-            // receiver; `run` does not spawn another. The handoff's
-            // `cluster_state` already carries the installed sender.
-            task_completed_rx: None,
+            task_completed_rx: Some(task_rx),
         }
     }
 
@@ -328,6 +357,33 @@ where
     /// Read-only access to the replicated ledger (tests / result getters).
     pub fn cluster_state(&self) -> &ClusterState<I> {
         &self.cluster_state
+    }
+
+    /// Tasks the cluster recorded as successfully completed, read off the
+    /// observer's moved-in (converged) `cluster_state`. Same CRDT reader
+    /// (`outcome_counts().succeeded`) the primary's `completed_count` routes
+    /// through — so the post-run accounting the PyO3 boundary reads is
+    /// identical in shape across a relocation. (The relocation wave's
+    /// [`crate::primary::RunOutcome`] re-sources the counts through this
+    /// surface after the submitter binding is consumed.)
+    pub fn completed_count(&self) -> usize {
+        self.cluster_state.outcome_counts().succeeded
+    }
+
+    /// Tasks the cluster recorded as terminally failed (any failure class).
+    /// Sums the three failure buckets off `cluster_state.outcome_counts()`,
+    /// matching the primary's `failed_count` semantics.
+    pub fn failed_count(&self) -> usize {
+        let o = self.cluster_state.outcome_counts();
+        o.fail_retry + o.fail_oom + o.fail_final
+    }
+
+    /// Tasks left without a recorded outcome. ALWAYS 0 for an observer: it
+    /// relinquished authority and never dispatched, so there is nothing it
+    /// could strand. Present so the post-run accounting surface mirrors the
+    /// primary's (`completed`/`failed`/`stranded`) across a relocation.
+    pub fn stranded_count(&self) -> usize {
+        0
     }
 
     /// LIVE `setup_pending` predicate (R2): `required_setup_on_promote &&
@@ -408,10 +464,12 @@ where
         // restore → register → spawn): the sender was installed at
         // construction (so restore-delivered events are buffered), and the
         // listeners are registered into the dispatcher's vector here, before
-        // it first polls. On the relocation path the dispatcher is inherited
-        // (`task_completed_rx` is `None`); the failure-policy drivers below
-        // still run, but their listeners only fire if the relocation wires
-        // them — a later-wave concern.
+        // it first polls. BOTH constructors install a fresh sender + set
+        // `task_completed_rx = Some`: cold-join via `with_pieces`, relocation
+        // via `from_handoff` (which REPLACES the inherited primary sender and
+        // carries the orphaned primary dispatcher handle only for teardown).
+        // So the observer always spawns its OWN dispatcher with the Policy
+        // B/D listeners here.
         let dispatcher_task = self.task_completed_rx.take().map(|task_rx| {
             let listeners: Vec<Box<dyn TaskCompletedListener>> =
                 vec![invalid_task_listener, aggregation_listener];

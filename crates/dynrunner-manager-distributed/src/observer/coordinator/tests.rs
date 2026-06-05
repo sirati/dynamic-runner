@@ -737,3 +737,175 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
     .await
     .expect("the live-setup-pending observer must terminate");
 }
+
+/// The shared inbound + bookkeeping a [`build_test_handoff`] hands back.
+struct HandoffTestRig {
+    handoff: super::ObserverHandoff<ChannelPeerTransport<TestId>, TestId>,
+    /// Feed mesh frames the observer's run loop applies.
+    inbound: mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    /// Count of events the INHERITED (primary) dispatcher received. The
+    /// `from_handoff` reconciliation REPLACES the inherited sender, so this
+    /// must stay 0 for any event emitted after construction — proof the
+    /// inherited dispatcher was superseded by the observer's own fresh one.
+    inherited_event_count: std::rc::Rc<std::cell::Cell<usize>>,
+    /// Held so the single dummy peer is not pruned for the test's lifetime.
+    _peers: PeerKeepalive,
+}
+
+/// Build an [`super::ObserverHandoff`] over a moved-in transport +
+/// cluster_state, mirroring what the relocated submitter's
+/// `into_observer_handoff` produces: the cluster_state already carries an
+/// installed task-completed sender (the inherited primary fabric), and two
+/// dummy dispatcher tasks stand in for the inherited dispatcher handles. The
+/// inherited task-completed dispatcher counts every event it receives into
+/// `inherited_event_count`.
+fn build_test_handoff(
+    node_id: &str,
+    cluster_state: ClusterState<TestId>,
+    config: ObserverConfig,
+) -> HandoffTestRig {
+    let (transport, inbound, peers) = transport_with_peers(node_id, 1);
+
+    // The inherited primary fabric: a task-completed channel already
+    // installed on the moved-in cluster_state, with a dummy dispatcher
+    // counting events on its receiver. `from_handoff` REPLACES this sender
+    // with a fresh one (so this dispatcher is orphaned + receives nothing
+    // further) and carries the handle only to abort it via single-teardown.
+    let mut cluster_state = cluster_state;
+    let (inherited_tx, mut inherited_rx) =
+        mpsc::unbounded_channel::<crate::task_completed::TaskCompletedEvent>();
+    cluster_state.install_task_completed_sender(inherited_tx);
+    let inherited_event_count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let count_for_task = inherited_event_count.clone();
+    let inherited_task_completed_dispatcher = tokio::task::spawn_local(async move {
+        while inherited_rx.recv().await.is_some() {
+            count_for_task.set(count_for_task.get() + 1);
+        }
+    });
+    // A dummy peer-lifecycle dispatcher handle (no observer consumer; carried
+    // only so single-teardown aborts it).
+    let lifecycle_dispatcher_handle =
+        tokio::task::spawn_local(async { std::future::pending::<()>().await });
+
+    let handoff = super::ObserverHandoff {
+        transport,
+        cluster_state,
+        node_id: node_id.to_string(),
+        deadlines: config.clone(),
+        started_phases: std::collections::HashSet::new(),
+        required_setup_on_promote: config.required_setup_on_promote,
+        panik_signal_rx: None,
+        task_completed_dispatcher_handle: inherited_task_completed_dispatcher,
+        lifecycle_dispatcher_handle,
+        holdings: std::collections::HashSet::new(),
+    };
+    HandoffTestRig {
+        handoff,
+        inbound,
+        inherited_event_count,
+        _peers: peers,
+    }
+}
+
+/// A relocation hands off transport + cluster_state BY VALUE: the observer
+/// resumes over the moved-in mesh (peer set intact, no re-dial) and the
+/// moved-in ledger, and exits cleanly on a `RunComplete` already present in
+/// that ledger. Pins the core relocation mechanic at the observer seam +
+/// proves the post-run accounting is re-sourced from the moved-in ledger.
+#[tokio::test(flavor = "current_thread")]
+async fn from_handoff_resumes_moved_in_state_and_exits_on_run_complete() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The moved-in ledger already carries the run's terminal +
+            // accounting (two completions) — exactly what the submitter's
+            // converged cluster_state would hold at relocation.
+            let mut cs = ClusterState::<TestId>::new();
+            for id in ["a", "b"] {
+                let t = task("p", id, &[]);
+                add(&mut cs, &t);
+                complete(&mut cs, id);
+            }
+            cs.apply(ClusterMutation::RunComplete);
+
+            let rig = build_test_handoff("obs", cs, observer_config("obs"));
+            let mut observer = ObserverCoordinator::from_handoff(rig.handoff);
+
+            let terminal = observer.run().await.expect("Ok on the moved-in run_complete");
+            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+
+            // Post-run accounting is re-sourced from the observer's moved-in
+            // (converged) ledger — the surface the relocated `PrimaryRunOutcome`
+            // reads after the submitter binding is consumed.
+            assert_eq!(observer.completed_count(), 2, "completions off the moved-in ledger");
+            assert_eq!(observer.failed_count(), 0);
+            assert_eq!(observer.stranded_count(), 0, "an observer strands nothing");
+        })
+        .await;
+}
+
+/// `from_handoff` reconciliation: the observer installs a FRESH task-completed
+/// channel on the moved-in cluster_state, REPLACING the inherited primary
+/// sender. Proof: an inbound `TaskCompleted` applied AFTER `from_handoff`
+/// (through the observer's run loop) routes to the FRESH sender — the inherited
+/// (orphaned) primary dispatcher receives ZERO post-handoff events, even
+/// though it was live and counting before the swap. (The observer's own fresh
+/// dispatcher carries the Policy B/D listeners; the inherited handle is
+/// carried only so single-teardown aborts it.)
+#[tokio::test(flavor = "current_thread")]
+async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut cs = ClusterState::<TestId>::new();
+                let t = task("p", "x", &[]);
+                add(&mut cs, &t);
+
+                let rig = build_test_handoff("obs", cs, observer_config("obs"));
+                let inherited_count = rig.inherited_event_count.clone();
+                let inbound = rig.inbound.clone();
+                let mut observer = ObserverCoordinator::from_handoff(rig.handoff);
+
+                // Apply a TaskCompleted AFTER from_handoff (so it routes via
+                // the FRESH sender), then complete the run. The observer's run
+                // loop applies these inbound frames.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    inbound
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "p".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::TaskCompleted {
+                                hash: "x".into(),
+                                result_data: None,
+                            }],
+                        })
+                        .expect("inbound open");
+                    inbound
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "p".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::RunComplete],
+                        })
+                        .expect("inbound open");
+                });
+
+                let terminal = observer.run().await.expect("Ok on RunComplete");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                // The completion was observed on the FRESH ledger.
+                assert_eq!(observer.completed_count(), 1, "completion applied via fresh sender");
+                // The INHERITED dispatcher received NOTHING after the swap —
+                // its sender was replaced by the fresh one in from_handoff.
+                assert_eq!(
+                    inherited_count.get(),
+                    0,
+                    "the inherited primary dispatcher must be superseded by the \
+                     observer's own fresh dispatcher (0 post-handoff events)"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the fresh-sender observer must terminate (not hang)");
+}
