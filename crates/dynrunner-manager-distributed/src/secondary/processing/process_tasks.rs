@@ -25,16 +25,6 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::{RunOutcome, SecondaryCoordinator};
 
-/// Cadence for the externally-registered cluster-state refresh callback
-/// (see [`SecondaryCoordinator::register_cluster_state_refresh`]). A
-/// modest 30s tick: the only consumer is the observer's live-snapshot
-/// feed, whose downstream reporter runs on a 10-minute / 1-minute
-/// cadence, so 30s keeps the published projection comfortably fresh
-/// between reporter reads while the per-tick `O(ledger)` projection cost
-/// stays negligible. Deliberately NOT per-`ClusterMutation` (which would
-/// make the projection `O(ledger × mutations)`).
-const CLUSTER_STATE_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
     Tr: PeerTransport<I>,
@@ -91,7 +81,6 @@ where
         let latches = super::super::lifecycle::OperationalLatches {
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
-            on_cluster_state_refresh: self.on_cluster_state_refresh.take(),
         };
         let primary_link = super::super::primary_link::PrimaryLink::with_failover_threshold(
             self.config.primary_link_failure_threshold,
@@ -115,7 +104,6 @@ where
         let super::super::lifecycle::OperationalLatches {
             mut announcer_outbox_rx,
             mut fatal_exit_signal_rx,
-            on_cluster_state_refresh,
         } = latches;
         // Seed each resumable terminal-signal receiver into a loop-local for
         // its `select!` arm. A loop-local is required here (it cannot be
@@ -202,14 +190,13 @@ where
             }
         }
 
-        // `announcer_outbox_rx`, `fatal_exit_signal_rx`, and
-        // `on_cluster_state_refresh` were surrendered into the loop's locals
-        // at the single `enter_operational` latch boundary above (the
-        // take-once carrier), so they own their receivers across the
-        // `select!` iterations exactly as the pre-typed flat-field flow
-        // did with per-field `Option::take()`. Each is `None` when its
+        // `announcer_outbox_rx` and `fatal_exit_signal_rx` were surrendered
+        // into the loop's locals at the single `enter_operational` latch
+        // boundary above (the take-once carrier), so they own their receivers
+        // across the `select!` iterations exactly as the pre-typed flat-field
+        // flow did with per-field `Option::take()`. Each is `None` when its
         // registration never happened (no observer announcer / no fatal-exit
-        // policy / no refresh consumer) and the matching arm parks on
+        // policy) and the matching arm parks on
         // `pending()`. `colocated_loopback_inbound_rx` and `panik_signal_rx`
         // are the two locals owned across iterations that are NOT fire-once
         // latches: each round-trips through `OperationalState` so it survives
@@ -221,20 +208,6 @@ where
         // 5s — same window the SubprocessWorkerFactory uses for its own
         // teardown ladder.
         const PANIK_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-        // The cluster-state refresh interval is built here so the first
-        // tick lands one full period in (the just-restored snapshot is
-        // already published by the integration site before the loop
-        // starts, so re-publishing it at t=0 would be redundant);
-        // `MissedTickBehavior::Skip` keeps a stalled loop from bursting
-        // catch-up ticks.
-        let mut cluster_state_refresh_interval =
-            tokio::time::interval(CLUSTER_STATE_REFRESH_INTERVAL);
-        cluster_state_refresh_interval
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Consume the immediate first tick so the refresh lands one full
-        // period in rather than firing on entry.
-        cluster_state_refresh_interval.reset();
 
         // Anti-entropy cadence. On each tick this secondary broadcasts its
         // `StateDigest` so peers behind it pull a snapshot (and vice
@@ -551,28 +524,6 @@ where
                             // Err arm.
                             fatal_exit_signal_rx = None;
                         }
-                    }
-                }
-                // Cluster-state refresh tick. The one in-loop moment a
-                // concurrently-running consumer (the observer's
-                // live-snapshot feed) can observe the freshening,
-                // post-apply CRDT: every other arm has just finished its
-                // apply (an inbound `ClusterMutation` routes through
-                // `handle_inbound` → the apply path), so `self.cluster_state`
-                // here reflects the latest converged ledger. Invoke the
-                // registered callback with a read-only borrow; the consumer
-                // PROJECTS it and publishes to its own cell. Periodic (not
-                // per-mutation) so the projection cost is O(ledger) per
-                // tick. When no consumer registered the closure is `None`
-                // and the tick is a no-op.
-                //
-                // Cancel-safety: `interval.tick` is cancel-safe (tokio
-                // docs); a sibling arm winning the race abandons the
-                // in-flight tick future, rebuilt next iteration against
-                // the same interval.
-                _ = cluster_state_refresh_interval.tick() => {
-                    if let Some(callback) = on_cluster_state_refresh.as_ref() {
-                        callback(&self.cluster_state);
                     }
                 }
                 // Anti-entropy tick: broadcast this secondary's digest so
