@@ -177,6 +177,9 @@ mod tests {
         fn workload_pid(&self, _: &str) -> Option<u32> {
             unreachable!("cleanup tests don't capture the workload PID")
         }
+        fn conmon_pid(&self, _: &str) -> Option<u32> {
+            unreachable!("cleanup tests don't capture the conmon PID")
+        }
         fn kill_pid1(&self, _: &str, _: &str) -> bool {
             unreachable!()
         }

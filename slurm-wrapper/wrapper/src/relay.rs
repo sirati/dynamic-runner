@@ -293,7 +293,7 @@ async fn dispatch_command(
         let exit_path = exit_sock_c.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&exit_path) {
-                let _ = write!(f, "{code}\n");
+                let _ = writeln!(f, "{code}");
             }
         })
         .await;
@@ -336,7 +336,7 @@ async fn dispatch_command(
         Ok(())
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    .map_err(std::io::Error::other)??;
 
     Ok(())
 }

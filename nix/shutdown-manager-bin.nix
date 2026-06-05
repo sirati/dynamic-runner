@@ -1,4 +1,26 @@
-{ pkgsCross }:
+{ pkgsCross, lib }:
+
+# The shutdown-manager now path-depends on `crates/dynrunner-reap` (the
+# shared reap state-machine, also used by the slurm-wrapper), which lives
+# OUTSIDE the `shutdown-manager/` subtree. So `src` can no longer be
+# `../shutdown-manager` alone — it must also include `crates/dynrunner-reap`.
+# We root `src` at the repo and filter to exactly the two trees the
+# manager build reads, then point `cargoRoot` at the `shutdown-manager`
+# manifest. The filter keeps the rebuild trigger tight — only
+# `shutdown-manager/**` and `crates/dynrunner-reap/**` changes invalidate
+# this derivation.
+let
+  # `lib.fileset` unions the manager subtree + the shared reap crate into
+  # one source with repo-relative layout preserved, so the manager's
+  # `../crates/dynrunner-reap` path-dep resolves. See wrapper-bin.nix.
+  shutdownSrc = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../shutdown-manager
+      ../crates/dynrunner-reap
+    ];
+  };
+in
 
 # Musl-static rustPlatform for the shutdown-manager binary.
 # Kept distinct from the framework wheel's rustPlatform
@@ -39,7 +61,20 @@ pkgsCross.musl64.pkgsStatic.rustPlatform.buildRustPackage {
   # Mirrors `shutdown-manager/Cargo.toml`'s `[package].version`.
   # Bump together with that file on shutdown-manager releases.
   version = "0.1.0";
-  src = ../shutdown-manager;
+  # Repo-root-filtered src (see the `let` above): includes both the
+  # `shutdown-manager` and the `crates/dynrunner-reap` path-dep it now
+  # references. `buildAndTestSubdir` runs the cargo build/check/install
+  # hooks INSIDE `shutdown-manager/` (where the manifest + Cargo.lock live)
+  # while keeping the full filtered tree as the source — so the manager's
+  # `../crates/dynrunner-reap` path-dep resolves to
+  # `<src>/crates/dynrunner-reap`, present in the tree. (Plain `cargoRoot`
+  # only relocates vendoring, not the build cwd.)
+  src = shutdownSrc;
+  # `cargoRoot` (lock + vendor location) + `buildAndTestSubdir` (build cwd)
+  # both set to the manager subdir — see the wrapper-bin.nix note for why
+  # both are required in this nixpkgs.
+  cargoRoot = "shutdown-manager";
+  buildAndTestSubdir = "shutdown-manager";
   cargoLock.lockFile = ../shutdown-manager/Cargo.lock;
   # ``+crt-static`` forces full static linking against musl,
   # mirroring the standalone flake's commonArgs (see

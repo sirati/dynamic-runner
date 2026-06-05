@@ -62,12 +62,18 @@
 //!   podman rm -af
 //! ```
 
-use crate::clock::Clock;
 use crate::podman::PodmanBackend;
-use crate::process_probe::ProcessProbe;
 use crate::shutdown_flag::ShutdownFlag;
+use dynrunner_reap::clock::Clock;
+use dynrunner_reap::process_probe::ProcessProbe;
+use dynrunner_reap::reap::{reap_pids, wait_for_pid_gone, ReapGraces, ReapTarget};
 use std::path::Path;
 use std::time::Duration;
+
+// The reap outcome type is owned by the shared reap crate; re-export it
+// under `poll_loop` so the manager's `main` and the integration tests
+// keep their historical `poll_loop::ReapStatus` import path.
+pub use dynrunner_reap::reap::ReapStatus;
 
 /// Graceful last-resort budget: how long the reaper waits, after
 /// writing the panik sentinel, for the workload to stop on its own.
@@ -118,33 +124,35 @@ pub enum Outcome {
     IdleShutdown,
 }
 
-/// Result of the PID-based workload reap. The manager must NOT exit 0
-/// while a known workload PID is still alive — that was the "false
-/// success" defect. `main` maps [`ReapStatus::OrphanSurvives`] to a
-/// non-zero exit so the operator (and any wrapping supervisor) sees
-/// the orphan was not reaped.
+/// Precisely WHY the state machine entered teardown. `Outcome`
+/// distinguishes signal-vs-idle; this distinguishes the two ways a
+/// `SignalShutdown` can be reached so `main` can always log a WHY line —
+/// closing the gap where the wrapper-monitor path tore down with no
+/// recorded cause (`describe_last_signal` returns `None` there, because
+/// no signal was ever captured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReapStatus {
-    /// No workload PID was ever captured (e.g. the container was gone
-    /// before the manager's first sighting), so there is nothing to
-    /// verify. The IDLE_SHUTDOWN branch always reports this.
-    NotApplicable,
-    /// A workload PID was captured and is confirmed gone — either it
-    /// had already exited, or it died within grace after SIGTERM /
-    /// SIGKILL. Safe to destroy the podman handle.
-    ConfirmedGone,
-    /// A workload PID was captured and is STILL ALIVE after SIGTERM,
-    /// the grace window, SIGKILL, and a second grace window. The
-    /// podman handle is intentionally left intact (not `rm`-ed) and
-    /// the manager exits non-zero.
-    OrphanSurvives,
+pub enum ShutdownTrigger {
+    /// The shutdown flag was set by a delivered signal (SIGTERM/SIGCONT).
+    /// `main` resolves the sender via `signals::describe_last_signal`.
+    Signal,
+    /// The monitored wrapper PID disappeared — the SLURM job process that
+    /// owns this container is gone, so we force teardown. Carries the PID
+    /// that vanished so the WHY line names it. This is the modern,
+    /// debounce-free replacement for the removed `squeue` poll: the
+    /// wrapper PID vanishing IS the authoritative "job is gone" signal.
+    WrapperGone { pid: u32 },
+    /// The container was absent for >= idle_shutdown after a prior
+    /// sighting (the IDLE_SHUTDOWN branch), which already logs its own
+    /// cause line.
+    Idle,
 }
 
-/// What `run` reports to `main`: which branch fired and whether the
-/// captured workload PID was confirmed dead.
+/// What `run` reports to `main`: which branch fired, WHY it fired, and
+/// whether the captured PIDs were confirmed dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunReport {
     pub outcome: Outcome,
+    pub trigger: ShutdownTrigger,
     pub reap: ReapStatus,
 }
 
@@ -166,37 +174,51 @@ pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
     let ticks_for_idle = ceil_ticks(cfg.idle_shutdown, cfg.poll_interval);
     let mut saw_once = false;
     let mut down_count: u64 = 0;
-    // Latest host PID of the container workload PLUS the start time
-    // captured for it, recorded each time the container record is
-    // present. The PID lets SIGNAL_SHUTDOWN reap the workload even
-    // after podman drops the record; the captured start time lets the
-    // reap confirm the PID still names the SAME process before
-    // signalling, closing the PID-reuse kill-path hazard.
-    let mut workload_pid: Option<(u32, Option<u64>)> = None;
+    // Latest captured host PIDs of the container's conmon supervisor AND
+    // its workload, each paired with the start time captured for it,
+    // recorded every poll the container record is present. The PIDs let
+    // SIGNAL_SHUTDOWN reap both directly even after podman drops the
+    // record; the captured start times let the reap confirm each PID
+    // still names the SAME process before signalling, closing the
+    // PID-reuse kill-path hazard. conmon is reaped too because it — not
+    // the workload — is the process that re-parents to host PID 1 and
+    // keeps NFS writers alive after a missed cgroup sweep.
+    let mut captured = CapturedPids::default();
     loop {
         if flag.is_set() {
             log("signal observed; entering SIGNAL_SHUTDOWN");
-            let reap = signal_shutdown(backend, clock, probe, cfg, workload_pid, &mut log);
-            return RunReport { outcome: Outcome::SignalShutdown, reap };
+            let reap = signal_shutdown(backend, clock, probe, cfg, &captured, &mut log);
+            return RunReport {
+                outcome: Outcome::SignalShutdown,
+                trigger: ShutdownTrigger::Signal,
+                reap,
+            };
         }
-        if wrapper_gone(probe, cfg.wrapper_pid) {
+        if let Some(pid) = wrapper_gone(probe, cfg.wrapper_pid) {
             log("wrapper PID gone; entering SIGNAL_SHUTDOWN (wrapper-monitor)");
-            let reap = signal_shutdown(backend, clock, probe, cfg, workload_pid, &mut log);
-            return RunReport { outcome: Outcome::SignalShutdown, reap };
+            let reap = signal_shutdown(backend, clock, probe, cfg, &captured, &mut log);
+            return RunReport {
+                outcome: Outcome::SignalShutdown,
+                trigger: ShutdownTrigger::WrapperGone { pid },
+                reap,
+            };
         }
         match backend.container_exists(&cfg.container_name) {
             true => {
                 saw_once = true;
                 down_count = 0;
-                // Refresh the captured workload PID while the record
-                // still exists. A `None` here (transient inspect
-                // failure) does not clobber a previously-captured PID:
-                // the last known good value is what we want to reap.
-                // The PID's start time is captured at the SAME instant
-                // (via the probe's `/proc` read) so the reap can later
-                // confirm the PID still names this exact process.
+                // Refresh the captured PIDs while the record still
+                // exists. A `None` here (transient inspect failure) does
+                // not clobber a previously-captured PID: the last known
+                // good value is what we want to reap. Each PID's start
+                // time is captured at the SAME instant (via the probe's
+                // `/proc` read) so the reap can later confirm the PID
+                // still names this exact process.
+                if let Some(pid) = backend.conmon_pid(&cfg.container_name) {
+                    captured.conmon = Some((pid, probe.start_time(pid)));
+                }
                 if let Some(pid) = backend.workload_pid(&cfg.container_name) {
-                    workload_pid = Some((pid, probe.start_time(pid)));
+                    captured.workload = Some((pid, probe.start_time(pid)));
                 }
             }
             false => {
@@ -212,6 +234,7 @@ pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
                         idle_shutdown(backend, &mut log);
                         return RunReport {
                             outcome: Outcome::IdleShutdown,
+                            trigger: ShutdownTrigger::Idle,
                             reap: ReapStatus::NotApplicable,
                         };
                     }
@@ -222,14 +245,41 @@ pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
     }
 }
 
-/// Reduce "optional wrapper PID + probe" to a single boolean wake-input
-/// for the poll loop. Returns `false` when no PID was configured so
-/// the loop's decision table stays the same shape with and without
-/// the wrapper-monitor enabled.
-fn wrapper_gone<P: ProcessProbe>(probe: &P, pid: Option<u32>) -> bool {
+/// The host PIDs the poll loop captures while the container record
+/// exists, so SIGNAL_SHUTDOWN can reap them directly after podman drops
+/// the record. Each is `Some((pid, captured_start_time))` once seen.
+/// Both conmon and the workload are tracked: conmon is the supervisor
+/// that survives a missed cgroup sweep and keeps NFS writers alive, so it
+/// must be reaped too (not only the workload).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapturedPids {
+    conmon: Option<(u32, Option<u64>)>,
+    workload: Option<(u32, Option<u64>)>,
+}
+
+impl CapturedPids {
+    /// Build the reap target list — conmon first (supervisor before its
+    /// child in the log narrative), then the workload. Each captured PID
+    /// contributes one [`ReapTarget`]; absent ones are skipped.
+    fn targets(&self) -> Vec<ReapTarget> {
+        [self.conmon, self.workload]
+            .into_iter()
+            .flatten()
+            .map(|(pid, start)| ReapTarget::new(pid, start))
+            .collect()
+    }
+}
+
+/// Reduce "optional wrapper PID + probe" to a wake-input for the poll
+/// loop. Returns `Some(pid)` when the configured wrapper PID is gone (the
+/// cue to force teardown, carrying the PID so the caller can record WHY),
+/// `None` when the wrapper is still alive OR no PID was configured — so
+/// the loop's decision table stays the same shape with and without the
+/// wrapper-monitor enabled.
+fn wrapper_gone<P: ProcessProbe>(probe: &P, pid: Option<u32>) -> Option<u32> {
     match pid {
-        None => false,
-        Some(p) => !probe.is_alive(p),
+        Some(p) if !probe.is_alive(p) => Some(p),
+        _ => None,
     }
 }
 
@@ -242,10 +292,10 @@ fn wrapper_gone<P: ProcessProbe>(probe: &P, pid: Option<u32>) -> bool {
 ///      `podman exec kill` / `podman kill` / `podman stop` path,
 ///      gated on `container_exists` because those subcommands no-op
 ///      once podman loses the record. This does NOT remove anything.
-///   2. **PID-based reap** — signal+verify the captured host workload
-///      PID directly through the [`ProcessProbe`], independent of the
-///      podman record. The podman handle (`rm -af`) is destroyed ONLY
-///      when the reap confirms the PID is gone; if a known PID is
+///   2. **PID-based reap** — signal+verify the captured host conmon AND
+///      workload PIDs directly through the [`ProcessProbe`], independent
+///      of the podman record. The podman handle (`rm -af`) is destroyed
+///      ONLY when the reap confirms BOTH are gone; if any known PID is
 ///      still alive the handle is left intact and the returned
 ///      [`ReapStatus`] is `OrphanSurvives`.
 pub fn signal_shutdown<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
@@ -253,33 +303,34 @@ pub fn signal_shutdown<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&st
     clock: &C,
     probe: &P,
     cfg: &PollConfig,
-    workload_pid: Option<(u32, Option<u64>)>,
+    captured: &CapturedPids,
     log: &mut L,
 ) -> ReapStatus {
     record_based_signal(backend, clock, cfg, log);
-    let reap = reap_workload_pid(probe, clock, cfg, workload_pid, log);
-    // When the direct PID-reap could not confirm the workload dead,
-    // try the graceful last resort BEFORE giving up: write the panik
-    // sentinel the secondary's own watcher monitors and wait a bounded
-    // window for it to shut down and exit on its own. This can only
-    // ever DOWNGRADE OrphanSurvives → ConfirmedGone (the workload
-    // self-exited) — it never escalates, never sends a signal, never
-    // removes anything. Any other reap status (ConfirmedGone /
-    // NotApplicable) passes through untouched.
+    let reap = reap_captured_pids(probe, clock, cfg, captured, log);
+    // When the direct PID-reap could not confirm the set dead, try the
+    // graceful last resort BEFORE giving up: write the panik sentinel the
+    // secondary's own watcher monitors and wait a bounded window for it
+    // to shut down and exit on its own. This can only ever DOWNGRADE
+    // OrphanSurvives → ConfirmedGone (the workload self-exited) — it never
+    // escalates, never sends a signal, never removes anything. Any other
+    // reap status (ConfirmedGone / NotApplicable) passes through
+    // untouched. It keys on the WORKLOAD PID: the secondary's in-container
+    // watcher stops the workload, and conmon exits after its child under
+    // `--rm`, so a confirmed-gone workload clears the whole set.
     let reap = match reap {
         ReapStatus::OrphanSurvives => {
-            graceful_panik_file_attempt(probe, clock, cfg, workload_pid, log)
+            graceful_panik_file_attempt(probe, clock, cfg, captured.workload, log)
         }
         other => other,
     };
     // Destroy the podman handle ONLY when nothing known is still alive.
-    // Removing it while the workload survives is exactly the defect
-    // that empties `podman ps -a` and turns every later name-based
-    // kill into a no-op.
+    // Removing it while a PID survives is exactly the defect that empties
+    // `podman ps -a` and turns every later name-based kill into a no-op.
     match reap {
         ReapStatus::OrphanSurvives => log(
-            "workload PID still alive after SIGKILL grace; LEAVING podman handle \
-             intact (not rm-ing) so the orphan stays inspectable",
+            "a captured PID is still alive after SIGKILL grace; LEAVING podman \
+             handle intact (not rm-ing) so the orphan stays inspectable",
         ),
         ReapStatus::ConfirmedGone | ReapStatus::NotApplicable => {
             let _ = backend.rm_all();
@@ -420,67 +471,26 @@ fn record_based_signal<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
     }
 }
 
-/// Stage 2: reap the captured host workload PID directly, independent
-/// of the podman record. SIGTERM → bounded grace → SIGKILL → bounded
-/// grace → final verify. Returns the [`ReapStatus`] the caller uses to
-/// decide whether to destroy the podman handle and what exit code the
-/// manager reports.
-///
-/// Conservative by construction:
-///   * signals only the ONE captured PID — never a pattern/pkill;
-///   * before EVERY signal it re-confirms the PID still names the
-///     SAME process via the captured start time
-///     ([`ProcessProbe::is_same_process`]); a PID that is gone OR
-///     whose start time has changed (kernel PID reuse) short-circuits
-///     to `ConfirmedGone` with NO signal sent, so the reap signal only
-///     ever reaches the genuine original workload;
-///   * escalation to SIGKILL only happens if the PID survives the
-///     SIGTERM grace; `OrphanSurvives` is returned only after SIGKILL
-///     plus its own grace fail to clear it (a stuck/uninterruptible
-///     process), so the manager never reports success over a live PID.
-fn reap_workload_pid<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
+/// Stage 2: reap the captured host conmon + workload PIDs directly,
+/// independent of the podman record. Delegates the SIGTERM → grace →
+/// SIGKILL → grace → verify state-machine to the shared
+/// [`dynrunner_reap::reap`] crate (the SAME reap the wrapper's in-band
+/// teardown uses), mapping the manager's configured graces onto
+/// [`ReapGraces`]. Returns the [`ReapStatus`] the caller uses to decide
+/// whether to destroy the podman handle and what exit code to report.
+fn reap_captured_pids<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
     probe: &P,
     clock: &C,
     cfg: &PollConfig,
-    workload_pid: Option<(u32, Option<u64>)>,
+    captured: &CapturedPids,
     log: &mut L,
 ) -> ReapStatus {
-    let Some((pid, captured_start)) = workload_pid else {
-        log("no workload PID was captured; nothing to reap by PID");
-        return ReapStatus::NotApplicable;
+    let targets = captured.targets();
+    let graces = ReapGraces {
+        sigterm_grace: cfg.secondary_grace,
+        sigkill_grace: cfg.container_stop_grace,
     };
-    if !probe.is_same_process(pid, captured_start) {
-        log(&format!(
-            "workload PID {} gone or reused (start time no longer matches); no signal sent",
-            pid
-        ));
-        return ReapStatus::ConfirmedGone;
-    }
-
-    let term_ok = probe.signal(pid, libc::SIGTERM);
-    log(&format!("kill -TERM {} → {}", pid, term_ok));
-    if wait_for_pid_gone(probe, clock, pid, captured_start, cfg.secondary_grace, log) {
-        return ReapStatus::ConfirmedGone;
-    }
-
-    log(&format!(
-        "workload PID {} still alive after {}s; escalating to SIGKILL",
-        pid,
-        cfg.secondary_grace.as_secs()
-    ));
-    let kill_ok = probe.signal(pid, libc::SIGKILL);
-    log(&format!("kill -KILL {} → {}", pid, kill_ok));
-    match wait_for_pid_gone(probe, clock, pid, captured_start, cfg.container_stop_grace, log) {
-        true => ReapStatus::ConfirmedGone,
-        false => {
-            log(&format!(
-                "workload PID {} STILL alive after SIGKILL + {}s grace",
-                pid,
-                cfg.container_stop_grace.as_secs()
-            ));
-            ReapStatus::OrphanSurvives
-        }
-    }
+    reap_pids(probe, clock, &targets, graces, log)
 }
 
 /// IDLE_SHUTDOWN branch.
@@ -527,39 +537,6 @@ fn wait_for_exit<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
         elapsed += tick;
     }
     log(&format!("grace of {}s elapsed; container still alive", grace.as_secs()));
-}
-
-/// Poll the captured workload's identity-aware liveness once per second
-/// up to `grace`, returning `true` as soon as the PID is gone (or its
-/// start time no longer matches — a reused PID is treated as gone, the
-/// reap-success condition) and `false` if `grace` elapses with the SAME
-/// process still alive. The 1-second cadence mirrors [`wait_for_exit`]
-/// and is intentionally independent of `poll_interval`.
-fn wait_for_pid_gone<P: ProcessProbe, C: Clock, L: FnMut(&str)>(
-    probe: &P,
-    clock: &C,
-    pid: u32,
-    captured_start: Option<u64>,
-    grace: Duration,
-    log: &mut L,
-) -> bool {
-    let tick = Duration::from_secs(1);
-    let mut elapsed = Duration::ZERO;
-    while elapsed < grace {
-        if !probe.is_same_process(pid, captured_start) {
-            log(&format!(
-                "workload PID {} exited after {}s",
-                pid,
-                elapsed.as_secs()
-            ));
-            return true;
-        }
-        clock.sleep(tick);
-        elapsed += tick;
-    }
-    // Final check after the last sleep so a process that dies exactly
-    // on the boundary is still observed as gone.
-    !probe.is_same_process(pid, captured_start)
 }
 
 /// Ceiling division `idle_shutdown / poll_interval`, with at least 1

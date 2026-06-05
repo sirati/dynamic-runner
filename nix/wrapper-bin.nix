@@ -1,4 +1,30 @@
-{ pkgsCross }:
+{ pkgsCross, lib }:
+
+# The standalone `slurm-wrapper` workspace now path-depends on
+# `crates/dynrunner-reap` (the shared reap state-machine, also used by the
+# shutdown-manager), which lives OUTSIDE the `slurm-wrapper/` subtree. So
+# `src` can no longer be `../slurm-wrapper` alone — it must also include
+# `crates/dynrunner-reap`. We therefore root `src` at the repo and filter
+# to exactly the two trees the wrapper workspace reads, then point
+# `cargoRoot` at the `slurm-wrapper` manifest. The filter keeps the
+# rebuild trigger tight (edits elsewhere in the repo don't invalidate this
+# derivation) — only `slurm-wrapper/**` and `crates/dynrunner-reap/**`
+# changes do.
+let
+  # The wrapper workspace path-depends on `crates/dynrunner-reap`, so the
+  # src must include BOTH trees with their RELATIVE layout preserved (the
+  # `../../crates/dynrunner-reap` path-dep must resolve). `lib.fileset` is
+  # the robust API for "union these subtrees into one source": it keeps the
+  # repo-relative paths intact and includes ancestor dirs automatically, so
+  # no hand-rolled prefix/ancestor filter is needed.
+  wrapperSrc = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../slurm-wrapper
+      ../crates/dynrunner-reap
+    ];
+  };
+in
 
 # Musl-static rustPlatform for the slurm-wrapper binary.
 # Kept distinct from the framework wheel's rustPlatform
@@ -39,7 +65,23 @@ pkgsCross.musl64.pkgsStatic.rustPlatform.buildRustPackage {
   # `wrapper` member depends on `config` with the `cli` feature
   # (so clap is pulled in by a normal workspace build); no extra
   # feature flag is required here.
-  src = ../slurm-wrapper;
+  # Repo-root-filtered src (see the `let` above): includes both the
+  # `slurm-wrapper` workspace AND the `crates/dynrunner-reap` path-dep it
+  # now references. `buildAndTestSubdir` runs the cargo build/check/install
+  # hooks INSIDE `slurm-wrapper/` (where the workspace manifest + Cargo.lock
+  # live) while keeping the full filtered tree as the source — so the
+  # wrapper's `../../crates/dynrunner-reap` path-dep resolves to
+  # `<src>/crates/dynrunner-reap`, present in the tree. (Plain `cargoRoot`
+  # only relocates vendoring, not the build cwd, so the build cargo ran at
+  # the src root and could not find the manifest.)
+  src = wrapperSrc;
+  # `cargoRoot` tells the vendor + lockfile-consistency hooks the Cargo.lock
+  # lives in `slurm-wrapper/`; `buildAndTestSubdir` runs the build/check
+  # hooks there too. Both are needed in this nixpkgs: `cargoRoot` alone
+  # left the build cwd at the src root (no manifest), `buildAndTestSubdir`
+  # alone made the lock hook look for Cargo.lock at the src root.
+  cargoRoot = "slurm-wrapper";
+  buildAndTestSubdir = "slurm-wrapper";
   cargoLock.lockFile = ../slurm-wrapper/Cargo.lock;
   # Build only the wrapper member's binary. The `config` member is
   # a pure lib (also consumed by the root workspace as a path-dep),

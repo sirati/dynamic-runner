@@ -35,6 +35,13 @@ const SRC_NETWORK_CONTAINER_PATH: &str = "/app/src-network";
 /// faithful equivalent. If a consumer is found to pass quoted/space-bearing
 /// container-command args, this split would diverge from bash and the
 /// contract must move `container_command` to a pre-split `Vec<String>`.
+// The argv is built by interleaved conditional `push`es with per-section
+// generate.rs provenance comments; a `vec![]` literal would erase that
+// structure (and is impossible across the conditionals). The eight inputs
+// are each a distinct, independent container-launch parameter — bundling
+// them into a struct would only move the same arity behind a name. Both
+// are deliberate, not accidental complexity.
+#[allow(clippy::vec_init_then_push, clippy::too_many_arguments)]
 pub fn build_run_argv(
     cfg: &WrapperConfig,
     layout: &Layout,
@@ -43,6 +50,7 @@ pub fn build_run_argv(
     peer_ips: &PeerIps,
     quic_port: u16,
     secondary_url: &str,
+    cgroup_parent: Option<&str>,
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
 
@@ -58,6 +66,20 @@ pub fn build_run_argv(
     // ---- run + fixed flags — generate.rs:826-831 ----
     argv.push("run".to_string());
     argv.push("--rm".to_string());
+    // Containment (design §4 a1): when the wrapper's job cgroup is
+    // delegated (the caller's `cgroup_parent` probe passed), create the
+    // container's cgroup BENEATH the slurmstepd job cgroup so conmon + the
+    // container land inside SLURM's authoritative `proctrack/cgroup` sweep
+    // and are reaped at `KillWait` with no dynrunner watchdog needed.
+    // `--cgroups=enabled` ensures podman actually creates the cgroup (not
+    // `no-conmon`/`disabled`). Omitted when the probe failed (no
+    // delegation): then the post-launch cgroup.procs adopt (a2) + the
+    // in-band reap (b) carry the load, so `None` here yields the
+    // byte-for-byte pre-existing argv.
+    if let Some(parent) = cgroup_parent {
+        argv.push(format!("--cgroup-parent={parent}"));
+        argv.push("--cgroups=enabled".to_string());
+    }
     argv.push("--name".to_string());
     argv.push(layout.container_name.clone());
     argv.push("--pull=never".to_string());
@@ -270,6 +292,7 @@ mod tests {
             &both_ips(),
             7777,
             secondary_url,
+            None,
         );
 
         let expected: Vec<String> = vec![
@@ -344,6 +367,64 @@ mod tests {
         assert!(argv.contains(&"--log-level=debug".to_string()));
     }
 
+    /// (a1) With a delegated job cgroup the caller passes `Some(parent)`:
+    /// `--cgroup-parent=<parent>` + `--cgroups=enabled` are inserted right
+    /// after `run --rm` (before `--name`), and NOTHING else changes vs the
+    /// `None` argv. This pins the containment-flag placement and proves
+    /// the flags are gated on the parent being present.
+    #[test]
+    fn cgroup_parent_inserts_containment_flags_after_run_rm() {
+        let cfg = maximal_cfg(ConnectionMode::Standard {
+            gateway_host: "gw.cluster".to_string(),
+            gateway_port: 4433,
+        });
+        let parent = "/system.slice/slurmstepd.scope/job_153731/step_batch";
+        let with_parent = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(8_589_934_592),
+            &both_ips(),
+            7777,
+            "tcp://gw.cluster:4433",
+            Some(parent),
+        );
+        let without_parent = build_run_argv(
+            &cfg,
+            &layout(),
+            &bins(),
+            Some(8_589_934_592),
+            &both_ips(),
+            7777,
+            "tcp://gw.cluster:4433",
+            None,
+        );
+
+        // The two argvs differ ONLY by the two containment tokens inserted
+        // immediately after `run --rm`.
+        let rm_idx = with_parent
+            .iter()
+            .position(|a| a == "--rm")
+            .expect("--rm present");
+        assert_eq!(
+            with_parent[rm_idx + 1],
+            format!("--cgroup-parent={parent}"),
+            "--cgroup-parent must follow --rm"
+        );
+        assert_eq!(
+            with_parent[rm_idx + 2], "--cgroups=enabled",
+            "--cgroups=enabled must follow --cgroup-parent"
+        );
+        // Removing the two inserted tokens reproduces the None argv exactly.
+        let mut stripped = with_parent.clone();
+        stripped.remove(rm_idx + 2);
+        stripped.remove(rm_idx + 1);
+        assert_eq!(
+            stripped, without_parent,
+            "Some(parent) must add EXACTLY the two containment tokens and nothing else"
+        );
+    }
+
     /// (b) Minimal case: no mem cap, no dynrunner, no mem-manager-reserved,
     /// empty extra/forwarded, both peer IPs None — empty env values, no
     /// `--memory`/dynrunner tokens.
@@ -362,6 +443,7 @@ mod tests {
             &PeerIps::default(),
             5555,
             secondary_url,
+            None,
         );
 
         let expected: Vec<String> = vec![
@@ -448,6 +530,7 @@ mod tests {
             &both_ips(),
             9001,
             secondary_url,
+            None,
         );
 
         // Find the `--secondary` flag and assert its value token follows.
@@ -481,6 +564,7 @@ mod tests {
             &both_ips(),
             7777,
             "tcp://gw:4433",
+            None,
         );
 
         assert!(
