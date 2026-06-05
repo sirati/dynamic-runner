@@ -34,12 +34,15 @@
 use std::collections::HashMap;
 
 use dynrunner_core::PhaseId;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, MessageType};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary};
+use super::super::test_helpers::{
+    FakeWorkerFactory, FixedEstimator, TestId, channel_mesh_to_primary, seed_member,
+    set_current_primary,
+};
 use super::super::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use super::processing::make_binary;
 
@@ -55,20 +58,14 @@ async fn pre_staged_fake_primary(
     mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
-    // Welcome + cert exchange.
-    let mut got_welcome = false;
-    let mut got_cert = false;
-    while !got_welcome || !got_cert {
-        match from_secondary.recv().await {
-            Some(msg) => match msg.msg_type() {
-                MessageType::SecondaryWelcome => got_welcome = true,
-                MessageType::CertExchange => got_cert = true,
-                _ => {}
-            },
-            None => return,
-        }
-    }
-
+    // This scenario models the PROMOTED, co-located node: it is already the
+    // recognized `current_primary` (seeded on its mirror below) BEFORE setup
+    // runs, so its `SecondaryWelcome` / `CertExchange` resolve to
+    // `Destination::Primary == self` → the in-process loopback (CH2), not the
+    // wire. The fake primary therefore never sees those frames; it drives the
+    // load-bearing setup trio (PeerInfo / InitialAssignment / TransferComplete)
+    // straight away and the secondary's `wait_for_setup` consumes them as
+    // before.
     to_secondary
         .send(DistributedMessage::PeerInfo {
             sender_id: "primary".into(),
@@ -179,6 +176,27 @@ async fn colocated_loopback_run_complete_breaks_loop_after_setup_pending_reentry
             // test owns the sender and plays the primary's broadcast leg.
             let (loopback_tx, loopback_rx) = tokio_mpsc::unbounded_channel();
             secondary.register_colocated_loopback_inbound(loopback_rx);
+
+            // Pre-staged setup-discovery now fires only on the SINGLE
+            // designated discoverer once it has BECOME the authority — the
+            // promoted, co-located node this scenario models. Seed that node's
+            // replicated mirror straight onto `cluster_state` (the CRDT, NOT
+            // the FSM-side `apply_primary_changed`, so no real co-located
+            // primary build is triggered — this test injects the run-over
+            // signal on CH1 directly):
+            //   - `seed_member` makes `sec-0` the sole alive, `can_be_primary`,
+            //     non-observer worker-secondary → the lowest-id designate;
+            //   - `set_current_primary` makes `current_primary == self` → the
+            //     authority axis.
+            // CH2 (the co-located-primary inbound sender) is wired to a sink so
+            // the secondary's `SecondaryWelcome` / `CertExchange`, which now
+            // resolve `Destination::Primary` to self → loopback, have a
+            // receiver instead of being dropped (the fake primary deliberately
+            // does not wait for them — see `pre_staged_fake_primary`).
+            seed_member(&mut secondary, "sec-0", true, false);
+            set_current_primary(&mut secondary, "sec-0");
+            let (colocated_tx, _colocated_rx) = tokio_mpsc::unbounded_channel();
+            secondary.register_colocated_primary_inbound(colocated_tx);
 
             let mut factory = FakeWorkerFactory;
 

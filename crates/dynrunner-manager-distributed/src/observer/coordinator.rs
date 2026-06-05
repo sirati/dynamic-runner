@@ -66,7 +66,7 @@ use crate::anti_entropy::{self, RequesterIdentity};
 use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
-use crate::observer::lifecycle::attach_observer_announcer;
+use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
@@ -194,8 +194,12 @@ where
     /// panik arm (BUG-4: the arm CONSUMES it — never a registered-but-
     /// never-consumed rx).
     panik_signal_rx: Option<oneshot::Receiver<PanikSignal>>,
-    /// The observer's static resource-holdings (default empty).
-    holdings: HashSet<String>,
+    /// The resource-holdings announcer's wiring, attached at construction
+    /// (BEFORE the cold-join factory's snapshot restore — see
+    /// [`build_cold_join_observer`]) so the restore's role-change hook fires
+    /// the initial `AnnounceTrigger` into the registered channel rather than
+    /// dropping it. [`Self::run`] takes it to spawn the announcer task.
+    announcer_handle: Option<AnnouncerHandle>,
     /// The setup-deadline elapsed, recorded for the GIL-side tail when the
     /// deadline genuinely expired (mirrors the primary's outcome slot).
     setup_deadline_elapsed: Option<Duration>,
@@ -285,6 +289,15 @@ where
         // dispatcher, which `run` spawns with the Policy B/D listeners.
         let (task_tx, task_rx) = mpsc::unbounded_channel::<TaskCompletedEvent>();
         cluster_state.install_task_completed_sender(task_tx);
+        // Attach the resource-holdings announcer's role-change hook on the
+        // moved-in (already-converged) ledger. The relocation path does no
+        // post-attach restore, so no initial trigger is dropped here; the
+        // hook still fires on every later `PrimaryChanged`. Attaching at
+        // construction (vs. in `run`) keeps the announcer wiring uniform
+        // across both constructors — `run` only ever spawns from the stored
+        // handle.
+        let announcer_handle =
+            attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
         Self {
             transport,
             cluster_state,
@@ -301,7 +314,7 @@ where
             inherited_task_completed_dispatcher: Some(task_completed_dispatcher_handle),
             lifecycle_dispatcher_handle: Some(lifecycle_dispatcher_handle),
             panik_signal_rx,
-            holdings,
+            announcer_handle: Some(announcer_handle),
             setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
         }
@@ -330,6 +343,19 @@ where
         // install so restore-delivered events are captured too.
         let (task_tx, task_rx) = mpsc::unbounded_channel::<TaskCompletedEvent>();
         cluster_state.install_task_completed_sender(task_tx);
+        // Attach the resource-holdings announcer's role-change hook HERE,
+        // BEFORE the cold-join factory's snapshot restore runs. The
+        // restore's `primary_epoch > local` branch fires
+        // `fire_role_change_hooks` from inside `cluster_state.restore`; with
+        // the hook registered first, that fire pushes the initial
+        // `AnnounceTrigger` into the registered channel (mirrors the
+        // attach-then-restore ordering the late-joiner pinned). `run` takes
+        // the handle to spawn the announcer task, which drains the queued
+        // trigger first. (Attaching here rather than in `run` is the fix for
+        // the dropped initial announce: with attach-in-`run`, the factory's
+        // restore had already fired the hook before any announcer existed.)
+        let announcer_handle =
+            attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
         Self {
             transport,
             cluster_state,
@@ -342,7 +368,7 @@ where
             inherited_task_completed_dispatcher: None,
             lifecycle_dispatcher_handle: None,
             panik_signal_rx,
-            holdings,
+            announcer_handle: Some(announcer_handle),
             setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
         }
@@ -492,14 +518,17 @@ where
             },
         ));
 
-        // Observer announcer (holdings, default empty). The bootstrap
-        // restore already happened pre-construction (cold-join factory) or
-        // pre-handoff (relocation), so there is no restore-time trigger to
-        // catch here; the announcer still fires on every later
-        // `PrimaryChanged` via the role-change hook this attach registers.
-        let holdings = std::mem::take(&mut self.holdings);
-        let announcer_handle =
-            attach_observer_announcer(&mut self.cluster_state, holdings, self.config.node_id.clone());
+        // Observer announcer. The role-change hook was attached at
+        // CONSTRUCTION (before the cold-join factory's snapshot restore), so
+        // the restore's role-change fire already pushed the initial
+        // `AnnounceTrigger` into the handle's channel — the task drains it on
+        // first poll. Here we only build the production cross-task sender and
+        // spawn the task from the stored handle. The hook also fires on every
+        // later `PrimaryChanged`.
+        let announcer_handle = self
+            .announcer_handle
+            .take()
+            .expect("announcer_handle is set by both constructors");
         let (announcer_outbox_tx, mut announcer_outbox_rx) =
             mpsc::channel::<AnnouncerOutboxItem<I>>(8);
         let announcer_sender =
@@ -912,7 +941,7 @@ where
         } else {
             format!("panik file: {}", matched_path.display())
         };
-        tracing::warn!(
+        tracing::error!(
             matched_path = %matched_path.display(),
             reason = %reason,
             "observer panik signal observed; announcing self-departure and exiting 137"
@@ -976,12 +1005,18 @@ where
 
     let required_setup = config.required_setup_on_promote;
     let node_id = config.node_id.clone();
-    // `with_pieces` installs the task_completed sender. Construct FIRST,
-    // then restore the bootstrap snapshot(s) into the now-sender-wired
-    // ledger so restore-delivered `TaskCompleted` events are buffered in
-    // the dispatcher channel (install sender → restore → … → spawn, the
-    // load-bearing ordering). `restore` is an idempotent lattice merge;
-    // applying each responder's snapshot unions them.
+    // `with_pieces` installs the task_completed sender AND attaches the
+    // resource-holdings announcer's role-change hook. Construct FIRST, then
+    // restore the bootstrap snapshot(s) into the now-wired ledger so:
+    //   (a) restore-delivered `TaskCompleted` events are buffered in the
+    //       dispatcher channel, and
+    //   (b) the restore's role-change fire pushes the initial
+    //       `AnnounceTrigger` into the announcer channel (the announcer hook
+    //       is registered, so the initial holdings announce is NOT dropped).
+    // The full load-bearing ordering is: install sender + attach announcer →
+    // restore → register listeners + spawn (in `run`). `restore` is an
+    // idempotent lattice merge; applying each responder's snapshot unions
+    // them.
     let mut coordinator = ObserverCoordinator::with_pieces(
         transport,
         cluster_state,

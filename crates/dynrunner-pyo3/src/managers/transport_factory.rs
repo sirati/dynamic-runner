@@ -273,17 +273,6 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     })
 }
 
-/// An observer late-joiner's mesh transport plus its `PeerCertInfo`.
-pub(crate) struct ObserverMeshBundle<I: Identifier> {
-    /// The opaque mesh transport. The manager runs the bootstrap
-    /// rendezvous (`join_running_cluster`, a `PeerTransport` trait
-    /// method) on it, then hands it to the coordinator by value.
-    pub transport: PeerNetwork<I>,
-    /// The `PeerCertInfo` the observer ships so peers can dial back
-    /// (e.g. for snapshot RPCs from a later joiner).
-    pub peer_cert_info: PeerCertInfo,
-}
-
 /// Stand up the observer late-joiner's peer transport.
 ///
 /// The CN baked into the cert MUST match `observer_id` because every
@@ -291,25 +280,18 @@ pub(crate) struct ObserverMeshBundle<I: Identifier> {
 /// rendezvous (`join_running_cluster`) runs on the returned transport in
 /// `run.rs` — it is a `PeerTransport` trait method and names no backend.
 ///
+/// Returns the bare `PeerNetwork`: the standalone, apply-only
+/// `ObserverCoordinator` holds the mesh transport directly and ships no
+/// `PeerCertInfo` (it ignores cert-exchange frames), so the
+/// secondary-style cert bundle the late-joiner used to build is gone.
+///
 /// Must run inside the coordinator's `LocalSet`.
 pub(crate) async fn observer_mesh<I: Identifier>(
     observer_id: &str,
-    ipv4_address: Option<String>,
-    ipv6_address: Option<String>,
-) -> Result<ObserverMeshBundle<I>, String> {
-    let peer_network = PeerNetwork::<I>::start(observer_id)
+) -> Result<PeerNetwork<I>, String> {
+    PeerNetwork::<I>::start(observer_id)
         .await
-        .map_err(|e| format!("failed to start peer network: {e}"))?;
-    let peer_cert_info = PeerCertInfo {
-        public_cert_pem: peer_network.cert_pem().to_string(),
-        ipv4_address,
-        ipv6_address,
-        quic_port: peer_network.port(),
-    };
-    Ok(ObserverMeshBundle {
-        transport: peer_network,
-        peer_cert_info,
-    })
+        .map_err(|e| format!("failed to start peer network: {e}"))
 }
 
 /// Build an on-demand co-located primary's role-blind mesh transport over
