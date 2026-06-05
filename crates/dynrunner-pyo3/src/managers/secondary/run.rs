@@ -95,6 +95,22 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
+        // Setup-defer mode for THIS run, as a `Copy` bool captured before
+        // `cfg_src_network` is moved into `SecondaryConfig` below. True iff
+        // the submitter deferred discovery / ledger-seed to the chosen
+        // compute peer (the `--source-already-staged` path: `src_network`
+        // is the staged-corpus bind-mount root, `Some` only in that mode).
+        // Propagated into the on-demand-built primary's `PrimaryConfig`
+        // (`required_setup_on_promote`) so a co-located primary activated
+        // from an EMPTY snapshot on the discovery node engages the
+        // `setup_pending()` suppressor + setup-promote-deadline backstop
+        // (see the activator below). In legacy / non-pre-staged runs this
+        // is `false`, leaving the activated primary on the unchanged
+        // bootstrap-exit path. Failover within a pre-staged run is
+        // self-correcting regardless: the snapshot is non-empty there, so
+        // `setup_pending()` (`required && task_count == 0`) is false on the
+        // first iteration.
+        let setup_defer_on_promote = cfg_src_network.is_some();
 
         // Snapshot the cap, flip `run_started`, and consume the
         // command-channel receiver for the detached runtime in one
@@ -554,6 +570,26 @@ impl PySecondaryCoordinator {
                     // restored CRDT snapshot seeds `phase_deps` /
                     // `total_tasks` at activation, so the config's task-graph
                     // fields stay at their defaults.
+                    //
+                    // `required_setup_on_promote` carries THIS run's
+                    // setup-defer mode into the activated primary. On the
+                    // `--source-already-staged` path the discovery node IS
+                    // the co-located primary, and it activates from an EMPTY
+                    // snapshot (discovery hasn't seeded the ledger yet). With
+                    // the flag set, `setup_pending()` (`required &&
+                    // task_count == 0`) suppresses the run-complete exits
+                    // until the loopback-delivered `TaskAdded` batch lands —
+                    // a STANDING gate, robust to the batch arriving after the
+                    // first would-be completion check. A genuinely-empty
+                    // discovery (0 tasks) still exits PROMPTLY: the discovery
+                    // node broadcasts `RunComplete` (see
+                    // `ingest_setup_discovery`), which loops back and trips
+                    // the ungated `RunComplete` exit — no wait on the
+                    // setup-promote deadline. The deadline stays a backstop
+                    // for a wedged-discovery feed. Defaulting this `false`
+                    // (the pre-fix shape) let the activated primary declare
+                    // `0+0 >= 0` run-complete before its own discovery batch
+                    // arrived.
                     let primary_config = dynrunner_manager_distributed::PrimaryConfig {
                         node_id: secondary_id.clone(),
                         keepalive_interval: dist_keepalive,
@@ -561,6 +597,7 @@ impl PySecondaryCoordinator {
                         keepalive_miss_threshold: dist_keepalive_miss_threshold,
                         retry_max_passes: dist_retry_max_passes,
                         oom_retry_max_passes: dist_oom_retry_max_passes,
+                        required_setup_on_promote: setup_defer_on_promote,
                         ..dynrunner_manager_distributed::PrimaryConfig::default()
                     };
                     let primary_scheduler = scheduler_config.build_memory_scheduler();
