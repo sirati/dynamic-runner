@@ -721,7 +721,7 @@ impl PySecondaryCoordinator {
                                     // `exit(137)` call (and the log); this
                                     // arm just propagates the matched_path
                                     // through the loop's typed result.
-                                    tracing::warn!(
+                                    tracing::error!(
                                         matched_path = %matched_path.display(),
                                         reason = %reason,
                                         "secondary panik shutdown; propagating \

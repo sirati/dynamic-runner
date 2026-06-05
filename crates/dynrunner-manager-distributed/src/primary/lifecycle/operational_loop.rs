@@ -665,7 +665,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         // `run_pipeline` consumes `panik_outcome`
                         // after the loop returns Ok and surfaces
                         // `RunError::PanikShutdown` to the caller.
-                        tracing::warn!(
+                        tracing::error!(
                             "primary operational loop exiting via panik path"
                         );
                         break;

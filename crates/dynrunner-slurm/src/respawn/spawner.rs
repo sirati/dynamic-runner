@@ -141,7 +141,7 @@ where
             let job_id = {
                 let mut mgr = job_manager.lock().await;
                 match mgr
-                    .submit_job(&wrapper_script, &secondary_id, 1, &run_log_dir)
+                    .submit_job(&wrapper_script, &secondary_id, &secondary_id, 1, &run_log_dir)
                     .await
                 {
                     Ok(id) => id,

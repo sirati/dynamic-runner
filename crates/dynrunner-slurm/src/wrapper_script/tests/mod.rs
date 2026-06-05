@@ -35,6 +35,7 @@ pub(super) fn standard_cfg<'a>(
         image_name: "test-app",
         image_tag: "latest",
         image_tar_basename: "test-app.tar",
+        image_digest: "testdigest0001",
         load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
         container_command: "dynamic_batch_tokenizer",
         cores_spec: "0",

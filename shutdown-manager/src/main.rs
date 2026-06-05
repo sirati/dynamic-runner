@@ -7,7 +7,7 @@
 use dynrunner_slurm_shutdown::cleanup::{final_cleanup, write_pid_file};
 use dynrunner_slurm_shutdown::clock::RealClock;
 use dynrunner_slurm_shutdown::config::{Config, parse};
-use dynrunner_slurm_shutdown::poll_loop::{PollConfig, ReapStatus, run};
+use dynrunner_slurm_shutdown::poll_loop::{Outcome, PollConfig, ReapStatus, run};
 use dynrunner_slurm_shutdown::podman::RealPodman;
 use dynrunner_slurm_shutdown::process_probe::KillProbe;
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
@@ -130,6 +130,20 @@ fn run_with_config(cfg: Config) -> ExitCode {
         log(&format!("wrapper-monitor enabled; watching pid {}", p));
     }
     let report = run(&backend, &flag, &clock, &probe, &poll_cfg, &mut log);
+    // When a signal drove the shutdown, report WHO sent it (sender pid +
+    // binary + full cmdline) and WHY we tore down — the diagnostic that
+    // tells the operator whether the kill came from slurmstepd (SLURM
+    // TIMEOUT/scancel), the wrapper/coordinator, or the kernel OOM-killer.
+    // `None` when the SignalShutdown branch was reached for a non-signal
+    // reason (the monitored wrapper PID disappeared), which the loop has
+    // already logged as such.
+    if report.outcome == Outcome::SignalShutdown {
+        if let Some(line) =
+            signals::describe_last_signal("the shutdown flag was set by an incoming signal")
+        {
+            log(&line);
+        }
+    }
     log(&format!("state machine completed: {:?}", report));
     // When the reaper left a live orphan (and its podman handle) intact,
     // preserve the scratch tree too so the orphan stays inspectable —

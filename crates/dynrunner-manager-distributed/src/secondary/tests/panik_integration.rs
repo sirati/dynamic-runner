@@ -158,6 +158,8 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let _ = panik_tx.send(crate::panik_watcher::PanikSignal {
                     matched_path: path_for_signal,
+                    // File source carries no signal, hence no sender PID.
+                    sender_pid: None,
                 });
             });
 
@@ -404,6 +406,9 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 let _ = panik_tx.send(crate::panik_watcher::PanikSignal {
                     matched_path: path_for_signal,
+                    // SIGTERM source carries the sender PID; a synthetic
+                    // non-zero PID exercises the sender-carrying branch.
+                    sender_pid: Some(12345),
                 });
             });
 

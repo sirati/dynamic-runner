@@ -60,6 +60,13 @@ rcgen = "0.13"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 nix = { version = "0.29", features = ["socket", "process", "signal"] }
+# Raw siginfo_t access (`si_pid()`) for the panik-watcher SIGTERM sender
+# capture. Already in the tree transitively via tokio's signal driver.
+libc = "0.2"
+# Chained SA_SIGINFO registration so the panik watcher can record the
+# SIGTERM sender PID alongside tokio's own self-pipe wakeup (both run in
+# the registry's multiplexed handler on a single delivery).
+signal-hook-registry = "1.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 base64 = "0.22"

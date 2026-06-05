@@ -620,7 +620,7 @@ impl PyLocalManager {
                         LocalRunOutcome::Done(result)
                     }
                     RaceOutcome::Panik(matched_path) => {
-                        tracing::warn!(
+                        tracing::error!(
                             matched_path = %matched_path.display(),
                             "panik signal observed on local manager; \
                              tearing down worker process trees"

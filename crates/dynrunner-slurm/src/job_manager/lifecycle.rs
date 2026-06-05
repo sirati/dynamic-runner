@@ -49,22 +49,33 @@ impl<G: Gateway> SlurmJobManager<G> {
     ///   that sets it explicitly get the `sbatch --mem=` cap. No-op for
     ///   any caller using the Python-default config.
     ///
-    /// `run_log_dir` is used verbatim as the prefix of the
-    /// `--output=`/`--error=` paths. Tilde expansion (`~/…` →
-    /// `/home/u/…`) is the caller's responsibility: the bash shell
-    /// expands a leading `~` for the trailing script-path argument and
-    /// for redirected paths in the write command, but it does NOT
-    /// expand `~` after `=` in `--output=~/…` style arguments, so
-    /// callers that hand a `~`-prefixed `run_log_dir` to `submit_job`
-    /// will end up with sbatch literally writing to `~/…`. The PyO3
-    /// bridge (see `crates/dynrunner-pyo3/src/slurm/job_manager.rs`)
-    /// expands tilde against the Python gateway's `remote_home` before
-    /// forwarding here, matching the legacy Python `_expand_path` call
-    /// site.
+    /// `<run_log_dir>/<secondary_id>` is the prefix of the
+    /// `--output=`/`--error=` paths: the SLURM batch-script stdout/stderr
+    /// (`slurm_<jobid>.out`/`.err`) land in the SAME per-secondary folder
+    /// the worker and role logs use, rather than spilling at the run-dir
+    /// root. The folder is `mkdir -p`'d on the gateway before sbatch runs
+    /// because SLURM does NOT create the parent directory for an
+    /// `--output=` path. Tilde expansion (`~/…` → `/home/u/…`) is the
+    /// caller's responsibility: the bash shell expands a leading `~` for
+    /// the trailing script-path argument and for redirected paths in the
+    /// write command, but it does NOT expand `~` after `=` in
+    /// `--output=~/…` style arguments, so callers that hand a
+    /// `~`-prefixed `run_log_dir` to `submit_job` will end up with sbatch
+    /// literally writing to `~/…`. The PyO3 bridge (see
+    /// `crates/dynrunner-pyo3/src/slurm/job_manager.rs`) expands tilde
+    /// against the Python gateway's `remote_home` before forwarding here,
+    /// matching the legacy Python `_expand_path` call site.
+    ///
+    /// `secondary_id` is known at submit time in every path: the initial
+    /// cohort assigns `secondary-{i}` deterministically by index before
+    /// rendering the wrapper, and the respawn path carries the
+    /// replacement id. SLURM's own job id (`%j`) is still resolved by
+    /// SLURM at job start and appended to the filename.
     pub async fn submit_job(
         &mut self,
         wrapper_script: &str,
         job_name: &str,
+        secondary_id: &str,
         nodes: u32,
         run_log_dir: &str,
     ) -> Result<String, SlurmError> {
@@ -84,6 +95,16 @@ impl<G: Gateway> SlurmJobManager<G> {
                 result.stderr
             )));
         }
+
+        // Per-secondary log folder for sbatch's own stdout/stderr.
+        // SLURM does NOT create the parent directory for an `--output=`
+        // path, so `mkdir -p` it here (before sbatch) — otherwise the
+        // batch job's `slurm_<jobid>.{out,err}` fail to open and the
+        // job's own diagnostics vanish. Same folder the container's
+        // `--full-log-dir=<root>/<sid>` writes `secondary.log` into and
+        // the worker logs land in.
+        let sec_log_dir = format!("{run_log_dir}/{secondary_id}");
+        self.gateway.create_directory(&sec_log_dir).await?;
 
         // Argument order mirrors the legacy Python `submit_job` so
         // operators eyeballing the rendered command see the same flag
@@ -128,8 +149,8 @@ impl<G: Gateway> SlurmJobManager<G> {
             ));
         }
 
-        sbatch_args.push(format!("--output={run_log_dir}/slurm_%j.out"));
-        sbatch_args.push(format!("--error={run_log_dir}/slurm_%j.err"));
+        sbatch_args.push(format!("--output={sec_log_dir}/slurm_%j.out"));
+        sbatch_args.push(format!("--error={sec_log_dir}/slurm_%j.err"));
 
         // `--mem` is intentionally opt-in (Python never emits it). See
         // the method doc-comment for the rationale; default-config

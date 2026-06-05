@@ -941,7 +941,7 @@ where
         } else {
             format!("panik file: {}", matched_path.display())
         };
-        tracing::warn!(
+        tracing::error!(
             matched_path = %matched_path.display(),
             reason = %reason,
             "observer panik signal observed; announcing self-departure and exiting 137"

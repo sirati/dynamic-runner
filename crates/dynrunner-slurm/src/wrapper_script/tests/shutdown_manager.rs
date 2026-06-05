@@ -251,6 +251,51 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     assert_bash_syntax_ok(&script);
 }
 
+/// The shutdown-manager log MUST land on the PERSISTENT per-secondary
+/// network log dir (`<log_network>/<secondary_id>/shutdown-manager.log`),
+/// NOT under `$RNDTMP`. `$RNDTMP` is the scratch tree the manager itself
+/// deletes on teardown, so a log there is destroyed exactly when it is
+/// needed (it records WHY the teardown happened). The dir must also be
+/// pre-created (the manager spawns before the container, so podman has
+/// not yet created the bind-mount target).
+#[test]
+fn shutdown_log_path_is_persistent_not_under_rndtmp() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+
+    // standard_cfg uses secondary_id="sec-01"; run_log_dir=None falls
+    // back to SlurmConfig::default().log_path() == "~/dynamic_batch/log".
+    let want_dir = format!("{}/sec-01", config.log_path());
+    let want_path = format!("{want_dir}/shutdown-manager.log");
+
+    assert!(
+        script.contains(&format!("SHUTDOWN_LOG_PATH=\"{want_path}\"")),
+        "shutdown log must point at the persistent per-secondary network \
+         path `{want_path}`; render:\n{script}"
+    );
+    // Regression guard: the old (buggy) `$RNDTMP/shutdown-manager.log`
+    // location must NOT reappear — that is the self-deleted tree.
+    assert!(
+        !script.contains("SHUTDOWN_LOG_PATH=\"$RNDTMP/shutdown-manager.log\""),
+        "shutdown log must NOT be placed under $RNDTMP (the manager deletes \
+         it on teardown); render still set it there"
+    );
+    // The persistent dir is created before the manager spawns.
+    assert!(
+        script.contains(&format!("mkdir -p \"{want_dir}\"")),
+        "the persistent shutdown-log dir must be pre-created before the \
+         manager spawns; render did not `mkdir -p {want_dir}`"
+    );
+    // The pid-file STAYS under $RNDTMP (scratch state that should be
+    // cleaned) — proving only the LOG relocated, not the scratch paths.
+    assert!(
+        script.contains("--pid-file \"$RNDTMP/shutdown-manager.pid\""),
+        "the pid-file must remain scratch state under $RNDTMP; render did not"
+    );
+    assert_bash_syntax_ok(&script);
+}
+
 /// Service-mode requires two `--property=` overrides:
 ///   - `Restart=no` so systemd doesn't auto-restart the manager
 ///     after it intentionally exits at cleanup completion.

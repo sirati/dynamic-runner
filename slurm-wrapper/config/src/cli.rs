@@ -40,6 +40,10 @@ struct Cli {
     image_path: String,
     #[arg(long)]
     image_tar_basename: String,
+    /// SHA-256 (hex) content key for the node-local image cache
+    /// (`image.rs`). Empty string → cache bypassed (per-job copy).
+    #[arg(long)]
+    image_digest: String,
     #[arg(long)]
     image_name: String,
     #[arg(long)]
@@ -144,6 +148,7 @@ impl Cli {
             secondary_id: self.secondary_id,
             image_path: self.image_path,
             image_tar_basename: self.image_tar_basename,
+            image_digest: self.image_digest,
             image_name: self.image_name,
             image_tag: self.image_tag,
             load_command: self.load_command,

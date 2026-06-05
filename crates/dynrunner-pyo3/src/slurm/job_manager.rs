@@ -405,6 +405,7 @@ impl PyRustSlurmJobManager {
         py: Python<'_>,
         wrapper_script: String,
         job_name: String,
+        secondary_id: String,
         nodes: u32,
         run_log_dir: String,
     ) -> PyResult<String> {
@@ -413,7 +414,7 @@ impl PyRustSlurmJobManager {
             block_on_local(async move {
                 lock_manager(&inner)
                     .await
-                    .submit_job(&wrapper_script, &job_name, nodes, &run_log_dir)
+                    .submit_job(&wrapper_script, &job_name, &secondary_id, nodes, &run_log_dir)
                     .await
                     .map_err(slurm_err_to_py)
             })

@@ -526,9 +526,11 @@ mod tests {
             socket_dir: socket_dir.clone(),
             cmd_socket: socket_dir.join("cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-test".into(),
-            shutdown_log_path: dir.join("shutdown-manager.log"),
+            shutdown_log_dir: dir.join("log-network/sec-0"),
+            shutdown_log_path: dir.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: dir.join("shutdown-manager.pid"),
             local_image: dir.join("image.tar"),
+            image_cache_root: dir.join("imgcache"),
         }
     }
 

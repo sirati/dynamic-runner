@@ -118,11 +118,16 @@ async fn build_and_transfer_images_propagates_packager_failure() {
 #[derive(Default)]
 struct SubmitRecordingGateway {
     commands: Mutex<Vec<String>>,
+    created_dirs: Mutex<Vec<String>>,
 }
 
 impl SubmitRecordingGateway {
     fn commands(&self) -> Vec<String> {
         self.commands.lock().unwrap().clone()
+    }
+
+    fn created_dirs(&self) -> Vec<String> {
+        self.created_dirs.lock().unwrap().clone()
     }
 
     fn sbatch_command(&self) -> String {
@@ -169,7 +174,8 @@ impl Gateway for SubmitRecordingGateway {
     async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
         Ok(())
     }
-    async fn create_directory(&self, _remote: &str) -> Result<(), GatewayError> {
+    async fn create_directory(&self, remote: &str) -> Result<(), GatewayError> {
+        self.created_dirs.lock().unwrap().push(remote.to_string());
         Ok(())
     }
     async fn file_exists(&self, _remote: &str) -> Result<bool, GatewayError> {
@@ -216,7 +222,13 @@ async fn submit_job_matches_python_invocation_shape() {
     };
     let mut mgr = SlurmJobManager::new(cfg, gw);
     let jid = mgr
-        .submit_job("#!/bin/sh\necho hi", "myjob", 1, "/srv/slurm/log/run-1")
+        .submit_job(
+            "#!/bin/sh\necho hi",
+            "myjob",
+            "secondary-0",
+            1,
+            "/srv/slurm/log/run-1",
+        )
         .await
         .expect("submit succeeds");
     assert_eq!(jid, "12345");
@@ -281,7 +293,7 @@ async fn submit_job_matches_python_invocation_shape() {
         ..SlurmConfig::default()
     };
     let mut mgr = SlurmJobManager::new(cfg, gw);
-    mgr.submit_job("#!/bin/sh", "j2", 1, "/srv/slurm/log/run-2")
+    mgr.submit_job("#!/bin/sh", "j2", "secondary-0", 1, "/srv/slurm/log/run-2")
         .await
         .expect("submit succeeds");
     let sbatch = mgr.gateway().sbatch_command();
@@ -304,9 +316,15 @@ async fn submit_job_emits_signal_lead_time_flag() {
         ..SlurmConfig::default()
     };
     let mut mgr = SlurmJobManager::new(cfg, gw);
-    mgr.submit_job("#!/bin/sh", "j-lead", 1, "/srv/slurm/log/run-lead")
-        .await
-        .expect("submit succeeds");
+    mgr.submit_job(
+        "#!/bin/sh",
+        "j-lead",
+        "secondary-0",
+        1,
+        "/srv/slurm/log/run-lead",
+    )
+    .await
+    .expect("submit succeeds");
     let sbatch = mgr.gateway().sbatch_command();
     assert!(
         sbatch.contains("--signal=B:SIGTERM@90"),
@@ -327,12 +345,66 @@ async fn submit_job_skips_signal_flag_when_lead_seconds_is_zero() {
         ..SlurmConfig::default()
     };
     let mut mgr = SlurmJobManager::new(cfg, gw);
-    mgr.submit_job("#!/bin/sh", "j-no-signal", 1, "/srv/slurm/log/run-x")
-        .await
-        .expect("submit succeeds");
+    mgr.submit_job(
+        "#!/bin/sh",
+        "j-no-signal",
+        "secondary-0",
+        1,
+        "/srv/slurm/log/run-x",
+    )
+    .await
+    .expect("submit succeeds");
     let sbatch = mgr.gateway().sbatch_command();
     assert!(
         !sbatch.contains("--signal="),
         "--signal must be omitted when signal_lead_seconds is 0; got: {sbatch}",
+    );
+}
+
+/// sbatch's own `--output`/`--error` land in the per-secondary folder
+/// `<run_log_dir>/<secondary_id>/`, NOT at the run-dir root. This is the
+/// same folder the container's `--full-log-dir=<root>/<sid>` writes
+/// `secondary.log` into and the worker logs land in. Pins the BUG2 fix:
+/// pre-fix the paths were `<run_log_dir>/slurm_%j.{out,err}` at the
+/// root. Also asserts the folder is `mkdir -p`'d on the gateway before
+/// sbatch (SLURM does not create the `--output=` parent directory).
+#[tokio::test]
+async fn submit_job_anchors_slurm_out_err_in_per_secondary_dir() {
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    mgr.submit_job(
+        "#!/bin/sh",
+        "prefix-secondary-2",
+        "secondary-2",
+        1,
+        "/srv/slurm/log/run-1",
+    )
+    .await
+    .expect("submit succeeds");
+
+    let sbatch = mgr.gateway().sbatch_command();
+    assert!(
+        sbatch.contains("--output=/srv/slurm/log/run-1/secondary-2/slurm_%j.out"),
+        "sbatch --output must land in the per-secondary folder; got: {sbatch}",
+    );
+    assert!(
+        sbatch.contains("--error=/srv/slurm/log/run-1/secondary-2/slurm_%j.err"),
+        "sbatch --error must land in the per-secondary folder; got: {sbatch}",
+    );
+    // Negative: no root-level slurm_%j.{out,err}.
+    assert!(
+        !sbatch.contains("--output=/srv/slurm/log/run-1/slurm_%j.out"),
+        "sbatch --output must not be at the run-dir root; got: {sbatch}",
+    );
+
+    // The per-secondary folder is created before sbatch.
+    let dirs = mgr.gateway().created_dirs();
+    assert!(
+        dirs.iter().any(|d| d == "/srv/slurm/log/run-1/secondary-2"),
+        "per-secondary log dir must be created on the gateway; got: {dirs:?}",
     );
 }

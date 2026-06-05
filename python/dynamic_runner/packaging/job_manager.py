@@ -387,6 +387,10 @@ class SlurmJobManager:
             image_name=self.packaging.get_image_name(),
             image_tag=self.packaging.get_image_tag(),
             image_tar_basename=self.deployment.image_tar_basename,
+            # Content key for the wrapper binary's node-local image cache:
+            # the secondary reuses a digest-keyed local copy instead of
+            # re-reading the shared-FS tarball per job (see image.rs).
+            image_digest=image_metadata.image_hash,
             load_command=self.packaging.get_load_command(
                 "$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN"
             ),
@@ -436,6 +440,7 @@ class SlurmJobManager:
         self,
         wrapper_script: str,
         job_name: str,
+        secondary_id: str,
         nodes: int = 1,
         run_log_dir: str | None = None,
     ) -> str:
@@ -456,10 +461,16 @@ class SlurmJobManager:
           ``remote_home`` attribute (a ``PosixPath`` for
           ``LocalGateway``, ``str | None`` for ``SSHGateway``) — a
           shape the Rust core can't see through ``PyGatewayAdapter``.
+
+        ``secondary_id`` anchors sbatch's own ``--output``/``--error``
+        under ``<run_log_dir>/<secondary_id>/`` so the batch script's
+        ``slurm_<jobid>.{out,err}`` live in the same per-secondary
+        folder as the worker and role logs, not at the run-dir root.
         """
         return self._rust.submit_job(
             wrapper_script,
             job_name,
+            secondary_id,
             nodes,
             self._expand_path(run_log_dir or self.slurm_config.get_log_dir()),
         )

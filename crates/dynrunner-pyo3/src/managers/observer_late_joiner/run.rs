@@ -217,7 +217,7 @@ impl PyObserverLateJoiner {
                             Ok(ObserverRunOutcome::Aborted(reason))
                         }
                         Ok(ObserverTerminal::Panik { matched_path }) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 matched_path = %matched_path.display(),
                                 "observer panik shutdown; propagating \
                                  to PyO3 boundary for exit(137)"
