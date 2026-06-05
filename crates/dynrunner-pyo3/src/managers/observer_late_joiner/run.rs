@@ -18,7 +18,7 @@ use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
 
 use super::PyObserverLateJoiner;
-use super::helpers::{map_read_dir_error, records_to_seed};
+use super::helpers::{decode_bootstrap_snapshots, map_read_dir_error, records_to_seed};
 
 /// Fleet-dead strand grace for a cold-join observer. There is no
 /// operator kwarg for this backstop; the single source of truth mirrors
@@ -141,23 +141,17 @@ impl PyObserverLateJoiner {
                     // 3. Decode each snapshot. The wire frame is a String
                     //    (the protocol crate keeps `I` erased there); we
                     //    materialise each back into the typed snapshot here.
-                    //    A bootstrap-decode failure is FATAL: the observer
-                    //    requested these snapshots precisely to populate its
-                    //    CRDT, so a malformed bootstrap reply must not be
-                    //    swallowed (continuing on an empty CRDT would report
-                    //    a lie). The cold-join factory `restore()`s each — the
-                    //    lattice unions them.
-                    let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> = snapshot_jsons
-                        .iter()
-                        .map(|snapshot_json| {
-                            serde_json::from_str(snapshot_json).map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "observer late-joiner: failed to decode \
-                                 ClusterStateSnapshot from join_running_cluster reply: {e}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                    //    A bootstrap-decode failure is FATAL (the `?`
+                    //    propagates) — the observer requested these snapshots
+                    //    precisely to populate its CRDT, so a malformed
+                    //    bootstrap reply must not be swallowed (continuing on
+                    //    an empty CRDT would report a lie). This is the
+                    //    BOOTSTRAP discriminator arm — the steady-state decode
+                    //    is WARN-and-keep (the AE-3 cadence re-pulls). The
+                    //    cold-join factory `restore()`s each — the lattice
+                    //    unions them.
+                    let snaps: Vec<ClusterStateSnapshot<RunnerIdentifier>> =
+                        decode_bootstrap_snapshots(&snapshot_jsons)?;
 
                     // 4. Build the standalone observer's config. No
                     //    scheduler / worker / dispatch fields — an observer

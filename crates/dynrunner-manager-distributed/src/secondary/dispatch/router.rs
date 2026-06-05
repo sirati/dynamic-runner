@@ -517,27 +517,30 @@ where
                 // contains; the merge keeps the strictly stronger of
                 // each).
                 //
-                // Per-frame FATALITY (P3 replication invariant): a
-                // ClusterSnapshot whose payload fails to deserialize is
-                // a hard error, NOT a swallow. A bootstrapping observer
-                // / late-joiner requested this snapshot precisely to
-                // populate its CRDT from a partial/empty starting state;
-                // continuing to "observe" an un-restored (partial/empty)
-                // CRDT would silently report a lie (a premature
-                // run-complete, wrong outcome counts). Latch
-                // `fatal_exit` so the operational loop aborts the run
-                // with a clear error instead of observing corruption.
+                // Per-frame fatality discriminator (D-C / D3): this arm is
+                // the STEADY-STATE anti-entropy / late-heal pull sink — it
+                // runs inside the operational loop (`dispatch_message`), NOT
+                // the bootstrap constructor. A malformed snapshot here is
+                // WARN-and-keep, NOT fatal: the AE-3 recovery cadence re-pulls
+                // a fresh snapshot from a rotating responder on the next tick
+                // (≤ one cadence period), so one bad frame cannot wedge or
+                // corrupt the replica. The BOOTSTRAP decode (cold-join
+                // constructor) stays FATAL — a malformed INITIAL snapshot
+                // genuinely leaves the node with no starting state and must
+                // hard-fail there. The discriminator is WHICH FUNCTION the
+                // decode lives in (steady-state loop arm = WARN, bootstrap
+                // constructor = fatal); there is no latch.
                 match serde_json::from_str::<ClusterStateSnapshot<I>>(&snapshot_json) {
                     Ok(snap) => {
                         self.cluster_state.restore(snap);
                     }
                     Err(e) => {
-                        let reason = format!(
-                            "ClusterSnapshot restore failed (malformed snapshot \
-                             payload); refusing to observe a partial/empty CRDT: {e}"
+                        tracing::warn!(
+                            error = %e,
+                            "ClusterSnapshot decode failed in the steady-state \
+                             anti-entropy sink; dropping the frame (the AE-3 \
+                             recovery cadence re-pulls a fresh snapshot next tick)"
                         );
-                        tracing::error!(error = %e, "{reason}");
-                        self.fatal_exit = Some(reason);
                     }
                 }
                 Ok(())
@@ -567,7 +570,6 @@ where
                     &local,
                     &digest,
                     &sender_id,
-                    self.cluster_state.current_primary(),
                     &requester,
                     timestamp_now(),
                 ) {

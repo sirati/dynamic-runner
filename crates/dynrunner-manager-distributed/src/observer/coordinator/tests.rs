@@ -1047,3 +1047,272 @@ async fn cold_join_announces_initial_holdings_after_restore() {
     .await
     .expect("the cold-join-announce observer must terminate");
 }
+
+/// D-C / D3 (§5.3): a steady-state WARN-DROPPED snapshot decode keeps the
+/// anti-entropy LIVE — the AE-3 recovery cadence RE-PULLS a fresh snapshot
+/// and the observer converges + exits `Done` within ≤ one cadence period.
+///
+/// ISOLATION of the TIMER-driven recovery (not the reactive digest arm):
+/// the ahead digest arrives EXACTLY ONCE. The observer's reactive
+/// `on_state_digest` issues the FIRST snapshot pull; the driver answers it
+/// with a MALFORMED snapshot (WARN-dropped, not fatal). After that there is
+/// NO further inbound digest, so the reactive arm is exhausted — the ONLY
+/// thing that can re-pull is the timer-driven AE-3 recovery cadence, which
+/// fires off the RECORDED peer digest. The driver answers that SECOND pull
+/// with the GOOD snapshot. Without the recovery cadence this test HANGS
+/// (no second pull ever comes) and trips the 5s timeout — that is the
+/// fail-before / pass-after proof that the cadence (not the reactive arm)
+/// drives convergence here.
+#[tokio::test(flavor = "current_thread")]
+async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The good donor snapshot the recovery re-pull heals from:
+                // one completed task + RunComplete.
+                let good_snapshot_json = {
+                    let mut donor = ClusterState::<TestId>::new();
+                    let t = task("p", "t1", &[]);
+                    add(&mut donor, &t);
+                    complete(&mut donor, "t1");
+                    donor.apply(ClusterMutation::RunComplete);
+                    serde_json::to_string(&donor.snapshot()).expect("snapshot serializes")
+                };
+                // The (single) digest the named primary broadcasts — ahead of
+                // the observer's empty ledger, so the observer is `is_behind`.
+                let ahead_digest = {
+                    let mut donor = ClusterState::<TestId>::new();
+                    let t = task("p", "t1", &[]);
+                    add(&mut donor, &t);
+                    complete(&mut donor, "t1");
+                    donor.digest()
+                };
+
+                // `promoted-sec`-keyed outbox so BOTH the reactive pull
+                // (Destination::Secondary(promoted-sec)) and the recovery pull
+                // resolve + send; we capture each RequestClusterSnapshot.
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (to_primary_tx, mut to_primary_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+                let transport =
+                    ChannelPeerTransport::from_raw_channels("obs".into(), outgoing, inbound_rx);
+
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "promoted-sec".into(),
+                    epoch: 2,
+                    reason: PrimaryChangeReason::Election,
+                });
+
+                let mut config = observer_config("obs");
+                // Short peer_timeout bounds the recovery period small (the
+                // recovery interval is tick_period.min(peer_timeout)); the
+                // driver keeps the primary clock fresh so the SILENCE backstop
+                // never fires within the test.
+                config.peer_timeout = Duration::from_millis(50);
+                config.fleet_dead_timeout = Duration::from_secs(60);
+
+                let mut observer = ObserverCoordinator::new(transport, cs, config);
+
+                let inbound_for_driver = inbound_tx.clone();
+                tokio::task::spawn_local(async move {
+                    // Keep the primary-silence clock alive throughout (a
+                    // Primary keepalive every 20ms < peer_timeout 50ms), so a
+                    // strand never fires — ONLY the recovery path can heal.
+                    let inbound_ka = inbound_for_driver.clone();
+                    let keepalive_pump = tokio::task::spawn_local(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            if inbound_ka
+                                .send(DistributedMessage::Keepalive {
+                                    sender_id: "promoted-sec".into(),
+                                    timestamp: 0.0,
+                                    secondary_id: "promoted-sec".into(),
+                                    active_workers: 0,
+                                    emitter_role: KeepaliveRole::Primary,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+
+                    // Feed the ahead digest EXACTLY ONCE — this is the only
+                    // event that drives the reactive pull; the recorded digest
+                    // is what the timer-driven recovery later re-pulls off.
+                    inbound_for_driver
+                        .send(DistributedMessage::StateDigest {
+                            sender_id: "promoted-sec".into(),
+                            timestamp: 0.0,
+                            digest: ahead_digest,
+                        })
+                        .expect("inbound open");
+
+                    // Two pulls are NOT timer-driven: the at-entry bootstrap
+                    // request (fired synchronously before the loop, to the
+                    // named primary) and the ONE reactive pull the single
+                    // inbound digest triggers. Answer BOTH of those with a
+                    // MALFORMED snapshot (WARN-dropped — the observer stays
+                    // behind). Since no further digest ever arrives, EVERY
+                    // pull after those two can ONLY be the TIMER-driven AE-3
+                    // recovery cadence (it re-pulls off the recorded digest);
+                    // answer those with the GOOD snapshot → converges. This
+                    // is the isolation: without the recovery cadence there is
+                    // no third pull and the test hangs to its 5s timeout.
+                    let mut non_timer_pulls_left = 2u8;
+                    while let Some(frame) = to_primary_rx.recv().await {
+                        if let DistributedMessage::RequestClusterSnapshot { .. } = frame {
+                            let reply = if non_timer_pulls_left > 0 {
+                                non_timer_pulls_left -= 1;
+                                "{ this is not valid snapshot json".to_string()
+                            } else {
+                                good_snapshot_json.clone()
+                            };
+                            inbound_for_driver
+                                .send(DistributedMessage::ClusterSnapshot {
+                                    sender_id: "promoted-sec".into(),
+                                    timestamp: 0.0,
+                                    snapshot_json: reply,
+                                })
+                                .expect("inbound open");
+                        }
+                    }
+                    keepalive_pump.abort();
+                });
+
+                let terminal = observer
+                    .run()
+                    .await
+                    .expect("a WARN-dropped decode must NOT strand; recovery re-pulls + heals");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert_eq!(
+                    observer.cluster_state().outcome_counts().succeeded,
+                    1,
+                    "the recovery re-pull restored the completed-task count"
+                );
+                drop(inbound_tx);
+            })
+            .await;
+    })
+    .await
+    .expect("the WARN-drop-then-recovery observer must terminate");
+}
+
+/// C9 quiesce (§5.3): the recovery cadence does NOT pull when the observer
+/// is converged with every known peer it has heard a digest from. Setup: a
+/// known primary broadcasts a digest the observer is ALREADY converged with
+/// (the observer's ledger matches it), so `plan_recovery_pull` returns
+/// `None` every tick. Proof: across a window spanning multiple recovery
+/// ticks, ZERO `RequestClusterSnapshot` frames are emitted by the recovery
+/// cadence (only the at-entry bootstrap request, which we account for).
+#[tokio::test(flavor = "current_thread")]
+async fn recovery_cadence_quiesces_when_converged() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The observer and the primary share the SAME ledger shape, so
+                // the digest the primary broadcasts is one the observer is NOT
+                // behind — the C9 quiesce case.
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (to_primary_tx, mut to_primary_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+                let transport =
+                    ChannelPeerTransport::from_raw_channels("obs".into(), outgoing, inbound_rx);
+
+                // Observer ledger: a named primary + one completed task.
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "promoted-sec".into(),
+                    epoch: 2,
+                    reason: PrimaryChangeReason::Election,
+                });
+                let t = task("p", "t1", &[]);
+                add(&mut cs, &t);
+                complete(&mut cs, "t1");
+                // The converged digest the primary will echo back (identical
+                // to the observer's own ⇒ not is_behind ⇒ quiesce).
+                let converged_digest = cs.digest();
+
+                let mut config = observer_config("obs");
+                config.peer_timeout = Duration::from_millis(40);
+                config.fleet_dead_timeout = Duration::from_secs(60);
+
+                let mut observer = ObserverCoordinator::new(transport, cs, config);
+
+                let inbound_for_driver = inbound_tx.clone();
+                let recovery_requests = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                let recovery_requests_drv = recovery_requests.clone();
+                tokio::task::spawn_local(async move {
+                    // Keep the silence clock fresh so the silence backstop
+                    // never fires; feed the converged digest so the observer
+                    // records a known-peer digest it is NOT behind.
+                    let inbound_ka = inbound_for_driver.clone();
+                    let pump = tokio::task::spawn_local(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                            let _ = inbound_ka.send(DistributedMessage::Keepalive {
+                                sender_id: "promoted-sec".into(),
+                                timestamp: 0.0,
+                                secondary_id: "promoted-sec".into(),
+                                active_workers: 0,
+                                emitter_role: KeepaliveRole::Primary,
+                            });
+                            let _ = inbound_ka.send(DistributedMessage::StateDigest {
+                                sender_id: "promoted-sec".into(),
+                                timestamp: 0.0,
+                                digest: converged_digest,
+                            });
+                        }
+                    });
+
+                    // Count any RequestClusterSnapshot the recovery cadence
+                    // emits over a multi-tick window. A drain task tallies
+                    // them; with C9 quiesce there is only the at-entry
+                    // bootstrap request (1), never a recovery re-pull.
+                    let count_task = tokio::task::spawn_local(async move {
+                        while let Some(frame) = to_primary_rx.recv().await {
+                            if let DistributedMessage::RequestClusterSnapshot { .. } = frame {
+                                recovery_requests_drv
+                                    .set(recovery_requests_drv.get() + 1);
+                            }
+                        }
+                    });
+
+                    // Let several recovery ticks (period ≈ 40ms) elapse, then
+                    // complete the run cleanly.
+                    tokio::time::sleep(Duration::from_millis(180)).await;
+                    pump.abort();
+                    inbound_for_driver
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "promoted-sec".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::RunComplete],
+                        })
+                        .expect("inbound open");
+                    // Give the drain a beat to observe any straggler frame.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    count_task.abort();
+                });
+
+                let terminal = observer.run().await.expect("Ok on RunComplete");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                // The ONLY snapshot request is the at-entry bootstrap one;
+                // the converged recovery cadence emitted ZERO re-pulls.
+                assert!(
+                    recovery_requests.get() <= 1,
+                    "a converged observer's recovery cadence must quiesce \
+                     (≤1 request = the at-entry bootstrap only), got {}",
+                    recovery_requests.get()
+                );
+                drop(inbound_tx);
+            })
+            .await;
+    })
+    .await
+    .expect("the converged-quiesce observer must terminate");
+}

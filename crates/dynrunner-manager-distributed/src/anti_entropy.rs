@@ -93,9 +93,8 @@ pub struct RequesterIdentity<'a> {
 }
 
 /// Receive-side decision for one peer digest. Given the LOCAL digest, the
-/// PEER's digest (off the wire frame), the sender's id, the currently
-/// recognised primary (if any), and the requester's own
-/// [`RequesterIdentity`], return `Some((destination, request))` when the
+/// PEER's digest (off the wire frame), the sender's id, and the requester's
+/// own [`RequesterIdentity`], return `Some((destination, request))` when the
 /// local replica is behind the peer and should pull a snapshot — or `None`
 /// when the replicas are converged (the self-quiescing case: no pull on a
 /// matching digest).
@@ -114,11 +113,10 @@ pub struct RequesterIdentity<'a> {
 /// sender is always the authoritative responder. `restore` is idempotent,
 /// so a redundant pull is harmless; no routability fallback is needed.
 ///
-/// `current_primary` is retained on the signature as the recognised-primary
-/// context every role already computes for its other receive arms; the pull
-/// TARGET no longer depends on it (the proven-ahead sender is authoritative
-/// regardless of role), so it is accepted but intentionally not consulted
-/// for target selection.
+/// The pull TARGET does NOT depend on the recognised primary (the proven-
+/// ahead sender is authoritative regardless of role), so the recognised
+/// primary is not a parameter — a possibly-lagging primary is never the
+/// fallback responder.
 ///
 /// The pulled snapshot answers `RequestClusterSnapshot` with a
 /// `ClusterSnapshot` the caller restores through the existing recv arm.
@@ -126,7 +124,6 @@ pub fn reconcile_against_peer<I>(
     local: &StateDigest,
     peer: &StateDigest,
     sender_id: &str,
-    _current_primary: Option<&str>,
     requester: &RequesterIdentity<'_>,
     timestamp: f64,
 ) -> Option<(Destination, DistributedMessage<I>)> {
@@ -145,6 +142,88 @@ pub fn reconcile_against_peer<I>(
     // primary is NOT consulted — it may not hold the missing data — so
     // there is no primary fallback.
     let destination = Destination::Secondary(PeerId::from(sender_id.to_string()));
+    let request = DistributedMessage::RequestClusterSnapshot {
+        sender_id: requester.node_id.to_string(),
+        timestamp,
+        is_observer: requester.is_observer,
+        can_be_primary: requester.can_be_primary,
+    };
+    Some((destination, request))
+}
+
+/// AE-3 recovery cadence — the TIMER-DRIVEN counterpart to
+/// [`reconcile_against_peer`]. Where `reconcile_against_peer` is the
+/// receive-side reaction to ONE inbound digest frame,
+/// [`plan_recovery_pull`] runs on the role's own snapshot-recovery
+/// interval with ZERO inbound traffic: given the local digest and the
+/// LAST-SEEN digest of each KNOWN peer (the `current_primary` ∪ alive
+/// secondaries roster), it decides whether the local replica is still
+/// behind any of them and, if so, picks ONE rotating responder to pull a
+/// fresh snapshot from. It exists so a snapshot whose decode was dropped
+/// (WARN-and-keep — the steady-state decode arm never latches a stuck
+/// observer) is RE-PULLED on the next tick until the replica converges.
+///
+/// # Single concern
+///
+/// The role-agnostic POLICY for the recovery cadence: the convergence
+/// detection (`is_behind` against each known peer's last-seen digest), the
+/// quiesce rule (C9), and the responder rotation. The caller owns ONLY the
+/// `send_to` edge and the storage of `(peer_id, last_seen_digest)` it feeds
+/// in; it re-implements none of the decision.
+///
+/// # C9 quiesce
+///
+/// Returns `None` (no pull) when the local replica is NOT behind ANY known
+/// peer's last-seen digest — i.e. the converged-to-everything-it-has-seen
+/// case. This is STRONGER than "non-empty AND decoded": a converged-but-
+/// stale snapshot pulled from a lagging responder would still leave the
+/// replica behind some OTHER known peer's digest, so the arm keeps re-
+/// pulling until genuinely caught up. When no known peer has a recorded
+/// digest yet, there is nothing to be behind, so it also quiesces.
+///
+/// # Different-responder rotation
+///
+/// `cursor` is advanced on every call that has at least one candidate
+/// responder (whether or not it is the one chosen this tick), so a
+/// responder whose previous snapshot failed to decode — leaving the
+/// replica STILL behind its digest, so it remains a candidate — is NOT
+/// retried immediately: the next tick rotates to a different candidate.
+/// One malformed responder therefore cannot wedge recovery while another
+/// proven-ahead peer is reachable. With a single candidate the rotation
+/// degenerates to re-pulling from it (the best available action).
+///
+/// `peer_digests` is the caller's `(known-peer-id, last-seen StateDigest)`
+/// view — ALREADY intersected with the live roster by the caller, so this
+/// function never consults membership itself (it owns no liveness concern).
+/// The pull target is `Destination::Secondary(peer_id)` — the same snapshot
+/// responder edge `reconcile_against_peer` pulls through (the responder
+/// coordinator is selected at the INGRESS demux, not by this variant).
+pub fn plan_recovery_pull<I>(
+    local: &StateDigest,
+    peer_digests: &[(String, StateDigest)],
+    cursor: &mut usize,
+    requester: &RequesterIdentity<'_>,
+    timestamp: f64,
+) -> Option<(Destination, DistributedMessage<I>)> {
+    // Candidate responders = known peers whose last-seen digest proves they
+    // hold ledger data the local replica lacks. A peer we are converged with
+    // is not a candidate; if EVERY known peer is converged (or none has a
+    // recorded digest), the candidate list is empty and we quiesce (C9).
+    let candidates: Vec<&str> = peer_digests
+        .iter()
+        .filter(|(_, peer)| local.is_behind(peer))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    // Pick the rotation-current candidate, then ADVANCE the cursor so the
+    // next tick targets a different responder (the different-responder-on-
+    // malformed rule). The modulo keeps the index in range as the candidate
+    // set shrinks across ticks.
+    let target = candidates[*cursor % candidates.len()];
+    *cursor = cursor.wrapping_add(1);
+    let destination = Destination::Secondary(PeerId::from(target.to_string()));
     let request = DistributedMessage::RequestClusterSnapshot {
         sender_id: requester.node_id.to_string(),
         timestamp,
@@ -194,7 +273,7 @@ mod tests {
             can_be_primary: true,
         };
         let decision: Option<(Destination, DistributedMessage<u32>)> =
-            reconcile_against_peer(&d, &d, "peer-1", Some("prim"), &me, 1.0);
+            reconcile_against_peer(&d, &d, "peer-1", &me, 1.0);
         assert!(decision.is_none());
     }
 
@@ -215,7 +294,7 @@ mod tests {
             can_be_primary: false,
         };
         let (dst, req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-1", Some("prim"), &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-1", &me, 1.0)
                 .expect("should pull when behind");
         // The proven-ahead sender, NOT `Destination::Primary`.
         assert_eq!(
@@ -252,7 +331,7 @@ mod tests {
             can_be_primary: true,
         };
         let (dst, _req): (Destination, DistributedMessage<u32>) =
-            reconcile_against_peer(&local, &peer, "peer-7", None, &me, 1.0)
+            reconcile_against_peer(&local, &peer, "peer-7", &me, 1.0)
                 .expect("should pull when behind");
         assert_eq!(
             dst,
@@ -265,11 +344,13 @@ mod tests {
     /// lacks) while the recognised primary is itself lagging (it has NOT seen
     /// that mutation either). The pull MUST target the ahead non-primary
     /// SENDER, not the lagging primary — routing to the primary would heal
-    /// nothing because the primary does not hold the missing data.
+    /// nothing because the primary does not hold the missing data. The target
+    /// selection no longer even consults a recognised-primary param (it was
+    /// dropped); this test pins that the proven-ahead SENDER is the target.
     #[test]
     fn pull_targets_proven_ahead_sender_not_lagging_primary() {
-        // The local replica and the (recognised) lagging primary share the
-        // SAME stale digest shape; only the non-primary sender is ahead.
+        // The local replica and a (notional) lagging primary share the SAME
+        // stale digest shape; only the non-primary sender is ahead.
         let local = StateDigest {
             tasks_count: 2,
             tasks_hash: 0x1111,
@@ -286,17 +367,9 @@ mod tests {
             is_observer: false,
             can_be_primary: true,
         };
-        // A primary IS recognised ("lagging-prim"), yet it is NOT the sender
-        // and (by construction) holds the same stale ledger as `local`.
-        let (dst, _req): (Destination, DistributedMessage<u32>) = reconcile_against_peer(
-            &local,
-            &ahead_sender,
-            "ahead-secondary",
-            Some("lagging-prim"),
-            &me,
-            1.0,
-        )
-        .expect("should pull when behind the ahead non-primary sender");
+        let (dst, _req): (Destination, DistributedMessage<u32>) =
+            reconcile_against_peer(&local, &ahead_sender, "ahead-secondary", &me, 1.0)
+                .expect("should pull when behind the ahead non-primary sender");
         assert_eq!(
             dst,
             Destination::Secondary(PeerId::from("ahead-secondary".to_string())),
@@ -314,7 +387,8 @@ mod tests {
     /// still warming its mirror) and is BEHIND a secondary's digest. It must
     /// still pull from that proven-ahead peer — the old `Some(_) =>
     /// Destination::Primary` would have routed the request to ITSELF and
-    /// healed nothing.
+    /// healed nothing. Now that the recognised-primary param is gone the
+    /// target is the proven-ahead sender by construction; this pins it.
     #[test]
     fn freshly_promoted_primary_behind_peer_pulls_from_peer() {
         let local = StateDigest::default();
@@ -323,22 +397,16 @@ mod tests {
             tasks_hash: 0x4444,
             ..Default::default()
         };
-        // The local node is the primary (it passes its OWN id as the
-        // recognised primary, exactly as `primary/task/mutation.rs` does).
+        // The local node is the (freshly-promoted, still-lagging) primary;
+        // it must pull from the proven-ahead peer, not itself.
         let me = RequesterIdentity {
             node_id: "me",
             is_observer: false,
             can_be_primary: true,
         };
-        let (dst, req): (Destination, DistributedMessage<u32>) = reconcile_against_peer(
-            &local,
-            &ahead_peer,
-            "ahead-secondary",
-            Some("me"),
-            &me,
-            1.0,
-        )
-        .expect("a behind primary must still pull from the ahead peer");
+        let (dst, req): (Destination, DistributedMessage<u32>) =
+            reconcile_against_peer(&local, &ahead_peer, "ahead-secondary", &me, 1.0)
+                .expect("a behind primary must still pull from the ahead peer");
         assert_eq!(
             dst,
             Destination::Secondary(PeerId::from("ahead-secondary".to_string())),
@@ -351,5 +419,101 @@ mod tests {
             }
             _ => panic!("expected RequestClusterSnapshot"),
         }
+    }
+
+    fn requester() -> RequesterIdentity<'static> {
+        RequesterIdentity {
+            node_id: "obs",
+            is_observer: true,
+            can_be_primary: false,
+        }
+    }
+
+    fn ahead(tasks: u64, hash: u64) -> StateDigest {
+        StateDigest {
+            tasks_count: tasks,
+            tasks_hash: hash,
+            ..Default::default()
+        }
+    }
+
+    /// C9 quiesce: an empty peer-digest view (no known peer has reported a
+    /// digest yet) yields NO recovery pull — there is nothing to be behind.
+    #[test]
+    fn recovery_quiesces_with_no_known_peer_digests() {
+        let local = StateDigest::default();
+        let mut cursor = 0usize;
+        let decision: Option<(Destination, DistributedMessage<u32>)> =
+            plan_recovery_pull(&local, &[], &mut cursor, &requester(), 1.0);
+        assert!(decision.is_none());
+        assert_eq!(cursor, 0, "no candidate ⇒ cursor untouched");
+    }
+
+    /// C9 quiesce: converged with EVERY known peer (none is ahead) ⇒ no pull.
+    #[test]
+    fn recovery_quiesces_when_converged_with_all_known_peers() {
+        let d = ahead(3, 0xABCD);
+        let peers = vec![("peer-1".to_string(), d), ("peer-2".to_string(), d)];
+        let mut cursor = 0usize;
+        let decision: Option<(Destination, DistributedMessage<u32>)> =
+            plan_recovery_pull(&d, &peers, &mut cursor, &requester(), 1.0);
+        assert!(decision.is_none(), "behind nobody ⇒ quiesce");
+        assert_eq!(cursor, 0);
+    }
+
+    /// Behind a known peer ⇒ pull from it via `Destination::Secondary`, and
+    /// the cursor advances (different-responder rotation).
+    #[test]
+    fn recovery_pulls_from_behind_peer_and_advances_cursor() {
+        let local = StateDigest::default();
+        let peers = vec![("peer-ahead".to_string(), ahead(2, 0x9))];
+        let mut cursor = 0usize;
+        let (dst, req): (Destination, DistributedMessage<u32>) =
+            plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+                .expect("behind a known peer ⇒ pull");
+        assert_eq!(
+            dst,
+            Destination::Secondary(PeerId::from("peer-ahead".to_string()))
+        );
+        assert_eq!(cursor, 1, "cursor advances so the next tick rotates");
+        match req {
+            DistributedMessage::RequestClusterSnapshot {
+                sender_id,
+                is_observer,
+                can_be_primary,
+                ..
+            } => {
+                assert_eq!(sender_id, "obs");
+                assert!(is_observer);
+                assert!(!can_be_primary);
+            }
+            _ => panic!("expected RequestClusterSnapshot"),
+        }
+    }
+
+    /// Different-responder rotation: two ahead peers, repeated ticks rotate
+    /// the responder so a single malformed responder cannot wedge recovery.
+    #[test]
+    fn recovery_rotates_responder_across_ticks() {
+        let local = StateDigest::default();
+        // Both peers are ahead (each holds a distinct task set the local
+        // replica lacks), so both stay candidates across ticks.
+        let peers = vec![
+            ("peer-a".to_string(), ahead(1, 0x1)),
+            ("peer-b".to_string(), ahead(1, 0x2)),
+        ];
+        let mut cursor = 0usize;
+        let mut targets = Vec::new();
+        for _ in 0..2 {
+            let (dst, _): (Destination, DistributedMessage<u32>) =
+                plan_recovery_pull(&local, &peers, &mut cursor, &requester(), 1.0)
+                    .expect("still behind ⇒ pull");
+            targets.push(dst);
+        }
+        assert_ne!(
+            targets[0], targets[1],
+            "consecutive ticks must target DIFFERENT responders so one \
+             malformed responder cannot wedge recovery"
+        );
     }
 }
