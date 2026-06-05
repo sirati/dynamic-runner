@@ -95,11 +95,26 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
-        // Setup-defer mode for THIS run, as a `Copy` bool captured before
-        // `cfg_src_network` is moved into `SecondaryConfig` below. True iff
-        // the submitter deferred discovery / ledger-seed to the chosen
-        // compute peer (the `--source-already-staged` path: `src_network`
-        // is the staged-corpus bind-mount root, `Some` only in that mode).
+        // Setup-defer mode for THIS run, derived from the pre-staged
+        // signal. The invariant: `setup_defer_on_promote` ⟺ this run
+        // DEFERRED discovery to me — i.e. the submitter ran with
+        // `--source-already-staged` (`self.source_already_staged`), so my
+        // discovered tasks arrive via loopback only AFTER I activate the
+        // co-located primary, not pre-seeded in the snapshot. This is the
+        // secondary-side twin of the wire `InitialAssignment.pre_staged_mode`
+        // (`primary::assignment` sets it from `source_pre_staged_root
+        // .is_some()`), so it matches the `setup_discovery_pending`
+        // `pre_staged_mode` gate (`secondary/coordinator.rs`) EXACTLY: the
+        // activated-primary suppressor is engaged precisely when this node
+        // will run setup-discovery.
+        //
+        // NOT derived from `src_network`: that resolves to the wrapper
+        // bind-mount (`/app/src-network`) for EVERY SLURM secondary
+        // (`PySecondaryConfig::new`), so `src_network.is_some()` would set
+        // the flag for ALL co-located primaries — including a genuinely-
+        // empty NON-pre-staged run, which has no discovery feed to wait
+        // for and would then hang until the setup-promote deadline.
+        //
         // Propagated into the on-demand-built primary's `PrimaryConfig`
         // (`required_setup_on_promote`) so a co-located primary activated
         // from an EMPTY snapshot on the discovery node engages the
@@ -109,8 +124,11 @@ impl PySecondaryCoordinator {
         // bootstrap-exit path. Failover within a pre-staged run is
         // self-correcting regardless: the snapshot is non-empty there, so
         // `setup_pending()` (`required && task_count == 0`) is false on the
-        // first iteration.
-        let setup_defer_on_promote = cfg_src_network.is_some();
+        // first iteration. (The submitter's discriminator also carries a
+        // `&& binaries.is_empty()` half — a submitter-local-view concern;
+        // on the secondary a non-empty pre-staged ledger self-corrects via
+        // `task_count() > 0`, so the pre-staged flag alone is correct here.)
+        let setup_defer_on_promote = derive_setup_defer_on_promote(self.source_already_staged);
 
         // Snapshot the cap, flip `run_started`, and consume the
         // command-channel receiver for the detached runtime in one
@@ -572,22 +590,37 @@ impl PySecondaryCoordinator {
                     // fields stay at their defaults.
                     //
                     // `required_setup_on_promote` carries THIS run's
-                    // setup-defer mode into the activated primary. On the
-                    // `--source-already-staged` path the discovery node IS
-                    // the co-located primary, and it activates from an EMPTY
-                    // snapshot (discovery hasn't seeded the ledger yet). With
-                    // the flag set, `setup_pending()` (`required &&
-                    // task_count == 0`) suppresses the run-complete exits
-                    // until the loopback-delivered `TaskAdded` batch lands —
-                    // a STANDING gate, robust to the batch arriving after the
-                    // first would-be completion check. A genuinely-empty
-                    // discovery (0 tasks) still exits PROMPTLY: the discovery
-                    // node broadcasts `RunComplete` (see
-                    // `ingest_setup_discovery`), which loops back and trips
-                    // the ungated `RunComplete` exit — no wait on the
-                    // setup-promote deadline. The deadline stays a backstop
-                    // for a wedged-discovery feed. Defaulting this `false`
-                    // (the pre-fix shape) let the activated primary declare
+                    // setup-defer mode into the activated primary —
+                    // `setup_defer_on_promote`, which is TRUE ⟺ this run
+                    // deferred discovery to me (`source_already_staged`; see
+                    // the derivation above). So my discovered tasks arrive
+                    // via loopback only AFTER activation, matching the
+                    // `setup_discovery_pending` `pre_staged_mode` gate
+                    // exactly. On the `--source-already-staged` path the
+                    // discovery node IS the co-located primary, and it
+                    // activates from an EMPTY snapshot (discovery hasn't
+                    // seeded the ledger yet). With the flag set,
+                    // `setup_pending()` (`required && task_count == 0`)
+                    // suppresses the run-complete exits until the
+                    // loopback-delivered `TaskAdded` batch lands — a STANDING
+                    // gate, robust to the batch arriving after the first
+                    // would-be completion check. A genuinely-empty discovery
+                    // (0 tasks) still exits PROMPTLY: the discovery node
+                    // broadcasts `RunComplete` (see `ingest_setup_discovery`),
+                    // which loops back and trips the ungated `RunComplete`
+                    // exit — no wait on the setup-promote deadline. The
+                    // deadline stays a backstop for a wedged-discovery feed.
+                    //
+                    // Conversely a NON-pre-staged run leaves this `false`,
+                    // so an empty-corpus relocated run exits via the normal
+                    // bootstrap RunComplete path — it never enters the
+                    // suppressed setup-discovery state it has no feed for,
+                    // and so never hangs to the setup-promote deadline.
+                    // (Deriving the flag from `src_network.is_some()` would
+                    // wrongly set it for that case, since `src_network` is
+                    // the wrapper bind-mount on EVERY SLURM secondary.)
+                    // Defaulting this `false` for a pre-staged run, by
+                    // contrast, let the activated primary declare
                     // `0+0 >= 0` run-complete before its own discovery batch
                     // arrived.
                     let primary_config = dynrunner_manager_distributed::PrimaryConfig {
@@ -1018,6 +1051,29 @@ impl PySecondaryCoordinator {
     }
 }
 
+/// Derive the activated co-located primary's `required_setup_on_promote`
+/// from THIS run's pre-staged signal.
+///
+/// Single concern: "does this run defer setup-discovery to me?" The
+/// answer is the secondary's own `source_already_staged` flag (forwarded
+/// from `args.source_already_staged` at the construction-dispatch site).
+/// When true, the co-located primary this node activates engages the
+/// `setup_pending()` suppressor so it does not declare `0+0 >= 0`
+/// run-complete before its loopback-delivered discovery batch lands —
+/// matching the `SecondaryCoordinator::setup_discovery_pending`
+/// `pre_staged_mode` gate exactly (both are the submitter's
+/// `--source-already-staged`, read from the secondary's own arg HERE vs
+/// the wire `InitialAssignment.pre_staged_mode` THERE).
+///
+/// Deliberately NOT `src_network.is_some()`: the wrapper bind-mounts
+/// `/app/src-network` for EVERY SLURM secondary, so that predicate would
+/// engage the suppressor for a genuinely-empty NON-pre-staged run too —
+/// which has no discovery feed and would then hang to the setup-promote
+/// deadline.
+pub(crate) fn derive_setup_defer_on_promote(source_already_staged: bool) -> bool {
+    source_already_staged
+}
+
 /// Compose the secondary's memprofile output directory from the
 /// operator's `--memprofile` opt-in.
 ///
@@ -1094,8 +1150,48 @@ fn resolve_secondary_memprofile_dir_with_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_secondary_memprofile_dir, resolve_secondary_memprofile_dir_with_probe};
+    use super::{
+        derive_setup_defer_on_promote, resolve_secondary_memprofile_dir,
+        resolve_secondary_memprofile_dir_with_probe,
+    };
     use std::path::Path;
+
+    // ── Setup-defer-on-promote discriminator (Finding-1 regression) ──
+    //
+    // The activated co-located primary's `required_setup_on_promote`
+    // suppressor must engage EXACTLY when this run deferred discovery to
+    // this node (`source_already_staged`), and NOT for a genuinely-empty
+    // NON-pre-staged run. The previous discriminator
+    // (`src_network.is_some()`) was true for EVERY SLURM secondary (the
+    // wrapper bind-mounts `/app/src-network` unconditionally), so a
+    // non-pre-staged empty-corpus run relocated to a compute peer got the
+    // suppressor engaged with no discovery feed to clear it → hung to the
+    // 600s setup-promote deadline. These pin the corrected derivation.
+
+    #[test]
+    fn non_pre_staged_does_not_defer_setup_on_promote() {
+        // Finding-1 repro: a genuinely-empty NON-pre-staged run
+        // (`source_already_staged = false`) must NOT engage the
+        // suppressor — `required_setup_on_promote` stays false, so the
+        // activated primary exits via the normal bootstrap RunComplete
+        // path instead of hanging to the setup-promote deadline. This is
+        // the case the old `src_network.is_some()` discriminator broke.
+        assert!(
+            !derive_setup_defer_on_promote(false),
+            "non-pre-staged run must leave setup-defer false (prompt exit, no deadline hang)"
+        );
+    }
+
+    #[test]
+    fn pre_staged_defers_setup_on_promote() {
+        // The pre-staged path (`--source-already-staged`): discovery is
+        // deferred to this node, so the suppressor MUST engage to hold
+        // the run-complete exit until the loopback discovery batch lands.
+        assert!(
+            derive_setup_defer_on_promote(true),
+            "pre-staged run must defer setup on promote (engage the suppressor)"
+        );
+    }
 
     #[test]
     fn disabled_returns_none_regardless_of_probe() {

@@ -73,6 +73,23 @@ pub(crate) fn run_secondary<'py>(
     // src_tmp is non-Optional on PySecondaryConfig (always
     // resolved by `__new__`); pass it through unconditionally.
     kwargs.set_item("src_tmp", config.src_tmp.clone())?;
+    // This run's pre-staged signal, read off `task_args` exactly the
+    // way the submitter primary reads it (`drive_rust.rs` →
+    // `source_pre_staged_root`). `true` iff the submitter was invoked
+    // with `--source-already-staged`, i.e. discovery / ledger-seed was
+    // DEFERRED to the chosen compute peer. Forwarded into the
+    // coordinator so its on-demand co-located primary can engage the
+    // `setup_pending()` suppressor EXACTLY when this node will run
+    // setup-discovery (the `pre_staged_mode` gate). Read here at the
+    // construction-dispatch boundary — `src_network`, in contrast,
+    // resolves to the wrapper bind-mount for EVERY SLURM secondary and
+    // is therefore NOT a pre-staged discriminator.
+    let source_already_staged = task_args
+        .getattr("source_already_staged")
+        .ok()
+        .map(|v| !v.is_none() && v.is_truthy().unwrap_or(false))
+        .unwrap_or(false);
+    kwargs.set_item("source_already_staged", source_already_staged)?;
     // `--mem-manager-reserved` opt-in for the nested workers
     // cgroup. None means "skip nesting" so omit the kwarg and let
     // the constructor pick its default (also None); anything else

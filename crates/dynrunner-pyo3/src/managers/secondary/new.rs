@@ -37,6 +37,7 @@ impl PySecondaryCoordinator {
         distributed_config = None,
         src_network = None,
         src_tmp = None,
+        source_already_staged = false,
         max_resources = None,
         peer_lifecycle_listener = None,
         log_dir = None,
@@ -66,6 +67,7 @@ impl PySecondaryCoordinator {
         distributed_config: Option<DistributedConfig>,
         src_network: Option<PathBuf>,
         src_tmp: Option<PathBuf>,
+        source_already_staged: bool,
         max_resources: Option<PyResourceMap>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
         log_dir: Option<String>,
@@ -124,6 +126,7 @@ impl PySecondaryCoordinator {
             distributed_config: distributed_config.unwrap_or_default(),
             src_network,
             src_tmp,
+            source_already_staged,
             types: task.types,
             // `from_python` already extracted phase_deps off the
             // TaskDefinition's `get_phases()`; we keep it on the
