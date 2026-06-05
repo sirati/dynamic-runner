@@ -919,3 +919,129 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
     .await
     .expect("the fresh-sender observer must terminate (not hang)");
 }
+
+/// Announcer-ordering fix: `build_cold_join_observer` attaches the
+/// resource-holdings announcer's role-change hook BEFORE it restores the
+/// bootstrap snapshot, so the restore's `PrimaryChanged` apply fires the
+/// hook into the registered channel and the INITIAL holdings announce is
+/// NOT dropped. Pre-fix the announcer was attached only in `run`, AFTER
+/// the factory's restore had already fired the (then-unregistered) hook,
+/// so the first announce never went out.
+///
+/// Proof: a cold-join observer with non-empty `holdings`, restoring a
+/// snapshot that names a primary (so the restore re-points
+/// `current_primary` and fires the role-change hook), broadcasts exactly
+/// the restore-driven `PeerResourceHoldingsUpdated` carrying those
+/// holdings to `Destination::Primary` — captured on the primary-keyed
+/// outbox — before the run completes.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_join_announces_initial_holdings_after_restore() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Donor snapshot: names a primary (epoch 4) so the restore's
+                // `primary_epoch > local` branch fires the role-change hook.
+                // NOT complete — the loop must keep running so the announcer
+                // task gets a turn to drain its trigger onto the outbox.
+                let snapshot = {
+                    let mut donor = ClusterState::<TestId>::new();
+                    donor.apply(ClusterMutation::PrimaryChanged {
+                        new: "promoted-sec".into(),
+                        epoch: 4,
+                        reason: PrimaryChangeReason::Election,
+                    });
+                    donor.snapshot()
+                };
+
+                // Observer transport: a `"promoted-sec"`-keyed outbox so the
+                // announce's `Destination::Primary` resolves + sends, plus an
+                // inbound we feed RunComplete into after capturing the announce.
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (to_primary_tx, mut to_primary_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("promoted-sec".to_string(), to_primary_tx);
+                let transport =
+                    ChannelPeerTransport::from_raw_channels("obs".into(), outgoing, inbound_rx);
+
+                let holdings: std::collections::HashSet<String> =
+                    ["/nix/store/aaa".to_string(), "/nix/store/bbb".to_string()]
+                        .into_iter()
+                        .collect();
+
+                let mut config = observer_config("obs");
+                config.peer_timeout = Duration::from_secs(60);
+                config.fleet_dead_timeout = Duration::from_secs(60);
+
+                let mut observer = super::build_cold_join_observer(
+                    transport,
+                    ClusterState::<TestId>::new(),
+                    config,
+                    vec![snapshot],
+                    holdings,
+                );
+
+                // Drain frames to the primary until the restore-driven
+                // holdings announce arrives, then complete the run. The
+                // observer also fires a bootstrap `RequestClusterSnapshot` to
+                // the named primary at loop entry (§6); skip it — only the
+                // `PeerResourceHoldingsUpdated` announce is under test.
+                tokio::task::spawn_local(async move {
+                    loop {
+                        let frame = to_primary_rx.recv().await.expect(
+                            "the restore-driven initial announce must reach the primary outbox",
+                        );
+                        match frame {
+                            DistributedMessage::RequestClusterSnapshot { .. } => continue,
+                            DistributedMessage::ClusterMutation { mutations, .. } => {
+                                assert_eq!(mutations.len(), 1, "one mutation per announce");
+                                match &mutations[0] {
+                                    ClusterMutation::PeerResourceHoldingsUpdated {
+                                        peer_id,
+                                        holdings,
+                                        epoch,
+                                    } => {
+                                        assert_eq!(peer_id, "obs");
+                                        assert_eq!(
+                                            holdings,
+                                            &vec![
+                                                "/nix/store/aaa".to_string(),
+                                                "/nix/store/bbb".to_string()
+                                            ],
+                                            "the initial announce carries the cold-join holdings"
+                                        );
+                                        assert_eq!(
+                                            *epoch, 4,
+                                            "the announce stamps the restored primary_epoch"
+                                        );
+                                    }
+                                    other => panic!(
+                                        "expected PeerResourceHoldingsUpdated; got {other:?}"
+                                    ),
+                                }
+                                break;
+                            }
+                            other => panic!("unexpected frame to primary: got {other:?}"),
+                        }
+                    }
+                    // Now finish the run.
+                    inbound_tx
+                        .send(DistributedMessage::ClusterMutation {
+                            sender_id: "promoted-sec".into(),
+                            timestamp: 0.0,
+                            mutations: vec![ClusterMutation::RunComplete],
+                        })
+                        .expect("inbound open");
+                });
+
+                let terminal = observer
+                    .run()
+                    .await
+                    .expect("Ok after the announce + RunComplete");
+                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+            })
+            .await;
+    })
+    .await
+    .expect("the cold-join-announce observer must terminate");
+}
