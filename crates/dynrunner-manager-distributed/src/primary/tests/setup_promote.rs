@@ -857,3 +857,278 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
         })
         .await;
 }
+
+/// T6 — RACE-ROBUST seeded-resume ordering (the `--source-already-staged`
+/// co-located-primary regression). A primary activated from an EMPTY
+/// ledger on the discovery node MUST NOT declare run-complete before its
+/// own setup-discovery batch is ingested — EVEN when that batch arrives
+/// AFTER the point at which the first would-be completion check fires.
+///
+/// Distinct from
+/// `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`
+/// (which PRE-queues the batch, so the very first recv tick drains it):
+/// here the batch is held back until the loop has demonstrably spun at
+/// least one full iteration with `total_tasks == 0`, reproducing the
+/// production race where the loopback `TaskAdded` arrives ~55ms after the
+/// activated primary's first run-complete check would have fired. The
+/// suppression is by STATE (`setup_pending()` is true while the ledger is
+/// empty), not by the frame being queued at check time — so the gate
+/// holds regardless of delivery timing. Pre-fix (activated
+/// `required_setup_on_promote = false`) the loop would trip
+/// `0+0 >= 0 && active_workers == 0` on iteration 1 and exit at total=0,
+/// sweeping the late batch into the shutdown drain.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_check() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let (_sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
+
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_millis(50),
+                // Setup-defer mode — the gate under test. The activated
+                // co-located primary on the `--source-already-staged` path
+                // is built with exactly this flag set (see the activator in
+                // `managers/secondary/run.rs`).
+                required_setup_on_promote: true,
+                // A long deadline so the test can ONLY exit via the counter
+                // path after the late batch lands, never via the backstop.
+                setup_promote_deadline: Duration::from_secs(30),
+                ..test_primary_config()
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            assert!(
+                primary.setup_pending(),
+                "setup_pending must be initialised true from config.required_setup_on_promote"
+            );
+
+            // Empty ledger at entry — what `activate_local_primary` hydrates
+            // from an EMPTY snapshot: default phase, no binaries, total=0.
+            let phase = dynrunner_core::PhaseId::from("default");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                std::collections::HashMap::new(),
+            )
+            .expect("default-phase pool");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.total_tasks = 0;
+
+            let bin = make_binary("setup-discovered-task", 100);
+            let hash = crate::primary::wire::compute_task_hash(&bin);
+
+            // Drive the loop and the DELAYED producer concurrently. The
+            // producer sleeps first, so the loop spins iteration 1 (and
+            // more) with an empty ledger BEFORE the batch is sent — the
+            // exact ordering the production race exhibits. If the gate were
+            // absent, the loop would already have exited at total=0 by the
+            // time the producer wakes, and the held sender would observe a
+            // closed channel; the post-exit assertions would then catch
+            // total_tasks=0 / setup_pending still true.
+            let producer_tx = incoming_tx.clone();
+            let producer_hash = hash.clone();
+            let producer_bin = bin.clone();
+            let producer = async move {
+                // Comfortably longer than the ~55ms production window so the
+                // first would-be completion check has definitely passed.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                producer_tx
+                    .send(DistributedMessage::ClusterMutation {
+                        sender_id: "sec-promoted".into(),
+                        timestamp: 0.0,
+                        mutations: vec![ClusterMutation::<TestId>::TaskAdded {
+                            hash: producer_hash.clone(),
+                            task: producer_bin,
+                        }],
+                    })
+                    .expect(
+                        "the inbound channel must still be open when the late batch is \
+                         sent — a SendError here means the loop already exited at total=0, \
+                         i.e. the setup_pending gate failed to suppress the premature exit",
+                    );
+                producer_tx
+                    .send(DistributedMessage::TaskComplete {
+                        sender_id: "sec-promoted".into(),
+                        timestamp: 0.0,
+                        secondary_id: "sec-promoted".into(),
+                        worker_id: 0,
+                        task_hash: producer_hash,
+                        result_data: None,
+                    })
+                    .expect("inbound channel must remain open for the completion report");
+            };
+            // Hold the original sender so the channel never closes from the
+            // producer side dropping its clone.
+            let _hold = incoming_tx;
+
+            let exit = tokio::time::timeout(Duration::from_secs(5), async {
+                let (loop_res, ()) = tokio::join!(primary.operational_loop(), producer);
+                loop_res
+            })
+            .await;
+
+            match exit {
+                Ok(Ok(())) => {
+                    assert!(
+                        !primary.setup_pending(),
+                        "setup_pending must be cleared by the late TaskAdded — if still \
+                         true the loop exited some other way (e.g. the deadline) without \
+                         absorbing the discovery batch"
+                    );
+                    assert_eq!(
+                        primary.total_tasks, 1,
+                        "the late-arriving discovery batch must be absorbed (total=1), \
+                         NOT discarded into a shutdown drain at total=0"
+                    );
+                    assert!(
+                        primary.completed_tasks.contains(&hash),
+                        "the completion for the discovered task must be recorded"
+                    );
+                    assert!(
+                        primary.setup_deadline_outcome.is_none(),
+                        "the run completed via the counter path, not the deadline backstop"
+                    );
+                }
+                Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+                Err(_) => panic!(
+                    "operational_loop did not exit within 5s after the delayed discovery \
+                     batch — the gate may be stuck, or the counter check is not re-enabling"
+                ),
+            }
+        })
+        .await;
+}
+
+/// T7 — genuinely-empty setup-discovery stays PROMPT. When discovery
+/// surfaces ZERO tasks, the discovery node broadcasts `RunComplete`
+/// directly (see `secondary::origination::ingest_setup_discovery`'s
+/// empty-discovery arm) because there will never be a `TaskCompleted` to
+/// drive the counter exit. That `RunComplete` loops back to the
+/// co-located primary and trips the UNGATED `cluster_state.run_complete()`
+/// exit in `run_complete_check` — so the primary exits IMMEDIATELY, NOT
+/// after waiting out `setup_promote_deadline`.
+///
+/// Pins the second invariant of the seeded-resume fix: setting
+/// `required_setup_on_promote = true` on the activated primary must NOT
+/// make a 0-task run pay the full deadline. The deadline is set to 30s
+/// here; a prompt RunComplete-driven exit completes in single-digit ms.
+/// `setup_pending()` stays true the whole time (no TaskAdded ever lands),
+/// proving the exit is via the ungated RunComplete arm, not the counter
+/// arm and not the deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_discovery_run_complete_exits_promptly_not_after_deadline() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let (_sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
+
+            let deadline = Duration::from_secs(30);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_millis(50),
+                required_setup_on_promote: true,
+                // Long deadline: a prompt exit MUST come from the RunComplete
+                // arm, well before this could fire. If the test takes ~30s
+                // the fix is wrong (the 0-task run wrongly waits the deadline).
+                setup_promote_deadline: deadline,
+                ..test_primary_config()
+            };
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            assert!(
+                primary.setup_pending(),
+                "setup_pending must be initialised true from config.required_setup_on_promote"
+            );
+
+            let phase = dynrunner_core::PhaseId::from("default");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                std::collections::HashMap::new(),
+            )
+            .expect("default-phase pool");
+            primary.pending = Some(pool);
+            primary.phase_completed.insert(phase.clone(), 0);
+            primary.phase_failed.insert(phase, 0);
+            primary.total_tasks = 0;
+
+            // The empty-discovery terminal: RunComplete with NO preceding
+            // TaskAdded — exactly the batch `ingest_setup_discovery` fans out
+            // when `task_count == 0`. No PhaseDepsSet is needed to exercise
+            // the exit (the run_complete arm reads only the sticky flag).
+            incoming_tx
+                .send(DistributedMessage::ClusterMutation {
+                    sender_id: "sec-promoted".into(),
+                    timestamp: 0.0,
+                    mutations: vec![ClusterMutation::<TestId>::RunComplete],
+                })
+                .unwrap();
+            let _hold = incoming_tx;
+
+            let start = std::time::Instant::now();
+            let exit = tokio::time::timeout(
+                // A ceiling far below the 30s deadline: if the run wrongly
+                // waits the deadline this times out and fails loudly.
+                Duration::from_secs(5),
+                primary.operational_loop(),
+            )
+            .await;
+            let elapsed = start.elapsed();
+
+            match exit {
+                Ok(Ok(())) => {
+                    assert!(
+                        primary.cluster_state_for_test().run_complete(),
+                        "the run must have exited via the RunComplete arm — the sticky \
+                         cluster_state.run_complete flag must be set"
+                    );
+                    assert!(
+                        primary.setup_pending(),
+                        "setup_pending must remain TRUE — no TaskAdded ever landed, so the \
+                         exit was the ungated RunComplete arm, NOT the counter arm; if this \
+                         is false the test rig leaked a task and the exit path diverged"
+                    );
+                    assert!(
+                        primary.setup_deadline_outcome.is_none(),
+                        "the deadline backstop must NOT have fired — a Some(...) here means \
+                         the 0-task run waited out the full setup_promote_deadline instead \
+                         of exiting promptly on RunComplete"
+                    );
+                    assert_eq!(
+                        primary.total_tasks, 0,
+                        "no task was ever discovered — total stays 0"
+                    );
+                    // Promptness: the exit must be far below the deadline.
+                    // The 5s timeout ceiling already enforces << 30s, but pin
+                    // a tighter bound so a regression that adds deadline-class
+                    // latency is caught even if the ceiling is later raised.
+                    assert!(
+                        elapsed < Duration::from_secs(2),
+                        "0-task setup-discovery must exit PROMPTLY on RunComplete \
+                         ({elapsed:?}), not pay the {deadline:?} setup-promote deadline"
+                    );
+                }
+                Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+                Err(_) => panic!(
+                    "operational_loop did not exit within 5s on a 0-task RunComplete — the \
+                     ungated run_complete arm is not firing, so the 0-task setup-discovery \
+                     case would wrongly wait the {deadline:?} deadline"
+                ),
+            }
+        })
+        .await;
+}
