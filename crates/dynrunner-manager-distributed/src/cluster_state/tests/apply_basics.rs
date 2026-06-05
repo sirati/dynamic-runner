@@ -53,7 +53,6 @@ fn assigned_late_after_completed_is_noop() {
             hash: "h".into(),
             secondary: "s1".into(),
             worker: 0,
-
             version: Default::default(),
         }),
         ApplyOutcome::NoOp
@@ -106,7 +105,6 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
-
         version: Default::default(),
     });
     assert_eq!(
@@ -148,7 +146,6 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
             hash: "h".into(),
             kind: ErrorType::Recoverable,
             error: "late".into(),
-
             version: Default::default(),
         }),
         ApplyOutcome::NoOp
@@ -190,7 +187,6 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "c".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
-
         version: Default::default(),
     });
     // 1 fail_oom (ResourceExhausted("memory"))
@@ -202,7 +198,6 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "d".into(),
         kind: ErrorType::ResourceExhausted("memory".into()),
         error: "oom".into(),
-
         version: Default::default(),
     });
     // 1 fail_final (ResourceExhausted("disk") falls through)
@@ -214,7 +209,6 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "e".into(),
         kind: ErrorType::ResourceExhausted("disk".into()),
         error: "no space".into(),
-
         version: Default::default(),
     });
     // 1 fail_final (NonRecoverable)
@@ -226,7 +220,6 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
-
         version: Default::default(),
     });
     // 1 Pending (uncounted)
@@ -273,7 +266,6 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
             reason: "missing dep".to_string().into(),
         },
         error: "invalid_task:missing dep".into(),
-
         version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
@@ -480,7 +472,6 @@ fn iter_pending_only_returns_pending() {
         hash: "i".into(),
         secondary: "s".into(),
         worker: 0,
-
         version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
@@ -517,7 +508,6 @@ fn convergence_completed_can_race_assigned() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
-
         version: Default::default(),
     };
     let completed: ClusterMutation<RunnerIdentifier> = ClusterMutation::TaskCompleted {
@@ -563,7 +553,6 @@ fn convergence_under_duplicates() {
             hash: "h1".into(),
             secondary: "s".into(),
             worker: 0,
-
             version: Default::default(),
         },
         ClusterMutation::TaskCompleted {
@@ -574,7 +563,6 @@ fn convergence_under_duplicates() {
             hash: "h2".into(),
             kind: ErrorType::Recoverable,
             error: "boom".into(),
-
             version: Default::default(),
         },
     ];

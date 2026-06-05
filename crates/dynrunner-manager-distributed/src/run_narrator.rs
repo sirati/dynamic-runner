@@ -352,7 +352,6 @@ mod tests {
                 hash: "bad".to_string(),
                 kind: ErrorType::NonRecoverable,
                 error: "boom".into(),
-
                 version: Default::default(),
             });
             state.apply(ClusterMutation::RunComplete);

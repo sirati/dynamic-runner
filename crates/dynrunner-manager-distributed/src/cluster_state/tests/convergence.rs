@@ -40,7 +40,13 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
                 version: v(2),
             },
         ),
-        ("blocked", TaskState::Blocked { task: t(), on: "p".into() }),
+        (
+            "blocked",
+            TaskState::Blocked {
+                task: t(),
+                on: "p".into(),
+            },
+        ),
         ("completed", TaskState::Completed { task: t() }),
         (
             "failed",
@@ -74,10 +80,7 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
 
 /// Merge `a` then `b` into a fresh state via the shared join and return
 /// the resulting variant discriminant name.
-fn merge_pair(
-    a: &TaskState<RunnerIdentifier>,
-    b: &TaskState<RunnerIdentifier>,
-) -> &'static str {
+fn merge_pair(a: &TaskState<RunnerIdentifier>, b: &TaskState<RunnerIdentifier>) -> &'static str {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let mut resumed = Vec::new();
     s.merge_task_state("h", a.clone(), None, &mut resumed);
@@ -239,6 +242,109 @@ fn terminal_total_order_holds() {
     assert_eq!(merge_pair(&completed, &unful), "completed");
 }
 
+// ── §2.2: FailedLike-vs-FailedLike — version BEFORE the discriminant ──
+
+/// Within `TerminalRank::FailedLike`, the join key compares `version`
+/// BEFORE the `failedlike` discriminant (design §2.2: the tuple is
+/// `(band, terminal_rank, version, nonterminal_rank, failedlike,
+/// payload_hash)`). So a higher-version generic `Failed` SUPERSEDES a
+/// lower-version `Unfulfillable`, and only at EQUAL version does the
+/// `Failed < Unfulfillable` discriminant decide.
+///
+/// This pins the merge-level behavior EXPLICITLY rather than leaning on
+/// the upstream primary-side `failed_tasks` dedup gate
+/// (`primary/task/failed.rs` + `handler.rs`) that keeps the higher-version
+/// generic-`Failed`-over-`Unfulfillable` case unreachable in production —
+/// that gate is a DIFFERENT concern, and this test makes the comparator's
+/// own ordering a pinned invariant in its own right.
+#[test]
+fn failedlike_version_arbitrates_before_discriminant() {
+    let task = mk_task("x");
+    let unful_s1 = TaskState::Unfulfillable {
+        task: task.clone(),
+        reason: "no-toolchain".into(),
+        last_error: "unfulfillable".into(),
+        version: TaskVersion {
+            primary_epoch: 0,
+            seq: 1,
+        },
+    };
+    let failed_s2 = TaskState::Failed {
+        task: task.clone(),
+        kind: ErrorType::NonRecoverable,
+        last_error: "boom".into(),
+        version: TaskVersion {
+            primary_epoch: 0,
+            seq: 2,
+        },
+    };
+
+    // (a) Higher-version generic `Failed` (s2) WINS over a lower-version
+    // `Unfulfillable` (s1): version arbitrates before the discriminant, so
+    // the incoming `Failed` strictly dominates → Applied, state → Failed.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let mut resumed = Vec::new();
+    s.merge_task_state("h", unful_s1.clone(), None, &mut resumed);
+    let out = s.merge_task_state("h", failed_s2.clone(), None, &mut resumed);
+    assert!(
+        matches!(
+            out,
+            MergeOutcome::Applied {
+                failure_won: true,
+                ..
+            }
+        ),
+        "higher-version Failed must win the FailedLike join (version before discriminant), got {out:?}"
+    );
+    assert_eq!(
+        variant_name(s.task_state("h").expect("present")),
+        "failed",
+        "the higher-version Failed (s2) supersedes the Unfulfillable (s1)"
+    );
+    // The reverse delivery order: the now-local higher-version Failed (s2)
+    // is NOT regressed by a redelivered lower-version Unfulfillable (s1).
+    let out_rev = s.merge_task_state("h", unful_s1.clone(), None, &mut resumed);
+    assert_eq!(
+        out_rev,
+        MergeOutcome::NoOp,
+        "a lower-version Unfulfillable must NOT regress the won higher-version Failed"
+    );
+    // And the converged state is order-independent: s2-Failed wins both ways.
+    assert_eq!(merge_pair(&unful_s1, &failed_s2), "failed");
+    assert_eq!(merge_pair(&failed_s2, &unful_s1), "failed");
+
+    // (b) EQUAL version (both s1): the `failedlike` discriminant decides.
+    // `Failed = 0 < Unfulfillable = 1`, and the join keeps the MAX key, so
+    // `Unfulfillable` is the deterministic winner — and an incoming generic
+    // `Failed` at equal version is a NoOp against a local `Unfulfillable`.
+    let failed_s1 = TaskState::Failed {
+        task: task.clone(),
+        kind: ErrorType::NonRecoverable,
+        last_error: "boom".into(),
+        version: TaskVersion {
+            primary_epoch: 0,
+            seq: 1,
+        },
+    };
+    let mut eq = ClusterState::<RunnerIdentifier>::new();
+    let mut eq_resumed = Vec::new();
+    eq.merge_task_state("h", unful_s1.clone(), None, &mut eq_resumed);
+    let eq_out = eq.merge_task_state("h", failed_s1.clone(), None, &mut eq_resumed);
+    assert_eq!(
+        eq_out,
+        MergeOutcome::NoOp,
+        "an equal-version generic Failed must NOT supersede a local Unfulfillable (Failed < Unfulfillable)"
+    );
+    assert_eq!(
+        variant_name(eq.task_state("h").expect("present")),
+        "unfulfillable",
+        "at equal version the Unfulfillable discriminant wins"
+    );
+    // Commutative at equal version: Unfulfillable wins regardless of order.
+    assert_eq!(merge_pair(&unful_s1, &failed_s1), "unfulfillable");
+    assert_eq!(merge_pair(&failed_s1, &unful_s1), "unfulfillable");
+}
+
 // ── §5.3 #3: C3 stale-assignment-after-requeue ──
 
 /// `Pending v0 → InFlight v1 (assigned) → Pending v2 (requeue reset,
@@ -250,23 +356,35 @@ fn stale_assignment_after_requeue_does_not_resurrect() {
     let task = mk_task("x");
     let pending_v0 = TaskState::Pending {
         task: task.clone(),
-        version: TaskVersion { primary_epoch: 1, seq: 0 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 0,
+        },
     };
     let inflight_v1 = TaskState::InFlight {
         task: task.clone(),
         secondary: "dead-sec".into(),
         worker: 0,
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     };
     let reset_pending_v2 = TaskState::Pending {
         task: task.clone(),
-        version: TaskVersion { primary_epoch: 1, seq: 2 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 2,
+        },
     };
     let reassign_inflight_v3 = TaskState::InFlight {
         task: task.clone(),
         secondary: "live-sec".into(),
         worker: 1,
-        version: TaskVersion { primary_epoch: 1, seq: 3 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 3,
+        },
     };
 
     let mut s = ClusterState::<RunnerIdentifier>::new();
@@ -316,7 +434,10 @@ async fn refailure_higher_version_emits_same_version_noops() {
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "first".into(),
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     });
     assert!(rx.try_recv().is_ok(), "first failure must emit");
     // Higher-version re-failure — WINS, emits again.
@@ -325,7 +446,10 @@ async fn refailure_higher_version_emits_same_version_noops() {
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
-            version: TaskVersion { primary_epoch: 1, seq: 2 },
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 2
+            },
         }),
         ApplyOutcome::Applied
     );
@@ -342,7 +466,10 @@ async fn refailure_higher_version_emits_same_version_noops() {
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
-            version: TaskVersion { primary_epoch: 1, seq: 2 },
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq: 2
+            },
         }),
         ApplyOutcome::NoOp
     );
@@ -370,7 +497,10 @@ fn failure_record_divergence_detected() {
             hash: "h".into(),
             kind,
             error: err.into(),
-            version: TaskVersion { primary_epoch: 1, seq },
+            version: TaskVersion {
+                primary_epoch: 1,
+                seq,
+            },
         });
         s
     };
@@ -456,7 +586,10 @@ fn apply_restore_digest_agree() {
         hash: "b".into(),
         secondary: "s".into(),
         worker: 0,
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     });
     s.apply(ClusterMutation::TaskCompleted {
         hash: "c".into(),
@@ -466,7 +599,10 @@ fn apply_restore_digest_agree() {
         hash: "d".into(),
         kind: ErrorType::NonRecoverable,
         error: "boom".into(),
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     });
     let mut joiner = ClusterState::<RunnerIdentifier>::new();
     joiner.restore(s.snapshot());
@@ -504,7 +640,10 @@ fn restore_supersedes_failed_with_completed() {
         hash: "prereq".into(),
         kind: ErrorType::Recoverable,
         error: "transient".into(),
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     });
     local.apply(ClusterMutation::TaskAdded {
         hash: "dep".into(),
@@ -555,7 +694,10 @@ async fn re_restore_is_idempotent_and_emits_once() {
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "boom".into(),
-        version: TaskVersion { primary_epoch: 1, seq: 1 },
+        version: TaskVersion {
+            primary_epoch: 1,
+            seq: 1,
+        },
     });
     let snap = src.snapshot();
 

@@ -81,7 +81,6 @@ fn seed_state(
                     hash: hash.clone(),
                     secondary: secondary.to_string(),
                     worker: *worker,
-
                     version: Default::default(),
                 });
             }
@@ -96,7 +95,6 @@ fn seed_state(
                     hash: hash.clone(),
                     kind: kind.clone(),
                     error: "x".to_string(),
-
                     version: Default::default(),
                 });
             }

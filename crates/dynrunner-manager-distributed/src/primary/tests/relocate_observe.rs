@@ -263,7 +263,6 @@ async fn relinquished_result_getters_read_replicated_ledger() {
                     hash: compute_task_hash(&bad),
                     kind: ErrorType::NonRecoverable,
                     error: "boom".into(),
-
                     version: Default::default(),
                 });
 

@@ -24,7 +24,6 @@ fn snapshot_round_trip_preserves_state() {
         hash: "i".into(),
         secondary: "s1".into(),
         worker: 7,
-
         version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {
@@ -84,7 +83,6 @@ fn snapshot_round_trip_preserves_invalid_task() {
             reason: "duplicate (phase,task_id)".to_string().into(),
         },
         error: "invalid_task:duplicate (phase,task_id)".into(),
-
         version: Default::default(),
     });
 
@@ -204,7 +202,6 @@ fn restore_lattice_merge_preserves_local_terminal() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
-
         version: Default::default(),
     });
 
@@ -234,7 +231,6 @@ fn restore_lattice_merge_promotes_pending_to_in_flight() {
         hash: "h".into(),
         secondary: "s".into(),
         worker: 4,
-
         version: Default::default(),
     });
 
@@ -311,7 +307,6 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
             reason: "missing dep".to_string().into(),
         },
         error: "missing".into(),
-
         version: Default::default(),
     });
     s.apply(ClusterMutation::TaskAdded {

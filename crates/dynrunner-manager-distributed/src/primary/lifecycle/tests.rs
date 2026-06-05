@@ -630,7 +630,6 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
-
                     version: Default::default(),
                 },
             );
@@ -708,7 +707,6 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
-
                     version: Default::default(),
                 },
             );
@@ -743,7 +741,6 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                     hash: hash.clone(),
                     kind: ErrorType::Recoverable,
                     error: "transient".into(),
-
                     version: Default::default(),
                 },
             );

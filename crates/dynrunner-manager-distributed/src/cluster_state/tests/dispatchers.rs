@@ -91,7 +91,6 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
         hash: "h-alpha".into(),
         secondary: "sec-1".into(),
         worker: 0,
-
         version: Default::default(),
     });
     assert_eq!(
@@ -134,7 +133,6 @@ async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
             hash: "h-beta".into(),
             kind: ErrorType::NonRecoverable,
             error: "disk full".into(),
-
             version: Default::default(),
         }),
         ApplyOutcome::Applied
@@ -177,7 +175,6 @@ async fn task_completed_listener_fires_on_unfulfillable_terminal() {
                 reason: "missing toolchain".to_owned().into(),
             },
             error: "missing toolchain".into(),
-
             version: Default::default(),
         }),
         ApplyOutcome::Applied

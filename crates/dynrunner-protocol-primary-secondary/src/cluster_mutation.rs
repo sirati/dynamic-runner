@@ -416,7 +416,7 @@ pub enum ClusterMutation<I> {
     ///   * Any dep `Unfulfillable` → `Blocked { task, on: dep_hash }`.
     ///   * Any dep `Failed { NonRecoverable, .. }` → cascade-fail as
     ///     `Failed { kind: NonRecoverable, task, last_error:
-    ///     "upstream-failed", attempts: 1 }`.
+    ///     "upstream-failed", version: default }`.
     ///   * Else (any dep in `Pending` / `InFlight` / `Blocked`) →
     ///     `Blocked { task, on: first-unresolved-dep-hash }`.
     ///

@@ -160,7 +160,6 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
                 reason: "missing upstream".to_string().into(),
             },
             error: "invalid_task:missing upstream".into(),
-
             version: Default::default(),
         });
         cs.apply(ClusterMutation::TaskAdded {
@@ -230,7 +229,6 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
             hash: "inflight-1".into(),
             secondary: "secondary-0".into(),
             worker: 0,
-
             version: Default::default(),
         });
     }
@@ -315,7 +313,6 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                     hash: "inflight-1".into(),
                     secondary: "secondary-0".into(),
                     worker: 0,
-
                     version: Default::default(),
                 });
             }
@@ -632,7 +629,6 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 1,
-
                     version: Default::default(),
                 });
             }
@@ -741,7 +737,6 @@ async fn promotion_resume_reconstructs_roster_without_redispatch() {
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 0,
-
                     version: Default::default(),
                 });
             }
@@ -874,7 +869,6 @@ async fn promoted_primary_detects_dead_secondary_and_requeues_inherited_inflight
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 0,
-
                     version: Default::default(),
                 });
             }
@@ -981,7 +975,6 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                         hash: hash.clone(),
                         secondary: "sec-dead".into(),
                         worker: 0,
-
                         version: Default::default(),
                     });
                 }

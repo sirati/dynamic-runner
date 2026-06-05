@@ -595,7 +595,6 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
             hash: victim_hash.clone(),
             secondary: "dead-sec".into(),
             worker: 0,
-
             version: Default::default(),
         });
     }

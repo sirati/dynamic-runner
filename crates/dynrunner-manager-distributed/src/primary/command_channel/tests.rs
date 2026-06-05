@@ -262,7 +262,6 @@ async fn reinject_task_budget_exhaustion() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
-
                     version: Default::default(),
                 });
             // Pool init: reinject requires the phase to exist.
@@ -300,7 +299,6 @@ async fn reinject_task_budget_exhaustion() {
                         reason: "still missing".to_string().into(),
                     },
                     error: "unfulfillable again".into(),
-
                     version: Default::default(),
                 });
             let (reply_tx2, reply_rx2) = oneshot::channel();
@@ -1076,7 +1074,6 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
                         reason: "missing toolchain".to_string().into(),
                     },
                     error: "unfulfillable".into(),
-
                     version: Default::default(),
                 });
             seed_pool(&mut coordinator, &[&b.phase_id]);
