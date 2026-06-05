@@ -898,6 +898,27 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         this
     }
 
+    /// Whether `Destination::Primary` resolves to THIS node — i.e. this
+    /// coordinator is itself the current primary. Reads the exact role
+    /// facts `Self::send_to` resolves `Destination::Primary` through:
+    /// `cluster_state.current_primary()` with this node's own
+    /// `config.node_id` as the bootstrap fallback. So `current_primary()
+    /// == Some(own id)` is self, and `None` (no `PrimaryChanged` applied
+    /// yet — the bootstrap/submitter primary) ALSO resolves to self,
+    /// matching the `bootstrap_primary = Some(node_id)` argument
+    /// `send_to` passes. It is `false` ONLY when `current_primary()` is a
+    /// remote peer (a DEMOTED ex-primary whose authority moved).
+    ///
+    /// Used by `handle_task_request` to decide whether an unassignable
+    /// `TaskRequest` may be relayed to `Destination::Primary`: relaying
+    /// to self is a self-feeding loopback cycle, not a no-op, so the
+    /// relay arm fires only when this is `false`.
+    pub(super) fn current_primary_is_self(&self) -> bool {
+        self.cluster_state
+            .current_primary()
+            .is_none_or(|p| p == self.config.node_id)
+    }
+
     /// THE egress edge: resolve a typed
     /// [`dynrunner_protocol_primary_secondary::Destination`] to a
     /// concrete transport target by reading this coordinator's own role
@@ -956,17 +977,21 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // `Destination::Secondary(own_id)` resolves here, so dropping
             // it would lose the co-located secondary's work.
             //
-            // Without a co-located secondary (the submitter primary,
-            // in-process tests): the only reachable case is the
-            // demoted-vs-live relay arm (`task/request.rs`) — a LIVE
-            // primary that couldn't assign a `TaskRequest` locally falls
-            // through to relay it to `Destination::Primary`, which is
-            // itself. Re-delivering it to the node already holding (and
-            // unable to assign) it is a benign no-op: the task stays in
-            // this primary's pool and the secondary retries on its next
-            // backoff tick. Faithful to the prior behaviour, where the
-            // self-relay resolved to `send_to_peer(own_id)` → NoRoute →
-            // swallowed.
+            // What does NOT reach here: a self-addressed `TaskRequest`
+            // relay. `handle_task_request` (`task/request.rs`) gates its
+            // `Destination::Primary` relay on `!current_primary_is_self()`
+            // — a LIVE primary that cannot assign a `TaskRequest` PARKS it
+            // locally instead of relaying to itself. That gate exists
+            // BECAUSE this loopback delivers a LIVE frame to the
+            // co-located secondary's inbound, which demuxes it straight
+            // back into this primary's inbound (`is_primary_facing` →
+            // `colocated_primary_inbound_tx`): an unthrottled self-feeding
+            // cycle, NOT a no-op. (The pre-one-mesh self-relay resolved to
+            // `send_to_peer(own_id)` → NoRoute → swallowed, which dead-
+            // ended; the `SendTarget::Loopback` path does not — hence the
+            // origin-side gate.) Only a DEMOTED ex-primary
+            // (`current_primary()` is a remote peer) still relays, and
+            // that resolves to `SendTarget::Peer`, never here.
             SendTarget::Loopback => match &self.colocated_loopback_tx {
                 Some(tx) => tx.send(msg).map_err(|_| {
                     "co-located secondary inbound loopback closed".to_string()
