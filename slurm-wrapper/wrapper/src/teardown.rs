@@ -21,6 +21,7 @@
 use std::process::Command;
 use std::time::Duration;
 
+use dynrunner_reap::bounded_command::{run_bounded, BoundedOutcome};
 use dynrunner_reap::clock::RealClock;
 use dynrunner_reap::process_probe::{KillProbe, ProcessProbe};
 use dynrunner_reap::reap::{reap_pids, ReapGraces, ReapStatus, ReapTarget};
@@ -39,6 +40,29 @@ use crate::LOG_TARGET;
 const STOP_GRACE: Duration = Duration::from_secs(10);
 const SIGTERM_GRACE: Duration = Duration::from_secs(3);
 const SIGKILL_GRACE: Duration = Duration::from_secs(2);
+
+/// Wall-clock bound for the metadata `podman inspect` calls (PID capture).
+/// A read of the container record is near-instant when healthy; bound it
+/// SHORT so a podman wedged on NFS-backed storage cannot gate the kill(2)
+/// reap. The reap is podman-/delegation-INDEPENDENT and is the hard
+/// backstop — if inspect cannot answer, we proceed with whatever PIDs we
+/// captured (possibly none) rather than block until SLURM's `KillWait`
+/// SIGKILLs the wrapper mid-teardown.
+const INSPECT_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock bound for `podman stop -t <STOP_GRACE>`. Podman's own `-t`
+/// already bounds the graceful wait to [`STOP_GRACE`] before it SIGKILLs
+/// the container, but the `podman` PROCESS itself can still wedge (NFS
+/// storage lock, hung conmon). Bound at `STOP_GRACE` + headroom so a
+/// healthy stop completes, while a wedged podman is killed and we fall
+/// straight through to the identity-checked kill(2) reap — the stop is a
+/// best-effort courtesy, the reap is the guarantee.
+const STOP_BUDGET: Duration = Duration::from_secs(15);
+
+/// Wall-clock bound for `podman rm -f` (handle destruction). Best-effort
+/// cleanup AFTER the reap has already confirmed the PIDs gone; bounded so
+/// a wedged podman cannot strand the wrapper at the very end of teardown.
+const RM_BUDGET: Duration = Duration::from_secs(5);
 
 /// Mirror generate.rs:306-310: `systemctl --user kill --signal=SIGCONT
 /// <unit>` for systemd mode, no-op for `None`.
@@ -140,23 +164,23 @@ pub fn reap_container_inband(podman: &str, layout: &Layout) -> ReapStatus {
 }
 
 /// `podman --root .. --runroot .. inspect --format <fmt> <name>` → host
-/// PID, or `None` when the record is gone / the field is 0 / unparsable.
-/// Mirrors the shutdown-manager's `inspect_pid`; both run the SAME
-/// invocation shape against the per-secondary storage root.
+/// PID, or `None` when the record is gone / the field is 0 / unparsable /
+/// or podman wedged past [`INSPECT_BUDGET`]. Mirrors the shutdown-manager's
+/// `inspect_pid`; both run the SAME invocation shape against the
+/// per-secondary storage root. BOUNDED: a podman stuck on NFS storage must
+/// not gate the kill(2) reap, so a timeout degrades to `None` (no captured
+/// PID for this slot) — the reap still runs on whatever was captured.
 fn inspect_pid(podman: &str, layout: &Layout, name: &str, format: &str) -> Option<u32> {
-    let out = podman_base(podman, layout)
-        .arg("inspect")
-        .arg("--format")
-        .arg(format)
-        .arg(name)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = podman_base(podman, layout);
+    cmd.arg("inspect").arg("--format").arg(format).arg(name);
+    let BoundedOutcome::Exited {
+        success: true,
+        stdout,
+    } = run_bounded(cmd, INSPECT_BUDGET, &RealClock, true)
+    else {
         return None;
-    }
-    let pid = String::from_utf8_lossy(&out.stdout)
+    };
+    let pid = String::from_utf8_lossy(&stdout)
         .trim()
         .lines()
         .next()?
@@ -170,19 +194,21 @@ fn inspect_pid(podman: &str, layout: &Layout, name: &str, format: &str) -> Optio
 }
 
 /// `podman stop -t <grace> <name>` — graceful stop, best-effort bool.
+/// BOUNDED at [`STOP_BUDGET`]: a wedged podman is SIGKILLed and reported
+/// `false`, never blocking the kill(2) reap that follows.
 fn podman_stop(podman: &str, layout: &Layout, name: &str, grace_secs: u32) -> bool {
-    run_silent(
-        podman_base(podman, layout)
-            .arg("stop")
-            .arg("-t")
-            .arg(grace_secs.to_string())
-            .arg(name),
-    )
+    let mut cmd = podman_base(podman, layout);
+    cmd.arg("stop").arg("-t").arg(grace_secs.to_string()).arg(name);
+    run_silent_bounded(cmd, STOP_BUDGET)
 }
 
 /// `podman rm -f <name>` — force-remove the handle, best-effort bool.
+/// BOUNDED at [`RM_BUDGET`]: a wedged podman cannot strand teardown at the
+/// final cleanup step.
 fn podman_rm_force(podman: &str, layout: &Layout, name: &str) -> bool {
-    run_silent(podman_base(podman, layout).arg("rm").arg("-f").arg(name))
+    let mut cmd = podman_base(podman, layout);
+    cmd.arg("rm").arg("-f").arg(name);
+    run_silent_bounded(cmd, RM_BUDGET)
 }
 
 /// Build a `podman` invocation with the per-secondary storage prefix +
@@ -202,14 +228,15 @@ fn podman_base(podman: &str, layout: &Layout) -> Command {
     c
 }
 
-/// Run a command swallowing all output, returning exit-0 as bool.
-fn run_silent(cmd: &mut Command) -> bool {
+/// Run a command under a wall-clock bound, swallowing all output and
+/// returning whether it exited 0. A timeout (the command was SIGKILLed) or
+/// a spawn error reports `false` — best-effort: on the teardown critical
+/// path the kill(2) reap is the guarantee, so a wedged or failed podman
+/// degrades to `false` and never blocks.
+fn run_silent_bounded(cmd: Command, budget: Duration) -> bool {
     matches!(
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-        Ok(s) if s.success()
+        run_bounded(cmd, budget, &RealClock, false),
+        BoundedOutcome::Exited { success: true, .. }
     )
 }
 

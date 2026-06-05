@@ -38,7 +38,7 @@ pub fn which(name: &str) -> Option<String> {
 
 /// `command -v <name>` presence probe: true when `name` resolves to an
 /// executable on `$PATH`. Single source of truth shared with
-/// `shutdown_spawn`'s `systemd-run` / `setsid` probes — exec-bit correct
+/// `shutdown_spawn`'s `systemd-run` probe — exec-bit correct
 /// (a `command -v` for an external requires the executable bit), unlike a
 /// bare `is_file()` check.
 pub fn on_path(name: &str) -> bool {

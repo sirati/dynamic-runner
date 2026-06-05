@@ -1,6 +1,9 @@
-//! Single concern: spawn the out-of-cgroup shutdown manager
-//! (generate.rs:214-296): `systemd-run --user --unit` service mode with a
-//! `setsid -f` fallback, same argv as the bash.
+//! Single concern: spawn the out-of-cgroup shutdown manager via
+//! `systemd-run --user --unit` (service mode). There is no `setsid`
+//! fallback: when the user-systemd bus is unreachable or registration
+//! fails, no out-of-cgroup survivor is spawned ([`ShutdownMode::None`])
+//! and the wrapper's bounded in-band reap is authoritative (see the
+//! [`ShutdownMode`] docs for why the old `setsid -f` path was removed).
 //!
 //! XDG_RUNTIME_DIR invariant (Phase 2): `systemd_user_runtime_dir` is the
 //! canonical per-uid value (`$XDG_RUNTIME_DIR` or `/run/user/<euid>`). It is
@@ -166,9 +169,10 @@ pub fn spawn(
     ShutdownMode::None
 }
 
-/// Run `systemd-run` synchronously (it blocks until registration). `Some` on
-/// success, `None` (with a WARNING logged) on non-zero / spawn failure so the
-/// caller falls through to setsid.
+/// Run `systemd-run` synchronously (it blocks until registration). `Some`
+/// on success, `None` (with a WARNING logged) on non-zero / spawn failure;
+/// the caller then returns [`ShutdownMode::None`] and the wrapper's in-band
+/// reap is authoritative (there is no `setsid` fallback).
 fn try_systemd_run(
     layout: &Layout,
     bin: &Path,
@@ -180,8 +184,9 @@ fn try_systemd_run(
         Ok(f) => Stdio::from(f),
         Err(e) => {
             eprintln!(
-                "WARNING: systemd-run --user --unit failed (cannot open log \
-                 {}: {e}); falling back to setsid -- cgroup escape DISABLED",
+                "WARNING: systemd-run --user --unit not started (cannot open log \
+                 {}: {e}); no out-of-cgroup survivor — the wrapper's in-band reap \
+                 is authoritative",
                 log_path.display()
             );
             return None;

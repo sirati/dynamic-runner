@@ -17,11 +17,30 @@
 //! `-u <user>` (the user's OWN jobs), NOT `-j <job-id>`: the manager has
 //! no SLURM job id, and the runtime user is resolvable from the
 //! environment. Best-effort throughout — a missing `squeue`, an
-//! unresolvable user, or a non-zero exit each log one note and return;
-//! losing a diagnostic snapshot is strictly less bad than aborting the
-//! reaper.
+//! unresolvable user, a non-zero exit, OR a hung slurmctld each log one
+//! note and return; losing a diagnostic snapshot is strictly less bad
+//! than aborting the reaper.
+//!
+//! BOUNDED: this snapshot runs (`main.rs`) BEFORE `final_cleanup`. An
+//! unbounded `squeue` against a wedged slurmctld would strand the manager
+//! forever — it would never clean up `/tmp` or exit. So the `squeue` (and
+//! the `id -un` user-resolution fallback) are run via
+//! [`dynrunner_reap::bounded_command::run_bounded`]: spawn, wait at most
+//! [`SQUEUE_BUDGET`], SIGKILL on expiry, treat a timeout as "no snapshot".
 
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
+
+use dynrunner_reap::bounded_command::{run_bounded, BoundedOutcome};
+use dynrunner_reap::clock::RealClock;
+
+/// Wall-clock bound for the one-shot diagnostic `squeue` (and the `id -un`
+/// user-resolution fallback). Short: this is best-effort CONTEXT captured
+/// on the teardown critical path, never a decision — a slurmctld that
+/// cannot answer in this window is treated as "no snapshot" so the manager
+/// proceeds straight to cleanup + exit. 5s comfortably covers a healthy
+/// `squeue` while never letting a hung controller strand teardown.
+const SQUEUE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Resolve the runtime user, run `squeue -u <user>` once, and append the
 /// formatted snapshot to `log`. Best-effort: never panics, never aborts.
@@ -53,17 +72,18 @@ fn resolve_user() -> Option<String> {
     }
     // Last resort: `id -un`. Absolute path is not used here because this
     // is a pure diagnostic; a PATH miss simply degrades to "no snapshot",
-    // never to a wrong reap decision.
-    let out = Command::new("id")
-        .arg("-un")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    // never to a wrong reap decision. BOUNDED for the same reason `squeue`
+    // is: nothing on the teardown critical path may block unboundedly.
+    let mut cmd = Command::new("id");
+    cmd.arg("-un");
+    let BoundedOutcome::Exited {
+        success: true,
+        stdout,
+    } = run_bounded(cmd, SQUEUE_BUDGET, &RealClock, true)
+    else {
         return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    };
+    let name = String::from_utf8_lossy(&stdout).trim().to_string();
     match name.is_empty() {
         true => None,
         false => Some(name),
@@ -75,20 +95,25 @@ fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
-/// Run `squeue -u <user>` once, capturing stdout. `Ok(stdout)` on exit-0;
-/// `Err(diag)` on spawn failure or non-zero exit (the diag is logged as
-/// the reason the snapshot is absent).
+/// Run `squeue -u <user>` once under a wall-clock bound, capturing stdout.
+/// `Ok(stdout)` on a clean exit-0; `Err(diag)` on spawn failure, non-zero
+/// exit, OR timeout against a hung slurmctld (the diag is logged as the
+/// reason the snapshot is absent). NEVER blocks longer than
+/// [`SQUEUE_BUDGET`] — the load-bearing property on the teardown path.
 fn run_squeue(user: &str) -> Result<String, String> {
-    let out = Command::new("squeue")
-        .arg("-u")
-        .arg(user)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("spawn error: {}", e))?;
-    match out.status.success() {
-        true => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
-        false => Err(format!("exit {}", out.status)),
+    let mut cmd = Command::new("squeue");
+    cmd.arg("-u").arg(user);
+    match run_bounded(cmd, SQUEUE_BUDGET, &RealClock, true) {
+        BoundedOutcome::Exited {
+            success: true,
+            stdout,
+        } => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        BoundedOutcome::Exited { success: false, .. } => Err("non-zero exit".to_string()),
+        BoundedOutcome::TimedOut => Err(format!(
+            "timed out after {}s (slurmctld unresponsive); killed",
+            SQUEUE_BUDGET.as_secs()
+        )),
+        BoundedOutcome::SpawnError(e) => Err(format!("spawn error: {}", e)),
     }
 }
 

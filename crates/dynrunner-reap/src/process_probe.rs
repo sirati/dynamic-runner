@@ -143,8 +143,16 @@ impl ProcessProbe for KillProbe {
             // orphans, while the inverse would deadlock the loop.
             libc::EPERM => false,
             other => {
+                // No consumer-specific prefix here: `dynrunner-reap` is
+                // SHARED between the shutdown-manager (`[shutdown-mgr]`) and
+                // the SLURM wrapper (`slurm-wrapper`), and the
+                // `ProcessProbe::is_alive` trait method (called per-tick in
+                // tight liveness loops) does not thread either consumer's
+                // log sink. The crate owns NO consumer's label, so the line
+                // is self-identifying via the type/method name and carries
+                // no foreign prefix.
                 eprintln!(
-                    "[shutdown-mgr] KillProbe::is_alive: unexpected errno {} for pid {}",
+                    "dynrunner-reap KillProbe::is_alive: unexpected errno {} for pid {}",
                     other, pid
                 );
                 false

@@ -159,11 +159,15 @@ file result/bin/dynrunner-slurm-shutdown   # → "static-pie linked"
 ldd result/bin/dynrunner-slurm-shutdown    # → "statically linked"
 ```
 
-The standalone `shutdown-manager/flake.nix` (`nix build .#default`) can no
-longer build in isolation: its `crane.cleanCargoSource ./.` cannot reach
-the sibling `../crates/dynrunner-reap` path-dep. Use the framework flake's
-`.#dynrunner-slurm-shutdown` target above (its `nix/shutdown-manager-bin.nix`
-roots the build src at the repo and unions both trees).
+The standalone `shutdown-manager/flake.nix` no longer exposes a build
+package — it provides ONLY a musl dev shell (`nix develop` here). Since the
+manager started path-depending on the repo-root `crates/dynrunner-reap`
+crate (shared with the slurm-wrapper), a `crane` build rooted at
+`shutdown-manager/` cannot resolve that out-of-subtree sibling without
+fighting crane's root-`Cargo.toml`/root-`Cargo.lock` assumptions. Rather
+than maintain a second, redundant (and fragile) build path, the canonical
+musl-static build is the framework flake's `.#dynrunner-slurm-shutdown`
+target above — the exact artefact the wheel bundles.
 
 Native development build (glibc-linked, fine for tests):
 

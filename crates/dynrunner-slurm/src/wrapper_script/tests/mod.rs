@@ -1,18 +1,25 @@
-//! Module-internal tests for the wrapper-script generators, split by
-//! concern. The shared `standard_cfg` helper builds a baseline
-//! `WrapperScriptConfig` so each test only overrides the field it
-//! exercises; sub-files import it via `super::standard_cfg`.
+//! Module-internal tests for the wrapper-script generators. The shared
+//! `standard_cfg` helper builds a baseline `WrapperScriptConfig` so each
+//! test only overrides the field it exercises; sub-files import it via
+//! `super::standard_cfg`.
+//!
+//! The renderer emits ONLY the `exec <wrapper-bin> <args…>` stub (the
+//! legacy inline-bash heredoc was deleted at root), so the surviving
+//! tests cover: the stub round-trip / anti-drift contract
+//! (`binary_stub`), `bash -n` smoke checks on the rendered stub +
+//! `bash_quote` (`syntax_and_quote`), and the image-validation
+//! `generate_test_wrapper_script` generator (`test_wrapper`), which is a
+//! separate generator and still emits a heredoc. The old heredoc-only
+//! test files (`standard_mode`, `reverse_mode`, `argv_quoting`,
+//! `cleanup`, `preflight_podman`, `shutdown_manager`) were removed with
+//! the dead path they asserted — that behaviour now lives in, and is
+//! tested by, the `dynrunner-slurm-wrapper` binary crate.
 
 use crate::config::SlurmConfig;
 use crate::wrapper_script::{ConnectionMode, WrapperScriptConfig};
+use std::path::Path;
 
-mod argv_quoting;
 mod binary_stub;
-mod cleanup;
-mod preflight_podman;
-mod reverse_mode;
-mod shutdown_manager;
-mod standard_mode;
 mod syntax_and_quote;
 mod test_wrapper;
 
@@ -24,12 +31,12 @@ pub(super) fn standard_cfg<'a>(
         slurm_config,
         // Generic baseline prefix; the legacy `asm` literal is no
         // longer hardcoded in the generator, so the baseline supplies
-        // one explicitly. Tests asserting the de-hardcoded `/tmp/...`
-        // and container-name shapes override this.
+        // one explicitly.
         name_prefix: "asm",
-        // Legacy bash path by default. The dedicated stub test flips
-        // this to `Some(...)` and asserts the round-trip.
-        wrapper_bin_path: None,
+        // Mandatory: the renderer emits the `exec <wrapper-bin>` stub for
+        // this binary path. A representative compute-node path; tests
+        // asserting the exact `exec` target override it.
+        wrapper_bin_path: Path::new("/gw/dynrunner-slurm-wrapper"),
         image_path: "/images/test.tar",
         secondary_id: "sec-01",
         image_name: "test-app",

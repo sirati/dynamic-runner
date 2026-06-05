@@ -224,8 +224,28 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
             // double-forked conmon back inside SLURM's authoritative
             // sweep. Best-effort and forensic-logged; the in-band reap is
             // the hard guarantee if this cannot run.
-            adopt_conmon_into_job_cgroup(&bins.podman, &layout, job_cgroup.as_ref());
-            run_to_completion(child, &mut monitor, &bins.podman, &layout).await
+            //
+            // The adopt POLLS `podman inspect` for conmon's PID for up to
+            // ~2s of `std::thread::sleep` — a SYNCHRONOUS, blocking probe.
+            // Running it inline here would block this tokio worker (and
+            // therefore delay the `run_to_completion` select! below) for up
+            // to 2s, so a SIGTERM arriving in that window would not be
+            // raced for up to 2s. Instead it runs on a `spawn_blocking`
+            // thread CONCURRENTLY with `run_to_completion`: the signal path
+            // is live from the instant the container is spawned, and the
+            // adopt's blocking polls never sit on a runtime worker. The
+            // handle is awaited AFTER the race resolves (the adopt has
+            // almost always finished by then; awaiting only reaps the
+            // blocking task cleanly).
+            let adopt_podman = bins.podman.clone();
+            let adopt_layout = layout.clone();
+            let adopt_cgroup = job_cgroup.clone();
+            let adopt = tokio::task::spawn_blocking(move || {
+                adopt_conmon_into_job_cgroup(&adopt_podman, &adopt_layout, adopt_cgroup.as_ref());
+            });
+            let code = run_to_completion(child, &mut monitor, &bins.podman, &layout).await;
+            let _ = adopt.await;
+            code
         }
         Err(e) => {
             tracing::error!(target: LOG_TARGET, "failed to spawn container: {e}");

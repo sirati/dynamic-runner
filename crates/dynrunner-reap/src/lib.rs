@@ -26,13 +26,20 @@
 //! aliveness is determined, or how the signal is delivered.
 //!
 //! Module map (one concern each):
-//! * `process_probe` — `ProcessProbe` trait + `KillProbe` (`kill(pid,0/sig)`)
-//! * `clock`         — `Clock` trait + `RealClock` for testable sleeps
-//! * `reap`          — the SIGTERM→grace→SIGKILL→verify state-machine
-//! * `testing`       — `MockProcessProbe` + `FakeClock` test doubles
+//! * `process_probe`   — `ProcessProbe` trait + `KillProbe` (`kill(pid,0/sig)`)
+//! * `clock`           — `Clock` trait + `RealClock` for testable sleeps
+//! * `reap`            — the SIGTERM→grace→SIGKILL→verify state-machine
+//! * `bounded_command` — `run_bounded`: spawn an external tool under a
+//!   wall-clock bound, SIGKILL on expiry. Both consumers shell out on the
+//!   teardown critical path (the wrapper's `podman inspect/stop/rm`, the
+//!   manager's one-shot `squeue`); a tool wedged on NFS / an unresponsive
+//!   slurmctld must NEVER block the hard kill(2) reap or the manager's
+//!   cleanup. This is the ONE bound both use.
+//! * `testing`         — `MockProcessProbe` + `FakeClock` test doubles
 //!   shared by this crate's tests and both consumers' tests (LTO-stripped
 //!   from the production binaries because they never reference them).
 
+pub mod bounded_command;
 pub mod clock;
 pub mod process_probe;
 pub mod reap;

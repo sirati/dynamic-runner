@@ -1,13 +1,9 @@
-//! Renderer↔binary contract for the wrapper-binary stub path
-//! (`WrapperScriptConfig::wrapper_bin_path = Some(...)`):
+//! Renderer↔binary contract for the wrapper-binary stub — the ONLY
+//! render path (`WrapperScriptConfig::wrapper_bin_path` is mandatory):
 //!
-//!   1. **De-hardcoding parity** — with `wrapper_bin_path = None`, the
-//!      legacy bash body still renders, but the `/tmp/<prefix>-…` scratch
-//!      dir and `<prefix>-…-<sid>` container name now come from
-//!      `name_prefix`, not the old hardcoded `asm` literal.
-//!   2. **Stub round-trip** — with `wrapper_bin_path = Some(bin)`, the
-//!      rendered body is a `#!/usr/bin/env bash` + single `exec <bin>
-//!      <args…>` line, and shell-splitting those args back through the
+//!   1. **Stub shape** — the rendered body is exactly a `#!/usr/bin/env
+//!      bash` shebang + a single `exec <bin> <args…>` line.
+//!   2. **Stub round-trip** — shell-splitting those args back through the
 //!      config crate's `cli` parser reconstructs the exact `WrapperConfig`
 //!      the renderer mapped from `WrapperScriptConfig`. This is the
 //!      anti-drift guard between the renderer (`generate.rs`) and the
@@ -30,36 +26,6 @@ fn cfg_config() -> SlurmConfig {
     }
 }
 
-/// Legacy bash path: the scratch dir and container name are derived from
-/// `name_prefix`, NOT the old hardcoded `asm`. A non-`asm` prefix must
-/// appear in both literals and `asm` must NOT.
-#[test]
-fn legacy_bash_uses_name_prefix_not_hardcoded_asm() {
-    let config = cfg_config();
-    let mut cfg = standard_cfg(&config, &[]);
-    cfg.name_prefix = "myprog";
-    cfg.secondary_id = "sec-9";
-    let script = generate_wrapper_script(&cfg);
-
-    assert!(
-        script.contains("RNDTMP=\"/tmp/myprog-"),
-        "scratch dir must use name_prefix; got: {script}",
-    );
-    assert!(
-        script.contains("CONTAINER_NAME=\"myprog-") && script.contains("-sec-9\""),
-        "container name must use name_prefix and secondary_id; got: {script}",
-    );
-    // The functional scratch/container assignments must NOT carry the
-    // old hardcoded `asm` literal. (Preflight-cleanup PROSE comments
-    // still mention `/tmp/asm-XXXX` as a historical example and the
-    // scan itself uses a `/tmp/*/storage` glob — neither is a
-    // name_prefix-derived literal, so they are out of scope here.)
-    assert!(
-        !script.contains("RNDTMP=\"/tmp/asm-") && !script.contains("CONTAINER_NAME=\"asm-"),
-        "no residual hardcoded `asm` literal in the RNDTMP / CONTAINER_NAME assignments",
-    );
-}
-
 /// Stub path: rendered body is exactly the shebang + a single `exec`
 /// line pointing at the supplied binary.
 #[test]
@@ -67,7 +33,7 @@ fn binary_stub_shape() {
     let config = cfg_config();
     let bin = Path::new("/gw/dynrunner-slurm-wrapper");
     let mut cfg = standard_cfg(&config, &[]);
-    cfg.wrapper_bin_path = Some(bin);
+    cfg.wrapper_bin_path = bin;
     let script = generate_wrapper_script(&cfg);
 
     let lines: Vec<&str> = script.lines().collect();
@@ -161,8 +127,8 @@ fn expected_wire(cfg_name_prefix: &str, rand_suffix: &str) -> WrapperConfig {
         forwarded_argv: vec![],
         extra_run_args: vec![],
         // `srcbins_mount_source`/`output_dir`/`run_log_dir` are None in the
-        // baseline, so the stub resolves them from the SlurmConfig — the
-        // same fallback the legacy bash uses.
+        // baseline, so the stub resolves them from the SlurmConfig
+        // (`src_bins_path`/`output_path`/`log_path`).
         srcbins_network: cfg_config().src_bins_path(),
         output_network: cfg_config().output_path(),
         log_network: cfg_config().log_path(),
@@ -187,7 +153,7 @@ fn binary_stub_round_trips_through_cli_parser() {
     let bin = Path::new("/gw/dynrunner-slurm-wrapper");
     let mut cfg = standard_cfg(&config, &[]);
     cfg.name_prefix = "asm";
-    cfg.wrapper_bin_path = Some(bin);
+    cfg.wrapper_bin_path = bin;
     let script = generate_wrapper_script(&cfg);
 
     let exec_line = script.lines().nth(1).expect("stub has an exec line");
@@ -223,7 +189,7 @@ fn binary_stub_round_trips_reverse_with_optionals() {
     let fwd = vec!["--platform".to_string(), "x86".to_string()];
     let mut cfg = standard_cfg(&config, &extras);
     cfg.name_prefix = "asm";
-    cfg.wrapper_bin_path = Some(bin);
+    cfg.wrapper_bin_path = bin;
     cfg.connection = ConnectionMode::Reverse {
         connection_info_dir: "/logs/connection_info",
     };

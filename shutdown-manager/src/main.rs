@@ -30,9 +30,9 @@ fn main() -> ExitCode {
         Err(e) => {
             // No `cfg` yet ⇒ no log-file destination. The argv-parse-
             // error path falls back to stderr alone; callers always
-            // have stderr in the failure case (systemd-run captures
-            // its own command stderr to the journal, and the setsid
-            // path's shell redirect captures the same).
+            // have stderr in the failure case (the manager is spawned via
+            // systemd-run, which captures its command stderr to the
+            // journal).
             eprintln!("{} argv error: {}", LOG_PREFIX, e);
             return ExitCode::from(2);
         }
