@@ -485,6 +485,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     pub(super) fn silent_secondary_ids(&self) -> std::collections::HashSet<String> {
         let report = self.collect_heartbeat_report();
         let now = Instant::now();
+        // Exclude the recognized primary's own same-peer secondary by IDENTITY
+        // (the same `id != current_primary` cut `alive_remote_secondary_count`
+        // uses). The EARLY dispatch-altitude requeue acts on first-stage silence,
+        // so during a transient self-keepalive gap — when the host's own
+        // secondary is still processing but momentarily silent — reporting self
+        // here would yank the self's LIVE in-flight task before the next
+        // keepalive refreshes the clock and before the hard backstop. The hard
+        // backstop (`decide_dead_secondaries`) is deliberately left unfiltered.
+        let current_primary = self.cluster_state.current_primary();
         report
             .silences
             .into_iter()
@@ -498,6 +507,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 )
                 .is_some()
             })
+            .filter(|s| Some(s.secondary_id.as_str()) != current_primary)
             .map(|s| s.secondary_id)
             .collect()
     }
