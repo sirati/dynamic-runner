@@ -135,7 +135,8 @@ mod tests {
             socket_dir: rndtmp.join("sockets"),
             cmd_socket: rndtmp.join("sockets/cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-2f1d4e89".to_string(),
-            shutdown_log_path: rndtmp.join("shutdown-manager.log"),
+            shutdown_log_dir: rndtmp.join("log-network/sec-0"),
+            shutdown_log_path: rndtmp.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: rndtmp.join("shutdown-manager.pid"),
             local_image: rndtmp.join("asm-tokenizer.tar"),
         };

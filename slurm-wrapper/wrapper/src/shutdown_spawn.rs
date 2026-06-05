@@ -291,7 +291,10 @@ mod tests {
             socket_dir: PathBuf::from("/tmp/asm-abc123/sockets"),
             cmd_socket: PathBuf::from("/tmp/asm-abc123/sockets/cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-abc123".to_string(),
-            shutdown_log_path: PathBuf::from("/tmp/asm-abc123/shutdown-manager.log"),
+            // Persistent per-secondary log dir on the network share; NOT
+            // under the /tmp scratch tree the manager deletes on teardown.
+            shutdown_log_dir: PathBuf::from("/net/log/7"),
+            shutdown_log_path: PathBuf::from("/net/log/7/shutdown-manager.log"),
             shutdown_pid_file: PathBuf::from("/tmp/asm-abc123/shutdown-manager.pid"),
             local_image: PathBuf::from("/tmp/asm-abc123/image.tar"),
         }
@@ -321,7 +324,7 @@ mod tests {
             "--wrapper-pid",
             "4242",
             "--log-file",
-            "/tmp/asm-abc123/shutdown-manager.log",
+            "/net/log/7/shutdown-manager.log",
             "--podman-path",
             "/run/current-system/sw/bin/podman",
             "--rm-path",
@@ -360,7 +363,7 @@ mod tests {
             "--wrapper-pid",
             "4242",
             "--log-file",
-            "/tmp/asm-abc123/shutdown-manager.log",
+            "/net/log/7/shutdown-manager.log",
             "--podman-path",
             "/run/current-system/sw/bin/podman",
             "--rm-path",
@@ -392,7 +395,7 @@ mod tests {
             "--wrapper-pid",
             "4242",
             "--log-file",
-            "/tmp/asm-abc123/shutdown-manager.log",
+            "/net/log/7/shutdown-manager.log",
             "--podman-path",
             "/run/current-system/sw/bin/podman",
             "--rm-path",

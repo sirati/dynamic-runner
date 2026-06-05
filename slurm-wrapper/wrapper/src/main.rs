@@ -684,7 +684,8 @@ mod tests {
             socket_dir: root.join("sockets"),
             cmd_socket: root.join("sockets/cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-test".to_string(),
-            shutdown_log_path: root.join("shutdown-manager.log"),
+            shutdown_log_dir: root.join("log-network/sec-0"),
+            shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("image.tar"),
         }

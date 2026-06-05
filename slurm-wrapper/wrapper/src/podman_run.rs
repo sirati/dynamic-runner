@@ -202,7 +202,8 @@ mod tests {
             socket_dir: PathBuf::from("/tmp/asm-2f1d4e89/sockets"),
             cmd_socket: PathBuf::from("/tmp/asm-2f1d4e89/sockets/cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-2f1d4e89".to_string(),
-            shutdown_log_path: PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.log"),
+            shutdown_log_dir: PathBuf::from("/net/log/sec-0"),
+            shutdown_log_path: PathBuf::from("/net/log/sec-0/shutdown-manager.log"),
             shutdown_pid_file: PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.pid"),
             local_image: PathBuf::from("/tmp/asm-2f1d4e89/asm-tokenizer.tar"),
         }

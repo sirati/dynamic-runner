@@ -46,7 +46,17 @@ pub struct Layout {
     pub socket_dir: PathBuf,        // <rndtmp>/sockets               (:43)
     pub cmd_socket: PathBuf,        // <socket_dir>/cmd.sock          (:44)
     pub shutdown_unit_name: String, // dynrunner-shutdown-<suffix>    (:225)
-    pub shutdown_log_path: PathBuf, // <rndtmp>/shutdown-manager.log  (:223)
+    /// Persistent per-secondary shutdown-manager log dir on the network
+    /// share: `<log_network>/<secondary_id>` — the SAME directory the
+    /// container's framework runner writes its own log into (the host
+    /// side of the `/app/log-network/<secondary_id>` `--full-log-dir`
+    /// mount, `podman_run.rs`). The shutdown manager's log MUST live here
+    /// and NOT under `rndtmp`: `rndtmp` is the scratch tree the manager
+    /// itself deletes on teardown (`shutdown-manager` `final_cleanup`),
+    /// so a log under it is destroyed exactly when it is needed most (it
+    /// records WHY the teardown happened). This dir survives the cleanup.
+    pub shutdown_log_dir: PathBuf, // <log_network>/<secondary_id>
+    pub shutdown_log_path: PathBuf, // <shutdown_log_dir>/shutdown-manager.log
     pub shutdown_pid_file: PathBuf, // <rndtmp>/shutdown-manager.pid  (:250)
     pub local_image: PathBuf,       // <rndtmp>/<image_tar_basename>  (:696)
 }
@@ -69,7 +79,14 @@ impl Layout {
         let cmd_socket = socket_dir.join("cmd.sock");
 
         let shutdown_unit_name = format!("dynrunner-shutdown-{}", cfg.rand_suffix);
-        let shutdown_log_path = rndtmp.join("shutdown-manager.log");
+        // Persistent, on-network, per-secondary: shares the directory the
+        // container runner logs into (`<log_network>/<secondary_id>`), so
+        // the shutdown log sits alongside the secondary's own log and
+        // survives the `rndtmp` cleanup the manager performs on teardown.
+        let shutdown_log_dir = PathBuf::from(&cfg.log_network).join(&cfg.secondary_id);
+        let shutdown_log_path = shutdown_log_dir.join("shutdown-manager.log");
+        // The pid-file stays under `rndtmp`: it is scratch state that
+        // SHOULD be removed when the scratch tree is torn down.
         let shutdown_pid_file = rndtmp.join("shutdown-manager.pid");
         let local_image = rndtmp.join(&cfg.image_tar_basename);
 
@@ -84,6 +101,7 @@ impl Layout {
             socket_dir,
             cmd_socket,
             shutdown_unit_name,
+            shutdown_log_dir,
             shutdown_log_path,
             shutdown_pid_file,
             local_image,
@@ -115,6 +133,13 @@ impl Layout {
         // mkdir -p storage run (generate.rs:345)
         std::fs::create_dir_all(&self.podman_storage)?;
         std::fs::create_dir_all(&self.podman_run)?;
+        // Ensure the persistent per-secondary shutdown-log dir exists on
+        // the network share BEFORE the shutdown manager is spawned (it is
+        // spawned ahead of the container, so podman has not yet created
+        // the bind-mount target). Without this the manager's append-mode
+        // open of <shutdown_log_dir>/shutdown-manager.log would fail on a
+        // missing parent and silently degrade to stderr-only.
+        std::fs::create_dir_all(&self.shutdown_log_dir)?;
         // chmod 700 storage run ONLY (generate.rs:346)
         std::fs::set_permissions(&self.podman_storage, std::fs::Permissions::from_mode(0o700))?;
         std::fs::set_permissions(&self.podman_run, std::fs::Permissions::from_mode(0o700))?;
@@ -173,10 +198,19 @@ mod tests {
             PathBuf::from("/tmp/asm-2f1d4e89/sockets/cmd.sock")
         );
         assert_eq!(l.shutdown_unit_name, "dynrunner-shutdown-2f1d4e89");
+        // Shutdown LOG lives on the persistent network share under the
+        // per-secondary dir (NOT under /tmp/<rndtmp>, which the manager
+        // deletes on teardown) — see `Layout::shutdown_log_dir`.
+        assert_eq!(
+            l.shutdown_log_dir,
+            PathBuf::from("/net/log/sec-0"),
+            "shutdown log dir must be <log_network>/<secondary_id>, persistent"
+        );
         assert_eq!(
             l.shutdown_log_path,
-            PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.log")
+            PathBuf::from("/net/log/sec-0/shutdown-manager.log")
         );
+        // PID file stays under the scratch tree (it is scratch state).
         assert_eq!(
             l.shutdown_pid_file,
             PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.pid")
@@ -228,12 +262,19 @@ mod tests {
             socket_dir: root.join("sockets"),
             cmd_socket: root.join("sockets/cmd.sock"),
             shutdown_unit_name: "dynrunner-shutdown-x".to_string(),
-            shutdown_log_path: root.join("shutdown-manager.log"),
+            shutdown_log_dir: root.join("log-network/sec-0"),
+            shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("img.tar"),
         };
 
         layout.create_dirs().unwrap();
+
+        assert!(
+            layout.shutdown_log_dir.is_dir(),
+            "create_dirs must pre-create the persistent shutdown-log dir: {}",
+            layout.shutdown_log_dir.display()
+        );
 
         for d in [
             &layout.rndtmp,

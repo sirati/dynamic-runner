@@ -74,6 +74,16 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
         .map(String::from)
         .unwrap_or_else(|| cfg.slurm_config.log_path());
 
+    // Persistent per-secondary shutdown-manager log: it lives under the
+    // on-network log dir (`<log_network>/<secondary_id>`, the host side
+    // of the container's `--full-log-dir` mount), NOT under `$RNDTMP`.
+    // The shutdown manager deletes `$RNDTMP` on teardown, so a log there
+    // would be destroyed exactly when it is needed (it records WHY the
+    // teardown happened). Placing it on the network share keeps it
+    // alongside the secondary's own log and survives the scratch cleanup.
+    let shutdown_log_dir = format!("{log_network}/{}", cfg.secondary_id);
+    let shutdown_log_path = format!("{shutdown_log_dir}/shutdown-manager.log");
+
     // Optional dynrunner-network volume/env block. When absent the
     // strings are empty and collapse cleanly inside the podman-run
     // continuation lines.
@@ -193,10 +203,12 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // Rather than chase the systemd quirk, the manager binary now
     // owns the log destination directly: `--log-file <PATH>` opens
     // the file at startup and appends every log line to it (in
-    // addition to stderr). The wrapper passes the same `$SHUTDOWN_LOG_PATH`
-    // it would have used for the systemd properties — operator-visible
-    // behaviour (single log file per job in `$RNDTMP/shutdown-manager.log`)
-    // is unchanged.
+    // addition to stderr). The wrapper passes `$SHUTDOWN_LOG_PATH`,
+    // which points at the PERSISTENT per-secondary network log dir
+    // (`<log_network>/<secondary_id>/shutdown-manager.log`), NOT under
+    // `$RNDTMP` — the manager deletes `$RNDTMP` on teardown, so a log
+    // there would be destroyed exactly when it records WHY the teardown
+    // happened.
     //
     // `--property=StandardError=journal` stays so panic backtraces
     // and any pre-`--log-file-open` stderr land in
@@ -206,14 +218,16 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // per-unit /tmp namespace isolation. Without this, the
     // shutdown-manager's view of `/tmp/asm-XXX/...` is a different
     // mount namespace from the wrapper's — the wrapper's
-    // `--tmp-prefix`, `--storage-root`, `--runroot`, `--pid-file`,
-    // and `--log-file` paths under `$RNDTMP` would resolve to a
+    // `--tmp-prefix`, `--storage-root`, `--runroot`, and `--pid-file`
+    // paths under `$RNDTMP` would resolve to a
     // private tmpfs inside the unit's namespace, NOT the on-disk
     // directories the wrapper created and the rest of the SLURM job
     // expects (asm-tokenizer 2026-05-18: journal trace showed the
     // manager running to completion, but no on-disk artifacts — the
-    // log file, pid file, and `podman unshare rm -rf` were all
-    // operating on a phantom namespace-private /tmp). NixOS's
+    // pid file and `podman unshare rm -rf` were all
+    // operating on a phantom namespace-private /tmp). The `--log-file`
+    // now lives on the network share (`<log_network>/<secondary_id>`),
+    // outside /tmp, so it is unaffected by PrivateTmp either way. NixOS's
     // user-systemd defaults can enable PrivateTmp transparently on
     // transient units; the explicit `=false` neutralizes that.
     //
@@ -239,7 +253,13 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
                         r##"SHUTDOWN_MODE=""
 SHUTDOWN_SCOPE=""
 SHUTDOWN_PID=""
-SHUTDOWN_LOG_PATH="$RNDTMP/shutdown-manager.log"
+# Persistent shutdown-manager log on the network share, under the
+# per-secondary dir — NOT under $RNDTMP, which the manager deletes on
+# teardown (a log there would be destroyed exactly when it records WHY
+# the teardown happened). Created here because the manager is spawned
+# before the container, so podman has not yet created the mount target.
+SHUTDOWN_LOG_PATH="{shutdown_log_path}"
+mkdir -p "{shutdown_log_dir}"
 if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run >/dev/null 2>&1; then
     SHUTDOWN_SCOPE="dynrunner-shutdown-{rnd_suffix}"
     # XDG_RUNTIME_DIR= prefix is a per-command env override (NOT
