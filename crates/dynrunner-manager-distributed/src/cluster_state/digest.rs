@@ -22,7 +22,6 @@ use std::hash::{Hash, Hasher};
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::StateDigest;
 
-use super::types::PeerState;
 use super::ClusterState;
 use super::TaskState;
 
@@ -83,8 +82,11 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
-            role_table,
-            peer_state,
+            // ── replicated but DELIBERATELY EXCLUDED from the digest ──
+            // (membership/role sets — non-monotone-via-removal and not
+            // snapshot-healable; see the classification comment below.)
+            role_table: _role_table,
+            peer_state: _peer_state,
             peer_holdings: _peer_holdings,
             task_outputs,
             secondary_capacities,
@@ -107,9 +109,32 @@ impl<I: Identifier> ClusterState<I> {
         // NOT carried in the digest: it is not a convergence-critical
         // ledger (a stale holdings map self-heals on the next per-peer
         // announce), and including it would add periodic churn without a
-        // correctness payoff. Both are bound above so the destructure stays
-        // exhaustive; their EXCLUSION from the digest is the deliberate
-        // classification this comment records.
+        // correctness payoff.
+        //
+        // `role_table` (the `observers` + `can_be_primary` id sets) and
+        // `peer_state` (the alive/dead membership ledger) are EXCLUDED from
+        // the digest for the SAME class of reason `peer_holdings` is, for
+        // two independent causes:
+        //   1. Non-monotone-via-removal + NOT snapshot-healable. The live
+        //      apply path REMOVES ids (`PeerRemoved` drops from
+        //      `observers`/`can_be_primary`; `SetCanBePrimary(false)`
+        //      removes), but `restore()` is additive/sticky — it replaces a
+        //      role set only when local is empty (else keeps local) and
+        //      inserts alive entries only into VACANT slots (a local `Dead`
+        //      is sticky, never resurrected). A pull can therefore never
+        //      reconcile a stale extra id, so summarising these would loop a
+        //      no-op pull every cadence tick.
+        //   2. They converge over their OWN paths. Additions flow via the
+        //      live `PeerJoined`/`PeerRemoved`/`SetCanBePrimary` broadcasts
+        //      plus the post-mesh `rebroadcast_full_roster` re-emit; and the
+        //      alive-set divergence is INTENTIONAL per the honest-liveness
+        //      design (each node owns its own liveness view), so anti-
+        //      entropy must NOT force-converge it — it must never resurrect
+        //      a peer a node correctly buried as dead.
+        // All three are bound above so the destructure stays exhaustive;
+        // their EXCLUSION from the digest is the deliberate classification
+        // this comment records. (See `StateDigest::is_behind` for the
+        // mirror-image rationale on the detector side.)
 
         // Tasks: count + order-independent XOR-fold of a per-entry hash
         // that combines the task's wire-hash KEY with its state-RANK, so a
@@ -128,30 +153,6 @@ impl<I: Identifier> ClusterState<I> {
             secondary_capacities_hash ^= hash_one(key);
         }
 
-        // Alive members: count + XOR-fold over the ids whose `peer_state`
-        // entry is `Alive` (the same projection `snapshot()` ships as
-        // `alive_members`; `Dead` is sticky-local and absence is not Dead,
-        // so only the `Alive` ids carry the convergence signal).
-        let mut alive_members_count = 0u64;
-        let mut alive_members_hash = 0u64;
-        for (id, entry) in peer_state {
-            if entry.state == PeerState::Alive {
-                alive_members_count += 1;
-                alive_members_hash ^= hash_one(id);
-            }
-        }
-
-        // Observers / primary-capable: count + XOR-fold over the id sets
-        // (the `RoleTable` projections `snapshot()` also ships).
-        let mut observers_hash = 0u64;
-        for id in &role_table.observers {
-            observers_hash ^= hash_one(id);
-        }
-        let mut can_be_primary_hash = 0u64;
-        for id in &role_table.can_be_primary {
-            can_be_primary_hash ^= hash_one(id);
-        }
-
         // Keyed-output cache: count + XOR-fold over the KEYS (per-key
         // first-write-wins, so the key-set identity detects a missing
         // entry).
@@ -165,12 +166,6 @@ impl<I: Identifier> ClusterState<I> {
             tasks_hash,
             secondary_capacities_count: secondary_capacities.len() as u64,
             secondary_capacities_hash,
-            alive_members_count,
-            alive_members_hash,
-            observers_count: role_table.observers.len() as u64,
-            observers_hash,
-            can_be_primary_count: role_table.can_be_primary.len() as u64,
-            can_be_primary_hash,
             task_outputs_count: task_outputs.len() as u64,
             task_outputs_hash,
             phase_deps_count: phase_deps.len() as u64,

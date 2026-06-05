@@ -3,12 +3,12 @@
 //! Anti-entropy convergence: a replica that missed a steady-state
 //! mutation while "disconnected" heals on the next digest exchange.
 //!
-//! This is the class-of-bug test the narrow (Wave-1) catch-up paths
-//! cannot pass: there is no late-join, no failover, no cold-start — just
-//! a live secondary that DROPPED one `TaskCompleted` broadcast (a transient
-//! mesh blip) and would otherwise stay permanently divergent. Periodic
-//! digest exchange detects the divergence and pulls a snapshot to heal it,
-//! then goes quiescent once converged.
+//! This is the class-of-bug test the narrow cold-start/failover catch-up
+//! paths cannot pass: there is no late-join, no failover, no cold-start —
+//! just a live secondary that DROPPED one `TaskCompleted` broadcast (a
+//! transient mesh blip) and would otherwise stay permanently divergent.
+//! Periodic digest exchange detects the divergence and pulls a snapshot to
+//! heal it, then goes quiescent once converged.
 
 use super::super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId, election_config, make_transport,

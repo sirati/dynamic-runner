@@ -58,24 +58,6 @@ pub struct StateDigest {
     /// identity is sufficient to detect a missing entry.
     #[serde(default)]
     pub secondary_capacities_hash: u64,
-    /// Number of peers currently `Alive` in the membership ledger.
-    #[serde(default)]
-    pub alive_members_count: u64,
-    /// XOR-fold over the alive-member id set.
-    #[serde(default)]
-    pub alive_members_hash: u64,
-    /// Number of replicated observers.
-    #[serde(default)]
-    pub observers_count: u64,
-    /// XOR-fold over the observer id set.
-    #[serde(default)]
-    pub observers_hash: u64,
-    /// Number of primary-capable peers.
-    #[serde(default)]
-    pub can_be_primary_count: u64,
-    /// XOR-fold over the primary-capable id set.
-    #[serde(default)]
-    pub can_be_primary_hash: u64,
     /// Number of keyed task-output cache entries.
     #[serde(default)]
     pub task_outputs_count: u64,
@@ -107,23 +89,52 @@ impl StateDigest {
     /// Per-field rule, faithful to the monotone `restore()` lattice:
     ///
     /// - Count-bearing fields (`tasks`, `secondary_capacities`,
-    ///   `alive_members`, `observers`, `can_be_primary`, `task_outputs`,
-    ///   `phase_deps`): the peer is ahead iff it holds strictly MORE
-    ///   entries (`peer.count > local.count`) OR holds the SAME number but
-    ///   a DIFFERENT fold (`count ==`, `hash !=`) — same-count-different-
-    ///   members means the peer holds at least one entry the local replica
-    ///   lacks (and the merge is a no-op for the entries they share, so
-    ///   pulling is always safe). A peer with FEWER entries is behind, not
-    ///   ahead, so it never triggers a local pull (the peer's own digest
-    ///   round will pull from us).
+    ///   `task_outputs`, `phase_deps`): the peer is ahead iff it holds
+    ///   strictly MORE entries (`peer.count > local.count`) OR holds the
+    ///   SAME number but a DIFFERENT fold (`count ==`, `hash !=`) — same-
+    ///   count-different-members means the peer holds at least one entry the
+    ///   local replica lacks (and the merge is a no-op for the entries they
+    ///   share, so pulling is always safe). A peer with FEWER entries is
+    ///   behind, not ahead, so it never triggers a local pull (the peer's
+    ///   own digest round will pull from us).
     /// - `primary_epoch`: ahead iff strictly higher (the `restore` epoch
     ///   merge is `>` wins).
     /// - `run_complete` / `run_aborted`: ahead iff the peer's latch is set
     ///   while ours is not (`false → true` ratchet; the reason string is
     ///   irrelevant to the detector).
     ///
+    /// The detector compares ONLY the monotone, snapshot-healable ledger
+    /// fields. The membership/role sets (`observers`, `can_be_primary`, the
+    /// alive-member set) are DELIBERATELY EXCLUDED — carried by neither the
+    /// digest nor this comparison — for two independent reasons:
+    ///
+    /// 1. They are non-monotone-via-removal and NOT snapshot-healable. The
+    ///    live apply path REMOVES ids (`PeerRemoved` drops a peer from
+    ///    `can_be_primary`/`observers`; `SetCanBePrimary(false)` removes),
+    ///    but `ClusterState::restore` is additive/sticky: it replaces the
+    ///    role sets only when the local set is empty (else keeps local) and
+    ///    inserts alive entries only into VACANT membership slots (a local
+    ///    `Dead` id is sticky and never resurrected). So a node holding a
+    ///    stale extra id can never reconcile it by pulling — flagging these
+    ///    would produce a PERMANENT no-op pull loop (a pull every cadence
+    ///    tick that `restore()` cannot heal).
+    /// 2. They converge via their OWN paths, not anti-entropy. Additions
+    ///    flow over the live `PeerJoined`/`PeerRemoved`/`SetCanBePrimary`
+    ///    broadcasts plus the post-mesh `rebroadcast_full_roster` re-emit.
+    ///    And the alive-member divergence is INTENTIONAL per the honest-
+    ///    liveness design — each node owns its own liveness view, so two
+    ///    nodes legitimately disagree on whether a peer is alive; anti-
+    ///    entropy must NEVER force-converge that (it must never resurrect a
+    ///    peer a node correctly buried as dead).
+    ///
+    /// (Removing a stale role-set id thus relies on deliver-once live
+    /// broadcast + the roster re-emit, not anti-entropy. Closing that gap —
+    /// a node that missed a single `PeerRemoved`/`SetCanBePrimary(false)`
+    /// while disconnected — would need a tombstone or version-vector in the
+    /// CRDT algebra, out of this delivery-layer detector's scope.)
+    ///
     /// Symmetric quiescence: when the two replicas are converged every
-    /// field compares equal and this returns `false`, so a steady-state
+    /// compared field is equal and this returns `false`, so a steady-state
     /// digest exchange triggers ZERO pulls — the self-quiescing property.
     pub fn is_behind(&self, other: &StateDigest) -> bool {
         field_behind(self.tasks_count, self.tasks_hash, other.tasks_count, other.tasks_hash)
@@ -132,24 +143,6 @@ impl StateDigest {
                 self.secondary_capacities_hash,
                 other.secondary_capacities_count,
                 other.secondary_capacities_hash,
-            )
-            || field_behind(
-                self.alive_members_count,
-                self.alive_members_hash,
-                other.alive_members_count,
-                other.alive_members_hash,
-            )
-            || field_behind(
-                self.observers_count,
-                self.observers_hash,
-                other.observers_count,
-                other.observers_hash,
-            )
-            || field_behind(
-                self.can_be_primary_count,
-                self.can_be_primary_hash,
-                other.can_be_primary_count,
-                other.can_be_primary_hash,
             )
             || field_behind(
                 self.task_outputs_count,
