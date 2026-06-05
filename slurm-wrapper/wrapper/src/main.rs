@@ -484,6 +484,8 @@ mod tests {
             "/staged/img.tar",
             "--image-tar-basename",
             "img.tar",
+            "--image-digest",
+            "a1b2c3d4e5f6",
             "--image-name",
             "img",
             "--image-tag",
@@ -513,6 +515,7 @@ mod tests {
         ];
         let cfg = dynrunner_slurm_wrapper_config::parse_args(argv).unwrap();
         assert_eq!(cfg.secondary_id, "sec-0");
+        assert_eq!(cfg.image_digest, "a1b2c3d4e5f6");
         assert_eq!(
             cfg.connection,
             ConnectionMode::Standard {
@@ -688,6 +691,7 @@ mod tests {
             shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("image.tar"),
+            image_cache_root: root.join("imgcache"),
         }
     }
 

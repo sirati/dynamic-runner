@@ -67,6 +67,16 @@ pub struct WrapperConfig {
     /// Basename for the node-local copy `"$RNDTMP/<basename>"`
     /// (`config.rs` `image_tar_basename`).
     pub image_tar_basename: String,
+    /// SHA-256 (hex) of the image tarball, computed framework-side at
+    /// upload time (`PodmanImageMetadata.image_hash`). The wrapper uses
+    /// it ONLY as the content key for the node-local image cache
+    /// (`image.rs::copy_and_load`): a node-local copy keyed by this
+    /// digest is reused across every secondary on the node instead of
+    /// re-reading the ~GB tarball from the shared FS per job. Content
+    /// changes produce a different digest → a different cache path →
+    /// automatic invalidation. May be empty for back-compat / test
+    /// callers, in which case the cache is bypassed (per-job copy).
+    pub image_digest: String,
     /// Container image name, e.g. `asm-tokenizer` (`config.rs`
     /// `image_name`). Joined as `<name>:<tag>` for the `podman run`
     /// image-ref argument (`generate.rs:734`).
@@ -173,6 +183,7 @@ impl WrapperConfig {
 
         push("--image-path", &self.image_path);
         push("--image-tar-basename", &self.image_tar_basename);
+        push("--image-digest", &self.image_digest);
         push("--image-name", &self.image_name);
         push("--image-tag", &self.image_tag);
         push("--load-command", &self.load_command);
@@ -246,6 +257,7 @@ mod tests {
             secondary_id: "sec-0".to_string(),
             image_path: "/home/u/staged/asm-tokenizer.tar".to_string(),
             image_tar_basename: "asm-tokenizer.tar".to_string(),
+            image_digest: "a1b2c3d4e5f6".to_string(),
             image_name: "asm-tokenizer".to_string(),
             image_tag: "latest".to_string(),
             load_command: "$PODMAN_BIN --root \"$PODMAN_STORAGE\" load -i \"$LOCAL_IMAGE\""
