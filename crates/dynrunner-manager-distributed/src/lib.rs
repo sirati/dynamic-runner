@@ -6,6 +6,7 @@ pub mod observer;
 pub mod panik_watcher;
 pub mod peer_lifecycle;
 pub mod primary;
+pub mod process;
 pub(crate) mod run_narrator;
 pub mod secondary;
 pub mod state;

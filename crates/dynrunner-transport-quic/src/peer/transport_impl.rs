@@ -285,6 +285,16 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         self.connections.contains_key(id.as_str())
     }
 
+    fn connected_ids(&self) -> Vec<PeerId> {
+        // Live enumeration off the same `connections` table that backs
+        // `peer_count`/`has_peer` — the single source of truth. Role-blind:
+        // the folded bootstrap primary appears as an ordinary id.
+        self.connections
+            .keys()
+            .map(|k| PeerId::from(k.as_str()))
+            .collect()
+    }
+
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         // Inherent method spawns per-peer dial tasks and returns
         // immediately; the trait stays async because other PeerTransport

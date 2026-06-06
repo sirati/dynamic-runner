@@ -164,6 +164,28 @@ pub trait PeerTransport<I: Identifier> {
     /// impl answers from its own real connection/writer table.
     fn has_peer(&self, id: &PeerId) -> bool;
 
+    /// Enumerate the currently-connected peer ids — the live id-set
+    /// behind [`Self::peer_count`] (the cardinality) and [`Self::has_peer`]
+    /// (the per-id predicate). Role-agnostic (transport ⊥ roles): it
+    /// returns bare [`PeerId`]s, never a role; the folded bootstrap
+    /// primary appears like any other connected member.
+    ///
+    /// Used by a role-aware wrapper that must PUBLISH the live membership
+    /// to a detached send-handle (which cannot borrow the by-value
+    /// transport). The wrapper reads this each pump cycle and republishes
+    /// the whole set — so the published view is a live read, never a
+    /// hand-maintained shadow.
+    ///
+    /// Default: empty. A transport whose detached handles never need the
+    /// per-id membership view (the no-peer arm, mock fixtures) compiles
+    /// unchanged; the cardinality [`Self::peer_count`] stays the
+    /// authoritative count regardless. Transports that DO back a published
+    /// membership view (`PeerNetwork`, the channel mesh) override to
+    /// enumerate their real connection table.
+    fn connected_ids(&self) -> Vec<PeerId> {
+        Vec::new()
+    }
+
     /// Connect to peers from the peer list received from primary.
     fn connect_to_peers(
         &mut self,
