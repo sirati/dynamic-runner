@@ -113,27 +113,13 @@ where
     ///      higher epoch. Every side effect below is gated on the apply
     ///      actually advancing state (`Applied`), so a no-op announcement
     ///      neither wakes nor resets.
-    ///   3. **Self-named → activate-on-demand + reset.** When `new` is THIS
-    ///      node and not an observer, BUILD the co-located primary on
-    ///      demand and reset the failover election to `Normal` (a primary
-    ///      now exists on this host — no lingering Promoted to name). The
-    ///      build forks on `reason`:
-    ///        * `Election` (failover-self): build inline here via
-    ///          [`Self::activate_co_located_primary_on_demand`] — this node
-    ///          is `Operational` and stays a follower of its own primary.
-    ///        * `Transferred` (bootstrap hand-off): the submitter sends the
-    ///          setup frames before it relocates, so the common case is
-    ///          this node is ALREADY `Operational` — build inline. If the
-    ///          relocate raced ahead of TransferComplete and this node is
-    ///          still in setup, DEFER the build to the setup FSM by latching
-    ///          `pending_transfer_activation`; `wait_for_setup` reads the
-    ///          latch and runs the Transferred transition (build, then
-    ///          advance to Operational together), keeping the build
-    ///          co-located with the setup→operational advance.
-    ///
-    ///      Both build paths are capability-gated and loud-on-violation
-    ///      inside `activate_co_located_primary_on_demand`; the "silent
-    ///      no-op on a missing gate" failure mode is gone by construction.
+    ///   3. **Self-named → signal + reset.** When `new` is THIS node and
+    ///      not an observer, the primary build on the promotion event is
+    ///      the Phase-C `Process` concern (the C4 seam — the secondary
+    ///      SIGNALS `Process` to construct the `PrimaryCoordinator`; it
+    ///      never builds one itself), and this node resets its failover
+    ///      election to `Normal` (a primary now exists — no lingering
+    ///      Promoted to name).
     ///   4. **Peer-named → reset.** When `new` is a PEER, a primary now
     ///      exists, so any in-flight failover election on this node is
     ///      stale: reset it to `Normal`.
@@ -185,41 +171,19 @@ where
         }
 
         if new == self.config.secondary_id {
-            // (3) This node is the new primary. Fork on `reason`:
-            //   * Election (failover-self): build the co-located primary on
-            //     demand inline (fire-once; capability-gated + loud inside
-            //     the builder). This node is Operational.
-            //   * Transferred (bootstrap hand-off): build inline if already
-            //     Operational (the common case — TransferComplete drove it
-            //     there before the relocate); else (still in setup) defer to
-            //     the setup FSM by latching the pending flag, which
-            //     `wait_for_setup` reads to build + advance together.
-            // Then reset the election: a primary now exists on this host,
-            // so there is no lingering Promoted state.
-            match reason {
-                dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election => {
-                    // Failover-self: this node is `Operational`. Build the
-                    // co-located primary on demand inline.
-                    self.activate_co_located_primary_on_demand();
-                }
-                dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred => {
-                    // Bootstrap hand-off. The submitter broadcasts the
-                    // setup frames (PeerInfo/InitialAssignment/Transfer
-                    // Complete) BEFORE it relocates, so the common case is
-                    // that this node already advanced to `Operational` —
-                    // build inline. If instead the relocate raced ahead of
-                    // TransferComplete and this node is still in setup,
-                    // latch the pending flag so the setup FSM transition
-                    // (`wait_for_setup`) builds + advances the lifecycle to
-                    // Operational together, keeping the build co-located
-                    // with the setup→operational advance.
-                    if self.lifecycle.operational_mut().is_some() {
-                        self.activate_co_located_primary_on_demand();
-                    } else {
-                        self.pending_transfer_activation = true;
-                    }
-                }
-            }
+            // (3) This node is the new primary.
+            //
+            // PHASE-C-SEAM[C4]: promotion/transfer signal. The build of
+            // the `PrimaryCoordinator` on this promotion event is the
+            // Phase-C `Process` concern — the secondary SIGNALS `Process`
+            // (which constructs the snapshot-seeded primary on the event,
+            // threading the secondary's `WorkerFactory` to the spawn site)
+            // and NEVER builds a primary itself. The `reason`
+            // (Election vs Transferred) is the Phase-C signal discriminant;
+            // it is consumed by `Process`, not here.
+            let _ = &reason;
+            // Reset the election: a primary now exists, so there is no
+            // lingering Promoted state.
             self.reset_election_to_normal();
         } else {
             // (4) A peer is the new primary, so any in-flight election on

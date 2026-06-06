@@ -96,48 +96,4 @@ impl<I> DistributedMessage<I> {
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
         }
     }
-
-    /// Whether this frame is consumed by the AUTHORITATIVE (primary)
-    /// role's dispatch rather than the follower-secondary's.
-    ///
-    /// Single source of truth for the role-aware inbound demux a
-    /// co-located primary+secondary node performs: when this node holds
-    /// `Role::Primary`, a frame for which this returns `true` (a remote
-    /// secondary's worker-lifecycle / setup report — the frames the
-    /// `PrimaryCoordinator`'s `dispatch_message` owns) routes to the
-    /// co-located PRIMARY; everything else (peer keepalive, CRDT mirror,
-    /// election, role/relay envelopes) routes to the SECONDARY. As a
-    /// follower this classifier is not consulted — every frame goes to
-    /// the secondary.
-    ///
-    /// The set mirrors the `PrimaryCoordinator`'s `dispatch_message`
-    /// match arms exactly:
-    ///   - `SecondaryWelcome` / `CertExchange` — connection setup the
-    ///     authority owns.
-    ///   - `TaskRequest` / `TaskComplete` / `TaskFailed` — the
-    ///     worker-lifecycle reports the authority attributes + accounts.
-    ///   - `MeshReady` — the per-secondary mesh-settled signal the
-    ///     authority gates promotion on.
-    ///   - `SecondaryFatalError` — the authority's fleet-death handler.
-    ///
-    /// `ClusterMutation` and `Keepalive` are DELIBERATELY excluded —
-    /// they are consumed by BOTH roles (the authority applies/tracks,
-    /// the follower mirrors), so they always route to the secondary
-    /// (which mirrors the CRDT for every node) and the co-located
-    /// primary observes the same mutations through its own mesh-member
-    /// broadcast receipt. `RequestClusterSnapshot` is the
-    /// secondary-side snapshot responder's concern (it serves the full
-    /// replicated CRDT it mirrors), so it also stays with the secondary.
-    pub fn is_primary_facing(&self) -> bool {
-        matches!(
-            self,
-            Self::SecondaryWelcome { .. }
-                | Self::CertExchange { .. }
-                | Self::TaskRequest { .. }
-                | Self::TaskComplete { .. }
-                | Self::TaskFailed { .. }
-                | Self::MeshReady { .. }
-                | Self::SecondaryFatalError { .. }
-        )
-    }
 }

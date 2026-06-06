@@ -24,7 +24,12 @@
 
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
+// Re-exported into the module namespace for the `#[cfg(test)]` child
+// modules that reach it via `use super::super::*` (the production code in
+// this module no longer names `DistributedMessage` directly).
+#[cfg(test)]
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::ClusterState;
@@ -59,35 +64,6 @@ mod tests;
 
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal};
-
-/// The shape of the ON-DEMAND primary-activator closure registered via
-/// [`SecondaryCoordinator::register_primary_activator`].
-///
-/// A peer becomes the primary by CONSTRUCTING a `PrimaryCoordinator` the
-/// moment it is named primary — there is no pre-parked object. This
-/// closure IS that construction-on-demand, fully type-erased so the
-/// secondary (generic over its OWN transport) never names the primary's
-/// `MeshHandleTransport` type and TRANSPORT⊥ROLES holds: the runtime
-/// layer (PyO3 / e2e harness) captures the construction inputs — the
-/// host's mesh transport handle + the loopback/demux channels + config +
-/// scheduler + estimator + command/phase wiring — and the secondary only
-/// decides WHEN to invoke it.
-///
-/// Invoked exactly once, synchronously, at the activation site (the apply
-/// hook for a failover-self `Election`, the setup FSM for a bootstrap
-/// `Transferred`), with a `snapshot` of the secondary's
-/// continuously-mirrored `cluster_state`. It builds the
-/// `PrimaryCoordinator`, `spawn_local`s its
-/// [`crate::primary::PrimaryCoordinator::run_activated`] (seeded resume
-/// from the snapshot), and returns the spawned `JoinHandle` so the
-/// runtime can join the activated primary at wind-down. `FnOnce` because
-/// it moves the captured single-use wiring (the mesh handle, the loopback
-/// channels) into the one coordinator it builds.
-///
-/// No `Send` bound: invoked on the coordinator's own `LocalSet`-bound
-/// task and the built primary is `spawn_local`'d onto the same `LocalSet`.
-pub type PrimaryActivator<I> =
-    Box<dyn FnOnce(crate::cluster_state::ClusterStateSnapshot<I>) -> tokio::task::JoinHandle<()>>;
 
 /// A task DEFERRED on this secondary because the target worker's
 /// per-type subprocess is mid-respawn (the dispatch arm observed
@@ -387,89 +363,42 @@ where
     /// same discipline as `panik_signal_rx`.
     pub(super) fatal_exit_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 
-    /// The ON-DEMAND primary-activator: a type-erased closure that
-    /// CONSTRUCTS + spawns a co-located `PrimaryCoordinator` the moment
-    /// this node becomes the primary. There is NO pre-parked object — the
-    /// coordinator does not exist until this closure runs.
+    /// Lifecycle hook invoked when this node owns the authoritative
+    /// primary pool and a phase reaches `Drained`. The PyO3 wrapper
+    /// installs a GIL-reacquiring closure that calls Python's
+    /// `task.on_phase_end(phase_id, completed, failed)`.
     ///
-    /// The runtime layer (`PySecondaryCoordinator::run` / the e2e harness)
-    /// captures the construction inputs (the host's mesh transport handle,
-    /// the loopback/demux channels, config, scheduler, estimator,
-    /// command/phase wiring) into this closure and registers it via
-    /// [`Self::register_primary_activator`]. It is invoked exactly once —
-    /// `take()`-n at the activation site
-    /// ([`Self::activate_co_located_primary_on_demand`]) — when THIS node
-    /// is named primary, for BOTH a failover-self election win and a
-    /// bootstrap transfer naming it. The activation site gates the invoke
-    /// on `cluster_state.can_be_primary(self)` (the explicit replicated
-    /// marker) and snapshots the continuously-mirrored `cluster_state` to
-    /// hand the freshly-built primary its seeded resume.
-    ///
-    /// `None` when no activator was registered (Rust-only tests, legacy
-    /// single-`run()` callers, a `disable_peer_overlay` / observer host
-    /// that joined with `can_be_primary = false`): the activation site
-    /// never attempts a build for a node whose marker is unset, so the
-    /// `None` is reached only on the never-capable paths and the broadcast
-    /// still fires. A registered activator with the marker SET but a
-    /// missing closure is a programmer error and is loudly rejected.
-    pub(super) primary_activator: Option<PrimaryActivator<I>>,
-
-    /// The `JoinHandle` of the co-located primary this node activated on
-    /// demand, set the instant
-    /// [`Self::activate_co_located_primary_on_demand`] invokes the
-    /// activator. The runtime ([`Self::take_activated_primary_handle`])
-    /// joins it at wind-down so the activated-primary future is never
-    /// leaked. `None` on every node that was never named primary.
-    pub(super) activated_primary_handle: Option<tokio::task::JoinHandle<()>>,
-
-    /// Set by the apply hook when a `PrimaryChanged { reason: Transferred,
-    /// new = self }` (a bootstrap hand-off naming this node) is applied
-    /// while this secondary is still in setup. The `wait_for_setup` loop
-    /// reads + clears it to run the setup-FSM Transferred transition
-    /// (build the co-located primary on demand, advance to Operational) —
-    /// keeping the build co-located with the lifecycle advance rather than
-    /// in the sync apply hook. A failover-self `Election` (the Operational
-    /// path) never sets this; it builds directly in the apply hook.
-    pub(super) pending_transfer_activation: bool,
-
-    /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
-    /// closure calling Python's `task.on_phase_end(phase_id, completed,
-    /// failed)`).
-    ///
-    /// The secondary holds NO authority and runs no phase machine — the
-    /// fire site is the co-located authoritative `PrimaryCoordinator`,
-    /// which owns `on_phase_end` and the phase machine. This field is a
-    /// registration ANCHOR: the PyO3 secondary wrapper accepts the
-    /// closure (keeping the `register_phase_lifecycle_callbacks` pre-run
-    /// contract stable for callers minting a handle from a secondary),
-    /// and the runtime transfers it (via
-    /// [`SecondaryCoordinator::take_composed_primary_wiring`]) into the
-    /// on-demand primary-activator closure, so the co-located primary
-    /// built on demand fires it. That extraction is the in-crate consumer,
-    /// so this field carries no `#[allow(dead_code)]`.
+    /// R4 SEAM: the secondary holds NO authority, so it has no
+    /// phase-machine to fire this from. The fire site is the
+    /// authoritative `PrimaryCoordinator`, which owns `on_phase_end` +
+    /// the phase machine; pyo3 registers the lifecycle hook on the
+    /// PRIMARY, not the secondary. Kept here only as the wiring anchor
+    /// R4 re-homes.
+    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_end: Option<crate::primary::OnPhaseEnd>,
 
-    /// Phase-start sibling of `on_phase_end`; same registration-anchor
-    /// disposition (transferred to the co-located primary via
-    /// `take_composed_primary_wiring`, fired by it, not the secondary).
+    /// Lifecycle hook invoked when this node owns the authoritative
+    /// primary pool and a phase flips Blocked → Active. Sibling of
+    /// `on_phase_end`; same R4-seam disposition.
+    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_start: Option<crate::primary::OnPhaseStart>,
 
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a
     /// `PySecondaryCoordinator`).
     ///
-    /// Externally-issued `PrimaryCommand`s are authority mutations whose
-    /// only correct owner is the co-located `PrimaryCoordinator`; the
-    /// secondary never drains this channel. The field is a registration
-    /// ANCHOR keeping the PyO3 `command_sender()` clone a stable type;
-    /// the composed runtime hands the receiver to the primary's command
-    /// loop via [`SecondaryCoordinator::take_composed_primary_wiring`].
+    /// R4 SEAM: the secondary no longer drains this channel — the
+    /// externally-issued `PrimaryCommand`s are authority mutations whose
+    /// only correct owner is the `PrimaryCoordinator`. Kept here only as
+    /// the wiring anchor R4 re-homes (so the PyO3 `command_sender()`
+    /// clone keeps a stable type until then).
+    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
     pub(super) command_rx: Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
-    /// consumers via `command_sender()`. Same registration-anchor
-    /// disposition as `command_rx` — a clone crosses to the co-located
-    /// primary via `take_composed_primary_wiring`.
+    /// consumers via `command_sender()`. Same R4-seam disposition as
+    /// `command_rx`.
+    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
     pub(super) command_tx: tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
 
     /// Per-task memory-profile sampler. `Some` iff
@@ -492,44 +421,4 @@ where
     /// Mirrors the same field on
     /// [`dynrunner_manager_local::manager::LocalManager`].
     pub(super) sampler: Option<dynrunner_manager_local::memprofile::MemProfileSampler>,
-
-    /// Co-located primary INBOUND sender (channel CH2). Registered by the
-    /// pyo3 composition via [`Self::register_colocated_primary_inbound`]
-    /// when this host runs a secondary that can build a co-located primary
-    /// on demand on the one mesh transport. The secondary forwards every
-    /// `is_primary_facing` frame into this sender when it holds the
-    /// primary role, and routes its own-host terminal reports here via
-    /// the [`Self::send_to`] `Loopback` arm; the co-located
-    /// `PrimaryCoordinator`'s `recv_peer` drains the matching receiver.
-    /// `None` outside a co-located composition (every non-pyo3 path) —
-    /// the forward is then a no-op and the `Loopback` arm drops, exactly
-    /// as before. `take`-n into the operational loop's latches at
-    /// `enter_operational`.
-    pub(super) colocated_primary_inbound_tx:
-        Option<tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>>,
-
-    /// Co-located primary LOOPBACK receiver (channel CH1) — the PRE-RUN
-    /// REGISTRATION SLOT only. Registered by the pyo3 composition via
-    /// [`Self::register_colocated_loopback_inbound`]. Carries the
-    /// primary→secondary direction (own-host `TaskAssignment` loopback +
-    /// the co-located primary's `Destination::All` broadcast leg); the
-    /// secondary drains it in its operational `select!` loop next to
-    /// `transport.recv_peer` and feeds each frame through `handle_inbound`
-    /// exactly as a wire frame. `None` outside a co-located composition —
-    /// the drain arm parks on `pending()`.
-    ///
-    /// `take`-n ONCE at the first `process_tasks` entry into the loop-local
-    /// loopback arm and moved into
-    /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
-    /// its RESUMABLE home: a `SetupPending` re-entry is a real second
-    /// consumption, and on a promoted node this is the SOLE path to the
-    /// co-located primary's `RunComplete`, so it must survive the yield. This
-    /// coordinator slot is therefore `None` from the first entry onward; the
-    /// live receiver lives on `OperationalState` thereafter. Seeded by the
-    /// same `coordinator-slot, else OperationalState` take-site idiom as
-    /// `panik_signal_rx` — registered only on the co-located (non-observer)
-    /// path, so on an observer both seed sources are `None` and the arm parks
-    /// on `pending()`.
-    pub(super) colocated_loopback_inbound_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
 }

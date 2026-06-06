@@ -126,13 +126,13 @@ async fn peer_keepalive_does_not_touch_primary_last_seen() {
     );
 }
 
-/// (c) A multi-role (co-located primary+secondary) host is tracked as
-/// BOTH: its `Secondary`-tagged keepalive lands in `peer_keepalives` even
-/// though its id IS the current primary, while a `Primary`-tagged
-/// keepalive from the same id refreshes `primary_last_seen`. The two
-/// liveness signals are independent — neither displaces the other.
+/// (c) A multi-role (primary+secondary) host is tracked as BOTH: its
+/// `Secondary`-tagged keepalive lands in `peer_keepalives` even though its
+/// id IS the current primary, while a `Primary`-tagged keepalive from the
+/// same id refreshes `primary_last_seen`. The two liveness signals are
+/// independent — neither displaces the other.
 #[tokio::test(flavor = "current_thread")]
-async fn colocated_host_tracked_as_both_primary_and_peer() {
+async fn multi_role_host_tracked_as_both_primary_and_peer() {
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
@@ -143,7 +143,7 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     let stale = Instant::now() - Duration::from_secs(60);
     sec.op_mut().primary_last_seen = Some(stale);
 
-    // The co-located host emits its secondary-capability keepalive: it is
+    // The multi-role host emits its secondary-capability keepalive: it is
     // a live mesh peer and MUST land in peer_keepalives despite its id
     // being the current primary.
     let before = Instant::now();
