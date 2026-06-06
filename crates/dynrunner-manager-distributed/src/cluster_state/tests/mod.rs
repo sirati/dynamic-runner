@@ -10,7 +10,7 @@ use dynrunner_core::{
     ErrorType, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TaskVersion, TypeId,
 };
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, RemovalCause, RoleChangeHookRegistrar, RoleTable,
+    ClusterMutation, RemovalCause, RoleChangeHookRegistrar, RoleTable, RunMilestoneKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -27,6 +27,7 @@ mod peer_lifecycle;
 mod peer_resources;
 mod role_table;
 mod run_aborted;
+mod run_milestones;
 mod secondary_capacity;
 mod snapshot;
 mod task_outputs;

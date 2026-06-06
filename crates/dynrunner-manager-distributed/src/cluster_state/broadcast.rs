@@ -115,7 +115,10 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::SecondaryCapacity { .. }
-            | ClusterMutation::TasksSpawned { .. } => {}
+            | ClusterMutation::TasksSpawned { .. }
+            // A7 run-milestone is a grow-only set element — its convergence
+            // is the set union, not a version-LWW, so it carries no stamp.
+            | ClusterMutation::RunMilestone { .. } => {}
         }
     }
 }
