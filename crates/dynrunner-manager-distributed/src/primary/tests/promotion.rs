@@ -1451,3 +1451,174 @@ async fn promoted_combined_state_reconstructs_faithfully() {
         })
         .await;
 }
+
+/// A promotion inheriting a terminal `Failed` task MUST NOT double-count it.
+///
+/// The run-complete counter sums two STRICTLY-DISJOINT sets
+/// (`completed_tasks.len() + failed_tasks.len() >= total_tasks`): on the live
+/// path a terminal hash lands in exactly ONE of {completed, failed}
+/// (`task::complete.rs` inserts completed, the failed handlers insert failed).
+/// A prior promotion-reconstruction patch made `hydrate`'s `Failed` arm seed
+/// the inherited hash into BOTH `completed_tasks` (hash-keyed) and
+/// `failed_tasks`, so a single inherited `Failed` counted TWICE. With ≥1
+/// inherited terminal `Failed` plus ≥1 inherited `Pending` still queued
+/// (undispatched at the operational loop's entry-time exit check), the
+/// inflated counter (`1 + 1 >= 2`) trips `run_complete` PREMATURELY while
+/// `active_workers == 0`, broadcasting `RunComplete` with the `Pending`
+/// stranded — a silent false-complete.
+///
+/// Pre-fix this FAILS two ways: the post-hydrate invariant (the inherited
+/// `Failed` hash must NOT be in `completed_tasks`) is violated, and the
+/// driven run strands the inherited `Pending`. Post-fix the disjoint-set
+/// invariant holds, the inherited `Failed` counts ONCE via `failed_tasks`,
+/// the `Pending` is dispatched + completed, and nothing is stranded.
+/// `NonRecoverable` keeps the inherited failure terminal throughout — it
+/// matches no retry `BucketKind`, so `run_retry_passes` never reinjects it
+/// (the count stays a stable `failed == 1`).
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_inherited_failed_not_double_counted_against_pending() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // --- Live primary: one NonRecoverable Failed task + one Pending
+            // task + a SecondaryCapacity. Snapshot the converged ledger. ---
+            let failed_task = make_binary("dead", 100);
+            let failed_hash = compute_task_hash(&failed_task);
+            let pending_task = make_binary("queued", 100);
+            let pending_hash = compute_task_hash(&pending_task);
+            let snapshot = {
+                let (transport, _ends) = setup_test(1);
+                let (mut live, _mesh) = build_test_primary(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let cs = live.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::new(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: failed_hash.clone(),
+                    task: failed_task.clone(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: pending_hash.clone(),
+                    task: pending_task.clone(),
+                });
+                // Terminate the first task as a NonRecoverable Failed — the
+                // budget-exhausted / permanently-failed shape a promotion can
+                // inherit. The second stays Pending.
+                cs.apply(ClusterMutation::TaskFailed {
+                    hash: failed_hash.clone(),
+                    kind: dynrunner_core::ErrorType::NonRecoverable,
+                    error: "permanent".into(),
+                    version: Default::default(),
+                    attempt: 0,
+                });
+                assert_eq!(cs.task_count(), 2, "live ledger holds 2 tasks");
+                live.cluster_state_for_test().snapshot()
+            };
+
+            // --- Promoted primary: restore + hydrate via the production
+            // promotion construction primitive. ---
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            // PRE-RUN deterministic invariant (the disjoint-sets law): the
+            // inherited terminal Failed hash is seeded into `failed_tasks`
+            // (retry/dedup) but MUST NOT also be in `completed_tasks`.
+            // FAILS pre-fix — the buggy `Failed` arm seeded both.
+            assert!(
+                promoted.failed_tasks.contains_key(&failed_hash),
+                "the inherited Failed hash must seed failed_tasks"
+            );
+            assert!(
+                !promoted.completed_tasks.contains(&failed_hash),
+                "the inherited Failed hash must NOT also be in completed_tasks \
+                 (disjoint-sets invariant: a terminal hash sits in exactly one \
+                 of {{completed, failed}})"
+            );
+            // The counter's two summands are disjoint, so the inherited Failed
+            // contributes ONE — not enough to trip the entry-time exit with
+            // the Pending still queued. FAILS pre-fix (the double-count made
+            // `1 + 1 >= 2` true before the Pending could dispatch).
+            assert_eq!(
+                promoted.total_tasks, 2,
+                "total_tasks hydrated from the inherited ledger"
+            );
+            assert!(
+                promoted.completed_tasks.len() + promoted.failed_tasks.len()
+                    < promoted.total_tasks,
+                "the run-complete counter must be below total while the inherited \
+                 Pending is still undispatched (pre-fix the double-counted Failed \
+                 inflates this to >= total → premature RunComplete)"
+            );
+            assert_eq!(
+                promoted.pool().len(),
+                1,
+                "the inherited Pending task is queued in the pool"
+            );
+
+            // --- Drive the promoted run against a fake secondary that answers
+            // the inherited Pending's dispatch + completes it. ---
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 1, 1024 * 1024 * 1024, rx, tx));
+            }
+
+            let (_deps, ops, ope) = noop_phase_args();
+            let outcome = promoted
+                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
+                .await
+                .expect("promoted run must not error");
+
+            match outcome {
+                PrimaryRunOutcome::Local {
+                    result,
+                    completed,
+                    failed,
+                    stranded,
+                } => {
+                    assert!(result.is_ok(), "run completed cleanly: {result:?}");
+                    // The inherited Pending was dispatched + completed — NOT
+                    // dropped by a premature RunComplete. Pre-fix it was
+                    // stranded (the false-complete fired before dispatch).
+                    assert_eq!(
+                        completed, 1,
+                        "the inherited Pending task was dispatched + completed \
+                         (pre-fix the premature RunComplete stranded it)"
+                    );
+                    assert_eq!(
+                        failed, 1,
+                        "the inherited NonRecoverable Failed task counts ONCE as failed"
+                    );
+                    assert_eq!(
+                        stranded, 0,
+                        "no inherited task was stranded by a premature RunComplete"
+                    );
+                }
+                PrimaryRunOutcome::Relocated { .. } => {
+                    panic!("promoted primary should run to a Local outcome, not relocate")
+                }
+            }
+        })
+        .await;
+}

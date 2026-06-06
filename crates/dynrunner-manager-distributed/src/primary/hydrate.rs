@@ -124,8 +124,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // The CRDT entry itself stays `Failed`; the bucket's reset
                 // (`TaskRetried`, budget-gated) is what later moves it to
                 // `Pending` — hydrate only rebuilds the projection.
+                //
+                // It does NOT seed `primary_completed` (the hash-keyed
+                // `completed_tasks` set): on the live path that set and
+                // `failed_tasks` are STRICTLY DISJOINT — a terminal hash
+                // sits in exactly one of {completed, failed} (see
+                // `task::complete.rs`). The run-complete counter sums both
+                // (`completed_tasks.len() + failed_tasks.len()`), so seeding
+                // an inherited `Failed` into both would count it TWICE and
+                // trip a premature false-complete. The dep-resolution seed a
+                // failed prereq's dependents need is `completed_task_ids`
+                // (task_id-keyed, a DIFFERENT set), which is preserved; the
+                // late-TaskFailed dedup in `task::failed.rs` ORs
+                // `failed_tasks.contains_key`, so it still dedupes without
+                // the `completed_tasks` membership.
                 TaskState::Failed { task, kind, .. } => {
-                    primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
@@ -330,7 +343,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         // Single source of truth for the run-completion accounting:
         // the cluster ledger's task count (`tasks.len()`), identical
-        // to the reactive `mirror_mutation_to_accounting` refresh.
+        // to the reactive `handle_cluster_mutation` `TaskAdded` refresh.
         self.total_tasks = self.cluster_state.task_count();
 
         let pending_count = pool.len();
