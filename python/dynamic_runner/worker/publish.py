@@ -33,7 +33,9 @@ from pathlib import Path
 from typing import Union
 
 from .._native import PublishError as PublishError
+from .._native import publish_all as _native_publish_all
 from .._native import publish_one as _native_publish_one
+from .._native import sweep_stale_tmps as _native_sweep_stale_tmps
 
 
 PathLike = Union[str, os.PathLike]
@@ -109,17 +111,62 @@ def publish(src: PathLike, dst: PathLike | None = None) -> Path:
 
 
 def publish_all(*srcs: PathLike) -> None:
-    """Publish multiple files in sequence. Stops at the first
-    failure — the partial-success state is exactly what
-    ``publish`` left behind on the file system: every src
-    processed before the failure is delivered, the failing src
-    and any after it are untouched. Consumers that want
-    all-or-nothing semantics must compose that themselves
-    (publish into a sibling dst tree, then atomically swap the
-    tree root).
+    """Publish multiple files as one staged transaction.
+
+    Resolves every ``src`` to its mirrored destination under
+    ``dst_root`` up front (the ``src_root`` is process-wide, read
+    once), then hands the whole ``[(src, dst), ...]`` batch to the
+    native ``publish_all`` in a single call. The native layer stages
+    ALL srcs (the slow cross-FS copies) before committing ANY of the
+    renames back-to-back, so an interruption during staging leaves
+    only ``.publish-tmp`` siblings — never a partial set of final
+    files. The partial window shrinks to the masked, sub-millisecond
+    rename phase the native layer owns.
+
+    Destination derivation is identical to ``publish``: each ``src``
+    must lie under ``src_root`` (else ``PublishError``). This is the
+    bulk file-move path; it does not feed the keyed-outputs
+    accumulator — keyed outputs remain ``Task.publish(key=)`` /
+    ``Task.publish_string``.
+
+    An empty call is a no-op (the native batch over an empty list is
+    trivially the empty transaction).
     """
+    if not srcs:
+        return
+    # _resolve returns the process-wide src_root identically for every
+    # src (it's read from env once per call, same value). Capture it
+    # from the first resolution and pass the (src, dst) pairs to the
+    # native batch — the resolution contract stays owned here, the
+    # transaction semantics stay owned by the native layer.
+    items: list[tuple[Path, Path]] = []
+    src_root: Path | None = None
     for src in srcs:
-        publish(src)
+        src_p, dst_p, root_p = _resolve(src, None)
+        src_root = root_p
+        items.append((src_p, dst_p))
+    _native_publish_all(items, src_root)
+
+
+def sweep_stale_tmps(dest_root: PathLike) -> int:
+    """Reap stale ``.publish-tmp`` siblings left in ``dest_root`` by a
+    prior worker run that was hard-killed mid-rename-phase.
+
+    Thin pass-through to the native sweep, which is own-host /
+    dead-pid scoped (NFS-safe across secondaries sharing the dest).
+    Returns the number of stale temps removed. A missing ``dest_root``
+    is a no-op returning 0.
+    """
+    return _native_sweep_stale_tmps(Path(dest_root))
+
+
+def dst_root() -> Path:
+    """The configured destination root (``DYNRUNNER_PUBLISH_DST_ROOT``,
+    falling back to the slurm-wrapper default). The single source of
+    truth callers (e.g. the run-start sweep) use to find the dir
+    where published files — and any crash-leftover temps — live.
+    """
+    return _roots()[1]
 
 
 __all__ = [
@@ -130,4 +177,6 @@ __all__ = [
     "PublishError",
     "publish",
     "publish_all",
+    "sweep_stale_tmps",
+    "dst_root",
 ]

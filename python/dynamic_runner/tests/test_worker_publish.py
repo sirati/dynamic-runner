@@ -20,7 +20,16 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import importlib
+
+# `dynamic_runner.worker.__init__` re-exports the `publish` *function*,
+# which shadows the `publish` *submodule* attribute on the package — so
+# `import dynamic_runner.worker.publish as x` would bind the function.
+# Resolve the module object explicitly to patch its module-level
+# `_native_*` bindings.
+publish_mod = importlib.import_module("dynamic_runner.worker.publish")
 from dynamic_runner.worker import (
     PublishError,
     Task,
@@ -32,6 +41,7 @@ from dynamic_runner.worker.publish import (
     DEFAULT_SRC_ROOT,
     ENV_DST_ROOT,
     ENV_SRC_ROOT,
+    sweep_stale_tmps,
 )
 
 
@@ -226,6 +236,68 @@ class EnvOverrideTests(unittest.TestCase):
             finally:
                 os.environ.pop(ENV_SRC_ROOT, None)
                 os.environ.pop(ENV_DST_ROOT, None)
+
+
+class PublishAllBatchTests(_PublishFixture):
+    """``publish_all`` resolves all triples up front and hands the
+    whole batch to the native ``publish_all`` in ONE call — it does
+    NOT fall back to N per-file ``publish_one`` calls. Stubs the
+    native layer so the call shape (single batch, all resolved pairs,
+    common src_root) is asserted directly without touching disk.
+    """
+
+    def test_publish_all_calls_native_batch_once_with_resolved_pairs(self):
+        a = self._stage("one.txt", "1")
+        b = self._stage("sub/two.txt", "2")
+        with patch.object(publish_mod, "_native_publish_all") as batch, \
+             patch.object(publish_mod, "_native_publish_one") as one:
+            publish_all(a, b)
+        # Exactly one batch call, zero per-file publish_one calls.
+        batch.assert_called_once()
+        one.assert_not_called()
+        items, src_root = batch.call_args.args
+        # All srcs resolved to their mirrored dsts, in order.
+        self.assertEqual(
+            items,
+            [
+                (a, self.dst_root / "one.txt"),
+                (b, self.dst_root / "sub/two.txt"),
+            ],
+        )
+        # The common, process-wide src_root is passed once.
+        self.assertEqual(src_root, self.src_root)
+
+    def test_publish_all_empty_is_noop(self):
+        with patch.object(publish_mod, "_native_publish_all") as batch:
+            publish_all()
+        batch.assert_not_called()
+
+    def test_publish_all_propagates_resolution_error_before_native_call(self):
+        # A src outside src_root must fail at resolution — the native
+        # batch is never invoked (no partial staging attempted).
+        outside = Path(self._dst_dir.name) / "escape.txt"
+        outside.write_text("x")
+        with patch.object(publish_mod, "_native_publish_all") as batch:
+            with self.assertRaises(PublishError):
+                publish_all(outside)
+        batch.assert_not_called()
+
+
+class SweepStaleTmpsTests(_PublishFixture):
+    """``sweep_stale_tmps`` is a thin pass-through to the native
+    own-host/dead-pid sweep, targeting the configured dst_root.
+    """
+
+    def test_sweep_passes_resolved_dst_root_and_returns_count(self):
+        with patch.object(
+            publish_mod, "_native_sweep_stale_tmps", return_value=3
+        ) as native:
+            reaped = sweep_stale_tmps(publish_mod.dst_root())
+        native.assert_called_once_with(self.dst_root)
+        self.assertEqual(reaped, 3)
+
+    def test_dst_root_reads_env(self):
+        self.assertEqual(publish_mod.dst_root(), self.dst_root)
 
 
 if __name__ == "__main__":

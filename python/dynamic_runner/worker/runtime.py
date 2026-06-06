@@ -38,9 +38,12 @@ Exception → wire mapping (load-bearing — see plan §D6):
                                        error_type=RECOVERABLE)
 * ``KeyboardInterrupt``/``SystemExit`` mid-task → ErrorResponse(
                                        RECOVERABLE) then exit
-* ``SIGTERM``                      → installed handler raises
+* ``SIGTERM`` / ``SIGHUP``         → installed handler raises
                                        SystemExit, falling into the
-                                       branch above.
+                                       branch above. (SIGHUP also
+                                       covers the publish-rename
+                                       signal-deferral delivery and
+                                       ssh-session teardown.)
 
 The "default to RECOVERABLE for unclassified exceptions" choice is
 symmetric with the Rust-side disconnect default (manager-local Phase D
@@ -409,28 +412,84 @@ def _classify_exception(exc: BaseException) -> Optional[ErrorResponse]:
     return None
 
 
-def _install_term_handler() -> Optional[Callable[..., Any]]:
-    """Translate SIGTERM into a SystemExit so the loop's existing
-    KeyboardInterrupt/SystemExit branches handle the shutdown
-    uniformly. Returns the previous handler so the caller can restore
-    it on exit.
+# Catchable signals the worker translates into SystemExit so the
+# loop's KeyboardInterrupt/SystemExit branches own every shutdown
+# uniformly:
+#
+# * SIGTERM — the framework's graceful-stop signal.
+# * SIGHUP  — ssh-session teardown (remote-podman dispatch: the
+#   coordinator kills the per-secondary ssh, the session ends, and
+#   the container's processes get SIGHUP — see
+#   `packaging/remote_podman.py`). It also arrives via the
+#   publish-rename signal-deferral: SIGHUP delivered during the
+#   masked rename phase is held pending by the kernel and delivered
+#   on unblock, where without a handler it would hit the default
+#   terminate-without-cleanup. Installing the handler routes that
+#   deferred SIGHUP through the same clean SystemExit path. Handling
+#   the signal at the worker-process level does not stop the kernel
+#   from delivering SIGHUP to the rest of the container/pod — this
+#   only changes THIS process's disposition, so the wrapper's own
+#   SIGHUP trap still fires.
+#
+# SIGINT is already SystemExit-equivalent in Python (KeyboardInterrupt),
+# so no re-installation is needed for that signal.
+_EXIT_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 
-    SIGINT is already SystemExit-equivalent in Python (KeyboardInterrupt),
-    so no re-installation is needed for that signal.
+
+def _install_exit_signal_handlers() -> dict[int, Any]:
+    """Translate the catchable exit signals into SystemExit so the
+    loop's existing KeyboardInterrupt/SystemExit branches handle the
+    shutdown uniformly. Returns a ``{signum: previous_handler}`` map
+    so the caller can restore each on exit.
+
+    Degrades gracefully per-signal: a signal that can't be installed
+    (not on the main thread, subsystem unavailable) is simply skipped
+    and absent from the returned map, so it follows the OS default
+    (immediate kill) and the framework's disconnect-with-task path
+    classifies it as Recoverable per Phase D.
     """
 
     def _raise_systemexit(signum, _frame):
         raise SystemExit(f"signal {signum}")
 
+    previous: dict[int, Any] = {}
+    for signum in _EXIT_SIGNALS:
+        try:
+            previous[signum] = signal.signal(signum, _raise_systemexit)
+        except (ValueError, OSError):
+            continue
+    return previous
+
+
+def _sweep_stale_publish_tmps() -> None:
+    """Reap ``.publish-tmp`` leftovers a prior worker run left in the
+    destination dir when it was hard-killed mid-publish. Run once at
+    worker run-start, before any task is processed.
+
+    The dest-root resolution and the own-host / dead-pid scoped sweep
+    both live in ``dynamic_runner.worker.publish`` (and, underneath,
+    the native crate) — this is a thin invocation that only owns the
+    "log if anything was reaped" observability. A sweep failure must
+    not block the worker from starting (a leftover temp is benign and
+    the next run will retry), so any error is logged and swallowed.
+    """
+    from .publish import dst_root, sweep_stale_tmps
+
     try:
-        return signal.signal(signal.SIGTERM, _raise_systemexit)
-    except (ValueError, OSError):
-        # Not on the main thread, or signal subsystem unavailable.
-        # The runtime degrades gracefully — without the handler,
-        # SIGTERM follows the OS default (immediate kill) and the
-        # framework's disconnect-with-task path classifies it as
-        # Recoverable per Phase D.
-        return None
+        reaped = sweep_stale_tmps(dst_root())
+    except Exception as exc:  # noqa: BLE001 — best-effort startup hygiene
+        _LOG.warning(
+            "worker.runtime: stale .publish-tmp sweep failed at run-start "
+            "(non-fatal): %s",
+            exc,
+        )
+        return
+    if reaped:
+        _LOG.info(
+            "worker.runtime: reaped %d stale .publish-tmp leftover(s) "
+            "from a prior crashed run",
+            reaped,
+        )
 
 
 @dataclass
@@ -635,7 +694,8 @@ def run(
         setup_worker_logging(getattr(args, "log_file", None))
         comm = _open_comm(args)
 
-    prev_term = _install_term_handler()
+    prev_handlers = _install_exit_signal_handlers()
+    _sweep_stale_publish_tmps()
     ctx = _RunCtx(comm=comm, handle=handle)
     try:
         _try_send(ctx, ReadyResponse())
@@ -664,9 +724,9 @@ def run(
             comm.close()
         except Exception:
             pass
-        if prev_term is not None:
+        for signum, prev in prev_handlers.items():
             try:
-                signal.signal(signal.SIGTERM, prev_term)
+                signal.signal(signum, prev)
             except (ValueError, OSError):
                 pass
 
