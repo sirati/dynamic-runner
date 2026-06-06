@@ -158,19 +158,23 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// Iterate every `((phase, bucket), used)` entry of the replicated
-    /// retry-pass USED map (P3). The read-seam the run-narrator diffs to
+    /// retry-pass USED map (P3). The read-seam the run-narrator scans to
     /// surface error- / OOM-retry-pass-start milestones from the converged
-    /// CRDT: each upward step of a key's `used` count is one retry pass that
-    /// opened (the retry-bucket core bumps it by exactly one per reinjecting
-    /// pass), so the narrator's last-seen-vs-current edge over THIS iterator
-    /// is the faithful derivation of the removed retry-pass milestones — a
-    /// pass opened on a promoted primary (a different node) is surfaced here
-    /// purely via replication, no per-node authority. Unlike
-    /// `retry_pass_used_for` (a single-key budget read) the narrator must
-    /// discover WHICH keys exist, so it borrows the whole map.
-    pub(crate) fn retry_passes_used(
-        &self,
-    ) -> impl Iterator<Item = (&(PhaseId, BucketKind), u32)> {
+    /// CRDT. The narrator derives a once-per-`(phase, bucket)` PRESENCE
+    /// milestone — it emits the moment a key first appears here with a
+    /// positive count (`used >= 1`) and never again for that key, no matter
+    /// how high the count climbs. It is NOT a per-step count diff: the
+    /// `used` value is read only for the `>= 1` presence test, not differenced
+    /// against a last-seen count. Presence is the only failover-consistent
+    /// derivation — a live primary watching a count step 1→2→3 and a
+    /// promoted/observing node fed the already-converged count 3 both see the
+    /// SAME presence and emit the SAME single line, whereas a count diff would
+    /// make them narrate differently from the one converged CRDT. A pass that
+    /// opened on a promoted primary (a different node) is surfaced here purely
+    /// via replication, no per-node authority. Unlike `retry_pass_used_for`
+    /// (a single-key budget read) the narrator must discover WHICH keys exist,
+    /// so it borrows the whole map. (See `run_narrator::retry_passes_emitted`.)
+    pub(crate) fn retry_passes_used(&self) -> impl Iterator<Item = (&(PhaseId, BucketKind), u32)> {
         self.retry_passes_used.iter().map(|(k, v)| (k, *v))
     }
 

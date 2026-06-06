@@ -4,6 +4,23 @@
 NO RUNTIME LOGIC HERE — this file orchestrates argv + runpy, nothing more.
 ==============================================================================
 
+==============================================================================
+ENTRYPOINT CONTRACT — the image already prepends ``python -m``; DO NOT repeat
+==============================================================================
+The consumer container image's ENTRYPOINT is ``["python", "-m"]``. So
+whatever the framework hands the container as its COMMAND is appended after
+``python -m`` and run as a module. The framework therefore passes a BARE
+module STRING (this shim's dotted name,
+``dynamic_runner._secondary_bootstrap``) as the container command — NEVER a
+``["python", "-m", ...]`` prefix of its own. Double-prepending would launch
+``python -m python -m dynamic_runner._secondary_bootstrap`` and break the
+cold start. The same rule holds one level down: this shim runs the consumer
+module with ``runpy.run_module`` (in THIS interpreter), NOT by re-spawning
+``python -m <module>`` — the ``python -m`` was already supplied by the image
+entrypoint that launched US. (Wire side of the same contract:
+``crates/dynrunner-slurm/.../wrapper_script/config.rs::container_command`` and
+``slurm-wrapper/wrapper/src/podman_run.rs``.)
+
 Single concern: before a freshly-spawned (or respawned) secondary's
 consumer module runs, fetch the cluster-wide ``forwarded_argv`` from the
 bootstrap primary over the mesh, splice it onto ``sys.argv``, and then run

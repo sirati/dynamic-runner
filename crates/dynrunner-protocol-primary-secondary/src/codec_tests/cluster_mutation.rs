@@ -434,6 +434,13 @@ fn roundtrip_task_retried_with_attempt_and_version() {
 /// Backward-compat: a `TaskRetried` from a sender that predates either field
 /// (only `{ hash }`) decodes `attempt` as the cold generation `0` and `version`
 /// as the `(0, 0)` strict minimum.
+///
+/// NOTE: this legacy decode path is in practice UNREACHABLE — `TaskRetried` is
+/// a NEW variant (F2), so no sender predating its `attempt`/`version` fields
+/// ever existed; an originator always mints `attempt: n+1`. The
+/// `#[serde(default)]` and this test pin the field-defaulting purely as a
+/// safety net so a malformed/truncated frame degrades to the cold generation
+/// rather than refusing to decode.
 #[test]
 fn legacy_task_retried_decodes_attempt_and_version_as_default() {
     let legacy = serde_json::json!({
