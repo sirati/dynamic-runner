@@ -24,6 +24,7 @@ fn converged_replicas_produce_equal_digests() {
         task: mk_task("c"),
     });
     a.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
@@ -76,6 +77,7 @@ fn same_count_state_advance_changes_fold() {
     });
     let stale = a.digest();
     a.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "t".into(),
         result_data: None,
     });
@@ -220,6 +222,7 @@ fn divergence_detected_then_quiescent_after_restore() {
         task: mk_task("b"),
     });
     complete.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "b".into(),
         result_data: None,
     });

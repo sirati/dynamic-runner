@@ -75,6 +75,7 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                             ClusterMutation::TaskCompleted {
                                 hash: h,
                                 result_data,
+                                ..
                             } if h == &hash => Some(result_data.clone()),
                             _ => None,
                         })

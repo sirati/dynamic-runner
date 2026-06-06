@@ -68,6 +68,7 @@ fn task_failed_invalid_task_transitions_pending_to_invalid() {
     assert_eq!(s.counts().pending, 1);
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::InvalidTask {
                 reason: BoundedString::from("missing dep (phase=p0, task_id=ghost)".to_string()),
@@ -93,6 +94,7 @@ fn invalid_task_terminal_locks_out_later_generic_failure() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::InvalidTask {
             reason: BoundedString::from("missing dep".to_string()),
@@ -103,6 +105,7 @@ fn invalid_task_terminal_locks_out_later_generic_failure() {
     // A later generic NonRecoverable TaskFailed is locked out.
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "upstream-failed".into(),

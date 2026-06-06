@@ -7,24 +7,32 @@ fn roundtrip_task_completed_with_result_data() {
     let mutation: ClusterMutation<TestId> = ClusterMutation::TaskCompleted {
         hash: "h-result".into(),
         result_data: Some(b"foo".to_vec()),
+        // Pin a NON-DEFAULT attempt (F2) so the assertion catches a dropped
+        // `attempt` on the wire.
+        attempt: 3,
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
 
     match decoded {
-        ClusterMutation::TaskCompleted { hash, result_data } => {
+        ClusterMutation::TaskCompleted {
+            hash,
+            result_data,
+            attempt,
+        } => {
             assert_eq!(hash, "h-result");
             assert_eq!(result_data.as_deref(), Some(b"foo".as_ref()));
+            assert_eq!(attempt, 3);
         }
         _ => panic!("expected TaskCompleted"),
     }
 }
 
 /// Backward-compat: a pre-Phase-2a sender's JSON shape — bare `{ "hash": ... }`
-/// without the new `result_data` field — must decode with `result_data: None`.
-/// Without `#[serde(default)]` the decode would refuse the frame and break
-/// rolling upgrades.
+/// without the new `result_data` field (nor the F2 `attempt`) — must decode
+/// with `result_data: None` and `attempt: 0`. Without `#[serde(default)]` the
+/// decode would refuse the frame and break rolling upgrades.
 #[test]
 fn legacy_task_completed_decodes_without_result_data() {
     let legacy = serde_json::json!({
@@ -34,9 +42,14 @@ fn legacy_task_completed_decodes_without_result_data() {
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
 
     match decoded {
-        ClusterMutation::TaskCompleted { hash, result_data } => {
+        ClusterMutation::TaskCompleted {
+            hash,
+            result_data,
+            attempt,
+        } => {
             assert_eq!(hash, "legacy-hash");
             assert!(result_data.is_none());
+            assert_eq!(attempt, 0);
         }
         _ => panic!("expected TaskCompleted"),
     }
@@ -187,6 +200,7 @@ fn task_completed_omits_absent_result_data_on_wire() {
     let mutation: ClusterMutation<TestId> = ClusterMutation::TaskCompleted {
         hash: "h-bare".into(),
         result_data: None,
+        attempt: 0,
     };
     let v = serde_json::to_value(&mutation).unwrap();
     let inner = &v["TaskCompleted"];
@@ -211,6 +225,9 @@ fn roundtrip_task_failed_with_version() {
             primary_epoch: 5,
             seq: 2,
         },
+        // Pin a NON-DEFAULT attempt (F2): the failure carries the generation
+        // it failed under so the retry originator reads it to mint n+1.
+        attempt: 2,
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
@@ -222,6 +239,7 @@ fn roundtrip_task_failed_with_version() {
             kind,
             error,
             version,
+            attempt,
         } => {
             assert_eq!(hash, "h-failed");
             assert_eq!(kind, ErrorType::NonRecoverable);
@@ -233,15 +251,17 @@ fn roundtrip_task_failed_with_version() {
                     seq: 2
                 }
             );
+            assert_eq!(attempt, 2);
         }
         _ => panic!("expected TaskFailed"),
     }
 }
 
-/// Backward-compat: a sender that predates the `version` field emits a
-/// `TaskFailed` JSON shape with only `{ hash, kind, error }`.
-/// `#[serde(default)]` must decode it as the `(0, 0)` strict minimum so a
-/// legacy record never dominates a versioned one.
+/// Backward-compat: a sender that predates the `version` field (nor the F2
+/// `attempt`) emits a `TaskFailed` JSON shape with only `{ hash, kind, error }`.
+/// `#[serde(default)]` must decode `version` as the `(0, 0)` strict minimum and
+/// `attempt` as the cold generation `0`, so a legacy record never dominates a
+/// versioned/attempt-bearing one.
 #[test]
 fn legacy_task_failed_decodes_version_as_default() {
     let legacy = serde_json::json!({
@@ -251,8 +271,11 @@ fn legacy_task_failed_decodes_version_as_default() {
     let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
 
     match decoded {
-        ClusterMutation::TaskFailed { version, .. } => {
+        ClusterMutation::TaskFailed {
+            version, attempt, ..
+        } => {
             assert_eq!(version, TaskVersion::default());
+            assert_eq!(attempt, 0);
         }
         _ => panic!("expected TaskFailed"),
     }
@@ -271,6 +294,9 @@ fn roundtrip_task_assigned_with_version() {
             primary_epoch: 1,
             seq: 9,
         },
+        // Pin a NON-DEFAULT attempt (F2): the assignment carries the retried
+        // generation so a worker outcome out-ranks the reset Pending.
+        attempt: 5,
     };
 
     let json = serde_json::to_string(&mutation).unwrap();
@@ -282,6 +308,7 @@ fn roundtrip_task_assigned_with_version() {
             secondary,
             worker,
             version,
+            attempt,
         } => {
             assert_eq!(hash, "h-assigned");
             assert_eq!(secondary, "sec-1");
@@ -293,6 +320,7 @@ fn roundtrip_task_assigned_with_version() {
                     seq: 9
                 }
             );
+            assert_eq!(attempt, 5);
         }
         _ => panic!("expected TaskAssigned"),
     }
@@ -361,6 +389,87 @@ fn roundtrip_task_reinjected_with_version() {
             );
         }
         _ => panic!("expected TaskReinjected"),
+    }
+}
+
+/// `TaskRetried` round-trips carrying a NON-DEFAULT `attempt` AND `version`
+/// (F2 — the per-phase retry reset `Failed { attempt: n } → Pending { attempt:
+/// n+1 }`). The originator-computed `attempt` is the TOP of the join key, so it
+/// MUST survive the wire; a default-valued test would pass even if the field
+/// were dropped, hence both fields are pinned non-default.
+#[test]
+fn roundtrip_task_retried_with_attempt_and_version() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskRetried {
+        hash: "h-retried".into(),
+        attempt: 4,
+        version: TaskVersion {
+            primary_epoch: 6,
+            seq: 8,
+        },
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskRetried {
+            hash,
+            attempt,
+            version,
+        } => {
+            assert_eq!(hash, "h-retried");
+            assert_eq!(attempt, 4);
+            assert_eq!(
+                version,
+                TaskVersion {
+                    primary_epoch: 6,
+                    seq: 8
+                }
+            );
+        }
+        _ => panic!("expected TaskRetried"),
+    }
+}
+
+/// Backward-compat: a `TaskRetried` from a sender that predates either field
+/// (only `{ hash }`) decodes `attempt` as the cold generation `0` and `version`
+/// as the `(0, 0)` strict minimum.
+#[test]
+fn legacy_task_retried_decodes_attempt_and_version_as_default() {
+    let legacy = serde_json::json!({
+        "TaskRetried": { "hash": "h" }
+    });
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskRetried {
+            hash,
+            attempt,
+            version,
+        } => {
+            assert_eq!(hash, "h");
+            assert_eq!(attempt, 0);
+            assert_eq!(version, TaskVersion::default());
+        }
+        _ => panic!("expected TaskRetried"),
+    }
+}
+
+/// Backward-compat: a `TaskAssigned` from a sender that predates the F2
+/// `attempt` (only `{ hash, secondary, worker }`, optionally `version`) decodes
+/// `attempt` as the cold generation `0`.
+#[test]
+fn legacy_task_assigned_decodes_attempt_as_default() {
+    let legacy = serde_json::json!({
+        "TaskAssigned": { "hash": "h", "secondary": "sec", "worker": 1 }
+    });
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskAssigned { attempt, .. } => {
+            assert_eq!(attempt, 0);
+        }
+        _ => panic!("expected TaskAssigned"),
     }
 }
 

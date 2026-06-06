@@ -125,6 +125,7 @@ mod tests {
             let payload = dynrunner_core::DonePayload { outputs: o };
             let bytes = serde_json::to_vec(&payload).expect("serialise DonePayload");
             state.apply(ClusterMutation::TaskCompleted {
+                attempt: 0,
                 hash,
                 result_data: Some(bytes),
             });

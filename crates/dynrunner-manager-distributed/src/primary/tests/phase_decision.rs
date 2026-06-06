@@ -190,6 +190,7 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
             task: toolchain,
         });
         cs.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "toolchain".into(),
             result_data: None,
         });
@@ -268,6 +269,7 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
             task: toolchain,
         });
         cs.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "toolchain".into(),
             result_data: None,
         });

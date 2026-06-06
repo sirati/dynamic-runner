@@ -221,6 +221,7 @@ mod tests {
 
     fn complete(state: &mut ClusterState<RunnerIdentifier>, hash: &str) {
         state.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: hash.to_string(),
             result_data: None,
         });
@@ -349,6 +350,7 @@ mod tests {
             complete(&mut state, "ok-a");
             complete(&mut state, "ok-b");
             state.apply(ClusterMutation::TaskFailed {
+                attempt: 0,
                 hash: "bad".to_string(),
                 kind: ErrorType::NonRecoverable,
                 error: "boom".into(),

@@ -588,3 +588,132 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         })
         .await;
 }
+
+/// The deepest failover-completeness guard (F2): a retry reset
+/// (`Failed { attempt: n } → Pending { attempt: n+1 }`) MUST survive a
+/// `restore()` of a peer snapshot still holding the stale
+/// `Failed { attempt: n }`.
+///
+/// Pre-fix, the retry-bucket reinjected a failed task into the LOCAL pool
+/// but emitted NO CRDT mutation, so the ledger stayed `Failed`; even a
+/// naive new `Failed → Pending` apply-arm would NOT survive anti-entropy,
+/// because `restore` routes every task through the band-first join and
+/// `Failed` (Terminal band) out-ranks `Pending` (NonTerminal band) BEFORE
+/// version is consulted — the reset would be reverted to `Failed` on every
+/// heal, orphaning the in-flight retry = lost work. Option (i) puts the
+/// per-task `attempt` generation at the TOP of the join key (above band),
+/// so the attempt-(n+1) `Pending` dominates the attempt-n `Failed` across
+/// EVERY merge path including restore/anti-entropy.
+///
+/// NEGATIVE-CONTROL CONFIRMATION: this test FAILS against a naive
+/// no-attempt arm (where the reset would be `Pending { attempt: 0 }`
+/// against `Failed { attempt: 0 }` — equal attempt, so band dominates and
+/// the restore reverts to `Failed`), and PASSES under the attempt-at-top
+/// design (the load-bearing step-5 assertion below). It was confirmed
+/// fail-naive by temporarily neutralizing the attempt-ordering (forcing
+/// the reset attempt to 0): step 5 then reverts to `Failed` as predicted.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_reset_survives_anti_entropy_heal() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // --- Build primary P1 and seed one task hash H as
+            // Failed { attempt: 0 } (TaskAdded then TaskFailed Recoverable). ---
+            let (transport, _ends) = setup_test(1);
+            let (mut p1, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let task = make_binary("h", 100);
+            let h = compute_task_hash(&task);
+            let cs = p1.cluster_state_mut_for_test();
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: h.clone(),
+                task,
+            });
+            cs.apply(ClusterMutation::TaskFailed {
+                hash: h.clone(),
+                kind: dynrunner_core::ErrorType::Recoverable,
+                error: "transient".into(),
+                version: Default::default(),
+                attempt: 0,
+            });
+            assert_eq!(
+                p1.cluster_state_for_test().task_state(&h).unwrap().attempt(),
+                0,
+                "seed: H is at the cold generation"
+            );
+
+            // --- Capture the stale peer view (P2's snapshot before the
+            // reset reaches it: H is still Failed { attempt: 0 }). ---
+            let stale = p1.cluster_state_for_test().snapshot();
+
+            // --- Originate the retry reset on P1: TaskRetried bumps
+            // attempt 0 → 1 and crosses Failed → Pending. ---
+            p1.cluster_state_mut_for_test()
+                .apply(ClusterMutation::TaskRetried {
+                    hash: h.clone(),
+                    attempt: 1,
+                    version: Default::default(),
+                });
+            {
+                let st = p1.cluster_state_for_test().task_state(&h).unwrap();
+                assert!(
+                    matches!(st, crate::cluster_state::TaskState::Pending { .. }),
+                    "after TaskRetried, H is Pending"
+                );
+                assert_eq!(st.attempt(), 1, "the reset minted the next generation");
+            }
+
+            // --- Heal: P1 restores the STALE peer snapshot (models the
+            // anti-entropy pull of P2's view INTO P1 — both sides are
+            // detected behind because the tasks_hash diverges). ---
+            p1.cluster_state_mut_for_test().restore(stale.clone());
+
+            // --- THE load-bearing assertion: the attempt-1 Pending
+            // out-ranks the attempt-0 Failed across the band boundary, so
+            // restore's merge does NOT revert the reset. ---
+            {
+                let st = p1.cluster_state_for_test().task_state(&h).unwrap();
+                assert!(
+                    matches!(st, crate::cluster_state::TaskState::Pending { .. }),
+                    "the retry reset SURVIVES the stale-Failed restore \
+                     (attempt dominates band) — a naive no-attempt arm \
+                     would revert to Failed here"
+                );
+                assert_eq!(st.attempt(), 1, "H stays at the reset generation");
+            }
+
+            // --- Symmetric direction: a fresh P2 holding the stale
+            // Failed { attempt: 0 } restores P1's reset snapshot and must
+            // ALSO converge to Pending { attempt: 1 }. ---
+            let reset_snap = p1.cluster_state_for_test().snapshot();
+            let (transport2, _ends2) = setup_test(1);
+            let (mut p2, _mesh2) = build_test_primary(
+                test_primary_config(),
+                transport2,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // P2 starts from the stale Failed view, then heals from P1.
+            p2.cluster_state_mut_for_test().restore(stale);
+            assert_eq!(
+                p2.cluster_state_for_test().task_state(&h).unwrap().attempt(),
+                0,
+                "P2 begins at the stale generation"
+            );
+            p2.cluster_state_mut_for_test().restore(reset_snap);
+            {
+                let st = p2.cluster_state_for_test().task_state(&h).unwrap();
+                assert!(
+                    matches!(st, crate::cluster_state::TaskState::Pending { .. }),
+                    "P2 converges to the reset (attempt dominates)"
+                );
+                assert_eq!(st.attempt(), 1, "both replicas converge to Pending{{1}}");
+            }
+        })
+        .await;
+}

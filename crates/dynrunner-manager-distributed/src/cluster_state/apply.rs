@@ -82,6 +82,8 @@ impl<I: Identifier> ClusterState<I> {
                     e.insert(TaskState::Pending {
                         task,
                         version: Default::default(),
+                        // Brand-new task: the cold generation (F2).
+                        attempt: 0,
                     });
                     ApplyOutcome::Applied
                 } else {
@@ -93,6 +95,7 @@ impl<I: Identifier> ClusterState<I> {
                 secondary,
                 worker,
                 version,
+                attempt,
             } => {
                 // The arm owns the mutation→state translation (its
                 // legitimate concern): the assignment carries no TaskInfo,
@@ -100,7 +103,12 @@ impl<I: Identifier> ClusterState<I> {
                 // task. The join then decides whether it wins — under C3 a
                 // stale (pre-reset) assignment LOSES to a higher-version
                 // requeue/reinject reset within the non-terminal band, so
-                // a dead-secondary assignment is never resurrected.
+                // a dead-secondary assignment is never resurrected. The
+                // `attempt` (F2, stamped at the choke point from the task's
+                // CURRENT generation) is the TOP of the join key, so an
+                // assignment for the retried generation out-ranks the
+                // `TaskRetried` reset and a stale lower-attempt assignment
+                // loses.
                 let Some(state) = self.tasks.get(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
@@ -110,10 +118,15 @@ impl<I: Identifier> ClusterState<I> {
                     secondary,
                     worker,
                     version,
+                    attempt,
                 };
                 self.apply_merge(&hash, incoming, None, resumed)
             }
-            ClusterMutation::TaskCompleted { hash, result_data } => {
+            ClusterMutation::TaskCompleted {
+                hash,
+                result_data,
+                attempt,
+            } => {
                 // The arm owns the mutation→state translation: the
                 // completion carries no TaskInfo, so the candidate
                 // `Completed` reuses the local entry's task. The join then
@@ -123,13 +136,15 @@ impl<I: Identifier> ClusterState<I> {
                 // unique TOP), which preserves the InvalidTask lockout. The
                 // retry-success supersession (`Failed → Completed`) and the
                 // newly-completed side-effects (output cache, auto-resume,
-                // event) are all owned by `merge_task_state`.
+                // event) are all owned by `merge_task_state`. The `attempt`
+                // (F2) is carried onto the `Completed` so the completion
+                // preserves the generation it completed under.
                 let Some(state) = self.tasks.get(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
                 let task = state.task().clone();
                 let outputs = Self::decode_done_payload_outputs(result_data);
-                let incoming = TaskState::Completed { task };
+                let incoming = TaskState::Completed { task, attempt };
                 self.apply_merge(&hash, incoming, outputs, resumed)
             }
             ClusterMutation::TaskFailed {
@@ -137,6 +152,7 @@ impl<I: Identifier> ClusterState<I> {
                 kind,
                 error,
                 version,
+                attempt,
             } => {
                 // The arm owns the mutation→state translation (error class
                 // → discrete variant); the join owns the supersede
@@ -163,18 +179,21 @@ impl<I: Identifier> ClusterState<I> {
                         reason: reason.to_string(),
                         last_error: error,
                         version,
+                        attempt,
                     },
                     ErrorType::InvalidTask { reason } => TaskState::InvalidTask {
                         task,
                         reason: reason.to_string(),
                         last_error: error,
                         version,
+                        attempt,
                     },
                     other => TaskState::Failed {
                         task,
                         kind: other,
                         last_error: error,
                         version,
+                        attempt,
                     },
                 };
                 self.apply_merge(&hash, incoming, None, resumed)
@@ -297,11 +316,20 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    TaskState::Unfulfillable { task, .. } => task.clone(),
+                // Preserve the source attempt (F2): a reinject is a
+                // within-generation rank-DROP, not a new retry attempt, so
+                // the attempt is unchanged — the same generation continues
+                // (mirrors `TaskRequeued`). `attempt` is read BEFORE the
+                // `task.clone()` move so both come off the same borrow.
+                let (task, attempt) = match state {
+                    TaskState::Unfulfillable { task, attempt, .. } => (task.clone(), *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending { task, version };
+                *state = TaskState::Pending {
+                    task,
+                    version,
+                    attempt,
+                };
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskRequeued { hash, version } => {
@@ -328,11 +356,58 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                let task = match state {
-                    TaskState::InFlight { task, .. } => task.clone(),
+                // Preserve the source attempt (F2): a requeue is a
+                // within-generation rank-DROP (the C3 non-regression note
+                // pins this — a requeue does NOT bump attempt; the same
+                // dispatch generation re-dispatches, so version still
+                // arbitrates a redelivered stale `TaskAssigned`).
+                let (task, attempt) = match state {
+                    TaskState::InFlight { task, attempt, .. } => (task.clone(), *attempt),
                     _ => return ApplyOutcome::NoOp,
                 };
-                *state = TaskState::Pending { task, version };
+                *state = TaskState::Pending {
+                    task,
+                    version,
+                    attempt,
+                };
+                ApplyOutcome::Applied
+            }
+            // The F2 retry reset: `Failed { attempt: n } → Pending {
+            // attempt: n+1 }`. Sibling to `TaskRequeued`/`TaskReinjected`
+            // (an authoritative rank-DROP that does NOT route through the
+            // monotone `merge_task_state` join — a dominance comparator
+            // would reject a band-crossing drop). The F2-β gate is
+            // `Failed`-ONLY: any other source state is a NoOp, so the reset
+            // cannot resurrect a `Completed`/`InvalidTask`/`Unfulfillable`/
+            // `InFlight`/`Pending`/`Blocked` task, and re-application is
+            // silent (the source is no longer `Failed`). The `attempt` was
+            // computed by the originator (`old.attempt + 1`, via the
+            // `Failed`-only read-side gate); the apply rule trusts it and
+            // writes it onto the new `Pending`. The bumped `attempt` is the
+            // TOP of the join key, so this reset out-ranks the prior
+            // `Failed { attempt: n }` across EVERY merge path including
+            // `restore`/anti-entropy — the orphan-revert the naive (no-
+            // attempt) `Failed → Pending` arm suffers is structurally
+            // impossible. The stamped `version` rides onto the `Pending`
+            // too so a late stale assignment within the new generation
+            // cannot resurrect (C3, preserved one level down).
+            ClusterMutation::TaskRetried {
+                hash,
+                attempt,
+                version,
+            } => {
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let task = match state {
+                    TaskState::Failed { task, .. } => task.clone(),
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::Pending {
+                    task,
+                    version,
+                    attempt,
+                };
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskBlocked { hash, on } => {
@@ -363,9 +438,13 @@ impl<I: Identifier> ClusterState<I> {
                         // dependent is silent either way.
                         ApplyOutcome::NoOp
                     }
-                    TaskState::Pending { task, .. } => {
+                    TaskState::Pending { task, attempt, .. } => {
+                        // Preserve the generation across the cascade-pause
+                        // (F2): a Blocked dependent re-dispatches at the
+                        // same attempt it was Pending under.
+                        let attempt = *attempt;
                         let task = task.clone();
-                        *state = TaskState::Blocked { task, on };
+                        *state = TaskState::Blocked { task, on, attempt };
                         ApplyOutcome::Applied
                     }
                 }

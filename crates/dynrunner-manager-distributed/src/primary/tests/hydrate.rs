@@ -97,6 +97,7 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
         });
         // Drive `toolchain` to terminal Completed.
         cs.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "toolchain".into(),
             result_data: None,
         });
@@ -160,6 +161,7 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
         });
         // Drive `toolchain` to terminal InvalidTask.
         cs.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "toolchain".into(),
             kind: dynrunner_core::ErrorType::InvalidTask {
                 reason: "missing upstream".to_string().into(),
@@ -231,6 +233,7 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
         });
         // Drive to InFlight on a remote secondary's worker.
         cs.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
             hash: "inflight-1".into(),
             secondary: "secondary-0".into(),
             worker: 0,
@@ -315,6 +318,7 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                     task: task.clone(),
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
                     hash: "inflight-1".into(),
                     secondary: "secondary-0".into(),
                     worker: 0,
@@ -397,6 +401,7 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                     task,
                 });
                 cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
                     hash: hash.clone(),
                     secondary: "sec-0".into(),
                     worker: 1,
@@ -517,6 +522,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                         task,
                     });
                     cs.apply(ClusterMutation::TaskAssigned {
+                        attempt: 0,
                         hash: hash.clone(),
                         secondary: "sec-dead".into(),
                         worker: 0,

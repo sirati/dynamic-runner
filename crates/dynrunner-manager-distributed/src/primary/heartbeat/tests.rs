@@ -748,6 +748,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
             task: victim.clone(),
         });
         cs.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
             hash: victim_hash.clone(),
             secondary: "dead-sec".into(),
             worker: 0,

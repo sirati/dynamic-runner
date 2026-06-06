@@ -77,11 +77,29 @@ pub enum ClusterMutation<I> {
         /// the `(0, 0)` strict minimum for a legacy sender.
         #[serde(default)]
         version: TaskVersion,
+        /// Primary-stamped retry-attempt generation (F2). Stamped at the
+        /// SAME origination choke point that stamps `version`, reading the
+        /// task's CURRENT attempt from the ledger; the receiver writes it
+        /// onto the resulting `InFlight` so a worker outcome for the
+        /// retried generation out-ranks the `TaskRetried` reset, and a
+        /// stale assignment for a lower attempt LOSES. `#[serde(default)]`
+        /// decodes a legacy sender's frame to attempt-0 (the cold
+        /// generation).
+        #[serde(default)]
+        attempt: u32,
     },
     TaskCompleted {
         hash: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_data: Option<Vec<u8>>,
+        /// Primary-stamped retry-attempt generation (F2). Stamped at the
+        /// origination choke point (reads the task's current attempt); the
+        /// receiver writes it onto the resulting `Completed` so a late
+        /// stale outcome for a lower attempt cannot resurrect a higher-
+        /// generation reset. `#[serde(default)]` decodes a legacy sender's
+        /// frame to attempt-0.
+        #[serde(default)]
+        attempt: u32,
     },
     TaskFailed {
         hash: String,
@@ -93,6 +111,14 @@ pub enum ClusterMutation<I> {
         /// settles an equal-version divergence). Defaults to `(0, 0)`.
         #[serde(default)]
         version: TaskVersion,
+        /// Primary-stamped retry-attempt generation (F2). Stamped at the
+        /// origination choke point (reads the task's current attempt); the
+        /// receiver writes it onto the resulting `Failed` so the retry
+        /// originator reads the current generation to mint the next reset.
+        /// `#[serde(default)]` decodes a legacy sender's frame to
+        /// attempt-0.
+        #[serde(default)]
+        attempt: u32,
     },
     PrimaryChanged {
         new: String,
@@ -219,6 +245,53 @@ pub enum ClusterMutation<I> {
         /// supersedes the pre-reset `InFlight` and a redelivered stale
         /// `TaskAssigned` cannot resurrect the dead-secondary assignment.
         /// Defaults to `(0, 0)`.
+        #[serde(default)]
+        version: TaskVersion,
+    },
+    /// Per-phase retry reinjection: the primary's retry-bucket decided a
+    /// `TaskState::Failed { attempt: n }` task gets one more attempt, so it
+    /// transitions the ledger `Failed → Pending { attempt: n+1 }`.
+    ///
+    /// Distinct from [`Self::TaskRequeued`] (`InFlight → Pending`, dead-
+    /// secondary recovery) and [`Self::TaskReinjected`] (`Unfulfillable →
+    /// Pending`, external-control resolution): this is the per-phase retry
+    /// budget reinjecting a genuinely-FAILED task, a different source state
+    /// and a different concern. It is the ONLY band-crossing reset that
+    /// BUMPS the per-task `attempt` (F2): the reset crosses the
+    /// terminal→non-terminal band, where `version` is the wrong arbiter
+    /// (band dominates version in the join), so the higher `attempt` — the
+    /// TOP of the join key — is what makes the reset survive anti-entropy.
+    /// Without the bump, a peer holding the stale `Failed { attempt: n }`
+    /// would revert the reset on every `restore`/anti-entropy heal (band
+    /// dominates), orphaning the in-flight retry = lost work.
+    ///
+    /// `attempt` is computed by the ORIGINATOR (it reads the current
+    /// `Failed { attempt: n }` via the `Failed`-only F2-β gate and emits
+    /// `attempt: n+1`); the apply rule trusts it. `version` is stamped at
+    /// the origination choke point like the other reset variants.
+    ///
+    /// Apply gates `Failed`-only (mirrors `TaskReinjected`'s
+    /// `Unfulfillable`-only gate): a reset cannot resurrect a `Completed` /
+    /// `InvalidTask` / `Unfulfillable` / `InFlight` / `Pending` /
+    /// `Blocked` task. Re-application is a NoOp (the source is no longer
+    /// `Failed`). The preserved `TaskInfo` is moved into the new `Pending`
+    /// so the retry re-dispatches the same binary.
+    TaskRetried {
+        hash: String,
+        /// Originator-computed retry-attempt generation (F2): `n+1` where
+        /// `n` is the current `Failed { attempt: n }`'s generation. The TOP
+        /// of the per-task join key, so the reset dominates the prior
+        /// `Failed` across every merge path. NOT version-stamped (it is the
+        /// originator's read-derived generation, not a minted monotone-per-
+        /// hash counter). `#[serde(default)]` decodes a legacy sender's
+        /// frame to attempt-0.
+        #[serde(default)]
+        attempt: u32,
+        /// Primary-stamped reset version (D-V / C3). A retry reset is an
+        /// authoritative rank-DROP (`Failed → Pending`); the stamped
+        /// version is written onto the resulting `Pending` so it strictly
+        /// supersedes within the new attempt generation too. Defaults to
+        /// `(0, 0)`.
         #[serde(default)]
         version: TaskVersion,
     },

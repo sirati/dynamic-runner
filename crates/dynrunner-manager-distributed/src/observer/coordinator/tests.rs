@@ -66,6 +66,7 @@ fn add(state: &mut ClusterState<TestId>, t: &TaskInfo<TestId>) {
 
 fn complete(state: &mut ClusterState<TestId>, hash: &str) {
     state.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: hash.to_string(),
         result_data: None,
     });
@@ -342,6 +343,7 @@ async fn observer_narrates_phases_and_one_completion_summary() {
             complete(&mut cs, "toolchain");
             complete(&mut cs, "ok");
             cs.apply(ClusterMutation::TaskFailed {
+                attempt: 0,
                 hash: "bad".to_string(),
                 kind: ErrorType::NonRecoverable,
                 error: "boom".into(),
@@ -845,6 +847,7 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::TaskCompleted {
+                                attempt: 0,
                                 hash: "seed".into(),
                                 result_data: None,
                             }],
@@ -1031,6 +1034,7 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                             sender_id: "p".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::TaskCompleted {
+                                attempt: 0,
                                 hash: "x".into(),
                                 result_data: None,
                             }],

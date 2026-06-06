@@ -81,6 +81,7 @@ async fn peer_departure_does_not_touch_task_ledger() {
         task: mk_task("b"),
     });
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h-inflight".into(),
         secondary: "departing".into(),
         worker: 0,

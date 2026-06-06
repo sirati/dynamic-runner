@@ -256,6 +256,7 @@ async fn reinject_task_budget_exhaustion() {
             coordinator
                 .cluster_state
                 .apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: ErrorType::Unfulfillable {
                         reason: "missing toolchain".to_string().into(),
@@ -293,6 +294,7 @@ async fn reinject_task_budget_exhaustion() {
             coordinator
                 .cluster_state
                 .apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: ErrorType::Unfulfillable {
                         reason: "still missing".to_string().into(),
@@ -619,6 +621,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             // so the resumed-dispatch plumbing fires.
             coordinator
                 .apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
+                    attempt: 0,
                     hash: prereq_hash.clone(),
                     result_data: None,
                 }])
@@ -1001,6 +1004,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
             coordinator
                 .cluster_state
                 .apply(ClusterMutation::TaskCompleted {
+                    attempt: 0,
                     hash: b_hash.clone(),
                     result_data: None,
                 });
@@ -1058,6 +1062,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
             coordinator
                 .cluster_state
                 .apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: b_hash.clone(),
                     kind: ErrorType::Unfulfillable {
                         reason: "missing toolchain".to_string().into(),
@@ -1191,6 +1196,7 @@ async fn spawn_tasks_runtime_duplicate_invalidates_all_pending_run_wide() {
             coordinator
                 .cluster_state
                 .apply(ClusterMutation::TaskCompleted {
+                    attempt: 0,
                     hash: done_hash.clone(),
                     result_data: None,
                 });

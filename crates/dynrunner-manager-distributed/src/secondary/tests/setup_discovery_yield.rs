@@ -298,6 +298,7 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
             for bin in &binaries {
                 let key = dynrunner_core::compute_task_hash(bin);
                 sec.cluster_state.apply(ClusterMutation::<_>::TaskAssigned {
+                    attempt: 0,
                     hash: key.clone(),
                     secondary: "sec-promoted".into(),
                     worker: 0u32,
@@ -305,6 +306,7 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
                 });
                 sec.cluster_state
                     .apply(ClusterMutation::<_>::TaskCompleted {
+                        attempt: 0,
                         hash: key,
                         result_data: None,
                     });

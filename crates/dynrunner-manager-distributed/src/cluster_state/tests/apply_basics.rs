@@ -43,6 +43,7 @@ fn assigned_late_after_completed_is_noop() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h".into(),
             result_data: None
         }),
@@ -50,6 +51,7 @@ fn assigned_late_after_completed_is_noop() {
     );
     assert_eq!(
         s.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
             hash: "h".into(),
             secondary: "s1".into(),
             worker: 0,
@@ -71,11 +73,13 @@ fn duplicate_completed_is_noop() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h".into(),
             result_data: None
         }),
@@ -102,6 +106,7 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
@@ -109,6 +114,7 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h".into(),
             result_data: None
         }),
@@ -138,11 +144,13 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::Recoverable,
             error: "late".into(),
@@ -174,6 +182,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
             task: mk_task(hash),
         });
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: hash.into(),
             result_data: None,
         });
@@ -184,6 +193,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         task: mk_task("c"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "c".into(),
         kind: ErrorType::Recoverable,
         error: "x".into(),
@@ -195,6 +205,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         task: mk_task("d"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "d".into(),
         kind: ErrorType::ResourceExhausted("memory".into()),
         error: "oom".into(),
@@ -206,6 +217,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         task: mk_task("e"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "e".into(),
         kind: ErrorType::ResourceExhausted("disk".into()),
         error: "no space".into(),
@@ -217,6 +229,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
         task: mk_task("f"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
@@ -253,6 +266,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
         task: mk_task("ok"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "ok".into(),
         result_data: None,
     });
@@ -261,6 +275,7 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
         task: mk_task("bad"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "bad".into(),
         kind: ErrorType::InvalidTask {
             reason: "missing dep".to_string().into(),
@@ -311,6 +326,7 @@ fn higher_version_refailure_supersedes() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "first".into(),
@@ -323,6 +339,7 @@ fn higher_version_refailure_supersedes() {
     // cadence the collector's repeat-count relies on, B1).
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
@@ -356,6 +373,7 @@ fn higher_version_refailure_supersedes() {
     // per-delivery double-count is fixed).
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
@@ -469,6 +487,7 @@ fn iter_pending_only_returns_pending() {
         task: mk_task("i"),
     });
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "i".into(),
         secondary: "s".into(),
         worker: 0,
@@ -479,6 +498,7 @@ fn iter_pending_only_returns_pending() {
         task: mk_task("c"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
@@ -505,12 +525,14 @@ fn convergence_completed_can_race_assigned() {
         task: mk_task("a"),
     };
     let assigned = ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
         version: Default::default(),
     };
     let completed: ClusterMutation<RunnerIdentifier> = ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     };
@@ -550,16 +572,19 @@ fn convergence_under_duplicates() {
             task: mk_task("h2"),
         },
         ClusterMutation::TaskAssigned {
+            attempt: 0,
             hash: "h1".into(),
             secondary: "s".into(),
             worker: 0,
             version: Default::default(),
         },
         ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h1".into(),
             result_data: None,
         },
         ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h2".into(),
             kind: ErrorType::Recoverable,
             error: "boom".into(),

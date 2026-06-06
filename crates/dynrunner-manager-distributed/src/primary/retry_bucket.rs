@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use dynrunner_core::{
     ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo,
 };
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -119,12 +120,16 @@ pub(crate) type RetryPassesUsed = HashMap<(PhaseId, BucketKind), u32>;
 ///   * Drive the post-reinject kickstart of idle workers (the two
 ///     paths have different worker-fan-out helpers).
 ///
-/// Returns `true` iff at least one binary was reinjected — the
-/// caller uses this to skip `on_phase_end` + `mark_phase_done` for
-/// this phase (the pool just flipped `Drained → Active` via
-/// `PendingPool::reinject` and the next `poll_drain_transitions`
-/// will be empty for this phase until the freshly-active items
-/// terminate).
+/// Returns the hashes of every reinjected binary (empty iff nothing
+/// was reinjected). The caller maps `!is_empty()` to the "skip
+/// `on_phase_end` + `mark_phase_done`" decision (the pool just flipped
+/// `Drained → Active` via `PendingPool::reinject` and the next
+/// `poll_drain_transitions` will be empty for this phase until the
+/// freshly-active items terminate). The hashes let the async caller
+/// originate the authoritative CRDT retry reset (`TaskRetried`) per
+/// reinjected task so the converged ledger moves `Failed { attempt: n }
+/// → Pending { attempt: n+1 }` and SURVIVES anti-entropy (F2) — the
+/// pure core stays CRDT-agnostic, surfacing only the hashes.
 pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     phase: &PhaseId,
     kind: BucketKind,
@@ -133,7 +138,7 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     retry_passes_used: &mut RetryPassesUsed,
     max_passes: u32,
     mut on_remove_from_failed: impl FnMut(&str),
-) -> bool {
+) -> Vec<String> {
     if candidates.is_empty() {
         // No failures of this kind for this phase. Caller moves
         // on. We intentionally do NOT touch the counter here:
@@ -141,7 +146,7 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
         // re-arrival of a failure (e.g. the cascade triggered
         // by an `apply_fail_permanent` cross-cut) should still
         // get a fresh budget if the counter was at 0.
-        return false;
+        return Vec::new();
     }
 
     let key = (phase.clone(), kind);
@@ -159,14 +164,16 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
             pending_failures = candidates.len(),
             "per-phase retry bucket: budget exhausted; failures permanent"
         );
-        return false;
+        return Vec::new();
     }
 
     let count = candidates.len();
+    let mut reinjected_hashes = Vec::with_capacity(count);
     for binary in candidates {
         let h = compute_task_hash(&binary);
         on_remove_from_failed(&h);
         pool.reinject(binary);
+        reinjected_hashes.push(h);
     }
 
     // Bump counter BEFORE the caller's kickstart so a kickstart-
@@ -192,7 +199,7 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
         "per-phase retry bucket: re-injecting failed tasks"
     );
 
-    true
+    reinjected_hashes
 }
 
 impl<S, E, I> PrimaryCoordinator<S, E, I>
@@ -301,7 +308,44 @@ where
                 },
             )
         };
-        if reinjected {
+        if !reinjected.is_empty() {
+            // Originate the authoritative CRDT retry reset for each
+            // reinjected hash so the converged ledger moves
+            // `Failed { attempt: n } → Pending { attempt: n+1 }` and
+            // SURVIVES anti-entropy (F2). The pure core only flipped the
+            // LOCAL pool + `failed_tasks`; without this the redispatch's
+            // `TaskAssigned → InFlight` NoOps against the still-`Failed`
+            // ledger (band dominates) and the work is lost on failover.
+            // The bumped `attempt` is the TOP of the join key, so the
+            // reset out-ranks the prior `Failed` across every merge path.
+            //
+            // The reset is gated `Failed`-only via `attempt_if_failed`
+            // (F2-β): at this point the task is still `Failed { attempt:
+            // n }` in the ledger (the core touched only the local pool,
+            // not the CRDT), so the read yields `Some(n)` and we mint
+            // `n+1`. A hash whose ledger state is no longer `Failed`
+            // (a racing terminal) yields `None` and originates nothing —
+            // a reset can never resurrect a non-`Failed` task. `version`
+            // is stamped at the origination choke point like the other
+            // reset variants. The originator lives HERE (the already-async
+            // caller), never in the pure CRDT-agnostic core, mirroring
+            // `apply_reinject_task`'s `TaskReinjected` origination.
+            let mut resets = Vec::with_capacity(reinjected.len());
+            for hash in &reinjected {
+                if let Some(n) = self
+                    .cluster_state
+                    .task_state(hash)
+                    .and_then(|s| s.attempt_if_failed())
+                {
+                    resets.push(ClusterMutation::TaskRetried {
+                        hash: hash.clone(),
+                        attempt: n + 1,
+                        version: Default::default(),
+                    });
+                }
+            }
+            self.apply_and_broadcast_cluster_mutations(resets).await;
+
             // Reinjection is a pool-entry edge: the workers won't
             // request a new task on their own (they already sent their
             // last `TaskRequest` which got `nothing-to-do` because the
@@ -322,7 +366,7 @@ where
             // run unmasked.
             self.single_worker_mode = false;
         }
-        Ok(reinjected)
+        Ok(!reinjected.is_empty())
     }
 
     /// OOM-bucket dispatch-shape preprocessor: sort retries by
@@ -440,7 +484,9 @@ mod important_event_tests {
                 |_h| {},
             )
         });
-        (reinjected, capture.events())
+        // The core returns the reinjected hashes; this emit-cadence test
+        // cares only about the boolean "did anything reinject", so map it.
+        (!reinjected.is_empty(), capture.events())
     }
 
     #[test]

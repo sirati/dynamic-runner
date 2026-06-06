@@ -67,6 +67,7 @@ fn task_completed_populates_task_outputs_cache() {
     let outputs = outputs_with("nonce", "xyz");
     let bytes = encode_wire(&outputs);
     let outcome = s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(bytes),
     });
@@ -88,6 +89,7 @@ fn task_completed_with_no_result_data_does_not_populate() {
         task: mk_task("a"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
@@ -112,6 +114,7 @@ fn task_completed_malformed_result_data_stores_empty_outputs() {
     });
     let garbage: Vec<u8> = b"not-json-at-all".to_vec();
     let outcome = s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(garbage),
     });
@@ -136,6 +139,7 @@ fn task_outputs_round_trip_via_snapshot() {
     let outputs = outputs_with("nonce", "xyz");
     let bytes = encode_wire(&outputs);
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(bytes),
     });
@@ -167,6 +171,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
         task: mk_task("a"),
     });
     local.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(encode_wire(&local_outputs)),
     });
@@ -177,6 +182,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
         task: mk_task("a"),
     });
     source.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(encode_wire(&snap_outputs)),
     });
@@ -220,6 +226,7 @@ fn python_encode_full_wrapper_decodes_outputs() {
     }))
     .expect("encode python wire shape");
     let outcome = s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(wire),
     });
@@ -257,6 +264,7 @@ fn python_encode_outputs_only_decodes_outputs() {
     }))
     .expect("encode python wire shape");
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(wire),
     });
@@ -306,15 +314,18 @@ fn phase_task_outputs_gathers_only_the_named_phase() {
     let common_outputs = outputs_with("artifact_drv", "/nix/store/abc");
     let dep_outputs = outputs_with("dependency_graph_pkl", "BASE64PICKLE");
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h_common".into(),
         result_data: Some(encode_wire(&common_outputs)),
     });
     // `variant` completes with NO published outputs.
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h_variant".into(),
         result_data: None,
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h_dep".into(),
         result_data: Some(encode_wire(&dep_outputs)),
     });
@@ -361,6 +372,7 @@ fn python_encode_counters_only_populates_empty_cache() {
     }))
     .expect("encode python wire shape");
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: Some(wire),
     });

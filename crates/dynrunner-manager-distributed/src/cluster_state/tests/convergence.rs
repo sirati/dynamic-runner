@@ -27,6 +27,7 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         (
             "pending",
             TaskState::Pending {
+                attempt: 0,
                 task: t(),
                 version: v(1),
             },
@@ -34,6 +35,7 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         (
             "inflight",
             TaskState::InFlight {
+                attempt: 0,
                 task: t(),
                 secondary: "s".into(),
                 worker: 0,
@@ -43,14 +45,16 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         (
             "blocked",
             TaskState::Blocked {
+                attempt: 0,
                 task: t(),
                 on: "p".into(),
             },
         ),
-        ("completed", TaskState::Completed { task: t() }),
+        ("completed", TaskState::Completed { task: t(), attempt: 0 }),
         (
             "failed",
             TaskState::Failed {
+                attempt: 0,
                 task: t(),
                 kind: ErrorType::Recoverable,
                 last_error: "e".into(),
@@ -60,6 +64,7 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         (
             "unfulfillable",
             TaskState::Unfulfillable {
+                attempt: 0,
                 task: t(),
                 reason: "r".into(),
                 last_error: "e".into(),
@@ -69,6 +74,7 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
         (
             "invalid",
             TaskState::InvalidTask {
+                attempt: 0,
                 task: t(),
                 reason: "r".into(),
                 last_error: "e".into(),
@@ -152,8 +158,9 @@ fn dominance_is_strict_and_antisymmetric() {
 #[test]
 fn completed_vs_invalidtask_invalidtask_wins() {
     // Merge-level: both orders → InvalidTask.
-    let completed = TaskState::Completed { task: mk_task("x") };
+    let completed = TaskState::Completed { task: mk_task("x"), attempt: 0 };
     let invalid = TaskState::InvalidTask {
+        attempt: 0,
         task: mk_task("x"),
         reason: "dup".into(),
         last_error: "invalid_task:dup".into(),
@@ -169,11 +176,13 @@ fn completed_vs_invalidtask_invalidtask_wins() {
         task: mk_task("x"),
     });
     a.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
     assert_eq!(
         a.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::InvalidTask {
                 reason: "dup".to_string().into(),
@@ -197,6 +206,7 @@ fn completed_vs_invalidtask_invalidtask_wins() {
         task: mk_task("x"),
     });
     b.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::InvalidTask {
             reason: "dup".to_string().into(),
@@ -206,6 +216,7 @@ fn completed_vs_invalidtask_invalidtask_wins() {
     });
     assert_eq!(
         b.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h".into(),
             result_data: None,
         }),
@@ -223,14 +234,16 @@ fn completed_vs_invalidtask_invalidtask_wins() {
 /// failure-likes; InvalidTask dominates Completed).
 #[test]
 fn terminal_total_order_holds() {
-    let completed = TaskState::Completed { task: mk_task("x") };
+    let completed = TaskState::Completed { task: mk_task("x"), attempt: 0 };
     let failed = TaskState::Failed {
+        attempt: 0,
         task: mk_task("x"),
         kind: ErrorType::Recoverable,
         last_error: "e".into(),
         version: Default::default(),
     };
     let unful = TaskState::Unfulfillable {
+        attempt: 0,
         task: mk_task("x"),
         reason: "r".into(),
         last_error: "e".into(),
@@ -261,6 +274,7 @@ fn terminal_total_order_holds() {
 fn failedlike_version_arbitrates_before_discriminant() {
     let task = mk_task("x");
     let unful_s1 = TaskState::Unfulfillable {
+        attempt: 0,
         task: task.clone(),
         reason: "no-toolchain".into(),
         last_error: "unfulfillable".into(),
@@ -270,6 +284,7 @@ fn failedlike_version_arbitrates_before_discriminant() {
         },
     };
     let failed_s2 = TaskState::Failed {
+        attempt: 0,
         task: task.clone(),
         kind: ErrorType::NonRecoverable,
         last_error: "boom".into(),
@@ -318,6 +333,7 @@ fn failedlike_version_arbitrates_before_discriminant() {
     // `Unfulfillable` is the deterministic winner — and an incoming generic
     // `Failed` at equal version is a NoOp against a local `Unfulfillable`.
     let failed_s1 = TaskState::Failed {
+        attempt: 0,
         task: task.clone(),
         kind: ErrorType::NonRecoverable,
         last_error: "boom".into(),
@@ -355,6 +371,7 @@ fn failedlike_version_arbitrates_before_discriminant() {
 fn stale_assignment_after_requeue_does_not_resurrect() {
     let task = mk_task("x");
     let pending_v0 = TaskState::Pending {
+        attempt: 0,
         task: task.clone(),
         version: TaskVersion {
             primary_epoch: 1,
@@ -362,6 +379,7 @@ fn stale_assignment_after_requeue_does_not_resurrect() {
         },
     };
     let inflight_v1 = TaskState::InFlight {
+        attempt: 0,
         task: task.clone(),
         secondary: "dead-sec".into(),
         worker: 0,
@@ -371,6 +389,7 @@ fn stale_assignment_after_requeue_does_not_resurrect() {
         },
     };
     let reset_pending_v2 = TaskState::Pending {
+        attempt: 0,
         task: task.clone(),
         version: TaskVersion {
             primary_epoch: 1,
@@ -378,6 +397,7 @@ fn stale_assignment_after_requeue_does_not_resurrect() {
         },
     };
     let reassign_inflight_v3 = TaskState::InFlight {
+        attempt: 0,
         task: task.clone(),
         secondary: "live-sec".into(),
         worker: 1,
@@ -431,6 +451,7 @@ async fn refailure_higher_version_emits_same_version_noops() {
     });
     // First failure at v1 — emits.
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::Recoverable,
         error: "first".into(),
@@ -443,6 +464,7 @@ async fn refailure_higher_version_emits_same_version_noops() {
     // Higher-version re-failure — WINS, emits again.
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
@@ -463,6 +485,7 @@ async fn refailure_higher_version_emits_same_version_noops() {
     // Same-version re-delivery — NoOp, no emit.
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "second".into(),
@@ -494,6 +517,7 @@ fn failure_record_divergence_detected() {
             task: mk_task("x"),
         });
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind,
             error: err.into(),
@@ -550,6 +574,7 @@ fn last_error_survives_restore_for_all_terminals() {
             task: mk_task(h),
         });
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: h.into(),
             kind,
             error: msg.into(),
@@ -583,6 +608,7 @@ fn apply_restore_digest_agree() {
         });
     }
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "b".into(),
         secondary: "s".into(),
         worker: 0,
@@ -592,10 +618,12 @@ fn apply_restore_digest_agree() {
         },
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "d".into(),
         kind: ErrorType::NonRecoverable,
         error: "boom".into(),
@@ -625,6 +653,7 @@ fn restore_supersedes_failed_with_completed() {
         task: mk_task("prereq"),
     });
     src.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "prereq".into(),
         result_data: None,
     });
@@ -637,6 +666,7 @@ fn restore_supersedes_failed_with_completed() {
         task: mk_task("prereq"),
     });
     local.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "prereq".into(),
         kind: ErrorType::Recoverable,
         error: "transient".into(),
@@ -683,6 +713,7 @@ async fn re_restore_is_idempotent_and_emits_once() {
         task: mk_task("c"),
     });
     src.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
@@ -691,6 +722,7 @@ async fn re_restore_is_idempotent_and_emits_once() {
         task: mk_task("f"),
     });
     src.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "boom".into(),
@@ -734,6 +766,7 @@ fn n_responder_union_order_independent() {
         });
         if terminal {
             s.apply(ClusterMutation::TaskCompleted {
+                attempt: 0,
                 hash: h.into(),
                 result_data: None,
             });
@@ -807,14 +840,17 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
             });
         }
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "c1".into(),
             result_data: None,
         });
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "c2".into(),
             result_data: None,
         });
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "f1".into(),
             kind: ErrorType::NonRecoverable,
             error: "genuine-failure".into(),
@@ -830,10 +866,12 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
     let mut primary = ClusterState::<RunnerIdentifier>::new();
     add_agreed(&mut primary);
     primary.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "d1".into(),
         result_data: None,
     });
     primary.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "d2".into(),
         result_data: None,
     });
@@ -845,6 +883,7 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
     let mut observer = ClusterState::<RunnerIdentifier>::new();
     add_agreed(&mut observer);
     observer.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "d1".into(),
         kind: ErrorType::Recoverable,
         error: "transient".into(),
@@ -854,6 +893,7 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
         },
     });
     observer.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "d2".into(),
         kind: ErrorType::Unfulfillable {
             reason: "no-toolchain".to_string().into(),

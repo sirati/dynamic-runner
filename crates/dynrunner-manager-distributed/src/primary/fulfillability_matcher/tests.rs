@@ -112,6 +112,7 @@ fn seed_tasks(
                 coordinator
                     .cluster_state
                     .apply(ClusterMutation::TaskFailed {
+                        attempt: 0,
                         hash: hash.clone(),
                         kind: ErrorType::Unfulfillable {
                             reason: format!("missing-resource-for-{name}").into(),
@@ -124,6 +125,7 @@ fn seed_tasks(
                 coordinator
                     .cluster_state
                     .apply(ClusterMutation::TaskFailed {
+                        attempt: 0,
                         hash: hash.clone(),
                         kind: ErrorType::NonRecoverable,
                         error: format!("nonrecoverable {name}"),
@@ -134,6 +136,7 @@ fn seed_tasks(
                 coordinator
                     .cluster_state
                     .apply(ClusterMutation::TaskCompleted {
+                        attempt: 0,
                         hash: hash.clone(),
                         result_data: None,
                     });

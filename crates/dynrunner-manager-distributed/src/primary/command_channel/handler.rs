@@ -98,7 +98,7 @@ where
         let task = match state {
             TaskState::Pending { task, .. }
             | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task }
+            | TaskState::Completed { task, .. }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
@@ -192,8 +192,11 @@ where
             hash,
             kind: error,
             error: reason,
-            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            // Both stamped at the origination choke point
+            // (apply_locally_for_broadcast): `version` minted, `attempt`
+            // read from the task's current generation (C-1).
             version: Default::default(),
+            attempt: Default::default(),
         });
         for (dep_hash, on_hash) in cascaded_blocks {
             mutations.push(ClusterMutation::TaskBlocked {
