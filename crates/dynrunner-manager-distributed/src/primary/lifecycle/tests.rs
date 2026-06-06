@@ -683,6 +683,7 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
             );
             coordinator.cluster_state.apply(
                 dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: ErrorType::Unfulfillable {
                         reason: "missing toolchain".to_string().into(),
@@ -760,6 +761,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
             );
             coordinator.cluster_state.apply(
                 dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: ErrorType::Unfulfillable {
                         reason: "missing toolchain".to_string().into(),
@@ -796,6 +798,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
             // Recoverable } via the Pending arm of TaskFailed.
             coordinator.cluster_state.apply(
                 dynrunner_protocol_primary_secondary::ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: ErrorType::Recoverable,
                     error: "transient".into(),

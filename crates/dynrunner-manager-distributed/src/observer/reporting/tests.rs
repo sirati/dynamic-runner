@@ -78,6 +78,7 @@ fn seed_state(
             Seed::Pending => {}
             Seed::InFlight { secondary, worker } => {
                 s.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
                     hash: hash.clone(),
                     secondary: secondary.to_string(),
                     worker: *worker,
@@ -86,12 +87,14 @@ fn seed_state(
             }
             Seed::Completed => {
                 s.apply(ClusterMutation::TaskCompleted {
+                    attempt: 0,
                     hash: hash.clone(),
                     result_data: None,
                 });
             }
             Seed::Failed(kind) => {
                 s.apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
                     hash: hash.clone(),
                     kind: kind.clone(),
                     error: "x".to_string(),

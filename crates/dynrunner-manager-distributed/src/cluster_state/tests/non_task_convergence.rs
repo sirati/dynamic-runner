@@ -228,10 +228,12 @@ fn task_outputs_value_divergence_detected() {
     }
     // Same key "t", DIFFERENT output values on the two replicas.
     a.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "t".into(),
         result_data: Some(done_payload(&mk_outputs("alpha"))),
     });
     b.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "t".into(),
         result_data: Some(done_payload(&mk_outputs("beta"))),
     });

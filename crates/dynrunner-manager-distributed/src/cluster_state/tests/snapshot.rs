@@ -21,6 +21,7 @@ fn snapshot_round_trip_preserves_state() {
         task: mk_task("i"),
     });
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "i".into(),
         secondary: "s1".into(),
         worker: 7,
@@ -31,6 +32,7 @@ fn snapshot_round_trip_preserves_state() {
         task: mk_task("c"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
@@ -78,6 +80,7 @@ fn snapshot_round_trip_preserves_invalid_task() {
         task: mk_task("bad"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "bad".into(),
         kind: ErrorType::InvalidTask {
             reason: "duplicate (phase,task_id)".to_string().into(),
@@ -195,6 +198,7 @@ fn restore_lattice_merge_preserves_local_terminal() {
         task: mk_task("h"),
     });
     joiner.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
@@ -205,6 +209,7 @@ fn restore_lattice_merge_preserves_local_terminal() {
         task: mk_task("h"),
     });
     peer.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h".into(),
         secondary: "s".into(),
         worker: 0,
@@ -234,6 +239,7 @@ fn restore_lattice_merge_promotes_pending_to_in_flight() {
         task: mk_task("h"),
     });
     peer.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h".into(),
         secondary: "s".into(),
         worker: 4,
@@ -285,6 +291,7 @@ fn restore_idempotent_under_double_apply() {
         task: mk_task("h"),
     });
     peer.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h".into(),
         result_data: None,
     });
@@ -308,6 +315,7 @@ fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
         task: mk_task("u"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "u".into(),
         kind: ErrorType::Unfulfillable {
             reason: "missing dep".to_string().into(),

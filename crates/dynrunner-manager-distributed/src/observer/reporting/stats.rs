@@ -236,7 +236,7 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
     match state {
         TaskState::Pending { task, .. }
         | TaskState::InFlight { task, .. }
-        | TaskState::Completed { task }
+        | TaskState::Completed { task, .. }
         | TaskState::Failed { task, .. }
         | TaskState::Unfulfillable { task, .. }
         | TaskState::Blocked { task, .. }

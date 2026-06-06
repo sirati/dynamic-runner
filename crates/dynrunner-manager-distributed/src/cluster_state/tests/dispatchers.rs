@@ -89,6 +89,7 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
     // a Pending → Completed shortcut (the apply rule covers both
     // but the in-flight path is the production shape).
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h-alpha".into(),
         secondary: "sec-1".into(),
         worker: 0,
@@ -96,6 +97,7 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h-alpha".into(),
             result_data: None,
         }),
@@ -131,6 +133,7 @@ async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
     // NonRecoverable is `"non_recoverable"`.
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h-beta".into(),
             kind: ErrorType::NonRecoverable,
             error: "disk full".into(),
@@ -171,6 +174,7 @@ async fn task_completed_listener_fires_on_unfulfillable_terminal() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h-gamma".into(),
             kind: ErrorType::Unfulfillable {
                 reason: "missing toolchain".to_owned().into(),
@@ -208,6 +212,7 @@ async fn task_completed_dedup_does_not_re_emit() {
         task: mk_task("delta"),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "h-delta".into(),
         result_data: None,
     });
@@ -216,6 +221,7 @@ async fn task_completed_dedup_does_not_re_emit() {
     rx.try_recv().expect("first TaskCompleted must emit");
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h-delta".into(),
             result_data: None,
         }),

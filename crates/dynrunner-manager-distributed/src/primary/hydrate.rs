@@ -97,7 +97,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // resolve their reference — those dependents cascade
                 // through the pool's dep machine exactly as they would
                 // against any other terminal prereq.
-                TaskState::Completed { task }
+                TaskState::Completed { task, .. }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. } => {

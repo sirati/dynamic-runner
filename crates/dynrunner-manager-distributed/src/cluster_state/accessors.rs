@@ -138,7 +138,7 @@ impl<I: Identifier> ClusterState<I> {
             let t = match s {
                 TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task }
+                | TaskState::Completed { task, .. }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
@@ -154,7 +154,7 @@ impl<I: Identifier> ClusterState<I> {
     /// prereq completes) and is excluded.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Completed { task }
+            TaskState::Completed { task, .. }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. } => Some((h, task)),
@@ -239,7 +239,7 @@ impl<I: Identifier> ClusterState<I> {
             let task = match st {
                 TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task }
+                | TaskState::Completed { task, .. }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
@@ -338,7 +338,7 @@ impl<I: Identifier> ClusterState<I> {
             let task = match s {
                 TaskState::Pending { task, .. }
                 | TaskState::InFlight { task, .. }
-                | TaskState::Completed { task }
+                | TaskState::Completed { task, .. }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
@@ -398,7 +398,7 @@ impl<I: Identifier> ClusterState<I> {
                 let task = match state {
                     TaskState::Pending { task, .. }
                     | TaskState::InFlight { task, .. }
-                    | TaskState::Completed { task }
+                    | TaskState::Completed { task, .. }
                     | TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
                     | TaskState::InvalidTask { task, .. }

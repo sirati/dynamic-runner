@@ -37,6 +37,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
     use crate::cluster_state::TaskState;
     let mut tasks = HashMap::new();
     let mk_pending = |path: &str, ident: &str| TaskState::Pending {
+        attempt: 0,
         task: TaskInfo {
             path: PathBuf::from(path),
             size: 100,

@@ -53,12 +53,27 @@ impl<I: Identifier> ClusterState<I> {
 
 /// Stamp the originator's `TaskVersion` onto every version-bearing
 /// mutation in `mutations` (the per-task `version` AND the capability
-/// `cap_version`), BEFORE the apply+filter loop (B3). The ONE choke point
-/// both originator paths route through, so a forgotten stamp at any
-/// `failed.rs`/`handler.rs`/`mutations.rs`/`coordinator.rs` origination
-/// site is impossible — those sites build the mutation with
-/// `version: Default::default()` (or `cap_version: Default::default()`)
-/// and this pass overwrites it with the minted version.
+/// `cap_version`) AND the per-task retry `attempt` onto the three
+/// COPY-CURRENT variants (F2 / C-1), BEFORE the apply+filter loop (B3).
+/// The ONE choke point both originator paths route through, so a
+/// forgotten stamp at any `failed.rs`/`handler.rs`/`mutations.rs`/
+/// `coordinator.rs` origination site is impossible — those sites build
+/// the mutation with `version: Default::default()` (or `cap_version:
+/// Default::default()`, or `attempt: 0`) and this pass overwrites it.
+///
+/// Attempt-stamping at the choke point (C-1, NOT per-origination-site):
+/// `TaskAssigned`/`TaskCompleted`/`TaskFailed` are COPY-CURRENT — they
+/// build a candidate state from the task's existing ledger entry — so the
+/// choke point stamps each with the task's CURRENT `attempt` (read via
+/// `task_state(hash).attempt()`, EXACTLY as `version` is stamped via
+/// `next_task_version`). At broadcast time the task is already at
+/// `attempt: n+1` if a `TaskRetried` reset applied earlier, so the copy-
+/// current variants pick it up automatically. Stamping it here — instead
+/// of at each of the N origination sites — keeps the logic in ONE place
+/// and makes a missed-site `attempt:0`-for-a-retried-task hazard (which
+/// would lose the join and reintroduce the lost work) impossible. ONLY
+/// `TaskRetried` (the n→n+1 INCREMENT, not a copy) carries an originator-
+/// computed `attempt` and is NOT attempt-stamped here.
 ///
 /// Compile guard (B3): the match is EXHAUSTIVE over `ClusterMutation`.
 /// The version-bearing variants are matched by DESTRUCTURING their
@@ -76,12 +91,40 @@ fn stamp_versions<I: Identifier>(
 ) {
     for m in mutations.iter_mut() {
         match m {
-            ClusterMutation::TaskFailed { hash, version, .. }
-            | ClusterMutation::TaskAssigned { hash, version, .. }
-            | ClusterMutation::TaskPreferredSecondariesUpdated { hash, version, .. }
-            | ClusterMutation::TaskReinjected { hash, version }
-            | ClusterMutation::TaskRequeued { hash, version } => {
+            // COPY-CURRENT variants: stamp BOTH the minted `version` AND the
+            // task's CURRENT `attempt` (C-1). The attempt read is `&self`
+            // and the version mint is `&mut self`; reading the attempt into
+            // a local FIRST keeps the borrows disjoint. A task absent from
+            // the ledger (an out-of-order copy-current ahead of its
+            // `TaskAdded`) reads attempt 0 — the apply arm NoOps it anyway
+            // (no local entry), so the stamped 0 never lands.
+            ClusterMutation::TaskAssigned {
+                hash,
+                version,
+                attempt,
+                ..
+            }
+            | ClusterMutation::TaskFailed {
+                hash,
+                version,
+                attempt,
+                ..
+            } => {
+                *attempt = state.task_state(hash).map_or(0, |s| s.attempt());
                 *version = state.next_task_version(hash);
+            }
+            ClusterMutation::TaskPreferredSecondariesUpdated { hash, version, .. }
+            | ClusterMutation::TaskReinjected { hash, version }
+            | ClusterMutation::TaskRequeued { hash, version }
+            | ClusterMutation::TaskRetried { hash, version, .. } => {
+                *version = state.next_task_version(hash);
+            }
+            // `TaskCompleted` is version-LESS (idempotent + rank-dominant)
+            // but DOES carry the F2 `attempt`: stamp it from the task's
+            // current generation so the completion preserves the attempt it
+            // completed under.
+            ClusterMutation::TaskCompleted { hash, attempt, .. } => {
+                *attempt = state.task_state(hash).map_or(0, |s| s.attempt());
             }
             // Capability mutations carry the SAME monotone stamp keyed by
             // PEER id (C6): the `cap_version` arbitrates a `can_be_primary`
@@ -100,13 +143,15 @@ fn stamp_versions<I: Identifier>(
             } => {
                 *cap_version = state.next_task_version(peer_id);
             }
-            // The genuinely version-LESS variants, listed EXPLICITLY (B3
-            // invariant: this arm must NEVER swallow a version-bearing
-            // variant). `TaskAdded` (vacant-insert), `TaskCompleted`
-            // (idempotent + rank-dominant), `TaskBlocked` (cascade-pause
-            // keyed on `on`), and every non-versioned non-task mutation.
+            // The genuinely version-LESS, attempt-LESS variants, listed
+            // EXPLICITLY (B3 invariant: this arm must NEVER swallow a
+            // version-bearing OR attempt-bearing variant). `TaskAdded`
+            // (vacant-insert at the cold attempt 0), `TaskBlocked`
+            // (cascade-pause keyed on `on`; its attempt is preserved from
+            // the Pending source in the apply arm, not stamped here), and
+            // every non-versioned non-task mutation. (`TaskCompleted` is
+            // attempt-stamped above.)
             ClusterMutation::TaskAdded { .. }
-            | ClusterMutation::TaskCompleted { .. }
             | ClusterMutation::TaskBlocked { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }

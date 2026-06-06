@@ -140,8 +140,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             hash: task_hash,
             secondary,
             worker,
-            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            // Both stamped at the origination choke point
+            // (apply_locally_for_broadcast): `version` minted, `attempt`
+            // read from the task's current generation (C-1).
             version: Default::default(),
+            attempt: Default::default(),
         }])
         .await;
     }

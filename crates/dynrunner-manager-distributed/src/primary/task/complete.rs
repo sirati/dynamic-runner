@@ -70,6 +70,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskCompleted {
                 hash: task_hash.clone(),
                 result_data: result_data.clone(),
+                // Stamped at the origination choke point: read from the
+                // task's current generation (C-1) so the completion
+                // preserves the attempt it completed under.
+                attempt: Default::default(),
             }])
             .await;
 

@@ -34,6 +34,13 @@ pub enum TaskState<I> {
         /// higher version beats a stale pre-reset `InFlight` within the
         /// non-terminal band even though `Pending`'s rank is lower.
         version: TaskVersion,
+        /// Retry-attempt generation (F2). The TOP of [`TaskJoinKey`], above
+        /// `band`: a retry reset mints `Pending { attempt: n+1 }` against a
+        /// `Failed { attempt: n }`, so the reset out-ranks the prior Failed
+        /// across EVERY merge path (apply, restore, anti-entropy) including
+        /// the band boundary version cannot cross. Defaults 0 (the cold
+        /// generation). See `TaskRetried`.
+        attempt: u32,
     },
     InFlight {
         task: TaskInfo<I>,
@@ -43,9 +50,20 @@ pub enum TaskState<I> {
         /// `TaskAssigned` mutation; a genuine post-reset re-assignment
         /// mints a still-higher version so it beats the reset `Pending`.
         version: TaskVersion,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. Stamped
+        /// from the `TaskAssigned` mutation's `attempt` (the choke point
+        /// reads the task's current attempt), so a worker outcome for
+        /// attempt n+1 out-ranks the reset `Pending { attempt: n+1 }` within
+        /// that generation, and a stale attempt-n assignment LOSES.
+        attempt: u32,
     },
     Completed {
         task: TaskInfo<I>,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. A
+        /// completion preserves the attempt it completed under so a late
+        /// stale attempt-n outcome cannot resurrect a higher-generation
+        /// reset.
+        attempt: u32,
     },
     Failed {
         task: TaskInfo<I>,
@@ -57,6 +75,10 @@ pub enum TaskState<I> {
         /// key. Replaces the dropped `attempts` counter (which had no
         /// authoritative source and no reader).
         version: TaskVersion,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. The
+        /// originator reads THIS to mint the `TaskRetried { attempt: n+1 }`
+        /// reset that supersedes it.
+        attempt: u32,
     },
     /// The task hit `ErrorType::Unfulfillable` — a required cluster
     /// resource (e.g. a toolchain outpath) is not held by any peer.
@@ -84,6 +106,11 @@ pub enum TaskState<I> {
         last_error: String,
         /// Terminal-payload version (D-V / AE-2). See `Failed::version`.
         version: TaskVersion,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. Carried
+        /// for uniformity (a reset never targets Unfulfillable — the F2-β
+        /// gate is Failed-only — so the attempt is inert here, preserved
+        /// across the Unfulfillable→reinject→Pending transition).
+        attempt: u32,
     },
     /// The task is a transitive dependent of a task currently in
     /// `Unfulfillable`. Dormant until the prerequisite (identified by
@@ -100,6 +127,10 @@ pub enum TaskState<I> {
     Blocked {
         task: TaskInfo<I>,
         on: String,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. Carried
+        /// for uniformity and preserved across the cascade-pause →
+        /// auto-resume (`Blocked → Pending`) transition.
+        attempt: u32,
     },
     /// The task hit `ErrorType::InvalidTask` — it is structurally
     /// invalid (e.g. a `task_depends_on` reference to a literally-
@@ -128,6 +159,11 @@ pub enum TaskState<I> {
         last_error: String,
         /// Terminal-payload version (D-V / AE-2). See `Failed::version`.
         version: TaskVersion,
+        /// Retry-attempt generation (F2). See `Pending::attempt`. Carried
+        /// for uniformity; InvalidTask is terminal and non-reinjectable, so
+        /// no reset ever bumps it (the InvalidTask-TOP invariant is
+        /// preserved WITHIN an attempt by `TerminalRank`).
+        attempt: u32,
     },
 }
 
@@ -140,7 +176,7 @@ impl<I> TaskState<I> {
         match self {
             TaskState::Pending { task, .. }
             | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task }
+            | TaskState::Completed { task, .. }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
@@ -156,11 +192,43 @@ impl<I> TaskState<I> {
         match self {
             TaskState::Pending { task, .. }
             | TaskState::InFlight { task, .. }
-            | TaskState::Completed { task }
+            | TaskState::Completed { task, .. }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
             | TaskState::Blocked { task, .. } => task,
+        }
+    }
+
+    /// The retry-attempt generation this state carries (F2). One canonical
+    /// accessor so the version-stamp choke point (`broadcast.rs`) reads the
+    /// task's CURRENT attempt without re-spelling the all-variants match —
+    /// it stamps that attempt onto the copy-current `TaskAssigned` /
+    /// `TaskCompleted` / `TaskFailed` candidate exactly as it stamps the
+    /// version.
+    pub(crate) fn attempt(&self) -> u32 {
+        match self {
+            TaskState::Pending { attempt, .. }
+            | TaskState::InFlight { attempt, .. }
+            | TaskState::Completed { attempt, .. }
+            | TaskState::Failed { attempt, .. }
+            | TaskState::Unfulfillable { attempt, .. }
+            | TaskState::InvalidTask { attempt, .. }
+            | TaskState::Blocked { attempt, .. } => *attempt,
+        }
+    }
+
+    /// The retry-attempt generation iff this is the `Failed` state, else
+    /// `None` (F2-β gate). The retry-bucket originator reads this to mint
+    /// `TaskRetried { attempt: n+1 }` ONLY against a `Failed { attempt: n }`
+    /// — a reset can never resurrect a `Completed` / `InvalidTask` /
+    /// `Unfulfillable` / `InFlight` task, mirroring `apply_reinject_task`'s
+    /// `Unfulfillable`-only gate. `None` here means "do not originate a
+    /// reset for this hash".
+    pub(crate) fn attempt_if_failed(&self) -> Option<u32> {
+        match self {
+            TaskState::Failed { attempt, .. } => Some(*attempt),
+            _ => None,
         }
     }
 
@@ -286,24 +354,38 @@ pub(super) enum FailedLikeRank {
 /// The ONE canonical per-task convergence key. Replaces BOTH the two
 /// hand-rolled per-state rank fns that previously lived in `snapshot.rs`
 /// and `digest.rs` (the duplicated logic). It is a
-/// TOTAL comparator tuple compared lexicographically: the [`JoinBand`]
-/// dominates first, then — within the non-terminal band — `version`
+/// TOTAL comparator tuple compared lexicographically: the per-task
+/// `attempt` generation (F2) dominates FIRST (above `band`), then the
+/// [`JoinBand`], then — within the non-terminal band — `version`
 /// arbitrates BEFORE rank (C3), and within the terminal band the
 /// [`TerminalRank`] separates the D-T order before `version` and the
 /// payload hash. Constructed by `task_join_key` (logic in `merge.rs`);
 /// the comparison logic lives there too, so apply, restore, and the
 /// digest fold all derive their order from this single key.
 ///
+/// `attempt` at the top is the F2 retry-reset survival mechanism: a
+/// `TaskRetried` mints `Pending { attempt: n+1 }` against a `Failed {
+/// attempt: n }`, and because `attempt` dominates `band`, the attempt-
+/// (n+1) `Pending` out-ranks the attempt-n `Failed` across EVERY merge
+/// path — including restore / anti-entropy, where `version` (a per-band
+/// arbiter) cannot cross the band boundary. The InvalidTask-TOP invariant
+/// (D-T) is preserved WITHIN an attempt; a reset never targets InvalidTask
+/// (the originator's `Failed`-only gate), so no attempt-bump races it.
+///
 /// The fields are ordered so that `#[derive(Ord)]`'s field-by-field
 /// lexicographic comparison IS the convergence order. For the
-/// non-terminal band the discriminating fields are `(band, version,
-/// nonterminal_rank)`; for terminals `(band, terminal_rank, version,
-/// failedlike, payload_content_hash)`. The unused sub-keys for a given
-/// band are filled with their minimum so they never perturb the order
-/// (a band's own discriminator already separates it).
+/// non-terminal band the discriminating fields are `(attempt, band,
+/// version, nonterminal_rank)`; for terminals `(attempt, band,
+/// terminal_rank, version, failedlike, payload_content_hash)`. The unused
+/// sub-keys for a given band are filled with their minimum so they never
+/// perturb the order (a band's own discriminator already separates it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct TaskJoinKey {
-    /// Coarse band — dominates first.
+    /// Retry-attempt generation (F2) — dominates FIRST, above `band`, so a
+    /// retry reset's higher-attempt `Pending` out-ranks the prior-attempt
+    /// `Failed` across the band boundary and survives anti-entropy.
+    pub(super) attempt: u32,
+    /// Coarse band — dominates after `attempt`.
     pub(super) band: JoinBand,
     /// Terminal ordering (D-T). Minimum (`FailedLike`) for non-terminals
     /// and `Blocked`, where it is inert (the band already separates them).

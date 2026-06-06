@@ -62,6 +62,7 @@ fn task_preferred_secondaries_updated_apply_preserves_state() {
         task: mk_task("h"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::Unfulfillable {
             reason: "missing".to_string().into(),
@@ -103,6 +104,7 @@ fn task_failed_with_unfulfillable_lands_in_unfulfillable_variant() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::Unfulfillable {
                 reason: "missing toolchain xyz".to_string().into(),
@@ -133,6 +135,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
         task: mk_task("h"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
@@ -153,6 +156,7 @@ fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
         task: mk_task("h2"),
     });
     s2.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h2".into(),
         kind: ErrorType::Recoverable,
         error: "transient".into(),
@@ -181,6 +185,7 @@ fn cascade_on_unfulfillable_marks_dependents_blocked() {
         task: mk_task("prereq"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "prereq".into(),
         kind: ErrorType::Unfulfillable {
             reason: "missing".to_string().into(),
@@ -232,6 +237,7 @@ fn spawned_dep_on_existing_invalid_task_cascades_as_non_recoverable() {
         task: mk_task("x"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "x_hash".into(),
         kind: ErrorType::InvalidTask {
             reason: "missing dep".to_string().into(),
@@ -291,6 +297,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
         task: mk_task("prereq"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "prereq".into(),
         kind: ErrorType::Unfulfillable {
             reason: "missing".to_string().into(),
@@ -325,6 +332,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
     // Prereq completes — every Blocked-on-prereq entry resumes.
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "prereq".into(),
             result_data: None
         }),
@@ -359,6 +367,7 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         task: mk_task("u"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "u".into(),
         kind: ErrorType::Unfulfillable {
             reason: "missing".to_string().into(),
@@ -382,6 +391,7 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         task: mk_task("f"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "f".into(),
         kind: ErrorType::NonRecoverable,
         error: "panic".into(),
@@ -412,6 +422,7 @@ fn task_requeued_transitions_in_flight_back_to_pending() {
         task: mk_task("h"),
     });
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "h".into(),
         secondary: "dead-sec".into(),
         worker: 0,
@@ -473,12 +484,14 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
         task: mk_task("c"),
     });
     s.apply(ClusterMutation::TaskAssigned {
+        attempt: 0,
         hash: "c".into(),
         secondary: "dead-sec".into(),
         worker: 0,
         version: Default::default(),
     });
     s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
         hash: "c".into(),
         result_data: None,
     });
@@ -500,6 +513,7 @@ fn task_requeued_is_noop_against_non_in_flight_states() {
         task: mk_task("i"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "i".into(),
         kind: ErrorType::InvalidTask {
             reason: "dup".to_string().into(),
@@ -536,6 +550,7 @@ fn task_failed_with_invalid_task_lands_in_invalid_task_variant() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::InvalidTask {
                 reason: "missing dep nope".to_string().into(),
@@ -566,6 +581,7 @@ fn reinject_against_invalid_task_is_noop_non_reinjectable() {
         task: mk_task("h"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::InvalidTask {
             reason: "dup id".to_string().into(),
@@ -598,6 +614,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
         task: mk_task("h"),
     });
     s.apply(ClusterMutation::TaskFailed {
+        attempt: 0,
         hash: "h".into(),
         kind: ErrorType::InvalidTask {
             reason: "missing dep".to_string().into(),
@@ -608,6 +625,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
     // A late generic worker-originated TaskFailed must NoOp.
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
             hash: "h".into(),
             kind: ErrorType::NonRecoverable,
             error: "panic".into(),
@@ -619,6 +637,7 @@ fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
     // dispatched, so success is impossible by construction).
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
             hash: "h".into(),
             result_data: None,
         }),

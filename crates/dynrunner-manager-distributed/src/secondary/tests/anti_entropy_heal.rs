@@ -94,6 +94,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 task: mk_task("t"),
             });
             donor.apply(ClusterMutation::TaskCompleted {
+                attempt: 0,
                 hash: "t".into(),
                 result_data: None,
             });

@@ -86,7 +86,10 @@ fn terminal_payload_hash<I>(state: &TaskState<I>) -> u64 {
 /// hash.
 pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
     match state {
-        TaskState::Pending { version, .. } => TaskJoinKey {
+        TaskState::Pending {
+            version, attempt, ..
+        } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::NonTerminal,
             terminal_rank: TerminalRank::FailedLike,
             version: *version,
@@ -94,7 +97,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: 0,
         },
-        TaskState::InFlight { version, .. } => TaskJoinKey {
+        TaskState::InFlight {
+            version, attempt, ..
+        } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::NonTerminal,
             terminal_rank: TerminalRank::FailedLike,
             version: *version,
@@ -102,7 +108,8 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: 0,
         },
-        TaskState::Blocked { .. } => TaskJoinKey {
+        TaskState::Blocked { attempt, .. } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::Blocked,
             terminal_rank: TerminalRank::FailedLike,
             version: TaskVersion::default(),
@@ -110,7 +117,8 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: 0,
         },
-        TaskState::Completed { .. } => TaskJoinKey {
+        TaskState::Completed { attempt, .. } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::Terminal,
             terminal_rank: TerminalRank::Completed,
             // Completed carries no version; the terminal rank already
@@ -120,7 +128,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: terminal_payload_hash(state),
         },
-        TaskState::Failed { version, .. } => TaskJoinKey {
+        TaskState::Failed {
+            version, attempt, ..
+        } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::Terminal,
             terminal_rank: TerminalRank::FailedLike,
             version: *version,
@@ -128,7 +139,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: terminal_payload_hash(state),
         },
-        TaskState::Unfulfillable { version, .. } => TaskJoinKey {
+        TaskState::Unfulfillable {
+            version, attempt, ..
+        } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::Terminal,
             terminal_rank: TerminalRank::FailedLike,
             version: *version,
@@ -136,7 +150,10 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             failedlike: FailedLikeRank::Unfulfillable,
             payload_content_hash: terminal_payload_hash(state),
         },
-        TaskState::InvalidTask { version, .. } => TaskJoinKey {
+        TaskState::InvalidTask {
+            version, attempt, ..
+        } => TaskJoinKey {
+            attempt: *attempt,
             band: JoinBand::Terminal,
             terminal_rank: TerminalRank::InvalidTask,
             version: *version,
@@ -163,6 +180,12 @@ pub(super) fn task_join_key_dominates(incoming: &TaskJoinKey, local: &TaskJoinKe
 pub(super) fn hashable_join_key<I>(state: &TaskState<I>) -> u64 {
     let k = task_join_key(state);
     hash_one((
+        // `attempt` is prepended (F2) so the digest fold sees a retry
+        // reset even at equal band/version: `Failed { attempt: n }` and
+        // `Pending { attempt: n+1 }` produce different `tasks_hash`es, so
+        // `field_behind` detects the divergence and the heal pulls the
+        // higher-attempt state.
+        k.attempt,
         k.band as u8,
         k.terminal_rank as u8,
         k.version,

@@ -205,8 +205,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 },
                 error: "missing dependency".to_string(),
                 // Stamped at the origination choke point
-                // (`apply_locally_for_broadcast`).
+                // (`apply_locally_for_broadcast`): `version` minted,
+                // `attempt` read from the task's current generation (C-1).
                 version: Default::default(),
+                attempt: Default::default(),
             });
         }
 
@@ -342,8 +344,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     reason: BoundedString::from(reason.clone()),
                 },
                 error: "run-wide invalidation (duplicate task identity)".to_string(),
-                // Stamped at the origination choke point (apply_locally_for_broadcast).
+                // Stamped at the origination choke point
+                // (apply_locally_for_broadcast): `version` minted,
+                // `attempt` read from the task's current generation (C-1).
                 version: Default::default(),
+                attempt: Default::default(),
             });
         }
         self.apply_and_broadcast_cluster_mutations(mutations).await;

@@ -136,17 +136,20 @@ impl<I: Identifier> ClusterState<I> {
             .collect();
         let mut resumed: Vec<TaskInfo<I>> = Vec::with_capacity(to_resume.len());
         for h in to_resume {
-            if let Some(TaskState::Blocked { task, .. }) = self.tasks.remove(&h) {
+            if let Some(TaskState::Blocked { task, attempt, .. }) = self.tasks.remove(&h) {
                 resumed.push(task.clone());
                 // Auto-resume is an authoritative cross-task transition
                 // (Blocked → Pending), not an assignment; the fresh
                 // `Pending` starts at the default version and a later
-                // genuine assignment mints a higher one.
+                // genuine assignment mints a higher one. The retry
+                // generation (F2) is PRESERVED from the Blocked entry — a
+                // cascade-resume is not a new retry attempt.
                 self.tasks.insert(
                     h,
                     TaskState::Pending {
                         task,
                         version: Default::default(),
+                        attempt,
                     },
                 );
             }
@@ -323,17 +326,29 @@ impl<I: Identifier> ClusterState<I> {
                     }
                 }
             }
+            // Every TasksSpawned entry is a BRAND-NEW task, so it enters at
+            // the cold retry generation (F2 attempt 0) regardless of which
+            // initial state it classifies into.
             let initial = if cascade_fail {
                 TaskState::Failed {
                     task,
                     kind: ErrorType::NonRecoverable,
                     last_error: "upstream-failed".to_string(),
                     version: Default::default(),
+                    attempt: 0,
                 }
             } else if let Some(on) = blocked_on_unfulfillable {
-                TaskState::Blocked { task, on }
+                TaskState::Blocked {
+                    task,
+                    on,
+                    attempt: 0,
+                }
             } else if let Some(on) = blocked_on_pending {
-                TaskState::Blocked { task, on }
+                TaskState::Blocked {
+                    task,
+                    on,
+                    attempt: 0,
+                }
             } else {
                 // Surface a clone of the freshly-Pending task so a
                 // receive-side caller can grow its local dispatch
@@ -344,6 +359,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Pending {
                     task,
                     version: Default::default(),
+                    attempt: 0,
                 }
             };
             tracing::debug!(
