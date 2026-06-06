@@ -485,7 +485,7 @@ dependencies = [
 name = "dynrunner-publish"
 version = "0.4.0"
 dependencies = [
- "libc",
+ "nix",
  "tempfile",
  "thiserror 2.0.18",
 ]
