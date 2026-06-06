@@ -243,7 +243,7 @@ where
         // OOM-bucket dispatch shape. `single_worker_mode` lives on
         // `PrimaryCoordinator`, so this is the only machine that drives
         // it — there is no parallel secondary-side retry mirror in the
-        // unified model (a promoted node runs its co-located primary,
+        // unified model (a promoted node runs its own same-peer primary,
         // which is THIS machine). Entry-side: flip the coordinator into
         // single-worker mode for the duration of the bucket so the
         // dispatch pipeline masks workers != local-id-0 and promotes
@@ -259,8 +259,8 @@ where
 
         // Build candidates from `all_binaries` (the run-start snapshot)
         // cross-referenced against `failed_tasks` (the hash-keyed
-        // ErrorType ledger). On an on-demand co-located primary that
-        // activated via the seeded resume, `all_binaries` is empty (the
+        // ErrorType ledger). On a promoted-host primary that was built
+        // via the seeded resume, `all_binaries` is empty (the
         // pool was hydrated
         // from the CRDT, not a run-start binary list); `failed_tasks` is
         // seeded from the restored ledger, and the candidate set is

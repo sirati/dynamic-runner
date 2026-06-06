@@ -426,7 +426,7 @@ async fn re_designation_on_designated_node_death() {
 /// Acceptance #4 — an observer is never designated. The lowest-id node
 /// (sec-a) is an observer; the next-lowest eligible node (sec-b) is the
 /// one that yields, and the observer never does. Mirrors the election's
-/// observer self-exclusion and `select_bootstrap_primary`'s observer cut.
+/// observer self-exclusion and the bootstrap selection's observer cut.
 #[tokio::test(flavor = "current_thread")]
 async fn observer_is_never_designated() {
     // sec-a is the lex-lowest id but an observer ⇒ excluded from the

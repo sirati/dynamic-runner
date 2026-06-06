@@ -159,11 +159,11 @@ impl PyDistributedManager {
 
         // Clone the task_definition once per secondary so the in-process
         // composition can fire `on_phase_end` through a promoted
-        // secondary's co-located primary on the SAME Python
+        // secondary's same-peer primary on the SAME Python
         // `TaskDefinition` instance the live primary's callback already
         // targets. Each spawned in-process secondary registers these
         // callbacks and, under composition, transfers them to its
-        // co-located primary built on demand (which owns the phase machine
+        // same-peer primary built on promotion (which owns the phase machine
         // and fires the cascade once activated). Each per-secondary closure
         // pair is pushed in the order the secondaries are spawned below;
         // the spawn loop pops one pair off this vec per iteration so each
@@ -388,9 +388,9 @@ impl PyDistributedManager {
                             // `PrimaryConfig` so an externally-issued
                             // `reinject_task` honours the operator's knob
                             // symmetrically regardless of which authority
-                            // (live or co-located) services it. Inert on
+                            // (live or same-peer) services it. Inert on
                             // a secondary until it holds the primary role
-                            // via its co-located primary.
+                            // via its same-peer primary.
                             unfulfillable_reinject_max_per_task,
                             // In-process distributed manager runs primary
                             // and secondaries in the same process, so

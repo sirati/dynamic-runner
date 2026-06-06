@@ -1,7 +1,7 @@
 //! [`TaskInfo`] — the one scheduling unit handed to the runtime — and the
 //! [`TaskInput`] alias used by older call-sites.
 //!
-//! Also hosts [`TaskDep`], the dep-graph edge primitive. Co-located here
+//! Also hosts [`TaskDep`], the dep-graph edge primitive. Kept here
 //! because dependencies are a `TaskInfo` concern (the field, the
 //! validation rules, and the cycle-checker are all reached via
 //! `TaskInfo.task_depends_on`).

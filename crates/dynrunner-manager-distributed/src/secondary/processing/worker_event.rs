@@ -43,7 +43,7 @@ where
     /// queueing) and (2) a CLASS-1 terminal report to the primary role
     /// (`send_to_primary`). The secondary is never the authority: it
     /// originates NO CRDT mutation and drives NO phase machine — the
-    /// co-located `PrimaryCoordinator` owns authoritative accounting,
+    /// same-peer `PrimaryCoordinator` owns authoritative accounting,
     /// reached via the `send_to_primary` loopback.
     pub(in crate::secondary) async fn handle_worker_event(
         &mut self,

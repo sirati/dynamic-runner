@@ -37,7 +37,7 @@ impl ResourceEstimator<TestId> for FixedEstimator {
 /// "primary forgot to queue StageFile" failure mode the in-process
 /// distributed pipeline regressed into.
 ///
-/// Co-located with `make_binary` instead of inlined in the test
+/// Placed next to `make_binary` instead of inlined in the test
 /// because both regression tests (T1 — failure pin; T2 — fix
 /// validation) share the exact same binary shape; centralising
 /// keeps them in lockstep.

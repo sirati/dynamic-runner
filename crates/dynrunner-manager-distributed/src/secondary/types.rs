@@ -26,7 +26,7 @@ use std::time::Duration;
 ///   setup_discovery_pending`) so the caller can run Python's
 ///   `task.discover_items` against the locally-mounted staged source and
 ///   feed the result back via `ingest_setup_discovery` — which broadcasts
-///   `PhaseDepsSet + TaskAdded` onto the mesh for the co-located
+///   `PhaseDepsSet + TaskAdded` onto the mesh for the same-peer
 ///   authoritative primary to pick up. The worker pool is left running;
 ///   re-entering `run_until_setup_or_done` resumes the loop, and the
 ///   fire-once latch (set by `ingest_setup_discovery`) prevents a
@@ -112,11 +112,11 @@ pub struct SecondaryConfig {
     ///
     /// INERT on the `SecondaryCoordinator`: the secondary holds no
     /// dispatch authority and runs no retry machine. The retry concern is
-    /// owned entirely by the co-located `PrimaryCoordinator` via its OWN
+    /// owned entirely by the same-peer `PrimaryCoordinator` via its OWN
     /// `PrimaryConfig::retry_max_passes`. This field rides on
     /// `SecondaryConfig` only so the PyO3 wrapper can carry the operator
     /// knob through a single config struct; the unified composition
-    /// threads the value into the co-located primary's config.
+    /// threads the value into the same-peer primary's config.
     pub retry_max_passes: u32,
 
     /// Number of retry passes for the per-phase OOM-retry bucket the
@@ -125,7 +125,7 @@ pub struct SecondaryConfig {
     /// `ResourceExhausted(memory)` failures stay terminal.
     ///
     /// INERT on the `SecondaryCoordinator`, same disposition as
-    /// `retry_max_passes`: the OOM-retry partition is the co-located
+    /// `retry_max_passes`: the OOM-retry partition is the same-peer
     /// `PrimaryCoordinator`'s concern, driven by its own
     /// `PrimaryConfig::oom_retry_max_passes`.
     pub oom_retry_max_passes: u32,
@@ -175,14 +175,14 @@ pub struct SecondaryConfig {
     /// Tests construct it with a tiny value for sub-second drive.
     pub primary_silence_backstop: Duration,
 
-    /// Whether this secondary can host the primary role ON DEMAND — it is
-    /// an overlay-enabled (real peer mesh present), non-observer compute
-    /// secondary whose runtime registered a primary-activator (a closure
-    /// that constructs + spawns a `PrimaryCoordinator` the moment this
-    /// node is named primary). The secondary advertises this in its
+    /// Whether this secondary can host the primary role on promotion — it
+    /// is an overlay-enabled (real peer mesh present), non-observer compute
+    /// secondary whose host can build a `PrimaryCoordinator` when this node
+    /// is named primary (Phase-C: the secondary signals `Process`, which
+    /// constructs + spawns it). The secondary advertises this in its
     /// `SecondaryWelcome`; the primary records it in the replicated
-    /// `RoleTable.can_be_primary`, which `select_bootstrap_primary` reads
-    /// as the single authoritative capability marker.
+    /// `RoleTable.can_be_primary`, which the bootstrap-promotion selection
+    /// reads as the single authoritative capability marker.
     ///
     /// This is the JOIN-TIME advertised value (twin of the wire
     /// `is_observer` role advertisement). It
@@ -190,7 +190,7 @@ pub struct SecondaryConfig {
     /// `cluster_state.can_be_primary(self)` (the replicated marker, which
     /// a client may also flip at runtime via `SetCanBePrimary`). A host
     /// with no mesh / `disable_peer_overlay` or an observer joins with
-    /// `false` so the submitter never relocates to it.
+    /// `false` so the submitter never moves authority to it.
     ///
     /// Default `false` (regular non-overlay secondary).
     pub can_be_primary: bool,
@@ -241,7 +241,7 @@ pub struct SecondaryConfig {
     /// INERT on the `SecondaryCoordinator` post-unification: the
     /// alive-demoted natural-quiesce `RunComplete`-broadcast branch this
     /// gated lived on the secondary's deleted authority mirror. In the
-    /// unified model a promoted node runs its co-located
+    /// unified model a promoted node runs its own same-peer
     /// `PrimaryCoordinator`, which owns run-completion (`run_complete_check`
     /// reads the authoritative pool + CRDT directly), and the demoted
     /// node becomes a pure observer that exits solely on
@@ -258,7 +258,7 @@ pub struct SecondaryConfig {
     ///
     /// INERT on the `SecondaryCoordinator`: the secondary drains no
     /// command channel and applies no reinject (those are authority
-    /// mutations). The cap is enforced by the co-located
+    /// mutations). The cap is enforced by the same-peer
     /// `PrimaryCoordinator` via its own
     /// `PrimaryConfig::unfulfillable_reinject_max_per_task`; this field
     /// rides on `SecondaryConfig` only so the PyO3 wrapper carries the
@@ -270,7 +270,7 @@ pub struct SecondaryConfig {
     /// times via this surface, subsequent calls fail with the
     /// `unfulfillable_reinject_budget_exhausted` structured-log
     /// event and the entry stays in `TaskState::Unfulfillable`. The
-    /// budget is owned and enforced by the authority (the co-located
+    /// budget is owned and enforced by the authority (the same-peer
     /// `PrimaryCoordinator` once this node is promoted), per its own
     /// `PrimaryConfig` copy of the same knob.
     pub unfulfillable_reinject_max_per_task: Option<u32>,

@@ -8,8 +8,8 @@
 //! There are no other spans in the runtime, and the explicit-target events
 //! are concern-keyed (not role-keyed), so a single role span entered at
 //! each coordinator's run entry is what attributes EVERY event — including
-//! the explicit-target ones — to its role. The co-located primary and the
-//! host secondary are separate `spawn_local` tasks, so each carries its
+//! the explicit-target ones — to its role. A promoted host's primary and
+//! its secondary are separate `spawn_local` tasks, so each carries its
 //! own span context and attribution stays correct across promotion.
 //!
 //! The span NAME carries the role (not a field value): the name is

@@ -438,10 +438,10 @@ where
     /// `can_be_primary` worker-secondary in the replicated membership
     /// mirror.
     ///
-    /// This is the SAME candidate set + `.min()` rule the primary's
-    /// `select_bootstrap_primary` (primary/coordinator.rs) applies to
-    /// pick the bootstrap-promotion target, computed here against the
-    /// secondary's own replicated `cluster_state`:
+    /// This is the SAME candidate set + `.min()` rule the deterministic
+    /// bootstrap-promotion selection applies to pick the bootstrap target,
+    /// computed here against the secondary's own replicated
+    /// `cluster_state`:
     ///   - [`ClusterState::alive_secondary_members`] — advertised
     ///     worker-secondary capacity (`worker_count > 0`) AND alive; the
     ///     faithful liveness signal in the SETUP window where no
@@ -450,17 +450,17 @@ where
     ///     `alive_secondary_ids`).
     ///   - `role_table().observers` excluded — an observer hosts no
     ///     workers and can never become primary, mirroring the election's
-    ///     observer self-exclusion and `select_bootstrap_primary`'s
-    ///     defensive cut.
+    ///     observer self-exclusion and the bootstrap selection's defensive
+    ///     cut.
     ///   - [`ClusterState::can_be_primary`] — the explicit replicated
     ///     capability marker; only a peer that declared it can host the
-    ///     primary on demand is eligible.
+    ///     primary role is eligible.
     ///
-    /// The primary's selection ALSO filters `mesh_ready_secondaries` /
+    /// The bootstrap selection ALSO filters `mesh_ready_secondaries` /
     /// `transport.has_peer`, which a secondary cannot read for its peers;
     /// its membership/liveness mirror is the faithful analogue (the same
     /// substitution `alive_secondary_ids` makes). The designated
-    /// discoverer is therefore the SAME node `select_bootstrap_primary`
+    /// discoverer is therefore the SAME node the bootstrap selection
     /// promotes — discovery and promotion re-coupled through one
     /// deterministic rule, with no cross-call between the two concerns.
     ///
@@ -493,9 +493,9 @@ where
     /// designated discoverer ([`Self::is_designated_discoverer`]).
     ///
     /// Axis (d) makes discovery run on EXACTLY ONE node: the designated
-    /// discoverer is the same lowest-id-eligible node
-    /// `select_bootstrap_primary` promotes, so discovery and promotion
-    /// are re-coupled through one deterministic rule.
+    /// discoverer is the same lowest-id-eligible node the bootstrap
+    /// selection promotes, so discovery and promotion are re-coupled
+    /// through one deterministic rule.
     ///
     /// `process_tasks` consults this once per tick and yields
     /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
@@ -976,7 +976,7 @@ where
         // here), so one span here covers them all — including the events
         // emitted on a `SetupPending` re-entry. A secondary that never
         // promotes only ever carries this span → `secondary.log`; a peer
-        // that activates a co-located primary spawns a SEPARATE task whose
+        // that activates a same-peer primary spawns a SEPARATE task whose
         // own primary span keeps that authority's events in `primary.log`.
         // See `dynrunner_core::role_span`.
         let span = tracing::info_span!(

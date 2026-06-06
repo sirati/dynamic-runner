@@ -88,8 +88,8 @@ impl PySecondaryCoordinator {
         )?;
 
         // Resolve this secondary's per-run log directory under the
-        // log-mount root, using `secondary_id` so two co-located
-        // secondaries on the same shared mount get distinct
+        // log-mount root, using `secondary_id` so two secondaries
+        // sharing the same mount get distinct
         // directories. `create_dir_all` errors surface as
         // construction-time failures — silently swallowing this with
         // `.ok()` produced 6h runs with zero worker log output when
