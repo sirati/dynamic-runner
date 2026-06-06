@@ -18,12 +18,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 
-[dev-dependencies]
-# `fetch_run_config` harness (`transport_tests.rs`) drives the default
-# trait impl on the current-thread runtime via `#[tokio::test]`, which
-# needs the `macros` + `rt` features the production deps above omit.
-tokio = { workspace = true, features = ["macros", "rt"] }
-
 [features]
 # Enable test-only inspection of routing state from downstream crates'
 # integration tests (e.g. dynrunner-transport-channel's
