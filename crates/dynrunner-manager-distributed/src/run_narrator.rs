@@ -17,9 +17,12 @@
 //! per-phase progress milestones are derived from the COMPLETE converged
 //! CRDT, exactly as a promoted primary would derive them: task-spawning off
 //! the same `has_any && dispatchable` phase edge as the "starting job phase"
-//! line, and the two retry-pass-start milestones off upward steps of the
-//! replicated grow-only [`ClusterState::retry_passes_used`] map (a pass that
-//! opened on a remote promoted primary is surfaced here purely via
+//! line, and the two retry-pass-start milestones off the PRESENCE of a
+//! positive count in the replicated grow-only
+//! [`ClusterState::retry_passes_used`] map — once per `(phase, bucket)`, not
+//! per count-increment, so the milestone derives identically whether a node
+//! watched the count climb live or was fed the already-converged value (a
+//! pass that opened on a remote promoted primary is surfaced here purely via
 //! replication).
 //!
 //! # Why narrate from the CRDT, not from the primary
@@ -52,7 +55,7 @@
 //! run-aborted summary is gated on a single `completion_emitted` latch so
 //! it fires exactly once across the whole observer tail.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId};
 
@@ -73,17 +76,20 @@ pub struct RunNarrator {
     started_phases: HashSet<PhaseId>,
     /// Phases for which the "phase complete" line has been emitted.
     done_phases: HashSet<PhaseId>,
-    /// Last-emitted retry-pass USED count per `(phase, bucket)`, diffed
-    /// against the replicated grow-only-MAX [`ClusterState::retry_passes_used`].
-    /// The retry-pass twin of the `started`/`done` edge-sets: instead of a
-    /// presence set it holds a per-key count, and a retry-pass-start
-    /// milestone is emitted on each UPWARD step (a key absent here is at the
-    /// implicit 0), since the retry-bucket bumps the count by one per pass
-    /// that actually opened. Re-observing an unchanged (or already-emitted)
-    /// count is silent, so a freshly-promoted/observing node fed a CRDT
-    /// already at N seeds its baseline to N on first sight and emits nothing
-    /// for the already-converged passes.
-    retry_passes_emitted: HashMap<(PhaseId, BucketKind), u32>,
+    /// `(phase, bucket)` keys for which the retry-pass-start milestone has
+    /// been emitted, derived from the replicated grow-only-MAX
+    /// [`ClusterState::retry_passes_used`]. A pure PRESENCE edge-set — the
+    /// exact twin of `started`/`done` — not a count diff: the milestone fires
+    /// ONCE the moment a `(phase, bucket)` key first appears with a positive
+    /// count (`retry_passes_used` ≥ 1) and never again for that key, no matter
+    /// how high the count climbs. Presence (not per-increment) is the only
+    /// failover-consistent derivation: a live primary watching the count step
+    /// 1→2→3 and a promoted/observing node fed the already-converged count 3
+    /// both see the SAME presence and so emit the SAME single line — whereas a
+    /// count diff would make the live primary emit three lines and the
+    /// promoted node only one, deriving DIFFERENT narration from the one
+    /// converged CRDT.
+    retry_passes_emitted: HashSet<(PhaseId, BucketKind)>,
     /// Whether the one-shot run-complete / run-aborted summary has fired.
     /// The two are mutually exclusive and share this single latch so at
     /// most one terminal line is ever emitted.
@@ -102,7 +108,7 @@ impl RunNarrator {
         Self {
             started_phases,
             done_phases: HashSet::new(),
-            retry_passes_emitted: HashMap::new(),
+            retry_passes_emitted: HashSet::new(),
             completion_emitted: false,
         }
     }
@@ -165,22 +171,19 @@ impl RunNarrator {
         }
 
         // Retry-pass-start milestones, derived off the replicated grow-only
-        // `retry_passes_used` map. The retry-bucket bumps a `(phase, bucket)`
-        // count by one per pass that actually opened (the SAME moment the
-        // removed projection originated its retry-pass milestone — the
-        // origination sat in the same `if !reinjected.is_empty()` block as
-        // the `record_retry_pass_used(used + 1)` bump), so an UPWARD step of
-        // the replicated count is the faithful edge for a pass start. Mirrors
-        // the started/done edge-sets, keyed by count rather than presence:
-        // emit once whenever the observed count exceeds the last-emitted one
-        // and store the new count, so a re-observe of an unchanged count is
-        // silent and a cold-join/promoted node fed a count already at N
-        // emits once for the 0→N step (it has no per-step history to
-        // replay). `BucketKind` selects the operator wording.
+        // `retry_passes_used` map. The milestone marks that a `(phase, bucket)`
+        // retry pass OPENED for that phase at all — a once-per-`(phase, bucket)`
+        // PRESENCE edge, mirroring the started/done edge-sets exactly: the
+        // first time a key is observed with a positive count (≥ 1) it is
+        // inserted and the milestone emitted, and never again for that key.
+        // Presence (not the per-increment count step) is the only
+        // failover-consistent derivation — a live primary watching the count
+        // climb 1→2→3 and a promoted/observing node fed the already-converged
+        // count 3 both observe the same presence and emit the SAME single line,
+        // so everything derives identically from the one converged CRDT.
+        // `BucketKind` selects the operator wording.
         for (key, used) in state.retry_passes_used() {
-            let last = self.retry_passes_emitted.get(key).copied().unwrap_or(0);
-            if used > last {
-                self.retry_passes_emitted.insert(key.clone(), used);
+            if used >= 1 && self.retry_passes_emitted.insert(key.clone()) {
                 let (phase, bucket) = key;
                 match bucket {
                     BucketKind::Recoverable => tracing::info!(
@@ -598,12 +601,12 @@ mod tests {
         );
     }
 
-    /// An upward step of the replicated `retry_passes_used` count emits the
+    /// The first positive count for a `(phase, bucket)` emits the
     /// retry-pass-start milestone whose wording matches the bucket:
-    /// Recoverable → error-retry, Oom → OOM-retry. Once per increment; a
-    /// re-observe of the unchanged count is silent.
+    /// Recoverable → error-retry, Oom → OOM-retry. Once per `(phase, bucket)`
+    /// presence; a re-observe of the unchanged counts is silent.
     #[test]
-    fn retry_pass_milestone_per_bucket_on_increment() {
+    fn retry_pass_milestone_per_bucket_wording() {
         let events = capture(|| {
             let mut state = ClusterState::<RunnerIdentifier>::new();
             let mut narrator = RunNarrator::new();
@@ -639,11 +642,14 @@ mod tests {
         );
     }
 
-    /// Each successive retry pass (the count stepping 1 → 2 → 3) emits its
-    /// own milestone — one line per increment, since each opened pass bumps
-    /// the replicated count by exactly one.
+    /// The retry-pass milestone fires ONCE per `(phase, bucket)` regardless of
+    /// how high the count climbs: observing the count step 1 → 2 → 3 emits a
+    /// single line, because the milestone marks the PRESENCE of a retry pass
+    /// for that bucket, not each increment. This is the failover-consistent
+    /// behaviour — a count diff would emit three lines on a node that watched
+    /// the steps but only one on a node fed the converged 3.
     #[test]
-    fn retry_pass_milestone_once_per_increment() {
+    fn retry_pass_milestone_once_per_phase_bucket() {
         let events = capture(|| {
             let mut state = ClusterState::<RunnerIdentifier>::new();
             let mut narrator = RunNarrator::new();
@@ -660,8 +666,55 @@ mod tests {
             .collect();
         assert_eq!(
             err.len(),
-            3,
-            "one error-retry-pass line per opened pass (1→2→3): {events:?}"
+            1,
+            "exactly one error-retry-pass line for the (phase, bucket) across all increments: {events:?}"
+        );
+    }
+
+    /// Failover consistency: a node that observes the count climb 0→1→2→3
+    /// incrementally and a node fed only the final converged count 3 must
+    /// derive the SAME narration — exactly ONE retry-pass line for that
+    /// `(phase, bucket)` — since both see the same presence in the converged
+    /// CRDT. This pins the presence-set (not count-diff) derivation.
+    #[test]
+    fn retry_pass_milestone_failover_consistent_incremental_vs_converged() {
+        // Node A: watched each increment as a live primary.
+        let incremental = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+            for n in 1..=3 {
+                bump_retry_pass(&mut state, "compile", BucketKind::Oom, n);
+                narrator.observe(&state);
+            }
+        });
+        // Node B: promoted/observing, fed only the converged count 3.
+        let converged = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            bump_retry_pass(&mut state, "compile", BucketKind::Oom, 3);
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+        });
+
+        let count = |events: &[crate::test_capture::CapturedEvent]| {
+            events
+                .iter()
+                .filter(|e| e.message.contains("OOM-retry-pass start"))
+                .count()
+        };
+        assert_eq!(
+            count(&incremental),
+            1,
+            "incremental observer emits one line: {incremental:?}"
+        );
+        assert_eq!(
+            count(&converged),
+            1,
+            "converged-count observer emits one line: {converged:?}"
+        );
+        assert_eq!(
+            count(&incremental),
+            count(&converged),
+            "incremental and converged nodes derive the SAME narration from the converged CRDT",
         );
     }
 
