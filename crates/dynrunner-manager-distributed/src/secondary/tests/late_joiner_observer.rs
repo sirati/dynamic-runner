@@ -1,11 +1,10 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FixedEstimator, NoPeers, TestId, TestTransport, election_config, make_transport,
+    NoPeers, SecondaryHarness, TestId, election_config, make_secondary,
 };
 use super::super::*;
 use dynrunner_core::TaskInfo;
-use dynrunner_scheduler::ResourceStealingScheduler;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -20,28 +19,14 @@ use std::path::PathBuf;
 /// observer MODE on the coordinator: observer-ness is the standalone
 /// `ObserverCoordinator` role plus the peer-side `RoleTable.observers`
 /// filter, never a `config` flag.
-fn make_zero_worker_late_joiner(
-    node_id: &str,
-) -> SecondaryCoordinator<
-    TestTransport<NoPeers>,
-    dynrunner_transport_channel::ChannelManagerEnd,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
-    // The node holds the `NoPeers` mesh stub directly; it restores from a
-    // snapshot, skips setup, and reads its terminal cue from
-    // `cluster_state` (RunComplete applied directly) — it never needs a
-    // primary uplink inbound, so dropping the uplink does not change what
-    // the late-joiner test exercises.
+fn make_zero_worker_late_joiner(node_id: &str) -> SecondaryHarness<NoPeers> {
+    // The node's mesh wraps the `NoPeers` stub; it restores from a snapshot,
+    // skips setup, and reads its terminal cue from `cluster_state`
+    // (RunComplete applied directly) — it never needs a primary inbound, so
+    // the `NoPeers` mesh does not change what the late-joiner test exercises.
     let mut config = election_config(node_id);
     config.num_workers = 0;
-    SecondaryCoordinator::new(
-        config,
-        make_transport(NoPeers),
-        ResourceStealingScheduler::memory(),
-        FixedEstimator(100),
-    )
+    make_secondary(config)
 }
 
 /// Build a synthetic `ClusterStateSnapshot<TestId>` carrying two
@@ -333,6 +318,9 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             // returns Ok and reports backpressure.
             let mut factory = super::super::test_helpers::FakeWorkerFactory;
             let result = sec.dispatch_message(assignment, &mut factory).await;
+            // Flush the queued backpressure report onto the RecordingPeer log
+            // (MeshClient::send is queued, drained by the pump).
+            sec.drain_egress().await;
             assert!(
                 result.is_ok(),
                 "TaskAssignment to a 0-worker Operational node must not \
@@ -441,6 +429,9 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             };
 
             let result = sec.dispatch_message(assignment, &mut factory).await;
+            // Flush the queued backpressure report onto the RecordingPeer log
+            // (MeshClient::send is queued, drained by the pump).
+            sec.drain_egress().await;
             assert!(result.is_ok(), "dispatch must succeed, got {result:?}");
 
             // The task landed on the FIRST idle slot (0), proving the
@@ -541,6 +532,9 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
 
             let mut factory = super::super::test_helpers::FakeWorkerFactory;
             let result = sec.dispatch_message(assignment, &mut factory).await;
+            // Flush the queued backpressure report onto the RecordingPeer log
+            // (MeshClient::send is queued, drained by the pump).
+            sec.drain_egress().await;
             assert!(
                 result.is_ok(),
                 "unresolvable TaskAssignment to a 0-worker node must not \
@@ -641,6 +635,8 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
             // before examining any task. Post-fix it completes.
             sec.handle_initial_assignment(zip_files, workers_ready, vec![], &mut factory)
                 .await;
+            // Flush the queued fail-loud report onto the RecordingPeer log.
+            sec.drain_egress().await;
 
             // No worker exists, so nothing is tracked as active.
             assert!(

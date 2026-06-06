@@ -20,14 +20,13 @@ use dynrunner_manager_local::oom::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL, OomWatcher, OomWatcherConfig,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{Destination, PeerId, PeerTransport};
+use dynrunner_protocol_primary_secondary::{Destination, PeerId};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::{RunOutcome, SecondaryCoordinator};
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -199,9 +198,9 @@ where
             // cancel-safe because the periodic ticks (keepalive, oom)
             // will cancel the in-flight recv/event futures whenever
             // they fire. `pool.recv_event` is `mpsc::Receiver::recv`
-            // (documented cancel-safe). `transport.recv_peer` is the one
-            // mesh inbound stream, backed by a per-connection bridge-task
-            // mpsc (cancel-safe; see `MessageReceiver` doc).
+            // (documented cancel-safe). `inbox.recv` is the role's mesh
+            // inbound stream, an `mpsc::UnboundedReceiver::recv` fed by the
+            // mesh-pump's demux (cancel-safe).
             // `interval.tick` is itself cancel-safe per tokio docs.
             tokio::select! {
                 // The pool lives inside `OperationalState`. The recv
@@ -209,12 +208,12 @@ where
                 // FIELD path (a partial borrow of `self.lifecycle`), NOT
                 // the `op_mut()` coordinator method (which borrows ALL of
                 // `self` and would conflict with the sibling
-                // `self.transport.recv_peer()` arm). The two recv futures
-                // then borrow disjoint fields (`self.lifecycle` vs
-                // `self.transport`), and both borrows release the moment
-                // `select!` picks a winner, so the arm BODIES are free to
-                // use `&mut self` methods. The `expect` is sound: this loop
-                // runs only after the `enter_operational` transition above.
+                // `self.inbox.recv()` arm). The two recv futures then borrow
+                // disjoint fields (`self.lifecycle` vs `self.inbox`), and
+                // both borrows release the moment `select!` picks a winner,
+                // so the arm BODIES are free to use `&mut self` methods. The
+                // `expect` is sound: this loop runs only after the
+                // `enter_operational` transition above.
                 event = self
                     .lifecycle
                     .operational_mut()
@@ -229,15 +228,16 @@ where
                         }
                     }
                 }
-                // Single mesh inbound arm. There is one mesh inbound
-                // stream — the manager addresses peers by id and the mesh
-                // relays. Failover-health is driven by the send-side
-                // no-route probe plus the keepalive time-axis in
-                // `check_primary_link_threshold`. A `None` here means the
-                // mesh inbound stream closed: no more frames can ever
-                // arrive, so exit cleanly — the historical "inbound
-                // closed = end of run" contract.
-                msg = self.transport.recv_peer() => {
+                // Single mesh inbound arm. There is one role inbound
+                // stream — the mesh-pump demuxes every wire frame addressed
+                // to this secondary's slot onto `self.inbox`. Failover-health
+                // is driven by the send-side no-route probe plus the
+                // keepalive time-axis in `check_primary_link_threshold`. A
+                // `None` here means every write end of the slot's inbound
+                // dropped (role teardown): no more frames can ever arrive,
+                // so exit cleanly — the historical "inbound closed = end of
+                // run" contract.
+                msg = self.inbox.recv() => {
                     match msg {
                         Some(m) => {
                             self.handle_inbound(m, factory).await;

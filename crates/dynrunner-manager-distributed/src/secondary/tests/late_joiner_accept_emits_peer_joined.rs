@@ -1,47 +1,34 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId, election_config, make_transport,
+    FakeWorkerFactory, RecordingPeer, SecondaryHarness, TestId, election_config,
+    make_secondary_recording,
 };
-use super::super::*;
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
-use dynrunner_scheduler::ResourceStealingScheduler;
 use tokio::sync::mpsc as tokio_mpsc;
 
-/// Build a SecondaryCoordinator over a `RecordingPeer` mesh stub so the
-/// test can inspect what got broadcast over the peer mesh on the
-/// late-joiner accept path.
+/// Build a secondary over a `RecordingPeer` mesh stub so the test can
+/// inspect what got broadcast over the peer mesh on the late-joiner accept
+/// path. The coordinator's `MeshClient` QUEUES sends, so a test calls
+/// `sec.drain_egress().await` after the `dispatch_message` and before
+/// reading `peer_log`.
 #[allow(clippy::type_complexity)]
 fn make_secondary_with_recording_peer(
     secondary_id: &str,
 ) -> (
-    SecondaryCoordinator<
-        super::super::test_helpers::TestTransport<RecordingPeer<TestId>>,
-        dynrunner_transport_channel::ChannelManagerEnd,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    SecondaryHarness<RecordingPeer<TestId>>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
     // `sec_to_pri_rx` is returned by this helper's signature; its sender
     // was the (now removed) channel uplink. These tests drive
     // `dispatch_message` directly and assert on the `RecordingPeer` mesh
-    // log (the `PeerJoined` broadcast / snapshot-reply land there), not
-    // on `sec_to_pri_rx`, so dropping the uplink does not change what
-    // they exercise. The secondary holds the `RecordingPeer` mesh stub
-    // directly.
+    // log (the `PeerJoined` broadcast / snapshot-reply land there), not on
+    // `sec_to_pri_rx`, so dropping the uplink does not change what they
+    // exercise.
     let (_sec_to_pri_tx, sec_to_pri_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let recorder = RecordingPeer::<TestId>::new(1);
-    let peer_log = recorder.log_handle();
-    let sec = SecondaryCoordinator::new(
-        election_config(secondary_id),
-        make_transport(recorder),
-        ResourceStealingScheduler::memory(),
-        FixedEstimator(100),
-    );
+    let (sec, peer_log) = make_secondary_recording(election_config(secondary_id), 1);
     (sec, sec_to_pri_rx, peer_log)
 }
 
@@ -100,6 +87,9 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
                 .expect("RequestClusterSnapshot handler succeeds");
+            // Flush the queued PeerJoined broadcast / snapshot reply onto the
+            // RecordingPeer log (MeshClient::send is queued).
+            sec.drain_egress().await;
 
             // Originator-side apply landed locally: the observer joiner
             // shows up in the observer projection.
@@ -156,6 +146,9 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
             sec.dispatch_message(req, &mut FakeWorkerFactory)
                 .await
                 .expect("RequestClusterSnapshot handler succeeds");
+            // Flush the queued PeerJoined broadcast / snapshot reply onto the
+            // RecordingPeer log (MeshClient::send is queued).
+            sec.drain_egress().await;
 
             // A worker joiner must NOT enter the observer projection.
             assert!(

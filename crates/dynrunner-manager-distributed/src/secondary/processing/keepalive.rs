@@ -11,17 +11,14 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, KeepaliveRole, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, KeepaliveRole};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::wire::timestamp_now;
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,

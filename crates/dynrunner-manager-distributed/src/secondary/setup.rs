@@ -4,16 +4,15 @@ use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, SetupBootstrapMessage,
+    DistributedBinaryInfo, DistributedMessage, MessageType, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::SecondaryCoordinator;
 use super::wire::{distributed_to_binary, timestamp_now};
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -213,12 +212,12 @@ where
         let mut got_transfer = false;
 
         while !got_peer_info || !got_assignment || !got_transfer {
-            // Opaque inbound: the one mesh inbound stream. During setup
-            // the mesh is still forming, so this yields the primary's
-            // setup frames as the primary host dials/accepts; the
-            // manager addresses peers by id and never sees a transport
-            // role split.
-            match self.transport.recv_peer().await {
+            // Opaque inbound: the role inbound stream. During setup the
+            // mesh is still forming, so the mesh-pump demuxes the primary's
+            // setup frames onto this secondary's slot inbox as the primary
+            // host dials/accepts; the manager addresses peers by id and
+            // never sees a transport role split.
+            match self.inbox.recv().await {
                 Some(msg) => {
                     // FIRST primary-originated frame = the announce. This
                     // is the `AwaitingPrimary → Configuring` boundary: the
@@ -266,11 +265,25 @@ where
                                 // lifecycle plumbing will consume it) but
                                 // is no longer the source of truth for
                                 // `RoleTable.observers`.
-                                // Non-blocking: per-peer dials run as
-                                // spawn_local tasks; returns immediately.
-                                // `connect_to_peers` dials the rest of the one
-                                // mesh (the primary link is already connected).
-                                self.transport.connect_to_peers(peers).await;
+                                //
+                                // PHASE-C-SEAM[C-NODE]: peer-mesh DIAL. In the
+                                // one-mesh model the transport (and
+                                // `connect_to_peers`) lives in the `Node`'s
+                                // `Mesh`, not on the coordinator — the
+                                // secondary holds only a `MeshClient` /
+                                // `RoleInbox`, neither of which dials. Dialing
+                                // the rest of the mesh on a PeerInfo is a
+                                // transport/membership concern the `Node`
+                                // (mesh-pump) owns: it observes every inbound
+                                // wire frame, so it can dial off the same
+                                // PeerInfo without a manager-layer
+                                // `connect_to_peers` call (clarification RV-2 —
+                                // don't re-derive membership at the manager
+                                // layer). The watchdog arming below stays here
+                                // (it operates on this coordinator's own
+                                // `MeshFormation` sub-concern, which the
+                                // coordinator still owns).
+                                let _ = peers;
                                 // Arm the peer-mesh watchdog. 30s = 10s
                                 // QUIC timeout + 10s WSS fallback timeout
                                 // + 10s slack for the accept side to

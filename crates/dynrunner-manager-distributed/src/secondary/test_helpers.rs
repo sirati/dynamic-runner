@@ -1,9 +1,27 @@
 //! Shared test fixtures for secondary-side tests. Compiled only under
 //! `#[cfg(test)]` so it never enters the production binary.
+//!
+//! # The mesh harness
+//!
+//! Post one-mesh, a `SecondaryCoordinator` no longer holds a transport: it
+//! reaches the wire ONLY through a [`crate::process::MeshClient`] (egress) +
+//! [`crate::process::RoleInbox`] (ingress), minted together with its
+//! `Arc<RoleSlot>` by `Mesh::register_local_role`. So every fixture wraps the
+//! test transport in a [`crate::process::Mesh`], registers the secondary
+//! role, and hands the coordinator the minted `client + inbox` plus a
+//! `promotion_tx`. The fixture returns a [`SecondaryHarness`] that OWNS the
+//! `Mesh` (so a test can drain the coordinator's queued egress against the
+//! transport — `MeshClient::send` is QUEUED, not synchronous), the
+//! `Arc<RoleSlot>` (keeping it alive so loopback delivery works), and the
+//! `promotion_rx` (so the C4 promotion signal has a live receiver to assert
+//! on). The harness `Deref`s to the coordinator so existing `sec.method()` /
+//! `sec.field` call sites are unchanged.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
@@ -19,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::{SecondaryConfig, SecondaryCoordinator};
+use crate::process::{LocalRole, Mesh, PromotionSignal, RoleSlot};
 
 /// The single `Tr: PeerTransport` secondary tests construct: the
 /// peer-mesh stub itself. `P` lets a test pick the stub (`NoPeers`,
@@ -35,11 +54,130 @@ use super::{SecondaryConfig, SecondaryCoordinator};
 /// a channel-backed mesh stub with the primary link folded in.
 pub(super) type TestTransport<P> = P;
 
-/// Build a [`TestTransport`] from a peer-mesh stub. The secondary holds
-/// the stub directly as its `Tr: PeerTransport` (the primary is a mesh
-/// peer reached by id, not a wrapped uplink).
+/// Build a [`TestTransport`] from a peer-mesh stub. The mesh wraps the
+/// stub; the secondary reaches it through the minted `MeshClient` /
+/// `RoleInbox` (the primary is a mesh peer reached by id, not a wrapped
+/// uplink).
 pub(super) fn make_transport<P: PeerTransport<TestId>>(peer: P) -> TestTransport<P> {
     peer
+}
+
+/// The concrete secondary coordinator type a test fixture builds. The
+/// coordinator no longer carries a transport generic — the mesh does — so
+/// this type is the same regardless of which peer-mesh stub backs the
+/// harness's `Mesh`.
+pub(super) type TestSecondary = SecondaryCoordinator<
+    ChannelManagerEnd,
+    ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+>;
+
+/// A built secondary plus the mesh plumbing a test must keep alive to
+/// drive it.
+///
+/// `Deref`/`DerefMut` to the [`SecondaryCoordinator`] so existing
+/// `sec.method()` / `sec.field` sites are unchanged. The harness OWNS:
+/// - `test_mesh`: the [`Mesh`] wrapping the transport. The coordinator's
+///   `MeshClient::send` QUEUES onto it; a test drains that queue with
+///   [`SecondaryHarness::drain_egress`] (which applies each dispatch
+///   against the transport, so a `RecordingPeer` log / channel receiver
+///   sees the sends) and routes inbound wire frames with
+///   [`SecondaryHarness::pump_inbound`].
+/// - `_slot`: the secondary's `Arc<RoleSlot>`. Held so the mesh `Weak`
+///   keeps upgrading (loopback delivery + the slot inbound stay live).
+/// - `promotion_rx`: the C4 promotion-signal receiver. A promotion test
+///   asserts a [`PromotionSignal`] arrives here.
+pub(super) struct SecondaryHarness<P: PeerTransport<TestId>> {
+    coord: TestSecondary,
+    pub(super) test_mesh: Mesh<TestId, P>,
+    _slot: Arc<RoleSlot<TestId>>,
+    pub(super) promotion_rx: mpsc::UnboundedReceiver<PromotionSignal>,
+}
+
+impl<P: PeerTransport<TestId>> Deref for SecondaryHarness<P> {
+    type Target = TestSecondary;
+    fn deref(&self) -> &Self::Target {
+        &self.coord
+    }
+}
+
+impl<P: PeerTransport<TestId>> DerefMut for SecondaryHarness<P> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.coord
+    }
+}
+
+impl<P: PeerTransport<TestId>> SecondaryHarness<P> {
+    /// Drain EVERY currently-queued egress dispatch the coordinator's
+    /// `MeshClient` enqueued, applying each against the mesh (and thus the
+    /// transport). After this returns, a `RecordingPeer` log / channel
+    /// receiver has observed all the sends. Also publishes the live
+    /// membership so the coordinator's `has_peer` egress gate reads the
+    /// transport truth.
+    ///
+    /// `MeshClient::send` enqueues synchronously, so by the time a test
+    /// awaits this every send it issued is already in the queue. The
+    /// `biased` select drains each ready item and breaks the instant the
+    /// queue is empty (the `next_local_dispatch` future parks `Pending`, so
+    /// the always-`Ready` fallback arm fires) — never blocking on a frame
+    /// that hasn't been sent.
+    pub(super) async fn drain_egress(&mut self) {
+        self.test_mesh.publish_membership();
+        loop {
+            tokio::select! {
+                biased;
+                item = self.test_mesh.next_local_dispatch() => match item {
+                    Some(i) => {
+                        let _ = self.test_mesh.apply_local_dispatch(i).await;
+                    }
+                    None => break,
+                },
+                _ = std::future::ready(()) => break,
+            }
+        }
+    }
+
+    /// Publish the live transport membership into the view the
+    /// coordinator's `MeshClient` reads (the `has_peer` no-route gate).
+    /// Call after seeding peer outboxes / registering the primary link so
+    /// a direct-method-call test (no running pump) sees a fresh view.
+    pub(super) fn publish_membership(&mut self) {
+        self.test_mesh.publish_membership();
+    }
+
+    /// Deliver one wire frame to this secondary's slot inbox — the test
+    /// analogue of the mesh-pump's ingress demux for a single-role harness
+    /// (every inbound frame in these fixtures is for the secondary).
+    pub(super) fn deliver_to_inbox(&mut self, frame: DistributedMessage<TestId>) -> bool {
+        self.test_mesh.deliver_local(LocalRole::Secondary, frame)
+    }
+}
+
+/// Wrap `transport` in a mesh, register the secondary role, and build the
+/// coordinator with the minted `client + inbox` + a fresh promotion
+/// channel. The single place every fixture mints the trio + signal, so a
+/// test never hand-pairs a client with the wrong inbox.
+fn build_harness<P: PeerTransport<TestId>>(
+    config: SecondaryConfig,
+    transport: P,
+    scheduler: ResourceStealingScheduler,
+    estimator: FixedEstimator,
+) -> SecondaryHarness<P> {
+    let secondary_id = config.secondary_id.clone();
+    let mut mesh = Mesh::new(transport);
+    let (slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from(secondary_id.as_str()));
+    mesh.publish_membership();
+    let (promotion_tx, promotion_rx) = mpsc::unbounded_channel();
+    let mut coord = SecondaryCoordinator::new(config, client, inbox, scheduler, estimator);
+    coord.register_promotion_signal(promotion_tx);
+    SecondaryHarness {
+        coord,
+        test_mesh: mesh,
+        _slot: slot,
+        promotion_rx,
+    }
 }
 
 /// Build the channel-backed mesh transport a secondary holds when driven
@@ -233,13 +371,24 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     fn peer_count(&self) -> usize {
         self.peer_count
     }
-    fn has_peer(&self, _id: &PeerId) -> bool {
-        // Identity-blind recorder: it models a configurable peer
-        // CARDINALITY (`self.peer_count`) for the "healthy mesh vs no
-        // peers" branches but records sends keyed by nothing. The only
-        // internally-consistent boolean it can give is derived from that
-        // count: a non-empty mesh has peers, an empty one does not.
-        self.peer_count > 0
+    fn has_peer(&self, id: &PeerId) -> bool {
+        // Synthetic membership: the recorder models a healthy mesh with the
+        // primary reachable (every recording test drives a node that already
+        // recognises a `"primary"`), plus `peer_count` peers. The egress
+        // no-route gate (`send_to`'s `has_peer` check on a resolved
+        // `Peer(id)`) reads this through the published `MembershipView`, so
+        // a `Destination::Primary` send must NOT be no-routed away here — it
+        // is the very send these tests want to observe in the log.
+        self.connected_ids().iter().any(|c| c == id)
+    }
+    fn connected_ids(&self) -> Vec<PeerId> {
+        // The folded primary is always a member; the configured cardinality
+        // is filled with `peer-{i}` ids. This backs the published view the
+        // coordinator's egress gate reads — `has_peer("primary")` is true so
+        // the recorded primary-bound sends route, and `peer_count()` agrees.
+        std::iter::once(PeerId::from("primary"))
+            .chain((0..self.peer_count).map(|i| PeerId::from(format!("peer-{i}").as_str())))
+            .collect()
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
@@ -333,22 +482,15 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
     }
 }
 
-/// Construct a SecondaryCoordinator holding a `NoPeers` mesh stub
-/// directly, detached from any real primary or peer; used to drive the
-/// election state machine via direct method calls without a full
-/// multi-process harness.
-pub(super) fn make_secondary(
-    config: SecondaryConfig,
-) -> SecondaryCoordinator<
-    TestTransport<NoPeers>,
-    ChannelManagerEnd,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
-    SecondaryCoordinator::new(
+/// Construct a secondary over a `NoPeers` mesh stub, detached from any
+/// real primary or peer; used to drive the election state machine via
+/// direct method calls without a full multi-process harness. Returns the
+/// mesh harness — `Deref`s to the coordinator, so `sec.method()` /
+/// `sec.field` sites are unchanged.
+pub(super) fn make_secondary(config: SecondaryConfig) -> SecondaryHarness<NoPeers> {
+    build_harness(
         config,
-        make_transport(NoPeers),
+        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -364,25 +506,20 @@ pub(super) fn make_secondary(
 /// Used by the setup-discovery designation tests to build the same
 /// membership view a node's mirror holds after the primary broadcasts the
 /// fleet roster — the input `is_designated_discoverer` reads.
-pub(super) fn seed_member<Tr, M, S, E>(
-    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+pub(super) fn seed_member<P: PeerTransport<TestId>>(
+    sec: &mut SecondaryHarness<P>,
     id: &str,
     can_be_primary: bool,
     is_observer: bool,
-) where
-    Tr: PeerTransport<TestId>,
-    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
-    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
-    E: ResourceEstimator<TestId> + Clone,
-{
+) {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    coord.cluster_state.apply(ClusterMutation::PeerJoined {
+    sec.cluster_state.apply(ClusterMutation::PeerJoined {
         peer_id: id.into(),
         is_observer,
         can_be_primary,
         cap_version: Default::default(),
     });
-    coord.cluster_state.apply(ClusterMutation::SecondaryCapacity {
+    sec.cluster_state.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.into(),
         worker_count: 1,
         resources: vec![],
@@ -393,17 +530,12 @@ pub(super) fn seed_member<Tr, M, S, E>(
 /// through the REAL `PrimaryChanged` apply path (epoch 1, advisory
 /// `Transferred` reason — the bootstrap-relocate shape). `is_designated_
 /// discoverer`'s sibling axis (5) reads `current_primary()`.
-pub(super) fn set_current_primary<Tr, M, S, E>(
-    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
+pub(super) fn set_current_primary<P: PeerTransport<TestId>>(
+    sec: &mut SecondaryHarness<P>,
     id: &str,
-) where
-    Tr: PeerTransport<TestId>,
-    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
-    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
-    E: ResourceEstimator<TestId> + Clone,
-{
+) {
     use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
-    coord.cluster_state.apply(ClusterMutation::<TestId>::PrimaryChanged {
+    sec.cluster_state.apply(ClusterMutation::<TestId>::PrimaryChanged {
         new: id.into(),
         epoch: 1,
         reason: PrimaryChangeReason::Transferred,
@@ -416,48 +548,35 @@ pub(super) fn set_current_primary<Tr, M, S, E>(
 /// itself. After this the node satisfies axes (4) + (5) of
 /// `setup_discovery_pending`, so the legacy single-node yield tests (which
 /// predate the designation gate) hold their original intent.
-pub(super) fn arm_designated_discoverer<Tr, M, S, E>(
-    coord: &mut SecondaryCoordinator<Tr, M, S, E, TestId>,
-) where
-    Tr: PeerTransport<TestId>,
-    M: dynrunner_protocol_manager_worker::ManagerEndpoint + 'static,
-    S: dynrunner_scheduler_api::Scheduler<TestId> + Clone,
-    E: ResourceEstimator<TestId> + Clone,
-{
-    let self_id = coord.config.secondary_id.clone();
-    seed_member(coord, &self_id, true, false);
-    set_current_primary(coord, &self_id);
+pub(super) fn arm_designated_discoverer<P: PeerTransport<TestId>>(sec: &mut SecondaryHarness<P>) {
+    let self_id = sec.config.secondary_id.clone();
+    seed_member(sec, &self_id, true, false);
+    set_current_primary(sec, &self_id);
 }
 
-/// Construct a SecondaryCoordinator over the unified transport with a
-/// [`RecordingPeer`] mesh stub, returning the coordinator + the shared
-/// broadcast log so a test can assert on the messages the failover
-/// terminal action (e.g. the `PrimaryChanged { new = self }` re-point)
-/// fans out onto the mesh. `peer_count` configures the recorder's
-/// reported mesh cardinality.
-#[allow(clippy::type_complexity)]
+/// Construct a secondary over a [`RecordingPeer`] mesh stub, returning the
+/// harness + the shared broadcast log so a test can assert on the messages
+/// the failover terminal action (e.g. the `PrimaryChanged { new = self }`
+/// re-point) fans out onto the mesh. Because `MeshClient::send` is QUEUED,
+/// a test must call [`SecondaryHarness::drain_egress`] AFTER the
+/// send-issuing call and BEFORE reading the log. `peer_count` configures
+/// the recorder's reported mesh cardinality.
 pub(super) fn make_secondary_recording(
     config: SecondaryConfig,
     peer_count: usize,
 ) -> (
-    SecondaryCoordinator<
-        TestTransport<RecordingPeer<TestId>>,
-        ChannelManagerEnd,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    SecondaryHarness<RecordingPeer<TestId>>,
     Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
     let recorder = RecordingPeer::<TestId>::new(peer_count);
     let log = recorder.log_handle();
-    let coord = SecondaryCoordinator::new(
+    let harness = build_harness(
         config,
-        make_transport(recorder),
+        recorder,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    (coord, log)
+    (harness, log)
 }
 
 /// Build a pre-staged, operational secondary whose replicated mirror holds
@@ -466,19 +585,12 @@ pub(super) fn make_secondary_recording(
 /// and the given recognized `current_primary`. This is the membership view
 /// a node's mirror holds after the primary broadcasts the fleet roster —
 /// the exact input `setup_discovery_pending`'s designation axes read.
-#[allow(clippy::type_complexity)]
 pub(super) fn node_with_roster(
     self_id: &str,
     roster: &[(&str, bool, bool)],
     current_primary: Option<&str>,
 ) -> (
-    SecondaryCoordinator<
-        TestTransport<RecordingPeer<TestId>>,
-        ChannelManagerEnd,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    SecondaryHarness<RecordingPeer<TestId>>,
     Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
     let (mut sec, log) = make_secondary_recording(election_config(self_id), roster.len());
@@ -491,4 +603,93 @@ pub(super) fn node_with_roster(
         set_current_primary(&mut sec, p);
     }
     (sec, log)
+}
+
+/// Build a secondary over a `ChannelPeerTransport` mesh stub, returning the
+/// harness. The trio is minted from a real `Mesh` over the channel
+/// transport, so a test can drive the operational `select!` loop end-to-end
+/// by running the coordinator's `run` future alongside the mesh-pump (see
+/// [`run_secondary_to_completion`]).
+pub(super) fn make_secondary_channel(
+    config: SecondaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+) -> SecondaryHarness<ChannelPeerTransport<TestId>> {
+    build_harness(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    )
+}
+
+/// Drive a channel-backed secondary's `run` to completion against a test
+/// mesh-pump.
+///
+/// The coordinator's `MeshClient` only QUEUES sends and its `RoleInbox` is
+/// fed only by the mesh; in production the `Node` runs a pump that drains
+/// the egress onto the wire AND demuxes inbound wire frames onto each
+/// role's slot — CONCURRENTLY, so a queued send never starves while the
+/// pump awaits an inbound (clarification M4). That concurrent pump needs
+/// disjoint access to the mesh's egress-queue receiver and the transport's
+/// inbound, which the C0 `Mesh` exposes only behind `&mut self` methods —
+/// not borrowable in two simultaneous `select!` arms. The real concurrent
+/// pump is `Node::run`, the C-NODE wave.
+///
+/// PENDING-C-NODE: this sequential pump (drain ALL ready egress, then await
+/// ONE inbound) is correct only for a strictly ping-pong fixture; a fixture
+/// where the secondary enqueues a send AND THEN awaits an inbound that
+/// depends on it can starve the send while the pump is parked on a prior
+/// `recv_peer`. Callers that drive a non-ping-pong handshake therefore gate
+/// on `Node::run` (the tests using this are `#[ignore]`d until C-NODE lands
+/// the concurrent pump). It is kept compiling so those test bodies are
+/// migrated to the harness constructor and re-enable cleanly under C-NODE.
+///
+/// - EGRESS: drain `next_local_dispatch` → `apply_local_dispatch`, which
+///   routes each frame loopback-or-remote (the secondary's primary-bound
+///   sends go over the wire to the folded `"primary"` link).
+/// - INGRESS: `recv_peer` → deliver to the secondary slot. These fixtures
+///   host exactly ONE local role, so every inbound wire frame is for the
+///   secondary; the `fake_primary` does not stamp C3 targets, so the
+///   single-role `deliver_local` is the faithful demux here.
+pub(super) async fn run_secondary_to_completion(
+    harness: &mut SecondaryHarness<ChannelPeerTransport<TestId>>,
+    factory: &mut impl WorkerFactory<ChannelManagerEnd>,
+) -> Result<(), String> {
+    let SecondaryHarness {
+        coord, test_mesh, ..
+    } = harness;
+
+    // Sequential pump: borrow `test_mesh` for ONE drain/await at a time so
+    // the two `&mut self` mesh methods never coexist in a `select!`.
+    let pump = async {
+        loop {
+            // Drain all currently-ready egress (single borrow per select).
+            loop {
+                tokio::select! {
+                    biased;
+                    item = test_mesh.next_local_dispatch() => match item {
+                        Some(i) => {
+                            let _ = test_mesh.apply_local_dispatch(i).await;
+                        }
+                        None => return,
+                    },
+                    _ = std::future::ready(()) => break,
+                }
+            }
+            // Then await one inbound and route it to the secondary slot.
+            match test_mesh.recv_peer().await {
+                Some(frame) => {
+                    test_mesh.deliver_local(LocalRole::Secondary, frame);
+                }
+                None => return,
+            }
+        }
+    };
+
+    let run = coord.run(factory);
+
+    tokio::select! {
+        r = run => r,
+        _ = pump => Err("mesh-pump exited before the secondary run completed".to_string()),
+    }
 }

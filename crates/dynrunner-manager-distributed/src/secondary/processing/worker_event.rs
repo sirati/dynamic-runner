@@ -17,7 +17,7 @@ use dynrunner_core::{ErrorType, Identifier, WorkerId};
 use dynrunner_manager_local::oom::{OomWatcher, classify_disconnect};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 /// Same window as the LocalManager path — 500ms covers ~10 samples
@@ -29,9 +29,8 @@ const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
 use super::super::SecondaryCoordinator;
 use super::super::wire::timestamp_now;
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,

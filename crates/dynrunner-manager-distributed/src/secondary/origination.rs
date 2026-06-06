@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use dynrunner_core::{BoundedString, Identifier, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, PeerTransport, RemovalCause,
+    ClusterMutation, Destination, DistributedMessage, RemovalCause,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
@@ -71,9 +71,8 @@ pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     }
 }
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,

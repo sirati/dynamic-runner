@@ -4,7 +4,7 @@ use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, PeerTransport, SendTarget, resolve_destination,
+    Destination, DistributedMessage, SendTarget, resolve_destination,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -22,34 +22,75 @@ pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resour
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// THE egress edge: resolve a typed [`Destination`] to a concrete
-    /// transport target by reading this coordinator's own role facts,
-    /// then dispatch the `PeerId`-only transport. The transport never
-    /// resolves a role.
+    /// THE egress edge: resolve the role-bearing [`Destination`] this
+    /// coordinator owns the facts for, stamp it on the frame (the C3 routing
+    /// field the RECEIVER's mesh-pump demuxes by), and queue the frame onto
+    /// the one mesh through this coordinator's [`crate::process::MeshClient`].
+    /// The coordinator never names a transport and never branches on
+    /// locality.
     ///
-    /// Resolution reads `cluster_state.current_primary()` (warm after a
-    /// `PrimaryChanged`) with the bootstrap-primary id as the cold-cache
-    /// fallback — exactly the by-id `Destination::Primary` resolution
-    /// that supersedes the deleted transport-resident
-    /// `Address::Role(Primary)` lookup. `Secondary`/`Observer`
-    /// destinations resolve to their carried host id; `All` is the mesh
-    /// broadcast. A resolved host id equal to this node's own id is
-    /// [`SendTarget::Loopback`].
+    /// `resolve_destination` stays AT this coordinator (clarification H1):
+    /// its role-specific bootstrap fallback (`current_primary()` warm after
+    /// a `PrimaryChanged`, the bootstrap-primary id as the cold-cache
+    /// fallback) is the GATE that produces the honest "no route to the
+    /// primary" `Err` the failover-health probe in [`Self::send_to_primary`]
+    /// keys on. The probe fires in TWO cases, both surfaced here before the
+    /// frame is queued:
+    ///   - `resolve_destination` returns `None` — no current primary AND no
+    ///     bootstrap link, so nothing resolves at all.
+    ///   - it resolves to a concrete remote [`SendTarget::Peer`] that is NOT
+    ///     a connected mesh member (`!self.client.has_peer(id)`). This is the
+    ///     one-mesh analogue of the deleted transport-level
+    ///     `send_to_peer(id) -> NoRoute Err`: because
+    ///     [`crate::process::MeshClient::send`] is QUEUED (it returns `Ok`
+    ///     the moment it enqueues, never observing the eventual wire result),
+    ///     the no-route signal must be read from the pump-published
+    ///     membership view at egress, not awaited from the send. The view is
+    ///     ≤1-cycle stale + monotone-toward-truth, which is SAFE for the
+    ///     probe: it never declares death (the probe only feeds a thresholded
+    ///     health window that a successful keepalive resets), and a stale-high
+    ///     `has_peer` merely delays the probe by one cycle — the keepalive
+    ///     time-axis backstop covers that window.
+    ///
+    /// # Two `Destination`s: the routing send-target vs the C3 stamp
+    ///
+    /// The mesh-pump's `dispatch` routes the queued frame by the
+    /// `MeshClient::send` `target` (loopback-vs-remote by id); the RECEIVER's
+    /// pump demuxes it to a local slot by the frame's STAMPED `target()`.
+    /// They are the same for all but the REMOTE-primary case, because
+    /// [`Destination::Primary`] is id-less and the mesh cannot route it by
+    /// host (the documented C3-seam `Mesh::dispatch` leaves open). So the
+    /// egress resolves `Destination::Primary` to its concrete host BEFORE
+    /// dispatch (per the `Mesh::dispatch` Primary-arm contract):
+    ///   - `SendTarget::Loopback` (a promoted self): send `dst` itself — the
+    ///     mesh loopbacks to the local role slot via `deliver_local`. Stamp
+    ///     `dst`.
+    ///   - `SendTarget::Peer(id)` from `Destination::Primary` (a REMOTE
+    ///     primary): send an id-bearing target carrying `id` so the mesh
+    ///     routes it by-id over the wire, but STAMP `Destination::Primary` so
+    ///     the receiving pump delivers to that host's PRIMARY slot.
+    ///   - `SendTarget::Peer(id)` from `Secondary`/`Observer`, and
+    ///     `SendTarget::Broadcast`: send `dst` itself; stamp `dst`.
+    ///
+    /// Nothing is dropped: a self-addressed `Destination::Primary` loopbacks
+    /// to the local primary slot; a remote one routes by its resolved host.
     pub(in crate::secondary) async fn send_to(
         &mut self,
         dst: Destination,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
+        // No-route GATE — the failover-health probe substrate. Resolve the
+        // role facts this coordinator owns; `None` is "no primary resolvable
+        // at all".
         let target = resolve_destination(
-            dst,
+            dst.clone(),
             self.cluster_state.current_primary(),
             self.bootstrap_primary_id.as_deref(),
             &self.config.secondary_id,
@@ -59,27 +100,32 @@ where
              bootstrap primary link — no route to the primary"
                 .to_string()
         })?;
-        match target {
-            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
-            // Broadcast egress. `transport.broadcast` fans the frame to
-            // REMOTE peers only — a node has no self-connection
-            // (`PeerNetwork::broadcast` iterates `self.connections`, which
-            // never holds the host's own id). The single home for EVERY
-            // `Destination::All` frame.
-            SendTarget::Broadcast => self.transport.broadcast(msg).await,
-            // PHASE-C-SEAM[C2]: secondary egress collapse. The resolved
-            // primary host id == this node's id (a self-addressed
-            // `Destination::Primary`). Phase C resolves this to an
-            // in-process loopback through the one-mesh `mesh.dispatch`;
-            // until then this is an unimplemented seam.
-            SendTarget::Loopback => {
-                let _ = &msg;
-                unimplemented!(
-                    "phase-c: C2 — secondary egress collapse to mesh.dispatch \
-                     (self-addressed Destination::Primary loopback delivery)"
-                )
-            }
+        // A resolved remote host that is NOT a connected member is the
+        // queued-mesh analogue of the old transport-level NoRoute — surface
+        // it as the probe `Err`. `Loopback` (a promoted self) and `Broadcast`
+        // never no-route.
+        if let SendTarget::Peer(id) = &target
+            && !self.client.has_peer(id)
+        {
+            return Err(format!(
+                "no route to {id}: resolved host is not a connected mesh member \
+                 (queued-mesh no-route — failover-health probe)"
+            ));
         }
+        // The C3 stamp is ALWAYS the role-bearing intent `dst` — it is what
+        // the receiver demuxes to a slot. The routing send-target carries the
+        // resolved host ONLY for a remote `Destination::Primary` (id-less, so
+        // the mesh can't route it by host without the resolution done here).
+        let send_target = match (&dst, &target) {
+            (Destination::Primary, SendTarget::Peer(id)) => {
+                Destination::Secondary(id.clone())
+            }
+            _ => dst.clone(),
+        };
+        // Queue it. `MeshClient::send` is QUEUED (M4): the pump drains it and
+        // routes loopback-or-remote against the live slots by `send_target`,
+        // and the receiving pump demuxes by the stamped `dst`.
+        self.client.send(send_target, msg.with_target(dst))
     }
 
     /// Send an operational frame to whoever currently holds the

@@ -24,7 +24,6 @@
 
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 // Re-exported into the module namespace for the `#[cfg(test)]` child
 // modules that reach it via `use super::super::*` (the production code in
 // this module no longer names `DistributedMessage` directly).
@@ -33,6 +32,7 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::ClusterState;
+use crate::process::{MeshClient, PromotionSignal, RoleInbox};
 use crate::zip_extract::ExtractionCache;
 
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
@@ -107,22 +107,25 @@ pub(super) struct PendingFirstBind<I: Identifier> {
 /// workers. It reports completions back and requests more work.
 ///
 /// Generic over:
-/// - `Tr`: the single `PeerId`-keyed mesh transport (a
-///   `PeerTransport<I>`). One opaque handle: the manager addresses by
-///   typed `Destination` and the egress edge ([`Self::send_to`])
-///   resolves it to a concrete peer-id (current/bootstrap primary,
-///   addressed secondary/observer, or broadcast). The transport never
-///   resolves a role — it is delivered a `PeerId`. The promotion
-///   re-route is implicit: `current_primary()` updates on every
-///   `PrimaryChanged`, so the next `Destination::Primary` resolves to
-///   the new holder.
 /// - `M`: manager endpoint for worker communication
 /// - `S`: scheduler
 /// - `E`: memory estimator
 /// - `I`: identifier type
-pub struct SecondaryCoordinator<Tr, M, S, E, I>
+///
+/// The coordinator holds NO transport: it reaches the one mesh ONLY
+/// through its [`MeshClient`] (egress) + [`RoleInbox`] (ingress), both
+/// minted together with the coordinator's `Arc<RoleSlot>` by
+/// `Mesh::register_local_role` and handed in at construction. The
+/// transport (and the role-demux that resolves a `Destination` to a
+/// loopback-or-remote send) lives in the `Node`'s `Mesh`; the
+/// coordinator never names it. The manager addresses by typed
+/// `Destination`, the egress edge ([`Self::send_to`]) stamps the
+/// resolved role-bearing target on the frame, and the mesh decides
+/// loopback-vs-remote. The promotion re-route is implicit:
+/// `current_primary()` updates on every `PrimaryChanged`, so the next
+/// `Destination::Primary` resolves to the new holder.
+pub struct SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
@@ -130,16 +133,39 @@ where
 {
     config: SecondaryConfig,
 
-    /// The single opaque `PeerId`-keyed mesh transport handle. Every
-    /// operational send goes through the [`Self::send_to`] egress edge,
-    /// which resolves a typed [`dynrunner_protocol_primary_secondary::Destination`]
-    /// to a concrete peer-id (or broadcast/loopback) by reading this
-    /// coordinator's own role facts, then calls the transport purely
-    /// by-id — the transport never resolves a role. Every inbound frame
-    /// arrives via `transport.recv_peer()`. The manager never names a
-    /// `primary_transport`/`peer_transport`, never reads `peer_count()`
-    /// for routing, and never branches on transport-locality.
-    transport: Tr,
+    /// Egress capability over the one mesh. Every operational send goes
+    /// through the [`Self::send_to`] egress edge, which resolves a typed
+    /// [`dynrunner_protocol_primary_secondary::Destination`] to a concrete
+    /// host by reading this coordinator's own role facts, stamps the
+    /// role-bearing target on the frame, and hands it to
+    /// [`MeshClient::send`] — QUEUED, drained by the mesh-pump, which
+    /// decides loopback-vs-remote against the live slot set. The manager
+    /// never names a `primary_transport`/`peer_transport` and never
+    /// branches on transport-locality. `peer_count`/`has_peer` (if ever
+    /// needed) read the pump-published membership view off this client.
+    client: MeshClient<I>,
+
+    /// Ingress stream over the one mesh. Every inbound frame addressed to
+    /// THIS role's slot arrives via [`RoleInbox::recv`] — the mesh-pump
+    /// has already demuxed the wire frame to this slot by its stamped
+    /// role-bearing target, so the coordinator receives only frames meant
+    /// for it. `None` from `recv()` is the role's teardown signal (every
+    /// write end of the slot's inbound dropped).
+    inbox: RoleInbox<I>,
+
+    /// Promotion signal egress — the C4 seam. On a self-named
+    /// `PrimaryChanged` (an election win via `fire_local_promotion`, or a
+    /// transferred primary) the secondary FIRES a [`PromotionSignal`] here
+    /// instead of building a primary itself (SUPREME-LAW #3: the secondary
+    /// NEVER constructs a primary). The matching receiver lives on the
+    /// `Node`, which builds the snapshot-seeded `PrimaryCoordinator` on the
+    /// signal. Installed before `run` via
+    /// [`Self::register_promotion_signal`] (mirror of
+    /// [`Self::register_panik_signal_rx`]). `None` for a coordinator with
+    /// no node-wiring (Rust-only unit fixtures that drive promotion through
+    /// direct method calls and assert on the CRDT identity advance instead
+    /// of a built primary); the fire site is then a best-effort no-op.
+    promotion_tx: Option<tokio::sync::mpsc::UnboundedSender<PromotionSignal>>,
 
     /// The peer-id of the primary this secondary dialled at bootstrap
     /// (the conventional `"primary"`), set via
