@@ -98,7 +98,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             let binaries = vec![make_binary("ok", 50), make_binary("flaky", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // The authoritative retry cascade lives on the PRIMARY (the
             // secondary is a pure flaky-worker driver / reporter). Read the
@@ -206,7 +206,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             let binaries = vec![make_binary("ok", 50), make_binary("doomed", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // Read the PRIMARY's authoritative counters before drop: by
             // this point the primary has fully consumed its retry budget on
@@ -336,7 +336,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // Main pass fails, retry pass fails again → permanent.
             assert_eq!(primary.completed_count(), 0);
@@ -447,7 +447,7 @@ async fn retry_max_passes_zero_disables_retry() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // Main pass fails once; retry loop is skipped entirely
             // because budget is 0 → permanent failure with no retry.
@@ -581,7 +581,11 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             // a hang. Mesh-ready collapses fast (500ms above);
             // post-promotion the secondary's quiesce grace contributes
             // ~2s, hence the 10s budget.
-            let run_fut = primary.run(binaries, HashMap::new(), on_start, on_end);
+            let run_fut = primary.run(
+                SeedSource::ColdStart { binaries, phase_deps: HashMap::new() },
+                on_start,
+                on_end,
+            );
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(
@@ -682,7 +686,7 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
 
             let binaries = vec![make_binary("flaky", 50)];
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // 1 completion, 0 residual failures: the per-phase bucket
             // reinjected the Recoverable failure inside the same `run()`
@@ -860,7 +864,11 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                 log_ends.lock().unwrap().push(Ev::End(p.to_string()));
             });
 
-            let run_fut = primary.run(binaries, phase_deps, on_start, on_end);
+            let run_fut = primary.run(
+                SeedSource::ColdStart { binaries, phase_deps },
+                on_start,
+                on_end,
+            );
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(

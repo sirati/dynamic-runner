@@ -175,7 +175,7 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             assert_eq!(primary.completed_count(), 3);
             assert_eq!(primary.failed_count(), 0);

@@ -14,9 +14,9 @@ fn preferred_secondaries_test_config() -> PrimaryConfig {
 }
 
 /// Helper: register `secondary_id` in `self.secondaries` at the
-/// `Operational` typestate so `seed_cluster_state` sees it as a
-/// member of the known-set. The connection's wire-flow fields are
-/// inert (no `transport.broadcast` actually crosses them here under
+/// `Operational` typestate so `broadcast_cold_seed`'s validation sees
+/// it as a member of the known-set. The connection's wire-flow fields
+/// are inert (no `transport.broadcast` actually crosses them here under
 /// the `setup_test(0)` harness's empty outgoing map; the in-process
 /// `ClusterMutation` broadcast loops only over registered outgoing
 /// senders, of which there are none).
@@ -37,13 +37,13 @@ fn register_operational_secondary(
     );
 }
 
-/// `seed_cluster_state` walks `self.all_binaries`, finds each task's
+/// `broadcast_cold_seed` walks `self.all_binaries`, finds each task's
 /// `preferred_secondaries` list, and emits exactly one
 /// `unknown_preferred_secondary` warn per offending id (multiple
 /// tasks referencing the same offending id collapse to one warn via
 /// the validator's dedup set). Known ids never trigger a warn.
 #[tokio::test(flavor = "current_thread")]
-async fn seed_cluster_state_warns_on_unknown_preferred_secondary_id() {
+async fn cold_seed_warns_on_unknown_preferred_secondary_id() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -79,7 +79,7 @@ async fn seed_cluster_state_warns_on_unknown_preferred_secondary_id() {
                 dynrunner_core::SoftPreferredSecondaries::new(vec!["secondary-known".into()]);
             primary.all_binaries = vec![t1, t2, t3, t4];
 
-            primary.seed_cluster_state().await;
+            primary.broadcast_cold_seed().await;
 
             let warned = primary.preferred_secondaries_validator.warned_snapshot();
             // Both unknown ids appear once; the known id is silent.
@@ -101,17 +101,16 @@ async fn seed_cluster_state_warns_on_unknown_preferred_secondary_id() {
                 "exactly two distinct unknown ids → exactly two warned entries; got {warned:?}"
             );
 
-            // Second `seed_cluster_state` call is idempotent on the warn
+            // Second `broadcast_cold_seed` call is idempotent on the warn
             // dedup set — no new entries land, the same two stay recorded.
-            // (Re-applies broadcast a duplicate batch which the CRDT
-            // NoOps; the validator path runs again and re-evaluates but
-            // emits nothing new because the dedup set already holds both
-            // ids.)
-            primary.seed_cluster_state().await;
+            // (The staged seed is empty here, so only the validator path
+            // re-runs; it re-evaluates but emits nothing new because the
+            // dedup set already holds both ids.)
+            primary.broadcast_cold_seed().await;
             let warned_again = primary.preferred_secondaries_validator.warned_snapshot();
             assert_eq!(
                 warned, warned_again,
-                "second seed_cluster_state must not change the warned set \
+                "second broadcast_cold_seed must not change the warned set \
              (dedup invariant); first={warned:?} second={warned_again:?}"
             );
         })
@@ -145,7 +144,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
             task.preferred_secondaries =
                 dynrunner_core::SoftPreferredSecondaries::new(vec!["secondary-late".into()]);
             primary.all_binaries = vec![task];
-            primary.seed_cluster_state().await;
+            primary.broadcast_cold_seed().await;
             let warned = primary.preferred_secondaries_validator.warned_snapshot();
             assert!(
                 warned.contains("secondary-late"),

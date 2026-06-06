@@ -15,8 +15,11 @@
 //! Faithful port of the now-removed secondary-side
 //! `populate_primary_from_cluster_state` (lived in the deleted
 //! `secondary/primary/` authority mirror); this is its single surviving
-//! home. It shares the relocated `cascade_drain_done` pool-cascade
-//! primitive (now in `secondary::origination`). One deviation: the
+//! home. Unlike that port, it does NOT silently drain empty phases: the
+//! primary's COORDINATOR owns the narrated lifecycle cascade
+//! (`fire_initial_phase_starts` + `drain_empty_active_phases` +
+//! `process_phase_lifecycle`), so empty-phase draining is the caller's
+//! concern (see the note at the pool build below). One deviation: the
 //! `PrimaryCoordinator` owns no local worker pool (workers are remote
 //! `RemoteWorkerState` entries; there is no `active_tasks` set), so
 //! the source's "Pending-in-cluster-state but locally-active" arm has
@@ -33,7 +36,6 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
-use crate::secondary::origination::cascade_drain_done;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -206,7 +208,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.pending = None;
                     return;
                 }
-                cascade_drain_done(&mut p);
+                // NB: empty-phase draining is NOT done here. The primary's
+                // COORDINATOR owns the narrated lifecycle cascade
+                // (`fire_initial_phase_starts` + `drain_empty_active_phases` +
+                // `process_phase_lifecycle`), which drains trivially-empty
+                // initial phases WHILE firing their `on_phase_start` /
+                // `on_phase_end(.., 0, 0)` callbacks. A silent
+                // `cascade_drain_done` here (the secondary-hydration port,
+                // where no such callbacks exist) would mark an empty initial
+                // phase `Done` BEFORE the coordinator could narrate it,
+                // suppressing the cold-path empty-phase callbacks. Both the
+                // run-entry path (`run_pipeline`, pre-loop cascade) and the
+                // mid-run rehydrate (`task::mutation`'s discovery-rebuild,
+                // which cascades explicitly) own the drain at their level.
                 p
             }
             Err(e) => {

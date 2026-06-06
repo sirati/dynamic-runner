@@ -3,6 +3,136 @@
 
 use super::*;
 
+use crate::primary::wire::compute_task_hash;
+
+/// One advertised-memory resource amount (in bytes), the live welcome
+/// shape: a single `memory` `ResourceAmount`.
+fn mem(bytes: u64) -> Vec<dynrunner_core::ResourceAmount> {
+    vec![dynrunner_core::ResourceAmount {
+        kind: dynrunner_core::ResourceKind::memory(),
+        amount: bytes,
+    }]
+}
+
+/// A promotion that inherits N `Pending` tasks must dispatch ALL of them —
+/// the F1 regression guard. Pre-F1, `run_pipeline` rebuilt the pool from the
+/// (empty) `binaries` run-arg, clobbering the hydrate-built pool to empty and
+/// zeroing `total_tasks`; the counter exit (`0 + 0 >= 0`) then tripped on the
+/// first operational-loop iteration and broadcast `RunComplete` with ZERO
+/// tasks dispatched (the silent false-complete bug). Post-F1 the unified init
+/// keys on `SeedSource::PromotionSnapshot`: it originates nothing and
+/// `hydrate_from_cluster_state` is the SOLE pool builder, so the N inherited
+/// Pending tasks are all dispatched and completed — `completed == N`,
+/// `stranded == 0`, NO premature `RunComplete`.
+#[tokio::test(flavor = "current_thread")]
+async fn mid_run_failover_dispatches_all_inherited_pending() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            const N: usize = 5;
+
+            // --- Live primary: seed N Pending tasks + one SecondaryCapacity
+            // for sec-0, then snapshot its converged ledger (the payload a
+            // promotion carries). ---
+            let snapshot = {
+                let (transport, _ends) = setup_test(1);
+                let (mut live, _mesh) = build_test_primary(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let cs = live.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::new(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                for i in 0..N {
+                    let task = make_binary(&format!("t-{i}"), 100);
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: compute_task_hash(&task),
+                        task,
+                    });
+                }
+                assert_eq!(cs.task_count(), N, "live ledger holds N Pending tasks");
+                live.cluster_state_for_test().snapshot()
+            };
+
+            // --- Promoted primary: restore + hydrate + reconstruct via the
+            // production promotion construction primitive. ---
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            // PRE-RUN invariant: hydrate built the pool + total_tasks from the
+            // inherited CRDT. The F1-broken `run_pipeline` would clobber these
+            // to empty/0 inside the run; here they are correct BEFORE the run.
+            assert_eq!(
+                promoted.pool().len(),
+                N,
+                "all N inherited Pending tasks hydrated into the pool"
+            );
+            assert_eq!(
+                promoted.total_tasks, N,
+                "total_tasks hydrated from the inherited ledger"
+            );
+
+            // --- Drive the promoted primary's run on the inherited ledger
+            // against a fake secondary that answers TaskRequests + completes
+            // every dispatched task. ---
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
+            }
+
+            let (_deps, ops, ope) = noop_phase_args();
+            let outcome = promoted
+                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
+                .await
+                .expect("promoted run must not error");
+
+            match outcome {
+                PrimaryRunOutcome::Local {
+                    result,
+                    completed,
+                    failed,
+                    stranded,
+                } => {
+                    assert!(result.is_ok(), "run completed cleanly: {result:?}");
+                    assert_eq!(
+                        completed, N,
+                        "every inherited Pending task was dispatched + completed \
+                         (pre-F1 false-completed with 0 dispatched)"
+                    );
+                    assert_eq!(failed, 0, "no task failed");
+                    assert_eq!(
+                        stranded, 0,
+                        "no inherited task was stranded by a premature RunComplete"
+                    );
+                }
+                PrimaryRunOutcome::Relocated { .. } => {
+                    panic!("promoted primary should run to a Local outcome, not relocate")
+                }
+            }
+        })
+        .await;
+}
+
 /// Multi-secondary mesh-ready gate: the primary must NOT issue its
 /// bootstrap primary announcement (`ClusterMutation::PrimaryChanged
 /// { new = primary }`) until every connected secondary has reported
@@ -76,7 +206,10 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             // in sequence and observe the gate.
             let primary_handle = tokio::task::spawn_local(async move {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(binaries, deps, ops, ope).await.unwrap();
+                primary
+                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
+                .await
+                .unwrap();
                 primary.completed_count()
             });
 
@@ -428,7 +561,10 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary
+                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
+                .await
+                .unwrap();
 
             let peers = peer_info_rx.await.expect("PeerInfo never delivered");
 

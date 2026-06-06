@@ -88,4 +88,6 @@ pub use pump::{MeshControl, MeshControlHandle};
 pub use role::LocalRole;
 pub use role_slot::RoleSlot;
 pub use run::{NodeRunOutcome, RunTerminal};
-pub use run_inputs::{NodeRunInputs, PrimaryRunArgs, PromotedPrimary, PromotedPrimaryBuilder};
+pub use run_inputs::{
+    NodeRunInputs, PrimaryRunArgs, PromotedPrimary, PromotedPrimaryBuilder, SeedSource,
+};

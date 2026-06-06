@@ -51,6 +51,8 @@ pub(super) use super::test_helpers::{
 #[allow(unused_imports)]
 pub(super) use super::*;
 #[allow(unused_imports)]
+pub(super) use crate::process::SeedSource;
+#[allow(unused_imports)]
 pub(super) use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 #[allow(unused_imports)]
 pub(super) use dynrunner_core::TaskInfo;

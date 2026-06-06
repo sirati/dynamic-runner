@@ -771,7 +771,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// directly (decoupling law).
     pub(super) worker_mgmt_fail_outcome: Option<String>,
 
-    /// Set at INITIAL-batch ingest (`ingest_initial_batch`) when the
+    /// Set at cold-start seed (`originate_cold_seed`) when the
     /// dependency-existence partition found a `(phase_id, task_id)`
     /// DUPLICATE before any phase started (#3a). Carries the abort
     /// reason. The bootstrap proceeds far enough to connect secondaries
@@ -779,22 +779,9 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// reads this directly after `wait_for_connections`, broadcasts
     /// `ClusterMutation::RunAborted { reason }`, and returns
     /// `RunError::DuplicateTaskIdPrePhase` — a hard cluster shutdown.
-    /// `None` on a clean ingest. Write-only at ingest, read-once at the
+    /// `None` on a clean seed. Write-only at seed, read-once at the
     /// abort gate (same discipline as `setup_deadline_outcome`).
     pub(super) pending_run_abort: Option<String>,
-
-    /// Set at INITIAL-batch ingest: the tasks the dependency-existence
-    /// partition flagged as having a literally-absent `(phase_id,
-    /// task_id)` dep (#2 missing-dep), each paired with the reason
-    /// naming the absent ids. They are EXCLUDED from the pool `extend`
-    /// (their `task_id` is pre-seeded into the pool's `failed_tasks`
-    /// so the survivors' dep resolution + cascade stay correct) but
-    /// KEPT in `all_binaries` so `seed_cluster_state` adds them to the
-    /// CRDT as `Pending`; `run_pipeline` then drains this and emits
-    /// `TaskFailed { kind: InvalidTask }` for each through the canonical
-    /// broadcast/apply pipeline (`Pending → InvalidTask`). Empty on a
-    /// clean ingest.
-    pub(super) pending_invalid_dep_tasks: Vec<(TaskInfo<I>, String)>,
 
     /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
     /// OOM retry bucket is actively reinjecting and draining; `false`
@@ -833,6 +820,22 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// and unicasts it back to a requesting peer. Empty for a run with
     /// no forwarded args.
     pub(super) forwarded_argv: Vec<String>,
+
+    /// Cold-start seed frames staged for the post-connection fleet
+    /// broadcast. `originate_cold_seed` (run BEFORE `wait_for_connections`,
+    /// so hydrate can build the pool from the local CRDT in time for
+    /// `fire_initial_phase_starts`) applies the seed
+    /// (`PhaseDepsSet`/`TaskAdded` + the `#2` invalid-dep `TaskFailed`
+    /// transitions) to the LOCAL `cluster_state` and parks the
+    /// version-stamped `applied` frames here. `broadcast_cold_seed` (run
+    /// AFTER `wait_for_connections`, so the broadcast reaches the connected
+    /// fleet) drains and ships them — a pre-connection broadcast is dropped,
+    /// so the local-apply and the broadcast are deliberately split across the
+    /// connect boundary. Empty on the `PromotionSnapshot` path (the inherited
+    /// CRDT replicates via the digest/restore anti-entropy path), making the
+    /// post-connection broadcast a natural no-op there — the `SeedSource` arm
+    /// is the discriminator, never a runtime `if seeded`.
+    pub(super) pending_cold_seed_broadcast: Vec<ClusterMutation<I>>,
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -950,9 +953,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
             pending_run_abort: None,
-            pending_invalid_dep_tasks: Vec::new(),
             single_worker_mode: false,
             forwarded_argv,
+            pending_cold_seed_broadcast: Vec::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -2245,8 +2248,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// which the coordinator still owns post-`run`).
     pub async fn run(
         &mut self,
-        binaries: Vec<TaskInfo<I>>,
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        seed: crate::process::SeedSource<I>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
     ) -> Result<(), RunError> {
@@ -2262,7 +2264,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         );
         async {
             let result = self
-                .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
+                .run_pipeline(seed, on_phase_start, on_phase_end)
                 .await;
             // Cleanup BOTH dispatchers on every exit (Ok or Err). The two
             // dispatchers own independent channels + listener vectors; both
@@ -2303,8 +2305,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `self` and so ignores the demote signal entirely.
     pub async fn run_consuming(
         mut self,
-        binaries: Vec<TaskInfo<I>>,
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        seed: crate::process::SeedSource<I>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
     ) -> Result<PrimaryRunOutcome<I>, RunError> {
@@ -2332,7 +2333,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // future no longer borrows it) on the relocate branch.
             let demoted = {
                 let pipeline =
-                    self.run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end);
+                    self.run_pipeline(seed, on_phase_start, on_phase_end);
                 tokio::pin!(pipeline);
                 tokio::select! {
                     result = &mut pipeline => {
@@ -2484,8 +2485,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// operational loop to completion in-place.
     async fn run_pipeline(
         &mut self,
-        binaries: Vec<TaskInfo<I>>,
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        seed: crate::process::SeedSource<I>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
     ) -> Result<(), RunError> {
@@ -2508,13 +2508,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `RunShouldFail`; a coordinator re-used across runs must not
         // inherit a stale outcome.
         self.worker_mgmt_fail_outcome = None;
-        // Per-run reset for the ingest-time invalid-task directives:
-        // `pending_run_abort` (3a) and `pending_invalid_dep_tasks` (#2)
-        // are written by `ingest_initial_batch` below and read once at
-        // their respective gates; a coordinator re-used across runs
-        // must not inherit a previous run's ingest residue.
+        // Per-run reset for the #3a abort directive: written by
+        // `originate_cold_seed` below and read once at the abort gate; a
+        // coordinator re-used across runs must not inherit a previous run's
+        // seed residue.
         self.pending_run_abort = None;
-        self.pending_invalid_dep_tasks.clear();
 
         // The setup-pending gate is a CRDT-derived predicate
         // (`Self::setup_pending`) rather than a stateful latch field: in
@@ -2528,32 +2526,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // setup-promote-deadline backstop; the setup-deferred discovery
         // feed (`ingest_setup_discovery`) seeds the ledger that flips it.
 
-        // Spawn the peer-lifecycle + task-completion dispatchers BEFORE
-        // any wire mutation can land. See `spawn_run_dispatchers`.
-        self.spawn_run_dispatchers();
-
-        // Discover the phase set: union of (1) every phase referenced
-        // by an item, (2) every phase mentioned as a key or parent in
-        // the deps map. The pool's constructor validates that every
-        // dep references a known phase.
-        let mut phase_set: HashSet<PhaseId> = binaries.iter().map(|b| b.phase_id.clone()).collect();
-        for (k, v) in &phase_deps {
-            phase_set.insert(k.clone());
-            for p in v {
-                phase_set.insert(p.clone());
-            }
-        }
-        // Capture the canonical phase-deps graph for the run before
-        // handing it to the pool. `seed_cluster_state` will then
-        // broadcast it as `ClusterMutation::PhaseDepsSet` so every
-        // secondary's `cluster_state.phase_deps` mirrors the same
-        // map — the post-promotion hydration consults it to rebuild
-        // a `PendingPool` with the same dependency machine.
-        self.phase_deps = phase_deps.clone();
-        // PendingPool::new wants an iterator yielding owned PhaseIds.
-        let pool = PendingPool::new(phase_set.clone(), phase_deps)
-            .map_err(|e| format!("PendingPool: {e:?}"))?;
-        self.pending = Some(pool);
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
         self.phase_completed.clear();
@@ -2565,26 +2537,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // implicitly depend on `new()`-only init) starts every
         // bucket from zero.
         self.retry_passes_used.clear();
-        for p in &phase_set {
-            self.phase_completed.insert(p.clone(), 0);
-            self.phase_failed.insert(p.clone(), 0);
-        }
 
-        // Sort by size descending for better packing — same intent as
-        // pre-Phase-4b. The pool preserves insertion order within a
-        // bucket, so we pre-sort here and ingest once.
-        let mut sorted = binaries;
-        sorted.sort_by_key(|b| std::cmp::Reverse(b.size));
-        // INITIAL-batch ingest. Runs BEFORE `fire_initial_phase_starts`
-        // below, so `ingest_initial_batch` is unconditionally the
-        // pre-phase (#3a) side of the duplicate split. It runs the
-        // dependency-existence partition (#2), pre-seeds the pool's
-        // failed set for the missing-dep ids, extends the pool with the
-        // VALID subset (preserving `extend`'s atomic contract — a cycle
-        // among valid tasks stays a hard error), sets `all_binaries` /
-        // `total_tasks`, and records the #3a abort + #2 invalid-dep
-        // directives for `run_pipeline` to fire at their gates below.
-        self.ingest_initial_batch(sorted)?;
+        // Spawn the peer-lifecycle + task-completion dispatchers BEFORE
+        // any wire mutation can land. See `spawn_run_dispatchers`.
+        self.spawn_run_dispatchers();
+
+        // Unified run-init: land the seed into the CRDT, then ALWAYS hydrate.
+        // The `SeedSource` arm selects ONLY who originates the CRDT first —
+        // NOT the pool/cache derivation, which is `hydrate`'s job on both
+        // paths. Cold-start = "hydrate from a freshly-seeded CRDT";
+        // promotion = "hydrate from the inherited CRDT".
+        //
+        // C-3 ordering: `originate_cold_seed` applies the seed to the LOCAL
+        // ledger ONLY (the fleet broadcast is staged and shipped post-connect
+        // by `broadcast_cold_seed`, so it reaches the connected secondaries —
+        // a pre-connection broadcast is dropped). Running it here, before
+        // `hydrate`, means the pool is available for `fire_initial_phase_starts`
+        // / `perform_initial_assignment` below; the #3a abort short-circuit
+        // inside `originate_cold_seed` seeds nothing on a doomed run.
+        match seed {
+            crate::process::SeedSource::ColdStart {
+                binaries,
+                phase_deps,
+            } => self.originate_cold_seed(binaries, phase_deps)?,
+            // The CRDT was already restored by `seed_from_promotion_snapshot`;
+            // hydrate (re-)derives the pool + caches from the inherited ledger.
+            crate::process::SeedSource::PromotionSnapshot => {}
+        }
+        // The SOLE pool builder (eliminates the pre-F1 `PendingPool::new` +
+        // `ingest_initial_batch` duplication against `hydrate`'s own build):
+        // it derives the pool, `total_tasks`, the unified `in_flight` ledger,
+        // and the worker / secondary rosters from whatever the CRDT now holds.
+        self.hydrate_from_cluster_state();
 
         let total = self.total_tasks;
         tracing::info!(
@@ -2629,12 +2613,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         //     `self.secondaries` connection states + `num_secondaries`), so
         //     seeding phases after it changes nothing it observes.
         //   * The 3a/3b duplicate discriminator is STRUCTURAL (the code
-        //     path — `ingest_initial_batch` vs `apply_spawn_tasks`), not a
+        //     path — `originate_cold_seed` vs `apply_spawn_tasks`), not a
         //     runtime read of `phase_started_emitted`; the only runtime read
         //     of `phase_started_emitted` is `fire_initial_phase_starts`' own
-        //     `insert` guard, and `ingest_initial_batch`'s `debug_assert!`
-        //     (must run before fire) is satisfied — ingest still runs far
-        //     above, before connect.
+        //     `insert` guard, and `originate_cold_seed`'s `debug_assert!`
+        //     (must run before fire) is satisfied — the cold seed still runs
+        //     far above, before connect.
         //   * No `on_phase_end` can fire DURING `wait_for_connections`: no
         //     task has been assigned yet (`perform_initial_assignment` runs
         //     below, after connect), and because `drain_empty_active_phases`
@@ -2706,11 +2690,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.process_phase_lifecycle(&mut command_rx).await;
         }
 
-        // #3a abort gate. `ingest_initial_batch` recorded a pending
+        // #3a abort gate. `originate_cold_seed` recorded a pending
         // abort iff the INITIAL batch had a `(phase_id, task_id)`
         // duplicate (pre-phase). Fire it HERE — the first point the
         // secondaries are connected — so the `RunAborted` broadcast
-        // reaches them (at ingest time none were connected). Returns
+        // reaches them (at seed time none were connected). Returns
         // `Err(RunError::DuplicateTaskIdPrePhase)` on the abort path
         // (the primary's PyO3 boundary surfaces a non-zero exit); a
         // no-op on the clean path. Hard cluster shutdown — short-
@@ -2791,25 +2775,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // loop unchanged in either mode, `emit_setup_defer_handshake`
         // sends the degenerate InitialAssignment + state transitions
         // the legacy path would have sent — empty payloads but the
-        // same wire-frame triple. The non-defer path keeps the
-        // legacy `seed_cluster_state` (TaskAdded fan-out, PhaseDepsSet)
-        // + `perform_initial_assignment` (round-robin worker
-        // assignments, staged-files inline) pairing.
+        // same wire-frame triple. The non-defer path ships the cold-start
+        // seed (the `PhaseDepsSet` + `TaskAdded` fan-out + the #2 invalid-dep
+        // `TaskFailed` transitions, applied LOCALLY at `originate_cold_seed`
+        // and staged for this post-connection broadcast so they reach the
+        // fleet) + `perform_initial_assignment` (round-robin worker
+        // assignments, staged-files inline). On a promotion the staged seed
+        // is empty (the inherited CRDT replicates via anti-entropy), so
+        // `broadcast_cold_seed` is a no-op there.
         if self.config.required_setup_on_promote {
             self.emit_setup_defer_handshake().await?;
         } else {
-            self.seed_cluster_state().await;
-            // #2 missing-dep emit. `seed_cluster_state` has now added
-            // every initial task — including the missing-dep ones — to
-            // the CRDT as `Pending`, so the `TaskFailed { InvalidTask }`
-            // emit transitions each `Pending → InvalidTask` (the apply
-            // rule also fans a `TaskCompletedEvent` carrying the
-            // `invalid_task:<reason>` kind, the framework's emission for
-            // the observer monitor). No-op when the partition found no
-            // missing-dep tasks. The cluster continues; these tasks are
-            // never dispatched (the pool pre-seeded them as failed at
-            // ingest), so `perform_initial_assignment` skips them.
-            self.emit_invalid_dep_tasks().await;
+            self.broadcast_cold_seed().await;
             self.perform_initial_assignment().await?;
         }
 

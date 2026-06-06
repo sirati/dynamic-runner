@@ -89,13 +89,12 @@ pub(super) fn spawn_primary_with<I, Sched, Est>(
     let _ = control;
     tokio::task::spawn_local(async move {
         let PrimaryRunArgs {
-            binaries,
-            phase_deps,
+            seed,
             on_phase_start,
             on_phase_end,
         } = args;
         match coordinator
-            .run_consuming(binaries, phase_deps, on_phase_start, on_phase_end)
+            .run_consuming(seed, on_phase_start, on_phase_end)
             .await
         {
             Ok(outcome) => {

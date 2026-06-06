@@ -68,39 +68,40 @@ fn cross_binary(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId
     t
 }
 
-/// SITE A (distributed ingest): the initial batch carrying the SAME
+/// SITE A (distributed seed): the initial batch carrying the SAME
 /// `task_id` in two DIFFERENT phases is valid per `partition_ingest`
-/// (full `(phase_id, task_id)` identity) and `ingest_initial_batch` must
+/// (full `(phase_id, task_id)` identity) and `originate_cold_seed` must
 /// NOT false-abort the run. Pre-fix `extend`'s bare-`task_id` dedup
 /// rejected the batch, surfacing a false `RunError` from the otherwise-
-/// successful `ingest_initial_batch`.
+/// successful seed. Post-F1, the cold seed lands the batch in the CRDT
+/// and `hydrate_from_cluster_state` builds the pool / `total_tasks`.
 #[test]
-fn ingest_initial_batch_cross_phase_same_task_id_is_not_a_duplicate() {
+fn cold_seed_cross_phase_same_task_id_is_not_a_duplicate() {
     let (mut primary, _mesh) = make_primary();
-    // Two phases, no deps. Install the pool the way `process_binaries`
-    // would, so `ingest_initial_batch` runs against a real pool.
-    let mut phase_set = std::collections::HashSet::new();
-    phase_set.insert(PhaseId::from("phaseA"));
-    phase_set.insert(PhaseId::from("phaseB"));
-    primary.pending = Some(
-        dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new()).expect("pool init"),
-    );
 
     let batch = vec![
         cross_binary("phaseA", "shared", &[]),
         cross_binary("phaseB", "shared", &[]),
     ];
     primary
-        .ingest_initial_batch(batch)
-        .expect("cross-phase same task_id must NOT abort ingest");
+        .originate_cold_seed(batch, HashMap::new())
+        .expect("cross-phase same task_id must NOT abort the cold seed");
+    // The seed lands in the CRDT; hydrate is the sole pool / total_tasks
+    // builder.
+    primary.hydrate_from_cluster_state();
 
     assert!(
         primary.pending_run_abort.is_none(),
         "no #3a duplicate abort should be recorded for a cross-phase same task_id"
     );
     assert_eq!(
+        primary.cluster_state_for_test().task_count(),
+        2,
+        "both cross-phase tasks seeded into the CRDT"
+    );
+    assert_eq!(
         primary.total_tasks, 2,
-        "both cross-phase tasks counted as valid"
+        "both cross-phase tasks counted as valid (hydrate-derived)"
     );
     assert_eq!(primary.pool().len(), 2, "both tasks landed in the pool");
 }
@@ -202,6 +203,12 @@ fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
         });
     }
     primary.hydrate_from_cluster_state();
+    // `hydrate_from_cluster_state` no longer self-drains empty phases (the
+    // coordinator owns the narrated cascade at run-entry). Drain the
+    // completed-only `build` phase here so its `compile` dependent unblocks
+    // to Active — the same cascade `run_pipeline`'s pre-loop performs before
+    // `fire_initial_phase_starts`.
+    crate::secondary::origination::cascade_drain_done(primary.pool_mut());
 
     // Install the worker-management bus sender, then fire phase starts.
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
