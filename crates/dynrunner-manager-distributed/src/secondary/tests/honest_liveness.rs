@@ -152,7 +152,7 @@ async fn busy_genuine_death_arms_fast_via_leg_a() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. })),
+    target: _, .. })),
         "fast (leg A) election must broadcast TimeoutQuery",
     );
 }
@@ -202,7 +202,7 @@ async fn wedged_primary_elects_at_backstop() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. })),
+    target: _, .. })),
         "backstop (leg B) election must broadcast TimeoutQuery",
     );
 }

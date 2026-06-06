@@ -97,7 +97,6 @@ fn dispatch_order_no_idle_workers() {
 /// 1 task — the third got nothing. Post-fix all three each receive
 /// exactly 1. We exercise that exact case here to pin the actual
 /// behaviour change, not just the determinism gain.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn initial_assignment_is_round_robin_and_name_sorted() {
     use std::sync::Arc;
@@ -149,7 +148,7 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
                     let mut rx = sec_inbound;
                     while let Some(msg) = rx.recv().await {
                         if let DistributedMessage::InitialAssignment {
-                            target: None,
+                            target: _,
                             zip_files,
                             ..
                         } = &msg

@@ -24,6 +24,7 @@ mod dispatch_decoupling;
 mod e2e;
 mod hydrate;
 mod initial_assignment;
+mod node_gates;
 mod oom_bucket;
 mod phase_decision;
 mod phase_ordering;
@@ -65,6 +66,23 @@ pub(super) use std::collections::HashMap;
 pub(super) use std::time::Duration;
 #[allow(unused_imports)]
 pub(super) use tokio::sync::mpsc as tokio_mpsc;
+
+/// Yield enough times for the production mesh-pump (spawned by
+/// [`build_test_primary`]) to drain a coordinator's QUEUED egress onto the
+/// wire and for the transport to deliver it.
+///
+/// A direct-handler test (e.g. `primary.handle_welcome(..).await` then a
+/// synchronous `try_recv` drain of the secondary's inbox) must call this
+/// BETWEEN the handler and the drain: `MeshClient::send` is QUEUED (M4), so
+/// the handler's broadcast sits on the pump's egress queue until the pump
+/// task is scheduled. Yielding hands control to the pump (and the channel
+/// transport's send) so the frame reaches the wire before the test reads it —
+/// the test-side counterpart of the queued-egress model.
+pub(super) async fn settle_pump() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
 
 /// Phase 4b: tests that don't care about phase lifecycle pass an empty
 /// dep map and no-op closures. Centralised here so individual tests
@@ -128,6 +146,99 @@ fn channel_mesh_secondary_ends(
     (pri_to_sec_tx, sec_to_pri_rx, transport)
 }
 
+/// Run a real `SecondaryCoordinator` against the PRODUCTION mesh-pump
+/// ([`crate::process::pump::run_pump`]) over `transport`, returning the
+/// secondary's own-worker run count when it exits.
+///
+/// This is the secondary half of the real-`Node` e2e harness: the
+/// coordinator holds ONLY a `MeshClient` (egress, queued) + `RoleInbox`
+/// (ingress); the pump owns the `Mesh` and concurrently drains the egress
+/// onto the wire AND demuxes inbound wire frames onto the secondary slot —
+/// the exact production turn C-NODE built. We do NOT use a test-double pump
+/// (the `PENDING-C-NODE` sequential stub starved non-ping-pong handshakes);
+/// this is the true concurrent pump.
+///
+/// The coordinator's `run` and the pump race on one `tokio::select!`: when
+/// the secondary's run completes we read its count and return — dropping the
+/// pump future (the transport's inbound closes when the primary side drops,
+/// which the pump observes as teardown anyway).
+async fn run_secondary_node(
+    config: SecondaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    factory: impl dynrunner_manager_local::WorkerFactory<
+        dynrunner_transport_channel::ChannelManagerEnd,
+    >,
+) -> usize {
+    run_secondary_node_reading(config, transport, factory, |s| s.local_tasks_run_for_test()).await
+}
+
+/// As [`run_secondary_node`] but the caller supplies a `reader` closure run
+/// on `&SecondaryCoordinator` AFTER the run exits, so a test can collect more
+/// than the own-worker count (e.g. the replicated `cluster_state` counts) off
+/// the same coordinator without a second harness.
+async fn run_secondary_node_reading<R>(
+    config: SecondaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    mut factory: impl dynrunner_manager_local::WorkerFactory<
+        dynrunner_transport_channel::ChannelManagerEnd,
+    >,
+    reader: impl FnOnce(
+        &SecondaryCoordinator<
+            dynrunner_transport_channel::ChannelManagerEnd,
+            ResourceStealingScheduler,
+            FixedEstimator,
+            TestId,
+        >,
+    ) -> R,
+) -> R {
+    use crate::process::{LocalRole, Mesh};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+
+    let mut mesh = Mesh::new(transport);
+    let secondary_id = config.secondary_id.clone();
+    let (_slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from(secondary_id.as_str()));
+    let mut secondary = SecondaryCoordinator::new(
+        config,
+        client,
+        inbox,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    // The egress edge resolves `Destination::Primary` to the in-process
+    // primary's id (`"primary"`) while the role table is cold — matching the
+    // folded primary mesh-link's key.
+    secondary.set_bootstrap_primary_id("primary".to_string());
+
+    // Publish the live membership BEFORE the secondary's first send so its
+    // no-route failover probe (`client.has_peer("primary")`) reads the folded
+    // primary link as connected from the very first welcome — the pump
+    // republishes every cycle, but the secondary's run may issue its first
+    // send before the pump task is first scheduled.
+    mesh.publish_membership();
+
+    // The production pump OWNS the mesh; it needs a control receiver even
+    // though this single-secondary harness performs no register/retag.
+    let (_control, control_rx) = crate::process::pump::control_channel::<TestId>();
+    let pump = crate::process::pump::run_pump(mesh, control_rx);
+    tokio::pin!(pump);
+
+    // Race the secondary's run against the pump in an inner scope so the run
+    // future (which borrows `&mut secondary`) is fully DROPPED before we read
+    // off `&secondary` (no overlapping borrow).
+    {
+        let run = secondary.run(&mut factory);
+        tokio::pin!(run);
+        tokio::select! {
+            r = &mut run => { r.unwrap(); }
+            // The pump exits first only if the wire closes before the
+            // secondary finishes — a harness/teardown race, not a clean run.
+            _ = &mut pump => {}
+        }
+    }
+    reader(&secondary)
+}
+
 /// Wire up a real SecondaryCoordinator as a tokio task, connected to the
 /// primary via a channel-backed mesh. Returns the secondary's channel ends
 /// that should be plugged into the primary's `ChannelPeerTransport`.
@@ -181,19 +292,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-        // The egress edge resolves `Destination::Primary` to the
-        // in-process primary's id (`"primary"`) while the role table is
-        // cold — matching the folded primary mesh-link's key.
-        secondary.set_bootstrap_primary_id("primary".to_string());
-        let mut factory = FakeWorkerFactory;
-        secondary.run(&mut factory).await.unwrap();
-        secondary.local_tasks_run_for_test()
+        run_secondary_node(config, transport, FakeWorkerFactory).await
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
@@ -242,16 +341,12 @@ pub(super) fn spawn_real_secondary_slow(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
+        run_secondary_node(
             config,
             transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-        secondary.set_bootstrap_primary_id("primary".to_string());
-        let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
-        secondary.run(&mut factory).await.unwrap();
-        secondary.local_tasks_run_for_test()
+            SlowFakeWorkerFactory::with_markers(slow_markers),
+        )
+        .await
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
@@ -311,16 +406,7 @@ pub(super) fn spawn_real_secondary_flaky(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
-            config,
-            transport,
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
-        );
-        secondary.set_bootstrap_primary_id("primary".to_string());
-        let mut factory = flaky;
-        secondary.run(&mut factory).await.unwrap();
-        secondary.local_tasks_run_for_test()
+        run_secondary_node(config, transport, flaky).await
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)

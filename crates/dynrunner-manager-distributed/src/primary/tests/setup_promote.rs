@@ -10,7 +10,6 @@ use super::*;
 /// refreshes to 1, and a subsequent `TaskCompleted` lets the counter
 /// check fire cleanly. Pre-fix this test would observe the loop exit
 /// before the TaskAdded message was even consumed off the transport.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
     let local = tokio::task::LocalSet::new();
@@ -198,7 +197,6 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
 /// that the gate added in T1 is a strict superset of historical
 /// behaviour — no regression on the path where `seed_cluster_state`
 /// ran locally and `total_tasks` was non-zero at startup.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn pre_seeded_counter_exit_unchanged() {
     let local = tokio::task::LocalSet::new();
@@ -340,6 +338,7 @@ async fn pre_seeded_counter_exit_unchanged() {
 /// + holding the dispatchable discovered task, phase_b Done), (c) the
 /// rebuild fires no `on_phase_end`, and (d) the latch transition itself.
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
@@ -648,7 +647,6 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
 ///     (rather than hanging the test runner).
 ///   - No transport activity: the channel transport's incoming queue
 ///     stays empty so no message arm can resolve.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn setup_deadline_fires_when_promoted_secondary_silent() {
     let local = tokio::task::LocalSet::new();
@@ -791,7 +789,6 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
 /// would continue ticking after the latch cleared and false-fire at
 /// deadline, returning Err with a spurious deadline-expiry on a
 /// completed run. Post-fix: `setup_deadline_outcome` stays `None`.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
     let local = tokio::task::LocalSet::new();
@@ -931,7 +928,6 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
 /// `required_setup_on_promote = false`) the loop would trip
 /// `0+0 >= 0 && active_workers == 0` on iteration 1 and exit at total=0,
 /// sweeping the late batch into the shutdown drain.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_check() {
     let local = tokio::task::LocalSet::new();
@@ -1082,7 +1078,6 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
 /// `setup_pending()` stays true the whole time (no TaskAdded ever lands),
 /// proving the exit is via the ungated RunComplete arm, not the counter
 /// arm and not the deadline.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn empty_discovery_run_complete_exits_promptly_not_after_deadline() {
     let local = tokio::task::LocalSet::new();

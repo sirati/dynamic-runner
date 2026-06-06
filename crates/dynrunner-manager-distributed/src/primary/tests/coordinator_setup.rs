@@ -135,7 +135,7 @@ fn drain_peer_joined(
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::ClusterMutation {
-            target: None,
+            target: _,
             mutations,
             ..
         } = msg
@@ -167,7 +167,7 @@ fn drain_secondary_capacity(
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::ClusterMutation {
-            target: None,
+            target: _,
             mutations,
             ..
         } = msg
@@ -195,7 +195,6 @@ fn drain_secondary_capacity(
 /// fixture: the broadcast envelope on the welcomed secondary's inbound
 /// channel, and the local apply recorded the capacity into the
 /// replicated ledger (readable via the CRDT accessors).
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() {
     let local = tokio::task::LocalSet::new();
@@ -232,6 +231,7 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
 
             // Surface 1: the capacity record is broadcast over the mesh
             // carrying the welcome's worker_count + resources.
+            settle_pump().await;
             let observed = drain_secondary_capacity(&mut to_sec_rx);
             assert_eq!(
                 observed,
@@ -264,7 +264,6 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
         .await;
 }
 
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
     let local = tokio::task::LocalSet::new();
@@ -285,6 +284,8 @@ async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
             // assertion is on the handler itself, not the surrounding setup
             // pipeline.
             primary.handle_welcome(welcome_msg(&id, false)).await;
+
+            settle_pump().await;
 
             let observed = drain_peer_joined(&mut to_sec_rx);
             assert_eq!(
@@ -315,7 +316,6 @@ async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
 /// The non-default value the multi-layer plumb is pinned against is the
 /// non-empty `peer_id` ("primary"): a dropped origination would leave
 /// `is_peer_alive("primary") == false` and an empty `drain_peer_joined`.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn originate_primary_membership_self_joins_the_primary_host() {
     let local = tokio::task::LocalSet::new();
@@ -341,6 +341,7 @@ async fn originate_primary_membership_self_joins_the_primary_host() {
             primary.originate_primary_membership().await;
 
             // Surface 1: exactly one self-PeerJoined on the wire, observer=false.
+            settle_pump().await;
             let observed = drain_peer_joined(&mut to_sec_rx);
             assert_eq!(
                 observed,
@@ -369,7 +370,6 @@ async fn originate_primary_membership_self_joins_the_primary_host() {
         .await;
 }
 
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
     let local = tokio::task::LocalSet::new();
@@ -388,6 +388,8 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
                 );
                 let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
                 primary.handle_welcome(welcome_msg(&id, true)).await;
+
+                settle_pump().await;
 
                 let observed = drain_peer_joined(&mut to_sec_rx);
                 assert_eq!(
@@ -424,6 +426,8 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
                 let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
                 primary.handle_welcome(welcome_msg(&id, false)).await;
 
+                settle_pump().await;
+
                 let observed = drain_peer_joined(&mut to_sec_rx);
                 assert_eq!(
                     observed,
@@ -459,7 +463,6 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
 /// leaking a tokio task per `run()` invocation. This test mirrors the
 /// single-secondary happy-path fixture so the assertion exercises the
 /// same end-of-run boundary every other test relies on.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
     let local = tokio::task::LocalSet::new();

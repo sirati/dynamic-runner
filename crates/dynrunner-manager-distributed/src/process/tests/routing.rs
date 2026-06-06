@@ -296,23 +296,24 @@ async fn route_incoming_all_fans_to_local_slots_not_wire() {
     );
 }
 
-/// `route_incoming` on an UNSTAMPED frame (`target == None`, the
-/// transitional pre-egress-rewire case) is LOUD: it `debug_assert!`s so the
-/// missing stamp screams in a debug build rather than silently routing
-/// wrong. This proves it does NOT silently drop / swallow the frame. In a
-/// release build the same arm `warn`s and falls back to the documented
-/// safe default (fan to every local slot) — the no-drop guarantee — which
-/// cannot be exercised here because the `debug_assert!` fires first under
-/// the test profile.
+/// `route_incoming` on an UNSTAMPED frame (`target == None`) does NOT drop
+/// it: it `warn`s (the diagnostic for a production egress that forgot to
+/// stamp) and falls back to the documented safe default — fan to every live
+/// local slot. A raw-frame test double that injects an unstamped frame must
+/// still have it delivered, never swallowed or panicked. Here the lone local
+/// primary slot receives the unstamped frame.
 #[tokio::test]
-#[should_panic(expected = "no C3 target")]
-async fn route_incoming_none_is_loud() {
+async fn route_incoming_none_fans_safely_never_drops() {
     let (transport, _r) = transport_with_remotes("host-a", &[]);
     let mut mesh = Mesh::<TestId, _>::new(transport);
-    let (_p_slot, _p_client, _inbox) =
+    let (_p_slot, _p_client, mut inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from("host-a"));
 
-    // `frame(..)` carries no stamped target — the pre-stamp transitional
-    // shape. The loud guard must fire.
+    // `frame(..)` carries no stamped target — the unstamped shape. The safe
+    // default fans it to every live local slot rather than dropping it.
     mesh.route_incoming(frame("unstamped"));
+    assert_eq!(
+        sender_of(&inbox.try_recv().expect("unstamped frame fanned to the primary slot")),
+        "unstamped"
+    );
 }

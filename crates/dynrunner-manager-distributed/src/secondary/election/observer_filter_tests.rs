@@ -68,7 +68,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::PromotionVote {
-                    target: None,
+                    target: _,
                     candidate_id, ..
                 } if candidate_id == "sec-b")),
         "expected PromotionVote naming sec-b (self); broadcasts: \
@@ -184,7 +184,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::PromotionVote {
-                    target: None,
+                    target: _,
                     candidate_id, ..
                 } if candidate_id == "sec-b")),
         "expected PromotionVote naming sec-b"

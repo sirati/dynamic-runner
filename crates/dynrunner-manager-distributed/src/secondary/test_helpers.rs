@@ -52,12 +52,14 @@ use crate::process::{LocalRole, Mesh, PromotionSignal, RoleSlot};
 /// "primary" frames (full setup + dispatch against a `fake_primary` /
 /// `spawn_real_secondary`) feed the primary as an ordinary mesh peer via
 /// a channel-backed mesh stub with the primary link folded in.
+#[allow(dead_code)] // scaffolding retained for the PENDING-C-NODE secondary e2e tests
 pub(super) type TestTransport<P> = P;
 
 /// Build a [`TestTransport`] from a peer-mesh stub. The mesh wraps the
 /// stub; the secondary reaches it through the minted `MeshClient` /
 /// `RoleInbox` (the primary is a mesh peer reached by id, not a wrapped
 /// uplink).
+#[allow(dead_code)] // scaffolding retained for the PENDING-C-NODE secondary e2e tests
 pub(super) fn make_transport<P: PeerTransport<TestId>>(peer: P) -> TestTransport<P> {
     peer
 }
@@ -142,6 +144,7 @@ impl<P: PeerTransport<TestId>> SecondaryHarness<P> {
     /// coordinator's `MeshClient` reads (the `has_peer` no-route gate).
     /// Call after seeding peer outboxes / registering the primary link so
     /// a direct-method-call test (no running pump) sees a fresh view.
+    #[allow(dead_code)] // scaffolding retained for the PENDING-C-NODE secondary e2e tests
     pub(super) fn publish_membership(&mut self) {
         self.test_mesh.publish_membership();
     }
@@ -149,6 +152,7 @@ impl<P: PeerTransport<TestId>> SecondaryHarness<P> {
     /// Deliver one wire frame to this secondary's slot inbox — the test
     /// analogue of the mesh-pump's ingress demux for a single-role harness
     /// (every inbound frame in these fixtures is for the secondary).
+    #[allow(dead_code)] // scaffolding retained for the PENDING-C-NODE secondary e2e tests
     pub(super) fn deliver_to_inbox(&mut self, frame: DistributedMessage<TestId>) -> bool {
         self.test_mesh.deliver_local(LocalRole::Secondary, frame)
     }
@@ -561,6 +565,7 @@ pub(super) fn arm_designated_discoverer<P: PeerTransport<TestId>>(sec: &mut Seco
 /// a test must call [`SecondaryHarness::drain_egress`] AFTER the
 /// send-issuing call and BEFORE reading the log. `peer_count` configures
 /// the recorder's reported mesh cardinality.
+#[allow(clippy::type_complexity)]
 pub(super) fn make_secondary_recording(
     config: SecondaryConfig,
     peer_count: usize,
@@ -585,6 +590,7 @@ pub(super) fn make_secondary_recording(
 /// and the given recognized `current_primary`. This is the membership view
 /// a node's mirror holds after the primary broadcasts the fleet roster —
 /// the exact input `setup_discovery_pending`'s designation axes read.
+#[allow(clippy::type_complexity)]
 pub(super) fn node_with_roster(
     self_id: &str,
     roster: &[(&str, bool, bool)],

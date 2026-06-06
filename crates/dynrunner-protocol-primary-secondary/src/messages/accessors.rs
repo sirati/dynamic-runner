@@ -91,6 +91,48 @@ impl<I> DistributedMessage<I> {
         self
     }
 
+    /// Strip the routing `target` back to `None` IN PLACE.
+    ///
+    /// The `target` is the WIRE ENVELOPE's routing header: the egress stamps
+    /// the resolved [`Destination`] so the receiving mesh-pump can demux the
+    /// frame to the right local role-slot WITHOUT a content classifier. Once
+    /// the pump has done that demux, the header has served its purpose — the
+    /// APPLICATION frame the role's handler then sees is target-agnostic
+    /// (every handler pattern-matches `target: None`, never a routed value).
+    /// So the mesh-pump clears the header at the local-delivery boundary,
+    /// keeping the routing concern entirely inside the mesh layer and the
+    /// handlers oblivious to it. Idempotent on an already-`None` frame.
+    pub fn clear_target(&mut self) {
+        let slot = match self {
+            Self::SecondaryWelcome { target, .. }
+            | Self::Entropy { target, .. }
+            | Self::CertExchange { target, .. }
+            | Self::PeerInfo { target, .. }
+            | Self::InitialAssignment { target, .. }
+            | Self::TaskRequest { target, .. }
+            | Self::TaskAssignment { target, .. }
+            | Self::TransferComplete { target, .. }
+            | Self::StageFile { target, .. }
+            | Self::RequestClusterSnapshot { target, .. }
+            | Self::ClusterSnapshot { target, .. }
+            | Self::StateDigest { target, .. }
+            | Self::MeshReady { target, .. }
+            | Self::TaskComplete { target, .. }
+            | Self::TaskFailed { target, .. }
+            | Self::Keepalive { target, .. }
+            | Self::TimeoutDetected { target, .. }
+            | Self::TimeoutQuery { target, .. }
+            | Self::TimeoutResponse { target, .. }
+            | Self::PromotionVote { target, .. }
+            | Self::PromotionConfirm { target, .. }
+            | Self::SecondaryFatalError { target, .. }
+            | Self::ClusterMutation { target, .. }
+            | Self::Relay { target, .. }
+            | Self::RelayBackoff { target, .. } => target,
+        };
+        *slot = None;
+    }
+
     pub fn sender_id(&self) -> &str {
         match self {
             Self::SecondaryWelcome { sender_id, .. }

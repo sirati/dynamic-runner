@@ -84,6 +84,89 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     }
 }
 
+/// Run a real `SecondaryCoordinator` over ANY `Tr: PeerTransport` against the
+/// PRODUCTION mesh-pump, returning its `completed_count` when it exits. The
+/// real-`Node` e2e harness for the network tests: the coordinator holds only
+/// a `MeshClient`/`RoleInbox`; the pump owns the `Mesh` over the real network
+/// transport and concurrently drains egress + routes inbound.
+async fn run_secondary_over<Tr>(config: SecondaryConfig, transport: Tr) -> usize
+where
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId> + 'static,
+{
+    use dynrunner_manager_distributed::process::{LocalRole, Mesh, pump};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+
+    let mut mesh = Mesh::new(transport);
+    let id = config.secondary_id.clone();
+    let (_slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Secondary, PeerId::from(id.as_str()));
+    let mut secondary =
+        SecondaryCoordinator::new(config, client, inbox, ResourceStealingScheduler::memory(), FixedEstimator(100));
+    secondary.set_bootstrap_primary_id("primary".to_string());
+
+    let (_control, control_rx) = pump::control_channel::<TestId>();
+    let pump_fut = pump::run_pump(mesh, control_rx);
+    tokio::pin!(pump_fut);
+
+    {
+        let mut factory = FakeWorkerFactory;
+        let run = secondary.run(&mut factory);
+        tokio::pin!(run);
+        tokio::select! {
+            r = &mut run => { r.unwrap(); }
+            _ = &mut pump_fut => {}
+        }
+    }
+    secondary.completed_count()
+}
+
+/// Run a real `PrimaryCoordinator` over ANY `Tr: PeerTransport` against the
+/// PRODUCTION mesh-pump, returning `(completed, failed)`. Mirrors
+/// `run_secondary_over` for the primary side of the network e2e.
+async fn run_primary_over<Tr>(
+    config: PrimaryConfig,
+    transport: Tr,
+    binaries: Vec<TaskInfo<TestId>>,
+) -> (usize, usize)
+where
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId> + 'static,
+{
+    use dynrunner_manager_distributed::process::{LocalRole, Mesh, pump};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+
+    let mut mesh = Mesh::new(transport);
+    let (_slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
+    let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut primary = PrimaryCoordinator::new(
+        config,
+        client,
+        inbox,
+        demote_rx,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let (_control, control_rx) = pump::control_channel::<TestId>();
+    let pump_fut = pump::run_pump(mesh, control_rx);
+    tokio::pin!(pump_fut);
+
+    {
+        let run = primary.run(
+            binaries,
+            std::collections::HashMap::new(),
+            Box::new(|_| {}),
+            Box::new(|_, _, _| {}),
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            r = &mut run => { r.unwrap(); }
+            _ = &mut pump_fut => {}
+        }
+    }
+    (primary.completed_count(), primary.failed_count())
+}
+
 /// End-to-end: 1 primary + 1 secondary over real WSS networking.
 ///
 /// Step 5b: the primary is constructed with a `TunneledPeerTransport`
@@ -163,23 +246,11 @@ async fn e2e_primary_secondary_over_wss() {
                     .await
                     .expect("peer network start");
                 peer_network.register_primary_link("primary".to_string(), client);
-                let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
-                    SecondaryCoordinator::new(
-                        config,
-                        peer_network,
-                        ResourceStealingScheduler::memory(),
-                        FixedEstimator(100),
-                    );
-                // Tell the egress edge which peer-id the dialled bootstrap
-                // wire reaches, so `Destination::Primary` resolves to it
-                // while the role table is cold (the setup window before
-                // any `PrimaryChanged`). This is what makes the primary
-                // reachable cold AND warm — the cold-primary resolution
-                // these tests pin.
-                secondary.set_bootstrap_primary_id("primary".to_string());
-                let mut factory = FakeWorkerFactory;
-                secondary.run(&mut factory).await.unwrap();
-                secondary.completed_count()
+                // Drive the real secondary over the real network transport
+                // against the production mesh-pump (the cold-primary
+                // resolution + bootstrap-link fold these tests pin happen
+                // inside `run_secondary_over` → the coordinator's egress).
+                run_secondary_over(config, peer_network).await
             });
 
             // Primary coordinator
@@ -189,32 +260,14 @@ async fn e2e_primary_secondary_over_wss() {
                 ..PrimaryConfig::default()
             };
 
-            let mut primary = PrimaryCoordinator::new(
-                config,
-                peer_transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-
             let binaries: Vec<TaskInfo<TestId>> = (0..5)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
 
-            primary
-                .run(
-                    binaries,
-                    std::collections::HashMap::new(),
-                    Box::new(|_| {}),
-                    Box::new(|_, _, _| {}),
-                )
-                .await
-                .unwrap();
-
-            let completed = primary.completed_count();
-            let failed = primary.failed_count();
-
-            // Drop primary to close transport, allowing secondary to exit
-            drop(primary);
+            // Drive the real primary over the real network transport against
+            // the production mesh-pump. Closing the transport (the pump's
+            // teardown) lets the secondary exit.
+            let (completed, failed) = run_primary_over(config, peer_transport, binaries).await;
 
             let sec_completed = sec_handle.await.unwrap();
 
@@ -308,23 +361,11 @@ async fn e2e_primary_secondary_over_quic() {
                     .await
                     .expect("peer network start");
                 peer_network.register_primary_link("primary".to_string(), client);
-                let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
-                    SecondaryCoordinator::new(
-                        config,
-                        peer_network,
-                        ResourceStealingScheduler::memory(),
-                        FixedEstimator(100),
-                    );
-                // Tell the egress edge which peer-id the dialled bootstrap
-                // wire reaches, so `Destination::Primary` resolves to it
-                // while the role table is cold (the setup window before
-                // any `PrimaryChanged`). This is what makes the primary
-                // reachable cold AND warm — the cold-primary resolution
-                // these tests pin.
-                secondary.set_bootstrap_primary_id("primary".to_string());
-                let mut factory = FakeWorkerFactory;
-                secondary.run(&mut factory).await.unwrap();
-                secondary.completed_count()
+                // Drive the real secondary over the real network transport
+                // against the production mesh-pump (the cold-primary
+                // resolution + bootstrap-link fold these tests pin happen
+                // inside `run_secondary_over` → the coordinator's egress).
+                run_secondary_over(config, peer_network).await
             });
 
             // Primary coordinator
@@ -334,31 +375,14 @@ async fn e2e_primary_secondary_over_quic() {
                 ..PrimaryConfig::default()
             };
 
-            let mut primary = PrimaryCoordinator::new(
-                config,
-                peer_transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-
             let binaries: Vec<TaskInfo<TestId>> = (0..5)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
 
-            primary
-                .run(
-                    binaries,
-                    std::collections::HashMap::new(),
-                    Box::new(|_| {}),
-                    Box::new(|_, _, _| {}),
-                )
-                .await
-                .unwrap();
-
-            let completed = primary.completed_count();
-            let failed = primary.failed_count();
-
-            drop(primary);
+            // Drive the real primary over the real network transport against
+            // the production mesh-pump. Closing the transport (the pump's
+            // teardown) lets the secondary exit.
+            let (completed, failed) = run_primary_over(config, peer_transport, binaries).await;
 
             let sec_completed = sec_handle.await.unwrap();
 

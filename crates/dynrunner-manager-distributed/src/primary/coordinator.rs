@@ -240,7 +240,12 @@ pub enum PrimaryRunOutcome<I: Identifier> {
     /// its terminal, and produces the final accounting — none of which is
     /// this coordinator's (now-consumed) concern.
     Relocated {
-        handoff: crate::observer::ObserverHandoff<I>,
+        /// Boxed: `ObserverHandoff` is a large payload (the full observer
+        /// resume state); boxing keeps `PrimaryRunOutcome` small so the
+        /// common `Local` variant does not carry the relocate payload's size
+        /// (clippy `large_enum_variant`). The relocate path is rare, so the
+        /// one allocation is negligible.
+        handoff: Box<crate::observer::ObserverHandoff<I>>,
     },
 }
 
@@ -1035,6 +1040,79 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
     ) {
         self.panik_signal_rx = Some(rx);
+    }
+
+    /// Register the BUG-6 demote signal on this primary's own
+    /// `cluster_state` (the [`crate::process::Node`]'s teardown lever).
+    ///
+    /// One concern: SIGNAL the owning `Node` whenever the replicated
+    /// `RoleTable.primary` flips OFF this primary's own id — i.e. another
+    /// peer became primary. The flip is observed through the
+    /// `register_role_change_hook` fabric, which fires on EVERY genuine
+    /// `RoleTable` mutation: a directly-applied `PrimaryChanged`
+    /// (`apply.rs`), a peer-merge (`apply_peer.rs`), AND a snapshot
+    /// restore/heal (`snapshot.rs`). Keying on ANY self→other flip — not
+    /// only the directly-applied event — is the partition-heal-safe BUG-6
+    /// contract: a heal that adopts a different primary via merge/restore is
+    /// NOT a `PrimaryChanged` apply, yet it must still demote the stale
+    /// primary, or the one-primary invariant breaks into a durable
+    /// two-primary.
+    ///
+    /// The hook ONLY signals (it fires synchronously inside the apply path —
+    /// CCD-9: never cross a node boundary, never block); the [`crate::process::Node`]'s
+    /// loop drains `demote_tx`'s receiver (the `demote_rx` this coordinator
+    /// holds) and surrenders the primary by value into an
+    /// [`crate::observer::ObserverHandoff`] (`run_consuming` →
+    /// `PrimaryRunOutcome::Relocated`). Best-effort: a dropped receiver means
+    /// the node is already winding down. Must be called pre-`run`, alongside
+    /// the other registration setters; the `Node` registers it the moment it
+    /// builds the primary (bootstrap submitter OR promotion).
+    pub fn register_demote_on_displaced(&mut self, demote_tx: tokio::sync::mpsc::UnboundedSender<()>) {
+        use dynrunner_protocol_primary_secondary::RoleChangeHookRegistrar;
+        let own_id = self.config.node_id.clone();
+        self.cluster_state.register_role_change_hook(Box::new(
+            move |table: &dynrunner_protocol_primary_secondary::address::RoleTable| {
+                // A self→other flip is: the table names SOME primary, and it
+                // is not us. The table naming nobody (cleared) is not a
+                // displacement (no successor to hand off to); the table
+                // naming US is the no-op self-confirm. Either way: only fire
+                // when another peer holds the role.
+                let displaced = match table.primary.as_deref() {
+                    Some(p) => p != own_id,
+                    None => false,
+                };
+                if displaced {
+                    // Best-effort: a dropped receiver = node winding down.
+                    let _ = demote_tx.send(());
+                }
+            },
+        ));
+    }
+
+    /// Seed this freshly-constructed (promotion-built) primary from the
+    /// promoting host's converged `cluster_state` snapshot, then rebuild the
+    /// authoritative derived caches.
+    ///
+    /// One concern: turn a promotion snapshot into a ready-to-`run`
+    /// authoritative view. The [`crate::process::Node`] calls this BEFORE
+    /// `run` on the promotion path (the secondary signalled; the `Node`
+    /// builds the primary and seeds it here). The snapshot is restored into
+    /// this primary's own ledger (an idempotent lattice merge), then
+    /// [`Self::hydrate_from_cluster_state`] +
+    /// [`Self::reconstruct_workers_from_cluster_state`] +
+    /// [`Self::reconstruct_secondaries_from_cluster_state`] rebuild the
+    /// pool / worker roster / secondary table as pure derived caches of the
+    /// replicated ledger. This is a NORMAL pre-`run` construction input — NOT
+    /// a `run_activated` resume (which is gone): the seeded primary then
+    /// enters the ordinary `run` path and originates `PrimaryChanged` itself.
+    pub fn seed_from_promotion_snapshot(
+        &mut self,
+        snapshot: crate::cluster_state::ClusterStateSnapshot<I>,
+    ) {
+        self.cluster_state.restore(snapshot);
+        self.hydrate_from_cluster_state();
+        self.reconstruct_workers_from_cluster_state();
+        self.reconstruct_secondaries_from_cluster_state();
     }
 
     /// Tear down the peer-lifecycle dispatcher task spawned at
@@ -2264,7 +2342,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // observer from the handoff and re-sources the final
                     // counts from the observer's converged ledger.
                     Ok(PrimaryRunOutcome::Relocated {
-                        handoff: self.into_observer_handoff(),
+                        handoff: Box::new(self.into_observer_handoff()),
                     })
                 }
             }

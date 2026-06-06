@@ -144,7 +144,7 @@ fn assigned_task_ids(
     let mut ids = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::TaskAssignment {
-            target: None,
+            target: _,
             binary_info,
             ..
         } = msg
@@ -159,7 +159,7 @@ fn assigned_task_ids(
 /// dispatch — but ONLY via the recheck woken by the `TasksAdded` the
 /// completion path emitted. Drive the bus end-to-end: complete A, drain
 /// the coalesced batch, run the reaction, observe B on the wire.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_completes() {
     let local = tokio::task::LocalSet::new();
@@ -232,7 +232,7 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
 /// completion path anymore, so without the signal the freed worker sits
 /// idle and B stays queued. Asserted over a bounded virtual-time window
 /// (`start_paused` + `advance`), NOT a real wall-clock hang.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
     let local = tokio::task::LocalSet::new();
@@ -292,7 +292,7 @@ async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
 /// eliminated. This test pins the equivalent live contract: selection
 /// authority is the held-task predicate, and a freed worker is a valid
 /// recheck target regardless of any advisory bookkeeping.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle() {
     let local = tokio::task::LocalSet::new();
@@ -389,7 +389,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
 /// dispatch recheck exactly once per batch (the recheck is idempotent
 /// over the pool/worker view). Pins the burst-coalescing contract at the
 /// worker-management reaction boundary.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn coalesce_multiple_tasks_added_into_one_recheck() {
     let local = tokio::task::LocalSet::new();

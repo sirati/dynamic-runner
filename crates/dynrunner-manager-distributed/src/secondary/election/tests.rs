@@ -63,7 +63,7 @@ async fn primary_dies_lowest_id_promotes() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. }))
+    target: _, .. }))
     );
 
     // Wait the gather window so the Suspecting tick is eligible to vote.
@@ -85,7 +85,7 @@ async fn primary_dies_lowest_id_promotes() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::PromotionVote {
-    target: None, .. }))
+    target: _, .. }))
     );
 
     // One peer confirms — combined with the candidate's own vote that
@@ -353,7 +353,7 @@ async fn self_named_election_fires_promotion_signal_advances_identity_and_rebroa
     let rebroadcast = log.borrow().iter().any(|m| {
         matches!(
             m,
-            DistributedMessage::ClusterMutation { target: None, mutations, .. }
+            DistributedMessage::ClusterMutation { target: _, mutations, .. }
                 if mutations.iter().any(|mu| matches!(
                     mu,
                     ClusterMutation::PrimaryChanged { new, reason, .. }
@@ -620,7 +620,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
                 .broadcast
                 .iter()
                 .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. })),
+    target: _, .. })),
             "no spurious TimeoutQuery against a healthy promoted primary",
         );
     }
@@ -643,7 +643,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. })),
+    target: _, .. })),
         "the election must broadcast a TimeoutQuery once the promoted primary is silent",
     );
 }

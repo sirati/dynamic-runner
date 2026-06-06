@@ -123,6 +123,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Test accessor: the death-clock timestamp recorded for `secondary_id`,
+    /// or `None` if no keepalive has refreshed it. Used by the §14 BUG-1 gate
+    /// to prove a same-peer secondary's `All` keepalive reached the local
+    /// primary slot and refreshed its death clock (the multi-role host does
+    /// NOT declare its own same-peer secondary dead).
+    #[cfg(test)]
+    pub(crate) fn last_keepalive_for_test(&self, secondary_id: &str) -> Option<Instant> {
+        self.secondary_keepalives.get(secondary_id).copied()
+    }
+
     /// Seed the keepalive timestamp at welcome time so the death deadline
     /// counts from when we first heard from the secondary, not from
     /// process start. A welcome starts a fresh silence streak, so the
