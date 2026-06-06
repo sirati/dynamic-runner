@@ -95,40 +95,6 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
-        // Setup-defer mode for THIS run, derived from the pre-staged
-        // signal. The invariant: `setup_defer_on_promote` ⟺ this run
-        // DEFERRED discovery to me — i.e. the submitter ran with
-        // `--source-already-staged` (`self.source_already_staged`), so my
-        // discovered tasks arrive via loopback only AFTER I activate the
-        // co-located primary, not pre-seeded in the snapshot. This is the
-        // secondary-side twin of the wire `InitialAssignment.pre_staged_mode`
-        // (`primary::assignment` sets it from `source_pre_staged_root
-        // .is_some()`), so it matches the `setup_discovery_pending`
-        // `pre_staged_mode` gate (`secondary/coordinator.rs`) EXACTLY: the
-        // activated-primary suppressor is engaged precisely when this node
-        // will run setup-discovery.
-        //
-        // NOT derived from `src_network`: that resolves to the wrapper
-        // bind-mount (`/app/src-network`) for EVERY SLURM secondary
-        // (`PySecondaryConfig::new`), so `src_network.is_some()` would set
-        // the flag for ALL co-located primaries — including a genuinely-
-        // empty NON-pre-staged run, which has no discovery feed to wait
-        // for and would then hang until the setup-promote deadline.
-        //
-        // Propagated into the on-demand-built primary's `PrimaryConfig`
-        // (`required_setup_on_promote`) so a co-located primary activated
-        // from an EMPTY snapshot on the discovery node engages the
-        // `setup_pending()` suppressor + setup-promote-deadline backstop
-        // (see the activator below). In legacy / non-pre-staged runs this
-        // is `false`, leaving the activated primary on the unchanged
-        // bootstrap-exit path. Failover within a pre-staged run is
-        // self-correcting regardless: the snapshot is non-empty there, so
-        // `setup_pending()` (`required && task_count == 0`) is false on the
-        // first iteration. (The submitter's discriminator also carries a
-        // `&& binaries.is_empty()` half — a submitter-local-view concern;
-        // on the secondary a non-empty pre-staged ledger self-corrects via
-        // `task_count() > 0`, so the pre-staged flag alone is correct here.)
-        let setup_defer_on_promote = derive_setup_defer_on_promote(self.source_already_staged);
 
         // Snapshot the cap, flip `run_started`, and consume the
         // command-channel receiver for the detached runtime in one
@@ -176,21 +142,14 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
-        // Phase-lifecycle callbacks for the on-demand-primary path. Built
-        // here under the GIL (the `make_on_phase_*` constructors
-        // capture a `Py<PyAny>` clone of `task_definition_py` that the
-        // closure body re-binds via `Python::attach` at each fire).
-        // Registered on the `SecondaryCoordinator` BEFORE
-        // `run_until_setup_or_done` enters, then TRANSFERRED (via
-        // `take_composed_primary_wiring`) into the on-demand primary-
-        // activator closure (the real authority owns the phase machine).
-        // The closures fire ONLY when this node is named primary: the
-        // co-located primary is BUILT ON DEMAND (election win or bootstrap
-        // transfer), hydrates from the replicated ledger snapshot, and its
-        // operational-loop phase cascade drives `on_phase_start` /
-        // `on_phase_end`. A node that is never named primary builds no
-        // coordinator and never calls into Python, so the GIL-reacquiring
-        // cost is paid only on the named-primary path.
+        // Phase-lifecycle callbacks. Built here under the GIL (the
+        // `make_on_phase_*` constructors capture a `Py<PyAny>` clone of
+        // `task_definition_py` that the closure body re-binds via
+        // `Python::attach` at each fire). Registered on the
+        // `SecondaryCoordinator` BEFORE `run_until_setup_or_done` enters.
+        // The closures fire only when this node is the authority that owns
+        // the phase machine; a node that never calls into Python pays no
+        // GIL-reacquiring cost.
         let sec_on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(self.task_definition_py.clone_ref(py)),
         );
@@ -267,10 +226,9 @@ impl PySecondaryCoordinator {
                 // flag's help text for the failover-incompat caveat),
                 // reading the backend's cert + QUIC port into the
                 // `PeerCertInfo` the `CertExchange` ships, extracting the
-                // mesh-send capability for the on-demand co-located primary,
-                // and folding the dialed bootstrap wire into the mesh
-                // under the primary's peer-id ("the tunnel is just a way
-                // of joining the mesh").
+                // mesh-send capability, and folding the dialed bootstrap
+                // wire into the mesh under the primary's peer-id ("the
+                // tunnel is just a way of joining the mesh").
                 //
                 // The identity passed to the peer mesh is BOTH the CN
                 // baked into this secondary's QUIC certificate AND the
@@ -305,12 +263,10 @@ impl PySecondaryCoordinator {
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 let peer_network = mesh_bundle.transport;
                 let secondary_cert_info = mesh_bundle.peer_cert_info;
-                // Cloneable mesh-send capability for the on-demand
-                // co-located primary's role-blind `MeshHandleTransport`
-                // (`Some` only when a real peer mesh exists — `Disabled`
-                // overlays have no remote secondaries and thus no failover,
-                // so the secondary's `can_be_primary` marker is `false` and
-                // no activator is registered). See `MeshSendHandle`.
+                // Cloneable mesh-send capability (`Some` only when a real
+                // peer mesh exists — `Disabled` overlays have no remote
+                // secondaries and thus no failover, so the secondary's
+                // `can_be_primary` marker is `false`). See `MeshSendHandle`.
                 let mesh_send_handle = mesh_bundle.mesh_send;
 
                 let config = SecondaryConfig {
@@ -367,60 +323,6 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                // Clone the estimator for the co-located primary BEFORE
-                // the secondary consumes it; the primary's seeded-resume
-                // dispatch needs its own resource estimator.
-                let primary_estimator = estimator.clone();
-
-                // ── Co-located primary↔secondary loopback channels ──
-                //
-                // Composed ONLY when a real mesh exists (a `Disabled`
-                // overlay has no remote secondaries to fail over among, so
-                // no co-located primary is built). Two in-process channels
-                // wire the two coordinators on this one host WITHOUT any
-                // per-role transport leg — the multi-role host runs the
-                // SINGLE mesh transport (held by the secondary) and the
-                // role-vs-locality split lives at the coordinator egress
-                // edges, not inside a transport:
-                //
-                //   * CH1 loopback_to_secondary: the co-located primary's
-                //     egress (`SendTarget::Loopback` unicast + the
-                //     `Destination::All` broadcast leg) delivers own-host
-                //     frames into the SECONDARY's inbound. The secondary
-                //     drains the matching receiver as if it were a wire
-                //     frame.
-                //   * CH2 primary_inbound: the secondary's ingress demux
-                //     forwards every primary-facing frame
-                //     (`is_primary_facing`) it drains off the host mesh —
-                //     plus its own-host terminal reports (its egress
-                //     `SendTarget::Loopback` arm) — into the co-located
-                //     PRIMARY's inbound. The primary's role-blind
-                //     `MeshHandleTransport::recv_peer` drains it.
-                //
-                // Both are unbounded `tokio::sync::mpsc`; the message type
-                // is `DistributedMessage<RunnerIdentifier>` on both legs.
-                // The four ends are held as `Option` so a `Disabled`
-                // overlay (no real mesh → no co-located primary) leaves
-                // every slot `None` and the registrations / composition
-                // below are no-ops.
-                let (
-                    loopback_to_secondary_tx,
-                    loopback_to_secondary_rx,
-                    primary_inbound_tx,
-                    primary_inbound_rx,
-                ): (
-                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
-                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
-                    Option<tokio::sync::mpsc::UnboundedSender<_>>,
-                    Option<tokio::sync::mpsc::UnboundedReceiver<_>>,
-                ) = if mesh_send_handle.is_some() {
-                    let (lb_tx, lb_rx) = tokio::sync::mpsc::unbounded_channel();
-                    let (pin_tx, pin_rx) = tokio::sync::mpsc::unbounded_channel();
-                    (Some(lb_tx), Some(lb_rx), Some(pin_tx), Some(pin_rx))
-                } else {
-                    (None, None, None, None)
-                };
-
                 // The secondary holds the mesh `PeerTransport`
                 // (`EitherPeerTransport`) DIRECTLY — the primary is a mesh
                 // peer reached by id, not a wrapped per-role leg.
@@ -430,20 +332,6 @@ impl PySecondaryCoordinator {
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
-
-                // Wire the secondary side of the co-located loopback
-                // channels (when composed). Pre-run, one-shot — same
-                // contract as `register_primary_activator`. The secondary
-                // drains CH1 (`loopback_to_secondary_rx`) into its inbound
-                // and forwards primary-facing frames into CH2
-                // (`primary_inbound_tx`). Both registrations are skipped on
-                // every non-co-located path (the `Disabled` overlay).
-                if let Some(rx) = loopback_to_secondary_rx {
-                    secondary.register_colocated_loopback_inbound(rx);
-                }
-                if let Some(tx) = primary_inbound_tx {
-                    secondary.register_colocated_primary_inbound(tx);
-                }
 
                 // Tell the egress edge which peer-id the bootstrap wire
                 // reaches (the conventional `"primary"`, the same id the
@@ -532,172 +420,13 @@ impl PySecondaryCoordinator {
                     sec_on_phase_end,
                 );
 
-                // ── On-demand co-located primary activator ──
-                //
-                // A peer becomes the primary by CONSTRUCTING a
-                // `PrimaryCoordinator` the MOMENT it is named primary
-                // (failover-self election win OR a bootstrap transfer
-                // naming it) — there is NO pre-parked object, no promotion
-                // gate. We capture the primary's construction inputs into a
-                // type-erased activator closure and register it on the
-                // secondary; the secondary `take()`s + invokes it at the
-                // activation site (the apply hook / setup FSM), gated on the
-                // replicated `can_be_primary(self)` marker, handing it a
-                // snapshot of the continuously-mirrored `cluster_state`. The
-                // closure builds the coordinator, `spawn_local`s its
-                // `run_activated` (seeded resume from the snapshot), and
-                // returns the `JoinHandle` so the wind-down below joins it.
-                //
-                // Registered ONLY when a REAL mesh exists
-                // (`mesh_send_handle.is_some()`): a `Disabled` overlay /
-                // `disable_peer_overlay` host has no mesh handle, so the
-                // secondary's `can_be_primary` marker is `false`, no
-                // activator is registered, and the submitter stays primary.
-                // The built primary holds the ROLE-BLIND `MeshHandleTransport`
-                // over the host's shared mesh (`mesh_send_handle` for remote
-                // send/broadcast, `primary_inbound_rx` for the demuxed
-                // inbound the secondary forwards). Its own-secondary loopback
-                // is NOT a transport leg: the egress edge delivers
-                // `SendTarget::Loopback` + the `Destination::All` broadcast
-                // leg through `loopback_to_secondary_tx`, registered via
-                // `register_colocated_loopback`.
-                if let (Some(mesh), Some(loopback_tx), Some(inbound_rx)) =
-                    (mesh_send_handle, loopback_to_secondary_tx, primary_inbound_rx)
-                {
-                    // Transfer the lifecycle/command wiring the PyO3 surface
-                    // minted on the secondary so the on-demand-built PRIMARY
-                    // — the real authority that owns the phase machine and
-                    // the externally-issued `PrimaryCommand` ingress — gets
-                    // it. The secondary keeps its own `command_tx` clone for
-                    // any handle minted off it. Taken NOW (pre-run, once) and
-                    // moved into the activator closure; the primary does not
-                    // exist yet, so the wiring is held in the closure until
-                    // the build fires.
-                    let (
-                        p_command_tx,
-                        p_command_rx,
-                        p_on_phase_start,
-                        p_on_phase_end,
-                    ) = secondary.take_composed_primary_wiring();
-
-                    // `PrimaryConfig` for the on-demand authority. Most
-                    // fields are bootstrap-phase concerns the seeded resume
-                    // bypasses; the load-bearing ones are `node_id` (own id,
-                    // so `Destination::Primary` resolves to self) and the
-                    // retry knobs (mirrored from the secondary's config). The
-                    // restored CRDT snapshot seeds `phase_deps` /
-                    // `total_tasks` at activation, so the config's task-graph
-                    // fields stay at their defaults.
-                    //
-                    // `required_setup_on_promote` carries THIS run's
-                    // setup-defer mode into the activated primary —
-                    // `setup_defer_on_promote`, which is TRUE ⟺ this run
-                    // deferred discovery to me (`source_already_staged`; see
-                    // the derivation above). So my discovered tasks arrive
-                    // via loopback only AFTER activation, matching the
-                    // `setup_discovery_pending` `pre_staged_mode` gate
-                    // exactly. On the `--source-already-staged` path the
-                    // discovery node IS the co-located primary, and it
-                    // activates from an EMPTY snapshot (discovery hasn't
-                    // seeded the ledger yet). With the flag set,
-                    // `setup_pending()` (`required && task_count == 0`)
-                    // suppresses the run-complete exits until the
-                    // loopback-delivered `TaskAdded` batch lands — a STANDING
-                    // gate, robust to the batch arriving after the first
-                    // would-be completion check. A genuinely-empty discovery
-                    // (0 tasks) still exits PROMPTLY: the discovery node
-                    // broadcasts `RunComplete` (see `ingest_setup_discovery`),
-                    // which loops back and trips the ungated `RunComplete`
-                    // exit — no wait on the setup-promote deadline. The
-                    // deadline stays a backstop for a wedged-discovery feed.
-                    //
-                    // Conversely a NON-pre-staged run leaves this `false`,
-                    // so an empty-corpus relocated run exits via the normal
-                    // bootstrap RunComplete path — it never enters the
-                    // suppressed setup-discovery state it has no feed for,
-                    // and so never hangs to the setup-promote deadline.
-                    // (Deriving the flag from `src_network.is_some()` would
-                    // wrongly set it for that case, since `src_network` is
-                    // the wrapper bind-mount on EVERY SLURM secondary.)
-                    // Defaulting this `false` for a pre-staged run, by
-                    // contrast, let the activated primary declare
-                    // `0+0 >= 0` run-complete before its own discovery batch
-                    // arrived.
-                    let primary_config = dynrunner_manager_distributed::PrimaryConfig {
-                        node_id: secondary_id.clone(),
-                        keepalive_interval: dist_keepalive,
-                        peer_timeout: dist_peer_timeout,
-                        keepalive_miss_threshold: dist_keepalive_miss_threshold,
-                        retry_max_passes: dist_retry_max_passes,
-                        oom_retry_max_passes: dist_oom_retry_max_passes,
-                        required_setup_on_promote: setup_defer_on_promote,
-                        ..dynrunner_manager_distributed::PrimaryConfig::default()
-                    };
-                    let primary_scheduler = scheduler_config.build_memory_scheduler();
-
-                    // The activator: invoked exactly once, ON DEMAND, with
-                    // the `cluster_state` snapshot the secondary captures at
-                    // the activation moment. It builds the
-                    // `PrimaryCoordinator` from the captured inputs, wires
-                    // its loopback + command + phase callbacks, and
-                    // `spawn_local`s `run_activated(snapshot)` on the shared
-                    // `LocalSet`, returning the spawned handle.
-                    let activator: dynrunner_manager_distributed::secondary::PrimaryActivator<
-                        RunnerIdentifier,
-                    > = Box::new(move |snapshot| {
-                        // The primary's role-blind `PeerTransport`, built
-                        // through the backend-opaque factory: every remote
-                        // peer over the shared mesh, recv via the demuxed
-                        // inbound the secondary feeds. No own-id / loopback
-                        // branch — the egress edge owns that.
-                        let primary_transport =
-                            transport_factory::colocated_primary_transport::<RunnerIdentifier>(
-                                mesh, inbound_rx,
-                            );
-                        let mut primary =
-                            dynrunner_manager_distributed::PrimaryCoordinator::new(
-                                primary_config,
-                                primary_transport,
-                                primary_scheduler,
-                                primary_estimator,
-                            );
-                        // Own-secondary loopback sender on the primary's
-                        // egress edge: a `Destination::Secondary(own_id)`
-                        // `TaskAssignment` (resolved to `SendTarget::
-                        // Loopback`) and every `Destination::All` broadcast
-                        // reach the co-located secondary through this leg.
-                        primary.register_colocated_loopback(loopback_tx);
-                        // Transfer the command channel so a Python-minted
-                        // `PrimaryHandle` reaches the authority's command
-                        // loop. `p_command_rx` is `Some` on the first (only)
-                        // `take_composed_primary_wiring` call; if `None`
-                        // (defensive — a double take), keep the receiver the
-                        // primary's `new()` minted.
-                        if let Some(rx) = p_command_rx {
-                            primary.replace_command_channel(p_command_tx, rx);
-                        }
-                        if let (Some(on_start), Some(on_end)) =
-                            (p_on_phase_start, p_on_phase_end)
-                        {
-                            primary.register_phase_lifecycle_callbacks(on_start, on_end);
-                        }
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = primary.run_activated(snapshot).await {
-                                tracing::error!(
-                                    error = %e,
-                                    "co-located primary (activated on demand) failed"
-                                );
-                            }
-                        })
-                    });
-                    secondary.register_primary_activator(activator);
-                } else {
-                    // No real mesh → the secondary cannot host a primary on
-                    // demand (`can_be_primary = false`). It keeps its own
-                    // command/lifecycle wiring (never transferred) and runs
-                    // as a pure follower; the submitter stays primary.
-                    let _ = &primary_estimator;
-                }
+                // PHASE-C-SEAM[C5]: pyo3 bridge shrink. The secondary no
+                // longer constructs/seeds/owns a primary. Phase C builds the
+                // primary's mesh transport via `transport_factory`, hands it
+                // to `Process`, and `Process` builds the `PrimaryCoordinator`
+                // (snapshot-seeded) on the promotion/election event. The
+                // pyo3 surface composes a `Process` and calls `process.run()`
+                // here instead of registering an activator on the secondary.
 
                 // Setup-promote outer loop: drive
                 // `run_until_setup_or_done` to a terminal state,
@@ -957,28 +686,8 @@ impl PySecondaryCoordinator {
 
                 let completed = secondary.completed_count() as u32;
 
-                // Wind down the co-located primary if this node activated
-                // one on demand. Take its `JoinHandle` BEFORE dropping the
-                // secondary, then drop the secondary so the tap/loopback
-                // channels close (a node that was never named primary built
-                // nothing — `take_activated_primary_handle` is `None` and
-                // this is a no-op). On a node that DID activate, its
-                // primary already finished its operational loop (it
-                // observed/broadcast RunComplete the same way the secondary
-                // did) and `run_activated` has returned or is about to;
-                // closing the tap ends any residual inbound. Await the
-                // handle so the activated-primary future is joined (never
-                // leaked) before this LocalSet unwinds.
-                let activated_primary_handle = secondary.take_activated_primary_handle();
+                // Drop the secondary so its mesh transport tears down.
                 drop(secondary);
-                if let Some(handle) = activated_primary_handle
-                    && let Err(e) = handle.await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        "co-located primary (activated on demand) did not join cleanly"
-                    );
-                }
 
                 // Tear down tracked worker subprocesses via the shared
                 // SIGTERM → grace → SIGKILL primitive. See
@@ -1049,29 +758,6 @@ impl PySecondaryCoordinator {
     fn completed(&self) -> u32 {
         self.completed
     }
-}
-
-/// Derive the activated co-located primary's `required_setup_on_promote`
-/// from THIS run's pre-staged signal.
-///
-/// Single concern: "does this run defer setup-discovery to me?" The
-/// answer is the secondary's own `source_already_staged` flag (forwarded
-/// from `args.source_already_staged` at the construction-dispatch site).
-/// When true, the co-located primary this node activates engages the
-/// `setup_pending()` suppressor so it does not declare `0+0 >= 0`
-/// run-complete before its loopback-delivered discovery batch lands —
-/// matching the `SecondaryCoordinator::setup_discovery_pending`
-/// `pre_staged_mode` gate exactly (both are the submitter's
-/// `--source-already-staged`, read from the secondary's own arg HERE vs
-/// the wire `InitialAssignment.pre_staged_mode` THERE).
-///
-/// Deliberately NOT `src_network.is_some()`: the wrapper bind-mounts
-/// `/app/src-network` for EVERY SLURM secondary, so that predicate would
-/// engage the suppressor for a genuinely-empty NON-pre-staged run too —
-/// which has no discovery feed and would then hang to the setup-promote
-/// deadline.
-pub(crate) fn derive_setup_defer_on_promote(source_already_staged: bool) -> bool {
-    source_already_staged
 }
 
 /// Compose the secondary's memprofile output directory from the
@@ -1151,47 +837,9 @@ fn resolve_secondary_memprofile_dir_with_probe(
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_setup_defer_on_promote, resolve_secondary_memprofile_dir,
-        resolve_secondary_memprofile_dir_with_probe,
+        resolve_secondary_memprofile_dir, resolve_secondary_memprofile_dir_with_probe,
     };
     use std::path::Path;
-
-    // ── Setup-defer-on-promote discriminator (Finding-1 regression) ──
-    //
-    // The activated co-located primary's `required_setup_on_promote`
-    // suppressor must engage EXACTLY when this run deferred discovery to
-    // this node (`source_already_staged`), and NOT for a genuinely-empty
-    // NON-pre-staged run. The previous discriminator
-    // (`src_network.is_some()`) was true for EVERY SLURM secondary (the
-    // wrapper bind-mounts `/app/src-network` unconditionally), so a
-    // non-pre-staged empty-corpus run relocated to a compute peer got the
-    // suppressor engaged with no discovery feed to clear it → hung to the
-    // 600s setup-promote deadline. These pin the corrected derivation.
-
-    #[test]
-    fn non_pre_staged_does_not_defer_setup_on_promote() {
-        // Finding-1 repro: a genuinely-empty NON-pre-staged run
-        // (`source_already_staged = false`) must NOT engage the
-        // suppressor — `required_setup_on_promote` stays false, so the
-        // activated primary exits via the normal bootstrap RunComplete
-        // path instead of hanging to the setup-promote deadline. This is
-        // the case the old `src_network.is_some()` discriminator broke.
-        assert!(
-            !derive_setup_defer_on_promote(false),
-            "non-pre-staged run must leave setup-defer false (prompt exit, no deadline hang)"
-        );
-    }
-
-    #[test]
-    fn pre_staged_defers_setup_on_promote() {
-        // The pre-staged path (`--source-already-staged`): discovery is
-        // deferred to this node, so the suppressor MUST engage to hold
-        // the run-complete exit until the loopback discovery batch lands.
-        assert!(
-            derive_setup_defer_on_promote(true),
-            "pre-staged run must defer setup on promote (engage the suppressor)"
-        );
-    }
 
     #[test]
     fn disabled_returns_none_regardless_of_probe() {

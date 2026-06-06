@@ -10,7 +10,7 @@
 //! four pyo3 manager `run.rs` constructors each named a concrete
 //! backend (`NetworkServer`, `NetworkClient`, `PeerNetwork`,
 //! `EitherPeerTransport`, `NoPeerTransport`, `TunneledPeerTransport`,
-//! `ChannelPeerTransport`, `MeshHandleTransport`) and read
+//! `ChannelPeerTransport`) and read
 //! backend-only scalars off it (`.port()`, `.cert_pem()`), so the
 //! backend choice leaked across the manager boundary.
 //!
@@ -20,14 +20,13 @@
 //! manager back an **opaque** `impl PeerTransport` plus the
 //! backend-derived values the manager still needs (the respawn trust
 //! anchor, the `PeerCertInfo` a secondary/observer ships in its
-//! `CertExchange`, and the optional mesh-send capability an on-demand
-//! co-located primary borrows). No caller of this module names a backend.
+//! `CertExchange`, and the optional mesh-send capability the manager
+//! borrows). No caller of this module names a backend.
 //!
 //! # What is NOT this module's concern
 //!
-//! The mesh-level COMPOSITION — A8's co-located `MeshHandleTransport` +
-//! the primary↔secondary loopback channels, the channel-fold's channel
-//! mesh, the `register_primary_link` bootstrap-wire fold, the
+//! The mesh-level COMPOSITION — the channel-fold's channel mesh, the
+//! `register_primary_link` bootstrap-wire fold, the
 //! `set_bootstrap_primary_id` egress hint — is the secondary/distributed
 //! coordinator's concern and stays in `run.rs`. This factory only owns
 //! BACKEND SELECTION/NAMING: it builds the backend objects and exposes
@@ -37,8 +36,8 @@
 use dynrunner_core::Identifier;
 use dynrunner_manager_distributed::PeerCertInfo;
 use dynrunner_transport_quic::{
-    EitherPeerTransport, MeshHandleTransport, MeshSendHandle, NetworkClient, NetworkServer,
-    NoPeerTransport, PeerNetwork,
+    EitherPeerTransport, MeshSendHandle, NetworkClient, NetworkServer, NoPeerTransport,
+    PeerNetwork,
 };
 use dynrunner_transport_tunnel::{InboundTap, SharedOutgoing, TunneledPeerTransport};
 
@@ -120,10 +119,10 @@ pub(crate) struct SecondaryMeshBundle<I: Identifier> {
     /// built from the backend's cert PEM + QUIC port (so the manager
     /// never reads `.cert_pem()` / `.port()` itself).
     pub peer_cert_info: PeerCertInfo,
-    /// Cloneable mesh-send capability for the on-demand co-located
-    /// primary's role-blind transport — `Some` only when a REAL peer
+    /// Cloneable mesh-send capability — `Some` only when a REAL peer
     /// mesh exists (a `Disabled` overlay has no remote secondaries and
-    /// thus no failover). Threaded into [`colocated_primary_transport`].
+    /// thus no failover). The manager reads `is_some()` as the
+    /// primary-capability marker.
     pub mesh_send: Option<MeshSendHandle<I>>,
 }
 
@@ -245,8 +244,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
             (EitherPeerTransport::Real(Box::new(pn)), cert_pem, port)
         };
 
-    // Cloneable mesh-send capability for the on-demand co-located primary's
-    // role-blind `MeshHandleTransport` (`Some` only when a real peer mesh
+    // Cloneable mesh-send capability (`Some` only when a real peer mesh
     // exists). Taken BEFORE the bootstrap wire fold so the handle reflects
     // the live `PeerNetwork`.
     let mesh_send = transport.mesh_send_handle();
@@ -292,24 +290,6 @@ pub(crate) async fn observer_mesh<I: Identifier>(
     PeerNetwork::<I>::start(observer_id)
         .await
         .map_err(|e| format!("failed to start peer network: {e}"))
-}
-
-/// Build an on-demand co-located primary's role-blind mesh transport over
-/// the host's single peer mesh.
-///
-/// The mesh-send capability (`mesh`) reaches every remote peer; the
-/// `inbound_rx` is the demuxed inbound the co-located secondary forwards.
-/// The own-secondary loopback is NOT a transport leg — it is the egress
-/// edge's `SendTarget::Loopback` arm (see `register_colocated_loopback`).
-/// Keeps `MeshHandleTransport` named only inside this factory. Called from
-/// inside the primary-activator closure when a peer becomes primary.
-pub(crate) fn colocated_primary_transport<I: Identifier>(
-    mesh: MeshSendHandle<I>,
-    inbound_rx: tokio::sync::mpsc::UnboundedReceiver<
-        dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-    >,
-) -> MeshHandleTransport<I> {
-    MeshHandleTransport::new(mesh, inbound_rx)
 }
 
 /// The in-process distributed manager's primary mesh transport plus the

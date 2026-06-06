@@ -3,12 +3,11 @@
 //!
 //! # Concern
 //!
-//! A node that runs BOTH a `SecondaryCoordinator` and an on-demand
-//! co-located `PrimaryCoordinator` on one `LocalSet` owns a SINGLE
-//! [`PeerNetwork`] mesh. The secondary holds that mesh by value (the
-//! `EitherPeerTransport`); the co-located primary's role-blind
-//! `Tr: PeerTransport` (`MeshHandleTransport`) still needs to reach
-//! remote peers over the same mesh once this node is promoted.
+//! A node owns a SINGLE [`PeerNetwork`] mesh, held by value behind the
+//! `EitherPeerTransport`. A second consumer on the same `LocalSet` may
+//! still need to reach the mesh's remote peers without taking ownership
+//! of the `connections` table — this handle is that cloneable mesh-send
+//! view.
 //!
 //! This handle is the cloneable mesh-send capability that makes that
 //! possible WITHOUT changing `PeerNetwork`'s ownership of its
@@ -29,9 +28,9 @@
 //! Like the rest of the QUIC transport, the mesh runs on a
 //! `current_thread` `LocalSet`. The proxy channel is a plain
 //! `tokio::sync::mpsc`; `send` on the handle is synchronous (no await),
-//! so cloning the handle into a co-located primary's `MeshHandleTransport`
-//! while the secondary keeps its own access through the owned mesh
-//! never aliases a borrow across an await.
+//! so cloning the handle to a second mesh-send consumer while the owner
+//! keeps its own access through the owned mesh never aliases a borrow
+//! across an await.
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
