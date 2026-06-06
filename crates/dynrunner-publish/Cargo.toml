@@ -13,7 +13,13 @@ readme.workspace       = true
 
 [dependencies]
 thiserror = { workspace = true }
-libc = "0.2"
+# `signal` (workspace default): RAII signal-mask guard that holds
+# {SIGTERM,SIGINT,SIGHUP} pending across the back-to-back rename phase
+# (sigprocmask, mirroring slurm-wrapper/wrapper/src/signals.rs).
+# `hostname`: `gethostname()` for the host token embedded in the
+# `.publish-tmp` sibling name, which makes the stale-temp sweep
+# shared-NFS-safe (own-host scope + local pid-liveness check).
+nix = { workspace = true, features = ["hostname"] }
 
 [dev-dependencies]
 tempfile = "3"
