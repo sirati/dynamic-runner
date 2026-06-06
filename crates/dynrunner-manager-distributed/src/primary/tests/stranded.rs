@@ -277,6 +277,148 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
         .await;
 }
 
+/// #235 primary half: on a routing collapse (`stranded > 0`) the shared
+/// finalize tail must broadcast `ClusterMutation::RunAborted { reason }`,
+/// NOT `RunComplete`. Pre-fix the tail broadcast `RunComplete`
+/// unconditionally, so a still-connected observer's narrator projected a
+/// false "run complete" over a collapsed cluster (the strand was invisible
+/// on the important channel).
+///
+/// `apply_and_broadcast_cluster_mutations` applies the terminal mutation to
+/// the primary's OWN `cluster_state` before fanning it over the mesh — the
+/// same mutation every connected peer receives — so the post-run CRDT state
+/// is the faithful observable for WHAT was broadcast: `run_aborted()` is
+/// `Some` and `run_complete()` is false. The locally-returned
+/// `RunError::ClusterCollapsed` is unchanged (asserted separately).
+#[tokio::test(flavor = "current_thread")]
+async fn strand_broadcasts_run_aborted_not_run_complete() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
+
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                fleet_dead_timeout: std::time::Duration::from_secs(600),
+                ..test_primary_config()
+            };
+
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
+                    id,
+                    /* num_workers = */ 1,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
+
+            let (deps, ops, ope) = noop_phase_args();
+            let outcome = primary.run(binaries, deps, ops, ope).await;
+
+            // Local return is the unchanged ClusterCollapsed.
+            assert!(
+                matches!(outcome, Err(RunError::ClusterCollapsed { .. })),
+                "strand must still return ClusterCollapsed locally, got {outcome:?}"
+            );
+
+            // The peer-facing broadcast is the honest RunAborted, NOT
+            // RunComplete — observed through the local apply.
+            let state = primary.cluster_state_for_test();
+            let reason = state.run_aborted().unwrap_or_else(|| {
+                panic!(
+                    "strand must broadcast RunAborted (run_aborted() = Some); \
+                     run_complete()={}",
+                    state.run_complete()
+                )
+            });
+            assert!(
+                !state.run_complete(),
+                "strand must NOT latch RunComplete — pre-fix it did, narrating a \
+                 false success on a collapsed cluster"
+            );
+            // Reason reuses the ClusterCollapsed render — carries the
+            // per-class breakdown so the observer's narrator emits a
+            // meaningful aborted line on the important channel.
+            assert!(
+                reason.contains("cluster routing collapsed"),
+                "abort reason must carry the ClusterCollapsed render, got: {reason}"
+            );
+        })
+        .await;
+}
+
+/// #235 primary half, clean twin: a happy-path run must still broadcast
+/// `RunComplete` (not `RunAborted`) — the conditional only diverges on
+/// `stranded > 0`. Same local-apply observable as the strand twin.
+#[tokio::test(flavor = "current_thread")]
+async fn clean_run_broadcasts_run_complete_not_aborted() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
+
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..4)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(
+                    id,
+                    /* num_workers = */ 2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
+
+            let (deps, ops, ope) = noop_phase_args();
+            primary
+                .run(binaries, deps, ops, ope)
+                .await
+                .expect("clean run must return Ok");
+
+            let state = primary.cluster_state_for_test();
+            assert!(
+                state.run_complete(),
+                "clean run must latch RunComplete"
+            );
+            assert!(
+                state.run_aborted().is_none(),
+                "clean run must NOT broadcast RunAborted, got reason: {:?}",
+                state.run_aborted()
+            );
+        })
+        .await;
+}
+
 /// Pin Fix-#21 contract: when the operational loop's
 /// `fleet_dead_timeout` arm fires with queued tasks in the pool, the
 /// drained binaries must be classified as `stranded` — not `failed`.
