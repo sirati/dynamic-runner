@@ -54,18 +54,6 @@ pub(crate) struct PySecondaryCoordinator {
     /// `None` falls back to a system tempdir under
     /// `db_secondary_<id>` (the historical default).
     pub(super) src_tmp: Option<PathBuf>,
-    /// This run's pre-staged signal: `true` iff the submitter was invoked
-    /// with `--source-already-staged`, i.e. discovery / ledger-seed was
-    /// DEFERRED to the chosen compute peer (this node) rather than run on
-    /// the submitter. Forwarded verbatim from `args.source_already_staged`
-    /// at the construction-dispatch site (`run_secondary`), mirroring the
-    /// submitter primary's own `source_pre_staged_root` plumb. It is the
-    /// secondary-side twin of the wire `InitialAssignment.pre_staged_mode`
-    /// (`primary::assignment` sets that from the submitter's
-    /// `source_pre_staged_root.is_some()`), available HERE at dispatch time
-    /// — before the wire assignment lands and the activator closure is
-    /// built. Sole input to `setup_defer_on_promote` (see [`run`]).
-    pub(super) source_already_staged: bool,
     pub(super) types: TypeRegistry,
     /// Phase dependency graph extracted from
     /// `LoadedTaskDefinition::from_python`. Retained on the wrapper
