@@ -75,7 +75,7 @@ async fn single_worker_subprocess_processes_all() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -287,7 +287,7 @@ async fn single_worker_named_socket_processes_all() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -364,7 +364,7 @@ async fn multi_worker_named_socket_processes_all() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -435,7 +435,7 @@ async fn multi_worker_subprocess_processes_all() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await

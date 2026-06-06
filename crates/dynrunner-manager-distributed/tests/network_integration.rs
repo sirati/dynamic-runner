@@ -175,7 +175,7 @@ where
             binaries,
             std::collections::HashMap::new(),
             Box::new(|_| {}),
-            Box::new(|_, _, _| {}),
+            Box::new(|_, _, _, _| {}),
         );
         tokio::pin!(run);
         tokio::select! {

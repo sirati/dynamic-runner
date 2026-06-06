@@ -92,7 +92,7 @@ pub(super) fn noop_phase_args() -> (
     OnPhaseStart,
     OnPhaseEnd,
 ) {
-    (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _| {}))
+    (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _, _| {}))
 }
 
 /// Shared `PrimaryConfig` starting point for the in-process coordinator

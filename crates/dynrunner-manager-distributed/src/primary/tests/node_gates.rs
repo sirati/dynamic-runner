@@ -383,7 +383,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                     binaries,
                     phase_deps: HashMap::new(),
                     on_phase_start: Box::new(|_| {}),
-                    on_phase_end: Box::new(|_, _, _| {}),
+                    on_phase_end: Box::new(|_, _, _, _| {}),
                 }),
                 primary_demote_tx: Some(demote_tx),
                 ..Default::default()

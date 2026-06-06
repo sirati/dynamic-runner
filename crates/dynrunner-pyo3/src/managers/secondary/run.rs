@@ -708,7 +708,7 @@ fn build_promoted_primary_recipe(
                 binaries: Vec::new(),
                 phase_deps: HashMap::new(),
                 on_phase_start: Box::new(|_| {}),
-                on_phase_end: Box::new(|_, _, _| {}),
+                on_phase_end: Box::new(|_, _, _, _| {}),
             },
         }
     })

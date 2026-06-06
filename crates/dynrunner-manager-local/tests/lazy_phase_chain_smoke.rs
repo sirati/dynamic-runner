@@ -142,7 +142,13 @@ async fn on_phase_end_spawn_tasks_runs_post_phase_via_outer_loop() {
             // Two initial p1 binaries; no p2 binaries at run start.
             let binaries = vec![make_binary("p1a", "p1"), make_binary("p1b", "p1")];
 
-            let on_phase_end = move |phase_id: &PhaseId, _completed: u32, _failed: u32| {
+            let on_phase_end = move |phase_id: &PhaseId,
+                                     _completed: u32,
+                                     _failed: u32,
+                                     _outputs: &std::collections::BTreeMap<
+                String,
+                dynrunner_core::TaskOutputs,
+            >| {
                 if phase_id.as_str() != "p1" {
                     return;
                 }

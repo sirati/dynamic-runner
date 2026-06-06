@@ -501,7 +501,7 @@ fn empty_primary_args<I: Identifier>() -> PrimaryRunArgs<I> {
         binaries: Vec::new(),
         phase_deps: std::collections::HashMap::new(),
         on_phase_start: Box::new(|_| {}),
-        on_phase_end: Box::new(|_, _, _| {}),
+        on_phase_end: Box::new(|_, _, _, _| {}),
     }
 }
 

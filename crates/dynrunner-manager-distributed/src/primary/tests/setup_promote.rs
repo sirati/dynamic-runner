@@ -396,7 +396,7 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
         let calls: std::sync::Arc<std::sync::Mutex<Vec<(String, u32, u32)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_inner = calls.clone();
-        primary.on_phase_end = Some(Box::new(move |p, c, f| {
+        primary.on_phase_end = Some(Box::new(move |p, c, f, _outputs| {
             calls_inner
                 .lock()
                 .expect("poisoned")

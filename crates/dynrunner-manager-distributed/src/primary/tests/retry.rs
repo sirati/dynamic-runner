@@ -572,7 +572,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                 Arc::new(Mutex::new(Vec::new()));
             let ends_cb = recorded_ends.clone();
             let on_end: crate::primary::OnPhaseEnd =
-                Box::new(move |p: &dynrunner_core::PhaseId, c: u32, f: u32| {
+                Box::new(move |p: &dynrunner_core::PhaseId, c: u32, f: u32, _outputs| {
                     ends_cb.lock().unwrap().push((p.to_string(), c, f));
                 });
             let on_start: crate::primary::OnPhaseStart = Box::new(|_| {});
@@ -856,7 +856,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                 log_starts.lock().unwrap().push(Ev::Start(p.to_string()));
             });
             let log_ends = log.clone();
-            let on_end: crate::primary::OnPhaseEnd = Box::new(move |p: &PhaseId, _, _| {
+            let on_end: crate::primary::OnPhaseEnd = Box::new(move |p: &PhaseId, _, _, _| {
                 log_ends.lock().unwrap().push(Ev::End(p.to_string()));
             });
 

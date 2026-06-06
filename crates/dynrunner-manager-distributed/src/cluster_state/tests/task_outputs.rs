@@ -269,6 +269,77 @@ fn python_encode_outputs_only_decodes_outputs() {
     );
 }
 
+/// A task placed in `phase` carrying `task_id = name`. Used by the
+/// `phase_task_outputs` gather test so two phases hold distinct tasks.
+fn mk_task_in_phase(name: &str, phase: &str) -> TaskInfo<RunnerIdentifier> {
+    TaskInfo {
+        phase_id: dynrunner_core::PhaseId::from(phase),
+        ..mk_task(name)
+    }
+}
+
+#[test]
+fn phase_task_outputs_gathers_only_the_named_phase() {
+    // The `on_phase_end` primitive: when a phase drains, the hook is
+    // handed `{task_id: TaskOutputs}` for THAT phase's published tasks,
+    // read off the same `task_outputs` cache `outputs_for` uses — no
+    // filesystem path. Pin: two phases each publish outputs; gathering
+    // one phase returns ONLY its tasks' outputs (keyed by task_id), and
+    // a task that published nothing contributes no entry.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // Phase "build" — two tasks; one publishes, one does not.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h_common".into(),
+        task: mk_task_in_phase("common_dep", "build"),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h_variant".into(),
+        task: mk_task_in_phase("variant", "build"),
+    });
+    // Phase "dependency_graph" — one task that publishes the pickle-ish
+    // payload the consumer reads from on_phase_end.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h_dep".into(),
+        task: mk_task_in_phase("dependency_graph", "dependency_graph"),
+    });
+
+    let common_outputs = outputs_with("artifact_drv", "/nix/store/abc");
+    let dep_outputs = outputs_with("dependency_graph_pkl", "BASE64PICKLE");
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h_common".into(),
+        result_data: Some(encode_wire(&common_outputs)),
+    });
+    // `variant` completes with NO published outputs.
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h_variant".into(),
+        result_data: None,
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h_dep".into(),
+        result_data: Some(encode_wire(&dep_outputs)),
+    });
+
+    // Gathering the "dependency_graph" phase returns ONLY its task's
+    // outputs, keyed by task_id — the exact handle on_phase_end gets.
+    let dep_phase = s.phase_task_outputs(&dynrunner_core::PhaseId::from("dependency_graph"));
+    assert_eq!(dep_phase.len(), 1, "only the dep_graph task: {dep_phase:?}");
+    assert_eq!(dep_phase.get("dependency_graph"), Some(&dep_outputs));
+
+    // Gathering "build" returns ONLY the task that published; the
+    // output-less `variant` contributes no entry (mirrors `outputs_for`'s
+    // None for a task that published nothing).
+    let build_phase = s.phase_task_outputs(&dynrunner_core::PhaseId::from("build"));
+    assert_eq!(build_phase.len(), 1, "only common_dep published: {build_phase:?}");
+    assert_eq!(build_phase.get("common_dep"), Some(&common_outputs));
+    assert!(!build_phase.contains_key("variant"));
+
+    // A phase with no tasks at all gathers to an empty map.
+    assert!(
+        s.phase_task_outputs(&dynrunner_core::PhaseId::from("nonexistent"))
+            .is_empty()
+    );
+}
+
 #[test]
 fn python_encode_counters_only_populates_empty_cache() {
     // Encoder shape when the task returns a `WorkerOutput` with

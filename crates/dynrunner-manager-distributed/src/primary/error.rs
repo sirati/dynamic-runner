@@ -122,6 +122,30 @@ pub enum RunError {
         /// (e.g. the invalid-task monitor's threshold breach).
         reason: String,
     },
+    /// A runtime `spawn_tasks` batch (typically from `on_phase_end`)
+    /// was REJECTED by the validator — every named task failed
+    /// `UnknownDependency` / `DuplicateTaskHash` — so the framework
+    /// silently dropped planned work. On the producer path a wholesale-
+    /// rejected next-phase batch nets ZERO dispatch yet every seeded task
+    /// already terminated, so `run_complete_check`'s counter exit trips
+    /// and the run exits rc=0 with zero outputs (the asm-dataset-nix
+    /// c39034f2 silent total=0). Surfacing this loudly is the safety net:
+    /// a non-empty spawn plan that dispatches nothing must never present
+    /// as a clean run.
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary RAISES on it
+    /// (the `Other` path is log-and-swallowed → exit 0, which is exactly
+    /// the silent failure this variant exists to prevent). Distinct from
+    /// `ClusterCollapsed` because nothing was stranded by a routing
+    /// collapse — the work never entered the ledger to be stranded. The
+    /// per-index `SpawnError` the caller already receives from
+    /// `spawn_tasks` is UNCHANGED; this is the run-level backstop for the
+    /// case where the consumer logs those per-task errors and proceeds.
+    SpawnRejected {
+        /// The `task_id`s the validator rejected (capped for the
+        /// message; the count is the authoritative signal).
+        rejected_task_ids: Vec<String>,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     ///
@@ -180,6 +204,34 @@ impl fmt::Display for RunError {
                  observer's invalid-task monitor) signalled a deliberate non-zero \
                  exit — the run did not complete cleanly."
             ),
+            Self::SpawnRejected { rejected_task_ids } => {
+                // Cap the inline list so a large rejected batch doesn't
+                // flood the message; the count is the load-bearing signal.
+                const SHOWN: usize = 8;
+                let n = rejected_task_ids.len();
+                let shown: Vec<&str> = rejected_task_ids
+                    .iter()
+                    .take(SHOWN)
+                    .map(String::as_str)
+                    .collect();
+                let suffix = if n > SHOWN {
+                    format!(" (+{} more)", n - SHOWN)
+                } else {
+                    String::new()
+                };
+                write!(
+                    f,
+                    "runtime spawn_tasks rejected {n} task(s): [{}]{suffix}. A \
+                     phase plan named these (phase_id, task_id) identities but the \
+                     validator rejected every one (unknown dependency or duplicate \
+                     hash), so the framework dispatched ZERO of them — the run would \
+                     otherwise have exited rc=0 with that planned work silently \
+                     dropped. Fix the producer so each spawned task's dependencies \
+                     resolve to ledger entries, or so its (phase_id, task_id) is \
+                     unique.",
+                    shown.join(", ")
+                )
+            }
             Self::Other(msg) => f.write_str(msg),
         }
     }

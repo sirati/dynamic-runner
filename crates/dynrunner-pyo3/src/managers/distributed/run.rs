@@ -247,6 +247,11 @@ impl PyDistributedManager {
         // or an invalid-task fatal-exit). RAISES at the GIL-side tail (never
         // the `Other` swallow). Same shape as `PyPrimaryCoordinator::run`.
         let mut fatal_policy_exit: Option<RunError> = None;
+        // Spawn-rejected terminal: a runtime `spawn_tasks` batch was
+        // wholesale-rejected so the phase dispatched ZERO tasks. RAISES at
+        // the GIL-side tail (never the `Other` swallow). Same shape as
+        // `PyPrimaryCoordinator::run`.
+        let mut spawn_rejected: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -783,6 +788,9 @@ impl PyDistributedManager {
                             e @ RunError::FatalPolicyExit { .. } => {
                                 fatal_policy_exit = Some(e);
                             }
+                            e @ RunError::SpawnRejected { .. } => {
+                                spawn_rejected = Some(e);
+                            }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
                                 // (exit 0) — see `PyPrimaryCoordinator::run`.
@@ -843,6 +851,13 @@ impl PyDistributedManager {
         if let Some(err) = fatal_policy_exit {
             // A deliberate policy abort (panicked role task / invalid-task
             // fatal-exit) — RAISE, never the `Other` swallow.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = spawn_rejected {
+            // A runtime spawn_tasks batch was wholesale-rejected → the phase
+            // dispatched ZERO tasks. RAISE so the wrapper sees a non-zero
+            // exit instead of the silent rc=0 that masked the dropped work.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

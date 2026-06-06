@@ -324,6 +324,24 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// clean run; `>0` on the cluster-collapse path the tokenizer hit
     /// on 2026-05-10. Reset to 0 at the start of every `run()`.
     pub(super) stranded_count: usize,
+    /// Per-task identities a runtime `spawn_tasks` batch could not apply
+    /// because the validator rejected them (`UnknownDependency` —
+    /// an `on_phase_end`-spawned task naming a `(phase_id, task_id)`
+    /// prereq absent from the ledger; or `DuplicateTaskHash`). Each
+    /// rejection is planned work the framework SILENTLY dropped — on the
+    /// producer path a wholesale-rejected build batch nets the next phase
+    /// ZERO dispatch yet every seeded task already terminated, so
+    /// `run_complete_check`'s counter exit trips and the run exits rc=0
+    /// with zero outputs (the asm-dataset-nix c39034f2 silent total=0).
+    ///
+    /// Accumulated by `apply_spawn_tasks` (the sole writer); read once by
+    /// `run()`'s final accounting, which surfaces a loud
+    /// `RunError::SpawnRejected` instead of the silent clean exit. Reset
+    /// to empty at the start of every `run()`. The per-index `SpawnError`
+    /// reply the caller already receives is UNCHANGED — this is the
+    /// run-level loud-fail backstop for the case where the consumer logs
+    /// those per-task errors and proceeds, masking a zero-dispatch phase.
+    pub(super) spawn_rejected_task_ids: Vec<String>,
     pub(super) all_binaries: Vec<TaskInfo<I>>,
     /// Phase-aware pending pool. Lazily initialised at `run()` start so
     /// the constructor doesn't need the phase set / dependency graph;
@@ -865,6 +883,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             workers: Vec::new(),
             total_tasks: 0,
             stranded_count: 0,
+            spawn_rejected_task_ids: Vec::new(),
             all_binaries: Vec::new(),
             pending: None,
             phase_deps: HashMap::new(),
@@ -2458,6 +2477,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
         self.stranded_count = 0;
+        // Same per-run reset for the spawn-rejection ledger: only written
+        // by `apply_spawn_tasks` when the validator rejects a runtime
+        // `spawn_tasks` task; a coordinator re-used across runs must not
+        // inherit a stale rejection.
+        self.spawn_rejected_task_ids.clear();
         // Reset the setup-promote-deadline outcome so a previous
         // run's residue (the field is only written when the deadline
         // arm fires; a clean run leaves it untouched, but a coordinator
@@ -3007,6 +3031,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return Err(RunError::ClusterCollapsed { stranded, outcome });
         }
 
+        // Loud-fail backstop for the silent zero-dispatch path. A runtime
+        // `spawn_tasks` batch (typically `on_phase_end` spawning the next
+        // phase) whose EVERY task the validator rejected nets that phase
+        // ZERO dispatch — `apply_spawn_tasks` never refreshed `total_tasks`,
+        // so `run_complete_check`'s counter exit tripped against the
+        // pre-spawn total and the run reached this clean tail with that
+        // planned work silently dropped (the asm-dataset-nix c39034f2
+        // producer-path silent total=0). Surfacing it as a structured
+        // `RunError::SpawnRejected` makes the submitter's PyO3 boundary
+        // RAISE instead of returning rc=0 — a non-empty spawn plan that
+        // dispatched nothing must never present as a clean run.
+        //
+        // Sequenced AFTER the strand check (a routing collapse is the
+        // stronger terminal and already raises). The per-index `SpawnError`
+        // the consumer received from `spawn_tasks` is unchanged; this is
+        // the run-level net the consumer's per-task WARN-and-continue
+        // otherwise slips through.
+        if !self.spawn_rejected_task_ids.is_empty() {
+            let rejected_task_ids = std::mem::take(&mut self.spawn_rejected_task_ids);
+            tracing::error!(
+                rejected = rejected_task_ids.len(),
+                "runtime spawn_tasks rejected every task in a batch — the \
+                 phase dispatched ZERO tasks and the run would otherwise have \
+                 exited rc=0 with that planned work silently dropped"
+            );
+            return Err(RunError::SpawnRejected { rejected_task_ids });
+        }
+
         tracing::info!(
             succeeded = outcome.succeeded,
             fail_retry = outcome.fail_retry,
@@ -3277,8 +3329,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 let completed = self.phase_completed.get(p).copied().unwrap_or(0);
                 let failed = self.phase_failed.get(p).copied().unwrap_or(0);
+                // Gather the just-completed phase's PUBLISHED task outputs
+                // BEFORE taking the `&mut self.on_phase_end` borrow (the
+                // gather is an immutable `&self.cluster_state` read). The
+                // cascade fires this hook AFTER the phase's `TaskCompleted`
+                // applies, so every produced output is already in the
+                // `task_outputs` cache here — the callback reads a finished
+                // task's output WITHOUT a filesystem path (the keyed-outputs
+                // primitive, lifted from per-dependent `predecessor_outputs`
+                // to the whole-phase `on_phase_end` surface). Owned clones,
+                // so no borrow outlives the call.
+                let phase_outputs = self.cluster_state.phase_task_outputs(p);
                 if let Some(cb) = self.on_phase_end.as_mut() {
-                    cb(p, completed, failed);
+                    cb(p, completed, failed, &phase_outputs);
                 }
                 // Apply any commands the on_phase_end callback queued
                 // via the in-runtime PrimaryHandle path. Without this,
