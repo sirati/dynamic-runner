@@ -15,7 +15,7 @@
 //!   * [`handler`] owns the dispatch entry `handle_primary_command`
 //!     and the `apply_*` methods on `PrimaryCoordinator`. Each arm
 //!     forwards to one method so the mutation's state-machine
-//!     semantics stay co-located with the rest of the coordinator's
+//!     semantics stay together with the rest of the coordinator's
 //!     state.
 //!   * The operational loop's `select!` arm (`lifecycle.rs`) calls
 //!     `handle_primary_command(self, cmd).await` — single line, no

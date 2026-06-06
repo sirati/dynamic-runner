@@ -270,7 +270,7 @@ async fn self_named_primary_resets_election_to_normal() {
         );
         assert!(
             actions.broadcast.is_empty(),
-            "no spurious election broadcast while the co-located primary is healthy",
+            "no spurious election broadcast while the same-peer primary is healthy",
         );
     }
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));

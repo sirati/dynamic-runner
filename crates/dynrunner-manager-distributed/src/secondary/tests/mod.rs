@@ -14,7 +14,7 @@
 //! Setup-discovery is NOT an authority-mirror concern and is restored
 //! in its correct shape: the secondary is the PRODUCER of the discovery
 //! result (it mounts the corpus), broadcasting `PhaseDepsSet + TaskAdded`
-//! onto the mesh for the co-located authoritative primary to pick up. It
+//! onto the mesh for the same-peer authoritative primary to pick up. It
 //! holds no dispatch authority over the discovered tasks — see
 //! [`setup_discovery_yield`].
 //!
