@@ -189,27 +189,6 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     ClusterMutation::TaskAdded { .. } | ClusterMutation::TasksSpawned { .. }
                 )
             });
-            // Setup-defer seeding edge: capture whether the
-            // CRDT-derived `setup_pending()` gate holds BEFORE this batch
-            // applies. An activated co-located primary on the
-            // `--source-already-staged` path builds its pool EMPTY (no
-            // phases — the activation snapshot carried neither tasks nor a
-            // `PhaseDepsSet`; see `activate_local_primary` /
-            // `hydrate_from_cluster_state`). The discovery feed then
-            // broadcasts the run's `PhaseDepsSet` + `TaskAdded` batch as
-            // the FIRST ledger growth. That batch introduces phases the
-            // empty pool does not know, so a plain `reinject` (which never
-            // registers a phase in `phase_state`) would queue each task in
-            // a bucket whose phase is not `Active` — silently
-            // un-dispatchable. The fix is to REBUILD the pool from the
-            // now-seeded `cluster_state` once, the moment discovery seeds
-            // it: `hydrate_from_cluster_state` reads `cluster_state.
-            // phase_deps()` (just set by the batch's `PhaseDepsSet`) and
-            // classifies each discovery phase Active/Blocked correctly,
-            // queuing every freshly-`Pending` discovery task. This is a
-            // one-shot — `setup_pending()` only ever transitions true→false
-            // once per run.
-            let was_setup_pending = self.setup_pending();
             // Collect any PeerJoined ids riding in the batch BEFORE
             // moving the mutations into apply. After the batch
             // applies, each joined id may have resolved a previously-
@@ -252,37 +231,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 self.cluster_state
                     .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
             }
-            if was_setup_pending && has_task_added && !self.setup_pending() {
-                // Setup-defer seeding edge (see `was_setup_pending`): the
-                // discovery feed's `PhaseDepsSet` + `TaskAdded` batch just
-                // seeded the empty ledger. REBUILD the activated primary's
-                // empty pool from the now-seeded `cluster_state` so the
-                // discovery phases are registered (Active/Blocked per the
-                // applied `phase_deps`) and every freshly-`Pending`
-                // discovery task is queued. `hydrate_from_cluster_state` is
-                // the single primitive that owns pool construction from the
-                // CRDT ledger; reusing it here (rather than a per-phase
-                // reinject) keeps phase classification in one place and
-                // respects the discovery dep graph. This SUBSUMES the
-                // incremental `newly_pending` reinject below for this batch
-                // (the rebuilt pool already holds every discovery task), so
-                // the two are mutually exclusive on `was_setup_pending`. A
-                // one-shot: `setup_pending()` only clears once.
-                tracing::info!(
-                    crdt_tasks = self.cluster_state.task_count(),
-                    "setup-defer discovery seeded the ledger; rebuilding the \
-                     activated primary's pool from cluster_state so the \
-                     discovery tasks become dispatchable"
-                );
-                self.hydrate_from_cluster_state();
-                // The rebuilt pool grew out of empty — EMIT a `TasksAdded`
-                // so the worker-management recheck dispatches the seeded
-                // discovery work to the reconstructed idle roster. Decoupled
-                // emit, never a direct dispatch call (the dispatch-
-                // decoupling law).
-                self.cluster_state
-                    .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
-            } else if self.pending.is_some() {
+            if self.pending.is_some() {
                 let reinjected_any = !newly_pending.is_empty();
                 for task in newly_pending {
                     tracing::debug!(

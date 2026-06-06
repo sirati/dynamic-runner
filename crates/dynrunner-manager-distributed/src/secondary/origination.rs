@@ -56,9 +56,8 @@ use crate::cluster_state::apply_locally_for_broadcast;
 /// "drain a freshly-seeded pool to quiescence".
 ///
 /// Relocated faithfully from the removed `secondary/primary/mod.rs`.
-/// The sole caller is the primary-side `hydrate_from_cluster_state`,
-/// reached from the composed primary's seeded resume (failover
-/// activation).
+// R4 SEAM: the only caller is the primary-side hydrate_from_cluster_state
+#[allow(dead_code)] // TODO(R4): reached via hydrate_from_cluster_state (P4 composition)
 pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     loop {
         pool.drain_empty_active_phases();
