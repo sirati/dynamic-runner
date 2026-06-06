@@ -291,6 +291,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             mem_manager_reserved_bytes: None,
             output_dir: None,
             memuse_log_path: None,
+            forwarded_argv: Vec::new(),
         };
         run_secondary_node(config, transport, FakeWorkerFactory).await
     });
@@ -340,6 +341,7 @@ pub(super) fn spawn_real_secondary_slow(
             mem_manager_reserved_bytes: None,
             output_dir: None,
             memuse_log_path: None,
+            forwarded_argv: Vec::new(),
         };
         run_secondary_node(
             config,
@@ -405,6 +407,7 @@ pub(super) fn spawn_real_secondary_flaky(
             mem_manager_reserved_bytes: None,
             output_dir: None,
             memuse_log_path: None,
+            forwarded_argv: Vec::new(),
         };
         run_secondary_node(config, transport, flaky).await
     });

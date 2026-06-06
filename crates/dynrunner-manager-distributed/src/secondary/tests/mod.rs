@@ -64,4 +64,5 @@ mod panik_integration;
 mod peer_mesh_watchdog;
 mod processing;
 mod r1;
+mod run_config_responder;
 mod setup_discovery_yield;

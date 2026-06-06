@@ -638,6 +638,44 @@ where
                 // compatibility but is not consumed here.
                 Ok(())
             }
+            DistributedMessage::RequestRunConfig { sender_id, .. } => {
+                // PURE read-only run-config responder. Answer a joining /
+                // respawned / cold-start-fetching peer from this node's
+                // node-local `forwarded_argv` and unicast exactly ONE
+                // `RunConfig` back (its return address rides `sender_id`,
+                // mirroring the snapshot responder's reply edge). Unlike the
+                // `RequestClusterSnapshot` arm above, it does NOT originate
+                // `PeerJoined`, does NOT send any welcome, and never touches
+                // roster / capacity / CRDT: the run-config is a node-local
+                // launch constant, not lattice data, so answering for it is
+                // read-only peer gossip — NOT authority (a secondary holds
+                // none; the work-split is preserved). Available on the
+                // secondary role so a cold-start fetch is answerable before
+                // any primary exists / promotes. A send failure is logged
+                // best-effort, exactly as the snapshot responder treats its
+                // own; the requester's bounded recv wait falls back to its
+                // own deadline.
+                let response = DistributedMessage::RunConfig {
+                    target: None,
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    forwarded_argv: self.forwarded_argv.clone(),
+                };
+                if let Err(e) = self
+                    .send_to(
+                        Destination::Secondary(PeerId::from(sender_id.clone())),
+                        response,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target = %sender_id,
+                        error = %e,
+                        "failed to deliver RunConfig response"
+                    );
+                }
+                Ok(())
+            }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");
                 Ok(())

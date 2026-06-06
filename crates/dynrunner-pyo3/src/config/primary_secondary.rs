@@ -383,6 +383,11 @@ impl PySecondaryConfig {
             // silent so callers that go through it don't pick
             // up an unintended log target.
             memuse_log_path: None,
+            // Parity default (empty): wiring the operator's run-config
+            // kwarg into `forwarded_argv` is a separate concern. This
+            // documented-but-unused one-step builder stays at the
+            // empty launch-constant.
+            forwarded_argv: Vec::new(),
         }
     }
 }

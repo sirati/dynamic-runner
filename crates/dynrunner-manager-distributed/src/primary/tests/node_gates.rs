@@ -337,6 +337,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
             let mut secondary = SecondaryCoordinator::new(
                 sec_config,

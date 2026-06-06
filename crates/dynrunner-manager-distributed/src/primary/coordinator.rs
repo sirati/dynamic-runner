@@ -822,6 +822,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// dispatch tends to share secondaries with the OOM-bucket
     /// retries anyway).
     pub(super) single_worker_mode: bool,
+
+    /// The consumer's run configuration — the byte-identical token
+    /// sequence the framework forwards onto a joining / respawned /
+    /// promoted node's command line. A NODE-LOCAL launch constant
+    /// seeded from `config.forwarded_argv` at construction (mirroring
+    /// `next_secondary_id`); NOT replicated lattice data, so it never
+    /// touches `cluster_state`. The `RequestRunConfig` responder
+    /// (`task::mutation::handle_request_run_config`) reads it READ-ONLY
+    /// and unicasts it back to a requesting peer. Empty for a run with
+    /// no forwarded args.
+    pub(super) forwarded_argv: Vec<String>,
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -873,6 +884,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // already minted (`secondary-0..secondary-{num_secondaries - 1}`)
         // so the first respawn lands on `secondary-{num_secondaries}`.
         let next_secondary_id = config.num_secondaries;
+        // Snapshot the node-local run-config off the config before it
+        // moves into `this.config`, mirroring `next_secondary_id`. The
+        // responder reads this verbatim; it never re-reads `config`.
+        let forwarded_argv = config.forwarded_argv.clone();
         let mut this = Self {
             config,
             client,
@@ -937,6 +952,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             pending_run_abort: None,
             pending_invalid_dep_tasks: Vec::new(),
             single_worker_mode: false,
+            forwarded_argv,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route

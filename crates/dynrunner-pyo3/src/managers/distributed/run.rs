@@ -434,6 +434,12 @@ impl PyDistributedManager {
                             // `Option<PathBuf>` test-fixture
                             // flexibility (None = silent).
                             memuse_log_path: sec_memuse_log_path.clone(),
+                            // Parity default (empty): the in-process
+                            // distributed manager dials no cold-start
+                            // run-config fetch (every node shares the
+                            // submitter's argv directly), so the
+                            // node-local launch constant stays empty.
+                            forwarded_argv: Vec::new(),
                         };
 
                         let estimator = sec_estimator;

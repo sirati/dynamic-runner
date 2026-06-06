@@ -396,6 +396,21 @@ pub struct SecondaryConfig {
     /// silent — preserves the test-fixture flexibility every
     /// other dispatch path has.
     pub memuse_log_path: Option<PathBuf>,
+
+    /// The consumer's run configuration — the byte-identical token
+    /// sequence the framework forwards onto a joining / respawned /
+    /// promoted node's command line so it reconstructs the exact
+    /// run-config the submitter launched with. A NODE-LOCAL launch
+    /// constant (this secondary sources its own copy from its cold-start
+    /// fetch; a promoted node threads the SAME fetched copy into its
+    /// `PrimaryConfig`), NOT replicated lattice data — so it lives on
+    /// the config, never in `ClusterState`.
+    ///
+    /// Read-only on the coordinator: the `RequestRunConfig` responder
+    /// answers a requesting peer with this verbatim, available on the
+    /// secondary role so a cold-start fetch is answerable before any
+    /// primary exists / promotes. Default empty.
+    pub forwarded_argv: Vec<String>,
 }
 
 impl Default for SecondaryConfig {
@@ -431,6 +446,7 @@ impl Default for SecondaryConfig {
             mem_manager_reserved_bytes: None,
             output_dir: None,
             memuse_log_path: None,
+            forwarded_argv: Vec::new(),
         }
     }
 }
