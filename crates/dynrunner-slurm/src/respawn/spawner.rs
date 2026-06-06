@@ -21,9 +21,9 @@ use super::tunnel::TunnelEstablisher;
 
 /// Closure that synthesises a SLURM wrapper-script body for a given
 /// respawn spec. Returns the script content (not a path); the
-/// [`SlurmJobManager::submit_job`] call below writes it to the gateway
-/// at `<root_folder>/job_<job_name>.sh` and submits via
-/// `sbatch --parsable`.
+/// [`SlurmJobManager::submit_job`] call below pipes it to sbatch over
+/// STDIN (`printf '%s' '<body>' | sbatch --parsable …`) — no gateway-
+/// side `job_<job_name>.sh` file is written.
 ///
 /// `Send + Sync` because the spawner is shared via `Arc<dyn
 /// SecondarySpawner>` and the trait method takes `&self`.
@@ -132,9 +132,10 @@ where
         // been pushed onto `job_manager.job_ids` (so the coordinator's
         // later `cleanup()` can `scancel` the orphan).
         tokio::task::spawn_local(async move {
-            // (2) Submit a 1-node sbatch. `submit_job` writes the
-            // wrapper, invokes sbatch, and pushes the returned job_id
-            // onto its `job_ids` Vec in a single `&mut self` borrow.
+            // (2) Submit a 1-node sbatch. `submit_job` pipes the
+            // wrapper body to sbatch over STDIN, invokes sbatch, and
+            // pushes the returned job_id onto its `job_ids` Vec in a
+            // single `&mut self` borrow.
             // Holding the Mutex across the whole call serialises
             // concurrent respawns through the same manager — matches
             // the existing pipeline contract.

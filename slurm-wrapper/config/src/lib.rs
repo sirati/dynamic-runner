@@ -103,11 +103,16 @@ pub struct WrapperConfig {
     /// secondary argv; when `None`, the flag is omitted
     /// (`generate.rs:748-751`).
     pub mem_manager_reserved_bytes: Option<u64>,
-    /// Dispatcher task-specific argv, spliced after `--src-network=...`
-    /// (`config.rs` `forwarded_argv`). Passed straight into the podman
-    /// argv vector — no bash re-quoting needed since the binary execs
-    /// podman directly.
-    pub forwarded_argv: Vec<String>,
+    /// Consumer's real secondary entrypoint module (e.g.
+    /// `asm_tokenizer.secondary`), emitted onto the container argv as
+    /// `--secondary-module <module>`. The container's entrypoint runs
+    /// the framework bootstrap shim (`dynamic_runner._secondary_bootstrap`)
+    /// — see `container_command` — which fetches the run config over the
+    /// peer mesh and then `runpy`s THIS module. Replaces the old
+    /// `forwarded_argv` command-line splice: the dispatcher's
+    /// task-specific argv now travels over the mesh (cold-start fetch),
+    /// not on the launch command line.
+    pub secondary_module: String,
     /// Consumer `podman run` flags inserted before the image-ref arg
     /// (`config.rs` `extra_run_args`). Passed straight into the argv.
     pub extra_run_args: Vec<String>,
@@ -194,9 +199,7 @@ impl WrapperConfig {
         if let Some(bytes) = self.mem_manager_reserved_bytes {
             push("--mem-manager-reserved-bytes", &bytes.to_string());
         }
-        for arg in &self.forwarded_argv {
-            push("--forwarded-arg", arg);
-        }
+        push("--secondary-module", &self.secondary_module);
         for arg in &self.extra_run_args {
             push("--extra-run-arg", arg);
         }
@@ -262,11 +265,11 @@ mod tests {
             image_tag: "latest".to_string(),
             load_command: "$PODMAN_BIN --root \"$PODMAN_STORAGE\" load -i \"$LOCAL_IMAGE\""
                 .to_string(),
-            container_command: "python -m asm_tokenizer.secondary".to_string(),
+            container_command: "dynamic_runner._secondary_bootstrap".to_string(),
             cores_spec: "-2".to_string(),
             max_memory_spec: "-2G".to_string(),
             mem_manager_reserved_bytes: Some(524_288_000),
-            forwarded_argv: vec!["--platform".to_string(), "x86".to_string()],
+            secondary_module: "asm_tokenizer.secondary".to_string(),
             extra_run_args: vec!["--ulimit".to_string(), "nofile=8192:8192".to_string()],
             srcbins_network: "/net/srcbins".to_string(),
             output_network: "/net/out".to_string(),

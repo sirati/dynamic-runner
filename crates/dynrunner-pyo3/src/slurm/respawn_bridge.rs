@@ -103,14 +103,12 @@ impl PySlurmSpawner {
 /// and call `job_manager.generate_wrapper_script(..., secondary_id=...)`
 /// with the per-spawn id substituted in.
 ///
-/// `primary_pubkey_pem` from each spec is appended to `forwarded_argv`
-/// as `--secondary-primary-pubkey-pem=<pem>` so the respawned
-/// secondary's argparse sees the live trust anchor at startup.
-/// Today the secondary's `--secondary-primary-pubkey-pem` parsing +
-/// QUIC-handshake verification is a TODO (see the spawner brief);
-/// the structural plumbing is in place so a follow-up that adds the
-/// argparse + verification reads the value without further wire
-/// changes.
+/// The respawned secondary fetches its run config — the dispatcher's
+/// task-specific argv AND its trust anchor — over the peer mesh at
+/// cold start (the container runs the bootstrap shim), so NO argv is
+/// spliced onto the launch command line here. `spec.primary_pubkey_pem`
+/// is therefore not consumed by this generator; the secondary-side
+/// trust-anchor delivery is a mesh-fetch concern, not a launch-line one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wrapper_script_generator_from_pyobj(
     py_job_manager: Py<PyAny>,
@@ -119,7 +117,6 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
     gateway_port: u16,
     cores_spec: String,
     max_memory_spec: String,
-    forwarded_argv: Vec<String>,
     reverse_connection: bool,
     run_log_dir: String,
     shutdown_manager_bin_path: Option<String>,
@@ -128,23 +125,6 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
     mem_manager_reserved_bytes: Option<u64>,
 ) -> WrapperScriptGenerator {
     Arc::new(move |spec: &SecondarySpawnSpec| -> Result<String, String> {
-        // Append the primary's cert PEM to forwarded_argv so the
-        // respawned secondary's argparse can pin it as the trust
-        // anchor at handshake time. Per-spawn read: a future cert
-        // rotation propagates without re-instantiating the spawner.
-        // TODO: the secondary's argparse for
-        // `--secondary-primary-pubkey-pem` and the corresponding
-        // QUIC peer-cert validation are follow-on work (see the
-        // SLURM-respawn fix brief). The wrapper-script side is wired
-        // so the value reaches the secondary; the missing piece is
-        // the secondary-side parse + verify.
-        let mut argv = forwarded_argv.clone();
-        if !spec.primary_pubkey_pem.is_empty() {
-            argv.push(format!(
-                "--secondary-primary-pubkey-pem={}",
-                spec.primary_pubkey_pem,
-            ));
-        }
         Python::attach(|py| -> PyResult<String> {
             let kwargs = PyDict::new(py);
             kwargs.set_item("image_metadata", image_metadata.bind(py))?;
@@ -153,7 +133,6 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
             kwargs.set_item("gateway_port", gateway_port)?;
             kwargs.set_item("cores_spec", &cores_spec)?;
             kwargs.set_item("max_memory_spec", &max_memory_spec)?;
-            kwargs.set_item("forwarded_argv", argv)?;
             kwargs.set_item("reverse_connection", reverse_connection)?;
             kwargs.set_item("run_log_dir", &run_log_dir)?;
             kwargs.set_item(
@@ -222,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_script_generator_threads_spec_new_id_and_pubkey_pem() {
+    fn wrapper_script_generator_threads_spec_new_id_and_constant_kwargs() {
         let (jm, globals) = make_stub_job_manager("stub_jm_threads");
         // Image metadata is opaque to the closure (the Python side
         // pickles it into the bash template); a None stand-in is
@@ -235,7 +214,6 @@ mod tests {
             5555,
             "0".to_owned(),
             "-2G".to_owned(),
-            vec!["--source".to_owned(), "/src".to_owned()],
             true,
             "/log/run-1".to_owned(),
             None,
@@ -289,78 +267,13 @@ mod tests {
                 .unwrap();
             assert_eq!(port, 5555);
 
-            // forwarded_argv contains the original entries PLUS the
-            // injected --secondary-primary-pubkey-pem= entry.
-            let argv: Vec<String> = call_dict
-                .get_item("forwarded_argv")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
-            assert!(argv.contains(&"--source".to_owned()));
-            assert!(argv.contains(&"/src".to_owned()));
+            // The dispatcher's task argv now travels over the peer mesh:
+            // the generator must NOT pass any `forwarded_argv` kwarg, and
+            // must NOT splice the spec's trust anchor onto the launch
+            // line as a `--secondary-primary-pubkey-pem=` token.
             assert!(
-                argv.iter()
-                    .any(|s| s.starts_with("--secondary-primary-pubkey-pem=")),
-                "spec.primary_pubkey_pem must be appended to forwarded_argv as \
-                 --secondary-primary-pubkey-pem=<pem>; got argv = {argv:?}",
-            );
-            let pem_arg = argv
-                .iter()
-                .find(|s| s.starts_with("--secondary-primary-pubkey-pem="))
-                .unwrap();
-            assert!(
-                pem_arg.contains("-----BEGIN PUBLIC KEY-----"),
-                "the appended argv entry must carry the full PEM; got: {pem_arg}",
-            );
-        });
-    }
-
-    #[test]
-    fn wrapper_script_generator_skips_pubkey_arg_when_pem_empty() {
-        let (jm, globals) = make_stub_job_manager("stub_jm_empty_pem");
-        let image_metadata = Python::attach(|py| py.None());
-        let generator = wrapper_script_generator_from_pyobj(
-            jm,
-            image_metadata,
-            "gw.example.invalid".to_owned(),
-            5555,
-            "0".to_owned(),
-            "-2G".to_owned(),
-            vec!["--source".to_owned()],
-            true,
-            "/log/run-1".to_owned(),
-            None,
-            "asm".to_owned(),
-            Some("/gw/dynrunner-slurm-wrapper".to_owned()),
-            None,
-        );
-
-        let spec = SecondarySpawnSpec {
-            new_secondary_id: "secondary-0".to_owned(),
-            primary_endpoint: "127.0.0.1:5555".to_owned(),
-            primary_pubkey_pem: String::new(),
-        };
-        let _body = generator(&spec).expect("closure must render");
-
-        Python::attach(|py| {
-            let g = globals.bind(py);
-            let calls_any = g.get_item("calls").unwrap();
-            let calls = calls_any.cast::<pyo3::types::PyList>().unwrap();
-            let call = calls.get_item(0).unwrap();
-            let call_dict = call.cast::<PyDict>().unwrap();
-            let argv: Vec<String> = call_dict
-                .get_item("forwarded_argv")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
-            assert!(
-                !argv
-                    .iter()
-                    .any(|s| s.starts_with("--secondary-primary-pubkey-pem")),
-                "empty pem must NOT inject an empty --secondary-primary-pubkey-pem= \
-                 argv entry (that would mask the missing-value follow-up); got: {argv:?}",
+                call_dict.get_item("forwarded_argv").unwrap().is_none(),
+                "generator must not pass a forwarded_argv kwarg (argv travels over the mesh)",
             );
         });
     }

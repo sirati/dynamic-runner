@@ -233,7 +233,7 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
         image_tar_basename: "app.tar.gz",
         image_digest: "appdigest0001",
         load_command: "podman load",
-        container_command: "dynamic_runner.task",
+        container_command: "dynamic_runner._secondary_bootstrap",
         cores_spec: "0",
         max_memory_spec: "-2G",
         connection: ConnectionMode::Standard {
@@ -245,7 +245,7 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
         srcbins_mount_source: None,
         output_dir: None,
         extra_run_args: &[],
-        forwarded_argv: &[],
+        secondary_module: "dynamic_runner.task",
         is_observer: false,
         shutdown_manager_bin_path: Some(bin_path),
         mem_manager_reserved_bytes: None,

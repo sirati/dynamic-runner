@@ -44,7 +44,9 @@ pub(super) fn standard_cfg<'a>(
         image_tar_basename: "test-app.tar",
         image_digest: "testdigest0001",
         load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
-        container_command: "dynamic_batch_tokenizer",
+        // The container entrypoint runs the framework bootstrap shim; the
+        // consumer's real module is named via `secondary_module` below.
+        container_command: "dynamic_runner._secondary_bootstrap",
         cores_spec: "0",
         max_memory_spec: "-2G",
         connection: ConnectionMode::Standard {
@@ -56,7 +58,7 @@ pub(super) fn standard_cfg<'a>(
         srcbins_mount_source: None,
         output_dir: None,
         extra_run_args,
-        forwarded_argv: &[],
+        secondary_module: "dynamic_batch_tokenizer",
         is_observer: false,
         // Disabled by default for the test baseline: the
         // out-of-cgroup shutdown-manager spawn block is a separate
