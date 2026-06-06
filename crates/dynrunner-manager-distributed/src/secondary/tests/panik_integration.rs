@@ -48,7 +48,9 @@ use dynrunner_protocol_primary_secondary::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{FakeWorkerFactory, TestId, make_secondary_channel};
+use super::super::test_helpers::{
+    FakeWorkerFactory, TestId, make_secondary_channel, start_secondary_pump,
+};
 use super::super::*;
 
 /// File source: run a secondary against a fake primary, register a
@@ -64,13 +66,11 @@ use super::super::*;
 ///
 /// SIGTERM source has the inverted assertion shape (NO announcement)
 /// and is covered by the sibling test below.
-// PENDING-C-NODE: the panik path drives `run_until_setup_or_done` through a
-// ping-pong setup handshake (the fake primary waits for the secondary's
-// welcome/cert egress before sending the setup frames) AND asserts on a mesh
-// broadcast — both need the concurrent mesh-pump (Node::run), which the C0
-// `Mesh` &mut-self API can't express in one select. Body migrated to the
-// harness constructor; re-enable under C-NODE.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`start_secondary_pump`):
+/// the pump drains the secondary's welcome/cert egress so the fake primary
+/// completes the setup handshake, and fans the self-departure broadcast out
+/// to the observed peer — the concurrency the sequential stub lacked.
 #[tokio::test(flavor = "current_thread")]
 async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -235,6 +235,12 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 while from_secondary.recv().await.is_some() {}
             });
 
+            // Spawn the production pump so the secondary's setup egress drains
+            // (the fake primary's handshake completes) and the self-departure
+            // broadcast fans out to the observed peer. `_guard` keeps the slot
+            // + pump alive for the whole drive.
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
+
             let mut factory = FakeWorkerFactory;
             // Drive the secondary. The panik handler records the `Panik`
             // lifecycle terminal and returns `Ok(RunOutcome::Terminal)`
@@ -333,13 +339,12 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
 /// mutation on BOTH the primary transport AND the peer transport,
 /// so the primary-wire absence is sufficient evidence that the call
 /// did not fire (rather than fired with a different transport).
-// PENDING-C-NODE: the panik path drives `run_until_setup_or_done` through a
-// ping-pong setup handshake (the fake primary waits for the secondary's
-// welcome/cert egress before sending the setup frames) AND asserts on a mesh
-// broadcast — both need the concurrent mesh-pump (Node::run), which the C0
-// `Mesh` &mut-self API can't express in one select. Body migrated to the
-// harness constructor; re-enable under C-NODE.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`start_secondary_pump`):
+/// the pump drains the setup egress so the handshake completes, and would
+/// fan any departure broadcast to the observed peer — so the empty
+/// `mesh_observer_rx` is genuine evidence the SIGTERM branch broadcast
+/// nothing, not a stalled pump.
 #[tokio::test(flavor = "current_thread")]
 async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -480,6 +485,11 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 // would ride the mesh, not the uplink.
                 while from_secondary.recv().await.is_some() {}
             });
+
+            // Spawn the production pump so the setup egress drains (handshake
+            // completes) and any departure broadcast would reach the observed
+            // peer. `_guard` keeps the slot + pump alive for the drive.
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
 
             let mut factory = FakeWorkerFactory;
             let outcome = tokio::time::timeout(

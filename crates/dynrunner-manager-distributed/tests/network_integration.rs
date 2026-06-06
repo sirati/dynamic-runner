@@ -104,6 +104,17 @@ where
         SecondaryCoordinator::new(config, client, inbox, ResourceStealingScheduler::memory(), FixedEstimator(100));
     secondary.set_bootstrap_primary_id("primary".to_string());
 
+    // Publish the live membership BEFORE the coordinator's first egress —
+    // mirroring production `Node::run`, where the pump's entry
+    // `publish_membership()` (synchronous-before-await) precedes any
+    // coordinator's first `has_peer`-gated send. The secondary's first egress
+    // is `send_welcome` → `send_to(Destination::Primary)`, gated on
+    // `client.has_peer("primary")` (which reads the pump-published
+    // `MembershipView`, EMPTY until the first publish). The `run`/`run_pump`
+    // arms below are ONE unbiased `select!`; without this pre-publish, a
+    // `run`-first poll order reads the empty view and no-routes the Welcome.
+    mesh.publish_membership();
+
     let (_control, control_rx) = pump::control_channel::<TestId>();
     let pump_fut = pump::run_pump(mesh, control_rx);
     tokio::pin!(pump_fut);
@@ -146,6 +157,14 @@ where
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+
+    // Publish the live membership BEFORE the coordinator's first egress —
+    // mirroring production `Node::run`, where the pump's entry
+    // `publish_membership()` precedes any coordinator's first `has_peer`-gated
+    // send. The `run`/`run_pump` arms below are ONE unbiased `select!`; without
+    // this pre-publish, a `run`-first poll order reads an empty `MembershipView`
+    // before the pump's own entry publish runs.
+    mesh.publish_membership();
 
     let (_control, control_rx) = pump::control_channel::<TestId>();
     let pump_fut = pump::run_pump(mesh, control_rx);

@@ -628,27 +628,95 @@ pub(super) fn make_secondary_channel(
     )
 }
 
-/// Drive a channel-backed secondary's `run` to completion against a test
-/// mesh-pump.
+/// Keeps the secondary's mesh plumbing alive while a test drives the
+/// detached coordinator against the running production pump.
 ///
-/// The coordinator's `MeshClient` only QUEUES sends and its `RoleInbox` is
-/// fed only by the mesh; in production the `Node` runs a pump that drains
-/// the egress onto the wire AND demuxes inbound wire frames onto each
-/// role's slot — CONCURRENTLY, so a queued send never starves while the
-/// pump awaits an inbound (clarification M4). That concurrent pump needs
-/// disjoint access to the mesh's egress-queue receiver and the transport's
-/// inbound, which the C0 `Mesh` exposes only behind `&mut self` methods —
-/// not borrowable in two simultaneous `select!` arms. The real concurrent
-/// pump is `Node::run`, the C-NODE wave.
+/// Holds the role-slot `Arc` (so the mesh `Weak` keeps upgrading — the pump
+/// can deliver inbound to the secondary slot; dropping it would sever
+/// ingress) and the pump task + control handle (so the pump keeps turning).
+/// A test drops it once it is done reading off the coordinator.
+pub(super) struct SecondaryPumpGuard {
+    _slot: Arc<RoleSlot<TestId>>,
+    _pump_task: tokio::task::JoinHandle<()>,
+    _control: crate::process::pump::MeshControlHandle<TestId>,
+}
+
+/// Spawn the PRODUCTION concurrent mesh-pump
+/// ([`crate::process::pump::run_pump`]) for `harness`, returning the detached
+/// coordinator + a [`SecondaryPumpGuard`] that keeps the plumbing alive.
 ///
-/// PENDING-C-NODE: this sequential pump (drain ALL ready egress, then await
-/// ONE inbound) is correct only for a strictly ping-pong fixture; a fixture
-/// where the secondary enqueues a send AND THEN awaits an inbound that
-/// depends on it can starve the send while the pump is parked on a prior
-/// `recv_peer`. Callers that drive a non-ping-pong handshake therefore gate
-/// on `Node::run` (the tests using this are `#[ignore]`d until C-NODE lands
-/// the concurrent pump). It is kept compiling so those test bodies are
-/// migrated to the harness constructor and re-enable cleanly under C-NODE.
+/// This is the secondary analogue of `run_secondary_node`
+/// (`primary/tests/mod.rs`): the harness owns both the coordinator and the
+/// `Mesh`; this consumes the harness, hands the `Mesh` to the production pump
+/// (an INDEPENDENT `spawn_local` task — exactly as `Node::run` composes it,
+/// concurrently draining egress AND routing inbound, so a queued send never
+/// starves), and hands the coordinator back so the caller drives it directly
+/// (`run`, `run_until_setup_or_done`, …) and inspects it afterward. Replaces
+/// the PENDING-C-NODE `run_secondary_to_completion` sequential stub for the
+/// full-handshake tests.
+///
+/// R5 pre-publish ordering: `build_harness` already published the membership
+/// at mint, and the pump republishes on its own entry
+/// (synchronous-before-await), so the secondary's first
+/// `has_peer("primary")`-gated egress reads the folded primary link as
+/// connected from the very first send.
+pub(super) fn start_secondary_pump(
+    harness: SecondaryHarness<ChannelPeerTransport<TestId>>,
+) -> (TestSecondary, SecondaryPumpGuard) {
+    let SecondaryHarness {
+        coord,
+        test_mesh,
+        _slot,
+        ..
+    } = harness;
+
+    let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+    let pump_task = tokio::task::spawn_local(crate::process::pump::run_pump(test_mesh, control_rx));
+
+    (
+        coord,
+        SecondaryPumpGuard {
+            _slot,
+            _pump_task: pump_task,
+            _control: control,
+        },
+    )
+}
+
+/// Drive a channel-backed secondary's `run` to completion against the
+/// PRODUCTION concurrent mesh-pump, returning the coordinator so the caller
+/// reads its post-run counters.
+///
+/// Built on [`start_secondary_pump`]: the pump runs as an independent task
+/// and `coord.run` is awaited separately, so when the wire closes and the
+/// pump exits the secondary's `run` keeps running to its clean `RunComplete`
+/// exit (a non-ping-pong `TaskRequest`→`TaskAssignment` handshake no longer
+/// starves — the pump drains the queued send while the run awaits the reply,
+/// M4 / BUG-2). The guard is held for the whole run, then dropped.
+pub(super) async fn run_secondary_node(
+    harness: SecondaryHarness<ChannelPeerTransport<TestId>>,
+    factory: &mut impl WorkerFactory<ChannelManagerEnd>,
+) -> (TestSecondary, Result<(), String>) {
+    let (mut coord, guard) = start_secondary_pump(harness);
+    let result = coord.run(factory).await;
+    drop(guard);
+    (coord, result)
+}
+
+/// Drive a channel-backed secondary's `run` to completion against a SIMPLE
+/// SEQUENTIAL test mesh-pump (drain ALL ready egress, then await ONE
+/// inbound).
+///
+/// This sequential drain is faithful ONLY for a non-ping-pong fixture: a
+/// fixture where the secondary enqueues a send AND THEN awaits an inbound
+/// that depends on it would starve the send while the pump is parked on a
+/// prior `recv_peer`. The ping-pong / full-handshake tests therefore use the
+/// PRODUCTION concurrent pump via [`run_secondary_node`] /
+/// [`start_secondary_pump`] instead. This stub is retained ONLY for the
+/// cold-start one-way-TIMEOUT tests (`r1.rs`): the primary never speaks, so
+/// the secondary drains its welcome/cert egress and then blocks on a silent
+/// inbound until its own `unconfigured_deadline` returns `Err` — a one-way
+/// timeout, not a handshake, which the sequential drain serves correctly.
 ///
 /// - EGRESS: drain `next_local_dispatch` → `apply_local_dispatch`, which
 ///   routes each frame loopback-or-remote (the secondary's primary-bound

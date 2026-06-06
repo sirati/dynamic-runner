@@ -5,8 +5,8 @@
 #![cfg(test)]
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, TestId, channel_mesh_to_primary, make_secondary_channel,
-    run_secondary_to_completion,
+    FakeWorkerFactory, TestId, channel_mesh_to_primary, make_secondary_channel, run_secondary_node,
+    start_secondary_pump,
 };
 use super::super::*;
 use dynrunner_core::{TaskInfo, WorkerId};
@@ -171,14 +171,11 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
     }
 }
 
-// PENDING-C-NODE: full request/assign ping-pong handshake against the
-// in-process `fake_primary`. The secondary enqueues a TaskRequest and THEN
-// awaits the matching TaskAssignment, so a queued send must not starve while
-// the pump awaits inbound — the CONCURRENT egress-drain + inbound-route pump.
-// The C0 `Mesh` exposes only `&mut self` drains (not borrowable in two
-// `select!` arms), so the real concurrent pump is `Node::run`. Re-enable when
-// C-NODE lands; the body is migrated to the harness constructor.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+// Full request/assign ping-pong handshake against the in-process
+// `fake_primary` over the PRODUCTION concurrent mesh-pump (`run_secondary_node`
+// → `crate::process::pump::run_pump`): the secondary enqueues a TaskRequest and
+// THEN awaits the matching TaskAssignment, so the pump drains the queued send
+// while the run awaits the reply (no sequential starvation).
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_with_real_workers_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -241,9 +238,8 @@ async fn secondary_with_real_workers_processes_tasks() {
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
-            run_secondary_to_completion(&mut secondary, &mut factory)
-                .await
-                .unwrap();
+            let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
+            result.unwrap();
 
             // The secondary keeps no per-node completed counter; assert
             // the OWN-worker run count (the CRDT-backed `completed_count`
@@ -257,14 +253,9 @@ async fn secondary_with_real_workers_processes_tasks() {
         .await;
 }
 
-// PENDING-C-NODE: full request/assign ping-pong handshake against the
-// in-process `fake_primary`. The secondary enqueues a TaskRequest and THEN
-// awaits the matching TaskAssignment, so a queued send must not starve while
-// the pump awaits inbound — the CONCURRENT egress-drain + inbound-route pump.
-// The C0 `Mesh` exposes only `&mut self` drains (not borrowable in two
-// `select!` arms), so the real concurrent pump is `Node::run`. Re-enable when
-// C-NODE lands; the body is migrated to the harness constructor.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+// Full request/assign ping-pong handshake over the PRODUCTION concurrent
+// mesh-pump (`run_secondary_node`) — the queued TaskRequest drains while the
+// run awaits the matching TaskAssignment.
 #[tokio::test(flavor = "current_thread")]
 async fn secondary_multi_worker_processes_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -325,9 +316,8 @@ async fn secondary_multi_worker_processes_tasks() {
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
-            run_secondary_to_completion(&mut secondary, &mut factory)
-                .await
-                .unwrap();
+            let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
+            result.unwrap();
 
             assert_eq!(secondary.local_tasks_run_for_test(), 6);
 
@@ -341,14 +331,10 @@ async fn secondary_multi_worker_processes_tasks() {
 /// the remaining 14+ must come via the operational TaskRequest →
 /// TaskAssignment loop. The legacy Python had a known gap here; this test
 /// pins the Rust behaviour so it can't silently regress.
-// PENDING-C-NODE: full request/assign ping-pong handshake against the
-// in-process `fake_primary`. The secondary enqueues a TaskRequest and THEN
-// awaits the matching TaskAssignment, so a queued send must not starve while
-// the pump awaits inbound — the CONCURRENT egress-drain + inbound-route pump.
-// The C0 `Mesh` exposes only `&mut self` drains (not borrowable in two
-// `select!` arms), so the real concurrent pump is `Node::run`. Re-enable when
-// C-NODE lands; the body is migrated to the harness constructor.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`run_secondary_node`):
+/// the 14+ operational TaskRequest→TaskAssignment round-trips each drain
+/// the queued request while the run awaits its reply.
 #[tokio::test(flavor = "current_thread")]
 async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -409,9 +395,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
-            run_secondary_to_completion(&mut secondary, &mut factory)
-                .await
-                .unwrap();
+            let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
+            result.unwrap();
 
             // All 15 must complete; the operational loop is responsible
             // for >= 14 of them since one worker can hold at most one
@@ -433,14 +418,10 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
 /// Pinning this end-to-end behaviour is what makes the wire feature
 /// safe to commit: the secondary handler, the cache registration,
 /// and the ExtractionCache lookup all interact correctly.
-// PENDING-C-NODE: full request/assign ping-pong handshake against the
-// in-process `fake_primary`. The secondary enqueues a TaskRequest and THEN
-// awaits the matching TaskAssignment, so a queued send must not starve while
-// the pump awaits inbound — the CONCURRENT egress-drain + inbound-route pump.
-// The C0 `Mesh` exposes only `&mut self` drains (not borrowable in two
-// `select!` arms), so the real concurrent pump is `Node::run`. Re-enable when
-// C-NODE lands; the body is migrated to the harness constructor.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`run_secondary_node`):
+/// the StageFile→TaskRequest→TaskAssignment handshake's queued sends drain
+/// while the run awaits each reply.
 #[tokio::test(flavor = "current_thread")]
 async fn stage_file_then_assign_task_succeeds() {
     use crate::zip_extract::compute_file_hash;
@@ -627,9 +608,8 @@ async fn stage_file_then_assign_task_succeeds() {
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
-            run_secondary_to_completion(&mut secondary, &mut factory)
-                .await
-                .unwrap();
+            let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
+            result.unwrap();
 
             assert_eq!(
                 secondary.local_tasks_run_for_test(),
@@ -724,14 +704,11 @@ async fn fake_primary_abort(
 /// `RunOutcome::Terminal` (projecting to `SecondaryTerminal::Aborted`),
 /// checked BEFORE the `run_complete()` break, and without waiting for any
 /// task drain — a hard shutdown.
-// PENDING-C-NODE: full request/assign ping-pong handshake against the
-// in-process `fake_primary`. The secondary enqueues a TaskRequest and THEN
-// awaits the matching TaskAssignment, so a queued send must not starve while
-// the pump awaits inbound — the CONCURRENT egress-drain + inbound-route pump.
-// The C0 `Mesh` exposes only `&mut self` drains (not borrowable in two
-// `select!` arms), so the real concurrent pump is `Node::run`. Re-enable when
-// C-NODE lands; the body is migrated to the harness constructor.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`start_secondary_pump`):
+/// the pump drains the secondary's welcome to `fake_primary_abort` (which
+/// then broadcasts the abort) and routes the `RunAborted` mutation back while
+/// the run is parked — the exact concurrency the sequential stub lacked.
 #[tokio::test(flavor = "current_thread")]
 async fn run_aborted_yields_terminal_aborted() {
     let local = tokio::task::LocalSet::new();
@@ -784,6 +761,12 @@ async fn run_aborted_yields_terminal_aborted() {
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
             secondary.set_bootstrap_primary_id("primary".to_string());
+
+            // Spawn the production pump so the secondary's egress drains and
+            // the primary's RunAborted is routed back while we drive the
+            // coordinator's `run_until_setup_or_done` directly. `_guard` keeps
+            // the slot + pump alive for the whole drive.
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
 
             let mut factory = FakeWorkerFactory;
             let outcome = secondary
