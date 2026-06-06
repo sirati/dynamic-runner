@@ -382,6 +382,12 @@ where
         &mut self,
         tasks: Vec<TaskInfo<I>>,
     ) -> Result<Vec<(usize, SpawnError)>, String> {
+        // Snapshot the per-index `task_id`s BEFORE the validator moves
+        // `tasks`, so the run-level loud-fail backstop below can name the
+        // rejected identities. The validator's `errors` carry the index
+        // into THIS vec, so the index resolves a `task_id` here.
+        let task_ids_by_index: Vec<String> =
+            tasks.iter().map(|t| t.task_id.clone()).collect();
         // Shared validator: pure read against `cluster_state` —
         // mirrored on the promoted-secondary path
         // (`SecondaryCoordinator::apply_spawn_tasks`) AND on the local
@@ -445,6 +451,28 @@ where
             // No mutation to broadcast; the per-index errors are the
             // entire result. Skip the apply+broadcast pass so we
             // don't emit an empty-batch wire event.
+            //
+            // Loud-fail backstop: a NON-EMPTY spawn batch whose every
+            // task the validator REJECTED nets the phase ZERO dispatch.
+            // Without recording it, `total_tasks` is never refreshed,
+            // `run_complete_check`'s counter exit trips against the pre-
+            // spawn total, and the run exits rc=0 with that planned work
+            // silently dropped (the producer-path silent total=0). Record
+            // the rejected identities so `run()`'s final accounting
+            // surfaces a loud `RunError::SpawnRejected` instead of a clean
+            // exit. Scoped to the all-rejected case (`valid_tasks.is_empty()`
+            // AND `!errors.is_empty()`): an empty INPUT batch is a benign
+            // no-op (nothing to dispatch, nothing rejected), and a PARTIAL
+            // rejection still dispatches its survivors below — the per-index
+            // `errors` already inform the caller of the dropped ones. The
+            // per-index reply the caller receives is UNCHANGED.
+            if !errors.is_empty() {
+                self.spawn_rejected_task_ids.extend(
+                    errors
+                        .iter()
+                        .map(|(idx, _)| task_ids_by_index[*idx].clone()),
+                );
+            }
             return Ok(errors);
         }
 

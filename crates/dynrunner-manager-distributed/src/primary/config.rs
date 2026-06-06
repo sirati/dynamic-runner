@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo, resolve_against_root};
+use std::collections::BTreeMap;
+
+use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, resolve_against_root};
 
 /// Per-phase lifecycle hook invoked by the coordinator when a phase
 /// flips Blocked → Active. The pyo3 layer (Phase 5B) wires this to the
@@ -11,11 +13,20 @@ use dynrunner_core::{Identifier, PhaseId, TaskInfo, resolve_against_root};
 pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
 
 /// Per-phase lifecycle hook invoked when a phase reaches Drained
-/// (`queued == 0` and `in_flight == 0`). Receives the phase id, plus
-/// counts of completed and failed items in that phase. The pyo3 layer
-/// (Phase 5B) wires this to `TaskDefinition.on_phase_end` so user code
-/// can finalise per-phase aggregates before the next phase activates.
-pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32) + Send>;
+/// (`queued == 0` and `in_flight == 0`). Receives the phase id, the
+/// counts of completed and failed items in that phase, AND the phase's
+/// PUBLISHED task outputs keyed by `task_id` (`{ task_id: TaskOutputs }`
+/// — each entry the producer's `publish_string` / `publish(.., key=..)`
+/// accumulator, already converged into the primary's `task_outputs`
+/// cache by the time the cascade fires this hook). The pyo3 layer wires
+/// this to `TaskDefinition.on_phase_end` so user code can finalise
+/// per-phase aggregates — and read a just-completed task's published
+/// output WITHOUT a filesystem path — before the next phase activates.
+///
+/// The outputs map is owned (clones off `cluster_state.task_outputs`) so
+/// the callback holds no borrow against the `&mut self` coordinator that
+/// fires it. It is empty for a phase whose tasks published nothing.
+pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &BTreeMap<String, TaskOutputs>) + Send>;
 
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {

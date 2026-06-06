@@ -181,6 +181,259 @@ async fn on_phase_end_fires_after_last_in_flight_completes_with_lazy_spawn() {
         .await;
 }
 
+/// Build a `TaskInfo` in `phase` carrying an intra-phase `task_depends_on`.
+/// Used by the producer-path build-spawn reproducer so the lazily-spawned
+/// `build_variant` items name their `build_common_dep` sibling.
+fn phased_binary_dep(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> {
+    TaskInfo {
+        task_depends_on: depends_on
+            .iter()
+            .map(|d| dynrunner_core::TaskDep {
+                task_id: (*d).into(),
+                phase_id: PhaseId::from(phase),
+                inherit_outputs: false,
+            })
+            .collect(),
+        ..phased_binary(name, phase, 50)
+    }
+}
+
+/// Build a `TaskInfo` carrying CROSS-phase deps: each `(dep_phase, dep_id)`
+/// names a prerequisite in a DIFFERENT phase. Mirrors the consumer's
+/// `build_variant` tasks whose `build_compilers_depends_on` point at
+/// `build_compilers`-phase toolchain tasks.
+fn phased_binary_xdep(
+    name: &str,
+    phase: &str,
+    cross_deps: &[(&str, &str)],
+) -> TaskInfo<TestId> {
+    TaskInfo {
+        task_depends_on: cross_deps
+            .iter()
+            .map(|(dep_phase, dep_id)| dynrunner_core::TaskDep {
+                task_id: (*dep_id).into(),
+                phase_id: PhaseId::from(*dep_phase),
+                inherit_outputs: false,
+            })
+            .collect(),
+        ..phased_binary(name, phase, 50)
+    }
+}
+
+/// Producer-path regression (asm-dataset-nix, c39034f2). Mirrors the
+/// consumer's full phase chain: `matrix_eval` (1 task) → `dependency_graph`
+/// (1 task) → `build` (declared, EMPTY at run start). The `build` items
+/// are injected from inside `on_phase_end("dependency_graph")` — one
+/// `build_common_dep` (no deps, lands `Pending`) plus four `build_variant`
+/// items that depend on it (land `Blocked`, auto-resume on the common-dep's
+/// completion). This is the EXACT shape that silently dispatched ZERO build
+/// tasks on the producer path.
+///
+/// The crux the reproducer pins: `total_tasks` is seeded at exactly 2
+/// (eval + dep_graph). When BOTH seeded tasks terminate, the operational
+/// loop's `run_complete_check` counter exit (`completed >= total_tasks`)
+/// is satisfied UNLESS the `on_phase_end`-spawned build batch refreshed
+/// `total_tasks` AND re-armed the pool before the next loop iteration. A
+/// premature RunComplete broadcast finishes every secondary at the
+/// dependency_graph drain edge and the 5 build tasks never dispatch — a
+/// silent `completed=2, stranded≈0, rc=0` total=0.
+#[tokio::test(flavor = "current_thread")]
+async fn producer_path_build_spawn_dispatches_after_dependency_graph() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Full consumer chain. `build` depends on `dependency_graph`
+            // which depends on `matrix_eval`.
+            let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            phase_deps.insert(
+                PhaseId::from("dependency_graph"),
+                vec![PhaseId::from("matrix_eval")],
+            );
+            phase_deps.insert(
+                PhaseId::from("build"),
+                vec![PhaseId::from("dependency_graph")],
+            );
+
+            // Exactly the two seeded tasks the producer path starts with;
+            // `total_tasks` = 2. `build` is declared (in phase_deps) but
+            // has NO seeded items.
+            let binaries: Vec<TaskInfo<TestId>> = vec![
+                phased_binary("eval", "matrix_eval", 100),
+                phased_binary("dep_graph", "dependency_graph", 100),
+            ];
+
+            // The build batch the consumer's on_phase_end spawns: one
+            // common-dep with no prereqs (Pending head) + four variants
+            // depending on it (Blocked, auto-resume on its completion).
+            let build_items: Vec<TaskInfo<TestId>> = vec![
+                phased_binary_dep("common_dep", "build", &[]),
+                phased_binary_dep("variant_a", "build", &["common_dep"]),
+                phased_binary_dep("variant_b", "build", &["common_dep"]),
+                phased_binary_dep("variant_c", "build", &["common_dep"]),
+                phased_binary_dep("variant_d", "build", &["common_dep"]),
+            ];
+
+            run_phase_ordering_scenario(
+                binaries,
+                phase_deps,
+                // No slow markers — the reproducer is about the drain-edge
+                // race, not in-flight overlap. With instant workers the
+                // eval+dep_graph completions land back-to-back and the
+                // counter exit is armed the instant dep_graph drains.
+                vec![],
+                Some(("dependency_graph".into(), build_items)),
+                // 2 seeded + 5 spawned build tasks must ALL complete.
+                /* expected_total_completed: */ 7,
+            )
+            .await;
+        })
+        .await;
+}
+
+/// Producer-path regression — LEAD 1 (cross-phase unresolvable dep).
+/// Mirrors the asm-dataset-nix consumer's `build_variant` items, which
+/// carry CROSS-phase `build_compilers_depends_on` toolchain edges. When
+/// the toolchain (`build_compilers` phase) produced no seeded task for the
+/// named id — e.g. a single-binary openssl run whose toolchain manifests
+/// resolved to nothing — every variant's cross-phase dep is `UnknownDependency`
+/// and is rejected at `validate_spawn_tasks`. Only the dep-free
+/// `build_common_dep` survives. The dangerous consequence the consumer hit:
+/// the build phase ends up with a degraded (partial OR empty) dispatch that
+/// silently produces 0 outputs while the run exits rc=0.
+///
+/// This test pins the FIX's contract: a `spawn_tasks` batch that the
+/// validator rejects WHOLESALE (every task carries an unresolvable
+/// cross-phase dep) must NOT silently drain to a clean total=0 — the
+/// loud-fail guard surfaces it. The clean (all-resolvable) sibling test
+/// above proves the happy path still dispatches.
+#[tokio::test(flavor = "current_thread")]
+async fn producer_path_build_spawn_all_rejected_does_not_silently_complete() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            phase_deps.insert(
+                PhaseId::from("dependency_graph"),
+                vec![PhaseId::from("matrix_eval")],
+            );
+            phase_deps.insert(
+                PhaseId::from("build"),
+                vec![PhaseId::from("dependency_graph")],
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = vec![
+                phased_binary("eval", "matrix_eval", 100),
+                phased_binary("dep_graph", "dependency_graph", 100),
+            ];
+
+            // Every spawned build item names a CROSS-phase prereq in the
+            // `build_compilers` phase that was NEVER seeded (no toolchain
+            // tasks for this run). validate_spawn_tasks rejects all 5 as
+            // UnknownDependency — the build phase plan is non-empty but
+            // dispatches ZERO tasks.
+            let build_items: Vec<TaskInfo<TestId>> = vec![
+                phased_binary_xdep("common_dep", "build", &[("build_compilers", "missing_tc")]),
+                phased_binary_xdep("variant_a", "build", &[("build_compilers", "missing_tc")]),
+                phased_binary_xdep("variant_b", "build", &[("build_compilers", "missing_tc")]),
+                phased_binary_xdep("variant_c", "build", &[("build_compilers", "missing_tc")]),
+                phased_binary_xdep("variant_d", "build", &[("build_compilers", "missing_tc")]),
+            ];
+
+            run_producer_zero_dispatch_scenario(binaries, phase_deps, build_items).await;
+        })
+        .await;
+}
+
+/// Driver for the loud-fail contract: a build batch whose every task is
+/// rejected by the validator (non-empty plan → zero dispatch). The run
+/// MUST NOT exit `Ok` with a silent total=0 — `primary.run()` surfaces a
+/// structured error. Built as a standalone driver (not
+/// `run_phase_ordering_scenario`) because the expected terminal is a
+/// loud failure, not a clean `completed == N`.
+async fn run_producer_zero_dispatch_scenario(
+    binaries: Vec<TaskInfo<TestId>>,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    rejected_build_items: Vec<TaskInfo<TestId>>,
+) {
+    let max_res = dynrunner_core::ResourceMap::from([(
+        dynrunner_core::ResourceKind::memory(),
+        1024 * 1024 * 1024u64,
+    )]);
+    let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+    let mut outgoing = HashMap::new();
+    let mut sec_handles = Vec::new();
+
+    for i in 0..2u32 {
+        let sec_id = format!("sec-{i}");
+        let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+            spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
+        outgoing.insert(sec_id, pri_to_sec_tx);
+        sec_handles.push(handle);
+
+        let tx = incoming_tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(incoming_tx);
+
+    let transport =
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+    let config = PrimaryConfig {
+        num_secondaries: 2,
+        connect_timeout: Duration::from_secs(10),
+        peer_timeout: Duration::from_secs(10),
+        ..test_primary_config()
+    };
+    let (mut primary, _mesh) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let command_sender = primary.command_sender();
+
+    let on_start: OnPhaseStart = Box::new(|_p: &PhaseId| {});
+    let items = rejected_build_items.clone();
+    let mut already_spawned = false;
+    let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, _c: u32, _f: u32, _outputs| {
+        if p.as_str() == "dependency_graph" && !already_spawned {
+            already_spawned = true;
+            let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+            let _ = command_sender.try_send(PrimaryCommand::SpawnTasks {
+                tasks: items.clone(),
+                reply: reply_tx,
+            });
+        }
+    });
+
+    let result = primary.run(binaries, phase_deps, on_start, on_end).await;
+
+    drop(primary);
+    for h in sec_handles {
+        let _ = h.await;
+    }
+
+    // The loud-fail contract: a phase declared with a non-empty plan that
+    // dispatches ZERO tasks must NOT exit clean. `run()` surfaces a
+    // structured `Err` so the PyO3 boundary raises instead of returning a
+    // silent rc=0.
+    assert!(
+        result.is_err(),
+        "a build phase whose entire spawned plan was rejected (zero \
+         dispatch) must surface a loud error, not a silent clean total=0; \
+         got Ok"
+    );
+}
+
 /// Shared scenario driver. Builds the secondary cluster + primary,
 /// runs the workload to completion, and asserts every
 /// `on_phase_end(phase_id)` firing for a multi-item phase reports a
@@ -275,7 +528,7 @@ async fn run_phase_ordering_scenario(
     let ends_cb = events.clone();
     let lazy_spawn = lazy_spawn_next.clone();
     let mut already_spawned = false;
-    let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32| {
+    let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32, _outputs| {
         ends_cb.lock().unwrap().push(PhaseEvent::End {
             phase: p.to_string(),
             completed: c,
@@ -529,7 +782,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             });
             let ends_cb = events.clone();
             let mut already_spawned = false;
-            let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32| {
+            let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32, _outputs| {
                 ends_cb.lock().unwrap().push(PhaseEvent::End {
                     phase: p.to_string(),
                     completed: c,

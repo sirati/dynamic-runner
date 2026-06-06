@@ -40,8 +40,14 @@ pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
 
 /// Callback invoked when a user-visible phase has fully drained (queue
 /// empty, no in-flight items). The two `u32` arguments are the phase's
-/// completed and failed counters as tracked by the manager.
-pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32) + Send>;
+/// completed and failed counters as tracked by the manager; the final
+/// argument is the phase's PUBLISHED task outputs keyed by `task_id`
+/// (`{ task_id: TaskOutputs }`, from each producer's `publish_string` /
+/// `publish(.., key=..)` accumulator) so the hook can read a finished
+/// task's output WITHOUT a filesystem path. Empty for a phase whose
+/// tasks published nothing. Uniform with the distributed primary's
+/// `OnPhaseEnd` so the pyo3 bridge wires ONE callback shape.
+pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, TaskOutputs>) + Send>;
 
 /// Configuration for the local manager.
 pub struct LocalManagerConfig {
@@ -471,7 +477,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
         on_phase_start: impl FnMut(&PhaseId) + Send + 'static,
-        on_phase_end: impl FnMut(&PhaseId, u32, u32) + Send + 'static,
+        on_phase_end: impl FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, TaskOutputs>)
+        + Send
+        + 'static,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         // Snapshot the phase set from the binaries' `phase_id`s. Any phase
@@ -888,13 +896,38 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 .get(&phase_id)
                 .copied()
                 .unwrap_or((0, 0));
+            // Gather the phase's published outputs BEFORE the
+            // `&mut on_phase_end_cb` borrow (the gather is an immutable
+            // `&self.task_outputs_cache` read).
+            let phase_outputs = self.phase_task_outputs(&phase_id);
             if let Some(cb) = self.on_phase_end_cb.as_mut() {
-                cb(&phase_id, completed, failed);
+                cb(&phase_id, completed, failed, &phase_outputs);
             }
             self.pool_mut().mark_phase_done(&phase_id);
         }
         self.deferred_drain_notifications = still_deferred;
         self.fire_on_phase_start_for_newly_active();
+    }
+
+    /// Gather every recorded [`TaskOutputs`] for the tasks of `phase_id`,
+    /// keyed by `task_id`. The local-mode twin of
+    /// `ClusterState::phase_task_outputs`: it lets the `on_phase_end` hook
+    /// hand a consumer's callback the just-completed phase's PUBLISHED
+    /// outputs (`publish_string` / `publish(.., key=..)`) WITHOUT a
+    /// filesystem path. Reads the `(phase_id, task_id)`-keyed
+    /// `task_outputs_cache` the `TaskCompleted` arm populates before
+    /// dependents dispatch, so by the time a phase drains and this hook
+    /// fires, its outputs are present. Returns owned clones so the
+    /// callback holds no borrow against the `&mut self` manager.
+    fn phase_task_outputs(
+        &self,
+        phase_id: &PhaseId,
+    ) -> std::collections::BTreeMap<String, TaskOutputs> {
+        self.task_outputs_cache
+            .iter()
+            .filter(|((p, _), _)| p == phase_id)
+            .map(|((_, task_id), outputs)| (task_id.clone(), outputs.clone()))
+            .collect()
     }
 
     /// `true` iff one of the manager's side queues still holds an item
@@ -941,8 +974,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 .get(&phase_id)
                 .copied()
                 .unwrap_or((0, 0));
+            // Gather the phase's published outputs BEFORE the
+            // `&mut on_phase_end_cb` borrow (immutable cache read).
+            let phase_outputs = self.phase_task_outputs(&phase_id);
             if let Some(cb) = self.on_phase_end_cb.as_mut() {
-                cb(&phase_id, completed, failed);
+                cb(&phase_id, completed, failed, &phase_outputs);
             }
             self.pool_mut().mark_phase_done(&phase_id);
         }

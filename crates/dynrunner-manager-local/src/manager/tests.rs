@@ -37,7 +37,7 @@ async fn single_worker_processes_all_binaries() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -75,7 +75,7 @@ async fn multiple_workers_process_binaries() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -108,7 +108,7 @@ async fn retry_phase_retries_failed_tasks() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -142,7 +142,7 @@ async fn resource_pressure_tasks_collected() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -175,7 +175,7 @@ async fn no_binaries_completes_immediately() {
                     Vec::<TaskInfo<TestId>>::new(),
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -221,7 +221,7 @@ async fn missing_dep_marks_invalid_task_and_run_continues() {
                     vec![good, bad],
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -275,7 +275,7 @@ async fn duplicate_task_id_is_hard_error_local() {
                     vec![a, b],
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await;
@@ -319,7 +319,7 @@ async fn cross_phase_same_task_id_both_run_local() {
                     vec![a, b],
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -404,7 +404,7 @@ async fn default_restart_respawns_after_success() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -496,7 +496,7 @@ async fn reuse_workers_keeps_slot_across_successes() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -566,7 +566,7 @@ async fn memuse_log_written() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -670,7 +670,7 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -720,7 +720,7 @@ async fn multiple_workers_with_mixed_results() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -865,7 +865,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await
@@ -1191,7 +1191,7 @@ async fn memprofile_run_level_smoke() {
                     binaries,
                     std::collections::HashMap::new(),
                     |_phase| {},
-                    |_phase, _completed, _failed| {},
+                    |_phase, _completed, _failed, _outputs| {},
                     &mut factory,
                 )
                 .await;

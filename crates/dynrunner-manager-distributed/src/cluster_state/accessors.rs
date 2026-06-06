@@ -370,6 +370,49 @@ impl<I: Identifier> ClusterState<I> {
         self.task_outputs.get(hash)
     }
 
+    /// Gather every recorded [`TaskOutputs`] for the tasks of `phase_id`,
+    /// keyed by `task_id`. The phase-lifecycle `on_phase_end` hook reads
+    /// this to hand a consumer's callback the just-completed phase's
+    /// PUBLISHED outputs (`publish_string` / `publish(.., key=..)`) WITHOUT
+    /// a filesystem path — the bytes already rode the wire on each task's
+    /// `DonePayload` → `result_data` and landed in this `task_outputs`
+    /// cache when the `TaskCompleted` applied, so by the time the cascade
+    /// fires `on_phase_end(phase_id, ..)` (AFTER that apply) the phase's
+    /// outputs are present here.
+    ///
+    /// Only tasks that actually recorded outputs appear (a task that
+    /// published nothing contributes no entry, mirroring `outputs_for`'s
+    /// `None`). Resolution walks the ledger once, matching each entry's
+    /// `phase_id`, then reads the hash-keyed `task_outputs` cache — the
+    /// same phase-aware identity rule `outputs_for` uses, lifted to the
+    /// whole phase. Returns owned clones so the caller (the
+    /// `&mut self`-holding coordinator firing `on_phase_end`) holds no
+    /// borrow across the callback.
+    pub fn phase_task_outputs(
+        &self,
+        phase_id: &PhaseId,
+    ) -> std::collections::BTreeMap<String, TaskOutputs> {
+        self.tasks
+            .iter()
+            .filter_map(|(hash, state)| {
+                let task = match state {
+                    TaskState::Pending { task, .. }
+                    | TaskState::InFlight { task, .. }
+                    | TaskState::Completed { task }
+                    | TaskState::Failed { task, .. }
+                    | TaskState::Unfulfillable { task, .. }
+                    | TaskState::InvalidTask { task, .. }
+                    | TaskState::Blocked { task, .. } => task,
+                };
+                if &task.phase_id != phase_id {
+                    return None;
+                }
+                let outputs = self.task_outputs.get(hash)?;
+                Some((task.task_id.clone(), outputs.clone()))
+            })
+            .collect()
+    }
+
     /// Whether the run has been declared finished by the primary.
     /// Sticky monotonic flag: once set, never clears for the lifetime
     /// of this state. Secondaries read this to break their main loop

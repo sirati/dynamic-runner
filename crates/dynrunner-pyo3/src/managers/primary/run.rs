@@ -294,6 +294,13 @@ impl PyPrimaryCoordinator {
         // primary-silence — is a structured `ClusterCollapsed` now and rides
         // the `cluster_collapsed` marker instead.)
         let mut fatal_policy_exit: Option<RunError> = None;
+        // Spawn-rejected terminal carried out of the detached tokio runtime.
+        // `Some(RunError::SpawnRejected { .. })` iff a runtime `spawn_tasks`
+        // batch was wholesale-rejected so the phase dispatched ZERO tasks.
+        // The GIL-side tail raises a `PyRuntimeError` so the submitter's
+        // wrapper sees a non-zero exit instead of the silent rc=0 that
+        // masked the dropped planned work.
+        let mut spawn_rejected: Option<RunError> = None;
         // Relocated-observer cluster-abort carried out of the detached tokio
         // runtime. `Some(reason)` iff the submitter relocated and the
         // observer tail observed a cluster-wide `RunAborted`
@@ -582,6 +589,14 @@ impl PyPrimaryCoordinator {
                                 // `Other` swallow.
                                 fatal_policy_exit = Some(e);
                             }
+                            e @ RunError::SpawnRejected { .. } => {
+                                // A runtime spawn_tasks batch was wholesale-
+                                // rejected → the phase dispatched ZERO tasks.
+                                // RAISE — never the `Other` swallow: a silent
+                                // zero-dispatch is exactly the rc=0 mask this
+                                // variant exists to break.
+                                spawn_rejected = Some(e);
+                            }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
                                 // (exit 0): a genuinely-unexpected generic
@@ -691,6 +706,16 @@ impl PyPrimaryCoordinator {
             // MUST surface non-zero — raise the structured `Err`'s Display as a
             // `PyRuntimeError`. (A relocated-observer STRAND rides
             // `cluster_collapsed` below instead.)
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = spawn_rejected {
+            // GIL is back. A runtime spawn_tasks batch was wholesale-rejected
+            // → the phase dispatched ZERO tasks. RAISE so the submitter's
+            // wrapper sees a non-zero exit instead of the silent rc=0 that
+            // masked the dropped planned work. Sequenced alongside the other
+            // structured raises and before `cluster_collapsed` (no strand to
+            // render — the work never entered the ledger).
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
