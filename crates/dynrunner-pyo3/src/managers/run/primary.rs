@@ -122,6 +122,18 @@ pub(crate) fn run_primary<'py>(
         "panik_watcher_poll_interval_secs",
         panik_watcher_poll_interval_secs,
     )?;
+    // The operator's run-config (parsed `args.forwarded_argv`), threaded
+    // into this primary's node-local `forwarded_argv` so it serves the real
+    // argv on `RequestRunConfig`. The same filtered tokens the spawned
+    // secondaries receive on their command line + re-serve. Only available
+    // when the dispatch helper supplied a `task_args` Namespace; absent /
+    // not-a-list collapses to the constructor's empty default.
+    if let Some(ta) = task_args.as_ref()
+        && let Ok(fwd) = ta.bind(py).getattr("forwarded_argv")
+        && let Ok(fwd) = fwd.extract::<Vec<String>>()
+    {
+        kwargs.set_item("forwarded_argv", fwd)?;
+    }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
     let args = (

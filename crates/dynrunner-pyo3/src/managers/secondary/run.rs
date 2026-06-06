@@ -65,6 +65,12 @@ impl PySecondaryCoordinator {
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
+        // The node-local run-config (the consumer's `args.forwarded_argv`).
+        // Captured on the GIL thread so both the detached-runtime
+        // `SecondaryConfig` (so THIS secondary re-serves `RequestRunConfig`)
+        // and the promoted-primary recipe (so a node promoted to primary
+        // answers identically) receive the SAME byte-identical copy.
+        let forwarded_argv = self.forwarded_argv.clone();
         // Resolve the memprofile output directory at run-start.
         // The three-input shape (`memprofile_enabled` + the
         // operator-supplied `output_dir` + the implicit
@@ -337,11 +343,15 @@ impl PySecondaryCoordinator {
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
                     output_dir: memprofile_output_dir.clone(),
                     memuse_log_path: cfg_memuse_log_path.clone(),
-                    // Parity default (empty): threading this secondary's
-                    // cold-start-fetched run-config into `forwarded_argv`
-                    // (and into the promoted-primary recipe) is a separate
-                    // concern. Empty launch-constant until then.
-                    forwarded_argv: Vec::new(),
+                    // The node-local run-config. On a cold-start secondary
+                    // this is the argv the `_secondary_bootstrap` shim
+                    // fetched over the mesh and spliced onto `sys.argv`; the
+                    // consumer re-parsed it into `args.forwarded_argv`, which
+                    // reached this coordinator's constructor. Stored here so
+                    // THIS secondary re-serves `RequestRunConfig` from its own
+                    // copy. Cloned because the promoted-primary recipe (built
+                    // below) needs the same value.
+                    forwarded_argv: forwarded_argv.clone(),
                 };
 
                 let factory = SubprocessWorkerFactory {
@@ -494,6 +504,7 @@ impl PySecondaryCoordinator {
                     command_rx,
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
+                    forwarded_argv,
                 });
 
                 let node = node.with_secondary(secondary, sec_slot);
@@ -619,6 +630,12 @@ struct PromotedPrimaryRecipeInputs {
     /// phase machine; the secondary does not — R4 seam).
     on_phase_start: crate::managers::lifecycle::OnPhaseStart,
     on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
+    /// The node-local run-config this secondary holds (the consumer's
+    /// `args.forwarded_argv`, mesh-fetched on cold start). Carried into the
+    /// promoted `PrimaryConfig.forwarded_argv` so a node promoted to primary
+    /// re-serves `RequestRunConfig` with the SAME argv it fetched — byte-
+    /// identical to the original submitter (no split-brain).
+    forwarded_argv: Vec<String>,
 }
 
 /// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
@@ -657,11 +674,15 @@ fn build_promoted_primary_recipe(
         command_rx,
         on_phase_start,
         on_phase_end,
+        forwarded_argv,
     } = inputs;
     // Single-use pieces captured in Options so the FnMut can take them on its
     // one invocation (a node promotes at most once per lifetime).
     let mut command_channel = Some((command_tx, command_rx));
     let mut phase_callbacks = Some((on_phase_start, on_phase_end));
+    // Same single-use shape: the run-config Vec is moved into the one
+    // promoted `PrimaryConfig` it builds.
+    let mut forwarded_argv = Some(forwarded_argv);
     Box::new(move |client, inbox, demote_rx, snapshot| {
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
@@ -675,6 +696,11 @@ fn build_promoted_primary_recipe(
             // must wait for its own discovery batch. Sourced from the run's
             // OWN `--source-already-staged` arg, NOT a derived band-aid.
             required_setup_on_promote,
+            // The node-local run-config this secondary fetched on cold start
+            // (or empty for a submitter-spawned secondary). Threaded verbatim
+            // so the promoted primary re-serves `RequestRunConfig` with the
+            // SAME argv — byte-identical to the original submitter.
+            forwarded_argv: forwarded_argv.take().unwrap_or_default(),
             ..PrimaryConfig::default()
         };
         let mut primary = PrimaryCoordinator::new(

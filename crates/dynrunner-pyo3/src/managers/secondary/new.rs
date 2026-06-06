@@ -46,6 +46,7 @@ impl PySecondaryCoordinator {
         unfulfillable_reinject_max_per_task = None,
         mem_manager_reserved_bytes = None,
         memprofile_enabled = false,
+        forwarded_argv = Vec::new(),
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -75,6 +76,7 @@ impl PySecondaryCoordinator {
         unfulfillable_reinject_max_per_task: Option<u32>,
         mem_manager_reserved_bytes: Option<u64>,
         memprofile_enabled: bool,
+        forwarded_argv: Vec<String>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -154,6 +156,7 @@ impl PySecondaryCoordinator {
             completed: 0,
             mem_manager_reserved_bytes,
             memprofile_enabled,
+            forwarded_argv,
         })
     }
 

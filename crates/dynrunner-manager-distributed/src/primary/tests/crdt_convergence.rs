@@ -576,3 +576,74 @@ async fn primary_answers_request_run_config_empty_preseed() {
         })
         .await;
 }
+
+/// (f) PROMOTED-primary answerability: a node promoted from secondary builds
+/// its `PrimaryCoordinator` from a `PrimaryConfig` whose `forwarded_argv` is
+/// the SAME copy it fetched over the mesh (the pyo3
+/// `build_promoted_primary_recipe` threads the secondary's node-local argv
+/// into the promoted `PrimaryConfig.forwarded_argv`). This test models that
+/// recipe's output — seeding the run-config via the CONFIG (the production
+/// `forwarded_argv: …` field on `PrimaryConfig`, NOT a direct post-construct
+/// field write) — and proves the config → coordinator → responder chain:
+/// the promoted node answers `RequestRunConfig` with the fetched argv
+/// byte-identically, so it is indistinguishable from the original submitter
+/// (no split-brain).
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_primary_answers_request_run_config_with_fetched_argv() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let mut requester_inbox = ends.remove(0).1;
+
+            // The argv a cold-start secondary fetched over the mesh. On
+            // promotion the pyo3 recipe builds the new primary's
+            // `PrimaryConfig` with exactly this in `forwarded_argv`.
+            let fetched = vec![
+                "--jobs".to_string(),
+                "8".to_string(),
+                "--name-regex".to_string(),
+                "foo.*".to_string(),
+            ];
+            // Seed via the CONFIG field — the production promotion path —
+            // rather than the post-construct `primary.forwarded_argv = …`
+            // write the pure-responder test (d) uses.
+            let config = PrimaryConfig {
+                forwarded_argv: fetched.clone(),
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            primary
+                .handle_request_run_config(DistributedMessage::RequestRunConfig {
+                    target: None,
+                    sender_id: "sec-0".into(),
+                    timestamp: 0.0,
+                })
+                .await;
+            settle_pump().await;
+
+            let mut run_configs: Vec<Vec<String>> = Vec::new();
+            while let Ok(msg) = requester_inbox.try_recv() {
+                if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                    run_configs.push(forwarded_argv);
+                }
+            }
+            assert_eq!(
+                run_configs.len(),
+                1,
+                "promoted primary must unicast exactly one RunConfig reply; got {run_configs:?}"
+            );
+            assert_eq!(
+                run_configs[0], fetched,
+                "the promoted primary must answer with the argv it fetched, \
+                 byte-identical to the original submitter (no split-brain)"
+            );
+        })
+        .await;
+}

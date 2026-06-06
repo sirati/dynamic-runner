@@ -383,10 +383,12 @@ impl PySecondaryConfig {
             // silent so callers that go through it don't pick
             // up an unintended log target.
             memuse_log_path: None,
-            // Parity default (empty): wiring the operator's run-config
-            // kwarg into `forwarded_argv` is a separate concern. This
-            // documented-but-unused one-step builder stays at the
-            // empty launch-constant.
+            // Empty launch-constant: the live secondary-construction site
+            // (`run_secondary` → `RustSecondaryCoordinator.__new__`) sources
+            // the node-local run-config from the consumer's parsed
+            // `args.forwarded_argv` kwarg, NOT from this config shim (which
+            // carries no argv field — it is only a parameter bundle). This
+            // documented-but-unused one-step builder therefore stays empty.
             forwarded_argv: Vec::new(),
         }
     }
