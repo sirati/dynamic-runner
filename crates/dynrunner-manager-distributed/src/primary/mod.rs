@@ -53,7 +53,7 @@ pub use command_channel::{
     COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
 pub use config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
-pub use coordinator::{PostBootstrap, PrimaryCoordinator, PrimaryRunOutcome};
+pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome};
 pub use error::RunError;
 
 // Submodule-visible coordinator-state types. `pub(crate)` so test-only

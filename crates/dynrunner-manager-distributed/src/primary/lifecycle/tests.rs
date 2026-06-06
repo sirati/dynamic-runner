@@ -188,26 +188,10 @@ async fn activate_local_primary_emits_a_keepalive() {
         .run_until(async {
             let (mut coordinator, log, _ends) =
                 make_recording_coordinator(1, Duration::from_millis(100), Duration::from_secs(1));
-            // Seed sec-0 into the REPLICATED capacity ledger, not just the
-            // local `secondaries` map: `activate_local_primary` now always
-            // hydrates the pool + roster from `cluster_state` on the
-            // on-demand path (the bug fix — `pending.is_none() &&
-            // total_tasks == 0`), and the roster reconstruction
-            // (`reconstruct_secondaries_from_cluster_state`) clears + rebuilds
-            // `self.secondaries` from this capacity ledger. A directly-seeded
-            // `secondaries` entry would be wiped by that rebuild — production
-            // always carries the secondary capacity in the activation
-            // snapshot, so this mirrors the real activation shape.
-            coordinator
-                .cluster_state_mut_for_test()
-                .apply(ClusterMutation::SecondaryCapacity {
-                    secondary: "sec-0".into(),
-                    worker_count: 1,
-                    resources: vec![dynrunner_core::ResourceAmount {
-                        kind: dynrunner_core::ResourceKind::memory(),
-                        amount: 1024 * 1024 * 1024,
-                    }],
-                });
+            // Seed sec-0 into the local `secondaries` map so the keepalive
+            // emitter has a roster to fan to (`broadcast_primary_keepalive`
+            // early-returns on an empty roster).
+            seed_secondary(&mut coordinator, "sec-0");
 
             assert_eq!(
                 count_keepalives(&log),
@@ -804,8 +788,8 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
 // `alive_secondary_members` reads, `PrimaryChanged` → `current_primary`,
 // `PeerRemoved` → Dead) rather than touching the primary-local
 // `secondaries` map (which the OLD `secondaries.is_empty()` condition
-// keyed off — exactly the field that left a co-located primary unable to
-// ever arm).
+// keyed off — exactly the field that left a primary running its own
+// secondary unable to ever arm).
 
 /// Seed ONE worker-secondary into the coordinator's replicated
 /// `cluster_state`: `PeerJoined` (→ Alive) + `SecondaryCapacity` (→ the
@@ -926,17 +910,17 @@ fn make_fleet_coordinator(
     )
 }
 
-/// (a) A co-located (Phase-E) primary partitioned from EVERY remote
-/// worker-secondary arms fleet-dead and strands — even though its OWN
-/// co-located secondary is still alive in the cluster ledger. This is
-/// the split-brain-safety invariant: the primary's own loopback
-/// secondary (whose id IS `current_primary`) must NOT keep it alive,
-/// because a freshly-elected primary may already be running the real
-/// cluster. The OLD `secondaries.is_empty()` condition could never trip
-/// here (the co-located secondary lives in the primary-local map), so
-/// the run hung; the count-based condition arms correctly.
+/// (a) A primary running its own secondary, partitioned from EVERY
+/// remote worker-secondary, arms fleet-dead and strands — even though its
+/// OWN secondary is still alive in the cluster ledger. This is the
+/// split-brain-safety invariant: the primary's own secondary (whose id IS
+/// `current_primary`) must NOT keep it alive, because a freshly-elected
+/// primary may already be running the real cluster. The OLD
+/// `secondaries.is_empty()` condition could never trip here (the own
+/// secondary lives in the primary-local map), so the run hung; the
+/// count-based condition arms correctly.
 #[tokio::test(flavor = "current_thread")]
-async fn colocated_primary_strands_when_only_own_secondary_alive() {
+async fn primary_strands_when_only_own_secondary_alive() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -944,8 +928,8 @@ async fn colocated_primary_strands_when_only_own_secondary_alive() {
             // `elapsed >= fleet_dead_timeout` predicate trips.
             let mut primary = make_fleet_coordinator(Duration::ZERO);
 
-            // Co-located host: it advertises BOTH a worker-secondary
-            // under its own id ("primary") AND is the recognized primary.
+            // The host advertises BOTH a worker-secondary under its own id
+            // ("primary") AND is the recognized primary.
             seed_cluster_secondary(&mut primary, "primary", 4);
             set_current_primary(&mut primary, "primary");
             // A remote secondary that has since died (partition).
@@ -958,13 +942,13 @@ async fn colocated_primary_strands_when_only_own_secondary_alive() {
             let state = primary.cluster_state_for_test();
             assert!(
                 state.alive_secondary_members().any(|id| id == "primary"),
-                "co-located own secondary must be an alive worker-secondary"
+                "the own secondary must be an alive worker-secondary"
             );
             assert_eq!(
                 state.alive_remote_secondary_count(),
                 0,
-                "every REMOTE worker-secondary is gone; only the co-located \
-                 own secondary remains, which the filter excludes"
+                "every REMOTE worker-secondary is gone; only the own \
+                 secondary remains, which the filter excludes"
             );
 
             prime_pool_with_queued(&mut primary, 3);
@@ -978,7 +962,7 @@ async fn colocated_primary_strands_when_only_own_secondary_alive() {
             // (never dispatched), so run-level accounting strands all.
             assert!(
                 primary.pool().is_empty(),
-                "co-located primary must arm fleet-dead and drain the pool \
+                "the primary must arm fleet-dead and drain the pool \
                  despite its own secondary being alive"
             );
             assert!(
@@ -1059,12 +1043,12 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
         .await;
 }
 
-/// (c) A submitter primary (no co-located secondary) whose remote-only
-/// fleet has entirely died arms fleet-dead and strands — the unchanged
-/// pre-co-located behaviour. The submitter is the recognized primary but
-/// is NOT a worker-secondary, so the `id != current_primary` filter is a
-/// no-op here: the count is simply "all alive worker-secondaries", which
-/// is zero once every remote secondary is dead.
+/// (c) A submitter primary (no own secondary) whose remote-only fleet has
+/// entirely died arms fleet-dead and strands. The submitter is the
+/// recognized primary but is NOT a worker-secondary, so the
+/// `id != current_primary` filter is a no-op here: the count is simply
+/// "all alive worker-secondaries", which is zero once every remote
+/// secondary is dead.
 #[tokio::test(flavor = "current_thread")]
 async fn submitter_primary_strands_when_remote_fleet_gone() {
     let local = tokio::task::LocalSet::new();
