@@ -52,7 +52,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BoundedString, Identifier};
+use dynrunner_core::{BoundedString, IMPORTANT_TARGET, Identifier};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, KeepaliveRole, RemovalCause, SendTarget,
     StateDigest, resolve_destination,
@@ -464,7 +464,31 @@ where
             .task_count()
             .saturating_sub(outcome.total_terminal());
         tracing::error!(stranded, %detail, "observer strand — surfacing ClusterCollapsed");
-        RunError::ClusterCollapsed { stranded, outcome }
+        let err = RunError::ClusterCollapsed { stranded, outcome };
+        // Backstop the fully-partitioned case (the observer can't receive
+        // the primary's `RunAborted` broadcast, so the narrator never
+        // projects the abort onto the important channel): emit the terminal
+        // reason on `IMPORTANT_TARGET` directly so the strand is never
+        // silent there.
+        self.emit_terminal_reason_important(&err.to_string());
+        err
+    }
+
+    /// Emit a run-terminal reason on the [`IMPORTANT_TARGET`] channel.
+    ///
+    /// The observer's own exit arms (strand backstop, setup-deadline,
+    /// fatal-policy, panik) reach this when the run ends WITHOUT a CRDT
+    /// terminal the narrator could project — the connected case is already
+    /// covered (the primary broadcasts `RunComplete` / `RunAborted` and the
+    /// narrator emits the summary on `IMPORTANT_TARGET`), but a partitioned
+    /// observer never sees that broadcast. One emit site, one line per arm,
+    /// so "every run-terminal reason reaches the important channel" holds on
+    /// both the connected and the partitioned path.
+    fn emit_terminal_reason_important(&self, reason: &str) {
+        tracing::error!(
+            target: IMPORTANT_TARGET,
+            "run terminated — {reason}",
+        );
     }
 
     /// LIVE `setup_pending` predicate (R2): `required_setup_on_promote &&
@@ -762,7 +786,9 @@ where
                         if self.setup_pending() {
                             let elapsed = setup_loop_start.elapsed();
                             self.setup_deadline_elapsed = Some(elapsed);
-                            return Err(RunError::SetupDeadlineExpired { elapsed });
+                            let err = RunError::SetupDeadlineExpired { elapsed };
+                            self.emit_terminal_reason_important(&err.to_string());
+                            return Err(err);
                         }
                         // A TaskAdded landed in the same tick — the gate is
                         // now inert; fall back into the loop.
@@ -784,9 +810,11 @@ where
                     // the PyO3 boundary RAISES — a policy abort must surface
                     // non-zero, never be log-and-swallowed.
                     Some(reason) = fatal_exit_rx.recv() => {
-                        return Err(RunError::FatalPolicyExit {
+                        let err = RunError::FatalPolicyExit {
                             reason: format!("invalid_task monitor — {reason}"),
-                        });
+                        };
+                        self.emit_terminal_reason_important(&err.to_string());
+                        return Err(err);
                     }
                 }
             }
@@ -1128,6 +1156,11 @@ where
             reason = %reason,
             "observer panik signal observed; announcing self-departure and exiting 137"
         );
+        // Surface the terminal reason on the important channel too: a panik
+        // exit is a run terminal the narrator never projects (no CRDT
+        // RunComplete / RunAborted lands), so without this it is silent
+        // there.
+        self.emit_terminal_reason_important(&format!("{reason} — exiting 137"));
         // Self-authored departure: apply locally + broadcast. Peers LOG it
         // and mark this node Dead. It does NOT cancel cluster work.
         let mutation = ClusterMutation::<I>::PeerRemoved {
