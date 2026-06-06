@@ -261,36 +261,43 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
 /// contract from the dispatch side: the request channel sender
 /// is `None`, so no listener can enqueue.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn respawn_dispatcher_skips_when_policy_disabled() {
-    let (coordinator, _mesh) = make_coordinator();
-    // No `enable_respawn` call — the spawner / budget / channel /
-    // listener registration are all absent by construction.
-    assert!(coordinator.respawn_spawner.is_none());
-    assert!(coordinator.respawn_budget.is_none());
-    assert!(coordinator.respawn_request_tx.is_none());
-    assert!(coordinator.respawn_request_rx.is_none());
-    assert!(coordinator.peer_lifecycle_listeners.is_empty());
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // `make_coordinator` spawns the production mesh-pump
+            // (`build_test_primary`), which `spawn_local`s — so this test, like
+            // its siblings, must run inside a `LocalSet`.
+            let (coordinator, _mesh) = make_coordinator();
+            // No `enable_respawn` call — the spawner / budget / channel /
+            // listener registration are all absent by construction.
+            assert!(coordinator.respawn_spawner.is_none());
+            assert!(coordinator.respawn_budget.is_none());
+            assert!(coordinator.respawn_request_tx.is_none());
+            assert!(coordinator.respawn_request_rx.is_none());
+            assert!(coordinator.peer_lifecycle_listeners.is_empty());
 
-    // Build a free-standing dispatcher listener so we can verify
-    // its on_event side-effect: a Removed event has no place to
-    // land if the channel side hasn't been wired. We construct a
-    // throwaway channel just to verify the closure shape; the
-    // coordinator's wiring itself is the contract under test.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RespawnRequest>();
-    let listener = respawn_dispatcher_listener(tx);
-    listener.on_event(&PeerLifecycleEvent::Removed {
-        id: "secondary-0".into(),
-        cause: RemovalCause::KeepaliveMiss,
-    });
-    // The free-standing listener does enqueue (it's a pure
-    // transformation); the coordinator we built simply has no
-    // listener registered, so its operational-loop arm would
-    // never see the request. That's the CCD-5 invariant.
-    let req = rx
-        .try_recv()
-        .expect("free-standing listener should still translate");
-    assert_eq!(req.original_id, "secondary-0");
+            // Build a free-standing dispatcher listener so we can verify
+            // its on_event side-effect: a Removed event has no place to
+            // land if the channel side hasn't been wired. We construct a
+            // throwaway channel just to verify the closure shape; the
+            // coordinator's wiring itself is the contract under test.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RespawnRequest>();
+            let listener = respawn_dispatcher_listener(tx);
+            listener.on_event(&PeerLifecycleEvent::Removed {
+                id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            // The free-standing listener does enqueue (it's a pure
+            // transformation); the coordinator we built simply has no
+            // listener registered, so its operational-loop arm would
+            // never see the request. That's the CCD-5 invariant.
+            let req = rx
+                .try_recv()
+                .expect("free-standing listener should still translate");
+            assert_eq!(req.original_id, "secondary-0");
+        })
+        .await;
 }
 
 /// Three deaths in the same family chain (each respawn's `new_id`

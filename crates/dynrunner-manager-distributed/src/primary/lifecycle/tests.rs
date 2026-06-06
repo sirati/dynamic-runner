@@ -15,21 +15,28 @@ use crate::primary::test_helpers::{
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
-use crate::process::{LocalRole, Mesh, RoleSlot};
+use crate::process::{LocalRole, Mesh};
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 use dynrunner_protocol_primary_secondary::address::PeerId;
-use std::sync::Arc;
 
-/// Keeps the test mesh + primary slot `Arc` + demote sender alive for a
-/// [`PrimaryCoordinator`] built over a [`RecordingPeer`]. These keepalive /
-/// announce-emission tests assert on what the coordinator broadcasts, which
-/// only reaches the recorder once the real `Node::run` pump drains the
-/// egress queue — so they are `#[ignore]`d until C-NODE; this guard keeps
-/// them compiling.
+/// Keeps the spawned mesh-pump + demote sender + pump control handle alive
+/// for a [`PrimaryCoordinator`] built over a [`RecordingPeer`]. These
+/// keepalive / announce-emission tests assert on what the coordinator
+/// broadcasts, which only reaches the recorder once the production mesh-pump
+/// (`crate::process::pump::run_pump`) drains the queued egress onto the
+/// transport — so the fixture spawns that pump exactly as `build_test_primary`
+/// does. The pump task OWNS the slot `Arc`; this guard holds the control
+/// handle (so the pump's control arm stays open) and aborts the pump on drop.
 struct RecordingMeshKeepalive {
-    _mesh: Mesh<TestId, RecordingPeer<TestId>>,
-    _slot: Arc<RoleSlot<TestId>>,
     _demote_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    _control: crate::process::MeshControlHandle<TestId>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RecordingMeshKeepalive {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
 }
 
 /// Stand-alone fixture matching the shape used by
@@ -142,11 +149,13 @@ fn make_recording_coordinator(
     };
     let recorder = RecordingPeer::<TestId>::new();
     let log = recorder.log_handle();
-    // Mint the mesh trio over the recording transport. With no pump (that
-    // is `Node::run`, C-NODE) a queued `client.send` never reaches the
-    // recorder, so the keepalive/announce emission these tests assert on
-    // is only captured under the real `Node::run` — they are `#[ignore]`d
-    // until then. This builder keeps them COMPILING.
+    // Mint the mesh trio over the recording transport, then spawn the
+    // PRODUCTION mesh-pump over the mesh — exactly as `build_test_primary`
+    // does. The pump drains the coordinator's QUEUED egress (M4) onto the
+    // recorder, so a `client.send` (keepalive / PrimaryChanged announce) lands
+    // in the shared log once the pump is scheduled; the tests `settle_pump()`
+    // before reading the log. MUST be called inside a `LocalSet` (the pump is
+    // `spawn_local`'d), which both callers are.
     let mut mesh = Mesh::new(recorder);
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
@@ -159,14 +168,23 @@ fn make_recording_coordinator(
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+    // Publish live membership before the pump spawns (the pump republishes
+    // every cycle thereafter), then hand the mesh to the production pump. The
+    // pump task OWNS the slot `Arc` for its lifetime, mirroring the node.
+    mesh.publish_membership();
+    let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+    let pump = tokio::task::spawn_local(async move {
+        let _slot = slot;
+        crate::process::pump::run_pump(mesh, control_rx).await;
+    });
     (
         coordinator,
         log,
         secondary_ends,
         RecordingMeshKeepalive {
-            _mesh: mesh,
-            _slot: slot,
             _demote_tx: demote_tx,
+            _control: control,
+            pump,
         },
     )
 }
@@ -206,7 +224,6 @@ fn count_keepalives(
 /// over the peer transport (delivery is not asserted — for the parked
 /// failover primary the transport is a no-op until A-M2 swaps it).
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn activate_local_primary_emits_a_keepalive() {
     let local = tokio::task::LocalSet::new();
     local
@@ -229,6 +246,9 @@ async fn activate_local_primary_emits_a_keepalive() {
                 .await
                 .expect("activation succeeds");
 
+            // The keepalive is a QUEUED mesh send; settle the production pump
+            // so it drains onto the recorder before reading the log.
+            crate::primary::tests::settle_pump().await;
             assert_eq!(
                 count_keepalives(&log),
                 1,
@@ -252,7 +272,6 @@ async fn activate_local_primary_emits_a_keepalive() {
 /// non-default value that proves the originator ran, not a zeroed
 /// default) AND the single uniform "primary changed" important event.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn activate_local_primary_announces_primary_changed() {
     use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
 
@@ -279,6 +298,12 @@ async fn activate_local_primary_announces_primary_changed() {
                 .activate_local_primary()
                 .await
                 .expect("activation succeeds");
+
+            // The PrimaryChanged announce is a QUEUED mesh send; settle the
+            // production pump so it drains onto the recorder before reading
+            // the log. The important-event hook fires on the LOCAL apply
+            // (synchronous, inside activate), so it is already captured.
+            crate::primary::tests::settle_pump().await;
 
             // Wire announce: exactly one broadcast carries a
             // `PrimaryChanged { new = "primary", epoch = 1 }`. `epoch: 1`
@@ -334,7 +359,6 @@ async fn activate_local_primary_announces_primary_changed() {
 /// `transport.recv()` pending, so the heartbeat-tick arm is what fires.
 /// Asserts at least one keepalive was emitted before the timeout returns.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn wait_for_mesh_ready_ticks_keepalive() {
     let local = tokio::task::LocalSet::new();
     local
@@ -357,6 +381,10 @@ async fn wait_for_mesh_ready_ticks_keepalive() {
                 .await
                 .expect("wait returns on the mesh-ready timeout");
 
+            // The keepalives the wait ticked are QUEUED mesh sends; settle the
+            // production pump so any still on the egress queue reach the
+            // recorder before the count is read.
+            crate::primary::tests::settle_pump().await;
             assert!(
                 count_keepalives(&log) >= 1,
                 "wait_for_mesh_ready must tick the keepalive emitter across the \

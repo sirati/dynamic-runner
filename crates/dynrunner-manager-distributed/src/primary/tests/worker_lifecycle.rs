@@ -45,9 +45,10 @@ fn primary_with_pool_and_idle_worker(
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
         tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
     )>,
+    PrimaryMeshKeepalive,
 ) {
     let (transport, ends) = setup_test(1);
-    let (mut primary, _mesh) = build_test_primary(
+    let (mut primary, mesh) = build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -65,7 +66,13 @@ fn primary_with_pool_and_idle_worker(
         0,
         ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]),
     );
-    (primary, ends)
+    // Return the mesh keepalive so the caller holds it: it OWNS the spawned
+    // mesh-pump (aborted on its Drop). Dropping it here would kill the pump,
+    // so a queued `client.send` would fail once the aborted task is reaped —
+    // exactly the "egress receiver dropped" failure that wedged the deferred
+    // dispatch recheck in tests that yield (e.g. a `drain_worker_signal_batch`
+    // wait) between the fixture build and the dispatch.
+    (primary, ends, mesh)
 }
 
 fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId> {
@@ -116,7 +123,7 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
             // `TaskAssignment` wire send inside `handle_task_request`
             // succeeds — dropping them would fail the send and trip the
             // rollback arm, leaving the slot idle.
-            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x]);
+            let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![x]);
 
             // Initial request assigns X to (sec-0, w0).
             primary
@@ -212,7 +219,7 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
         .run_until(async {
             let x = phased("task-x", "work");
             let hash_x = compute_task_hash(&x);
-            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x.clone()]);
+            let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![x.clone()]);
 
             // Seed the CRDT ledger so the live `TaskAssigned` origination
             // has a `Pending` entry to transition (the pool seed alone
@@ -278,7 +285,6 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
 /// slot moved to Y — yields no double-decrement. The hash IS the held
 /// identity, so a terminal for a non-held hash cannot free the slot.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn stale_complete_after_reassignment_is_noop_on_slot() {
     let local = tokio::task::LocalSet::new();
     local
@@ -292,7 +298,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // would otherwise mark the phase Done, hiding Y from
             // `view_for_worker` (Active-only) and blocking the
             // reassignment this test depends on.
-            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x.clone(), y]);
+            let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![x.clone(), y]);
 
             // Install the worker-management bus: the completion path
             // EMITS a `TasksAdded` (deferred dispatch) instead of
@@ -604,7 +610,7 @@ async fn complete_for_untracked_hash_is_noop() {
         .run_until(async {
             let y = phased("task-y", "work");
             let hash_y = compute_task_hash(&y);
-            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![y]);
+            let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![y]);
 
             primary
                 .handle_task_request(task_request("sec-0", 0))

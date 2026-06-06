@@ -372,7 +372,20 @@ async fn exactly_one_node_yields_by_designation() {
 /// None`, then another node) → no yield. Only once `current_primary` is
 /// sec-a itself does the yield fire. Pins "no discovery into the void".
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
+#[ignore = "OBSOLETE — tests a DELETED invariant (not a timing-adaptation): commit \
+            3f3aef7e ('secondary: remove the co-located primary concept') \
+            intentionally removed the setup-discovery SELF-RECOGNITION axis \
+            (axis 5: `current_primary() == self`) from setup_discovery_pending / \
+            is_designated_discoverer (coordinator.rs ~L510/L548 now gate ONLY on \
+            the lowest-id-eligible rule, not on authority-readiness). This test \
+            asserts the removed axis fires (a None / other-node current_primary \
+            must suppress the yield), which no longer holds: sec_a is the \
+            lowest-id designate regardless of current_primary, so \
+            setup_discovery_pending is true even at current_primary=None \
+            (observed). This is a deliberate behavioral change, NOT a \
+            queued-egress settle issue — the test should be retired or rewritten \
+            to the post-3f3aef7e contract. Needs owner adjudication. Left \
+            ignored per the do-not-paper-over-genuine-changes rule."]
 async fn designated_node_skips_until_authority_ready() {
     let roster = [("sec-a", true, false), ("sec-b", true, false)];
 
