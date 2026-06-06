@@ -305,6 +305,28 @@ impl<I> TaskState<I> {
     }
 }
 
+/// Which per-phase EVENT counter a [`ClusterState::phase_event_tally_for`]
+/// key addresses (F4). The two map keys `(PhaseId, PhaseTally)` mirror the
+/// two node-local event counters they replace (`phase_completed` /
+/// `phase_failed`) — ONE replicated field, two keys, NOT two fields and NOT
+/// a per-class breakdown.
+///
+/// EVENT-shaped, not terminal-shaped: a fail → reinject → succeed task
+/// increments BOTH `Failed` and `Completed` (each terminal OBSERVATION is
+/// one event), so this is a grow-only-MAX of a monotone event count — NOT a
+/// projection of the single terminal `TaskState` the ledger converges to.
+/// `PhaseRollup` / `outcome_counts` stay terminal-shaped (a distinct
+/// concern).
+///
+/// Derives `Serialize`/`Deserialize` because it crosses the wire INSIDE the
+/// snapshot's `(PhaseId, PhaseTally)` map key; `Copy`/`Eq`/`Hash` so it is a
+/// cheap `HashMap` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PhaseTally {
+    Completed,
+    Failed,
+}
+
 /// Coarse convergence band. The band dominates FIRST in the
 /// [`TaskJoinKey`] ordering, so any terminal beats any non-terminal
 /// regardless of version (C3 req-a: a worker outcome that raced a reset

@@ -384,19 +384,12 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// failures; their ErrorType classification is the operator's
     /// post-mortem signal.
     pub(super) failed_tasks: HashMap<String, ErrorType>,
-    /// Per-phase completion counters fed to `on_phase_end`. Incremented
-    /// inside the same code paths that update `completed_tasks` /
-    /// `failed_tasks`.
-    pub(super) phase_completed: HashMap<PhaseId, u32>,
-    pub(super) phase_failed: HashMap<PhaseId, u32>,
-    /// Per-(phase, retry-bucket) pass counter, owned by
-    /// `primary::retry_bucket`. Each entry tracks how many passes
-    /// have been consumed by the matching bucket for that phase;
-    /// caps are read from `config.retry_max_passes` /
-    /// `config.oom_retry_max_passes`. See
-    /// [`crate::primary::retry_bucket`] for the surface this is
-    /// keyed against.
-    pub(super) retry_passes_used: crate::primary::retry_bucket::RetryPassesUsed,
+    // Per-phase completed/failed EVENT tallies are now the replicated
+    // grow-only-MAX `ClusterState::phase_event_tallies` (F4) so a promoted
+    // primary reports the SAME event-shaped `on_phase_end` numbers; the
+    // per-(phase, bucket) retry-pass counter is the replicated
+    // `ClusterState::retry_passes_used` (P3) so the retry budget survives
+    // failover. Neither is node-local on the coordinator any more.
     /// Currently in-flight count per `TypeId`, against
     /// `config.max_concurrent_per_type`. Incremented on dispatch
     /// (in both `assign_initial` and `assign_normal` paths),
@@ -503,15 +496,11 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// calls and the PyO3 side surfaces that as a Python exception.
     pub(super) command_tx: tokio_mpsc::Sender<PrimaryCommand<I>>,
 
-    /// Per-task reinject counter, paired with
-    /// `PrimaryConfig::unfulfillable_reinject_max_per_task`. Lazily
-    /// initialised on first reinject for a hash; counts DOWN from
-    /// the configured cap (so 0 means "exhausted, refuse"). The
-    /// map is keyed by task hash, not task_id, because external-
-    /// control callers use the hash as the canonical identifier
-    /// (mirroring the rest of the wire protocol).
-    pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
-
+    // The per-task unfulfillable-reinject counter is now the replicated
+    // grow-only-MAX `ClusterState::unfulfillable_reinject_used` (P3) — a
+    // per-hash USED count, NOT the old decrementing node-local `remaining`.
+    // The handler derives `remaining = cap − used` locally so the reinject
+    // budget survives failover.
     /// Peer-lifecycle dispatcher channel receiver, paired with the
     /// `lifecycle_tx` installed on `cluster_state` at construction.
     /// Taken out at `run()` start and handed to
@@ -908,9 +897,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             completed_tasks: HashSet::new(),
             in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
-            phase_completed: HashMap::new(),
-            phase_failed: HashMap::new(),
-            retry_passes_used: HashMap::new(),
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
@@ -925,7 +911,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             cluster_state: ClusterState::new(),
             command_rx: Some(command_rx),
             command_tx,
-            unfulfillable_reinject_remaining: HashMap::new(),
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,
@@ -2100,7 +2085,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// mirror (which no longer exists).
     #[cfg(test)]
     pub fn retry_passes_used_for_test(&self) -> u32 {
-        self.retry_passes_used.values().sum()
+        self.cluster_state.retry_passes_used_total()
+    }
+
+    /// Test-only read of the replicated per-phase Completed EVENT tally
+    /// (F4) — the count `on_phase_end` would report for `phase`. Reads the
+    /// CRDT field that replaced the old node-local `phase_completed` map.
+    #[cfg(test)]
+    pub fn phase_completed_for_test(&self, phase: &PhaseId) -> u32 {
+        self.cluster_state
+            .phase_event_tally_for(&(phase.clone(), crate::cluster_state::PhaseTally::Completed))
+    }
+
+    /// Test-only read of the replicated per-phase Failed EVENT tally (F4).
+    /// Sibling to [`Self::phase_completed_for_test`].
+    #[cfg(test)]
+    pub fn phase_failed_for_test(&self, phase: &PhaseId) -> u32 {
+        self.cluster_state
+            .phase_event_tally_for(&(phase.clone(), crate::cluster_state::PhaseTally::Failed))
     }
 
     /// Test-only borrow of the primary's replicated cluster ledger.
@@ -2564,15 +2566,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
-        self.phase_completed.clear();
-        self.phase_failed.clear();
         self.phase_started_emitted.clear();
-        // Per-(phase, bucket) retry counters: cleared at run-start
-        // so a coordinator reused across runs (no production path
-        // does this today, but the single-shot contract should not
-        // implicitly depend on `new()`-only init) starts every
-        // bucket from zero.
-        self.retry_passes_used.clear();
+        // The per-phase EVENT tallies (F4) and the per-(phase, bucket)
+        // retry-pass counter (P3) are NOT cleared here: they are now the
+        // replicated grow-only-MAX `ClusterState` fields. A `ColdStart` CRDT
+        // is empty (the accessor returns 0), a `PromotionSnapshot` CRDT
+        // carries the inherited counts via max-merge — and a stale clear
+        // could resurrect a re-granted budget on failover, which the
+        // grow-only-MAX merge is specifically designed to prevent. The
+        // `SeedSource` selects the CRDT origination, not a counter reset.
 
         // Spawn the peer-lifecycle + task-completion dispatchers BEFORE
         // any wire mutation can land. See `spawn_run_dispatchers`.
@@ -3378,8 +3380,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 {
                     continue;
                 }
-                let completed = self.phase_completed.get(p).copied().unwrap_or(0);
-                let failed = self.phase_failed.get(p).copied().unwrap_or(0);
+                // Read the replicated EVENT tallies (F4): identical numbers
+                // to the old node-local maps on the live path, CORRECT on
+                // the promoted path (the events were replicated). EVENT-
+                // shaped — a fail → reinject → succeed task contributed to
+                // BOTH — so `on_phase_end` reports the same event numbers a
+                // promoted primary would, not a terminal projection.
+                let completed = self
+                    .cluster_state
+                    .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Completed));
+                let failed = self
+                    .cluster_state
+                    .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Failed));
                 // Gather the just-completed phase's PUBLISHED task outputs
                 // BEFORE taking the `&mut self.on_phase_end` borrow (the
                 // gather is an immutable `&self.cluster_state` read). The
@@ -3499,7 +3511,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         task_id: Option<&str>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
-        *self.phase_completed.entry(phase_id.clone()).or_insert(0) += 1;
+        // Originate the per-phase Completed EVENT tally (F4): compute the
+        // new running count and max-bump the replicated grow-only-MAX field.
+        // EVENT-shaped — a fail → reinject → succeed task increments BOTH
+        // Failed and Completed — so this counts terminal OBSERVATIONS, not a
+        // terminal-state projection.
+        let key = (phase_id.clone(), crate::cluster_state::PhaseTally::Completed);
+        let new_count = self.cluster_state.phase_event_tally_for(&key) + 1;
+        self.cluster_state.record_phase_event_tally(key, new_count);
         self.pool_mut().on_item_finished(phase_id, task_id);
         self.process_phase_lifecycle(command_rx).await;
     }
@@ -3521,7 +3540,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         _task_id: Option<&str>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
-        *self.phase_failed.entry(phase_id.clone()).or_insert(0) += 1;
+        // Originate the per-phase Failed EVENT tally (F4): same shape as
+        // `note_item_completed` — compute the new running count and max-bump
+        // the replicated grow-only-MAX field. EVENT-shaped (counts terminal
+        // OBSERVATIONS), so a later retry-success still increments Completed
+        // and BOTH survive a promotion via max-merge.
+        let key = (phase_id.clone(), crate::cluster_state::PhaseTally::Failed);
+        let new_count = self.cluster_state.phase_event_tally_for(&key) + 1;
+        self.cluster_state.record_phase_event_tally(key, new_count);
         self.pool_mut().on_item_finished(phase_id, None);
         self.process_phase_lifecycle(command_rx).await;
     }

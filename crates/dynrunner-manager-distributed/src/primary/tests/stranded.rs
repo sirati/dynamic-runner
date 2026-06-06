@@ -479,8 +479,6 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
                 .collect();
             pool.extend(binaries.clone()).expect("valid extend");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.all_binaries = binaries.clone();
             primary.total_tasks = binaries.len();
 

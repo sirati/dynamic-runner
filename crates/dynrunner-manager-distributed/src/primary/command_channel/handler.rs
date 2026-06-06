@@ -229,17 +229,20 @@ where
             }
         };
 
-        // Budget check. None == unbounded (the bypass branch);
-        // `Some(0)` means "exhausted, refuse"; `Some(n>0)` decrements
-        // and proceeds. The map is initialised lazily — first reinject
-        // for a hash seeds the counter from the configured cap.
+        // Budget check (P3). `None` == unbounded (the bypass branch): no
+        // used counter is originated, since there is no cap to enforce.
+        // `Some(cap)`: `remaining = cap − used` is derived LOCALLY from the
+        // replicated grow-only-MAX `unfulfillable_reinject_used` field; a
+        // `remaining == 0` refuses. On a successful reinject below the used
+        // count is max-bumped via the originator so it survives failover (a
+        // promoted primary inherits `used` and does NOT re-grant the
+        // budget). The replicated counter counts UP (was a node-local
+        // DECREMENTING `remaining`); the local derivation is the read-side.
         let max = self.config.unfulfillable_reinject_max_per_task;
+        let used = self.cluster_state.unfulfillable_reinject_used_for(&hash);
         if let Some(cap) = max {
-            let remaining = self
-                .unfulfillable_reinject_remaining
-                .entry(hash.clone())
-                .or_insert(cap);
-            if *remaining == 0 {
+            let remaining = cap.saturating_sub(used);
+            if remaining == 0 {
                 tracing::warn!(
                     task_hash = %hash,
                     cap,
@@ -251,7 +254,6 @@ where
                      (cap={cap})"
                 ));
             }
-            *remaining -= 1;
         }
 
         // Local pool reinject: same primitive the retry-pass code path
@@ -260,6 +262,16 @@ where
         // the bucket head so the next dispatch tick picks it up.
         self.failed_tasks.remove(&hash);
         self.pool_mut().reinject(binary);
+
+        // Originate the bumped used count (P3) ONLY when a cap is set —
+        // an unbounded `None` cap has no budget to enforce, so skip the
+        // origination entirely (no counter to grow). Grow-only MAX, so a
+        // promoted primary inherits `used + 1` and the budget survives
+        // failover.
+        if max.is_some() {
+            self.cluster_state
+                .record_unfulfillable_reinject_used(hash.clone(), used + 1);
+        }
 
         // Broadcast so every node's CRDT mirror moves the entry off
         // `Failed` synchronously.

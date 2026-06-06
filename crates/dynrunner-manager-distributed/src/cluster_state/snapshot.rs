@@ -13,10 +13,13 @@ use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs};
 use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
 use serde::{Deserialize, Serialize};
 
+use crate::primary::retry_bucket::BucketKind;
+
 use super::ClusterState;
 use super::TaskState;
+use super::grow_max::merge_grow_max;
 use super::merge::merge_capability;
-use super::types::{CapabilityEntry, PeerEntry, PeerState};
+use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally};
 
 /// Serializable snapshot of an entire `ClusterState`. Used by the
 /// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
@@ -213,6 +216,31 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-field shape).
     #[serde(default)]
     pub run_aborted: Option<String>,
+    /// Replicated per-phase EVENT tallies (F4) — grow-only MAX of a monotone
+    /// event count keyed by `(PhaseId, PhaseTally)`. Carried so a promoted
+    /// primary inherits the per-phase completed/failed EVENT counts (a fail
+    /// → reinject → succeed task contributed to BOTH) and reports the SAME
+    /// `on_phase_end` numbers. Merge rule on `restore`: per-key grow-only
+    /// MAX (a stale peer can never resurrect a lower count). `#[serde(default)]`
+    /// keeps wire compat with a pre-field sender (missing field decodes as an
+    /// empty map, the accessor's `unwrap_or(0)` covers it).
+    #[serde(default)]
+    pub phase_event_tallies: HashMap<(PhaseId, PhaseTally), u32>,
+    /// Replicated per-(phase, bucket) retry-pass USED counter (P3) —
+    /// grow-only MAX of a monotone used count. Carried so a promoted primary
+    /// inherits the retry budget already consumed (the budget is NOT
+    /// re-granted on failover). Merge rule on `restore`: per-key grow-only
+    /// MAX. `#[serde(default)]` keeps wire compat with a pre-field sender.
+    #[serde(default)]
+    pub retry_passes_used: HashMap<(PhaseId, BucketKind), u32>,
+    /// Replicated per-hash unfulfillable-reinject USED counter (P3) —
+    /// grow-only MAX of a monotone used count. Carried so a promoted primary
+    /// inherits the reinject budget already consumed (the budget is NOT
+    /// re-granted on failover; `remaining = cap − used` is derived locally).
+    /// Merge rule on `restore`: per-key grow-only MAX. `#[serde(default)]`
+    /// keeps wire compat with a pre-field sender.
+    #[serde(default)]
+    pub unfulfillable_reinject_used: HashMap<String, u32>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -257,6 +285,10 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings,
             task_outputs,
             secondary_capacities,
+            // Replicated grow-only-MAX maps (F4 + P3).
+            phase_event_tallies,
+            retry_passes_used,
+            unfulfillable_reinject_used,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -312,6 +344,12 @@ impl<I: Identifier> ClusterState<I> {
             // from a snapshot learns the run is already over / aborted.
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Replicated grow-only-MAX maps (F4 + P3) — carried so a
+            // promoted primary inherits the per-phase event tallies and the
+            // retry / reinject used-budgets via max-merge on restore.
+            phase_event_tallies: phase_event_tallies.clone(),
+            retry_passes_used: retry_passes_used.clone(),
+            unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
         }
     }
 
@@ -392,6 +430,9 @@ impl<I: Identifier> ClusterState<I> {
             alive_members,
             run_complete,
             run_aborted,
+            phase_event_tallies,
+            retry_passes_used,
+            unfulfillable_reinject_used,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -571,5 +612,18 @@ impl<I: Identifier> ClusterState<I> {
         {
             self.run_aborted = Some(reason);
         }
+        // Grow-only-MAX maps (F4 + P3): per-key MAX merge so a promoted
+        // primary inherits the per-phase event tallies and the retry /
+        // reinject used-budgets, and a stale peer's snapshot can never
+        // resurrect a lower count (max never decreases). Converges under
+        // max regardless of (live-broadcast, snapshot) arrival order — the
+        // exact property that makes the run-start `clear()` unnecessary AND
+        // safe. The merge rule is spelled once in `grow_max::merge_grow_max`.
+        merge_grow_max(&mut self.phase_event_tallies, phase_event_tallies);
+        merge_grow_max(&mut self.retry_passes_used, retry_passes_used);
+        merge_grow_max(
+            &mut self.unfulfillable_reinject_used,
+            unfulfillable_reinject_used,
+        );
     }
 }

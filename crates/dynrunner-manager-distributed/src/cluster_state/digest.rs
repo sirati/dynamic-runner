@@ -80,6 +80,12 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings: _peer_holdings,
             task_outputs,
             secondary_capacities,
+            // Replicated grow-only-MAX maps (F4 + P3) — summarised: count +
+            // VALUE-folding XOR (the count diverges before convergence, so
+            // the fold must see the value, same shape as `task_outputs`).
+            phase_event_tallies,
+            retry_passes_used,
+            unfulfillable_reinject_used,
             // ── node-local: not replicated, carries no convergence signal ──
             // (see the field docs on `ClusterState`; same set `snapshot()`
             // classifies node-local).
@@ -160,6 +166,17 @@ impl<I: Identifier> ClusterState<I> {
             capabilities_hash ^= super::merge::capability_fold(id, entry);
         }
 
+        // Grow-only-MAX maps (F4 + P3): count + order-independent XOR-fold
+        // of the `(key, value)` PAIRS (folds the VALUE because the count
+        // diverges before convergence — same shape as `task_outputs_hash`,
+        // so a same-key divergent-count entry is detected by `field_behind`
+        // and pulled). The fold rule is spelled once in
+        // `grow_max::fold_grow_max`.
+        let phase_event_tallies_hash = super::grow_max::fold_grow_max(phase_event_tallies);
+        let retry_passes_used_hash = super::grow_max::fold_grow_max(retry_passes_used);
+        let unfulfillable_reinject_used_hash =
+            super::grow_max::fold_grow_max(unfulfillable_reinject_used);
+
         StateDigest {
             tasks_count: tasks.len() as u64,
             tasks_hash,
@@ -186,6 +203,12 @@ impl<I: Identifier> ClusterState<I> {
             primary_epoch: *primary_epoch,
             run_complete: *run_complete,
             run_aborted: run_aborted.is_some(),
+            phase_event_tallies_count: phase_event_tallies.len() as u64,
+            phase_event_tallies_hash,
+            retry_passes_used_count: retry_passes_used.len() as u64,
+            retry_passes_used_hash,
+            unfulfillable_reinject_used_count: unfulfillable_reinject_used.len() as u64,
+            unfulfillable_reinject_used_hash,
         }
     }
 }

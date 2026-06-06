@@ -149,8 +149,6 @@ fn make_primed_primary(
     let pool = PendingPool::<TestId>::new([phase.clone()], std::collections::HashMap::new())
         .expect("default-phase pool");
     primary.pending = Some(pool);
-    primary.phase_completed.insert(phase.clone(), 0);
-    primary.phase_failed.insert(phase, 0);
     primary.total_tasks = tasks.len();
     primary.all_binaries = tasks;
     (primary, mesh)

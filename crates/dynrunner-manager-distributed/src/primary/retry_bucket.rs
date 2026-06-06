@@ -7,8 +7,9 @@
 //! Module boundary:
 //!   * Owns: the [`BucketKind`] enum (which `ErrorType`s belong to
 //!     which retry channel), the per-(phase, bucket) pass counter
-//!     stored on [`PrimaryCoordinator::retry_passes_used`], the
-//!     reinjection driver [`PrimaryCoordinator::try_run_phase_retry_bucket`].
+//!     (the replicated grow-only-MAX `ClusterState::retry_passes_used`
+//!     field, P3 — survives failover), the reinjection driver
+//!     [`PrimaryCoordinator::try_run_phase_retry_bucket`].
 //!   * Does NOT own: the cascade itself (lives in
 //!     `coordinator::process_phase_lifecycle`), the per-task
 //!     dispatch decisions (live in `lifecycle::dispatch_to_idle_workers`
@@ -33,13 +34,12 @@
 //! done (every retry-bucket exhausted), matching the user's "next
 //! phase depends on previous phase being done" framing.
 
-use std::collections::HashMap;
-
 use dynrunner_core::{
     ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo,
 };
 use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
@@ -59,8 +59,17 @@ use crate::worker_signal::WorkerMgmtSignal;
 /// `ResourceExhausted` (e.g. gpu_vram) and `NonRecoverable` /
 /// `Unfulfillable` stay in `failed_tasks` permanently; they are NOT
 /// the retry-bucket primitive's concern.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum BucketKind {
+/// Derives `Serialize`/`Deserialize` because it is half of the
+/// `(PhaseId, BucketKind)` map key of the replicated `retry_passes_used`
+/// grow-only-MAX field on `ClusterState` (P3) — the key crosses the wire
+/// inside the snapshot.
+///
+/// `pub` (same category as `CapabilityEntry`) because it is reachable
+/// through the `pub` `ClusterStateSnapshot::retry_passes_used` map key; the
+/// variants are only CONSTRUCTED inside the crate (the retry-bucket cascade),
+/// external callers round-trip the snapshot opaquely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BucketKind {
     Recoverable,
     Oom,
 }
@@ -86,17 +95,12 @@ impl BucketKind {
     }
 }
 
-/// Per-(phase, bucket) pass counter. Initialised empty; entries are
-/// inserted at the moment a bucket runs for the first time on a
-/// given phase. Lookups fall back to 0.
-///
-/// Lifetime: tied to the coordinator. Survives across multiple
-/// `process_phase_lifecycle` cascades within a single `run()`; reset
-/// implicitly when a fresh `PrimaryCoordinator` is constructed for a
-/// new run. No explicit clear is required between phases — the key
-/// includes `PhaseId`, so phase A's counter is structurally
-/// independent of phase B's.
-pub(crate) type RetryPassesUsed = HashMap<(PhaseId, BucketKind), u32>;
+// The per-(phase, bucket) pass counter now lives on the replicated
+// `ClusterState::retry_passes_used` grow-only-MAX field (P3) so the retry
+// budget survives failover. No node-local instance is held by the
+// coordinator any more — the pure core reads the current `used` by value
+// (passed by the async caller from the CRDT accessor) and the caller
+// persists `used + 1` via the originator, keeping the core CRDT-free (P3-γ).
 
 /// Pure retry-bucket primitive shared between the live-primary and
 /// the promoted-secondary's primary path. Owns ONLY the three
@@ -130,27 +134,34 @@ pub(crate) type RetryPassesUsed = HashMap<(PhaseId, BucketKind), u32>;
 /// reinjected task so the converged ledger moves `Failed { attempt: n }
 /// → Pending { attempt: n+1 }` and SURVIVES anti-entropy (F2) — the
 /// pure core stays CRDT-agnostic, surfacing only the hashes.
+///
+/// `used` is the CURRENT per-(phase, bucket) used count, read BY VALUE
+/// from the replicated `ClusterState::retry_passes_used` by the async
+/// caller (P3-γ — the core never touches the CRDT). On a reinject the new
+/// used count is `used + 1`; the async caller persists that via
+/// `record_retry_pass_used` exactly when this returns a non-empty Vec (an
+/// empty / budget-exhausted return is not a "used" pass and the caller
+/// originates nothing).
 pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     phase: &PhaseId,
     kind: BucketKind,
     candidates: Vec<TaskInfo<I>>,
     pool: &mut PendingPool<I>,
-    retry_passes_used: &mut RetryPassesUsed,
+    used: u32,
     max_passes: u32,
     mut on_remove_from_failed: impl FnMut(&str),
 ) -> Vec<String> {
     if candidates.is_empty() {
         // No failures of this kind for this phase. Caller moves
-        // on. We intentionally do NOT touch the counter here:
-        // an empty bucket pass is not a "used" pass — a future
-        // re-arrival of a failure (e.g. the cascade triggered
-        // by an `apply_fail_permanent` cross-cut) should still
-        // get a fresh budget if the counter was at 0.
+        // on. We intentionally do NOT bump the counter (the caller
+        // originates nothing on an empty return): an empty bucket
+        // pass is not a "used" pass — a future re-arrival of a
+        // failure (e.g. the cascade triggered by an
+        // `apply_fail_permanent` cross-cut) should still get a fresh
+        // budget if the counter was at 0.
         return Vec::new();
     }
 
-    let key = (phase.clone(), kind);
-    let used = retry_passes_used.get(&key).copied().unwrap_or(0);
     if used >= max_passes {
         // Budget exhausted. Surviving failures stay in the
         // caller's failed-store; caller fires `on_phase_end` and
@@ -176,10 +187,10 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
         reinjected_hashes.push(h);
     }
 
-    // Bump counter BEFORE the caller's kickstart so a kickstart-
-    // side error path leaving the system in an inconsistent state
-    // does not burn a second pass on the same set of failures.
-    retry_passes_used.insert(key, used + 1);
+    // The async caller persists the bumped count (`used + 1`) via the
+    // CRDT originator on this non-empty return, BEFORE its kickstart, so a
+    // kickstart-side error path does not burn a second pass on the same
+    // set of failures.
 
     // Phase-transition important event: the start of a retry pass.
     // ONE emit site shared by both retry channels — `bucket = ?kind`
@@ -294,6 +305,14 @@ where
         let candidates = self.assign_oom_preferred_secondaries(kind, candidates);
 
         let cap = kind.max_passes(&self.config);
+        // Read the CURRENT used count from the replicated grow-only-MAX
+        // field (P3) and pass it BY VALUE into the CRDT-free pure core; the
+        // budget check (`used >= max_passes`) is the core's, against this
+        // replicated count, so a promoted primary that inherited the count
+        // via max-merge enforces the SAME budget — the retries are not
+        // re-granted on failover.
+        let key = (phase.clone(), kind);
+        let used = self.cluster_state.retry_pass_used_for(&key);
         let reinjected = {
             let failed_tasks = &mut self.failed_tasks;
             try_phase_retry_bucket_core(
@@ -301,7 +320,7 @@ where
                 kind,
                 candidates,
                 self.pending.as_mut().expect("pool must be initialised"),
-                &mut self.retry_passes_used,
+                used,
                 cap,
                 |h| {
                     failed_tasks.remove(h);
@@ -309,6 +328,13 @@ where
             )
         };
         if !reinjected.is_empty() {
+            // Persist the bumped pass count (`used + 1`) via the §0
+            // originator (P3-γ — the pure core stayed CRDT-free and only
+            // surfaced the reinjected hashes). Grow-only MAX, so a promoted
+            // primary inherits this and the budget survives failover. Done
+            // BEFORE the reset broadcast + kickstart so a kickstart-side
+            // error does not burn a second pass on the same failures.
+            self.cluster_state.record_retry_pass_used(key, used + 1);
             // Originate the authoritative CRDT retry reset for each
             // reinjected hash so the converged ledger moves
             // `Failed { attempt: n } → Pending { attempt: n+1 }` and
@@ -433,7 +459,7 @@ mod important_event_tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
 
-    use super::{BucketKind, RetryPassesUsed, try_phase_retry_bucket_core};
+    use super::{BucketKind, try_phase_retry_bucket_core};
     use crate::test_capture::{ImportantCapture, important_only};
 
     fn task(name: &str, phase: &PhaseId) -> TaskInfo<RunnerIdentifier> {
@@ -467,10 +493,10 @@ mod important_event_tests {
     ) -> (bool, Vec<crate::test_capture::CapturedEvent>) {
         let phase = PhaseId::from("phase-a");
         let mut pool = pool(&phase);
-        let mut used: RetryPassesUsed = HashMap::new();
-        if used_seed > 0 {
-            used.insert((phase.clone(), kind), used_seed);
-        }
+        // The pure core now takes the current used count BY VALUE (P3-γ —
+        // CRDT-free); the seed models a phase that already consumed
+        // `used_seed` passes.
+        let used = used_seed;
         let capture = ImportantCapture::default();
         let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
         let reinjected = with_default(subscriber, || {
@@ -479,7 +505,7 @@ mod important_event_tests {
                 kind,
                 candidates,
                 &mut pool,
-                &mut used,
+                used,
                 max_passes,
                 |_h| {},
             )

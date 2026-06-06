@@ -61,8 +61,6 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         )
         .expect("default-phase pool");
         primary.pending = Some(pool);
-        primary.phase_completed.insert(phase.clone(), 0);
-        primary.phase_failed.insert(phase, 0);
         primary.total_tasks = 0;
 
         // Pre-load the transport: a TaskAdded mutation followed by a
@@ -241,8 +239,6 @@ async fn pre_seeded_counter_exit_unchanged() {
             )
             .expect("default-phase pool");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.total_tasks = 2;
             primary.completed_tasks.insert("h-legacy-1".into());
             primary.completed_tasks.insert("h-legacy-2".into());
@@ -382,10 +378,6 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
         )
         .expect("two-phase pool");
         primary.pending = Some(pool);
-        primary.phase_completed.insert(phase_a.clone(), 0);
-        primary.phase_completed.insert(phase_b.clone(), 0);
-        primary.phase_failed.insert(phase_a.clone(), 0);
-        primary.phase_failed.insert(phase_b.clone(), 0);
         primary.total_tasks = 0;
 
         // Record every on_phase_end invocation in a shared ledger
@@ -704,8 +696,6 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
             )
             .expect("default-phase pool");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.total_tasks = 0;
 
             // Outer ceiling: a stuck operational loop should fail the
@@ -819,8 +809,6 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
             )
             .expect("default-phase pool");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.total_tasks = 0;
 
             // Pre-queue a TaskAdded + TaskCompleted that mirror the
@@ -970,8 +958,6 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
             )
             .expect("default-phase pool");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.total_tasks = 0;
 
             let bin = make_binary("setup-discovered-task", 100);
@@ -1115,8 +1101,6 @@ async fn empty_discovery_run_complete_exits_promptly_not_after_deadline() {
             )
             .expect("default-phase pool");
             primary.pending = Some(pool);
-            primary.phase_completed.insert(phase.clone(), 0);
-            primary.phase_failed.insert(phase, 0);
             primary.total_tasks = 0;
 
             // The empty-discovery terminal: RunComplete with NO preceding
