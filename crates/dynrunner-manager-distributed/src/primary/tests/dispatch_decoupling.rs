@@ -159,7 +159,6 @@ fn assigned_task_ids(
 /// dispatch — but ONLY via the recheck woken by the `TasksAdded` the
 /// completion path emitted. Drive the bus end-to-end: complete A, drain
 /// the coalesced batch, run the reaction, observe B on the wire.
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_completes() {
     let local = tokio::task::LocalSet::new();
@@ -178,7 +177,10 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
                 "worker must take phase-A task first (B is blocked on A)"
             );
             // Drain the A assignment off the wire so the post-completion
-            // assertion sees only B.
+            // assertion sees only B. The assignment is a QUEUED mesh send
+            // (M4), so settle the pump before draining or the frame is still
+            // on the egress queue and leaks into a later drain.
+            settle_pump().await;
             let _ = assigned_task_ids(&mut ends[0].1);
 
             // Install the worker-management bus to capture the emit.
@@ -197,6 +199,11 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
                 primary.slot_is_idle_for_test("sec-0", 0),
                 "worker frees on A's terminal"
             );
+            // Settle so that IF the completion path had (wrongly) dispatched
+            // inline, the frame would have reached the wire by now — the
+            // emptiness assertion below is only load-bearing once the pump
+            // has had the chance to deliver any queued assignment.
+            settle_pump().await;
             assert!(
                 assigned_task_ids(&mut ends[0].1).is_empty(),
                 "no inline dispatch on the completion path — dispatch is deferred \
@@ -215,7 +222,10 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
             );
             primary.react_to_worker_signal_batch(batch).await;
 
-            // The recheck dispatched B to the now-free worker.
+            // The recheck dispatched B to the now-free worker. Its
+            // TaskAssignment is a queued mesh send, so settle the pump
+            // before draining the wire.
+            settle_pump().await;
             let assigned = assigned_task_ids(&mut ends[0].1);
             assert_eq!(
                 assigned,
@@ -232,7 +242,6 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
 /// completion path anymore, so without the signal the freed worker sits
 /// idle and B stays queued. Asserted over a bounded virtual-time window
 /// (`start_paused` + `advance`), NOT a real wall-clock hang.
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
     let local = tokio::task::LocalSet::new();
@@ -245,6 +254,9 @@ async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
                 .await
                 .unwrap();
             assert!(primary.slot_holds_hash_for_test("sec-0", 0, &hash_a));
+            // Drain the A assignment off the wire; settle the queued send
+            // first so it does not leak into the post-advance empty-check.
+            settle_pump().await;
             let _ = assigned_task_ids(&mut ends[0].1);
 
             // NO worker-management sender installed: the completion
@@ -266,7 +278,11 @@ async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
             // a direct phase→worker dispatch call would dispatch B here
             // and fail the assertion.
             tokio::time::advance(Duration::from_secs(3600)).await;
-            tokio::task::yield_now().await;
+            // Settle the pump as well: this gives any (wrongly) queued
+            // dispatch every chance to reach the wire, so the emptiness
+            // assertion is load-bearing under the queued-egress model — not
+            // merely a window in which the pump had not yet been scheduled.
+            settle_pump().await;
 
             assert!(
                 assigned_task_ids(&mut ends[0].1).is_empty(),
@@ -292,7 +308,6 @@ async fn negative_control_suppressed_tasks_added_never_dispatches_dependent() {
 /// eliminated. This test pins the equivalent live contract: selection
 /// authority is the held-task predicate, and a freed worker is a valid
 /// recheck target regardless of any advisory bookkeeping.
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle() {
     let local = tokio::task::LocalSet::new();
@@ -346,6 +361,9 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
                     ("t1", "t0".to_string())
                 };
             let _ = held_first;
+            // Drain the first assignment off the wire; settle the queued
+            // send first so it does not leak into the final drain.
+            settle_pump().await;
             let _ = assigned_task_ids(&mut ends[0].1);
 
             // Selection authority: `dispatch_order` returns ONLY the
@@ -374,6 +392,8 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
                 .expect("emit must produce a batch");
             primary.react_to_worker_signal_batch(batch).await;
 
+            // The remaining-task assignment is a queued mesh send.
+            settle_pump().await;
             assert_eq!(
                 assigned_task_ids(&mut ends[0].1),
                 vec![expect_second],
@@ -389,7 +409,6 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
 /// dispatch recheck exactly once per batch (the recheck is idempotent
 /// over the pool/worker view). Pins the burst-coalescing contract at the
 /// worker-management reaction boundary.
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation needed (decoupling-law timing)"]
 #[tokio::test(flavor = "current_thread")]
 async fn coalesce_multiple_tasks_added_into_one_recheck() {
     let local = tokio::task::LocalSet::new();
@@ -400,6 +419,9 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
                 .handle_task_request(task_request("sec-0", 0))
                 .await
                 .unwrap();
+            // Settle the queued A assignment onto the wire and discard it so
+            // it does not leak into the post-recheck B drain.
+            settle_pump().await;
             let _ = assigned_task_ids(&mut ends[0].1);
 
             let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
@@ -448,6 +470,8 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
             // view), so the coalesced multi-signal batch produces a
             // single dispatch, not three.
             primary.react_to_worker_signal_batch(batch).await;
+            // B's assignment is a queued mesh send.
+            settle_pump().await;
             assert_eq!(
                 assigned_task_ids(&mut ends[0].1),
                 vec!["b".to_string()],

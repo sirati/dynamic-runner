@@ -20,19 +20,68 @@ use std::sync::Arc;
 /// Keeps the test mesh + primary slot `Arc` + demote sender alive for the
 /// life of a [`PrimaryCoordinator`] built by [`build_primary`]. Local twin
 /// of `test_helpers::PrimaryMeshKeepalive` (this file uses its own `TestId`,
-/// so it cannot reuse that helper). No pump runs (that is `Node::run`,
-/// C-NODE); these tests drive the coordinator's heartbeat methods directly,
-/// not wire round-trips.
+/// so it cannot reuse that helper).
+///
+/// Two shapes, exactly mirroring `test_helpers::PrimaryMeshKeepalive`:
+/// - NO-PUMP (the default `build_primary`): the mesh is parked in `_mesh` so
+///   its egress-queue receiver stays alive; tests inspect the coordinator's
+///   in-memory state directly and never drive a wire round trip.
+/// - PUMPED (`build_primary_pumped`, used by the queued-egress tests inside a
+///   `LocalSet`): the production [`crate::process::pump::run_pump`] OWNS the
+///   mesh + slot, so a queued `client.send` reaches the transport's outgoing
+///   channels. The guard holds the control handle (keeps the pump's control
+///   arm open) and aborts the pump task on drop.
 struct MeshKeepalive {
-    _mesh: Mesh<TestId, ChannelPeerTransport<TestId>>,
-    _slot: Arc<RoleSlot<TestId>>,
+    _mesh: Option<Mesh<TestId, ChannelPeerTransport<TestId>>>,
+    _slot: Option<Arc<RoleSlot<TestId>>>,
     _demote_tx: tokio_mpsc::UnboundedSender<()>,
+    _control: Option<crate::process::MeshControlHandle<TestId>>,
+    pump: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Mint the primary's mesh capability trio from a test `Mesh` and build a
-/// [`PrimaryCoordinator`] over them (mirrors `process/tests` minting). Spawns
-/// no pump. Returns the coordinator + the keepalive the caller binds to
-/// `_mesh` for the coordinator's lifetime.
+impl Drop for MeshKeepalive {
+    fn drop(&mut self) {
+        if let Some(h) = self.pump.take() {
+            h.abort();
+        }
+    }
+}
+
+/// Mint the primary's mesh trio + build the [`PrimaryCoordinator`], returning
+/// the coordinator alongside the still-owned `mesh`, `slot`, and demote
+/// sender. The single construction choke point both `build_primary` (no pump)
+/// and `build_primary_pumped` (production pump) share — the mint +
+/// `new(client, inbox, demote_rx, …)` wiring lives here ONCE, and each entry
+/// point decides only what to do with the returned mesh/slot.
+#[allow(clippy::type_complexity)]
+fn mint_primary<S, E>(
+    config: PrimaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    scheduler: S,
+    estimator: E,
+) -> (
+    PrimaryCoordinator<S, E, TestId>,
+    Mesh<TestId, ChannelPeerTransport<TestId>>,
+    Arc<RoleSlot<TestId>>,
+    tokio_mpsc::UnboundedSender<()>,
+)
+where
+    S: Scheduler<TestId>,
+    E: ResourceEstimator<TestId>,
+{
+    let mut mesh = Mesh::new(transport);
+    let (slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
+    let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    (primary, mesh, slot, demote_tx)
+}
+
+/// Mint a [`PrimaryCoordinator`] over a test `Mesh` and spawn NO pump.
+/// These tests drive the coordinator's heartbeat methods directly and inspect
+/// in-memory state, not wire round-trips; the mesh is parked idle in the
+/// keepalive so its egress-queue receiver stays alive (a queued `client.send`
+/// must not error as "pump dropped").
 fn build_primary<S, E>(
     config: PrimaryConfig,
     transport: ChannelPeerTransport<TestId>,
@@ -43,17 +92,53 @@ where
     S: Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
-    let mut mesh = Mesh::new(transport);
-    let (slot, client, inbox) =
-        mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
-    let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
-    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    let (primary, mesh, slot, demote_tx) = mint_primary(config, transport, scheduler, estimator);
     (
         primary,
         MeshKeepalive {
-            _mesh: mesh,
-            _slot: slot,
+            _mesh: Some(mesh),
+            _slot: Some(slot),
             _demote_tx: demote_tx,
+            _control: None,
+            pump: None,
+        },
+    )
+}
+
+/// As [`build_primary`] but spawns the PRODUCTION mesh-pump over the mesh, so
+/// the coordinator's QUEUED egress (M4) drains onto the transport's outgoing
+/// channels and the per-secondary receivers observe the broadcast. MUST be
+/// called inside a `tokio::task::LocalSet` (the pump is `spawn_local`'d); the
+/// queued-egress heartbeat tests wrap their body in `LocalSet::run_until`.
+/// The pump task OWNS the slot `Arc` for its lifetime, mirroring the node.
+fn build_primary_pumped<S, E>(
+    config: PrimaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    scheduler: S,
+    estimator: E,
+) -> (PrimaryCoordinator<S, E, TestId>, MeshKeepalive)
+where
+    S: Scheduler<TestId> + 'static,
+    E: ResourceEstimator<TestId> + 'static,
+{
+    let (primary, mesh, slot, demote_tx) =
+        mint_primary(config, transport, scheduler, estimator);
+    // Publish live membership before the pump spawns (the pump republishes
+    // every cycle thereafter).
+    mesh.publish_membership();
+    let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+    let pump = tokio::task::spawn_local(async move {
+        let _slot = slot;
+        crate::process::pump::run_pump(mesh, control_rx).await;
+    });
+    (
+        primary,
+        MeshKeepalive {
+            _mesh: None,
+            _slot: None,
+            _demote_tx: demote_tx,
+            _control: Some(control),
+            pump: Some(pump),
         },
     )
 }
@@ -325,58 +410,66 @@ fn collect_peer_removed(
 /// carries, so a misbehaving secondary can't force unbounded
 /// allocation on receivers.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let (mut primary, _mesh) = build_primary(
-        config(Duration::from_millis(50), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
-    register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
-
-    // Build an oversized error payload so the truncation guarantee
-    // is exercised end-to-end (not just in the BoundedString unit
-    // test).
-    let huge = "x".repeat(4096);
-    let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
-        target: None,
-        sender_id: "sec-a".into(),
-        timestamp: 0.0,
-        secondary_id: "sec-a".into(),
-        error: huge,
-    };
-    primary.handle_secondary_fatal_error(fatal).await.unwrap();
-
-    let mut removed = collect_peer_removed(&mut sec_rxs[0]);
-    removed.extend(collect_peer_removed(&mut sec_rxs[1]));
-    removed.sort_by(|a, b| a.0.cmp(&b.0));
-    removed.dedup();
-    assert_eq!(removed.len(), 1, "exactly one PeerRemoved authored");
-    assert_eq!(removed[0].0, "sec-a");
-    match &removed[0].1 {
-        RemovalCause::FatalError(s) => {
-            // BoundedString<1024> truncates at construction; the
-            // oversized input must be capped on the wire payload.
-            assert_eq!(
-                s.as_ref().len(),
-                1024,
-                "FatalError diagnostic must be truncated to 1024 bytes; \
-                 got {} bytes",
-                s.as_ref().len()
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
             );
-            let expected: String = "x".repeat(1024);
-            assert_eq!(s.as_ref(), expected);
-        }
-        other => panic!("expected FatalError cause; got {other:?}"),
-    }
-    // Silence unused-import warning for BoundedString — the
-    // truncation invariant is checked via length above, but the
-    // type itself is the load-bearing piece for that invariant.
-    let _: BoundedString<1024> = BoundedString::from("anchor");
+            install_default_pool(&mut primary);
+            register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+            register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+            // Build an oversized error payload so the truncation guarantee
+            // is exercised end-to-end (not just in the BoundedString unit
+            // test).
+            let huge = "x".repeat(4096);
+            let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
+                target: None,
+                sender_id: "sec-a".into(),
+                timestamp: 0.0,
+                secondary_id: "sec-a".into(),
+                error: huge,
+            };
+            primary.handle_secondary_fatal_error(fatal).await.unwrap();
+
+            // The PeerRemoved is a QUEUED mesh send; settle the production
+            // pump so it drains onto the survivors' outgoing channels before
+            // the receivers are drained.
+            crate::primary::tests::settle_pump().await;
+            let mut removed = collect_peer_removed(&mut sec_rxs[0]);
+            removed.extend(collect_peer_removed(&mut sec_rxs[1]));
+            removed.sort_by(|a, b| a.0.cmp(&b.0));
+            removed.dedup();
+            assert_eq!(removed.len(), 1, "exactly one PeerRemoved authored");
+            assert_eq!(removed[0].0, "sec-a");
+            match &removed[0].1 {
+                RemovalCause::FatalError(s) => {
+                    // BoundedString<1024> truncates at construction; the
+                    // oversized input must be capped on the wire payload.
+                    assert_eq!(
+                        s.as_ref().len(),
+                        1024,
+                        "FatalError diagnostic must be truncated to 1024 bytes; \
+                         got {} bytes",
+                        s.as_ref().len()
+                    );
+                    let expected: String = "x".repeat(1024);
+                    assert_eq!(s.as_ref(), expected);
+                }
+                other => panic!("expected FatalError cause; got {other:?}"),
+            }
+            // Silence unused-import warning for BoundedString — the
+            // truncation invariant is checked via length above, but the
+            // type itself is the load-bearing piece for that invariant.
+            let _: BoundedString<1024> = BoundedString::from("anchor");
+        })
+        .await;
 }
 
 /// A secondary that's still sending keepalives stays in the routable
@@ -449,135 +542,143 @@ fn first_task_assignment(
 /// that recheck synchronously (drain the batch + call the reaction) —
 /// the dispatch still happens, just via the batched recheck.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let (mut primary, _mesh) = build_primary(
-        config(Duration::from_millis(50), 2),
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+            let (mut primary, _mesh) = build_primary_pumped(
+                config(Duration::from_millis(50), 2),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
 
-    // sec-a is the wedged secondary; it owns one in-flight task that
-    // must be recovered into the pool and re-dispatched to sec-b.
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+            // sec-a is the wedged secondary; it owns one in-flight task that
+            // must be recovered into the pool and re-dispatched to sec-b.
+            register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
 
-    // sec-b is the survivor with an IDLE worker that has a non-zero
-    // memory budget (FixedEstimator requires memory=1, so the budget
-    // must exceed that). Without a budget the scheduler returns NoFit
-    // and the test would falsely pass against a buggy primary.
-    let sec_b_conn = SecondaryConnection::new("sec-b".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-        .receive_cert_exchange(String::new(), None, None, 0)
-        .begin_peer_discovery()
-        .peers_ready()
-        .assignments_sent();
-    primary.secondaries.insert(
-        "sec-b".into(),
-        SecondaryConnectionState::Operational(sec_b_conn),
-    );
-    primary.seed_keepalive("sec-b");
-    primary.register_idle_worker_for_test(
-        "sec-b".into(),
-        1,
-        ResourceMap::from([(
-            dynrunner_core::ResourceKind::memory(),
-            1024 * 1024 * 1024u64,
-        )]),
-    );
+            // sec-b is the survivor with an IDLE worker that has a non-zero
+            // memory budget (FixedEstimator requires memory=1, so the budget
+            // must exceed that). Without a budget the scheduler returns NoFit
+            // and the test would falsely pass against a buggy primary.
+            let sec_b_conn = SecondaryConnection::new("sec-b".into())
+                .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+                .receive_cert_exchange(String::new(), None, None, 0)
+                .begin_peer_discovery()
+                .peers_ready()
+                .assignments_sent();
+            primary.secondaries.insert(
+                "sec-b".into(),
+                SecondaryConnectionState::Operational(sec_b_conn),
+            );
+            primary.seed_keepalive("sec-b");
+            primary.register_idle_worker_for_test(
+                "sec-b".into(),
+                1,
+                ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024u64,
+                )]),
+            );
 
-    // Install the worker-management bus so the requeue path's
-    // `TasksAdded` emit lands on a receiver we drive the recheck from.
-    let (wm_tx, mut wm_rx) =
-        tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
-    primary
-        .cluster_state_mut_for_test()
-        .install_worker_mgmt_sender(wm_tx);
+            // Install the worker-management bus so the requeue path's
+            // `TasksAdded` emit lands on a receiver we drive the recheck from.
+            let (wm_tx, mut wm_rx) =
+                tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
 
-    // Sleep past the keepalive deadline so sec-a is dead. Refresh
-    // sec-b's keepalive immediately before the tick so only sec-a
-    // ends up in the dead list — the surviving-peer shape the
-    // single-death requeue takes in production.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    primary.record_keepalive("sec-b");
-    primary.process_heartbeat_tick().await.unwrap();
+            // Sleep past the keepalive deadline so sec-a is dead. Refresh
+            // sec-b's keepalive immediately before the tick so only sec-a
+            // ends up in the dead list — the surviving-peer shape the
+            // single-death requeue takes in production.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            primary.record_keepalive("sec-b");
+            primary.process_heartbeat_tick().await.unwrap();
 
-    // sec-a is gone, sec-b survives, the recovered task is in the
-    // pool. These three are independent of the kickstart contract —
-    // they assert the requeue itself happened, so a regression in
-    // the requeue path can't masquerade as a kickstart failure.
-    assert!(
-        !primary.secondaries.contains_key("sec-a"),
-        "dead secondary must be removed"
-    );
-    assert!(
-        primary.secondaries.contains_key("sec-b"),
-        "survivor must remain"
-    );
+            // sec-a is gone, sec-b survives, the recovered task is in the
+            // pool. These three are independent of the kickstart contract —
+            // they assert the requeue itself happened, so a regression in
+            // the requeue path can't masquerade as a kickstart failure.
+            assert!(
+                !primary.secondaries.contains_key("sec-a"),
+                "dead secondary must be removed"
+            );
+            assert!(
+                primary.secondaries.contains_key("sec-b"),
+                "survivor must remain"
+            );
 
-    // Deferred-recheck contract: the requeue path emitted a
-    // `TasksAdded` rather than dispatching inline. Drain the coalesced
-    // batch and run the worker-management reaction synchronously —
-    // exactly what the operational loop's worker-management arm does.
-    let batch =
-        crate::worker_signal::drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            // Deferred-recheck contract: the requeue path emitted a
+            // `TasksAdded` rather than dispatching inline. Drain the coalesced
+            // batch and run the worker-management reaction synchronously —
+            // exactly what the operational loop's worker-management arm does.
+            let batch = crate::worker_signal::drain_worker_signal_batch(
+                &mut wm_rx,
+                Duration::from_millis(50),
+            )
             .await
             .expect("dead-secondary requeue must emit a TasksAdded batch");
-    assert!(
-        batch
-            .signals
-            .contains(&crate::worker_signal::WorkerMgmtSignal::TasksAdded),
-        "requeue path must emit TasksAdded; got {:?}",
-        batch.signals
-    );
-    // Keep the survivor genuinely live across the reaction: in production
-    // sec-b keeps sending keepalives, so it never looks silent. Without
-    // the refresh the test's long pre-tick sleep would leave sec-b past
-    // the first silence stage, and the dispatch-altitude lazy oracle would
-    // (correctly) treat the freshly-assigned-to survivor as a silent
-    // holder and evict it — a test artifact, not the kickstart contract.
-    primary.record_keepalive("sec-b");
-    primary.react_to_worker_signal_batch(batch).await;
+            assert!(
+                batch
+                    .signals
+                    .contains(&crate::worker_signal::WorkerMgmtSignal::TasksAdded),
+                "requeue path must emit TasksAdded; got {:?}",
+                batch.signals
+            );
+            // Keep the survivor genuinely live across the reaction: in production
+            // sec-b keeps sending keepalives, so it never looks silent. Without
+            // the refresh the test's long pre-tick sleep would leave sec-b past
+            // the first silence stage, and the dispatch-altitude lazy oracle would
+            // (correctly) treat the freshly-assigned-to survivor as a silent
+            // holder and evict it — a test artifact, not the kickstart contract.
+            primary.record_keepalive("sec-b");
+            primary.react_to_worker_signal_batch(batch).await;
 
-    // The load-bearing assertion: sec-b's outgoing channel saw a
-    // `TaskAssignment` — i.e. the recheck re-dispatched to the
-    // surviving idle worker, the very signal the production run was
-    // missing.
-    let assignment = first_task_assignment(&mut sec_rxs[1]);
-    assert!(
-        assignment.is_some(),
-        "survivor must receive TaskAssignment after dead-secondary requeue; \
-         without the kickstart the recovered task hangs in the pool until \
-         the next external event (which never came in the cohort run)"
-    );
-    if let Some(DistributedMessage::TaskAssignment {
-        target: _,
-        secondary_id,
-        ..
-    }) = assignment
-    {
-        assert_eq!(secondary_id, "sec-b");
-    }
-    // Post-dispatch the survivor's worker is no longer idle and the
-    // recovered task is no longer in the queued bucket — symmetric
-    // to the dispatch-success path elsewhere. `pool().len()` counts
-    // queued + in-flight + blocked, so checking `iter()` (queued-
-    // only) is the right shape: the task moved from queued to
-    // in-flight on the kickstart's dispatch call.
-    assert!(
-        primary
-            .workers
-            .iter()
-            .any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
-        "survivor's worker must flip to busy after the kickstart"
-    );
-    assert_eq!(
-        primary.pool().iter().count(),
-        0,
-        "recovered task must leave the queued bucket via dispatch kickstart"
-    );
+            // The load-bearing assertion: sec-b's outgoing channel saw a
+            // `TaskAssignment` — i.e. the recheck re-dispatched to the
+            // surviving idle worker, the very signal the production run was
+            // missing. The assignment is a QUEUED mesh send, so settle the
+            // production pump before draining the wire.
+            crate::primary::tests::settle_pump().await;
+            let assignment = first_task_assignment(&mut sec_rxs[1]);
+            assert!(
+                assignment.is_some(),
+                "survivor must receive TaskAssignment after dead-secondary requeue; \
+                 without the kickstart the recovered task hangs in the pool until \
+                 the next external event (which never came in the cohort run)"
+            );
+            if let Some(DistributedMessage::TaskAssignment {
+                target: _,
+                secondary_id,
+                ..
+            }) = assignment
+            {
+                assert_eq!(secondary_id, "sec-b");
+            }
+            // Post-dispatch the survivor's worker is no longer idle and the
+            // recovered task is no longer in the queued bucket — symmetric
+            // to the dispatch-success path elsewhere. `pool().len()` counts
+            // queued + in-flight + blocked, so checking `iter()` (queued-
+            // only) is the right shape: the task moved from queued to
+            // in-flight on the kickstart's dispatch call.
+            assert!(
+                primary
+                    .workers
+                    .iter()
+                    .any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
+                "survivor's worker must flip to busy after the kickstart"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "recovered task must leave the queued bucket via dispatch kickstart"
+            );
+        })
+        .await;
 }
 
 /// R-1: a dead-secondary requeue transitions the CRDT entry
@@ -1178,103 +1279,113 @@ async fn oracle_false_corners() {
 /// well under the 100ms hard bound, driven by the dispatch reaction not the
 /// heartbeat tick).
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_remains() {
-    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    // WARN at 1x (50ms), hard backstop far away (20x = 1s) so the recovery
-    // CANNOT be the backstop — it must be the lazy oracle.
-    let mut cfg = config(Duration::from_millis(50), 2);
-    cfg.silence_warn_multiples = vec![1];
-    cfg.silence_hard_multiple = 20;
-    let (mut primary, _mesh) = build_primary(
-        cfg,
-        transport,
-        ResourceStealingScheduler::memory(),
-        FixedEstimator,
-    );
-    install_default_pool(&mut primary);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+            // WARN at 1x (50ms), hard backstop far away (20x = 1s) so the recovery
+            // CANNOT be the backstop — it must be the lazy oracle.
+            let mut cfg = config(Duration::from_millis(50), 2);
+            cfg.silence_warn_multiples = vec![1];
+            cfg.silence_hard_multiple = 20;
+            let (mut primary, _mesh) = build_primary_pumped(
+                cfg,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+            install_default_pool(&mut primary);
 
-    // sec-a is the silent holder of the only in-flight task.
-    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+            // sec-a is the silent holder of the only in-flight task.
+            register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
 
-    // sec-b is the idle survivor with a real memory budget.
-    let sec_b_conn = SecondaryConnection::new("sec-b".into())
-        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-        .receive_cert_exchange(String::new(), None, None, 0)
-        .begin_peer_discovery()
-        .peers_ready()
-        .assignments_sent();
-    primary.secondaries.insert(
-        "sec-b".into(),
-        SecondaryConnectionState::Operational(sec_b_conn),
-    );
-    primary.seed_keepalive("sec-b");
-    primary.register_idle_worker_for_test(
-        "sec-b".into(),
-        1,
-        ResourceMap::from([(
-            dynrunner_core::ResourceKind::memory(),
-            1024 * 1024 * 1024u64,
-        )]),
-    );
+            // sec-b is the idle survivor with a real memory budget.
+            let sec_b_conn = SecondaryConnection::new("sec-b".into())
+                .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+                .receive_cert_exchange(String::new(), None, None, 0)
+                .begin_peer_discovery()
+                .peers_ready()
+                .assignments_sent();
+            primary.secondaries.insert(
+                "sec-b".into(),
+                SecondaryConnectionState::Operational(sec_b_conn),
+            );
+            primary.seed_keepalive("sec-b");
+            primary.register_idle_worker_for_test(
+                "sec-b".into(),
+                1,
+                ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
+                    1024 * 1024 * 1024u64,
+                )]),
+            );
 
-    // Install the worker-management bus so the requeue path's re-emitted
-    // `TasksAdded` lands on a receiver (drained the NEXT iteration in
-    // production; here we just need a live sender).
-    let (wm_tx, mut wm_rx) =
-        tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
-    primary
-        .cluster_state_mut_for_test()
-        .install_worker_mgmt_sender(wm_tx);
+            // Install the worker-management bus so the requeue path's re-emitted
+            // `TasksAdded` lands on a receiver (drained the NEXT iteration in
+            // production; here we just need a live sender).
+            let (wm_tx, mut wm_rx) =
+                tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
 
-    // sec-a goes silent past the FIRST WARN stage (50ms) but NOT past the
-    // hard backstop (1s). Refresh sec-b so it stays a live survivor.
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    primary.record_keepalive("sec-b");
-    assert!(
-        primary.only_silent_held_work_remains(),
-        "precondition: only sec-a's silent-held in-flight work remains"
-    );
+            // sec-a goes silent past the FIRST WARN stage (50ms) but NOT past the
+            // hard backstop (1s). Refresh sec-b so it stays a live survivor.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            primary.record_keepalive("sec-b");
+            assert!(
+                primary.only_silent_held_work_remains(),
+                "precondition: only sec-a's silent-held in-flight work remains"
+            );
 
-    // Drive the worker-management reaction with a `TasksAdded` batch — the
-    // dispatch pass finds sec-b idle with nothing to dispatch, then the
-    // post-pass consult declares sec-a dead and requeues victim-a.
-    let batch = crate::worker_signal::WorkerSignalBatch {
-        signals: vec![crate::worker_signal::WorkerMgmtSignal::TasksAdded],
-    };
-    primary.react_to_worker_signal_batch(batch).await;
+            // Drive the worker-management reaction with a `TasksAdded` batch — the
+            // dispatch pass finds sec-b idle with nothing to dispatch, then the
+            // post-pass consult declares sec-a dead and requeues victim-a.
+            let batch = crate::worker_signal::WorkerSignalBatch {
+                signals: vec![crate::worker_signal::WorkerMgmtSignal::TasksAdded],
+            };
+            primary.react_to_worker_signal_batch(batch).await;
 
-    assert!(
-        !primary.secondaries.contains_key("sec-a"),
-        "lazy oracle declared the silent holder dead"
-    );
-    assert!(
-        primary.secondaries.contains_key("sec-b"),
-        "the live survivor is untouched"
-    );
+            assert!(
+                !primary.secondaries.contains_key("sec-a"),
+                "lazy oracle declared the silent holder dead"
+            );
+            assert!(
+                primary.secondaries.contains_key("sec-b"),
+                "the live survivor is untouched"
+            );
 
-    // The requeue re-emitted a `TasksAdded` (production drains it next
-    // iteration). Drive that recheck synchronously to re-dispatch.
-    let followup =
-        crate::worker_signal::drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            // The requeue re-emitted a `TasksAdded` (production drains it next
+            // iteration). Drive that recheck synchronously to re-dispatch.
+            let followup = crate::worker_signal::drain_worker_signal_batch(
+                &mut wm_rx,
+                Duration::from_millis(50),
+            )
             .await
             .expect("the lazy requeue must re-emit a TasksAdded batch");
-    // Keep the survivor live across the re-dispatch reaction (production
-    // invariant: a live secondary keeps sending keepalives).
-    primary.record_keepalive("sec-b");
-    primary.react_to_worker_signal_batch(followup).await;
+            // Keep the survivor live across the re-dispatch reaction (production
+            // invariant: a live secondary keeps sending keepalives).
+            primary.record_keepalive("sec-b");
+            primary.react_to_worker_signal_batch(followup).await;
 
-    let assignment = first_task_assignment(&mut sec_rxs[1]);
-    assert!(
-        assignment.is_some(),
-        "the recovered task must re-dispatch to the idle survivor"
-    );
-    if let Some(DistributedMessage::TaskAssignment {
-        target: _,
-        secondary_id,
-        ..
-    }) = assignment
-    {
-        assert_eq!(secondary_id, "sec-b");
-    }
+            // The re-dispatch TaskAssignment is a QUEUED mesh send; settle the
+            // production pump so it drains onto sec-b's outgoing channel before
+            // the wire is drained.
+            crate::primary::tests::settle_pump().await;
+            let assignment = first_task_assignment(&mut sec_rxs[1]);
+            assert!(
+                assignment.is_some(),
+                "the recovered task must re-dispatch to the idle survivor"
+            );
+            if let Some(DistributedMessage::TaskAssignment {
+                target: _,
+                secondary_id,
+                ..
+            }) = assignment
+            {
+                assert_eq!(secondary_id, "sec-b");
+            }
+        })
+        .await;
 }
