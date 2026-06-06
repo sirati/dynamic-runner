@@ -305,16 +305,15 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // (re-handshake / partial fleet survival).
             //
             // Counting REMOTE secondaries (excluding the recognized
-            // primary by identity) is what makes the arming honest on a
-            // co-located (Phase-E) host that runs a `PrimaryCoordinator`
-            // alongside its own co-located secondary: its own secondary
-            // never counts, so a co-located primary partitioned from every
+            // primary by identity) is what makes the arming honest when
+            // the recognized primary also runs its own secondary: that
+            // secondary never counts, so a primary partitioned from every
             // remote secondary arms fleet-dead and strands — it does NOT
-            // hang on the strength of its own loopback secondary, and it
-            // does NOT stay alive against a freshly-elected primary
-            // (split-brain). For a submitter primary the recognized
-            // primary is not a worker-secondary, so the count is just "all
-            // alive worker-secondaries" — unchanged behaviour.
+            // hang on the strength of its own secondary, and it does NOT
+            // stay alive against a freshly-elected primary (split-brain).
+            // For a submitter primary the recognized primary is not a
+            // worker-secondary, so the count is just "all alive
+            // worker-secondaries" — unchanged behaviour.
             //
             // Tokenizer surfaced the original failure on cohort-3 where
             // SSH-tunnel blips killed all 5 secondaries at once and the

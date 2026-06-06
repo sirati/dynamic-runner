@@ -18,9 +18,8 @@
 //!   break-outcome. Decoupled from the phase/task code that emits the
 //!   signals (the dispatch-decoupling law).
 //! - [`promotion`] — `wait_for_mesh_ready` + `activate_local_primary`
-//!   (the mesh-settle gate + the single composition mechanism that
-//!   activates THIS node's co-located primary as the authority; no
-//!   remote role hand-off — see `activate_local_primary`).
+//!   (the mesh-settle gate + the single mechanism that activates THIS
+//!   node as the primary authority — see `activate_local_primary`).
 //!
 //! `dispatch_order` (free fn) lives here because every sub-module
 //! consumes it; it has no `&self` so it can't sit on the inherent
@@ -37,11 +36,6 @@ mod mutations;
 mod operational_loop;
 mod promotion;
 mod worker_mgmt;
-
-/// The bootstrap hand-off outcome the `run_pipeline` fork branches on.
-/// Re-exported so the fork (in `primary/coordinator.rs`) can name it
-/// without reaching into the private `promotion` sub-module.
-pub(crate) use promotion::RelocationOutcome;
 
 #[cfg(test)]
 mod tests;

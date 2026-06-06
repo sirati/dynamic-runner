@@ -216,28 +216,14 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // peer link, alive across promotion per
             // `feedback_mesh_independent_of_role_and_membership.md`.
             //
-            // But when this node IS the current primary, that same
-            // `Destination::Primary` resolves to SELF
-            // (`SendTarget::Loopback`), and on a co-located host the
-            // loopback delivers a LIVE frame to the own-secondary's
-            // inbound, which demuxes it straight back into this primary's
-            // inbound — an unthrottled self-feeding `TaskRequest` cycle
-            // (it bypasses the secondary's per-worker origination backoff
-            // because it never re-enters via `request_task_for_worker`).
-            // Relaying to self is therefore NOT a no-op; it is the bug.
-            //
-            // Gate: relay ONLY when the current primary is a remote peer
-            // (`!current_primary_is_self()`). When self IS the primary,
-            // PARK the request locally — there is no remaining action. The
-            // worker re-attempts on its next backoff-throttled
-            // `request_task_for_worker` tick, and `dispatch_to_idle_workers`
-            // re-nudges idle workers when work actually arrives
-            // (`WorkerMgmtSignal::TasksAdded` / a completion), so parking
-            // strands nothing.
-            if !assigned
-                && !self.current_primary_is_self()
-                && let Err(e) = self.send_to(Destination::Primary, msg).await
-            {
+            // When this node IS the current primary the relay is a benign
+            // in-process loopback (no re-demux cycle): the request simply
+            // re-addresses self and is dropped. The worker re-attempts on
+            // its next backoff-throttled `request_task_for_worker` tick,
+            // and `dispatch_to_idle_workers` re-nudges idle workers when
+            // work actually arrives (`WorkerMgmtSignal::TasksAdded` / a
+            // completion), so nothing strands.
+            if !assigned && let Err(e) = self.send_to(Destination::Primary, msg).await {
                 tracing::debug!(
                     error = %e,
                     "primary-bound relay via Destination::Primary dropped; \

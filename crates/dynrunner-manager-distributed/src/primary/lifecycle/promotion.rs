@@ -1,33 +1,12 @@
 use std::collections::HashSet;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerId, PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
-
-/// Outcome of the submitter's bootstrap hand-off decision
-/// ([`PrimaryCoordinator::relocate_primary_to`]).
-///
-/// The bootstrap fork in `run_pipeline` branches on this to choose the
-/// post-activation regime: a successful relocation drops into the
-/// relocation observer tail, while a fall-back-to-local keeps
-/// the submitter on the normal operational path
-/// (`run_operational_and_finalize`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RelocationOutcome {
-    /// Authority was originated onto the chosen compute peer (the
-    /// submitter dropped `Role::Primary` on its own apply); the caller
-    /// must enter the observer tail.
-    Relocated,
-    /// The chosen candidate regressed (vanished from the mesh or became
-    /// an observer) between selection and origination, so the submitter
-    /// activated itself as the local primary instead and the caller must
-    /// run the normal operational path.
-    FellBackToLocal,
-}
 
 impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
     PrimaryCoordinator<Tr, S, E, I>
@@ -163,11 +142,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
     }
 
-    /// Activate THIS node's co-located primary as the authoritative
-    /// primary. The single composition mechanism both handoff sides
-    /// converge on (the brief's `activate_local_primary`): bootstrap
-    /// (the run pipeline reaches its operational loop) and failover (the
-    /// election's terminal `Promoted` transition) both call this.
+    /// Activate THIS node as the authoritative primary. The single
+    /// mechanism both handoff sides converge on (the brief's
+    /// `activate_local_primary`): bootstrap (the run pipeline reaches its
+    /// operational loop) and failover (the election's terminal `Promoted`
+    /// transition) both call this.
     ///
     /// # Uniform primary announcement
     ///
@@ -189,66 +168,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// requeue path's "did the primary just die?" check — which can
     /// never match a secondary id, so the authority never self-clears
     /// the pointer.
-    ///
-    /// # Seeded resume (failover activation)
-    ///
-    /// Two activation shapes converge here:
-    ///
-    ///   * **Bootstrap**: `run_pipeline` already built the pool from the
-    ///     `binaries` argument and set `total_tasks` before reaching this
-    ///     call (`pending.is_some()`). Nothing to seed — the local pool
-    ///     IS the source of truth.
-    ///   * **Activated resume (failover OR setup-defer)**: a co-located
-    ///     primary built ON DEMAND (`run_activated`) never ran
-    ///     `run_pipeline`'s pool-build, so `pending` is `None`. It must
-    ///     build its `PendingPool` from the replicated `cluster_state`
-    ///     (`hydrate_from_cluster_state`) so dispatch resumes seeded,
-    ///     BYPASSING the connect / mesh-ready handshake (it inherited a
-    ///     formed mesh). This covers BOTH activation snapshots uniformly:
-    ///       * a POPULATED failover snapshot — the CRDT already holds the
-    ///         full ledger, so hydrate rebuilds the pool + unified
-    ///         `in_flight` ledger + `completed_tasks` from it; and
-    ///       * an EMPTY setup-defer snapshot — `cluster_state` is still
-    ///         empty at activation (discovery seeds it later via the
-    ///         feed), so hydrate builds an EMPTY (phase-deps-seeded) pool.
-    ///         The pool MUST be built here regardless: the operational
-    ///         loop's `run_complete_check` (and the `TaskAdded` reinject
-    ///         path) calls `self.pool()`, which `expect`s `pending` is
-    ///         `Some`. The empty pool is harmless while `setup_pending()`
-    ///         holds (its drain/counter exits are gated off); the first
-    ///         discovery `TaskAdded` then reinjects into THIS pool and
-    ///         dispatch fires. This mirrors the submitter's
-    ///         `run_pipeline`, which builds the pool UNCONDITIONALLY even
-    ///         in setup-defer mode (empty `binaries`).
-    ///
-    /// The discriminator is `pending.is_none() && total_tasks == 0`:
-    /// true on EVERY on-demand-activated path (both empty and populated
-    /// snapshots — a parked/on-demand primary has `pending == None` and
-    /// `total_tasks == 0` until hydrate runs), false for bootstrap (where
-    /// `run_pipeline` set `pending` and `total_tasks` from `binaries`).
     pub(crate) async fn activate_local_primary(&mut self) -> Result<(), String> {
         self.primary_id = Some(self.config.node_id.clone());
-
-        // Activated-resume hydration. See the doc above: the bootstrap
-        // path leaves `pending` Some (and `total_tasks` > 0 for a
-        // non-empty run), so this is reached ONLY by an on-demand
-        // co-located primary (`run_activated`) — whether it activates
-        // into a POPULATED failover ledger or an EMPTY setup-defer one.
-        // In both cases the pool MUST be built so `self.pool()` is never
-        // `None` in the operational loop; for an empty ledger
-        // `hydrate_from_cluster_state` builds an empty (phase-deps-
-        // seeded) pool, exactly what `run_pipeline` builds for the
-        // setup-defer submitter.
-        if self.pending.is_none() && self.total_tasks == 0 {
-            tracing::info!(
-                node = %self.config.node_id,
-                crdt_tasks = self.cluster_state.task_count(),
-                "co-located primary activating on demand; hydrating pool \
-                 + in-flight ledger from cluster_state (empty pool when \
-                 the setup-defer ledger is not yet seeded)"
-            );
-            self.hydrate_from_cluster_state();
-        }
 
         // Uniform primary announcement: originate `PrimaryChanged { new
         // = self }` so `current_primary()` resolves to this host
@@ -281,95 +202,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         Ok(())
     }
 
-    /// Bootstrap hand-off: relocate FULL primary authority off the
-    /// submitter onto the `chosen` compute peer, stepping the submitter
-    /// down to an observer.
-    ///
-    /// This is the faithful generalisation of the failover election's
-    /// terminal action: it originates `PrimaryChanged { new = chosen,
-    /// epoch = primary_epoch() + 1 }` through the SAME uniform primitive
-    /// `activate_local_primary` uses — `apply_and_broadcast_cluster_mutations`.
-    /// That call applies the mutation LOCALLY (so the submitter's own
-    /// `current_primary` becomes `chosen` via epoch-LWW and it drops
-    /// `Role::Primary`, since `chosen != self`) AND broadcasts it (so the
-    /// chosen peer's apply hook spawns its co-located primary). There is
-    /// thus exactly one authority at every instant: the submitter holds
-    /// epoch-1 until this originates epoch-2, then the chosen peer holds
-    /// it the moment it applies its own naming.
-    ///
-    /// # Why no `activate_local_primary` / no `primary_id = self`
-    ///
-    /// `activate_local_primary` asserts THIS host as the primary; calling
-    /// it here would re-pin authority to the submitter (the bootstrap pin
-    /// being removed). `relocate_primary_to` instead hands authority off
-    /// and steps down — it must NOT set `self.primary_id` (the heartbeat
-    /// requeue path's "did the primary just die?" anchor), because the
-    /// submitter is no longer the primary.
-    ///
-    /// # Defensive re-confirmation (degenerate candidate vanished)
-    ///
-    /// Selection (`select_bootstrap_primary`) and this call are not
-    /// atomic: a candidate confirmed at selection time could vanish from
-    /// the mesh, or land in `role_table().observers`, in the gap. If
-    /// either regressed, FALL BACK to `activate_local_primary` (stay
-    /// primary) so the submitter never strands on an evaporated candidate,
-    /// and signal the caller (via [`RelocationOutcome::FellBackToLocal`])
-    /// to run the normal operational path. This mirrors the failover
-    /// election's own non-observer / confirmed-peer guard.
-    pub(crate) async fn relocate_primary_to(
-        &mut self,
-        chosen: PeerId,
-    ) -> Result<RelocationOutcome, String> {
-        // Defensive re-confirmation against the selection→origination
-        // gap: the candidate must STILL be a confirmed mesh peer and STILL
-        // not an observer. `has_peer` reads the live transport membership;
-        // the observer cut reads the replicated role table — the same two
-        // predicates `select_bootstrap_primary` applied.
-        let confirmed = self.transport.has_peer(&chosen);
-        let is_observer = self
-            .cluster_state
-            .role_table()
-            .observers
-            .contains(chosen.as_str());
-        if !confirmed || is_observer {
-            tracing::warn!(
-                chosen = %chosen.as_str(),
-                confirmed,
-                is_observer,
-                "bootstrap hand-off candidate regressed since selection \
-                 (vanished from the mesh or became an observer); falling \
-                 back to local primary so the submitter never strands on \
-                 an evaporated candidate"
-            );
-            self.activate_local_primary().await?;
-            return Ok(RelocationOutcome::FellBackToLocal);
-        }
-
-        // Originate `PrimaryChanged { new = chosen, epoch + 1 }` through
-        // the same uniform announcement primitive `activate_local_primary`
-        // uses. The local apply drops the submitter's `Role::Primary`
-        // (current_primary != self); the broadcast wakes the chosen peer's
-        // apply hook, which spawns its co-located primary + resets its
-        // election. NOT `activate_local_primary`, NOT `primary_id = self`.
-        let epoch = self.cluster_state.primary_epoch() + 1;
-        tracing::info!(
-            chosen = %chosen.as_str(),
-            epoch,
-            "bootstrap hand-off: relocating full primary authority to the \
-             chosen compute peer; submitter stepping down to observer"
-        );
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
-            new: chosen.into_string(),
-            epoch,
-            // Bootstrap TRANSFER: the submitter names a DIFFERENT chosen
-            // peer (`new != self`). The chosen peer's apply hook routes
-            // this through its setup FSM's Transferred transition (build
-            // the co-located primary on demand), distinct from a
-            // failover-self `Election`.
-            reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
-        }])
-        .await;
-
-        Ok(RelocationOutcome::Relocated)
-    }
 }
