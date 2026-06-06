@@ -105,6 +105,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(discovery::find_items, m)?)?;
     m.add("PublishError", m.py().get_type::<publish::PublishError>())?;
     m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
+    m.add_function(wrap_pyfunction!(publish::publish_all, m)?)?;
+    m.add_function(wrap_pyfunction!(publish::sweep_stale_tmps, m)?)?;
     m.add_function(wrap_pyfunction!(
         slurm::wrapper_script::generate_wrapper_script,
         m
