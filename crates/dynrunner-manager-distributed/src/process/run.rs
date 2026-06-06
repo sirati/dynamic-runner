@@ -144,6 +144,18 @@ where
         let own_peer_id = first_live_peer_id(&primary, &secondary, &observer);
 
         // Hand the mesh to the pump (sole owner) + keep the control handle.
+        //
+        // ORDERING INVARIANT (R5 — DO NOT REORDER): the pump is spawned
+        // BEFORE any coordinator below. On the `current_thread` LocalSet the
+        // pump's entry `publish_membership()` (see `run_pump`) runs to its
+        // first await before a later-spawned coordinator is polled, so the
+        // pump publishes the live membership into the detached clients' view
+        // BEFORE any coordinator drives its first egress. A coordinator's
+        // first `send_to` / `has_peer`-gated egress (e.g. the secondary's
+        // setup Welcome) must therefore NEVER observe an empty membership
+        // view. Spawning a coordinator before the pump — or making the
+        // entry publish await-first — would re-introduce the empty-view
+        // no-route race the test harness hit.
         let (control, control_rx) = pump::control_channel::<I>();
         let pump_task = tokio::task::spawn_local(pump::run_pump(mesh, control_rx));
 
@@ -314,15 +326,21 @@ where
         }
 
         // ── Wind-down ───────────────────────────────────────────────────
-        // The headline role has resolved into `outcome`. Drop the control
-        // handle so the pump's control arm closes, then ABORT the pump rather
-        // than awaiting it: the pump's ingress arm parks on the transport
-        // inbound, which stays open as long as a PEER is still connected (the
-        // wire does not close just because THIS node's headline role finished)
-        // — so awaiting the pump would hang. The pump's egress is already
-        // drained for every send issued before this point (the headline role's
-        // last frames left the queue before its run future resolved), so
-        // aborting loses nothing in flight.
+        // The headline role has resolved into `outcome`. First DEFENSIVELY
+        // drain any final egress (NEW-C): a frame queued in the same sync
+        // step as the headline run-future resolving (e.g. a last keepalive /
+        // completion broadcast) has not yet been pulled by the pump, and a
+        // bare abort would discard it. `wind_down().await` has the pump apply
+        // every currently-queued egress item through the mesh and ack BEFORE
+        // we abort, so no final frame is silently dropped. It is bounded (the
+        // pump drains what is queued NOW, never awaiting a fresh item).
+        //
+        // Then drop the control handle so the pump's control arm closes, and
+        // ABORT the pump rather than awaiting it: the pump's ingress arm
+        // parks on the transport inbound, which stays open as long as a PEER
+        // is still connected (the wire does not close just because THIS
+        // node's headline role finished) — so awaiting the pump would hang.
+        control.wind_down().await;
         drop(control);
         pump_task.abort();
         let _ = pump_task.await;
