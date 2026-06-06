@@ -292,8 +292,8 @@ impl PyPrimaryCoordinator {
         // genuinely stranded — so the GIL-side tail raises a
         // `PyRuntimeError` on it. (Relocated panik / aborted / setup-deadline
         // terminals are already mapped onto the structured `panik_shutdown` /
-        // `duplicate_task_id_pre_phase` / `setup_deadline_expired` markers by
-        // `PrimaryRunOutcome::from_observer`.)
+        // `duplicate_task_id_pre_phase` / `setup_deadline_expired` markers
+        // off the `result` carried in `PrimaryRunOutcome::Relocated`.)
         let mut relocated_strand: Option<RunError> = None;
 
         py.detach(|| {

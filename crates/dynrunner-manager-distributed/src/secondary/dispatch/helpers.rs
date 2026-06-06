@@ -48,11 +48,12 @@ where
     /// it is also the ONE activation path: this hook runs
     /// [`Self::apply_primary_changed`] per such mutation so a
     /// `PrimaryChanged { new = self }` arriving over ANY receive path
-    /// (operational dispatch, peer relay, or setup-time) BUILDS the
-    /// co-located primary on demand (or, for a bootstrap `Transferred`,
-    /// latches the setup-FSM build) and resets the failover election. It
-    /// keys on identity, not on election history — a node that never
-    /// suspected/voted still activates when named.
+    /// (operational dispatch, peer relay, or setup-time) advances the
+    /// CRDT primary identity and — on a self-named promotion — leaves the
+    /// Phase-C seam that SIGNALS `Process` to build the primary (it does
+    /// NOT build one here), then resets the failover election. It keys on
+    /// identity, not on election history — a node that never
+    /// suspected/voted still reacts when named.
     ///
     /// Returns `true` iff a `PrimaryChanged` genuinely advanced the
     /// primary identity (an `Applied`, not a stale-epoch NoOp or an
@@ -72,10 +73,10 @@ where
         let mut primary_changed = false;
         for m in mutations {
             match m {
-                // `reason` routes the activation fork: a failover-self
-                // `Election` builds the co-located primary inline here; a
-                // bootstrap `Transferred` naming this node defers the build
-                // to the setup FSM (see `apply_primary_changed`). The
+                // `reason` (Election vs Transferred) is the Phase-C signal
+                // discriminant carried through to `Process`; the build of the
+                // primary on a self-named promotion is the Phase-C `Process`
+                // concern, not done here (see `apply_primary_changed`). The
                 // central CRDT epoch-LWW apply itself stays reason-blind.
                 ClusterMutation::PrimaryChanged { new, epoch, reason } => {
                     primary_changed |= self.apply_primary_changed(new, epoch, reason);

@@ -68,7 +68,7 @@ pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 ///
 /// Registered once, at primary-coordinator construction, on the node
 /// that emits the other primary-side important events; a promoted
-/// secondary runs its co-located primary coordinator, so the hook
+/// secondary runs its own same-peer primary coordinator, so the hook
 /// rides the promotion automatically.
 pub(crate) fn register_primary_changed_important_hook<I: Identifier>(
     cluster_state: &mut ClusterState<I>,

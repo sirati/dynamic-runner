@@ -89,8 +89,9 @@ where
                 //    for primary-liveness.
                 //  - A `Secondary` keepalive ALWAYS feeds `peer_keepalives`,
                 //    even when its originator id == the current primary (a
-                //    co-located primary+secondary host's secondary capability
-                //    is a live mesh peer like any other). The quorum/candidate
+                //    host running primary+secondary under one peer-id has a
+                //    secondary capability that is a live mesh peer like any
+                //    other). The quorum/candidate
                 //    sites read `live_peer_ids()`, which excludes the current
                 //    primary, so this entry never inflates election counts.
                 match emitter_role {
@@ -259,7 +260,8 @@ where
                 // That `true` is the TERMINAL ACTION cue:
                 // `fire_local_promotion` originates + locally applies
                 // `PrimaryChanged { new = self }`, which (via the apply
-                // hook) builds the co-located primary on demand (seeded
+                // hook) leaves the Phase-C seam that signals `Process` to
+                // build the primary on the self-named promotion (seeded
                 // resume from the replicated CRDT), and
                 // broadcasts the same frame so surviving secondaries
                 // re-point `Role::Primary` onto this winner.

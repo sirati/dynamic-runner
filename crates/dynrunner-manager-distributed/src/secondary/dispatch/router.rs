@@ -598,7 +598,8 @@ where
             DistributedMessage::ClusterMutation { mutations, .. } => {
                 // `apply_cluster_mutations` mirrors the batch and, for a
                 // `PrimaryChanged`, runs the unified primary-activation
-                // hook (wake co-located primary + reset election + observer
+                // hook (Phase-C seam: signal `Process` to build the primary
+                // on a self-named promotion + reset election + observer
                 // guard). It returns whether a primary-identity change was
                 // genuinely applied; when it was, revive the worker-pull
                 // rate-limiter — backoff accrued against the PRIOR primary

@@ -315,8 +315,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                     // primary-capability in the `SecondaryWelcome` (an
                     // overlay-enabled compute secondary ⇒ true; a no-mesh
                     // host / observer ⇒ false). Record that truth in the
-                    // replicated `RoleTable.can_be_primary` so
-                    // `select_bootstrap_primary` reads the explicit marker.
+                    // replicated `RoleTable.can_be_primary` so the
+                    // bootstrap-promotion selection reads the explicit marker.
                     can_be_primary,
                     // Stamped at the origination choke point
                     // (`apply_locally_for_broadcast` → `stamp_versions`).

@@ -28,7 +28,7 @@
 //!   `PrimaryCommand::ReinjectTask` against the coordinator's command
 //!   channel — both naturally live behind `&mut self` on the
 //!   operational loop's borrow. Putting the drain helper in the
-//!   `select!` keeps the matcher invocation co-located with the
+//!   `select!` keeps the matcher invocation alongside the
 //!   coordinator without cross-task synchronization.
 
 use std::time::Duration;

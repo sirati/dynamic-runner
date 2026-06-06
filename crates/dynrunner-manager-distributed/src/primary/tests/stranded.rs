@@ -64,7 +64,7 @@ async fn stranded_count_is_zero_on_clean_run() {
 /// the operational loop — i.e. the cluster-collapse failure mode the
 /// stranded-tracking patch is designed to detect.
 ///
-/// Co-located with the test that uses it because the shape ("die
+/// Kept next to the test that uses it because the shape ("die
 /// after handshake, before the run loop can dispatch a single task")
 /// is specific to the cluster-collapse regression and not general
 /// enough to merit promotion to `test_helpers.rs`.

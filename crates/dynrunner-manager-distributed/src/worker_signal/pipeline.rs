@@ -24,7 +24,7 @@
 //! Why an async helper (not a spawned task): worker management must
 //! react against its own `&mut self` state (worker registry, dispatch
 //! queue), so the drain lives inside its operational `select!` rather
-//! than on a detached task — keeping the reaction co-located with the
+//! than on a detached task — keeping the reaction next to the
 //! state it mutates without cross-task synchronization.
 //!
 //! Unlike the matcher pipeline — whose batch keeps only the *latest*

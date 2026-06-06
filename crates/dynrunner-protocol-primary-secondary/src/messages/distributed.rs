@@ -51,14 +51,14 @@ pub enum DistributedMessage<I> {
         /// senders wire-compatible.
         #[serde(default)]
         is_observer: bool,
-        /// Whether this secondary can host the primary role on demand —
+        /// Whether this secondary can host the primary role on promotion —
         /// it is an overlay-enabled (real peer mesh present), non-observer
-        /// compute secondary, so it can construct a `PrimaryCoordinator`
-        /// the moment it is named primary. The primary translates this
+        /// compute secondary, so its host can build a `PrimaryCoordinator`
+        /// when it is named primary. The primary translates this
         /// into the secondary's replicated `RoleTable.can_be_primary`
         /// entry (the `PeerJoined { can_be_primary }` it originates on
-        /// welcome-accept), which `select_bootstrap_primary` reads as the
-        /// single authoritative capability marker. Mirrors the
+        /// welcome-accept), which the bootstrap-promotion selection reads
+        /// as the single authoritative capability marker. Mirrors the
         /// `is_observer` advertisement exactly. `#[serde(default)]` keeps
         /// pre-field senders wire-compatible (they decode as `false` — the
         /// conservative "submitter stays primary" value).
@@ -312,7 +312,7 @@ pub enum DistributedMessage<I> {
         /// liveness it is asserting: a `Primary` keepalive refreshes the
         /// receiver's primary-liveness tracking, a `Secondary` keepalive
         /// refreshes its peer-mesh liveness — without this tag the two
-        /// signals collapse onto one entry and a co-located node is
+        /// signals collapse onto one entry and a multi-role node is
         /// dropped from `peer_keepalives`, corrupting election quorum.
         ///
         /// `#[serde(default)]` decodes a missing field as `Secondary`,

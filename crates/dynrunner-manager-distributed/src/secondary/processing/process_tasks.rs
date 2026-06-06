@@ -184,7 +184,7 @@ where
         // channel: the externally-issued `PrimaryCommand`s
         // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
         // SpawnTasks) are authority mutations whose only correct owner
-        // is the co-located `PrimaryCoordinator` (which runs the command
+        // is the same-peer `PrimaryCoordinator` (which runs the command
         // arm in its own operational loop). The `command_tx` /
         // `command_rx` fields stay on the struct as the registration
         // anchor keeping the PyO3 `PrimaryHandle` clone a stable type;
@@ -335,7 +335,7 @@ where
                     // last unsatisfied request. The secondary holds no
                     // retry machine: per-phase retry re-injection is the
                     // AUTHORITY's concern (the live primary, or this
-                    // node's co-located primary once promoted), driven by
+                    // node's same-peer primary once promoted), driven by
                     // its phase-drain cascade — so this keepalive arm
                     // needs no retry-pass call, only the safety-net
                     // idle-worker re-poll.
@@ -512,7 +512,7 @@ where
             // re-acquire the GIL, run Python's `task.discover_items`
             // against the locally bind-mounted corpus, and feed the
             // result back via `ingest_setup_discovery` — which broadcasts
-            // `PhaseDepsSet + TaskAdded` onto the mesh (the co-located
+            // `PhaseDepsSet + TaskAdded` onto the mesh (the same-peer
             // primary picks them up as a mesh member, refreshes
             // `total_tasks`, and its CRDT-derived `setup_pending()` gate
             // flips false) and latches the fire-once guard. On re-entry

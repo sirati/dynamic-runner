@@ -135,7 +135,7 @@ where
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        // ONE mesh broadcast — every mesh member (peers, the co-located
+        // ONE mesh broadcast — every mesh member (peers, the same-peer
         // authority, any observer) receives it. Errors are logged, not
         // propagated (see method doc).
         if let Err(e) = self.send_to(Destination::All, msg).await {
@@ -292,7 +292,7 @@ where
     ///      `TaskAdded` per discovered binary.
     ///   2. Originate the batch via `apply_and_broadcast_mutations` —
     ///      applies locally to `cluster_state` and fans out to the mesh
-    ///      (every member, including the co-located authority, receives
+    ///      (every member, including the same-peer authority, receives
     ///      it). This is legitimate originator-side cluster-state
     ///      production from the node that ran discovery; the secondary
     ///      is the producer of the discovery result, not an authority
@@ -306,7 +306,7 @@ where
     /// the same batch.
     ///
     /// Feed to the composed authoritative primary: the `TaskAdded`
-    /// broadcast reaches the co-located primary as any mesh member would
+    /// broadcast reaches the same-peer primary as any mesh member would
     /// receive it (the discovering node and the authority are both mesh
     /// members). The primary's `handle_cluster_mutation` applies the
     /// batch to its `cluster_state`, refreshes `total_tasks` from the

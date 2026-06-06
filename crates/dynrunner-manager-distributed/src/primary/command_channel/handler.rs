@@ -2,7 +2,7 @@
 //! is the single match called from the operational loop's `select!`;
 //! each arm forwards to an `apply_*` method on `PrimaryCoordinator`
 //! defined below so the mutation's state-machine semantics stay
-//! co-located with the rest of the coordinator's state.
+//! alongside the rest of the coordinator's state.
 
 use dynrunner_core::{ErrorType, Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};

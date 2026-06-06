@@ -431,8 +431,8 @@ fn consumer_invariants_survive_snapshot_restore() {
     };
 
     let mut s = ClusterState::<RunnerIdentifier>::new();
-    // A co-located primary + a remote worker-secondary, exactly the
-    // bootstrap-relocation roster.
+    // A same-peer primary+secondary host + a remote worker-secondary,
+    // exactly the bootstrap-promotion roster.
     s.apply(ClusterMutation::PeerJoined {
         peer_id: "primary".into(),
         is_observer: false,
@@ -450,7 +450,7 @@ fn consumer_invariants_survive_snapshot_restore() {
         worker_count: 4,
         resources: vec![mem(2 * 1024 * 1024 * 1024)],
     });
-    // The co-located host is the recognized primary so the
+    // The same-peer host is the recognized primary so the
     // `id != current_primary` cut in `alive_remote_secondary_count`
     // is genuinely exercised.
     s.apply(ClusterMutation::PrimaryChanged {

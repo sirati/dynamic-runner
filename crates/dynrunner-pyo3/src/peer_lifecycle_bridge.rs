@@ -328,7 +328,7 @@ mod tests {
     fn added_event_still_routes_to_on_peer_added() {
         // Regression pin: the typed-cause refactor touches the Removed
         // arm; the Added arm's positional contract is unchanged and
-        // must keep flowing through. Co-located with the cause tests
+        // must keep flowing through. Kept alongside the cause tests
         // because both paths live in `on_event`.
         let (listener_obj, globals) = make_recording_listener();
         let bridge = PyPeerLifecycleListener::new(listener_obj);

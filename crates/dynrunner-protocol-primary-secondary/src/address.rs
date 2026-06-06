@@ -148,7 +148,7 @@ pub enum Destination {
 /// - [`SendTarget::Broadcast`] — fan out to the whole mesh via the
 ///   transport's broadcast.
 /// - [`SendTarget::Loopback`] — the resolved host id equals the local
-///   id; deliver to the co-located coordinator without a wire hop. The
+///   id; deliver to the same-peer coordinator without a wire hop. The
 ///   edge owns the loopback delivery (the implicit "resolved host id ==
 ///   local id" rule), NOT the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]

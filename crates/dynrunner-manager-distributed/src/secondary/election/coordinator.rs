@@ -82,9 +82,10 @@ where
     /// The live mesh peers for failover quorum/candidate reasoning: the
     /// keys of `peer_keepalives` MINUS the current primary's host id.
     ///
-    /// A co-located primary+secondary host emits a `Secondary` keepalive
-    /// that lands in `peer_keepalives` even though its id is the current
-    /// primary (the recognition arm tracks a multi-role host as BOTH). That
+    /// A host that runs primary+secondary under one peer-id emits a
+    /// `Secondary` keepalive that lands in `peer_keepalives` even though its
+    /// id is the current primary (the recognition arm tracks a multi-role
+    /// host as BOTH). That
     /// entry is correct as peer-mesh liveness but must NEVER inflate
     /// election counts — the primary is the role being failed-over FROM, not
     /// a peer that could vote for or become a candidate. Excluding it here
@@ -118,8 +119,9 @@ where
     /// independent subset of {primary, secondary, observer} under one
     /// peer-id, so "is an alive secondary" is answered by the secondary
     /// capability itself, NOT by `!primary && !observer`. Consequently a
-    /// co-located primary+secondary host COUNTS (it positively has a
-    /// secondary), an observer is absent because it has no secondary (it
+    /// host running primary+secondary under one peer-id COUNTS (it
+    /// positively has a secondary), an observer is absent because it has no
+    /// secondary (it
     /// emits no `Secondary` keepalive / advertises no workers), and a
     /// primary-only host is absent for the same positive reason. This is
     /// exactly where the failover-quorum notion DIFFERS: `live_peer_ids`
@@ -131,8 +133,8 @@ where
     /// by which ledger physically exists, NOT by an arbitrary flag:
     ///   - OPERATIONAL (the `OperationalState` exists): `peer_keepalives`
     ///     keys. A peer is in this map IFF it emitted a `Secondary`
-    ///     keepalive — positive proof it runs a live secondary (the
-    ///     co-located primary included; see the recognition arm in
+    ///     keepalive — positive proof it runs a live secondary (a
+    ///     same-peer primary included; see the recognition arm in
     ///     `peer/message_handler.rs`). A peer swept by `check_peer_timeouts`
     ///     is correctly gone.
     ///   - SETUP / pre-operational (no `OperationalState`, so no
@@ -231,8 +233,8 @@ where
         // driven by the role-tagged recognition path in `handle_inbound`'s
         // Keepalive arm: a `Primary`-tagged keepalive whose originator IS
         // the current primary refreshes it, so a promoted peer's primary
-        // keepalives feed leg (B) exactly like the co-located primary's
-        // traffic once did. A co-located primary's Secondary keepalive lands
+        // keepalives feed leg (B) exactly like a same-peer primary's
+        // traffic once did. A same-peer primary's Secondary keepalive lands
         // in `peer_keepalives` (it is a live mesh peer) but is excluded from
         // quorum/candidate counts by `live_peer_ids`, so peer liveness and
         // primary liveness stay cleanly separate.
@@ -285,8 +287,8 @@ where
                 // node to coordinate with, so the cluster is
                 // already unsalvageable. Bail with a clear reason
                 // instead of pretending the election succeeded.
-                // Who the silent primary was (co-located or a promoted
-                // peer), snapshotted above from the single source of "who
+                // Who the silent primary was (a same-peer primary or a
+                // promoted peer), snapshotted above from the single source of "who
                 // is primary now" — BOTH the diagnostic identity and the
                 // `TimeoutQuery::query_node_id` the peers reply about. It
                 // drives no election decision (that is `primary_silent`
@@ -553,7 +555,7 @@ where
         if promoted {
             tracing::info!(round, "won election — taking over as primary");
             // The election state machine only records the terminal
-            // `Promoted` state transition. Activating the co-located
+            // `Promoted` state transition. Activating the same-peer
             // primary — `PrimaryCoordinator::activate_local_primary`,
             // which on this seeded-resume path hydrates the pool from the
             // replicated CRDT and enters the operational loop — is the
@@ -610,7 +612,8 @@ where
         };
 
         // (1) Apply locally through the unified hook so THIS winner's own
-        // apply hook fires (activate co-located primary + reset election).
+        // apply hook fires (Phase-C seam: signal `Process` to build the
+        // primary on the self-named promotion + reset election).
         self.apply_cluster_mutations(vec![mutation.clone()]);
 
         // (2) Broadcast the re-point so surviving peers apply the same

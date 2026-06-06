@@ -171,11 +171,11 @@ pub struct PrimaryConfig {
     /// minutes before the operator noticed.
     ///
     /// Counting REMOTE secondaries (excluding the recognized primary by
-    /// identity) is what arms this correctly on a co-located host that
-    /// runs a primary alongside its own secondary: the primary's own
-    /// secondary never keeps the timer disarmed, so a co-located primary
-    /// cut off from every remote secondary still arms and strands rather
-    /// than hanging on its own loopback secondary.
+    /// identity) is what arms this correctly on a host that runs a primary
+    /// alongside its own secondary under one peer-id: the primary's own
+    /// secondary never keeps the timer disarmed, so such a primary cut off
+    /// from every remote secondary still arms and strands rather than
+    /// hanging on its own loopback secondary.
     ///
     /// Set to `Duration::ZERO` for fail-fast (exit at the moment
     /// the fleet first goes empty). Set to a long value if a

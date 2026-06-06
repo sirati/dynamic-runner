@@ -192,7 +192,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                 }
                 queued = self.proxy_rx.recv() => {
                     // Mesh-send proxy drain (see `mesh_send.rs` +
-                    // `MeshSendHandle`). An on-demand co-located primary's
+                    // `MeshSendHandle`). A promoted-host primary's
                     // send-proxy queued a remote send here; forward it
                     // through THIS network's own relay-aware send path
                     // so the router's relay / blacklist / redial logic
