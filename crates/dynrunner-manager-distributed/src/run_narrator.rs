@@ -43,7 +43,6 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId};
-use dynrunner_protocol_primary_secondary::RunMilestoneKind;
 
 use crate::ClusterState;
 
@@ -61,12 +60,6 @@ pub struct RunNarrator {
     started_phases: HashSet<PhaseId>,
     /// Phases for which the "phase complete" line has been emitted.
     done_phases: HashSet<PhaseId>,
-    /// A7 run-milestones already narrated. Diffed against the replicated
-    /// grow-only [`ClusterState::run_milestones`] set, the SAME
-    /// `HashSet::insert` edge pattern as the started/done sets but keyed
-    /// by `(RunMilestoneKind, PhaseId)` and driven off the replicated
-    /// milestone facts rather than inferred from per-task state deltas.
-    narrated_milestones: HashSet<(RunMilestoneKind, PhaseId)>,
     /// Whether the one-shot run-complete / run-aborted summary has fired.
     /// The two are mutually exclusive and share this single latch so at
     /// most one terminal line is ever emitted.
@@ -85,7 +78,6 @@ impl RunNarrator {
         Self {
             started_phases,
             done_phases: HashSet::new(),
-            narrated_milestones: HashSet::new(),
             completion_emitted: false,
         }
     }
@@ -131,38 +123,6 @@ impl RunNarrator {
                     phase = %phase,
                     "phase complete",
                 );
-            }
-        }
-
-        // A7 run-milestone projection. The SAME accumulator-diff pattern
-        // as the phase-started/complete sets above — `HashSet::insert`
-        // returns `true` only on the first sight of a `(kind, phase)`,
-        // so each milestone narrates exactly once and a re-tick against
-        // the unchanged (or grown) replicated set is silent. Driven off
-        // the replicated grow-only `run_milestones()` edge-set, NOT
-        // inferred from per-task deltas: a milestone reached on a
-        // PROMOTED primary (a DIFFERENT node) is surfaced to this
-        // observer purely via the converged CRDT, so the observer
-        // narrates a remote-node milestone it never executed.
-        for (kind, phase) in state.run_milestones() {
-            if self.narrated_milestones.insert((*kind, phase.clone())) {
-                match kind {
-                    RunMilestoneKind::PhaseTaskSpawning => tracing::info!(
-                        target: IMPORTANT_TARGET,
-                        phase = %phase,
-                        "phase preparation / task spawning",
-                    ),
-                    RunMilestoneKind::ErrorRetryPassStart => tracing::info!(
-                        target: IMPORTANT_TARGET,
-                        phase = %phase,
-                        "error-retry-pass start",
-                    ),
-                    RunMilestoneKind::OomRetryPassStart => tracing::info!(
-                        target: IMPORTANT_TARGET,
-                        phase = %phase,
-                        "OOM-retry-pass start",
-                    ),
-                }
             }
         }
 
@@ -221,7 +181,6 @@ mod tests {
     use crate::test_capture::{ImportantCapture, important_only};
     use dynrunner_core::{ErrorType, PhaseId, RunnerIdentifier, TaskDep, TaskInfo, TypeId};
     use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
-    use dynrunner_protocol_primary_secondary::RunMilestoneKind;
     use tracing::subscriber::with_default;
     use tracing_subscriber::Layer;
     use tracing_subscriber::Registry;
@@ -264,17 +223,6 @@ mod tests {
         state.apply(ClusterMutation::TaskCompleted {
             hash: hash.to_string(),
             result_data: None,
-        });
-    }
-
-    /// Apply an A7 run-milestone fact for `(kind, phase)` — the exact
-    /// `ClusterMutation` the promoted primary originates and every
-    /// replica's CRDT mirror converges to. Re-application is the apply
-    /// rule's idempotent grow-only NoOp.
-    fn milestone(state: &mut ClusterState<RunnerIdentifier>, kind: RunMilestoneKind, phase: &str) {
-        state.apply(ClusterMutation::RunMilestone {
-            kind,
-            phase: PhaseId::from(phase),
         });
     }
 
@@ -493,110 +441,6 @@ mod tests {
         assert!(
             events.iter().all(|e| !e.message.contains("phase complete")),
             "a phase whose only task is Blocked is not complete: {events:?}"
-        );
-    }
-
-    /// Each of the three A7 milestone kinds projects its own one line,
-    /// carrying the milestone's phase, exactly once; re-observing the
-    /// unchanged milestone set emits nothing further.
-    #[test]
-    fn run_milestones_emit_one_line_per_kind_once() {
-        let events = capture(|| {
-            let mut state = ClusterState::<RunnerIdentifier>::new();
-            milestone(&mut state, RunMilestoneKind::PhaseTaskSpawning, "compile");
-            milestone(&mut state, RunMilestoneKind::ErrorRetryPassStart, "compile");
-            milestone(&mut state, RunMilestoneKind::OomRetryPassStart, "compile");
-
-            let mut narrator = RunNarrator::new();
-            narrator.observe(&state);
-            // Re-observe the unchanged milestone set: idempotent.
-            narrator.observe(&state);
-        });
-
-        let line = |needle: &str| -> Vec<&crate::test_capture::CapturedEvent> {
-            events.iter().filter(|e| e.message.contains(needle)).collect()
-        };
-
-        let spawn = line("phase preparation / task spawning");
-        assert_eq!(
-            spawn.len(),
-            1,
-            "exactly one phase-preparation line across both observes: {events:?}"
-        );
-        assert_eq!(spawn[0].fields.get("phase").map(String::as_str), Some("compile"));
-
-        let err = line("error-retry-pass start");
-        assert_eq!(
-            err.len(),
-            1,
-            "exactly one error-retry-pass line: {events:?}"
-        );
-        assert_eq!(err[0].fields.get("phase").map(String::as_str), Some("compile"));
-
-        let oom = line("OOM-retry-pass start");
-        assert_eq!(oom.len(), 1, "exactly one OOM-retry-pass line: {events:?}");
-        assert_eq!(oom[0].fields.get("phase").map(String::as_str), Some("compile"));
-    }
-
-    /// The SAME milestone kind reached for two DIFFERENT phases narrates
-    /// once per phase: the accumulator key is `(kind, phase)`, so the
-    /// per-phase distinction is preserved.
-    #[test]
-    fn run_milestones_narrate_per_phase() {
-        let events = capture(|| {
-            let mut state = ClusterState::<RunnerIdentifier>::new();
-            milestone(&mut state, RunMilestoneKind::PhaseTaskSpawning, "compile");
-            milestone(&mut state, RunMilestoneKind::PhaseTaskSpawning, "link");
-
-            let mut narrator = RunNarrator::new();
-            narrator.observe(&state);
-            narrator.observe(&state);
-        });
-
-        let phases: HashSet<&str> = events
-            .iter()
-            .filter(|e| e.message.contains("phase preparation / task spawning"))
-            .filter_map(|e| e.fields.get("phase").map(String::as_str))
-            .collect();
-        assert_eq!(
-            phases,
-            HashSet::from(["compile", "link"]),
-            "one phase-preparation line per phase: {events:?}"
-        );
-    }
-
-    /// A milestone reached on a REMOTE node (the promoted primary) is
-    /// surfaced to THIS observer purely via the converged CRDT and
-    /// narrated here, even though the observer never executed it. Modelled
-    /// by applying the milestone fact a remote primary originated, then
-    /// observing — the narrator has no other source than `run_milestones()`.
-    #[test]
-    fn observer_narrates_remote_node_milestone() {
-        let events = capture(|| {
-            let mut state = ClusterState::<RunnerIdentifier>::new();
-            // The promoted primary on another node recorded this milestone;
-            // it converged into this observer's replicated ledger. No task
-            // for the phase exists in THIS replica's mirror, so a per-task
-            // projection would see nothing — the milestone fact is the only
-            // source, proving the projection is CRDT-differed.
-            milestone(&mut state, RunMilestoneKind::PhaseTaskSpawning, "remote-phase");
-
-            let mut narrator = RunNarrator::new();
-            narrator.observe(&state);
-        });
-
-        let spawn: Vec<_> = events
-            .iter()
-            .filter(|e| e.message.contains("phase preparation / task spawning"))
-            .collect();
-        assert_eq!(
-            spawn.len(),
-            1,
-            "the observer narrates a remote-node milestone from the converged CRDT: {events:?}"
-        );
-        assert_eq!(
-            spawn[0].fields.get("phase").map(String::as_str),
-            Some("remote-phase")
         );
     }
 }

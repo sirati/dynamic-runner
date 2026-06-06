@@ -170,77 +170,69 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
 /// `fire_initial_phase_starts` emits `PhaseStartedNeedsWorkers { min: 1 }`
 /// for a newly-started phase that carries pending work, and emits nothing
 /// further when re-run (idempotent: only newly-inserted phases emit).
-#[tokio::test(flavor = "current_thread")]
-async fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
-    // `fire_initial_phase_starts` is async (it originates the A7 milestone
-    // through the broadcast path) and `build_test_primary` spawns its mesh
-    // pump under the live runtime, so the body must run inside a `LocalSet`.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (mut primary, _mesh) = make_primary();
+#[test]
+fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
+    let (mut primary, _mesh) = make_primary();
 
-            // Seed a completed `build`-phase prereq plus two `compile`-phase
-            // dependents so `compile` hydrates as Active-with-items.
-            let toolchain = dep_binary("toolchain", "build", &[]);
-            let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
-            let dep_b = dep_binary("dep-b", "compile", &["toolchain"]);
-            {
-                let cs = primary.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::PhaseDepsSet {
-                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: "toolchain".into(),
-                    task: toolchain,
-                });
-                cs.apply(ClusterMutation::TaskCompleted {
-                    hash: "toolchain".into(),
-                    result_data: None,
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: "dep-a".into(),
-                    task: dep_a,
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: "dep-b".into(),
-                    task: dep_b,
-                });
-            }
-            primary.hydrate_from_cluster_state();
+    // Seed a completed `build`-phase prereq plus two `compile`-phase
+    // dependents so `compile` hydrates as Active-with-items.
+    let toolchain = dep_binary("toolchain", "build", &[]);
+    let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+    let dep_b = dep_binary("dep-b", "compile", &["toolchain"]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "toolchain".into(),
+            task: toolchain,
+        });
+        cs.apply(ClusterMutation::TaskCompleted {
+            hash: "toolchain".into(),
+            result_data: None,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep-a".into(),
+            task: dep_a,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep-b".into(),
+            task: dep_b,
+        });
+    }
+    primary.hydrate_from_cluster_state();
 
-            // Install the worker-management bus sender, then fire phase starts.
-            let (tx, mut rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
-            primary
-                .cluster_state_mut_for_test()
-                .install_worker_mgmt_sender(tx);
+    // Install the worker-management bus sender, then fire phase starts.
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(tx);
 
-            primary.fire_initial_phase_starts().await;
+    primary.fire_initial_phase_starts();
 
-            // Exactly one signal: `compile` started with min == 1 (it has work);
-            // `build` is already terminal/done so it is not a newly-active phase.
-            let first = rx.try_recv().expect("a PhaseStartedNeedsWorkers signal");
-            assert_eq!(
-                first,
-                WorkerMgmtSignal::PhaseStartedNeedsWorkers {
-                    phase: PhaseId::from("compile"),
-                    min: 1,
-                }
-            );
-            assert!(
-                rx.try_recv().is_err(),
-                "only the work-carrying started phase emits"
-            );
+    // Exactly one signal: `compile` started with min == 1 (it has work);
+    // `build` is already terminal/done so it is not a newly-active phase.
+    let first = rx.try_recv().expect("a PhaseStartedNeedsWorkers signal");
+    assert_eq!(
+        first,
+        WorkerMgmtSignal::PhaseStartedNeedsWorkers {
+            phase: PhaseId::from("compile"),
+            min: 1,
+        }
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "only the work-carrying started phase emits"
+    );
 
-            // Re-firing is idempotent: `compile` is already in
-            // `phase_started_emitted`, so no further signal.
-            primary.fire_initial_phase_starts().await;
-            assert!(
-                rx.try_recv().is_err(),
-                "re-running fire_initial_phase_starts emits nothing for already-started phases"
-            );
-        })
-        .await;
+    // Re-firing is idempotent: `compile` is already in
+    // `phase_started_emitted`, so no further signal.
+    primary.fire_initial_phase_starts();
+    assert!(
+        rx.try_recv().is_err(),
+        "re-running fire_initial_phase_starts emits nothing for already-started phases"
+    );
 }
 
 /// `fire_initial_phase_starts` emits the "starting job phase" important
@@ -248,73 +240,58 @@ async fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
 /// insert edge), and re-firing emits nothing — pinning that the
 /// phase-start/phase-transition important event tracks the same
 /// once-per-phase transition as the worker-management signal.
-#[tokio::test(flavor = "current_thread")]
-async fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
+#[test]
+fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
     use crate::test_capture::{ImportantCapture, important_only};
-    use tracing::subscriber::set_default;
+    use tracing::subscriber::with_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
 
-    // `fire_initial_phase_starts` is async (it originates the A7 milestone
-    // through the broadcast path) and `build_test_primary` spawns its mesh
-    // pump under the live runtime, so the body must run inside a `LocalSet`.
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (mut primary, _mesh) = make_primary();
+    let (mut primary, _mesh) = make_primary();
 
-            let toolchain = dep_binary("toolchain", "build", &[]);
-            let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
-            {
-                let cs = primary.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::PhaseDepsSet {
-                    deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: "toolchain".into(),
-                    task: toolchain,
-                });
-                cs.apply(ClusterMutation::TaskCompleted {
-                    hash: "toolchain".into(),
-                    result_data: None,
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: "dep-a".into(),
-                    task: dep_a,
-                });
-            }
-            primary.hydrate_from_cluster_state();
+    let toolchain = dep_binary("toolchain", "build", &[]);
+    let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "toolchain".into(),
+            task: toolchain,
+        });
+        cs.apply(ClusterMutation::TaskCompleted {
+            hash: "toolchain".into(),
+            result_data: None,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep-a".into(),
+            task: dep_a,
+        });
+    }
+    primary.hydrate_from_cluster_state();
 
-            // Worker-management sender so the emit path doesn't drop on a
-            // missing sender (orthogonal to the important-event assertion).
-            let (tx, _rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
-            primary
-                .cluster_state_mut_for_test()
-                .install_worker_mgmt_sender(tx);
+    // Worker-management sender so the emit path doesn't drop on a
+    // missing sender (orthogonal to the important-event assertion).
+    let (tx, _rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(tx);
 
-            let capture = ImportantCapture::default();
-            let subscriber =
-                Registry::default().with(capture.clone().with_filter(important_only()));
-            // `set_default` (not `with_default`) so the subscriber is held across
-            // the `.await` inside `fire_initial_phase_starts` — the milestone
-            // origination it now drives broadcasts via an async send. The
-            // `current_thread` runtime keeps the emit on this thread, so the
-            // important "starting job phase" event reaches THIS subscriber.
-            {
-                let _guard = set_default(subscriber);
-                primary.fire_initial_phase_starts().await;
-                // Idempotent re-fire emits no further important event.
-                primary.fire_initial_phase_starts().await;
-            }
+    let capture = ImportantCapture::default();
+    let subscriber = Registry::default().with(capture.clone().with_filter(important_only()));
+    with_default(subscriber, || {
+        primary.fire_initial_phase_starts();
+        // Idempotent re-fire emits no further important event.
+        primary.fire_initial_phase_starts();
+    });
 
-            let msgs = capture.messages();
-            assert_eq!(
-                msgs.len(),
-                1,
-                "exactly one starting-job-phase important event for the one newly-active \
-                 work-carrying phase: {msgs:?}"
-            );
-            assert!(msgs[0].contains("starting job phase"), "{msgs:?}");
-        })
-        .await;
+    let msgs = capture.messages();
+    assert_eq!(
+        msgs.len(),
+        1,
+        "exactly one starting-job-phase important event for the one newly-active \
+         work-carrying phase: {msgs:?}"
+    );
+    assert!(msgs[0].contains("starting job phase"), "{msgs:?}");
 }

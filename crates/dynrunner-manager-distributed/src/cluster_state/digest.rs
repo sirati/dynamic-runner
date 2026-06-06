@@ -80,11 +80,6 @@ impl<I: Identifier> ClusterState<I> {
             peer_holdings: _peer_holdings,
             task_outputs,
             secondary_capacities,
-            // A7 reached-milestone grow-only set IS summarised: it is a
-            // proper CRDT (union-merged in `restore`), so folding it is
-            // detect-WITH-heal — a flagged divergence is one a snapshot
-            // pull's union merge actually resolves.
-            run_milestones,
             // ── node-local: not replicated, carries no convergence signal ──
             // (see the field docs on `ClusterState`; same set `snapshot()`
             // classifies node-local).
@@ -165,17 +160,6 @@ impl<I: Identifier> ClusterState<I> {
             capabilities_hash ^= super::merge::capability_fold(id, entry);
         }
 
-        // Run-milestones (A7): count + order-independent XOR-fold over the
-        // `(kind, phase)` set elements. `RunMilestoneKind` and `PhaseId`
-        // are both `Hash`, so the pair hashes to a stable per-entry `u64`;
-        // the XOR-fold is invariant under iteration order and re-computing
-        // it on a converged replica yields the same value. Detect-WITH-heal
-        // — a divergent set drives a pull whose union merge converges it.
-        let mut run_milestones_hash = 0u64;
-        for entry in run_milestones {
-            run_milestones_hash ^= hash_one(entry);
-        }
-
         StateDigest {
             tasks_count: tasks.len() as u64,
             tasks_hash,
@@ -199,8 +183,6 @@ impl<I: Identifier> ClusterState<I> {
             current_primary_hash: hash_one(current_primary),
             capabilities_count: capabilities.len() as u64,
             capabilities_hash,
-            run_milestones_count: run_milestones.len() as u64,
-            run_milestones_hash,
             primary_epoch: *primary_epoch,
             run_complete: *run_complete,
             run_aborted: run_aborted.is_some(),
