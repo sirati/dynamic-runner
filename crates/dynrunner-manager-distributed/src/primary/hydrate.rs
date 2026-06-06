@@ -28,10 +28,10 @@
 //! the `InFlight` arm as remote-in-flight, never double-counted as
 //! local-active.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
@@ -78,6 +78,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // universe is the `task()` of every entry: a pure derived cache of
         // the CRDT, rebuilt on hydrate exactly like the pool.
         let mut all_binaries: Vec<TaskInfo<I>> = Vec::new();
+        // The hash-keyed `ErrorType` ledger the retry bucket cross-references
+        // (`all_binaries` × `failed_tasks`). Rebuilt from every `Failed`
+        // CRDT entry so the retry subsystem is NOT inert on a promoted
+        // primary — without this, inherited `Failed` tasks with remaining
+        // retry budget are never reinjected (the candidate filter finds an
+        // empty `failed_tasks`). The CRDT `Failed { kind }` carries the SAME
+        // `ErrorType` the live path inserted (`task::failed.rs` /
+        // `command_channel::handler.rs` store `error_type` into both
+        // `failed_tasks` and the `TaskFailed { kind }` mutation), so this is
+        // a faithful projection. `Unfulfillable` / `InvalidTask` never reach
+        // this map: the `TaskFailed` apply arm demultiplexes those
+        // `ErrorType`s into their DISCRETE `TaskState` variants (not
+        // `Failed`), so a `Failed` state's `kind` is only ever
+        // `Recoverable` / `NonRecoverable` / `ResourceExhausted` — exactly
+        // the live-path `failed_tasks` contents. `NonRecoverable` matches no
+        // `BucketKind`, so it stays inert (never re-retried), mirroring the
+        // live path. The replicated `retry_passes_used` budget gates
+        // re-retry, so seeding every recoverable `Failed` is safe.
+        let mut failed_tasks: HashMap<String, ErrorType> = HashMap::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             all_binaries.push(state.task().clone());
@@ -97,8 +116,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // resolve their reference — those dependents cascade
                 // through the pool's dep machine exactly as they would
                 // against any other terminal prereq.
+                // `Failed` does the SAME dep-resolution seed as the other
+                // terminal-ish states (so dependents' `task_depends_on`
+                // resolve in `extend()`) AND additionally re-seeds the
+                // hash-keyed `failed_tasks` ledger from the carried `kind`,
+                // so the retry bucket has a candidate source post-promotion.
+                // The CRDT entry itself stays `Failed`; the bucket's reset
+                // (`TaskRetried`, budget-gated) is what later moves it to
+                // `Pending` — hydrate only rebuilds the projection.
+                TaskState::Failed { task, kind, .. } => {
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(task.task_id.clone());
+                    failed_tasks.insert(hash.clone(), kind.clone());
+                }
                 TaskState::Completed { task, .. }
-                | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. } => {
                     primary_completed.insert(hash.clone());
@@ -182,6 +213,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // promoted primary's retry bucket has a candidate source (it was
         // empty on the seeded path before this). Pure derived cache.
         self.all_binaries = all_binaries;
+        // Rebuild the hash-keyed failure ledger the retry bucket
+        // cross-references against `all_binaries`. Without this a promoted
+        // primary's retry subsystem is inert (empty candidate set) even
+        // though `all_binaries` and the budget are present. Pure derived
+        // cache of the CRDT `Failed` entries.
+        self.failed_tasks = failed_tasks;
         // `single_worker_mode` is an ephemeral within-bucket dispatch-shape
         // flag, NOT a failover decision input: a freshly-promoted primary
         // starts unmasked and the next OOM-bucket entry re-arms it. Reset
@@ -512,17 +549,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             })
             .collect();
 
-        // The next minted id must exceed every id already in the roster so
-        // a respawn after promotion never collides with one the pre-failover
-        // primary already minted (it had advanced the counter past
-        // `config.num_secondaries`). `next_secondary_id` is a pure derived
-        // cache of the CRDT roster's id space; the `.max(self.next_secondary_id)`
-        // floor preserves the `config.num_secondaries` bootstrap reservation
-        // when the roster is smaller than that floor.
+        // The next minted id must exceed every id already HANDED OUT across
+        // the failover so a respawn after promotion never collides with one
+        // the pre-failover primary already minted (it had advanced the
+        // counter past `config.num_secondaries`). Two replicated sources are
+        // authoritative for "ids already handed out":
+        //   * `known_secondaries()` — the capacity roster (a secondary that
+        //     has broadcast its `SecondaryCapacity`); and
+        //   * `respawn_events()` keys — the F7 respawn ledger, whose key is
+        //     the minted `new_id`. A respawn the pre-failover primary minted
+        //     + ledgered but whose secondary has NOT yet broadcast its
+        //     `SecondaryCapacity` is INVISIBLE to `known_secondaries()`; the
+        //     ledger is the only record of that already-handed-out id, so it
+        //     must fold into the max or the promoted primary re-mints it and
+        //     collides. Both encode ids as `secondary-{n}`, parsed by the
+        //     shared `parse_secondary_index`.
+        // `next_secondary_id` is a pure derived cache of the CRDT's id space;
+        // the `.max(self.next_secondary_id)` floor preserves the
+        // `config.num_secondaries` bootstrap reservation when both sources
+        // are smaller than that floor.
         let max_known = self
             .cluster_state
             .known_secondaries()
             .filter_map(super::secondary_id::parse_secondary_index)
+            .chain(
+                self.cluster_state
+                    .respawn_events()
+                    .keys()
+                    .filter_map(|id| super::secondary_id::parse_secondary_index(id)),
+            )
             .max();
         if let Some(m) = max_known {
             self.next_secondary_id = self.next_secondary_id.max(m + 1);

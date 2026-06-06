@@ -987,3 +987,467 @@ fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() 
         "a never-reached phase must NOT be marked started"
     );
 }
+
+/// DRIVE-THROUGH P1 regression: a promotion that inherits an
+/// already-started phase must NOT re-fire `on_phase_start` for it when the
+/// run actually executes. The sibling test above asserts the projection
+/// right after `seed_from_promotion_snapshot`, but never drives
+/// `run_pipeline` — so it could not catch `run_pipeline` clearing
+/// `phase_started_emitted` UNCONDITIONALLY between the seed and
+/// `fire_initial_phase_starts`. This drives the full
+/// `run_consuming(PromotionSnapshot, ..)` with a COUNTING `on_phase_start`
+/// and asserts ZERO fires for the inherited started phase.
+///
+/// FAILS pre-fix: the unconditional `phase_started_emitted.clear()` in
+/// `run_pipeline` wiped the seeded projection, so `fire_initial_phase_starts`
+/// re-inserted + re-fired `on_phase_start` (and re-emitted the "starting job
+/// phase" line) for the already-started phase.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // --- Live primary: seed one Pending task in phase "build" plus a
+            // SecondaryCapacity, then snapshot. The single phase "build" is
+            // thereby already-started (≥1 ledger entry → rollup has_any). ---
+            let snapshot = {
+                let (transport, _ends) = setup_test(1);
+                let (mut live, _mesh) = build_test_primary(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let cs = live.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::new(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                let mut task = make_binary("b-1", 100);
+                task.phase_id = dynrunner_core::PhaseId::from("build");
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&task),
+                    task,
+                });
+                live.cluster_state_for_test().snapshot()
+            };
+
+            // --- Promoted primary via the production construction primitive. ---
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            // Sanity: the seed marked "build" already-started.
+            assert!(
+                promoted
+                    .phase_started_emitted
+                    .contains(&dynrunner_core::PhaseId::from("build")),
+                "seed must mark the inherited started phase"
+            );
+
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
+            }
+
+            // COUNTING on_phase_start: record every phase the run fires
+            // `on_phase_start` for. The inherited "build" must appear ZERO
+            // times (already started pre-failover).
+            let fires: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let fires_cb = std::sync::Arc::clone(&fires);
+            let ops: OnPhaseStart = Box::new(move |p: &dynrunner_core::PhaseId| {
+                fires_cb.lock().unwrap().push(p.to_string());
+            });
+            let ope: OnPhaseEnd = Box::new(|_, _, _, _| {});
+
+            let outcome = promoted
+                .run_consuming(SeedSource::PromotionSnapshot, ops, ope)
+                .await
+                .expect("promoted run must not error");
+            assert!(
+                matches!(outcome, PrimaryRunOutcome::Local { .. }),
+                "promoted primary should run to a Local outcome"
+            );
+
+            let recorded = fires.lock().unwrap().clone();
+            let build_fires = recorded.iter().filter(|p| p.as_str() == "build").count();
+            assert_eq!(
+                build_fires, 0,
+                "on_phase_start must NOT re-fire for an inherited already-started \
+                 phase (pre-fix the unconditional clear in run_pipeline wiped the \
+                 P1 seed and re-fired); recorded fires: {recorded:?}"
+            );
+        })
+        .await;
+}
+
+/// F6/F7 id-space GAP: a respawn the pre-failover primary minted +
+/// ledgered (`respawn_events`) whose secondary has NOT yet broadcast its
+/// `SecondaryCapacity` is INVISIBLE to `known_secondaries()`. The
+/// promotion-hydrate `next_secondary_id` derive must fold the respawn
+/// ledger's keys into `max_known` so the promoted primary does not re-mint
+/// that already-handed-out id and collide.
+///
+/// FAILS pre-fix: the derive read only `known_secondaries()`, so a
+/// ledgered-but-unregistered respawn id was missed and the next mint
+/// collided with it.
+#[test]
+fn promoted_hydrate_advances_next_secondary_id_past_ledgered_respawn() {
+    let (transport, _ends) = setup_test(1);
+    let config = PrimaryConfig {
+        num_secondaries: 2,
+        ..test_primary_config()
+    };
+    let (mut promoted, _mesh) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    {
+        let cs = promoted.cluster_state_mut_for_test();
+        // Bootstrap roster secondary-0, secondary-1 broadcast capacity.
+        for id in ["secondary-0", "secondary-1"] {
+            cs.apply(ClusterMutation::SecondaryCapacity {
+                secondary: id.into(),
+                worker_count: 1,
+                resources: mem(8 * 1024 * 1024 * 1024),
+            });
+        }
+        // A respawn the pre-failover primary minted + ledgered as
+        // secondary-7, but whose secondary has NOT yet broadcast its
+        // SecondaryCapacity — so it is absent from `known_secondaries()`
+        // and visible ONLY via the F7 respawn ledger.
+        cs.record_respawn_event(
+            "secondary-7".into(),
+            crate::cluster_state::RespawnEventRecord {
+                original_id: "secondary-1".into(),
+                cause: dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                at: std::time::SystemTime::UNIX_EPOCH,
+            },
+        );
+    }
+
+    promoted.hydrate_from_cluster_state();
+
+    // The next mint must exceed the highest id ACROSS BOTH the capacity
+    // roster (max 1) and the respawn ledger (7) → 8, NOT reset to the
+    // num_secondaries floor (2) nor stop at the roster max (2) where it
+    // would re-mint secondary-7.
+    assert_eq!(
+        promoted.next_secondary_id, 8,
+        "next_secondary_id must exceed the ledgered respawn id even when its \
+         secondary has not yet broadcast SecondaryCapacity"
+    );
+    assert_eq!(
+        promoted.mint_secondary_id(),
+        "secondary-8",
+        "the first respawn after promotion must NOT collide with the ledgered \
+         secondary-7"
+    );
+}
+
+/// FIX-3 (retry subsystem inert post-promotion): a promotion that inherits a
+/// recoverable `Failed` task with remaining retry budget must re-seed
+/// `failed_tasks` from the CRDT so the retry bucket actually reinjects it.
+/// Drives `try_run_phase_retry_bucket` (the same primitive the operational
+/// loop's drain edge calls) and asserts the inherited `Failed` is reset to
+/// `Pending` with a bumped attempt.
+///
+/// FAILS pre-fix: hydrate left `failed_tasks` empty, so the candidate filter
+/// (`all_binaries` × `failed_tasks`) found nothing and the task stayed
+/// permanently `Failed` — the retry subsystem was inert on a promoted
+/// primary.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_retries_inherited_recoverable_failed_task() {
+    use crate::primary::retry_bucket::BucketKind;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // --- Live primary: one task that ended a pass as
+            // Failed { Recoverable, attempt: 0 }, plus a SecondaryCapacity.
+            // Snapshot the converged ledger (the promotion payload). ---
+            let snapshot = {
+                let (transport, _ends) = setup_test(1);
+                let (mut live, _mesh) = build_test_primary(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let task = make_binary("flaky", 100);
+                let h = compute_task_hash(&task);
+                let cs = live.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::new(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: h.clone(),
+                    task,
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    hash: h.clone(),
+                    kind: dynrunner_core::ErrorType::Recoverable,
+                    error: "transient".into(),
+                    version: Default::default(),
+                    attempt: 0,
+                });
+                live.cluster_state_for_test().snapshot()
+            };
+
+            // --- Promoted primary: a generous retry budget so the bucket has
+            // budget to reinject (the replicated retry_passes_used is 0 in the
+            // snapshot, so remaining = retry_max_passes). ---
+            let (transport, _secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                retry_max_passes: 3,
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            let phase = dynrunner_core::PhaseId::from("default");
+            let task = make_binary("flaky", 100);
+            let h = compute_task_hash(&task);
+
+            // Post-hydrate the failure ledger must be rebuilt (FAILS pre-fix:
+            // empty) so the retry bucket has a candidate source.
+            assert_eq!(
+                promoted.failed_tasks.get(&h),
+                Some(&dynrunner_core::ErrorType::Recoverable),
+                "hydrate must re-seed failed_tasks from the inherited Failed entry"
+            );
+
+            // Sanity: the inherited task is Failed { attempt: 0 } in the CRDT.
+            assert!(
+                matches!(
+                    promoted.cluster_state_for_test().task_state(&h),
+                    Some(crate::cluster_state::TaskState::Failed { .. })
+                ),
+                "inherited task starts Failed in the CRDT"
+            );
+
+            // Drive the retry bucket (the operational loop's drain edge calls
+            // this). The reinject moves the local pool + failed_tasks and
+            // originates the budget-gated TaskRetried reset.
+            let mut command_rx = None;
+            let reinjected = promoted
+                .try_run_phase_retry_bucket(&phase, BucketKind::Recoverable, &mut command_rx)
+                .await
+                .expect("retry bucket call must succeed");
+            assert!(
+                reinjected,
+                "the inherited recoverable Failed task must be reinjected \
+                 (pre-fix the empty failed_tasks yielded no candidates)"
+            );
+
+            // The CRDT reset is the load-bearing post-condition: Failed → Pending
+            // with the bumped attempt generation.
+            let st = promoted
+                .cluster_state_for_test()
+                .task_state(&h)
+                .expect("task still in ledger");
+            assert!(
+                matches!(st, crate::cluster_state::TaskState::Pending { .. }),
+                "the retry reset moved the inherited Failed to Pending"
+            );
+            assert_eq!(
+                st.attempt(),
+                1,
+                "the reset minted the next attempt generation"
+            );
+            // The local failure ledger dropped the reinjected hash.
+            assert!(
+                !promoted.failed_tasks.contains_key(&h),
+                "the reinjected task is removed from failed_tasks"
+            );
+        })
+        .await;
+}
+
+/// COMBINED-STATE failover: a single promotion inheriting an already-started
+/// phase + an InFlight task + a recoverable Failed task (with budget) + a
+/// respawn-ledger entry simultaneously. Asserts ALL of:
+///   * `on_phase_start` does NOT re-fire for the started phase (FIX-1),
+///   * `next_secondary_id` exceeds the ledgered respawn id (FIX-2),
+///   * the Failed task is retried — reset to Pending (FIX-3),
+///   * the InFlight task is NOT re-dispatched (stays InFlight, no reset).
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_combined_state_reconstructs_faithfully() {
+    use crate::primary::retry_bucket::BucketKind;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let phase = dynrunner_core::PhaseId::from("build");
+
+            // Hashes built up front so the assertions can address each task.
+            let mut failed_t = make_binary("failed-1", 100);
+            failed_t.phase_id = phase.clone();
+            let failed_h = compute_task_hash(&failed_t);
+            let mut inflight_t = make_binary("inflight-1", 100);
+            inflight_t.phase_id = phase.clone();
+            let inflight_h = compute_task_hash(&inflight_t);
+
+            // --- Live primary: one Failed{Recoverable}, one InFlight, both in
+            // phase "build" (so the phase is already-started), a capacity
+            // record, and a ledgered respawn (secondary-9) with no capacity. ---
+            let snapshot = {
+                let (transport, _ends) = setup_test(1);
+                let (mut live, _mesh) = build_test_primary(
+                    PrimaryConfig::default(),
+                    transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let cs = live.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::new(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "secondary-0".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: failed_h.clone(),
+                    task: failed_t.clone(),
+                });
+                cs.apply(ClusterMutation::TaskFailed {
+                    hash: failed_h.clone(),
+                    kind: dynrunner_core::ErrorType::Recoverable,
+                    error: "transient".into(),
+                    version: Default::default(),
+                    attempt: 0,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: inflight_h.clone(),
+                    task: inflight_t.clone(),
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    hash: inflight_h.clone(),
+                    secondary: "secondary-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                    attempt: 0,
+                });
+                cs.record_respawn_event(
+                    "secondary-9".into(),
+                    crate::cluster_state::RespawnEventRecord {
+                        original_id: "secondary-0".into(),
+                        cause: dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                        at: std::time::SystemTime::UNIX_EPOCH,
+                    },
+                );
+                live.cluster_state_for_test().snapshot()
+            };
+
+            let (transport, _secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                retry_max_passes: 3,
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            // FIX-1: the started phase is seeded (no re-fire window).
+            assert!(
+                promoted.phase_started_emitted.contains(&phase),
+                "inherited started phase must be seeded so on_phase_start does not re-fire"
+            );
+
+            // FIX-2: next id exceeds the ledgered respawn (secondary-9 → 10),
+            // not the num_secondaries floor (1) nor the capacity-roster max (0).
+            assert_eq!(
+                promoted.next_secondary_id, 10,
+                "next_secondary_id must exceed the ledgered respawn id"
+            );
+
+            // FIX-3: failed_tasks rebuilt; InFlight not in failed_tasks.
+            assert_eq!(
+                promoted.failed_tasks.get(&failed_h),
+                Some(&dynrunner_core::ErrorType::Recoverable),
+                "the inherited recoverable Failed must be in failed_tasks"
+            );
+            assert!(
+                !promoted.failed_tasks.contains_key(&inflight_h),
+                "the InFlight task must NOT be in failed_tasks"
+            );
+
+            // Drive the retry bucket: the Failed is reinjected, the InFlight
+            // is left untouched (it is not a Failed candidate).
+            let mut command_rx = None;
+            let reinjected = promoted
+                .try_run_phase_retry_bucket(&phase, BucketKind::Recoverable, &mut command_rx)
+                .await
+                .expect("retry bucket call must succeed");
+            assert!(reinjected, "the inherited Failed must be reinjected");
+
+            // Failed → Pending (bumped attempt).
+            let failed_state = promoted
+                .cluster_state_for_test()
+                .task_state(&failed_h)
+                .expect("failed task in ledger");
+            assert!(
+                matches!(failed_state, crate::cluster_state::TaskState::Pending { .. }),
+                "the inherited Failed task was retried (reset to Pending)"
+            );
+            assert_eq!(failed_state.attempt(), 1, "retry bumped the attempt");
+
+            // InFlight stays InFlight — never re-dispatched, never reset.
+            let inflight_state = promoted
+                .cluster_state_for_test()
+                .task_state(&inflight_h)
+                .expect("inflight task in ledger");
+            assert!(
+                matches!(
+                    inflight_state,
+                    crate::cluster_state::TaskState::InFlight { .. }
+                ),
+                "the inherited InFlight task must NOT be re-dispatched by promotion"
+            );
+            assert_eq!(
+                inflight_state.attempt(),
+                0,
+                "the InFlight task's generation is untouched"
+            );
+        })
+        .await;
+}
