@@ -26,6 +26,14 @@ pub enum MessageType {
     /// Response to `RequestClusterSnapshot`: a full `ClusterStateSnapshot`
     /// the receiver merges into its local mirror via `ClusterState::restore`.
     ClusterSnapshot,
+    /// Joining / reconnecting / respawned secondary asks any connected
+    /// peer for the cluster-wide run configuration (the consumer's
+    /// `forwarded_argv`). Replicated, so any peer can answer; carries no
+    /// payload beyond routing.
+    RequestRunConfig,
+    /// Response to `RequestRunConfig`: the cluster-wide `forwarded_argv`
+    /// the requester splices onto its argv to reconstruct the run-config.
+    RunConfig,
     /// Periodic anti-entropy fingerprint (`StateDigest`). Every role
     /// broadcasts it on the convergence cadence; a receiver behind the
     /// sender pulls a snapshot via `RequestClusterSnapshot`. Detector

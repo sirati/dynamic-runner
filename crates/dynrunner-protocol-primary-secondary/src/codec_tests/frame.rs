@@ -132,6 +132,17 @@ fn roundtrip_all_message_types() {
             timestamp: 0.0,
             snapshot_json: "{}".into(),
         },
+        DistributedMessage::RequestRunConfig {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+        },
+        DistributedMessage::RunConfig {
+            target: None,
+            sender_id: "p".into(),
+            timestamp: 0.0,
+            forwarded_argv: vec!["--epochs".into(), "3".into()],
+        },
         DistributedMessage::StateDigest {
             target: None,
             sender_id: "s".into(),

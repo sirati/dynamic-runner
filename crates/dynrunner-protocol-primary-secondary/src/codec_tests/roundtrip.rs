@@ -398,3 +398,84 @@ fn empty_predecessor_outputs_elided_on_wire() {
         "empty predecessor_outputs must be elided via skip_serializing_if, got: {json}"
     );
 }
+
+/// `RequestRunConfig` carries no payload beyond the routing/common
+/// fields, so the round-trip pins only that the frame encodes and decodes
+/// back to the same variant with its `sender_id` intact.
+#[test]
+fn roundtrip_request_run_config() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RequestRunConfig {
+        target: None,
+        sender_id: "sec-late".into(),
+        timestamp: 77.0,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::RequestRunConfig { sender_id, .. } => {
+            assert_eq!(sender_id, "sec-late");
+        }
+        _ => panic!("expected RequestRunConfig"),
+    }
+}
+
+/// The full `RunConfig.forwarded_argv` survives the wire token-for-token.
+/// An empty vec is the `#[serde(default)]`, so a populated argv is the
+/// case that proves the field isn't silently dropped — every token and
+/// its order must decode back equal (argv reconstruction is exact).
+#[test]
+fn roundtrip_run_config_forwarded_argv() {
+    let forwarded_argv = vec![
+        "--config".to_string(),
+        "/app/run.toml".to_string(),
+        "--seed".to_string(),
+        "42".to_string(),
+    ];
+    let msg: DistributedMessage<TestId> = DistributedMessage::RunConfig {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 88.0,
+        forwarded_argv: forwarded_argv.clone(),
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::RunConfig {
+            sender_id,
+            forwarded_argv: decoded_argv,
+            ..
+        } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(decoded_argv, forwarded_argv);
+        }
+        _ => panic!("expected RunConfig"),
+    }
+}
+
+/// Backcompat: a JSON payload of `RunConfig` from a pre-field sender (the
+/// `forwarded_argv` field absent entirely) decodes with an empty argv.
+/// `#[serde(default)]` is what keeps a rolling upgrade working — a peer
+/// that has not learned about the field yet can still ship `RunConfig`
+/// frames to a newer requester, and vice versa.
+#[test]
+fn legacy_run_config_without_forwarded_argv_decodes_empty() {
+    let legacy = serde_json::json!({
+        "msg_type": "run_config",
+        "sender_id": "primary",
+        "timestamp": 0.0
+    });
+    let json = serde_json::to_vec(&legacy).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::RunConfig { forwarded_argv, .. } => {
+            assert!(forwarded_argv.is_empty());
+        }
+        _ => panic!("expected RunConfig"),
+    }
+}
