@@ -338,19 +338,6 @@ async fn pre_seeded_counter_exit_unchanged() {
 /// + holding the dispatchable discovered task, phase_b Done), (c) the
 /// rebuild fires no `on_phase_end`, and (d) the latch transition itself.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "REGRESSION (not a timing-adaptation): commit 8990911c removed the \
-            setup-defer seeding-edge pool REBUILD from handle_cluster_mutation \
-            (the `was_setup_pending && has_task_added && !setup_pending()` → \
-            hydrate_from_cluster_state branch). A wire-received discovery \
-            PhaseDepsSet+TaskAdded batch now lands in the CRDT but never \
-            reaches the dispatch pool: phase_a stays Drained with 0 queued \
-            (observed), so the discovered task is silently un-dispatchable — \
-            exactly the failure the removed code prevented. The setup-defer \
-            feature (required_setup_on_promote / emit_setup_defer_handshake) \
-            is still live, so this is a genuine behavioral change, NOT a \
-            queued-egress settle issue. Needs owner adjudication: restore the \
-            rebuild branch vs. retire the path. Left ignored per the \
-            do-not-paper-over-genuine-regressions rule."]
 async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {

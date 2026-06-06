@@ -197,6 +197,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     ClusterMutation::TaskAdded { .. } | ClusterMutation::TasksSpawned { .. }
                 )
             });
+            // Discovery-seed surface, distinct from the runtime-spawn
+            // surface above. `TaskAdded` is originated ONLY as the
+            // initial ledger seed — `seed_cluster_state` (run start) and
+            // `ingest_setup_discovery` (the `--source-already-staged`
+            // discovery feed) — always paired with a `PhaseDepsSet`,
+            // never as an incremental mid-run add (that is `TasksSpawned`,
+            // which auto-resumes through the pool's dep machine via
+            // `newly_pending`). A `TaskAdded` therefore marks the FIRST
+            // ledger growth this node's pool sees. Snapshot pre-apply,
+            // act post-apply (same shape as `has_task_added`).
+            let carries_discovery_task_added = mutations
+                .iter()
+                .any(|m| matches!(m, ClusterMutation::TaskAdded { .. }));
             // Collect any PeerJoined ids riding in the batch BEFORE
             // moving the mutations into apply. After the batch
             // applies, each joined id may have resolved a previously-
@@ -239,25 +252,80 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.cluster_state
                     .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
             }
+            // Pool-coherence after a ledger-growing apply. Two
+            // mutually-exclusive surfaces, both gated on this node still
+            // owning a pool (`self.pending.is_some()`):
+            //
+            //   * Discovery seed at a quiescent pool (REBUILD). A
+            //     `TaskAdded` Applied AND the pool currently holds no
+            //     queued dispatchable work — the pool was built before
+            //     discovery seeded the ledger and is drained/empty (the
+            //     setup-defer `--source-already-staged` path: phases sit
+            //     `Active`-empty or `Drained`, every declared phase with
+            //     zero items; see `coordinator.rs`'s setup-pending cascade
+            //     gate). `TaskAdded` does NOT feed `newly_pending` (only
+            //     `TasksSpawned` does, in `apply_tasks.rs`), so a plain
+            //     reinject never runs for it and the discovered tasks
+            //     would stay in the CRDT ledger un-dispatchable. REBUILD
+            //     the pool from the now-seeded `cluster_state` via the
+            //     `hydrate_from_cluster_state` primitive — it reads the
+            //     batch's just-applied `phase_deps`, classifies each
+            //     discovery phase Active/Blocked, queues every
+            //     freshly-`Pending` discovery task, and `cascade_drain_done`s
+            //     a declared-but-empty phase to `Done` (the activated-primary
+            //     semantics; no `on_phase_end` re-fires). This re-activates
+            //     the drained pool — the integrated form of the same
+            //     dispatch-enablement the runtime-spawn reinject below gives
+            //     an ACTIVE phase. The predicate is one-shot by
+            //     construction: the rebuild queues the seed, so the pool
+            //     then holds dispatchable work and a re-delivered batch
+            //     (idempotent `TaskAdded` NoOp) does not re-trigger.
+            //
+            //   * Runtime spawn into the live pool (INCREMENTAL reinject).
+            //     `TasksSpawned` entries the apply rule classified freshly
+            //     `Pending` (no deps, or all deps already `Completed`) ride
+            //     `newly_pending`. A primary that still owns a pool
+            //     reinjects each so the pool stays coherent with the CRDT
+            //     ledger across wire-received batches. This matters for the
+            //     re-promotion path: a demoted primary applying a promoted-
+            //     secondary's TasksSpawned broadcast keeps the post-spawn
+            //     tasks dispatchable, so a later re-election finds the pool
+            //     already aligned with the cluster's view (without it,
+            //     re-election would resurrect the pool from its pre-spawn
+            //     snapshot and the post-spawn tasks would never dispatch).
+            //
+            // The rebuild SUBSUMES the incremental reinject for the seed
+            // batch (the rebuilt pool already holds every discovery task),
+            // so the two are mutually exclusive. Each emits a decoupled
+            // `TasksAdded` worker-mgmt signal so the recheck dispatches the
+            // new work — never a direct dispatch call (the dispatch-
+            // decoupling law).
             if self.pending.is_some() {
-                let reinjected_any = !newly_pending.is_empty();
-                for task in newly_pending {
-                    tracing::debug!(
-                        phase = %task.phase_id,
-                        task_id = ?task.task_id,
-                        "pool: reinject freshly-Pending task from \
-                         wire-received TasksSpawned"
+                if carries_discovery_task_added && !self.pool().has_queued_dispatchable() {
+                    tracing::info!(
+                        crdt_tasks = self.cluster_state.task_count(),
+                        "discovery TaskAdded seeded the ledger at a quiescent \
+                         pool; rebuilding from cluster_state so the discovered \
+                         tasks become dispatchable"
                     );
-                    self.pool_mut().reinject(task);
-                }
-                // Wire-received `TasksSpawned` that grew the live pool is
-                // a pool-entry edge — EMIT a `TasksAdded` so the
-                // worker-management recheck dispatches the new work.
-                // Decoupled emit, never a direct dispatch call (the
-                // dispatch-decoupling law).
-                if reinjected_any {
+                    self.hydrate_from_cluster_state();
                     self.cluster_state
                         .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+                } else {
+                    let reinjected_any = !newly_pending.is_empty();
+                    for task in newly_pending {
+                        tracing::debug!(
+                            phase = %task.phase_id,
+                            task_id = ?task.task_id,
+                            "pool: reinject freshly-Pending task from \
+                             wire-received TasksSpawned"
+                        );
+                        self.pool_mut().reinject(task);
+                    }
+                    if reinjected_any {
+                        self.cluster_state
+                            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+                    }
                 }
             }
             if !joined_peer_ids.is_empty() {
