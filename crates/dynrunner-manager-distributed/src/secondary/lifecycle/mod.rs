@@ -120,11 +120,11 @@ use super::primary_link::PrimaryLink;
 /// per-secondary terminal payload (see the module docs).
 ///
 /// **No promotion state.** A secondary is never promoted: when its host
-/// becomes the primary the host's co-located primary coordinator is BUILT
-/// ON DEMAND (the coordinator-level `primary_activator`, invoked from the
-/// apply hook for a failover-self election win and from the setup FSM for a
-/// bootstrap transfer), while this secondary stays `Operational`. There is
-/// no `Operational → Promoted` lifecycle transition.
+/// becomes the primary the host's `PrimaryCoordinator` is constructed on the
+/// promotion event by the Phase-C `Process` (the secondary only SIGNALS the
+/// event — see the C4 seam in `apply_primary_changed`), while this secondary
+/// stays `Operational`. There is no `Operational → Promoted` lifecycle
+/// transition.
 ///
 /// **Observer is a role, not a state.** A pure observer / late-joiner
 /// constructs [`Operational`](SecondaryLifecycle::Operational) directly
@@ -326,68 +326,6 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// Setup-discovery fire-once latch, carried forward from
     /// [`ConfiguringState`].
     pub(in crate::secondary) setup_discovery_done: bool,
-
-    /// Co-located primary LOOPBACK receiver (channel CH1) — RESUMABLE
-    /// per-run terminal-signal state, NOT a fire-once latch.
-    ///
-    /// On a promoted / multi-role host the co-located
-    /// [`crate::primary::PrimaryCoordinator`] is NOT a mesh peer of itself,
-    /// so its `RunComplete` (and every other `Destination::All` broadcast)
-    /// reaches this co-located secondary's `process_tasks` loop ONLY through
-    /// this loopback — the QUIC mesh never closes, so the `recv_peer()==None`
-    /// break cannot fire. This receiver is therefore the SOLE path by which a
-    /// promoted secondary observes its own primary's clean completion.
-    ///
-    /// It lives on [`OperationalState`] (alongside `active_tasks` and the
-    /// other resumable per-run state) precisely BECAUSE a `SetupPending`
-    /// yield/re-entry is a real second consumption: the operational loop
-    /// `take`s it into a loop-local at each entry and restores it here before
-    /// the `SetupPending` return, so re-entry re-attaches it from this home.
-    /// Were it a fire-once [`OperationalLatches`] member, the re-entry would
-    /// find `None`, the loopback arm would park on `pending()` forever, and
-    /// the promoted secondary would never observe `RunComplete` (per-run
-    /// container/process leak). Seeded from the coordinator's
-    /// `colocated_loopback_inbound_rx` slot at the `process_tasks`
-    /// loop-local-take site (`coordinator-slot, else OperationalState`),
-    /// the same single idiom as `panik_signal_rx`; `None` on every
-    /// non-co-located path (the drain arm parks on `pending()`) and for the
-    /// pure-observer construction.
-    pub(in crate::secondary) colocated_loopback_inbound_rx:
-        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
-
-    /// Panik-watcher signal receiver — RESUMABLE per-run terminal-signal
-    /// state, NOT a fire-once latch.
-    ///
-    /// The watcher resolves this `oneshot` the moment it observes any
-    /// configured sentinel path OR a delivered SIGTERM (the SLURM
-    /// time-limit / `scancel` → `kill -TERM` cascade). It is the SOLE
-    /// in-loop path by which a graceful operator-initiated shutdown reaches
-    /// the operational `select!`: the panik arm turns it into worker
-    /// teardown + the `Panik` terminal + exit(137), letting the secondary
-    /// release its resources before the kernel `SIGKILL`s at the grace
-    /// deadline.
-    ///
-    /// It lives on [`OperationalState`] (alongside `active_tasks` and the
-    /// other resumable per-run state) precisely BECAUSE a `SetupPending`
-    /// yield/re-entry is a real second consumption: a REGULAR (non-observer)
-    /// secondary registers panik AND can be the pre-staged discovery node,
-    /// so it both reaches the panik arm and takes the `SetupPending`
-    /// excursion. The operational loop `take`s it into a loop-local at each
-    /// entry and restores it here before the `SetupPending` return, so
-    /// re-entry re-attaches it from this home. Were it a fire-once
-    /// [`OperationalLatches`] member, the re-entry would find `None`, the
-    /// panik arm would park on `pending()` forever, and a SIGTERM delivered
-    /// after the discovery yield would NOT be acted on by the secondary loop
-    /// (the watcher's oneshot cannot reach the dead arm) — graceful
-    /// shutdown is lost and teardown falls back to the kernel `SIGKILL`.
-    /// Seeded from the coordinator's `panik_signal_rx` slot at the
-    /// `process_tasks` loop-local-take site
-    /// (`coordinator-slot, else OperationalState`), the same single idiom as
-    /// `colocated_loopback_inbound_rx`; `None` when no panik paths were set
-    /// (the arm parks on `pending()`) and for the pure-observer
-    /// construction.
-    pub(in crate::secondary) panik_signal_rx:
-        Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -462,35 +400,15 @@ impl Default for MeshFormation {
 /// `Option`, hands it to `enter_operational`, and gets the unwrapped values
 /// back to drive the operational `select!` loop.
 ///
-/// **Neither the co-located loopback inbound receiver NOR the panik-watcher
-/// signal receiver is here.** Both used to ride this carrier, but a
-/// `SetupPending` yield/re-entry is a real SECOND consumption, and each is a
-/// SOLE terminal-signal path for a NON-observer pre-staged node:
-///
-/// - The loopback receiver: on a promoted node the co-located primary is not
-///   a mesh peer of itself, so its `RunComplete` reaches the secondary only
-///   via the loopback. A `None`-on-re-entry would park the loopback arm on
-///   `pending()` forever and leak the run.
-/// - The panik receiver: a REGULAR (non-observer) secondary registers panik
-///   AND can be the pre-staged discovery node, so a SIGTERM delivered after
-///   the discovery yield must still be acted on. A `None`-on-re-entry would
-///   park the panik arm on `pending()` forever, dropping graceful shutdown
-///   to a kernel `SIGKILL`.
-///
-/// Both are therefore resumable per-run state on
-/// [`OperationalState::colocated_loopback_inbound_rx`] /
-/// [`OperationalState::panik_signal_rx`], `take`-n into a loop-local and
-/// restored before the `SetupPending` return so re-entry re-attaches them.
-///
 /// The `lifecycle_rx` / `task_completed_rx` receivers are deliberately NOT
 /// here: they were already `take()`-n earlier (in
-/// `run_until_setup_or_done_inner`) to spawn their dispatcher tasks, and
-/// `command_rx` is transferred to the co-located primary — none of the
-/// three is ever drained by this loop, so the carrier only ferries the
-/// receivers the operational `select!` actually polls.
+/// `run_until_setup_or_done_inner`) to spawn their dispatcher tasks; the
+/// `panik_signal_rx` is `take()`-n straight into a `process_tasks`
+/// loop-local off its coordinator slot, not via this carrier. So the
+/// carrier only ferries the receivers it owns — the ones the operational
+/// `select!` actually polls and that have no other take-site.
 ///
-/// **Fire-once by construction — and that is exactly why the loopback and
-/// panik receivers are elsewhere.** A `SetupPending` excursion re-enters
+/// **Fire-once by construction.** A `SetupPending` excursion re-enters
 /// `run_until_setup_or_done` and finds the lifecycle already `Operational`,
 /// so `enter_operational` is never called twice; and even if it were, the
 /// coordinator's `Option::take()` yields `None` on the second pass. For the
@@ -503,18 +421,7 @@ impl Default for MeshFormation {
 /// `SetupPending` excursion, so its arms are never re-parked on re-entry.
 /// Modelling these two as a move-in / move-out carrier (NOT fields of
 /// [`OperationalState`]) keeps them where they belong — local to the
-/// operational loop, not part of the resumable state data. The loopback
-/// inbound receiver and the panik signal receiver are the exceptions: each
-/// is the SOLE terminal-signal path for a NON-observer node that DOES take
-/// the `SetupPending` excursion (the loopback on a promoted node, panik on a
-/// pre-staged regular secondary), so a `None`-on-re-entry is FATAL — they
-/// are resumable per-run state on [`OperationalState`], not members of this
-/// fire-once carrier.
-///
-/// `primary_activator` is deliberately NOT here: it stays a
-/// coordinator-level slot, `take()`-n at the activation site when this node
-/// is named primary and the co-located primary is built on demand (the
-/// secondary itself never leaves `Operational`), not at this boundary.
+/// operational loop, not part of the resumable state data.
 pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// Observer-announcer outbox receiver. `None` outside an attached
     /// observer wiring.
@@ -645,19 +552,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// called from any non-`Configuring` variant: the transition is only
     /// valid out of `Configuring`.
     ///
-    /// The two resumable terminal-signal receivers
-    /// ([`OperationalState::colocated_loopback_inbound_rx`] and
-    /// [`OperationalState::panik_signal_rx`]) are NOT seeded here: both start
-    /// `None` on this construction and are seeded from their coordinator slots
-    /// at the `process_tasks` loop-local-take site (with a fallback to the
-    /// restored `OperationalState` value on re-entry). That single take site,
-    /// rather than this transition, is the seed/restore home for both because
-    /// panik is also registered on the observer's already-`Operational` path
-    /// (which never reaches this `Configuring` arm), so seeding it only here
-    /// would drop the observer's receiver — and sourcing the loopback the same
-    /// way keeps ONE idiom for both. Unlike the fire-once
-    /// [`OperationalLatches`], both must survive re-entry — see the take site
-    /// and the matching `OperationalState` fields.
+    /// The panik-watcher signal receiver is NOT seeded here: it is
+    /// `take()`-n straight off its coordinator slot into a `process_tasks`
+    /// loop-local at the take site. That single take site, rather than this
+    /// transition, is its seed home because panik is also registered on the
+    /// observer's already-`Operational` path (which never reaches this
+    /// `Configuring` arm), so seeding it only here would drop the observer's
+    /// receiver.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::secondary) fn enter_operational(
         self,
@@ -695,14 +596,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done,
-                    // Both resumable terminal-signal receivers start `None` on
-                    // the lifecycle: the live receiver is held on its
-                    // coordinator slot until the `process_tasks`
-                    // loop-local-take site seeds it (see
-                    // [`OperationalState::colocated_loopback_inbound_rx`] /
-                    // [`OperationalState::panik_signal_rx`]).
-                    colocated_loopback_inbound_rx: None,
-                    panik_signal_rx: None,
                 }));
                 (next, latches)
             }
@@ -747,18 +640,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             pre_staged_mode: false,
             uses_file_based_items: true,
             setup_discovery_done: false,
-            // A pure observer / late-joiner has no co-located primary, so no
-            // loopback inbound; the operational loop's drain arm parks on
-            // `pending()`.
-            colocated_loopback_inbound_rx: None,
-            // `panik_signal_rx` starts `None` on this observer shell: the
-            // observer DOES register a panik receiver, but (like the normal
-            // path) the live receiver stays on the coordinator slot until the
-            // `process_tasks` loop-local-take site seeds it. The observer
-            // lands here already-`Operational` and never takes the
-            // `SetupPending` excursion, so the take site sees the coordinator
-            // slot `Some` on its single entry — no restore is needed.
-            panik_signal_rx: None,
         }));
         (state, latches)
     }

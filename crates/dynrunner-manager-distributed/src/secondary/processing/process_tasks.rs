@@ -60,24 +60,11 @@ where
         // flow did across the yield. The carrier ferries only the receivers
         // the operational `select!` actually polls. `lifecycle_rx` /
         // `task_completed_rx` were already taken in
-        // `run_until_setup_or_done_inner` to spawn their dispatchers, and
-        // `command_rx` is transferred to the co-located primary — none is
-        // drained here, so none rides this carrier.
-        //
-        // The co-located loopback inbound receiver and the panik signal
-        // receiver are deliberately NOT fire-once latches: each is the SOLE
-        // terminal-signal path for a NON-observer node that DOES take the
-        // `SetupPending` excursion, and a `SetupPending` re-entry IS a genuine
-        // second consumption.
-        //   - loopback: on a promoted node the co-located primary's
-        //     `RunComplete` reaches this loop only via the loopback (the mesh
-        //     never closes).
-        //   - panik: a regular (non-observer) secondary registers panik AND
-        //     can be the pre-staged discovery node, so a SIGTERM delivered
-        //     after the discovery yield must still be acted on.
-        // Both are seeded into loop-locals below from ONE idiom (the
-        // coordinator slot, else the value restored to `OperationalState`) and
-        // restored to `OperationalState` before the `SetupPending` return.
+        // `run_until_setup_or_done_inner` to spawn their dispatchers, and the
+        // `command_rx` ingress is re-homed to the authoritative primary —
+        // none is drained here, so none rides this carrier. The panik signal
+        // receiver is taken straight off its coordinator slot into a
+        // loop-local below (not via this carrier).
         let latches = super::super::lifecycle::OperationalLatches {
             announcer_outbox_rx: self.announcer_outbox_rx.take(),
             fatal_exit_signal_rx: self.fatal_exit_signal_rx.take(),
@@ -105,38 +92,14 @@ where
             mut announcer_outbox_rx,
             mut fatal_exit_signal_rx,
         } = latches;
-        // Seed each resumable terminal-signal receiver into a loop-local for
-        // its `select!` arm. A loop-local is required here (it cannot be
-        // polled in-place off `OperationalState`) because the pool arm already
-        // holds a `&mut self.lifecycle` partial borrow for its own recv
-        // future; a second `&mut self.lifecycle` for either drain arm would
-        // conflict. Both seed via ONE idiom — `coordinator-slot, else
-        // OperationalState`:
-        //   - First entry (normal or observer): the live receiver is on the
-        //     coordinator slot (`register_colocated_loopback_inbound` /
-        //     `register_panik_signal_rx`), `OperationalState` is `None` → take
-        //     the coordinator slot.
-        //   - `SetupPending` re-entry: the coordinator slot is already `None`
-        //     (taken on the first entry) → fall back to the value restored to
-        //     `OperationalState` before the prior yield.
-        // Each is restored to `OperationalState` before the `SetupPending`
-        // return (below) so re-entry re-attaches it. Without that:
-        //   - loopback: a promoted node loses the SOLE path to its own
-        //     primary's `RunComplete` and leaks the run.
-        //   - panik: a SIGTERM delivered after a pre-staged discovery yield
-        //     never reaches the re-parked arm and graceful shutdown falls back
-        //     to `SIGKILL`.
-        // The loopback receiver is registered only on the co-located
-        // (non-observer) path, so on an observer both seed sources are `None`
-        // and its arm parks on `pending()`.
-        let mut colocated_loopback_inbound_rx = self
-            .colocated_loopback_inbound_rx
-            .take()
-            .or_else(|| self.op_mut().colocated_loopback_inbound_rx.take());
-        let mut panik_signal_rx = self
-            .panik_signal_rx
-            .take()
-            .or_else(|| self.op_mut().panik_signal_rx.take());
+        // Take the panik-watcher signal receiver out of `self` into a
+        // loop-local so the panik arm's `await` can own it across `select!`
+        // iterations. A loop-local is required here (it cannot be polled
+        // in-place off the coordinator) because the pool arm already holds a
+        // `&mut self.lifecycle` partial borrow for its own recv future; a
+        // second `&mut self` for the panik arm would conflict. `None` when no
+        // panik paths were configured (the arm parks on `pending()`).
+        let mut panik_signal_rx = self.panik_signal_rx.take();
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: after a host suspend/resume the
@@ -196,13 +159,9 @@ where
         // across the `select!` iterations exactly as the pre-typed flat-field
         // flow did with per-field `Option::take()`. Each is `None` when its
         // registration never happened (no observer announcer / no fatal-exit
-        // policy) and the matching arm parks on
-        // `pending()`. `colocated_loopback_inbound_rx` and `panik_signal_rx`
-        // are the two locals owned across iterations that are NOT fire-once
-        // latches: each round-trips through `OperationalState` so it survives
-        // a `SetupPending` re-entry (see the takes above and the restore
-        // before the `SetupPending` return below). `panik_signal_rx` is
-        // `None` only when no panik paths were configured.
+        // policy) and the matching arm parks on `pending()`. `panik_signal_rx`
+        // is the loop-local taken off the coordinator slot above; it is `None`
+        // only when no panik paths were configured.
         //
         // Grace for the SIGTERM → SIGKILL escalation on the worker pool is
         // 5s — same window the SubprocessWorkerFactory uses for its own
@@ -288,36 +247,6 @@ where
                                 "mesh inbound stream closed; exiting cleanly"
                             );
                             break;
-                        }
-                    }
-                }
-                // Co-located primary LOOPBACK inbound (channel CH1). On a
-                // multi-role host the co-located `PrimaryCoordinator`'s
-                // egress (own-host `TaskAssignment` loopback + its
-                // `Destination::All` broadcast leg) sends into the matching
-                // sender; this arm drains the receiver and feeds each frame
-                // through `handle_inbound` EXACTLY as a wire frame, so a
-                // loopback `TaskAssignment` / `ClusterMutation` /
-                // `RunComplete` is processed identically to a
-                // mesh-delivered one. `None` (no co-located primary
-                // composed — every non-pyo3 path) ⇒ the arm parks on
-                // `pending()` and never fires, same idiom as the announcer
-                // / panik arms. A `Some(None)` (channel closed: the
-                // co-located primary dropped its sender) drops the rx so a
-                // later iteration re-parks. `mpsc::Receiver::recv` is
-                // cancel-safe.
-                loopback = async {
-                    match colocated_loopback_inbound_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match loopback {
-                        Some(frame) => {
-                            self.handle_inbound(frame, factory).await;
-                        }
-                        None => {
-                            colocated_loopback_inbound_rx = None;
                         }
                     }
                 }
@@ -607,23 +536,6 @@ where
                      yielding from process_tasks so caller can run \
                      task.discover_items and call ingest_setup_discovery"
                 );
-                // Restore the resumable terminal-signal receivers to their
-                // home in `OperationalState` BEFORE yielding. This is the ONLY
-                // return path that re-enters `process_tasks`; a loop-local
-                // would otherwise drop here and the re-entry would find `None`
-                // (the coordinator slots are already consumed), parking the
-                // arm on `pending()` forever.
-                //   - loopback: on a promoted node that loses the SOLE path to
-                //     its own primary's `RunComplete` and leaks the run.
-                //   - panik: a SIGTERM (or sentinel file) delivered after this
-                //     pre-staged discovery yield would never be acted on by
-                //     the secondary loop — graceful shutdown is lost and
-                //     teardown falls back to the kernel `SIGKILL`.
-                // Restoring to `OperationalState` (NOT the coordinator's
-                // fire-once slots) is what makes them resumable across
-                // re-entry.
-                self.op_mut().colocated_loopback_inbound_rx = colocated_loopback_inbound_rx;
-                self.op_mut().panik_signal_rx = panik_signal_rx;
                 return Ok(RunOutcome::SetupPending);
             }
 

@@ -96,9 +96,6 @@ where
             announcer_outbox_rx: None,
             panik_signal_rx: None,
             fatal_exit_signal_rx: None,
-            primary_activator: None,
-            activated_primary_handle: None,
-            pending_transfer_activation: false,
             on_phase_end: None,
             on_phase_start: None,
             command_rx: Some(command_rx),
@@ -107,12 +104,6 @@ where
             // post-`initialize_workers` — see the doc on the
             // `sampler` field for the runtime-context rationale.
             sampler: None,
-            // Co-located loopback channels — registered by the pyo3
-            // composition (`register_colocated_*`) only when this host
-            // also runs an on-demand co-located primary. `None` everywhere
-            // else (the forward / drain become no-ops).
-            colocated_primary_inbound_tx: None,
-            colocated_loopback_inbound_rx: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -244,58 +235,6 @@ where
         self.mesh.degraded
     }
 
-    /// Register the co-located primary's INBOUND sender (channel CH2).
-    ///
-    /// The composed runtime (pyo3 secondary wrapper) builds both
-    /// coordinators on one host and connects them with two unbounded
-    /// channels. CH2 carries the secondary→primary direction: when this
-    /// host holds the primary role, [`Self::handle_inbound`] forwards
-    /// every `is_primary_facing` frame into this sender (so the
-    /// co-located `PrimaryCoordinator`'s `recv_peer` drains it), and the
-    /// secondary's own-host terminal reports route here via the
-    /// [`Self::send_to`] `Loopback` arm. `None` (no co-located primary
-    /// composed — every non-pyo3 path) leaves the forward a no-op.
-    ///
-    /// Pre-`run_until_setup_or_done` contract, same one-shot shape as
-    /// [`Self::register_primary_activator`]: the slot is `take`-n into
-    /// the operational loop's latches at the `enter_operational`
-    /// boundary.
-    pub fn register_colocated_primary_inbound(
-        &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<
-            dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-        >,
-    ) {
-        self.colocated_primary_inbound_tx = Some(tx);
-    }
-
-    /// Register the co-located primary's loopback RECEIVER (channel CH1).
-    ///
-    /// CH1 carries the primary→secondary direction: the co-located
-    /// `PrimaryCoordinator`'s egress (own-host `TaskAssignment` loopback +
-    /// the `Destination::All` broadcast leg) sends into the matching
-    /// sender, and the secondary drains this receiver in its operational
-    /// `select!` loop alongside `transport.recv_peer`, feeding each frame
-    /// through [`Self::handle_inbound`] exactly as a wire frame so a
-    /// loopback `TaskAssignment` / `ClusterMutation` / `RunComplete` is
-    /// processed identically to a mesh-delivered one. `None` outside a
-    /// co-located composition — the drain arm parks on `pending()`.
-    ///
-    /// Pre-`run_until_setup_or_done` contract, one-shot: the receiver is
-    /// `take`-n at the first `process_tasks` entry and moved into its
-    /// resumable home on
-    /// [`super::lifecycle::OperationalState::colocated_loopback_inbound_rx`],
-    /// where it survives a `SetupPending` re-entry (on a promoted node it is
-    /// the sole path to the co-located primary's `RunComplete`).
-    pub fn register_colocated_loopback_inbound(
-        &mut self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<
-            dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-        >,
-    ) {
-        self.colocated_loopback_inbound_rx = Some(rx);
-    }
-
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
     /// invoked off the apply path for every `PeerJoined`/`PeerRemoved`
     /// state transition. Must be called BEFORE
@@ -372,74 +311,6 @@ where
         self.fatal_exit_signal_rx = Some(rx);
     }
 
-    /// Register the ON-DEMAND primary-activator closure: the
-    /// construction-on-demand of a co-located
-    /// [`crate::primary::PrimaryCoordinator`].
-    ///
-    /// The runtime layer captures the primary's construction inputs (the
-    /// host's mesh transport handle, the loopback/demux channels, config,
-    /// scheduler, estimator, command/phase wiring) into this closure and
-    /// hands it here. There is NO pre-built coordinator — when this node is
-    /// named primary (failover-self election win OR a bootstrap transfer
-    /// naming it), [`Self::activate_co_located_primary_on_demand`]
-    /// `take()`s this closure, snapshots `cluster_state`, and invokes it to
-    /// build and spawn the primary into its seeded resume. Pre-
-    /// `run_until_setup_or_done` contract, same single-shot shape as the
-    /// other `register_*` setters. Absent registration (Rust-only tests /
-    /// legacy single-`run()` callers / a `disable_peer_overlay` host)
-    /// leaves the activator `None`; a node whose replicated
-    /// `can_be_primary` marker is unset never reaches the build, so the
-    /// `None` is benign there and the `PrimaryChanged` broadcast still
-    /// fires. See [`super::PrimaryActivator`].
-    pub fn register_primary_activator(&mut self, activator: super::PrimaryActivator<I>) {
-        self.primary_activator = Some(activator);
-    }
-
-    /// Take the `JoinHandle` of the co-located primary this node activated
-    /// on demand (if any), for the runtime to join at wind-down so the
-    /// activated-primary future is never leaked. `None` on every node that
-    /// was never named primary (no build ever ran). Single-shot: the
-    /// handle is moved out, leaving `None`.
-    pub fn take_activated_primary_handle(&mut self) -> Option<tokio::task::JoinHandle<()>> {
-        self.activated_primary_handle.take()
-    }
-
-    /// Extract the composed-primary wiring — the lifecycle/command
-    /// channels the PyO3 wrapper minted on this `SecondaryCoordinator`
-    /// so its `PrimaryHandle` clone stays a stable type — for transfer
-    /// onto the co-located [`crate::primary::PrimaryCoordinator`], the
-    /// real consumer.
-    ///
-    /// Returns `(command_tx, command_rx, on_phase_start, on_phase_end)`,
-    /// taking each out of `self`. The composed runtime hands the command
-    /// pair to the primary via `replace_command_channel` and the phase
-    /// callbacks via `register_lifecycle_*`/`register_phase_*` — the
-    /// authority owns the phase machine and the externally-issued
-    /// `PrimaryCommand` ingress, NOT the follower secondary. This is the
-    /// site that makes these fields live (consumed in-crate), so the
-    /// fields carry no `#[allow(dead_code)]`.
-    ///
-    /// One-shot: a second call yields `(_, None, None, None)` because
-    /// the receiver/closures were already taken. The `command_tx` clone
-    /// is `Clone`, so the secondary retains its own copy for any handle
-    /// minted off it; only the receiver is uniquely transferred.
-    #[allow(clippy::type_complexity)]
-    pub fn take_composed_primary_wiring(
-        &mut self,
-    ) -> (
-        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
-        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
-        Option<crate::primary::OnPhaseStart>,
-        Option<crate::primary::OnPhaseEnd>,
-    ) {
-        (
-            self.command_tx.clone(),
-            self.command_rx.take(),
-            self.on_phase_start.take(),
-            self.on_phase_end.take(),
-        )
-    }
-
     /// Register a [`crate::task_completed::TaskCompletedListener`].
     /// Same single-shot, pre-`run_until_setup_or_done`-only contract
     /// as [`Self::register_lifecycle_listener`].
@@ -459,18 +330,14 @@ where
     /// Must be called before `run_until_setup_or_done` enters.
     ///
     /// The secondary holds NO phase machine and never fires these
-    /// itself. It is a registration ANCHOR: the runtime moves the closures
-    /// into the on-demand primary-activator closure (the authority that
-    /// owns the phase machine is built from them via
-    /// [`Self::take_composed_primary_wiring`]); the co-located primary
-    /// fires them once it is activated on demand. On a node that registers
-    /// no activator (in-process distributed secondaries on a
-    /// `NoPeerTransport` mesh) the closures stay dormant and are never
-    /// invoked.
+    /// itself. It is a registration ANCHOR (R4 SEAM): pyo3 keeps the
+    /// `register_phase_lifecycle_callbacks` pre-run contract stable for
+    /// callers minting a handle from a secondary; the authoritative
+    /// `PrimaryCoordinator` — which owns the phase machine — is the
+    /// real fire site that R4 re-homes the registration onto.
     ///
     /// Single concern: accept ownership of the boxed GIL-reacquiring
-    /// closures from the PyO3 wrapper and hold them until the
-    /// composition transfers them to the authority.
+    /// closures from the PyO3 wrapper and hold them as the wiring anchor.
     pub fn register_phase_lifecycle_callbacks(
         &mut self,
         on_phase_start: crate::primary::OnPhaseStart,
@@ -622,18 +489,13 @@ where
     /// hasn't already run its own discovery pass
     /// ([`Self::setup_discovery_done`]), (c) the replicated ledger is
     /// still empty (`cluster_state.task_count() == 0` — no node has
-    /// seeded it yet), (d) this node is the single deterministically-
-    /// designated discoverer ([`Self::is_designated_discoverer`]), and
-    /// (e) this node is the recognized post-promotion authority
-    /// (`cluster_state.current_primary() == self`).
+    /// seeded it yet), and (d) this node is the single deterministically-
+    /// designated discoverer ([`Self::is_designated_discoverer`]).
     ///
-    /// Axes (d) and (e) together make discovery run on EXACTLY ONE node
-    /// and only AFTER that node has become the authority: the designated
+    /// Axis (d) makes discovery run on EXACTLY ONE node: the designated
     /// discoverer is the same lowest-id-eligible node
-    /// `select_bootstrap_primary` promotes (axis d), and axis (e) holds
-    /// the yield until that node's own `PrimaryChanged` has propagated —
-    /// so its `ingest_setup_discovery` broadcast is consumed by its own
-    /// already-operational co-located primary, never into the void.
+    /// `select_bootstrap_primary` promotes, so discovery and promotion
+    /// are re-coupled through one deterministic rule.
     ///
     /// `process_tasks` consults this once per tick and yields
     /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
@@ -650,7 +512,6 @@ where
             && !self.lifecycle.setup_discovery_done()
             && self.cluster_state.task_count() == 0
             && self.is_designated_discoverer()
-            && self.cluster_state.current_primary() == Some(self.config.secondary_id.as_str())
     }
 
     pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
