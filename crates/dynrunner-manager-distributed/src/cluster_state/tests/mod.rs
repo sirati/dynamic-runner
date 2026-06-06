@@ -26,6 +26,7 @@ mod non_task_convergence;
 mod panik;
 mod peer_lifecycle;
 mod peer_resources;
+mod respawn_ledger;
 mod role_table;
 mod run_aborted;
 mod secondary_capacity;

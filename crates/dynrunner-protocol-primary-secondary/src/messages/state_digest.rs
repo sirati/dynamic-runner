@@ -126,6 +126,15 @@ pub struct StateDigest {
     /// (P3): a divergent used-count at an equal hash is detected.
     #[serde(default)]
     pub unfulfillable_reinject_used_hash: u64,
+    /// Number of respawn-ledger entries (F7 grow-only SET).
+    #[serde(default)]
+    pub respawn_events_count: u64,
+    /// XOR-fold over the respawn-ledger `(new_id, record)` pairs (F7): a
+    /// peer that recorded a respawn event this replica lacks makes the
+    /// replica behind, so the snapshot pull's union-merge heals it (and the
+    /// admission budget / cooldown converge cluster-wide).
+    #[serde(default)]
+    pub respawn_events_hash: u64,
 }
 
 impl StateDigest {
@@ -241,6 +250,16 @@ impl StateDigest {
                 self.unfulfillable_reinject_used_hash,
                 other.unfulfillable_reinject_used_count,
                 other.unfulfillable_reinject_used_hash,
+            )
+            // F7 grow-only SET: count-OR-hash compare, same shape as the
+            // other count-bearing fields. A peer that recorded a respawn
+            // event this replica lacks makes the replica behind; the
+            // snapshot pull's union-merge heals it.
+            || field_behind(
+                self.respawn_events_count,
+                self.respawn_events_hash,
+                other.respawn_events_count,
+                other.respawn_events_hash,
             )
     }
 }

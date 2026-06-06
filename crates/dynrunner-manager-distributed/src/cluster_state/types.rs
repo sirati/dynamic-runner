@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, TaskInfo, TaskVersion, WorkerId};
-use dynrunner_protocol_primary_secondary::RoleTable;
+use dynrunner_protocol_primary_secondary::{RemovalCause, RoleTable};
 use serde::{Deserialize, Serialize};
 
 use crate::task_completed::TaskCompletedEvent;
@@ -325,6 +325,37 @@ impl<I> TaskState<I> {
 pub enum PhaseTally {
     Completed,
     Failed,
+}
+
+/// One accepted respawn event in the replicated respawn ledger (F7).
+///
+/// The replicated ledger is a grow-only SET `HashMap<String,
+/// RespawnEventRecord>` keyed by `new_id` (the minted replacement
+/// secondary id, globally unique per accepted event — `mint_secondary_id`
+/// monotone), so the `new_id` is NOT carried in the value (it is the map
+/// key). The record carries the chain root the budget family-walk needs
+/// (`original_id`), the removal `cause` (operator forensics), and the
+/// timestamp the cooldown check reads (`at`).
+///
+/// Replacing the node-local `VecDeque<RespawnEvent>` ring: the respawn
+/// admission budget (`max_per_secondary` / `max_total` / `cooldown`) is a
+/// failover decision input, so the ledger it consults must be replicated.
+/// Grow-only SET (keyed insert, never remove, value written exactly once
+/// per unique `new_id`), so it converges under union-by-key on `restore`
+/// and rides the snapshot + anti-entropy digest path with ZERO wire
+/// surface — the same channel `secondary_capacities` uses.
+///
+/// Derives `Serialize`/`Deserialize` because it crosses the wire as the
+/// snapshot map VALUE; `Hash`/`Eq` so the digest can fold the
+/// `(new_id, record)` PAIR (`RemovalCause` and `SystemTime` are both
+/// `Hash`). The set is UNcapped — the total budget bounds its growth
+/// (once `max_total` events land every further request is rejected, so the
+/// set never exceeds `max_total + in-flight`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RespawnEventRecord {
+    pub original_id: String,
+    pub cause: RemovalCause,
+    pub at: std::time::SystemTime,
 }
 
 /// Coarse convergence band. The band dominates FIRST in the

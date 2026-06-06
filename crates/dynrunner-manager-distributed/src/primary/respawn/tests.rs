@@ -1,10 +1,9 @@
 //! Contract-level constructor smoke tests. Full integration
 //! (spawner ↔ dispatcher ↔ JoinSet drain) lands in sibling F6.
 
-use super::types::push_event;
 use super::*;
 use dynrunner_protocol_primary_secondary::RemovalCause;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 #[test]
 fn spawn_spec_constructs() {
@@ -58,45 +57,6 @@ fn respawn_outcome_constructs_with_ok_and_err() {
     assert!(matches!(err.result, Err(ref s) if s == "spawn failed"));
 }
 
-#[test]
-fn respawn_event_constructs() {
-    let ev = RespawnEvent {
-        original_id: "sec-a".to_owned(),
-        new_id: "sec-a-replacement".to_owned(),
-        cause: RemovalCause::KeepaliveMiss,
-        at: SystemTime::now(),
-    };
-    assert_eq!(ev.original_id, "sec-a");
-    assert_eq!(ev.new_id, "sec-a-replacement");
-    assert!(matches!(ev.cause, RemovalCause::KeepaliveMiss));
-}
-
-#[test]
-fn respawn_event_ringbuffer_drops_oldest_at_1024_cap() {
-    use std::collections::VecDeque;
-
-    let mut ring: VecDeque<RespawnEvent> = VecDeque::new();
-    // Push exactly one more than the cap; the very first event
-    // (`new_id = "new-0"`) must be evicted, and the buffer must
-    // remain at the cap with the freshest event at the back.
-    for i in 0..=RESPAWN_EVENTS_CAP {
-        push_event(
-            &mut ring,
-            RespawnEvent {
-                original_id: format!("orig-{i}"),
-                new_id: format!("new-{i}"),
-                cause: RemovalCause::KeepaliveMiss,
-                at: SystemTime::now(),
-            },
-        );
-    }
-    assert_eq!(ring.len(), RESPAWN_EVENTS_CAP);
-    assert_eq!(ring.front().unwrap().new_id, "new-1");
-    assert_eq!(
-        ring.back().unwrap().new_id,
-        format!("new-{}", RESPAWN_EVENTS_CAP),
-    );
-}
 // End-to-end coverage of the listener → request-channel →
 // operational-loop-arm pipeline. Each test constructs a
 // `PrimaryCoordinator` against the in-process channel stub used
@@ -249,7 +209,7 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
             let ids = captured.lock().unwrap();
             assert_eq!(ids.len(), 1);
             assert_eq!(ids[0], "secondary-1");
-            assert_eq!(coordinator.respawn_events.len(), 1);
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 1);
         })
         .await;
 }
@@ -296,6 +256,40 @@ async fn respawn_dispatcher_skips_when_policy_disabled() {
                 .try_recv()
                 .expect("free-standing listener should still translate");
             assert_eq!(req.original_id, "secondary-0");
+        })
+        .await;
+}
+
+/// F7-ζ: with the respawn policy disabled (`respawn_budget == None`),
+/// `dispatch_respawn_request` early-returns BEFORE any ledger write, so the
+/// REPLICATED respawn ledger is never touched — the grow-only SET stays
+/// empty and contributes nothing to a snapshot/digest. This pins that a
+/// `None` budget never originates a replicated event.
+#[tokio::test(flavor = "current_thread")]
+async fn disabled_policy_writes_nothing_to_replicated_ledger() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // No `enable_respawn` — `respawn_budget` is `None`.
+            assert!(coordinator.respawn_budget.is_none());
+            assert!(coordinator.cluster_state.respawn_events().is_empty());
+
+            // Dispatch a request directly (what the operational-loop arm
+            // does). With no budget, it must drop the request and write
+            // nothing to the replicated ledger.
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert!(
+                coordinator.cluster_state.respawn_events().is_empty(),
+                "a disabled respawn policy must never write to the replicated ledger",
+            );
+            assert!(
+                coordinator.respawn_tasks.is_empty(),
+                "a disabled respawn policy must never spawn",
+            );
         })
         .await;
 }
@@ -356,8 +350,8 @@ async fn respawn_dispatcher_respects_per_secondary_budget() {
                 "4th death should NOT have spawned",
             );
             assert_eq!(calls.load(Ordering::SeqCst), 3);
-            // Ring records 3 events (one per accepted spawn).
-            assert_eq!(coordinator.respawn_events.len(), 3);
+            // Ledger records 3 events (one per accepted spawn).
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 3);
         })
         .await;
 }
@@ -412,7 +406,7 @@ async fn respawn_dispatcher_respects_total_budget() {
                 "11th death should NOT have spawned",
             );
             assert_eq!(calls.load(Ordering::SeqCst), 10);
-            assert_eq!(coordinator.respawn_events.len(), 10);
+            assert_eq!(coordinator.cluster_state.respawn_events().len(), 10);
         })
         .await;
 }
@@ -469,7 +463,7 @@ async fn respawn_dispatcher_minted_id_is_monotonic() {
 /// `PeerRemoved` per peer within a tight window. With the
 /// historical bounded (256-cap) channel and `try_send` drop-on-full
 /// path, anything past 256 vanished without trace — the budget
-/// accounting (`respawn_events` ring) never saw the request,
+/// accounting (the replicated `respawn_events` ledger) never saw the request,
 /// `respawn_budget_exhausted` never fired, and the operator had no
 /// way to know a death had happened. The unbounded shape pins the
 /// inverse: 1000 sequential `Removed` events all enqueue without
@@ -554,9 +548,9 @@ async fn unbounded_respawn_request_channel_accepts_burst() {
                 "spawner must have received every accepted request",
             );
             assert_eq!(
-                coordinator.respawn_events.len() as u32,
+                coordinator.cluster_state.respawn_events().len() as u32,
                 BURST,
-                "every accepted request must land on the events ring",
+                "every accepted request must land on the replicated ledger",
             );
         })
         .await;

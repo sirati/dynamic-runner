@@ -6,8 +6,10 @@
 use std::sync::Arc;
 
 use super::types::{
-    RespawnDecision, RespawnEvent, RespawnOutcome, RespawnRequest, SecondarySpawnSpec, push_event,
+    RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec,
 };
+
+use crate::cluster_state::RespawnEventRecord;
 
 // ── Operational-loop entry points ─────────────────────────────────
 //
@@ -30,13 +32,15 @@ where
     I: Identifier,
 {
     /// Handle one [`RespawnRequest`] drained off the respawn-request
-    /// channel. Consults the budget against the live `respawn_events`
-    /// ring, mints a fresh secondary id on accept, builds the
-    /// [`SecondarySpawnSpec`], and spawns the future onto
-    /// `respawn_tasks`. Rejections emit the
-    /// `respawn_budget_exhausted` structured log event and a
-    /// budget-rejection record on the ring so downstream forensics
-    /// can see why a death didn't lead to a respawn.
+    /// channel. Consults the budget against the REPLICATED respawn ledger
+    /// (`cluster_state.respawn_events()`), mints a fresh secondary id on
+    /// accept, builds the [`SecondarySpawnSpec`], and spawns the future
+    /// onto `respawn_tasks`. Rejections emit the `respawn_budget_exhausted`
+    /// structured log event but record NOTHING on the ledger (the ledger
+    /// holds accepted events only — the budget consults `len()` for the
+    /// total cap, so a rejection must not inflate it). A disabled policy
+    /// (`respawn_budget == None`) early-returns BEFORE any ledger write, so
+    /// the replicated set is never touched when respawn is off.
     pub(crate) fn dispatch_respawn_request(&mut self, request: RespawnRequest) {
         let (spawner, budget) = match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref())
         {
@@ -56,7 +60,8 @@ where
         };
 
         let now = std::time::SystemTime::now();
-        let decision = budget.should_respawn(&request.original_id, &self.respawn_events, now);
+        let decision =
+            budget.should_respawn(&request.original_id, self.cluster_state.respawn_events(), now);
         match decision {
             RespawnDecision::Accept => {}
             RespawnDecision::RejectFamilyBudget
@@ -84,17 +89,20 @@ where
             primary_pubkey_pem: self.respawn_primary_pubkey_pem.clone(),
         };
 
-        // Record the attempt on the ring NOW — before the spawn
-        // future resolves — so budget consultation for any
-        // immediately-following request in the same `select!` tick
-        // already sees this entry. Without this, a tight burst of
-        // peer deaths could each independently consult an empty
-        // ring and all pass the cap.
-        push_event(
-            &mut self.respawn_events,
-            RespawnEvent {
+        // Record the accepted event on the REPLICATED ledger NOW —
+        // before the spawn future resolves — so budget consultation for
+        // any immediately-following request in the same `select!` tick
+        // already sees this entry. Without this, a tight burst of peer
+        // deaths could each independently consult an empty ledger and all
+        // pass the cap. Keyed by the freshly-minted `new_id` (globally
+        // unique), so the union-by-key merge never collides; the value
+        // carries the chain root + cause + timestamp the budget reads. A
+        // promoted primary inherits this via snapshot/AE, so the budget +
+        // cooldown survive failover (F7).
+        self.cluster_state.record_respawn_event(
+            new_id.clone(),
+            RespawnEventRecord {
                 original_id: request.original_id.clone(),
-                new_id: new_id.clone(),
                 cause: request.cause.clone(),
                 at: now,
             },

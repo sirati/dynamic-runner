@@ -168,6 +168,8 @@ fn roundtrip_all_message_types() {
                 retry_passes_used_hash: 0x99,
                 unfulfillable_reinject_used_count: 1,
                 unfulfillable_reinject_used_hash: 0xAA,
+                respawn_events_count: 4,
+                respawn_events_hash: 0xBB,
             },
         },
         DistributedMessage::TaskComplete {
