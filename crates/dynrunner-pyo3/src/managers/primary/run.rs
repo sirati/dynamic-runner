@@ -6,9 +6,11 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RunError,
+use dynrunner_manager_distributed::process::{
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal,
 };
+use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
+use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
@@ -282,19 +284,23 @@ impl PyPrimaryCoordinator {
         // Python wrapper raises instead of returning exit 0.
         let mut duplicate_task_id_pre_phase: Option<RunError> = None;
 
-        // Relocated-observer strand carried out of the detached tokio
-        // runtime. `Some(RunError)` iff the submitter RELOCATED full
-        // authority onto a chosen compute peer and the standalone observer
-        // tail it then ran exited with a strand-backstop / fatal-exit `Err`
-        // (fleet-dead, primary-silence, or the invalid_task Policy-B fatal).
-        // Unlike a stay-local `RunError::Other` (legacy log-and-swallow ⇒
-        // exit 0), a relocated strand MUST surface non-zero — the run was
-        // genuinely stranded — so the GIL-side tail raises a
-        // `PyRuntimeError` on it. (Relocated panik / aborted / setup-deadline
-        // terminals are already mapped onto the structured `panik_shutdown` /
-        // `duplicate_task_id_pre_phase` / `setup_deadline_expired` markers
-        // off the `result` carried in `PrimaryRunOutcome::Relocated`.)
-        let mut relocated_strand: Option<RunError> = None;
+        // Policy-abort terminal carried out of the detached tokio runtime.
+        // `Some(RunError::FatalPolicyExit)` iff the node's terminal was a
+        // deliberate policy abort (a relocated-observer invalid-task Policy-B
+        // fatal-exit, or a panicked role task). Unlike a stay-local
+        // `RunError::Other` (legacy log-and-swallow ⇒ exit 0), a policy abort
+        // MUST surface non-zero — so the GIL-side tail raises a
+        // `PyRuntimeError`. (A relocated-observer STRAND — fleet-dead /
+        // primary-silence — is a structured `ClusterCollapsed` now and rides
+        // the `cluster_collapsed` marker instead.)
+        let mut fatal_policy_exit: Option<RunError> = None;
+        // Relocated-observer cluster-abort carried out of the detached tokio
+        // runtime. `Some(reason)` iff the submitter relocated and the
+        // observer tail observed a cluster-wide `RunAborted`
+        // (`RunTerminal::Aborted` — a #3a pre-phase duplicate). The GIL-side
+        // tail exits 1 (a clean non-zero, like the secondary's aborted arm),
+        // distinct from a policy abort's `PyRuntimeError`.
+        let mut relocated_aborted: Option<String> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -374,14 +380,36 @@ impl PyPrimaryCoordinator {
                     ..PrimaryConfig::default()
                 };
 
-                // The mesh listener (held in `_mesh_server_guard` above)
-                // stays bound to the LocalSet's lifetime so its accept
-                // loops keep feeding the transport; the coordinator now
-                // holds the single `Tr` transport.
-                let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =
+                // Wrap the opaque mesh transport in the role-demux `Mesh`
+                // (the one thing in this process that touches the wire) and
+                // register the bootstrap Primary slot, minting the
+                // coordinator's `(client, inbox)` ends + the `Arc<RoleSlot>`
+                // the `Node` holds as the teardown lever. The mesh listener
+                // (held in `_mesh_server_guard` above) stays bound to the
+                // LocalSet so its accept loops keep feeding the transport.
+                let mut mesh = Mesh::new(peer_transport);
+                let (pri_slot, pri_client, pri_inbox) =
+                    mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+
+                // BUG-6 demote channel: the bootstrap primary relocates into
+                // a standalone observer on any self→other primary-register
+                // flip. The RECEIVER goes to `PrimaryCoordinator::new`; the
+                // SENDER goes to `NodeRunInputs.primary_demote_tx`, where
+                // `Node::run` installs it on the primary's role-change hook
+                // (`register_demote_on_displaced`). The node-level demote
+                // channel `Node::new` returns is a separate, unused leg here.
+                let (demote_tx, demote_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<()>();
+
+                // The coordinator never names a transport: the `Mesh` (owned
+                // by the `Node`'s pump) holds it; the coordinator reaches the
+                // wire only through `client` (egress) + `inbox` (ingress).
+                let mut primary: PrimaryCoordinator<_, _, RunnerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
-                        peer_transport,
+                        pri_client,
+                        pri_inbox,
+                        demote_rx,
                         scheduler_config.build_memory_scheduler(),
                         estimator,
                     );
@@ -475,82 +503,102 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, file_hash, content_hash, src, dest);
                 }
 
-                // phase_deps + lifecycle closures captured from the
-                // outer scope (5A built phase_deps; 5B built the
-                // GIL-reacquiring on_phase_* closures).
-                //
-                // `run_consuming` OWNS `primary` so a genuine bootstrap
-                // relocation can destructure it into the standalone
-                // observer's handoff (the submitter can never run the
-                // observer on its own primary). The post-run accounting the
-                // boundary used to read off `primary.completed_count()`
-                // travels back through the `PrimaryRunOutcome` — sourced from
-                // the primary's own ledger on the stay-local path, and from
-                // the observer's converged ledger on the relocated path.
-                let outcome = primary
-                    .run_consuming(rust_binaries, phase_deps, on_phase_start, on_phase_end)
-                    .await;
-                // Whether the submitter stayed local or relocated, the
-                // structured exit contract rides on the inner `result`; the
-                // counts ride alongside. The two arms differ ONLY in how a
-                // generic `Err` is treated: a stay-local `Other` keeps the
-                // legacy log-and-swallow (⇒ exit 0), a relocated strand
-                // raises (⇒ non-zero).
-                let (result, relocated, c, f, s) = match outcome {
-                    Ok(PrimaryRunOutcome::Local {
-                        result,
-                        completed,
-                        failed,
-                        stranded,
-                    }) => (result, false, completed, failed, stranded),
-                    Ok(PrimaryRunOutcome::Relocated {
-                        result,
-                        completed,
-                        failed,
-                        stranded,
-                    }) => (result, true, completed, failed, stranded),
-                    // A `run_consuming` top-level `Err` (a pipeline error
-                    // before the fork resolved) consumed `primary`, so the
-                    // counts are unavailable — surface zeros and route the
-                    // error through the markers below.
-                    Err(e) => (Err(e), false, 0, 0, 0),
+                // Compose the bootstrap-submitter `Node`: a pure-primary node
+                // (no co-located secondary, no promotion recipe — the
+                // submitter is the seed authority and can only relocate INTO
+                // an observer, never promote). `Node::run` owns the
+                // coordinator + the mesh-pump + the lifecycle; the boundary
+                // composes the inputs and drives it to a single outcome.
+                let (node, _node_promo_tx, _node_demote_tx) = Node::new(mesh);
+                let node = node.with_primary(primary, pri_slot);
+                let inputs: NodeRunInputs<
+                    crate::subprocess_factory::SubprocessWorkerFactory,
+                    _,
+                    _,
+                    RunnerIdentifier,
+                > = NodeRunInputs {
+                    primary_run_args: Some(PrimaryRunArgs {
+                        binaries: rust_binaries,
+                        phase_deps,
+                        on_phase_start,
+                        on_phase_end,
+                    }),
+                    // BUG-6: the SENDER half of the primary's demote channel
+                    // (its RECEIVER is already inside the coordinator). The
+                    // node installs it on the role-change hook so a self→other
+                    // primary flip relocates the submitter into the observer
+                    // tail (the `Relocated` swap is consumed INSIDE `Node`).
+                    primary_demote_tx: Some(demote_tx),
+                    // No co-located secondary, so no worker factory; no
+                    // promotion recipe (the submitter is the seed authority).
+                    secondary_factory: None,
+                    promote: None,
                 };
-                if let Err(e) = &result {
-                    tracing::error!(error = %e, "primary coordinator failed");
-                }
-                match result {
-                    Err(RunError::ClusterCollapsed { .. }) => {
-                        cluster_collapsed = result.err();
+
+                // Drive the node to its single outcome. The submitter either
+                // ran the primary to completion in-place OR relocated into a
+                // standalone observer tail; either way `Node::run` resolves to
+                // ONE role-agnostic `RunTerminal` (+ counts). The boundary
+                // maps that terminal to the GIL-side exit markers uniformly —
+                // a relocated observer's Aborted/Panik/strand and a stay-local
+                // primary's structured/generic error funnel through the same
+                // four-way terminal.
+                let outcome = node.run(inputs).await;
+
+                completed = outcome.completed as u32;
+                failed = outcome.failed as u32;
+                stranded = outcome.stranded as u32;
+
+                match outcome.terminal {
+                    RunTerminal::Done => {}
+                    RunTerminal::Aborted { reason } => {
+                        // Cluster-wide `RunAborted` (#3a pre-phase duplicate),
+                        // observed by a relocated submitter-observer tail.
+                        relocated_aborted = Some(reason);
                     }
-                    Err(RunError::PanikShutdown {
-                        matched_path,
-                        reason: _,
-                    }) => {
+                    RunTerminal::Panik { matched_path } => {
+                        // Operator panik (stay-local primary OR relocated
+                        // observer) — exit 137.
                         panik_shutdown_path = Some(matched_path);
                     }
-                    Err(e @ RunError::SetupDeadlineExpired { .. }) => {
-                        setup_deadline_expired = Some(e);
-                    }
-                    Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
-                        duplicate_task_id_pre_phase = Some(e);
-                    }
-                    Err(e @ RunError::Other(_)) if relocated => {
-                        // A relocated-observer strand (fleet-dead /
-                        // primary-silence / fatal-exit): raise, never swallow.
-                        relocated_strand = Some(e);
-                    }
-                    Err(RunError::Other(_)) | Ok(()) => {
-                        // Legacy log-and-swallow behaviour for
-                        // non-structured STAY-LOCAL errors is preserved
-                        // here: these surface through the per-counter
-                        // accounting below (stranded count + the
-                        // log line above), not as a PyErr.
+                    RunTerminal::Failed { error } => {
+                        tracing::error!(error = %error, "primary node run failed");
+                        match error {
+                            RunError::ClusterCollapsed { .. } => {
+                                cluster_collapsed = Some(error);
+                            }
+                            RunError::PanikShutdown { matched_path, .. } => {
+                                panik_shutdown_path = Some(matched_path);
+                            }
+                            e @ RunError::SetupDeadlineExpired { .. } => {
+                                setup_deadline_expired = Some(e);
+                            }
+                            e @ RunError::DuplicateTaskIdPrePhase { .. } => {
+                                duplicate_task_id_pre_phase = Some(e);
+                            }
+                            e @ RunError::FatalPolicyExit { .. } => {
+                                // A policy abort (e.g. a relocated-observer
+                                // invalid-task fatal-exit). RAISE — never the
+                                // `Other` swallow.
+                                fatal_policy_exit = Some(e);
+                            }
+                            RunError::Other(_) => {
+                                // The PRESERVED stay-local-primary swallow
+                                // (exit 0): a genuinely-unexpected generic
+                                // failure surfaces via the stranded-count
+                                // accounting + the log line above, not a PyErr.
+                                // Every KNOWN must-raise condition is a
+                                // structured variant above (strand →
+                                // ClusterCollapsed, policy abort →
+                                // FatalPolicyExit), so reaching `Other` is
+                                // exactly the old blast-radius-minimization
+                                // case. (The relocated-observer strand is a
+                                // structured ClusterCollapsed now, so it is
+                                // NOT swallowed here — it raises above.)
+                            }
+                        }
                     }
                 }
-
-                completed = c as u32;
-                failed = f as u32;
-                stranded = s as u32;
             }));
         });
 
@@ -623,13 +671,26 @@ impl PyPrimaryCoordinator {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
-        if let Some(err) = relocated_strand {
+        if let Some(reason) = relocated_aborted {
             // GIL is back. The submitter relocated full authority and the
-            // standalone observer tail it ran exited on a strand backstop
-            // (fleet-dead / primary-silence) or a Policy-B fatal-exit. Unlike
-            // a stay-local `Other`, this MUST surface non-zero — the run was
-            // genuinely stranded with no clean `RunComplete`. Raise the
-            // structured `Err`'s Display as a `PyRuntimeError`.
+            // standalone observer tail observed a cluster-wide `RunAborted`
+            // (#3a pre-phase duplicate). Exit 1 — the same clean non-zero a
+            // secondary/observer takes on a cluster abort. Sequenced after
+            // panik (strictly stronger) and before the strand/collapse
+            // accounting (an abort is a definitive cluster terminal).
+            tracing::error!(
+                reason = %reason,
+                "run aborted cluster-wide: relocated submitter-observer exiting with code 1"
+            );
+            std::process::exit(1);
+        }
+
+        if let Some(err) = fatal_policy_exit {
+            // GIL is back. A deliberate policy abort (a relocated-observer
+            // invalid-task Policy-B fatal-exit, or a panicked role task). It
+            // MUST surface non-zero — raise the structured `Err`'s Display as a
+            // `PyRuntimeError`. (A relocated-observer STRAND rides
+            // `cluster_collapsed` below instead.)
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

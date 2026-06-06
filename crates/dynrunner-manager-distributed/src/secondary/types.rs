@@ -4,8 +4,61 @@
 //! see. The coordinator's own state machine lives in `coordinator.rs`
 //! and `mod.rs`.
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
+
+use dynrunner_core::{Identifier, TaskInfo};
+
+/// The consumer's setup-discovery policy — the secondary's mirror of the
+/// `register_phase_lifecycle_callbacks` hook family.
+///
+/// Invoked by the secondary's run loop on each `RunOutcome::SetupPending`
+/// yield (pre-staged mode with an empty replicated ledger) to produce the
+/// discovered task batch; the secondary then feeds it into
+/// `ingest_setup_discovery` (the `PhaseDepsSet + TaskAdded` mesh broadcast)
+/// and resumes the loop. Moving the loop INTO the secondary keeps the
+/// setup-promote drive a framework concern (features-in-Rust) and the
+/// discovery itself a consumer POLICY (the pyo3 wrapper supplies a closure
+/// that runs Python's `task.discover_items`).
+///
+/// # Why it returns a FUTURE (the non-blocking contract — correctness)
+///
+/// The secondary's run loop shares ONE single-threaded runtime with the
+/// `Node`'s mesh-pump. If discovery blocked that thread (a slow
+/// `--source-already-staged` scan, or a GIL-held Python excursion), the
+/// pump would stall: the secondary's keepalives stop flowing AND it stops
+/// receiving the primary's, so the primary declares it dead and STRANDS the
+/// run — the exact §14/§15 fleet-collapse the one-mesh work fixed. So the
+/// closure returns a future the secondary `.await`s, yielding the thread to
+/// the pump; the consumer is responsible for making that future
+/// non-thread-blocking (e.g. the pyo3 wrapper runs the GIL excursion on a
+/// `spawn_blocking` thread and awaits its handle). `Err` aborts the run.
+///
+/// `FnMut` because the secondary may yield `SetupPending` more than once in
+/// principle (the fire-once latch makes it once in practice); the boxed
+/// future need not be `Send` — it is awaited on the secondary's own
+/// `!Send` task.
+pub type SetupDiscoveryFn<I> = Box<
+    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<I>>, String>>>>,
+>;
+
+/// The consumer's setup-discovery policy plus the phase-dependency graph
+/// the secondary feeds alongside the discovered binaries into
+/// `ingest_setup_discovery`. Registered together (via
+/// `SecondaryCoordinator::register_setup_discovery`) because both are needed
+/// for one ingest and neither is meaningful without the other.
+pub struct SetupDiscovery<I: Identifier> {
+    /// The discovery policy — produces the task batch on a `SetupPending`
+    /// yield. See [`SetupDiscoveryFn`].
+    pub discover: SetupDiscoveryFn<I>,
+    /// The phase-dependency graph broadcast with the discovered tasks. The
+    /// consumer resolves this from its `TaskDefinition.get_phases()` once at
+    /// construction; the per-yield discovery only resolves the per-task
+    /// list.
+    pub phase_deps: std::collections::HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+}
 
 /// Per-run control signal reported by
 /// `SecondaryCoordinator::run_until_setup_or_done`.

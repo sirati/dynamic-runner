@@ -1,17 +1,30 @@
-//! `PySecondaryCoordinator::run` — drives the coordination loop on a
-//! dedicated tokio runtime, handling the setup-promote yield by
-//! re-acquiring the GIL to call `task.discover_items` whenever the
-//! Rust core observes `RunOutcome::SetupPending`. Also exposes the
-//! `completed` getter.
+//! `PySecondaryCoordinator::run` — composes a compute-peer `Node`
+//! (a secondary that can be promoted) and drives `Node::run` on a
+//! dedicated tokio runtime. The setup-promote yield is now driven by the
+//! Rust `SecondaryCoordinator` itself (via the registered setup-discovery
+//! policy); this wrapper supplies that policy (a closure that runs Python's
+//! `task.discover_items` OFF the runtime thread so the mesh-pump's
+//! keepalives keep flowing). Also exposes the `completed` getter.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_manager_distributed::{
-    RunOutcome, SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
+use dynrunner_core::TaskInfo;
+use dynrunner_manager_distributed::process::{
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal,
 };
+use dynrunner_manager_distributed::{
+    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator, SetupDiscovery,
+};
+use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::config::connection::ConnectionMode;
+use crate::config::scheduler::SchedulerConfig;
+use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
@@ -125,6 +138,23 @@ impl PySecondaryCoordinator {
         let task_args_py = self.task_args_py.clone_ref(py);
         let phase_deps_for_ingest = self.phase_deps.clone();
         let setup_discover_root = self.src_network.clone();
+        // Capture the submitter's `--source-already-staged` signal on the
+        // GIL thread for the PROMOTED primary's `required_setup_on_promote`.
+        // This is the SAME signal the submitter's own `PrimaryConfig` uses
+        // (`args.source_already_staged is not None`): the node that owns
+        // setup-discovery is exactly the node whose promoted primary must
+        // engage the `setup_pending()` suppressor so it does not declare
+        // `0+0 >= 0` run-complete before its discovery-broadcast `TaskAdded`
+        // batch lands. Sourced from the run's OWN arg (D6/D7 — values
+        // originate on the run's config), NOT a derived band-aid chain
+        // (`derive_setup_defer_on_promote` was deleted as poison).
+        let required_setup_on_promote = self
+            .task_args_py
+            .bind(py)
+            .getattr("source_already_staged")
+            .ok()
+            .filter(|v| !v.is_none())
+            .is_some();
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -309,7 +339,7 @@ impl PySecondaryCoordinator {
                     memuse_log_path: cfg_memuse_log_path.clone(),
                 };
 
-                let mut factory = SubprocessWorkerFactory {
+                let factory = SubprocessWorkerFactory {
                     python_executable,
                     source_dir,
                     output_dir,
@@ -323,15 +353,28 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                // The secondary holds the mesh `PeerTransport`
-                // (`EitherPeerTransport`) DIRECTLY — the primary is a mesh
-                // peer reached by id, not a wrapped per-role leg.
-                let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
-                    config,
-                    peer_network,
-                    scheduler_config.build_memory_scheduler(),
-                    estimator,
-                );
+                // Wrap the opaque mesh transport in the role-demux `Mesh`
+                // (the one thing in this process that touches the wire) and
+                // register the Secondary slot, minting the coordinator's
+                // `(client, inbox)` ends + the `Arc<RoleSlot>` the `Node`
+                // holds as the teardown lever. The coordinator never names a
+                // transport — the `Node`'s pump owns the `Mesh`.
+                let mut mesh = Mesh::new(peer_network);
+                let (sec_slot, sec_client, sec_inbox) = mesh
+                    .register_local_role(LocalRole::Secondary, PeerId::from(secondary_id.as_str()));
+
+                // Clone the scheduler-tuning + estimator for the SECONDARY's
+                // own coordinator; the originals are moved into the promote
+                // recipe below (which the promoted primary builds its own
+                // scheduler/estimator from).
+                let mut secondary: SecondaryCoordinator<_, _, _, RunnerIdentifier> =
+                    SecondaryCoordinator::new(
+                        config,
+                        sec_client,
+                        sec_inbox,
+                        scheduler_config.build_memory_scheduler(),
+                        estimator.clone(),
+                    );
 
                 // Tell the egress edge which peer-id the bootstrap wire
                 // reaches (the conventional `"primary"`, the same id the
@@ -342,19 +385,11 @@ impl PySecondaryCoordinator {
                 // self-announcement lands.
                 secondary.set_bootstrap_primary_id("primary".to_string());
 
-                // Swap in the Python-facing command channel so the
-                // `PrimaryHandle` Python is holding talks to the same
-                // receiver this secondary's `process_tasks` loop
-                // reads from. Same pre-run contract as
-                // `PyPrimaryCoordinator`.
-                secondary.replace_command_channel(command_tx, command_rx);
-
                 // Register the Python peer-lifecycle listener (if any)
-                // BEFORE `run_until_setup_or_done` enters — the
-                // coordinator's `register_lifecycle_listener` contract
-                // requires pre-run registration because the listener
-                // vector is `mem::take`-d into the spawned dispatcher
-                // on first entry.
+                // BEFORE `run` enters — the coordinator's
+                // `register_lifecycle_listener` contract requires pre-run
+                // registration because the listener vector is `mem::take`-d
+                // into the spawned dispatcher on first entry.
                 if let Some(listener) = peer_lifecycle_listener {
                     secondary.register_lifecycle_listener(listener);
                 }
@@ -407,312 +442,100 @@ impl PySecondaryCoordinator {
                     secondary.register_panik_signal_rx(rx);
                 }
 
-                // Install the phase-lifecycle callbacks for the
-                // post-promotion path. Pre-`run_until_setup_or_done`
-                // contract — same shape as `register_lifecycle_listener`
-                // and `register_panik_signal_rx` above. Non-promoted
-                // secondaries never fire either closure; the GIL cost
-                // is paid only when the secondary holds the primary
-                // pool. The closures themselves were constructed under
-                // the GIL above.
-                secondary.register_phase_lifecycle_callbacks(
-                    sec_on_phase_start,
-                    sec_on_phase_end,
-                );
+                // Register the consumer's setup-discovery policy. The Rust
+                // `SecondaryCoordinator` now OWNS the setup-promote yield loop
+                // (the framework drives WHEN); this closure is the consumer's
+                // POLICY (it runs Python `task.discover_items` OFF the runtime
+                // thread, so the `Node`'s mesh-pump keeps the keepalives
+                // flowing during discovery — §14/§15). On a non-pre-staged run
+                // the secondary never yields `SetupPending`, so the policy is
+                // inert.
+                secondary.register_setup_discovery(SetupDiscovery {
+                    discover: build_setup_discovery_fn(
+                        task_definition_py,
+                        task_args_py,
+                        setup_discover_root,
+                    ),
+                    phase_deps: phase_deps_for_ingest,
+                });
 
-                // PHASE-C-SEAM[C5]: pyo3 bridge shrink. The secondary no
-                // longer constructs/seeds/owns a primary. Phase C builds the
-                // primary's mesh transport via `transport_factory`, hands it
-                // to `Process`, and `Process` builds the `PrimaryCoordinator`
-                // (snapshot-seeded) on the promotion/election event. The
-                // pyo3 surface composes a `Process` and calls `process.run()`
-                // here instead of registering an activator on the secondary.
+                // Compose the compute-peer `Node`: a secondary that may be
+                // PROMOTED to primary. `Node::new` hands out the
+                // `promotion_tx` the secondary signals on a self-named
+                // `PrimaryChanged`; `register_promotion_signal` wires it. The
+                // `promote` recipe (below) is what `Node::run` calls on that
+                // signal to BUILD the snapshot-seeded `PrimaryCoordinator` —
+                // the secondary NEVER constructs a primary (SUPREME-LAW #3).
+                let (node, promotion_tx, _node_demote_tx) = Node::new(mesh);
+                secondary.register_promotion_signal(promotion_tx);
 
-                // Setup-promote outer loop: drive
-                // `run_until_setup_or_done` to a terminal state,
-                // bouncing back through Python's `discover_items` on
-                // every `SetupPending` yield. The Rust core yields
-                // `SetupPending` only in pre-staged mode with an empty
-                // replicated ledger (the authority deferred discovery —
-                // it sent an empty `InitialAssignment { pre_staged_mode:
-                // true }` rather than seeding the ledger; see
-                // `SecondaryCoordinator::setup_discovery_pending`), and
-                // at most ONCE per node (the fire-once latch in
-                // `ingest_setup_discovery`). Legacy / failover / non-
-                // pre-staged runs observe `Done` on the first iteration
-                // and the loop exits cleanly without re-entering Python.
-                //
-                // GIL discipline: this entire async block runs inside
-                // `py.detach` (GIL released). Each Python excursion
-                // re-acquires via `Python::attach`, makes the single
-                // `discover_items` call, converts the iterable into
-                // `Vec<TaskInfo<RunnerIdentifier>>` through the
-                // workspace-shared `extract_binaries` helper, then
-                // returns — yielding the GIL back so the next Rust
-                // async tick can proceed. The Python-side time on the
-                // GIL is bounded by the cost of one user-defined
-                // generator drain plus the per-item attribute reads
-                // `extract_binaries` performs; in particular the
-                // Rust transport state, worker pool, and `select!`
-                // loop are NOT held while Python is running.
-                //
-                // Cancel-safety: `run_until_setup_or_done` documents
-                // its `process_tasks` `select!` arms as cancel-safe
-                // (mpsc recv + tokio interval ticks; see
-                // `secondary/processing.rs:57-65`). The `SetupPending`
-                // early return abandons the in-flight `select!`
-                // future and reentry rebuilds it from scratch on the
-                // next loop iteration's `run_until_setup_or_done`
-                // call. No coordinator state is dropped across the
-                // yield (`setup_phase_completed` is latched, workers
-                // stay running, transports remain connected).
-                // Loop result carries the three distinct terminal
-                // shapes the coordinator can produce:
-                //   - `Ok(())`: clean shutdown, return to Python normally.
-                //   - `Err(PyErr)`: typed run failure, surfaced to
-                //     Python as the wrapping exception.
-                //   - `Panik(PathBuf)`: operator-initiated emergency
-                //     stop; the outer `run()` calls
-                //     `std::process::exit(137)` after reacquiring
-                //     the GIL.
-                //
-                // Modelled as an enum (rather than a sentinel string
-                // smuggled through `Err(PyErr)`) so the boundary
-                // remains typed and the exit-on-panik decision is
-                // a structural match, not a string compare.
-                enum LoopResult {
-                    Ok(()),
-                    Err(PyErr),
-                    Panik(std::path::PathBuf),
-                    Aborted(String),
-                }
-                let loop_result: LoopResult = loop {
-                    let outcome = match secondary
-                        .run_until_setup_or_done(&mut factory)
-                        .await
-                    {
-                        Ok(o) => o,
-                        Err(e) => {
-                            tracing::error!(error = %e, "secondary failed");
-                            break LoopResult::Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                format!("secondary failed: {e}"),
-                            ));
-                        }
-                    };
-                    match outcome {
-                        RunOutcome::Terminal => {
-                            // The per-secondary terminal is the single
-                            // source of truth on the lifecycle; read it
-                            // back to choose the boundary action. The
-                            // coordinator already ran the matching teardown
-                            // (and, for panik, killed every worker pgid)
-                            // inside `run_until_setup_or_done`.
-                            match secondary.terminal() {
-                                Some(SecondaryTerminal::Done) | None => {
-                                    tracing::info!("secondary finished successfully");
-                                    break LoopResult::Ok(());
-                                }
-                                Some(SecondaryTerminal::Panik {
-                                    matched_path,
-                                    reason,
-                                }) => {
-                                    // The PyO3 outer scope owns the actual
-                                    // `exit(137)` call (and the log); this
-                                    // arm just propagates the matched_path
-                                    // through the loop's typed result.
-                                    tracing::error!(
-                                        matched_path = %matched_path.display(),
-                                        reason = %reason,
-                                        "secondary panik shutdown; propagating \
-                                         to PyO3 boundary for exit(137)"
-                                    );
-                                    break LoopResult::Panik(matched_path);
-                                }
-                                Some(SecondaryTerminal::Aborted { reason }) => {
-                                    // The primary broadcast `RunAborted`
-                                    // (#3a pre-phase duplicate). The PyO3
-                                    // outer scope owns the `exit(1)` call;
-                                    // this arm propagates the reason.
-                                    tracing::error!(
-                                        reason = %reason,
-                                        "secondary run aborted by primary; propagating \
-                                         to PyO3 boundary for exit(1)"
-                                    );
-                                    break LoopResult::Aborted(reason);
-                                }
-                                Some(SecondaryTerminal::Failed { reason }) => {
-                                    // `Failed` propagates as the run loop's
-                                    // `Err` (handled by the `Err(e)` arm
-                                    // above), so a `Terminal` with a `Failed`
-                                    // lifecycle is unexpected — surface it as
-                                    // an error rather than silently succeeding.
-                                    break LoopResult::Err(
-                                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                            "secondary failed: {reason}"
-                                        )),
-                                    );
-                                }
-                            }
-                        }
-                        RunOutcome::SetupPending => {
-                            // Re-acquire the GIL ONLY for the duration
-                            // of `task.discover_items` + the typed
-                            // conversion. Held resources released back
-                            // to the runtime when this block returns.
-                            let discovered = Python::attach(|py| -> PyResult<
-                                Vec<dynrunner_core::TaskInfo<RunnerIdentifier>>,
-                            > {
-                                let root = setup_discover_root
-                                    .as_ref()
-                                    .ok_or_else(|| {
-                                        pyo3::exceptions::PyRuntimeError::new_err(
-                                            "RunOutcome::SetupPending observed but \
-                                             src_network is None — the wrapper has no \
-                                             root to pass to task.discover_items; this \
-                                             is a programmer error (only pre-staged \
-                                             mode emits the SetupPending yield, and \
-                                             that mode always supplies src_network)",
-                                        )
-                                    })?;
-                                let task_def = task_definition_py.bind(py);
-                                let args = task_args_py.bind(py);
-                                let root_py = root.clone().into_pyobject(py)?;
-                                // Surface `args.resolved_output_root`
-                                // on the secondary so the task's
-                                // `discover_items` sees the same
-                                // attribute contract the submitter's
-                                // `run.py:139` and the SLURM pipeline's
-                                // `slurm/pipeline.rs:368` set on the
-                                // submitter side. Without this any
-                                // `--skip-existing`-style filter
-                                // silently no-ops on setup-promote.
-                                //
-                                // Resolution rule:
-                                // - Pre-staged mode
-                                //   (`args.source_already_staged`
-                                //   non-None): the secondary's
-                                //   filesystem-view of the gateway-side
-                                //   output dir lives at the
-                                //   wrapper-script's static bind-mount
-                                //   path `/app/out-network`.
-                                //   `args.output` is the submitter's
-                                //   local-cache path, forwarded
-                                //   verbatim and meaningless here.
-                                // - Non-pre-staged: fall back to
-                                //   `Path(args.output).resolve()`,
-                                //   matching the legacy local-mode
-                                //   shape.
-                                let pre_staged = args
-                                    .getattr("source_already_staged")
-                                    .ok()
-                                    .filter(|v| !v.is_none())
-                                    .is_some();
-                                if pre_staged {
-                                    args.setattr(
-                                        "resolved_output_root",
-                                        "/app/out-network",
-                                    )?;
-                                } else if let Ok(output_attr) =
-                                    args.getattr("output")
-                                {
-                                    let pathlib = py.import("pathlib")?;
-                                    let path = pathlib
-                                        .getattr("Path")?
-                                        .call1((output_attr,))?
-                                        .call_method0("resolve")?;
-                                    args.setattr(
-                                        "resolved_output_root",
-                                        path.str()?,
-                                    )?;
-                                }
-                                // Buffer the discover_items iterable
-                                // into a `PyList` so the workspace's
-                                // existing `extract_binaries` helper
-                                // (used by primary.rs::run and the
-                                // SLURM pipeline) handles the typed
-                                // conversion uniformly — no parallel
-                                // extraction logic introduced here.
-                                let py_list = PyList::empty(py);
-                                let iter = task_def.call_method1(
-                                    "discover_items",
-                                    (root_py, args),
-                                )?;
-                                for item in iter.try_iter()? {
-                                    py_list.append(item?)?;
-                                }
-                                extract_binaries(&py_list)
-                            });
-                            let discovered = match discovered {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "task.discover_items raised during \
-                                         setup-promote; aborting secondary"
-                                    );
-                                    break LoopResult::Err(e);
-                                }
-                            };
-                            tracing::info!(
-                                tasks = discovered.len(),
-                                "setup-promote discovery complete; \
-                                 ingesting into Rust core"
-                            );
-                            if let Err(e) = secondary
-                                .ingest_setup_discovery(
-                                    discovered,
-                                    phase_deps_for_ingest.clone(),
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    error = %e,
-                                    "ingest_setup_discovery failed; aborting secondary"
-                                );
-                                break LoopResult::Err(
-                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                        "ingest_setup_discovery: {e}"
-                                    )),
-                                );
-                            }
-                            // Loop continues; the next
-                            // `run_until_setup_or_done` call short-
-                            // circuits the setup handshake (its
-                            // `setup_phase_completed` latch is true)
-                            // and re-enters `process_tasks` directly.
-                        }
-                    }
+                // The promoted primary's build recipe. Captures the config
+                // template + the command channel + the phase callbacks the
+                // PROMOTED primary owns (not the secondary — per R4 the
+                // secondary holds no phase machine). Invoked at most once, on
+                // promotion, with the converged snapshot the secondary
+                // captured on the signal.
+                let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                    secondary_id: secondary_id.clone(),
+                    keepalive_interval: dist_keepalive,
+                    peer_timeout: dist_peer_timeout,
+                    keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                    retry_max_passes: dist_retry_max_passes,
+                    oom_retry_max_passes: dist_oom_retry_max_passes,
+                    required_setup_on_promote,
+                    scheduler_config,
+                    estimator,
+                    command_tx,
+                    command_rx,
+                    on_phase_start: sec_on_phase_start,
+                    on_phase_end: sec_on_phase_end,
+                });
+
+                let node = node.with_secondary(secondary, sec_slot);
+                let inputs: NodeRunInputs<
+                    SubprocessWorkerFactory,
+                    _,
+                    _,
+                    RunnerIdentifier,
+                > = NodeRunInputs {
+                    secondary_factory: Some(factory),
+                    promote: Some(promote),
+                    primary_run_args: None,
+                    primary_demote_tx: None,
                 };
 
-                let completed = secondary.completed_count() as u32;
-
-                // Drop the secondary so its mesh transport tears down.
-                drop(secondary);
-
-                // Tear down tracked worker subprocesses via the shared
-                // SIGTERM → grace → SIGKILL primitive. See
-                // `subprocess_factory::terminate_children` for why
-                // straight SIGKILL is the wrong default for
-                // podman-launched workers.
-                //
-                // Skipped on the panik path: the coordinator's
-                // `pool.kill_all_workers_with_grace` already took down
-                // every worker pgid (including descendants), and we
-                // want the `exit(137)` decision to fire as soon as
-                // the outer scope picks up the Panik variant — no
-                // additional grace ladder.
-                if !matches!(loop_result, LoopResult::Panik(_)) {
-                    factory.cleanup_all();
-                }
-
-                match loop_result {
-                    LoopResult::Ok(()) => Ok(SecondaryRunOutcome::Done(completed)),
-                    LoopResult::Err(e) => Err(e),
-                    LoopResult::Panik(matched_path) => {
+                // Drive the node to its single role-agnostic terminal. The
+                // node ran the secondary (with its setup-promote loop) and, on
+                // a promotion, BUILT + ran the promoted primary in the same
+                // process. The factory's worker-teardown ran INSIDE `Node::run`
+                // (gated off panik). Map the terminal to the GIL-side outcome.
+                let outcome = node.run(inputs).await;
+                let completed = outcome.completed as u32;
+                match outcome.terminal {
+                    RunTerminal::Done => {
+                        tracing::info!("secondary node finished successfully");
+                        Ok(SecondaryRunOutcome::Done(completed))
+                    }
+                    RunTerminal::Panik { matched_path } => {
+                        tracing::error!(
+                            matched_path = %matched_path.display(),
+                            "secondary panik shutdown; propagating to PyO3 boundary for exit(137)"
+                        );
                         Ok(SecondaryRunOutcome::Panik(matched_path))
                     }
-                    LoopResult::Aborted(reason) => {
+                    RunTerminal::Aborted { reason } => {
+                        tracing::error!(
+                            reason = %reason,
+                            "secondary run aborted by primary; propagating \
+                             to PyO3 boundary for exit(1)"
+                        );
                         Ok(SecondaryRunOutcome::Aborted(reason))
+                    }
+                    RunTerminal::Failed { error } => {
+                        tracing::error!(error = %error, "secondary node run failed");
+                        Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "secondary failed: {error}"
+                        )))
                     }
                 }
             }))
@@ -758,6 +581,271 @@ impl PySecondaryCoordinator {
     fn completed(&self) -> u32 {
         self.completed
     }
+}
+
+/// Inputs to [`build_promoted_primary_recipe`] — everything the promoted
+/// primary's build needs that is captured on the GIL thread / from config.
+struct PromotedPrimaryRecipeInputs {
+    secondary_id: String,
+    keepalive_interval: std::time::Duration,
+    peer_timeout: std::time::Duration,
+    keepalive_miss_threshold: u32,
+    retry_max_passes: u32,
+    oom_retry_max_passes: u32,
+    /// The submitter's `--source-already-staged` signal (captured on the GIL
+    /// thread). When true the promoted primary engages the `setup_pending()`
+    /// suppressor so it does not declare `0+0 >= 0` run-complete before its
+    /// discovery-broadcast `TaskAdded` batch lands.
+    required_setup_on_promote: bool,
+    scheduler_config: SchedulerConfig,
+    estimator: PyMemoryEstimatorBridge,
+    /// The Python `PrimaryHandle`'s command channel ends. The PROMOTED PRIMARY
+    /// drains the receiver (post-promotion, externally-issued
+    /// `spawn_tasks`/`reinject` land on its `primary_pending` pool); the
+    /// secondary does not (R4 seam). Moved into the promoted primary via
+    /// `replace_command_channel`.
+    command_tx: tokio::sync::mpsc::Sender<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+    command_rx: tokio::sync::mpsc::Receiver<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+    /// The phase-lifecycle callbacks the PROMOTED primary fires (it owns the
+    /// phase machine; the secondary does not — R4 seam).
+    on_phase_start: crate::managers::lifecycle::OnPhaseStart,
+    on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
+}
+
+/// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
+/// promotion signal to construct the snapshot-seeded `PrimaryCoordinator`.
+///
+/// The node supplies the mesh ends + the demote receiver + the converged
+/// `cluster_state` snapshot (carried on the signal, captured atomically at the
+/// promotion-fire instant); this recipe builds the coordinator around them and
+/// SEEDS it via `seed_from_promotion_snapshot`, returning the ready-to-`run`
+/// primary + its (empty — the snapshot carries the tasks) pipeline args. The
+/// node stays ignorant of scheduler/estimator/`PrimaryConfig` construction
+/// (those are the caller's concern); it only registers the slot + spawns the
+/// returned coordinator.
+///
+/// `FnMut`-but-single-use: a node promotes at most once, so the command
+/// channel + phase callbacks (single-use, not `Clone`) are captured in
+/// `Option`s and taken on the first (only) invocation.
+fn build_promoted_primary_recipe(
+    inputs: PromotedPrimaryRecipeInputs,
+) -> dynrunner_manager_distributed::process::PromotedPrimaryBuilder<
+    dynrunner_scheduler::ResourceStealingScheduler,
+    PyMemoryEstimatorBridge,
+    RunnerIdentifier,
+> {
+    let PromotedPrimaryRecipeInputs {
+        secondary_id,
+        keepalive_interval,
+        peer_timeout,
+        keepalive_miss_threshold,
+        retry_max_passes,
+        oom_retry_max_passes,
+        required_setup_on_promote,
+        scheduler_config,
+        estimator,
+        command_tx,
+        command_rx,
+        on_phase_start,
+        on_phase_end,
+    } = inputs;
+    // Single-use pieces captured in Options so the FnMut can take them on its
+    // one invocation (a node promotes at most once per lifetime).
+    let mut command_channel = Some((command_tx, command_rx));
+    let mut phase_callbacks = Some((on_phase_start, on_phase_end));
+    Box::new(move |client, inbox, demote_rx, snapshot| {
+        let config = PrimaryConfig {
+            node_id: secondary_id.clone(),
+            keepalive_interval,
+            peer_timeout,
+            keepalive_miss_threshold,
+            retry_max_passes,
+            oom_retry_max_passes,
+            // The promoted-primary's setup-defer suppressor (D6/D7): the node
+            // that owns discovery is exactly the node whose promoted primary
+            // must wait for its own discovery batch. Sourced from the run's
+            // OWN `--source-already-staged` arg, NOT a derived band-aid.
+            required_setup_on_promote,
+            ..PrimaryConfig::default()
+        };
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            client,
+            inbox,
+            demote_rx,
+            scheduler_config.build_memory_scheduler(),
+            estimator.clone(),
+        );
+        // Transfer the Python `PrimaryHandle`'s command channel so an
+        // externally-issued `spawn_tasks` / `reinject` (e.g. from a promoted
+        // node's `on_phase_end`) reaches THIS primary's command loop.
+        if let Some((tx, rx)) = command_channel.take() {
+            primary.replace_command_channel(tx, rx);
+        }
+        // The promoted primary owns the phase machine, so it fires the
+        // `on_phase_*` callbacks (R4: the secondary held them only as the
+        // wiring anchor; they belong on the authority).
+        if let Some((on_start, on_end)) = phase_callbacks.take() {
+            primary.register_phase_lifecycle_callbacks(on_start, on_end);
+        }
+        // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
+        // construction input — not a `run_activated` resume, which is gone):
+        // restore the ledger + rebuild the derived pool/roster caches, then
+        // the primary enters the ordinary `run` path and originates
+        // `PrimaryChanged` itself.
+        primary.seed_from_promotion_snapshot(snapshot);
+        PromotedPrimary {
+            coordinator: primary,
+            // The snapshot carries the tasks + phase-deps; a promoted primary
+            // enters `run` with empty binaries (the setup-defer / seeded
+            // path), exactly like the submitter's setup-deferred local
+            // primary.
+            run_args: PrimaryRunArgs {
+                binaries: Vec::new(),
+                phase_deps: HashMap::new(),
+                on_phase_start: Box::new(|_| {}),
+                on_phase_end: Box::new(|_, _, _| {}),
+            },
+        }
+    })
+}
+
+/// Build the consumer's setup-discovery policy closure.
+///
+/// The returned [`dynrunner_manager_distributed::SetupDiscoveryFn`] is
+/// invoked by the Rust `SecondaryCoordinator`'s run loop on each
+/// `SetupPending` yield (pre-staged mode, empty ledger). It runs Python's
+/// `task.discover_items(<root>, args)` and converts the result through the
+/// workspace-shared `extract_binaries`.
+///
+/// # Non-block correctness (§14/§15)
+///
+/// The secondary's run loop shares ONE single-threaded runtime with the
+/// `Node`'s mesh-pump. Running the GIL excursion ON that thread would stall
+/// the pump → the secondary's keepalives stop → the primary declares it dead
+/// → STRAND. So each invocation runs the GIL excursion on a
+/// `tokio::task::spawn_blocking` thread and the returned future merely
+/// `.await`s that handle — yielding the runtime thread to the pump, which
+/// keeps the mesh alive (keepalives flowing) for the whole discovery
+/// duration, however slow the `--source-already-staged` scan is.
+///
+/// The `Send` Python handles are captured in an `Option` and MOVED into the
+/// blocking task on the first (only) invocation — the secondary yields
+/// `SetupPending` at most once (the `ingest_setup_discovery` fire-once latch),
+/// so an `FnMut` that consumes its handles via `take()` is sufficient and
+/// avoids any off-GIL `Py` clone (which would need a `Python` token). A
+/// defensive second invocation surfaces a clear error rather than panicking.
+fn build_setup_discovery_fn(
+    task_definition_py: Py<PyAny>,
+    task_args_py: Py<PyAny>,
+    setup_discover_root: Option<std::path::PathBuf>,
+) -> dynrunner_manager_distributed::SetupDiscoveryFn<RunnerIdentifier> {
+    // Captured once; taken on the single invocation (fire-once latch upstream).
+    let mut handles = Some((task_definition_py, task_args_py, setup_discover_root));
+    Box::new(move || {
+        let taken = handles.take();
+        let fut = async move {
+            let Some((task_definition_py, task_args_py, setup_discover_root)) = taken else {
+                return Err(
+                    "setup-discovery policy invoked more than once — the secondary \
+                     yields SetupPending at most once (ingest fire-once latch); a \
+                     second yield is a programmer error"
+                        .to_string(),
+                );
+            };
+            // Run the GIL excursion OFF the runtime thread so the mesh-pump
+            // keeps the keepalives flowing during discovery (§14/§15).
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
+                    discover_items_under_gil(
+                        py,
+                        &task_definition_py,
+                        &task_args_py,
+                        setup_discover_root.as_ref(),
+                    )
+                })
+            })
+            .await
+            .map_err(|e| format!("setup-discovery blocking task panicked/aborted: {e}"))?
+        };
+        Box::pin(fut) as Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<RunnerIdentifier>>, String>>>>
+    })
+}
+
+/// The GIL-held body of one setup-discovery excursion: resolve the output
+/// root attribute, call `task.discover_items(<root>, args)`, and convert the
+/// result into typed binaries. Pure under-GIL logic, factored out so the
+/// `spawn_blocking` closure stays a thin off-thread wrapper. Returns a
+/// `String` error (the secondary aborts the run on it) so no `PyErr` crosses
+/// the `Send` boundary.
+fn discover_items_under_gil(
+    py: Python<'_>,
+    task_definition_py: &Py<PyAny>,
+    task_args_py: &Py<PyAny>,
+    setup_discover_root: Option<&std::path::PathBuf>,
+) -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
+    let root = setup_discover_root.ok_or_else(|| {
+        "RunOutcome::SetupPending observed but src_network is None — the wrapper \
+         has no root to pass to task.discover_items; this is a programmer error \
+         (only pre-staged mode emits the SetupPending yield, and that mode always \
+         supplies src_network)"
+            .to_string()
+    })?;
+    let task_def = task_definition_py.bind(py);
+    let args = task_args_py.bind(py);
+    let root_py = root
+        .clone()
+        .into_pyobject(py)
+        .map_err(|e| format!("failed to convert discovery root to a Python path: {e}"))?;
+    // Surface `args.resolved_output_root` on the secondary so the task's
+    // `discover_items` sees the same attribute contract the submitter sets.
+    // - Pre-staged mode (`args.source_already_staged` non-None): the
+    //   secondary's filesystem-view of the gateway-side output dir lives at
+    //   the wrapper-script's static bind-mount path `/app/out-network`.
+    // - Non-pre-staged: fall back to `Path(args.output).resolve()`.
+    let pre_staged = args
+        .getattr("source_already_staged")
+        .ok()
+        .filter(|v| !v.is_none())
+        .is_some();
+    if pre_staged {
+        args.setattr("resolved_output_root", "/app/out-network")
+            .map_err(|e| format!("failed to set resolved_output_root: {e}"))?;
+    } else if let Ok(output_attr) = args.getattr("output") {
+        let resolved = (|| -> PyResult<Bound<'_, PyAny>> {
+            let pathlib = py.import("pathlib")?;
+            pathlib
+                .getattr("Path")?
+                .call1((output_attr,))?
+                .call_method0("resolve")
+        })()
+        .map_err(|e| format!("failed to resolve output root: {e}"))?;
+        let resolved_str = resolved
+            .str()
+            .map_err(|e| format!("failed to stringify resolved output root: {e}"))?;
+        args.setattr("resolved_output_root", resolved_str)
+            .map_err(|e| format!("failed to set resolved_output_root: {e}"))?;
+    }
+    // Buffer the discover_items iterable into a `PyList` so the shared
+    // `extract_binaries` helper handles the typed conversion uniformly.
+    let py_list = PyList::empty(py);
+    let iter = task_def
+        .call_method1("discover_items", (root_py, args))
+        .map_err(|e| format!("task.discover_items raised: {e}"))?;
+    let iter = iter
+        .try_iter()
+        .map_err(|e| format!("discover_items result is not iterable: {e}"))?;
+    for item in iter {
+        let item = item.map_err(|e| format!("discover_items iteration raised: {e}"))?;
+        py_list
+            .append(item)
+            .map_err(|e| format!("failed to buffer a discovered item: {e}"))?;
+    }
+    extract_binaries(&py_list).map_err(|e| format!("extract_binaries failed: {e}"))
 }
 
 /// Compose the secondary's memprofile output directory from the

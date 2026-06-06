@@ -574,6 +574,18 @@ impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
         let subcgroup_procs = subcgroup.map(|h| h.procs_path());
         self.spawn_with_runtime(worker_id, &runtime, subcgroup_procs)
     }
+
+    /// Tear down the tracked worker subprocesses via the shared
+    /// SIGTERM→grace→SIGKILL primitive. `Node::run`'s secondary arm invokes
+    /// this at end of run (gated off the panik path — see the trait doc).
+    /// Without it the `std::process::Child` handles would drop without
+    /// killing, leaking the podman worker subprocesses (a `Child` drop is a
+    /// no-op on the OS process). The ladder is a brief blocking teardown at
+    /// end-of-run (no pump activity remains for this node), matching the
+    /// pre-Node pyo3 wrapper's post-loop `cleanup_all()` call exactly.
+    async fn cleanup(&mut self) {
+        self.cleanup_all();
+    }
 }
 
 #[cfg(test)]

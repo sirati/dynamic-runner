@@ -101,8 +101,36 @@ pub enum RunError {
         /// secondary-side log agree.
         reason: String,
     },
+    /// A run-loop POLICY ABORT — a deliberate, consumer-/policy-driven
+    /// non-zero exit that is NOT a strand/collapse and NOT a pre-phase
+    /// duplicate. The canonical case is the observer's invalid-task Policy-B
+    /// fatal-exit (the windowed invalid-task monitor signalled), but this is a
+    /// GENERAL home for the policy-abort class.
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary RAISES on it (the
+    /// run was deliberately aborted by a policy — it MUST surface non-zero,
+    /// never the `Other` log-and-swallow). Distinct from `ClusterCollapsed`
+    /// because nothing was stranded by a routing collapse: reporting a policy
+    /// abort as "cluster collapsed (N stranded)" would mis-point the
+    /// operator's diagnostic (goal #235 — surface the RIGHT exit reason).
+    ///
+    /// NOTE: `DuplicateTaskIdPrePhase` is a sibling policy-abort that predates
+    /// this variant; a future audit may fold it into this class. Left as-is
+    /// for now (its dedicated boundary mapping + message are load-bearing).
+    FatalPolicyExit {
+        /// Human-readable reason naming the policy that aborted the run
+        /// (e.g. the invalid-task monitor's threshold breach).
+        reason: String,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
+    ///
+    /// The ONLY swallow-eligible variant: a stay-local primary's unexpected
+    /// generic `Other` is log-and-swallowed at the PyO3 boundary (exit 0,
+    /// surfacing via the stranded-count accounting) — a pre-existing
+    /// blast-radius-minimization behavior. EVERY known failure that must
+    /// surface non-zero is a STRUCTURED variant above, so `Other` is reached
+    /// only by a genuinely-unexpected generic failure.
     Other(String),
 }
 
@@ -145,6 +173,12 @@ impl fmt::Display for RunError {
                  torn down cluster-wide rather than proceeding on an ambiguous \
                  task set. Fix the producer so every (phase_id, task_id) is \
                  unique within the run."
+            ),
+            Self::FatalPolicyExit { reason } => write!(
+                f,
+                "run aborted by policy: {reason}. A run-loop policy (e.g. the \
+                 observer's invalid-task monitor) signalled a deliberate non-zero \
+                 exit — the run did not complete cleanly."
             ),
             Self::Other(msg) => f.write_str(msg),
         }

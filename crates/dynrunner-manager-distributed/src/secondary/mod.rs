@@ -63,7 +63,9 @@ mod test_helpers;
 mod tests;
 
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
-pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal};
+pub use types::{
+    PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal, SetupDiscovery, SetupDiscoveryFn,
+};
 
 /// A task DEFERRED on this secondary because the target worker's
 /// per-type subprocess is mid-respawn (the dispatch arm observed
@@ -165,7 +167,7 @@ where
     /// no node-wiring (Rust-only unit fixtures that drive promotion through
     /// direct method calls and assert on the CRDT identity advance instead
     /// of a built primary); the fire site is then a best-effort no-op.
-    promotion_tx: Option<tokio::sync::mpsc::UnboundedSender<PromotionSignal>>,
+    promotion_tx: Option<tokio::sync::mpsc::UnboundedSender<PromotionSignal<I>>>,
 
     /// The peer-id of the primary this secondary dialled at bootstrap
     /// (the conventional `"primary"`), set via
@@ -408,6 +410,19 @@ where
     /// `on_phase_end`; same R4-seam disposition.
     #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_start: Option<crate::primary::OnPhaseStart>,
+
+    /// The consumer's setup-discovery policy + the phase-dep graph it
+    /// broadcasts alongside the discovered tasks. Installed via
+    /// [`Self::register_setup_discovery`] BEFORE `run`; `Some` only on the
+    /// pre-staged path where a promoted/discovering node owes setup work.
+    /// When `Some`, the `run` convenience wrapper drives the
+    /// `RunOutcome::SetupPending` yield loop itself — calling the closure,
+    /// `await`ing its (non-thread-blocking) future, and feeding the result
+    /// into [`Self::ingest_setup_discovery`] — instead of erroring on the
+    /// yield. `None` for every non-pre-staged caller, where the secondary
+    /// never observes `SetupPending` and `run` resolves on the first
+    /// `Terminal`.
+    pub(super) setup_discovery: Option<super::SetupDiscovery<I>>,
 
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a

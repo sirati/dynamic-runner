@@ -66,19 +66,29 @@ where
 /// The caller-supplied recipe for building a promoted primary.
 ///
 /// Invoked by [`super::Node::run`] on a [`super::PromotionSignal`], handed
-/// the just-minted mesh ends + the demote receiver the node owns. Returns the
-/// built + seeded primary and its run args.
+/// the just-minted mesh ends, the demote receiver the node owns, AND the
+/// promoting host's converged `cluster_state` snapshot (carried ON the
+/// signal — captured atomically at the promotion-fire instant by the
+/// secondary). Returns the built + seeded primary and its run args.
 ///
-/// The builder OWNS snapshot-sourcing: the caller (pyo3) wires the secondary
-/// and the builder together, so the builder captures the promoting host's
-/// converged `cluster_state` (via the secondary's shared ledger handle) and
-/// calls `PrimaryCoordinator::seed_from_promotion_snapshot` itself. The node
-/// stays ignorant of the seed source — it only registers the slot + spawns
-/// the returned coordinator (SUPREME-LAW #3: the node builds via the recipe,
-/// the secondary never builds). `FnMut` (not `FnOnce`) only so the type is a
-/// plain boxed closure; a node promotes at most once per lifetime.
+/// The node supplies the snapshot but stays ignorant of how to TURN it into a
+/// seeded coordinator: the builder calls
+/// `PrimaryCoordinator::seed_from_promotion_snapshot(snapshot)` itself,
+/// because only the caller (pyo3) knows the scheduler / estimator /
+/// `PrimaryConfig` to construct the coordinator around it. The node only
+/// registers the slot + spawns the returned coordinator (SUPREME-LAW #3: the
+/// node builds via the recipe, the secondary never builds). Threading the
+/// snapshot through the signal (rather than a shared-mutable cell the builder
+/// reads out-of-band) keeps the seed coherent with its trigger and owned
+/// (`Send`). `FnMut` (not `FnOnce`) only so the type is a plain boxed closure;
+/// a node promotes at most once per lifetime.
 pub type PromotedPrimaryBuilder<Sched, Est, I> = Box<
-    dyn FnMut(MeshClient<I>, RoleInbox<I>, mpsc::UnboundedReceiver<()>) -> PromotedPrimary<Sched, Est, I>,
+    dyn FnMut(
+        MeshClient<I>,
+        RoleInbox<I>,
+        mpsc::UnboundedReceiver<()>,
+        crate::cluster_state::ClusterStateSnapshot<I>,
+    ) -> PromotedPrimary<Sched, Est, I>,
 >;
 
 /// Everything [`super::Node::run`] consumes beyond the [`super::Node`]

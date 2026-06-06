@@ -180,16 +180,25 @@ where
             // the snapshot-seeded primary on the event, threading this
             // secondary's `WorkerFactory` to the spawn site) and NEVER
             // builds a primary itself (SUPREME-LAW #3). FIRE the typed
-            // `PromotionSignal { reason, epoch }`: `reason`
+            // `PromotionSignal { reason, epoch, snapshot }`: `reason`
             // (Election vs Transferred) lets the `Node` branch the
             // build/seed path; `epoch` carries the role-table generation the
-            // promotion was raised at so the build is seeded against the
-            // right snapshot. Best-effort — a dropped receiver (or an
-            // unwired coordinator: Rust-only unit fixtures) means no `Node`
-            // is listening, which the CRDT mutation above has already
-            // recorded, so the test still observes the identity advance.
+            // promotion was raised at; `snapshot` is THIS host's converged
+            // `cluster_state` captured RIGHT HERE — atomically with the
+            // signal, inside the same `&mut self` apply that just advanced
+            // the CRDT identity (the `apply` above). Capturing it on the
+            // signal (not via a shared-mutable cell the `Node` reads later)
+            // keeps the seed coherent with its trigger and owned (`Send`):
+            // the `Node` threads it straight to the
+            // `PromotedPrimaryBuilder`, which calls
+            // `seed_from_promotion_snapshot`. Best-effort — a dropped
+            // receiver (or an unwired coordinator: Rust-only unit fixtures)
+            // means no `Node` is listening, which the CRDT mutation above
+            // has already recorded, so the test still observes the identity
+            // advance.
             if let Some(tx) = &self.promotion_tx {
-                if tx.send(PromotionSignal { reason, epoch }).is_err() {
+                let snapshot = self.cluster_state.snapshot();
+                if tx.send(PromotionSignal { reason, epoch, snapshot }).is_err() {
                     tracing::debug!(
                         secondary = %self.config.secondary_id,
                         epoch,

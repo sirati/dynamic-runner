@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 
 use super::mesh::Mesh;
 use super::role_slot::RoleSlot;
+use crate::cluster_state::ClusterStateSnapshot;
 
 /// One live local role: its coordinator paired with the `Arc<RoleSlot>`
 /// the mesh demuxes to (clarification H3).
@@ -79,11 +80,23 @@ pub struct RoleEntry<C, I: Identifier> {
 /// the `Node` does the build on its own loop.
 ///
 /// Typed end-to-end (no strings): the `reason` distinguishes an election
-/// win from a transferred primary, and the `epoch` carries the role-table
-/// epoch the signal was raised at so the build is seeded against the right
-/// generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PromotionSignal {
+/// win from a transferred primary, the `epoch` carries the role-table
+/// epoch the signal was raised at, and the `snapshot` is the promoting
+/// host's converged `cluster_state` captured ATOMICALLY at the
+/// promotion-fire instant (the same `&mut self` apply that fires the
+/// signal). Carrying the snapshot ON the signal — rather than a
+/// shared-mutable cell the `Node` reads later — keeps it coherent with its
+/// trigger and owned (`Send`): there is no "secondary writes before Node
+/// reads" ordering coupling. The `Node` hands the snapshot straight to the
+/// caller's [`super::PromotedPrimaryBuilder`], which seeds the freshly-built
+/// primary via `seed_from_promotion_snapshot`.
+///
+/// Generic over `I` because the snapshot is `ClusterStateSnapshot<I>`. Not
+/// `Copy`/`PartialEq`/`Eq` (the snapshot is a `HashMap`-bearing payload);
+/// `Clone` so a test fixture can keep a copy after asserting on the fired
+/// signal.
+#[derive(Debug, Clone)]
+pub struct PromotionSignal<I: Identifier> {
     /// Why this host is being promoted — an election win
     /// (`fire_local_promotion`) or a transferred primary (submitter
     /// relocate). Carried so the node-wiring wave can branch the build/seed
@@ -91,6 +104,11 @@ pub struct PromotionSignal {
     pub reason: PrimaryChangeReason,
     /// The role-table epoch at which the promotion was raised.
     pub epoch: u64,
+    /// The promoting host's converged `cluster_state` snapshot, captured at
+    /// the promotion-fire instant. The `Node` threads it to the
+    /// [`super::PromotedPrimaryBuilder`] so the built primary resumes from
+    /// the right replicated generation rather than empty state.
+    pub snapshot: ClusterStateSnapshot<I>,
 }
 
 /// The OS-process role composition shell (see the module docs).
@@ -128,7 +146,7 @@ where
     /// secondary at construction.
     // TODO(C-NODE): drained by `Node::run`'s promotion arm.
     #[allow(dead_code)]
-    pub promotion_rx: mpsc::UnboundedReceiver<PromotionSignal>,
+    pub promotion_rx: mpsc::UnboundedReceiver<PromotionSignal<I>>,
     /// Demote ingress: the BUG-6 role-change hook signals here on ANY
     /// self→other primary-register flip (apply OR restore/merge heal); the
     /// node-wiring wave's loop drains this and drops `self.primary` (§1.5).
@@ -158,7 +176,7 @@ where
         mesh: Mesh<I, Tr>,
     ) -> (
         Self,
-        mpsc::UnboundedSender<PromotionSignal>,
+        mpsc::UnboundedSender<PromotionSignal<I>>,
         mpsc::UnboundedSender<()>,
     ) {
         let (promotion_tx, promotion_rx) = mpsc::unbounded_channel();
