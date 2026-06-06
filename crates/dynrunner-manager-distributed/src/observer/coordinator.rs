@@ -509,17 +509,23 @@ where
              (an observer has no bootstrap primary link) — no route to the primary"
                 .to_string()
         })?;
-        // Map the resolved SendTarget back to the role-bearing Destination
-        // the receiver's pump demuxes against. `dst` is already role-bearing
-        // (the observer only ever sends `Destination::Primary` directed or
-        // `Destination::All`), so a resolved `Peer`/`Broadcast` carries the
-        // SAME role as `dst`; the resolution only told us it is routable.
-        let resolved: Destination = match target {
-            SendTarget::Peer(_) | SendTarget::Broadcast => dst,
+        // Two `Destination`s: the routing send-target the mesh-pump dispatches
+        // by, and the C3 stamp the RECEIVER's pump demuxes against its slots.
+        // They differ ONLY for a remote `Destination::Primary`: it is id-less,
+        // so the mesh cannot route it by host — `Mesh::dispatch`'s Primary arm
+        // can only `deliver_local`, and with no local primary slot it returns
+        // the C3-seam `Err` and the frame is DROPPED. So mirror the secondary's
+        // `(Primary, Peer(id)) → Secondary(id)` collapse (`resource.rs:119`):
+        // ROUTE under the resolved host's id so the mesh delivers it over the
+        // wire, but STAMP `Destination::Primary` so the receiver's pump demuxes
+        // to its primary slot.
+        let send_target: Destination = match (&dst, &target) {
+            (Destination::Primary, SendTarget::Peer(id)) => Destination::Secondary(id.clone()),
+            (_, SendTarget::Peer(_) | SendTarget::Broadcast) => dst.clone(),
             // The observer is never the primary, so a self-resolved
             // Destination::Primary is a logic-impossible case; drop it
             // best-effort rather than self-addressing.
-            SendTarget::Loopback => {
+            (_, SendTarget::Loopback) => {
                 tracing::debug!(
                     "observer send resolved to self (impossible for a zero-authority \
                      observer); dropping"
@@ -527,7 +533,10 @@ where
                 return Ok(());
             }
         };
-        self.client.send(resolved.clone(), msg.with_target(resolved))
+        // The C3 stamp is ALWAYS the role-bearing intent `dst` — what the
+        // receiver demuxes to a slot. Only the routing send-target carries the
+        // resolved host (for a remote, id-less `Destination::Primary`).
+        self.client.send(send_target, msg.with_target(dst))
     }
 
     /// Drive the observer until the run terminates or a strand backstop
