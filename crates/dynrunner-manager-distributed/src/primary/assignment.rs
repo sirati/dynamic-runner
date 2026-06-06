@@ -250,6 +250,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 .remove(secondary_id)
                 .unwrap_or_default();
             let msg = DistributedMessage::InitialAssignment {
+                target: None,
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
                 secondary_id: secondary_id.clone(),
@@ -377,6 +378,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
         for secondary_id in &secondary_ids {
             let msg = DistributedMessage::InitialAssignment {
+                target: None,
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
                 secondary_id: secondary_id.clone(),

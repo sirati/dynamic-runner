@@ -147,7 +147,8 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
                 tokio::task::spawn_local(async move {
                     let mut rx = sec_inbound;
                     while let Some(msg) = rx.recv().await {
-                        if let DistributedMessage::InitialAssignment { zip_files, .. } = &msg {
+                        if let DistributedMessage::InitialAssignment {
+    target: None, zip_files, .. } = &msg {
                             let n: usize = zip_files.iter().map(|zf| zf.binaries.len()).sum();
                             counts_for_secondary
                                 .lock()

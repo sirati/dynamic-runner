@@ -8,7 +8,8 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 /// returns both an `AnnouncerHandle` AND a production
 /// `PeerMeshAnnouncerSender` from `attach_observer_announcer`,
 /// and the announcer's `send_holdings` ends up posting a
-/// `DistributedMessage::ClusterMutation { mutations: vec![
+/// `DistributedMessage::ClusterMutation {
+/// mutations: vec![
 /// PeerResourceHoldingsUpdated { … } ] }` onto the coordinator-
 /// side outbox (which the operational `select!` will drain onto
 /// `peer_transport.send(Role::Primary, …)`).

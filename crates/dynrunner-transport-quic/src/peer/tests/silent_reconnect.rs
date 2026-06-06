@@ -146,6 +146,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // can now iterate to accept peer-b's pending dial.
             peer_a
                 .broadcast(DistributedMessage::Keepalive {
+                    target: None,
                     sender_id: "peer-a".into(),
                     timestamp: 1.0,
                     secondary_id: "peer-a".into(),
@@ -179,6 +180,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // surfacing the AcceptedPeer through new_conn_tx.
             peer_b
                 .broadcast(DistributedMessage::Keepalive {
+                    target: None,
                     sender_id: "peer-b".into(),
                     timestamp: 1.0,
                     secondary_id: "peer-b".into(),
@@ -235,6 +237,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // silent and the "peer relay engaged" warn would
             // never fire.
             let warmup: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 1.5,
                 secondary_id: "peer-a".into(),
@@ -291,6 +294,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // emits redial(B). spawn_redial fires (A lower-id
             // than B), dialing B in the background.
             let msg1: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 2.0,
                 secondary_id: "peer-a".into(),
@@ -343,6 +347,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // connections again). observe_direct fires the
             // "peer direct link restored" info — the heal log.
             let msg2: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 3.0,
                 secondary_id: "peer-a".into(),

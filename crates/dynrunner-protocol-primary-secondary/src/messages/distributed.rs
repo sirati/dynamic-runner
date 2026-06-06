@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use dynrunner_core::{ErrorType, ResourceAmount, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
+use crate::address::Destination;
 use crate::cluster_mutation::ClusterMutation;
 use crate::messages::binary_info::{DistributedBinaryInfo, StagedFileRecord, ZipFileAssignment};
 use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
@@ -37,6 +38,15 @@ use crate::messages::state_digest::StateDigest;
 #[allow(clippy::large_enum_variant)]
 pub enum DistributedMessage<I> {
     SecondaryWelcome {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -66,11 +76,29 @@ pub enum DistributedMessage<I> {
         can_be_primary: bool,
     },
     Entropy {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         entropy_hex: String,
     },
     CertExchange {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -80,11 +108,29 @@ pub enum DistributedMessage<I> {
         quic_port: u16,
     },
     PeerInfo {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         peers: Vec<PeerConnectionInfo>,
     },
     InitialAssignment {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -132,6 +178,15 @@ pub enum DistributedMessage<I> {
         uses_file_based_items: bool,
     },
     TaskRequest {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -139,6 +194,15 @@ pub enum DistributedMessage<I> {
         available_resources: Vec<ResourceAmount>,
     },
     TaskAssignment {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -168,6 +232,15 @@ pub enum DistributedMessage<I> {
         predecessor_outputs: BTreeMap<String, TaskOutputs>,
     },
     TransferComplete {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         total_files: u64,
@@ -187,6 +260,15 @@ pub enum DistributedMessage<I> {
     /// the SHA256 of the file contents (used only for the integrity
     /// check on the copy).
     StageFile {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -209,6 +291,15 @@ pub enum DistributedMessage<I> {
     /// observed peer-connection count at signal time (0 in the
     /// single-secondary or fully-failed cases).
     MeshReady {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -220,6 +311,15 @@ pub enum DistributedMessage<I> {
     /// originator targets a specific peer via the unicast transport;
     /// no broadcast (one snapshot is enough).
     RequestClusterSnapshot {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         /// The joiner's own role. The snapshot responder is the first
@@ -259,6 +359,15 @@ pub enum DistributedMessage<I> {
     /// semantics on the receiver, which decodes back into
     /// `ClusterStateSnapshot<I>` once `I` is known in context.
     ClusterSnapshot {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         snapshot_json: String,
@@ -280,11 +389,29 @@ pub enum DistributedMessage<I> {
     /// JSON-erased string the way `ClusterSnapshot` carries its
     /// `I`-parametric payload.
     StateDigest {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         digest: StateDigest,
     },
     TaskComplete {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -294,6 +421,15 @@ pub enum DistributedMessage<I> {
         result_data: Option<Vec<u8>>,
     },
     TaskFailed {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -303,6 +439,15 @@ pub enum DistributedMessage<I> {
         error_message: String,
     },
     Keepalive {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -323,12 +468,30 @@ pub enum DistributedMessage<I> {
         emitter_role: KeepaliveRole,
     },
     TimeoutDetected {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         timed_out_secondary_id: String,
         last_seen: f64,
     },
     TimeoutQuery {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         /// Node id of the suspected-dead party. May be a secondary (when
@@ -338,6 +501,15 @@ pub enum DistributedMessage<I> {
         query_node_id: String,
     },
     TimeoutResponse {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         /// Echoes the `query_node_id` from the corresponding TimeoutQuery
@@ -352,12 +524,30 @@ pub enum DistributedMessage<I> {
         last_keepalive: Option<f64>,
     },
     PromotionVote {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         candidate_id: String,
         vote_round: u32,
     },
     PromotionConfirm {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         new_primary_id: String,
@@ -371,6 +561,15 @@ pub enum DistributedMessage<I> {
     /// of the fault (e.g. "peer mesh fully failed to form: 0 of N
     /// peers reachable; cluster routing impossible").
     SecondaryFatalError {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
@@ -384,6 +583,15 @@ pub enum DistributedMessage<I> {
     /// at run start) into one wire message; single-mutation events
     /// (one `TaskAssigned` per dispatch) use a one-element vec.
     ClusterMutation {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         mutations: Vec<ClusterMutation<I>>,
@@ -408,6 +616,15 @@ pub enum DistributedMessage<I> {
     /// Application code never observes `Relay` — `recv_peer` strips
     /// the envelope before delivery.
     Relay {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         target_id: String,
@@ -424,6 +641,15 @@ pub enum DistributedMessage<I> {
     /// propagates the backoff one step further back. The originator
     /// drops the relay with a warn when its own candidates exhaust.
     RelayBackoff {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
         sender_id: String,
         timestamp: f64,
         original_sender: String,

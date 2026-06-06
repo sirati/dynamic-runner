@@ -67,7 +67,8 @@ fn drain_first_cluster_mutation(
     rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
 ) -> Vec<ClusterMutation<TestId>> {
     while let Ok(msg) = rx.try_recv() {
-        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
             return mutations;
         }
     }
@@ -192,6 +193,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             // already-present records (NoOp) and adds sec-1's.
             promoted
                 .handle_cluster_mutation(DistributedMessage::ClusterMutation {
+                    target: None,
                     sender_id: "primary".into(),
                     timestamp: 0.0,
                     mutations: batch,
@@ -360,6 +362,7 @@ async fn primary_answers_request_cluster_snapshot() {
             // requests a snapshot.
             primary
                 .handle_request_cluster_snapshot(DistributedMessage::RequestClusterSnapshot {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 0.0,
                     is_observer: false,
@@ -374,7 +377,8 @@ async fn primary_answers_request_cluster_snapshot() {
             while let Ok(msg) = requester_inbox.try_recv() {
                 match msg.msg_type() {
                     MessageType::ClusterSnapshot => {
-                        if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = msg {
+                        if let DistributedMessage::ClusterSnapshot {
+    target: None, snapshot_json, .. } = msg {
                             let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
                                 serde_json::from_str(&snapshot_json).expect("snapshot decodes");
                             let mut restored = crate::cluster_state::ClusterState::<TestId>::new();
@@ -389,7 +393,8 @@ async fn primary_answers_request_cluster_snapshot() {
                     MessageType::ClusterMutation => {
                         // The originated PeerJoined for the requester rides
                         // a broadcast ClusterMutation batch.
-                        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
                             got_peer_joined |= mutations.iter().any(|m| {
                                 matches!(
                                     m,

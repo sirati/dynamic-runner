@@ -330,6 +330,7 @@ where
                 };
                 if let Some(query_node_id) = current_primary_id {
                     actions.broadcast.push(DistributedMessage::TimeoutQuery {
+                        target: None,
                         sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
                         query_node_id,
@@ -416,6 +417,7 @@ where
                     // runtime's terminal action on that transition, not a
                     // transitional Voting-time hint.
                     actions.broadcast.push(DistributedMessage::PromotionVote {
+                        target: None,
                         sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
                         candidate_id: secondary_id.clone(),
@@ -440,6 +442,7 @@ where
                         started: Instant::now(),
                     };
                     actions.broadcast.push(DistributedMessage::PromotionVote {
+                        target: None,
                         sender_id: secondary_id.clone(),
                         timestamp: timestamp_now(),
                         candidate_id: secondary_id.clone(),
@@ -519,6 +522,7 @@ where
             };
         }
         Some(DistributedMessage::PromotionConfirm {
+            target: None,
             sender_id,
             timestamp: timestamp_now(),
             new_primary_id: candidate,
@@ -620,6 +624,7 @@ where
         // frame through the same hook. epoch+1 strictly supersedes the
         // prior primary identity.
         let msg = DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             mutations: vec![mutation],

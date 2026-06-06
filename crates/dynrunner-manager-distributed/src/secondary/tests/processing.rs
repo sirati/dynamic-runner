@@ -41,6 +41,7 @@ pub(super) async fn fake_primary(
     // Send peer list (empty — no peers in test)
     to_secondary
         .send(DistributedMessage::PeerInfo {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             peers: vec![],
@@ -50,6 +51,7 @@ pub(super) async fn fake_primary(
     // Send initial assignment (empty — tasks come via TaskAssignment)
     to_secondary
         .send(DistributedMessage::InitialAssignment {
+            target: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             sender_id: "primary".into(),
@@ -64,6 +66,7 @@ pub(super) async fn fake_primary(
     // Send transfer complete
     to_secondary
         .send(DistributedMessage::TransferComplete {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             total_files: 0,
@@ -103,6 +106,7 @@ pub(super) async fn fake_primary(
     // `to_secondary` only afterwards.
     to_secondary
         .send(DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete],
@@ -128,6 +132,7 @@ pub(super) fn send_task_assignment(
 ) {
     let hash = format!("hash_{}", binary.identifier.0);
     tx.send(DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
@@ -488,6 +493,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 }
                 pri_to_sec_tx
                     .send(DistributedMessage::PeerInfo {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         peers: vec![],
@@ -495,6 +501,7 @@ async fn stage_file_then_assign_task_succeeds() {
                     .unwrap();
                 pri_to_sec_tx
                     .send(DistributedMessage::InitialAssignment {
+                        target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
                         sender_id: "primary".into(),
@@ -507,6 +514,7 @@ async fn stage_file_then_assign_task_succeeds() {
                     .unwrap();
                 pri_to_sec_tx
                     .send(DistributedMessage::TransferComplete {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         total_files: 0,
@@ -516,6 +524,7 @@ async fn stage_file_then_assign_task_succeeds() {
 
                 pri_to_sec_tx
                     .send(DistributedMessage::StageFile {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
@@ -535,6 +544,7 @@ async fn stage_file_then_assign_task_succeeds() {
                                 let worker_id = extract_worker_id(&msg);
                                 pri_to_sec_tx
                                     .send(DistributedMessage::TaskAssignment {
+                                        target: None,
                                         sender_id: "primary".into(),
                                         timestamp: 0.0,
                                         secondary_id: secondary_id_clone.clone(),
@@ -574,6 +584,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 // the secondary's `process_tasks` exits on
                 // `cluster_state.run_complete()`.
                 let _ = pri_to_sec_tx.send(DistributedMessage::ClusterMutation {
+                    target: None,
                     sender_id: "primary".into(),
                     timestamp: 0.0,
                     mutations: vec![
@@ -636,6 +647,7 @@ async fn fake_primary_abort(
     }
     to_secondary
         .send(DistributedMessage::PeerInfo {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             peers: vec![],
@@ -643,6 +655,7 @@ async fn fake_primary_abort(
         .unwrap();
     to_secondary
         .send(DistributedMessage::InitialAssignment {
+            target: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             sender_id: "primary".into(),
@@ -655,6 +668,7 @@ async fn fake_primary_abort(
         .unwrap();
     to_secondary
         .send(DistributedMessage::TransferComplete {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             total_files: 0,
@@ -671,6 +685,7 @@ async fn fake_primary_abort(
     // (projecting to `SecondaryTerminal::Aborted`).
     to_secondary
         .send(DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 0.0,
             mutations: vec![

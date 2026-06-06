@@ -18,6 +18,7 @@ struct TestId(String);
 
 fn keepalive(sender: &str) -> DistributedMessage<TestId> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: sender.into(),
         timestamp: 1.0,
         secondary_id: sender.into(),
@@ -125,6 +126,7 @@ fn relay_envelope(
     inner: DistributedMessage<TestId>,
 ) -> DistributedMessage<TestId> {
     DistributedMessage::Relay {
+        target: None,
         sender_id: sender.into(),
         timestamp: 1.0,
         target_id: target.into(),
@@ -154,7 +156,8 @@ async fn relay_envelope_forwarded_through_submitter_to_target() {
     // Fully deterministic: no timer, both frames are already queued.
     let got = transport.recv_peer().await.expect("trailing frame delivers");
     assert!(
-        matches!(got, DistributedMessage::Keepalive { .. }),
+        matches!(got, DistributedMessage::Keepalive {
+    target: None, .. }),
         "first yielded frame must be the trailing direct keepalive, \
          not the forwarded relay: {got:?}"
     );
@@ -181,7 +184,8 @@ async fn relay_envelope_addressed_to_self_is_unwrapped() {
     let got = transport.recv_peer().await.expect("must deliver unwrapped inner");
     assert_eq!(got.sender_id(), "sec-A");
     assert!(
-        matches!(got, DistributedMessage::Keepalive { .. }),
+        matches!(got, DistributedMessage::Keepalive {
+    target: None, .. }),
         "delivered frame must be the unwrapped inner, not the Relay wrapper: {got:?}"
     );
 }
@@ -192,6 +196,7 @@ async fn relay_envelope_addressed_to_self_is_unwrapped() {
 /// `Destination::All` / `broadcast`.
 fn cluster_mutation(epoch: u64) -> DistributedMessage<TestId> {
     DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 1.0,
         mutations: vec![ClusterMutation::PrimaryChanged {

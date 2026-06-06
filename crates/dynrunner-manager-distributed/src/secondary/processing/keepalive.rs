@@ -111,6 +111,7 @@ where
             .filter(|w| w.current_binary.is_some())
             .count() as u32;
         let msg = DistributedMessage::Keepalive {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),

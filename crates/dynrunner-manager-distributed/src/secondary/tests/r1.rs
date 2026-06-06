@@ -73,6 +73,7 @@ mod r1_helpers {
         sender: &str,
     ) -> dynrunner_protocol_primary_secondary::DistributedMessage<TestId> {
         dynrunner_protocol_primary_secondary::DistributedMessage::Keepalive {
+            target: None,
             sender_id: sender.into(),
             timestamp: timestamp_now(),
             secondary_id: sender.into(),
@@ -188,7 +189,8 @@ async fn r1_promotion_on_no_route_count_axis() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. })),
         "Suspecting transition must broadcast TimeoutQuery"
     );
     assert!(sec.fatal_exit.is_none(), "healthy mesh must not fatal-exit");
@@ -693,6 +695,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // tests).
             secondary.pool_mut().workers[0].loaded_type_id = Some(binary.type_id.clone());
             let assignment = DistributedMessage::TaskAssignment {
+                target: None,
                 sender_id: "sec-0".into(), // promoted peer-primary
                 timestamp: 0.0,
                 secondary_id: "sec-1".into(),

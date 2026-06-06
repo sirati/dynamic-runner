@@ -71,6 +71,7 @@ mod tests {
         let mut rx = router.register(MessageType::Keepalive);
 
         let msg = DistributedMessage::Keepalive {
+            target: None,
             sender_id: "sec-0".into(),
             timestamp: 1.0,
             secondary_id: "sec-0".into(),
@@ -93,6 +94,7 @@ mod tests {
     fn unregistered_type_returns_false() {
         let router: MessageRouter<TestId> = MessageRouter::new("primary".into());
         let msg = DistributedMessage::Keepalive {
+            target: None,
             sender_id: "sec-0".into(),
             timestamp: 1.0,
             secondary_id: "sec-0".into(),

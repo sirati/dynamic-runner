@@ -136,6 +136,7 @@ async fn receiver_side_relay_observation_triggers_redial() {
 
     let now = Instant::now();
     let inbound = DistributedMessage::Relay {
+        target: None,
         sender_id: "d".into(),
         timestamp: 1.0,
         target_id: "a".into(),
@@ -146,7 +147,8 @@ async fn receiver_side_relay_observation_triggers_redial() {
     let outcome = router.process_inbound(inbound, &mut conns, Clocks { now, wire: 1.0 });
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
-            assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
+            assert!(matches!(&*msg, DistributedMessage::Keepalive {
+    target: None, .. }));
             assert_eq!(
                 redial_target.as_deref(),
                 Some("d"),

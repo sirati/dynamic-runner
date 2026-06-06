@@ -197,11 +197,66 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         let _ = self.transport.broadcast(frame.clone()).await;
 
         // Local fan: every local slot except the originating role.
-        // Collect the prune-targets first, then prune (never during the
-        // upgrade walk — BUG-2).
+        self.fan_local(Some(origin), frame);
+    }
+
+    /// Route ONE frame received off the wire to the right LOCAL slot(s),
+    /// reading the frame's resolved [`Destination`] target (the C3 field
+    /// stamped by the sender's egress) — a pure `role → slot` table, NEVER
+    /// a content classifier and NEVER an `if host == local_id` test.
+    ///
+    /// This is the mesh-pump's INGRESS demux. It is local-only: an inbound
+    /// frame has already crossed the wire to THIS peer, so it is NEVER
+    /// re-fanned to remotes (the no-re-broadcast invariant, dirty-D3 /
+    /// BUG-8). The `origin`-exclusion of [`Self::broadcast`] does not apply
+    /// — the originator is a remote peer, not a local role.
+    ///
+    /// - directed `Some(Primary|Secondary|Observer)` → [`Self::deliver_local`]
+    ///   to that one role's slot.
+    /// - `Some(All)` → local fan to every live slot.
+    /// - `None` (transitional: a frame stamped before the egress rewire
+    ///   lands) → a LOUD `debug_assert!` + `warn`, then the documented safe
+    ///   default: fan to every live LOCAL slot so NO local coordinator
+    ///   misses a frame. We never silently drop. Once every egress edge
+    ///   stamps `Some(resolved)` (the next coordinator-rewire wave), this
+    ///   arm is unreachable and the `debug_assert!` guards that invariant.
+    pub fn route_incoming(&mut self, frame: DistributedMessage<I>) {
+        match frame.target() {
+            Some(Destination::All) => self.fan_local(None, frame),
+            Some(dst) => {
+                // `from_destination` is total over the non-`All` directed
+                // variants; the `All` arm is handled above.
+                let role = LocalRole::from_destination(dst)
+                    .expect("non-All directed Destination always carries a role");
+                self.deliver_local(role, frame);
+            }
+            None => {
+                debug_assert!(
+                    false,
+                    "Mesh::route_incoming: frame arrived with no C3 target — every \
+                     egress edge must stamp Some(resolved) once the coordinators are \
+                     rewired"
+                );
+                tracing::warn!(
+                    kind = ?frame.msg_type(),
+                    "mesh ingress: frame has no routing target (pre-stamp transitional); \
+                     fanning to every local slot rather than dropping it"
+                );
+                self.fan_local(None, frame);
+            }
+        }
+    }
+
+    /// Deliver a frame to every LIVE local slot, optionally excluding one
+    /// role. Collect-then-prune over a stale `Weak` (never prune during
+    /// the upgrade walk — BUG-2). This is the local half of both the
+    /// egress `All`-fan (`exclude = Some(origin)`, BUG-1) and the ingress
+    /// fan (`exclude = None`). It NEVER touches the wire — the remote half
+    /// of an egress broadcast is the caller's separate concern.
+    fn fan_local(&mut self, exclude: Option<LocalRole>, frame: DistributedMessage<I>) {
         let mut to_prune: Vec<LocalRole> = Vec::new();
         for role in [LocalRole::Primary, LocalRole::Secondary, LocalRole::Observer] {
-            if role == origin {
+            if Some(role) == exclude {
                 continue;
             }
             if let Some(weak) = self.slot_for(role) {
@@ -218,6 +273,43 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         for role in to_prune {
             self.clear_slot(role);
         }
+    }
+
+    /// Re-point a live local slot from the `old` role's field to the `new`
+    /// role's field, atomically with the slot's in-place
+    /// [`RoleSlot::set_role`] retag (clarification D-RETAG / H5).
+    ///
+    /// C0 keys slots by FIELD (`primary`/`secondary`/`observer`), not by
+    /// the slot's live `role()`. So a bare `slot.set_role(new)` would leave
+    /// this mesh demuxing `new`-role frames to a `None` field and
+    /// `old`-role frames to the now-retagged slot. This method moves the
+    /// `Weak` from the `old` field to the `new` field AND flips the slot's
+    /// role, in one step, so the demux stays correct across the
+    /// submitter-primary→observer handoff. The SAME `Arc`/channel is
+    /// preserved — the [`super::RoleInbox`] drains uninterrupted (stable
+    /// channel, no delivery gap).
+    ///
+    /// `old == new` is a no-op. If no slot occupies the `old` field
+    /// (already torn down or never registered), the move is a no-op — there
+    /// is nothing live to retag — and the `new` field is left as-is. The
+    /// caller (the [`super::Node`] swap) holds the matching `Arc` and is
+    /// the authority on whether a retag is appropriate.
+    pub fn retag_local_role(&mut self, old: LocalRole, new: LocalRole) {
+        if old == new {
+            return;
+        }
+        let Some(weak) = self.take_slot(old) else {
+            return;
+        };
+        // Flip the live slot's role in place (the stable-channel retag),
+        // then re-point the mesh `Weak` into the `new` field. A pre-existing
+        // `Weak` in the `new` field is REPLACED — its `Arc`, once the caller
+        // drops it, simply never upgrades again (the same semantics as a
+        // second `register_local_role`).
+        if let Some(arc) = weak.upgrade() {
+            arc.set_role(new);
+        }
+        self.set_slot(new, weak);
     }
 
     /// Publish the LIVE transport membership into the [`MembershipView`]
@@ -281,6 +373,26 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             LocalRole::Primary => self.primary = None,
             LocalRole::Secondary => self.secondary = None,
             LocalRole::Observer => self.observer = None,
+        }
+    }
+
+    /// Take a role's `Weak` out of its field, leaving it `None` (the move
+    /// source for [`Self::retag_local_role`]).
+    fn take_slot(&mut self, role: LocalRole) -> Option<Weak<RoleSlot<I>>> {
+        match role {
+            LocalRole::Primary => self.primary.take(),
+            LocalRole::Secondary => self.secondary.take(),
+            LocalRole::Observer => self.observer.take(),
+        }
+    }
+
+    /// Install a `Weak` into a role's field (the move destination for
+    /// [`Self::retag_local_role`]).
+    fn set_slot(&mut self, role: LocalRole, weak: Weak<RoleSlot<I>>) {
+        match role {
+            LocalRole::Primary => self.primary = Some(weak),
+            LocalRole::Secondary => self.secondary = Some(weak),
+            LocalRole::Observer => self.observer = Some(weak),
         }
     }
 

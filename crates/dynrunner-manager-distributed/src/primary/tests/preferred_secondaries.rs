@@ -164,6 +164,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
             // `handle_cluster_mutation` with the PeerJoined batch.
             register_operational_secondary(&mut primary, "secondary-late");
             let join = dynrunner_protocol_primary_secondary::DistributedMessage::ClusterMutation {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: crate::primary::wire::timestamp_now(),
                 mutations: vec![

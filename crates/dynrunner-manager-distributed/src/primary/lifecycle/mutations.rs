@@ -81,6 +81,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             return;
         }
         let msg = DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             mutations: applied,
@@ -291,6 +292,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }
         let count = self.secondaries.len();
         let msg = DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             mutations,
@@ -433,6 +435,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     pub(crate) async fn send_transfer_complete(&mut self) -> Result<(), String> {
         let msg = DistributedMessage::TransferComplete {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             total_files: 0,

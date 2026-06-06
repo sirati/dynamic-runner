@@ -408,6 +408,7 @@ pub(super) async fn fake_secondary_with_addrs(
 ) {
     outgoing_to_primary
         .send(DistributedMessage::SecondaryWelcome {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -424,6 +425,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
     outgoing_to_primary
         .send(DistributedMessage::CertExchange {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -442,6 +444,7 @@ pub(super) async fn fake_secondary_with_addrs(
     // because the in-process fake doesn't model peer-dial latency.
     outgoing_to_primary
         .send(DistributedMessage::MeshReady {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -484,6 +487,7 @@ pub(super) async fn fake_secondary_with_addrs(
                             for task_hash in pending_hashes.drain() {
                                 outgoing_to_primary
                                     .send(DistributedMessage::TaskComplete {
+                                        target: None,
                                         sender_id: secondary_id.clone(),
                                         timestamp: 0.0,
                                         secondary_id: secondary_id.clone(),
@@ -517,6 +521,7 @@ pub(super) async fn fake_secondary_with_addrs(
                     pending_hashes.remove(&entry.hash);
                     outgoing_to_primary
                         .send(DistributedMessage::TaskComplete {
+                            target: None,
                             sender_id: secondary_id.clone(),
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
@@ -528,6 +533,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
                     outgoing_to_primary
                         .send(DistributedMessage::TaskRequest {
+                            target: None,
                             sender_id: secondary_id.clone(),
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
@@ -545,6 +551,7 @@ pub(super) async fn fake_secondary_with_addrs(
                 pending_hashes.remove(&file_hash);
                 outgoing_to_primary
                     .send(DistributedMessage::TaskComplete {
+                        target: None,
                         sender_id: secondary_id.clone(),
                         timestamp: 0.0,
                         secondary_id: secondary_id.clone(),
@@ -556,6 +563,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
                 outgoing_to_primary
                     .send(DistributedMessage::TaskRequest {
+                        target: None,
                         sender_id: secondary_id.clone(),
                         timestamp: 0.0,
                         secondary_id: secondary_id.clone(),

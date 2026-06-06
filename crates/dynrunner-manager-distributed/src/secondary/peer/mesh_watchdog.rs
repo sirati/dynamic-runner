@@ -214,6 +214,7 @@ where
             return;
         }
         let msg: DistributedMessage<I> = DistributedMessage::MeshReady {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),

@@ -16,6 +16,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
+            target: None,
             ref secondary_id,
             worker_id,
             ref available_resources,
@@ -120,6 +121,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         let predecessor_outputs =
                             gather_predecessor_outputs(&self.cluster_state, &binary);
                         let assignment_msg = DistributedMessage::TaskAssignment {
+                            target: None,
                             sender_id: self.config.node_id.clone(),
                             timestamp: timestamp_now(),
                             secondary_id: sec_id.clone(),

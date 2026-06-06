@@ -223,6 +223,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// no-op.
     pub(super) fn handle_mesh_ready(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::MeshReady {
+            target: None,
             secondary_id,
             peer_count,
             ..
@@ -239,6 +240,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     pub(super) async fn handle_welcome(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::SecondaryWelcome {
+            target: None,
             secondary_id,
             resources,
             worker_count,
@@ -334,6 +336,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     pub(super) fn handle_cert_exchange(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::CertExchange {
+            target: None,
             secondary_id,
             public_cert_pem,
             ipv4_address,

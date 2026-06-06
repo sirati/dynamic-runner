@@ -7,10 +7,11 @@
 //! `PeerId`s — it never resolves or mentions a role. Yet a peer that runs
 //! several coordinators (a primary + its own secondary after a promotion)
 //! must demux an incoming directed frame to the RIGHT local coordinator
-//! and must let a coordinator address a same-process sibling without a
-//! "co-located" concept. That role-aware demux lives HERE, in
-//! `manager-distributed`, wrapped strictly on top of the role-agnostic
-//! transport. The transport stays untouched for roles.
+//! and must let a coordinator address a same-process sibling on the SAME
+//! peer through a normal `Destination`, never a special same-peer code
+//! path. That role-aware demux lives HERE, in `manager-distributed`,
+//! wrapped strictly on top of the role-agnostic transport. The transport
+//! stays untouched for roles.
 //!
 //! # The five types and their single concern + boundary
 //!
@@ -44,19 +45,32 @@
 //!   [`mesh::Mesh::register_local_role`] so it cannot mismatch (M3).
 //!   Boundary: the coordinator holds these; sees neither the mesh nor the
 //!   transport.
+//! - [`node::Node`] — the *OS-process role composition shell*: the
+//!   [`mesh::Mesh`] + one nullable [`node::RoleEntry`] per role + the
+//!   promotion/demote lifecycle channels. SKELETON only here (the struct +
+//!   `RoleEntry` + [`node::PromotionSignal`] + channel plumbing); the
+//!   `run` composition, the promotion build, and the BUG-6 teardown are
+//!   the node-wiring wave. Boundary: names the coordinators by generic
+//!   parameter, never reaching into one.
 //!
-//! # C0 scope (this module) vs later phases
+//! # Scope (this module) vs the coordinator-rewire waves
 //!
-//! These are the linchpin types only. The `Process` object (composition +
-//! mesh-pump + spawn/drive) is C1; the egress collapse at the coordinator
-//! `send_to` edges is C2; the explicit per-frame `target: Destination`
-//! field on the wire type is C3. C0 designs `dispatch`/`deliver_local` to
-//! ACCEPT a role-bearing target so those phases plug in without reshaping
-//! the API.
+//! The wire frame's per-variant routing `target: Option<Destination>` (the
+//! C3 field), the `Mesh` ingress demux ([`mesh::Mesh::route_incoming`]),
+//! the in-place mesh retag ([`mesh::Mesh::retag_local_role`]), and the
+//! [`node::Node`] SKELETON all live now. Still to come (the
+//! coordinator-per-agent waves): the coordinators dropping their transport
+//! generic to take a [`mesh_client::MeshClient`] + [`mesh_client::RoleInbox`],
+//! stamping the resolved `target` at their egress edges, and the
+//! `Node::run` composition that registers roles, spawns the coordinators +
+//! mesh-pump, and drives promotion/demotion. `dispatch`/`deliver_local`/
+//! `route_incoming` already ACCEPT a role-bearing target so those waves
+//! plug in without reshaping the API.
 
 pub mod membership;
 pub mod mesh;
 pub mod mesh_client;
+pub mod node;
 pub mod role;
 pub mod role_slot;
 
@@ -66,5 +80,6 @@ mod tests;
 pub use membership::MembershipView;
 pub use mesh::Mesh;
 pub use mesh_client::{LocalDispatch, MeshClient, RoleInbox};
+pub use node::{Node, PromotionSignal, RoleEntry};
 pub use role::LocalRole;
 pub use role_slot::RoleSlot;

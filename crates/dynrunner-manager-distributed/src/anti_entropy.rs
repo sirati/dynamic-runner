@@ -71,6 +71,7 @@ pub fn digest_broadcast<I>(
     digest: StateDigest,
 ) -> DistributedMessage<I> {
     DistributedMessage::StateDigest {
+        target: None,
         sender_id: node_id.to_string(),
         timestamp,
         digest,
@@ -143,6 +144,7 @@ pub fn reconcile_against_peer<I>(
     // there is no primary fallback.
     let destination = Destination::Secondary(PeerId::from(sender_id.to_string()));
     let request = DistributedMessage::RequestClusterSnapshot {
+        target: None,
         sender_id: requester.node_id.to_string(),
         timestamp,
         is_observer: requester.is_observer,
@@ -241,6 +243,7 @@ pub fn plan_recovery_pull<I>(
     *cursor = cursor.wrapping_add(1);
     let destination = Destination::Secondary(PeerId::from(target.to_string()));
     let request = DistributedMessage::RequestClusterSnapshot {
+        target: None,
         sender_id: requester.node_id.to_string(),
         timestamp,
         is_observer: requester.is_observer,

@@ -201,6 +201,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             return;
         }
         let msg = DistributedMessage::<I>::Keepalive {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.node_id.clone(),
@@ -328,6 +329,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // if the heartbeat-monitor's call was a false positive. Iterating
         // the post-removal survivors avoids that race.
         let timeout_msg = DistributedMessage::<I>::TimeoutDetected {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             timed_out_secondary_id: secondary_id.clone(),
@@ -556,6 +558,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         let DistributedMessage::SecondaryFatalError {
+            target: None,
             secondary_id,
             error,
             ..

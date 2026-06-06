@@ -201,6 +201,7 @@ impl<I: Identifier> Router<I> {
                 relay_id,
                 path,
                 inner,
+                target: _,
             } => {
                 if target_id == self.self_id {
                     // Receiver-side observation: the original sender
@@ -261,6 +262,7 @@ impl<I: Identifier> Router<I> {
                 timestamp: _,
                 original_sender,
                 relay_id,
+                target: _,
             } => {
                 self.handle_inbound_backoff(
                     original_sender,
@@ -301,6 +303,7 @@ impl<I: Identifier> Router<I> {
     ) -> InboundOutcome<I> {
         match msg {
             DistributedMessage::Relay {
+                target: None,
                 sender_id,
                 target_id,
                 inner,

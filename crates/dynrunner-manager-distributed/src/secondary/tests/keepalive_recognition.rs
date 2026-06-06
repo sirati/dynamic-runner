@@ -24,6 +24,7 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, 
 /// identity plus the emitter role tag.
 fn keepalive(origin: &str, role: KeepaliveRole) -> DistributedMessage<TestId> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: origin.into(),
         timestamp: 1.0,
         secondary_id: origin.into(),
@@ -37,6 +38,7 @@ fn keepalive(origin: &str, role: KeepaliveRole) -> DistributedMessage<TestId> {
 /// what every other secondary test uses to install a primary identity).
 fn promote(primary_id: &str) -> DistributedMessage<TestId> {
     DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "promoter".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {

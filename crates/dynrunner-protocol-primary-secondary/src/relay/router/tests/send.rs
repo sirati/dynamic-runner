@@ -25,7 +25,8 @@ fn send_to_peer_direct_when_target_reachable() {
     assert_eq!(entries[0].addressee, "b");
     assert!(matches!(
         entries[0].msg,
-        DistributedMessage::Keepalive { .. }
+        DistributedMessage::Keepalive {
+    target: None, .. }
     ));
     // Direct path must NOT have set last_observed_relay_at.
     assert!(

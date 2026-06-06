@@ -343,6 +343,7 @@ pub trait PeerTransport<I: Identifier> {
                     continue;
                 }
                 let request = DistributedMessage::RequestClusterSnapshot {
+                    target: None,
                     sender_id: local_id.clone(),
                     timestamp: timestamp_now(),
                     // The joiner declares its own role + capability so the
@@ -414,7 +415,8 @@ pub trait PeerTransport<I: Identifier> {
                             Ok(snapshots)
                         };
                     }
-                    Ok(Some(DistributedMessage::ClusterSnapshot { snapshot_json, .. })) => {
+                    Ok(Some(DistributedMessage::ClusterSnapshot {
+    target: None, snapshot_json, .. })) => {
                         snapshots.push(snapshot_json);
                         continue;
                     }

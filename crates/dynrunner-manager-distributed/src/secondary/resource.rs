@@ -173,6 +173,7 @@ where
         file_hash: &str,
     ) -> Result<(), String> {
         let msg = DistributedMessage::TaskFailed {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
@@ -260,6 +261,7 @@ where
                     };
 
                     let msg = DistributedMessage::TaskFailed {
+                        target: None,
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
@@ -332,6 +334,7 @@ where
         };
 
         let msg = DistributedMessage::TaskRequest {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),

@@ -63,6 +63,7 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[(&str, &str)]) -> TaskInfo<
 
 fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId> {
     DistributedMessage::TaskRequest {
+        target: None,
         sender_id: secondary_id.into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
@@ -76,6 +77,7 @@ fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId
 
 fn task_complete(secondary_id: &str, worker_id: u32, hash: &str) -> DistributedMessage<TestId> {
     DistributedMessage::TaskComplete {
+        target: None,
         sender_id: secondary_id.into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
@@ -145,7 +147,8 @@ fn assigned_task_ids(
 ) -> Vec<String> {
     let mut ids = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        if let DistributedMessage::TaskAssignment { binary_info, .. } = msg {
+        if let DistributedMessage::TaskAssignment {
+    target: None, binary_info, .. } = msg {
             ids.push(binary_info.task_id);
         }
     }

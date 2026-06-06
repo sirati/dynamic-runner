@@ -70,6 +70,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// bounded recv wait falls back to its own deadline.
     pub(crate) async fn handle_request_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
         let DistributedMessage::RequestClusterSnapshot {
+            target: None,
             sender_id,
             is_observer,
             can_be_primary,
@@ -82,6 +83,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         match serde_json::to_string(&snapshot) {
             Ok(snapshot_json) => {
                 let response = DistributedMessage::ClusterSnapshot {
+                    target: None,
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
                     snapshot_json,
@@ -139,6 +141,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// itself non-observer + primary-capable on the request frame.
     pub(crate) async fn handle_state_digest(&mut self, msg: DistributedMessage<I>) {
         let DistributedMessage::StateDigest {
+            target: None,
             digest, sender_id, ..
         } = msg
         else {
@@ -175,7 +178,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     }
 
     pub(crate) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
-        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
             // Note whether any ledger-growing mutation rides in this
             // batch BEFORE moving the mutations into apply, so the
             // post-apply `total_tasks` refresh below absorbs runtime

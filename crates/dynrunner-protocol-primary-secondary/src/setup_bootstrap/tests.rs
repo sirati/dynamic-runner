@@ -109,6 +109,7 @@ fn non_setup_variant_rejected() {
     // Pick `Keepalive` — the canonical runtime frame and the one
     // most likely to race a setup-phase recv in practice.
     let runtime: DistributedMessage<()> = DistributedMessage::Keepalive {
+        target: None,
         sender_id: "s0".into(),
         timestamp: 4.0,
         secondary_id: "s0".into(),

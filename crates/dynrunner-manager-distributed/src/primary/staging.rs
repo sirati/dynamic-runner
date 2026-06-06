@@ -287,6 +287,7 @@ where
         dest_path: String,
     ) -> Result<(), String> {
         let msg = DistributedMessage::StageFile {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: secondary_id.to_string(),

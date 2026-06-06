@@ -177,6 +177,7 @@ mod tests {
         let cert_der = cert.cert_der.clone();
 
         let outgoing: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+            target: None,
             sender_id: "test".into(),
             timestamp: 42.0,
             secondary_id: "test".into(),

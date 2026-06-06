@@ -68,6 +68,7 @@ async fn non_observer_filters_observer_from_lowest_alive() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::PromotionVote {
+                    target: None,
                     candidate_id, ..
                 } if candidate_id == "sec-b")),
         "expected PromotionVote naming sec-b (self); broadcasts: \
@@ -93,6 +94,7 @@ async fn primary_changed_naming_observer_is_rejected() {
     });
 
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -182,6 +184,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::PromotionVote {
+                    target: None,
                     candidate_id, ..
                 } if candidate_id == "sec-b")),
         "expected PromotionVote naming sec-b"
@@ -191,6 +194,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
     // PrimaryChanged naming the observer is silently rejected
     // (logged at error level) without flipping role.
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {

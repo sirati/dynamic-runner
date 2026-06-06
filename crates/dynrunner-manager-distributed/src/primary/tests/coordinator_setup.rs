@@ -106,6 +106,7 @@ fn set_slurm_job_manager_stores_arc() {
 /// (broadcast shape, observer projection, non-observer broadcast).
 fn welcome_msg(secondary_id: &str, is_observer: bool) -> DistributedMessage<TestId> {
     DistributedMessage::SecondaryWelcome {
+        target: None,
         sender_id: secondary_id.into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
@@ -133,7 +134,8 @@ fn drain_peer_joined(
 ) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
             for m in mutations {
                 if let dynrunner_protocol_primary_secondary::ClusterMutation::PeerJoined {
                     peer_id,
@@ -160,7 +162,8 @@ fn drain_secondary_capacity(
 ) -> Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>)> {
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
             for m in mutations {
                 if let dynrunner_protocol_primary_secondary::ClusterMutation::SecondaryCapacity {
                     secondary,
@@ -203,6 +206,7 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
             // resource, so the assertion pins that the ORIGINATED capacity
             // carries the welcome's values, not a default.
             let welcome = DistributedMessage::SecondaryWelcome {
+                target: None,
                 sender_id: id.clone(),
                 timestamp: 0.0,
                 secondary_id: id.clone(),

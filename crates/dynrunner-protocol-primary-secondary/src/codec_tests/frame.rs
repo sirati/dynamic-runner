@@ -18,6 +18,7 @@ fn decode_frame_incomplete_body() {
 #[test]
 fn msg_type_and_sender() {
     let msg: DistributedMessage<TestId> = DistributedMessage::Entropy {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 1.0,
         entropy_hex: "deadbeef".into(),
@@ -31,6 +32,7 @@ fn roundtrip_all_message_types() {
     use dynrunner_core::{ResourceAmount, ResourceKind};
     let messages: Vec<DistributedMessage<TestId>> = vec![
         DistributedMessage::SecondaryWelcome {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -44,11 +46,13 @@ fn roundtrip_all_message_types() {
             can_be_primary: true,
         },
         DistributedMessage::Entropy {
+            target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
             entropy_hex: "aa".into(),
         },
         DistributedMessage::CertExchange {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -58,11 +62,13 @@ fn roundtrip_all_message_types() {
             quic_port: 5000,
         },
         DistributedMessage::PeerInfo {
+            target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
             peers: vec![],
         },
         DistributedMessage::InitialAssignment {
+            target: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             sender_id: "p".into(),
@@ -73,6 +79,7 @@ fn roundtrip_all_message_types() {
             staged_files: vec![],
         },
         DistributedMessage::TaskRequest {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -83,6 +90,7 @@ fn roundtrip_all_message_types() {
             }],
         },
         DistributedMessage::TaskAssignment {
+            target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -105,23 +113,27 @@ fn roundtrip_all_message_types() {
             predecessor_outputs: std::collections::BTreeMap::new(),
         },
         DistributedMessage::TransferComplete {
+            target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
             total_files: 10,
             total_bytes: 1024,
         },
         DistributedMessage::RequestClusterSnapshot {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             is_observer: false,
             can_be_primary: true,
         },
         DistributedMessage::ClusterSnapshot {
+            target: None,
             sender_id: "p".into(),
             timestamp: 0.0,
             snapshot_json: "{}".into(),
         },
         DistributedMessage::StateDigest {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             digest: StateDigest {
@@ -142,6 +154,7 @@ fn roundtrip_all_message_types() {
             },
         },
         DistributedMessage::TaskComplete {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -150,6 +163,7 @@ fn roundtrip_all_message_types() {
             result_data: None,
         },
         DistributedMessage::TaskFailed {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -159,6 +173,7 @@ fn roundtrip_all_message_types() {
             error_message: "m".into(),
         },
         DistributedMessage::Keepalive {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
@@ -166,35 +181,41 @@ fn roundtrip_all_message_types() {
             emitter_role: KeepaliveRole::Secondary,
         },
         DistributedMessage::TimeoutDetected {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             timed_out_secondary_id: "s2".into(),
             last_seen: 0.0,
         },
         DistributedMessage::TimeoutQuery {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             query_node_id: "s2".into(),
         },
         DistributedMessage::TimeoutResponse {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             query_node_id: "s2".into(),
             last_keepalive: Some(1.0),
         },
         DistributedMessage::PromotionVote {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             candidate_id: "s".into(),
             vote_round: 1,
         },
         DistributedMessage::PromotionConfirm {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             new_primary_id: "s".into(),
             vote_round: 1,
         },
         DistributedMessage::SecondaryFatalError {
+            target: None,
             sender_id: "s".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),

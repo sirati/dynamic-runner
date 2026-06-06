@@ -75,7 +75,8 @@ fn count_snapshot_requests(
 ) -> usize {
     log.borrow()
         .iter()
-        .filter(|m| matches!(m, DistributedMessage::RequestClusterSnapshot { .. }))
+        .filter(|m| matches!(m, DistributedMessage::RequestClusterSnapshot {
+    target: None, .. }))
         .count()
 }
 
@@ -137,6 +138,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
 
             // ── Round 1: the peer's periodic digest arrives. ──
             let digest_frame = DistributedMessage::StateDigest {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
@@ -156,6 +158,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             let snapshot_json =
                 serde_json::to_string(&donor.snapshot()).expect("donor snapshot serializes");
             let reply = DistributedMessage::ClusterSnapshot {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 snapshot_json,
@@ -182,6 +185,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             // ── Round 2: the next digest round must be a NoOp (quiescent). ──
             peer_log.borrow_mut().clear();
             let digest_frame_2 = DistributedMessage::StateDigest {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
@@ -234,13 +238,15 @@ async fn converged_secondary_emits_but_does_not_pull() {
                 peer_log
                     .borrow()
                     .iter()
-                    .any(|m| matches!(m, DistributedMessage::StateDigest { .. })),
+                    .any(|m| matches!(m, DistributedMessage::StateDigest {
+    target: None, .. })),
                 "the cadence emit must put a StateDigest on the wire"
             );
 
             // Receiving the converged peer's digest pulls nothing.
             peer_log.borrow_mut().clear();
             let digest_frame = DistributedMessage::StateDigest {
+                target: None,
                 sender_id: "worker-c".into(),
                 timestamp: 0.0,
                 digest: peer.digest(),

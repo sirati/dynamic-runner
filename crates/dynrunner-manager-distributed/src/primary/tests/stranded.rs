@@ -77,6 +77,7 @@ async fn fake_secondary_dies_post_mesh_ready(
 ) {
     outgoing_to_primary
         .send(DistributedMessage::SecondaryWelcome {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -92,6 +93,7 @@ async fn fake_secondary_dies_post_mesh_ready(
         .unwrap();
     outgoing_to_primary
         .send(DistributedMessage::CertExchange {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -103,6 +105,7 @@ async fn fake_secondary_dies_post_mesh_ready(
         .unwrap();
     outgoing_to_primary
         .send(DistributedMessage::MeshReady {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -431,6 +434,7 @@ async fn drain_pending_messages_updates_completed_set() {
             for hash in ["hash-a", "hash-b", "hash-c"] {
                 incoming_tx
                     .send(DistributedMessage::TaskComplete {
+                        target: None,
                         sender_id: sec_id.clone(),
                         timestamp: 0.0,
                         secondary_id: sec_id.clone(),

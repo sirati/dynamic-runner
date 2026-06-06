@@ -141,7 +141,8 @@ async fn gated_mesh_secondary(
     fn is_primary_changed(m: &DistributedMessage<TestId>) -> bool {
         matches!(
             m,
-            DistributedMessage::ClusterMutation { mutations, .. }
+            DistributedMessage::ClusterMutation {
+    target: None, mutations, .. }
                 if mutations
                     .iter()
                     .any(|mu| matches!(mu, ClusterMutation::PrimaryChanged { .. }))
@@ -150,6 +151,7 @@ async fn gated_mesh_secondary(
 
     outgoing_to_primary
         .send(DistributedMessage::SecondaryWelcome {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -166,6 +168,7 @@ async fn gated_mesh_secondary(
 
     outgoing_to_primary
         .send(DistributedMessage::CertExchange {
+            target: None,
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -195,6 +198,7 @@ async fn gated_mesh_secondary(
                 _ = trigger => {
                     outgoing_to_primary
                         .send(DistributedMessage::MeshReady {
+                            target: None,
                             sender_id: secondary_id.clone(),
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
@@ -268,6 +272,7 @@ fn handle_inbound_for_gated_secondary(
             for (idx, entry) in entries.iter().enumerate() {
                 let worker_id = workers_ready.get(idx).map(|w| w.worker_id).unwrap_or(0);
                 let _ = outgoing.send(DistributedMessage::TaskComplete {
+                    target: None,
                     sender_id: secondary_id.into(),
                     timestamp: 0.0,
                     secondary_id: secondary_id.into(),
@@ -276,6 +281,7 @@ fn handle_inbound_for_gated_secondary(
                     result_data: None,
                 });
                 let _ = outgoing.send(DistributedMessage::TaskRequest {
+                    target: None,
                     sender_id: secondary_id.into(),
                     timestamp: 0.0,
                     secondary_id: secondary_id.into(),
@@ -290,6 +296,7 @@ fn handle_inbound_for_gated_secondary(
         DistributedMessage::TransferComplete { .. } => {}
         DistributedMessage::TaskAssignment { file_hash, .. } => {
             let _ = outgoing.send(DistributedMessage::TaskComplete {
+                target: None,
                 sender_id: secondary_id.into(),
                 timestamp: 0.0,
                 secondary_id: secondary_id.into(),
@@ -298,6 +305,7 @@ fn handle_inbound_for_gated_secondary(
                 result_data: None,
             });
             let _ = outgoing.send(DistributedMessage::TaskRequest {
+                target: None,
                 sender_id: secondary_id.into(),
                 timestamp: 0.0,
                 secondary_id: secondary_id.into(),
@@ -404,7 +412,8 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             tokio::task::spawn_local(async move {
                 let mut rx = sec1_inbound;
                 while let Some(msg) = rx.recv().await {
-                    if let DistributedMessage::PeerInfo { peers, .. } = &msg
+                    if let DistributedMessage::PeerInfo {
+    target: None, peers, .. } = &msg
                         && let Some(tx) = peer_info_tx.take()
                     {
                         let _ = tx.send(peers.clone());

@@ -29,12 +29,22 @@ pub(super) struct TestId(String);
 /// frame arrived where.
 pub(super) fn frame(sender: &str) -> DistributedMessage<TestId> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: sender.to_string(),
         timestamp: 1.0,
         secondary_id: sender.to_string(),
         active_workers: 0,
         emitter_role: KeepaliveRole::Secondary,
     }
+}
+
+/// As [`frame`], but with the Phase-C routing `target` stamped — the shape
+/// the egress edge produces and the mesh-pump's `route_incoming` reads.
+pub(super) fn frame_to(
+    sender: &str,
+    target: dynrunner_protocol_primary_secondary::address::Destination,
+) -> DistributedMessage<TestId> {
+    frame(sender).with_target(target)
 }
 
 pub(super) fn sender_of(msg: &DistributedMessage<TestId>) -> &str {

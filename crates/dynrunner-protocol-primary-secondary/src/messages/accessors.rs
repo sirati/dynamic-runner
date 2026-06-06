@@ -1,12 +1,96 @@
 //! Inherent accessor methods on `DistributedMessage<I>`
-//! (`sender_id`, `timestamp`, `msg_type`). Extracted from
-//! `distributed.rs` so the enum-shape file stays focused on the wire
-//! variant declarations.
+//! (`sender_id`, `timestamp`, `msg_type`, and the Phase-C routing
+//! `target`). Extracted from `distributed.rs` so the enum-shape file
+//! stays focused on the wire variant declarations.
 
+use crate::address::Destination;
 use crate::messages::distributed::DistributedMessage;
 use crate::messages::message_type::MessageType;
 
 impl<I> DistributedMessage<I> {
+    /// The Phase-C mesh routing target stamped on this frame, if any.
+    ///
+    /// `None` on a freshly-constructed frame; the egress edge stamps
+    /// `Some(resolved)` via [`DistributedMessage::with_target`] /
+    /// [`DistributedMessage::set_target`] once the coordinators are
+    /// rewired. The receiving mesh-pump reads this to demux the frame to
+    /// the right local role-slot (a pure role→slot table) WITHOUT a
+    /// content classifier.
+    pub fn target(&self) -> Option<&Destination> {
+        match self {
+            Self::SecondaryWelcome { target, .. }
+            | Self::Entropy { target, .. }
+            | Self::CertExchange { target, .. }
+            | Self::PeerInfo { target, .. }
+            | Self::InitialAssignment { target, .. }
+            | Self::TaskRequest { target, .. }
+            | Self::TaskAssignment { target, .. }
+            | Self::TransferComplete { target, .. }
+            | Self::StageFile { target, .. }
+            | Self::RequestClusterSnapshot { target, .. }
+            | Self::ClusterSnapshot { target, .. }
+            | Self::StateDigest { target, .. }
+            | Self::MeshReady { target, .. }
+            | Self::TaskComplete { target, .. }
+            | Self::TaskFailed { target, .. }
+            | Self::Keepalive { target, .. }
+            | Self::TimeoutDetected { target, .. }
+            | Self::TimeoutQuery { target, .. }
+            | Self::TimeoutResponse { target, .. }
+            | Self::PromotionVote { target, .. }
+            | Self::PromotionConfirm { target, .. }
+            | Self::SecondaryFatalError { target, .. }
+            | Self::ClusterMutation { target, .. }
+            | Self::Relay { target, .. }
+            | Self::RelayBackoff { target, .. } => target.as_ref(),
+        }
+    }
+
+    /// Stamp the resolved routing `target` on this frame IN PLACE.
+    ///
+    /// Called by the coordinator egress edge after resolving a
+    /// [`Destination`] to its concrete host (the egress maps the
+    /// role-erased `SendTarget` back to a role-bearing `Destination` and
+    /// stamps it here). The mesh-pump reads it at ingress.
+    pub fn set_target(&mut self, dst: Destination) {
+        let slot = match self {
+            Self::SecondaryWelcome { target, .. }
+            | Self::Entropy { target, .. }
+            | Self::CertExchange { target, .. }
+            | Self::PeerInfo { target, .. }
+            | Self::InitialAssignment { target, .. }
+            | Self::TaskRequest { target, .. }
+            | Self::TaskAssignment { target, .. }
+            | Self::TransferComplete { target, .. }
+            | Self::StageFile { target, .. }
+            | Self::RequestClusterSnapshot { target, .. }
+            | Self::ClusterSnapshot { target, .. }
+            | Self::StateDigest { target, .. }
+            | Self::MeshReady { target, .. }
+            | Self::TaskComplete { target, .. }
+            | Self::TaskFailed { target, .. }
+            | Self::Keepalive { target, .. }
+            | Self::TimeoutDetected { target, .. }
+            | Self::TimeoutQuery { target, .. }
+            | Self::TimeoutResponse { target, .. }
+            | Self::PromotionVote { target, .. }
+            | Self::PromotionConfirm { target, .. }
+            | Self::SecondaryFatalError { target, .. }
+            | Self::ClusterMutation { target, .. }
+            | Self::Relay { target, .. }
+            | Self::RelayBackoff { target, .. } => target,
+        };
+        *slot = Some(dst);
+    }
+
+    /// Builder form of [`DistributedMessage::set_target`]: consume the
+    /// frame, stamp `dst`, and return it. The egress edge uses whichever
+    /// form fits its call shape; both stamp the same field.
+    pub fn with_target(mut self, dst: Destination) -> Self {
+        self.set_target(dst);
+        self
+    }
+
     pub fn sender_id(&self) -> &str {
         match self {
             Self::SecondaryWelcome { sender_id, .. }

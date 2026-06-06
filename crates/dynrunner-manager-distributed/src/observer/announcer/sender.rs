@@ -140,6 +140,7 @@ impl<I: dynrunner_core::Identifier> AnnouncerSender for PeerMeshAnnouncerSender<
             epoch: body.epoch,
         };
         let msg = DistributedMessage::<I>::ClusterMutation {
+            target: None,
             sender_id: self.sender_id.clone(),
             timestamp: announcer_timestamp_now(),
             mutations: vec![mutation],

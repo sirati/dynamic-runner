@@ -265,7 +265,8 @@ async fn watchdog_still_fires_pre_run_complete() {
 
     let mut saw_mesh_ready = false;
     while let Ok(msg) = sec_to_pri_rx.try_recv() {
-        if let DistributedMessage::MeshReady { peer_count, .. } = msg {
+        if let DistributedMessage::MeshReady {
+    target: None, peer_count, .. } = msg {
             assert_eq!(peer_count, 0);
             saw_mesh_ready = true;
         }

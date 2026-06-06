@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn roundtrip_stage_file() {
     let msg: DistributedMessage<TestId> = DistributedMessage::StageFile {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 4.2,
         secondary_id: "sec-7".into(),

@@ -105,6 +105,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         );
         incoming_tx
             .send(DistributedMessage::ClusterMutation {
+                target: None,
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskAdded {
@@ -125,6 +126,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         // `completed_tasks` insert + the counter exit matter here.
         incoming_tx
             .send(DistributedMessage::TaskComplete {
+                target: None,
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
                 secondary_id: "sec-promoted".into(),
@@ -493,6 +495,7 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
         deps.insert(phase_b.clone(), Vec::new());
         primary
             .handle_cluster_mutation(DistributedMessage::ClusterMutation {
+                target: None,
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
                 mutations: vec![
@@ -836,6 +839,7 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
             let hash = crate::primary::wire::compute_task_hash(&bin);
             incoming_tx
                 .send(DistributedMessage::ClusterMutation {
+                    target: None,
                     sender_id: "sec-promoted".into(),
                     timestamp: 0.0,
                     mutations: vec![ClusterMutation::<TestId>::TaskAdded {
@@ -851,6 +855,7 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
             // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`.
             incoming_tx
                 .send(DistributedMessage::TaskComplete {
+                    target: None,
                     sender_id: "sec-promoted".into(),
                     timestamp: 0.0,
                     secondary_id: "sec-promoted".into(),
@@ -989,6 +994,7 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 producer_tx
                     .send(DistributedMessage::ClusterMutation {
+                        target: None,
                         sender_id: "sec-promoted".into(),
                         timestamp: 0.0,
                         mutations: vec![ClusterMutation::<TestId>::TaskAdded {
@@ -1003,6 +1009,7 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
                     );
                 producer_tx
                     .send(DistributedMessage::TaskComplete {
+                        target: None,
                         sender_id: "sec-promoted".into(),
                         timestamp: 0.0,
                         secondary_id: "sec-promoted".into(),
@@ -1118,6 +1125,7 @@ async fn empty_discovery_run_complete_exits_promptly_not_after_deadline() {
             // the exit (the run_complete arm reads only the sticky flag).
             incoming_tx
                 .send(DistributedMessage::ClusterMutation {
+                    target: None,
                     sender_id: "sec-promoted".into(),
                     timestamp: 0.0,
                     mutations: vec![ClusterMutation::<TestId>::RunComplete],

@@ -328,6 +328,7 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                     tokio::time::sleep(Duration::from_millis(60)).await;
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "sec-1".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::PrimaryChanged {
@@ -339,6 +340,7 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                         .expect("inbound open");
                     inbound
                         .send(DistributedMessage::Keepalive {
+                            target: None,
                             sender_id: "sec-1".into(),
                             timestamp: 0.0,
                             secondary_id: "sec-1".into(),
@@ -351,6 +353,7 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                     tokio::time::sleep(Duration::from_millis(90)).await;
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "sec-1".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
@@ -417,6 +420,7 @@ async fn observer_recovers_from_snapshot_reply() {
                 // it up immediately on entry.
                 inbound_tx
                     .send(DistributedMessage::ClusterSnapshot {
+                        target: None,
                         sender_id: "promoted-sec".into(),
                         timestamp: 0.0,
                         snapshot_json,
@@ -635,6 +639,7 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                     tokio::time::sleep(Duration::from_millis(60)).await;
                     inbound_tx
                         .send(DistributedMessage::ClusterSnapshot {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             snapshot_json,
@@ -647,6 +652,7 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                     tokio::time::sleep(Duration::from_millis(70)).await;
                     inbound_tx
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
@@ -704,6 +710,7 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                     let t = task("p", "seed", &[]);
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::TaskAdded {
@@ -714,6 +721,7 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                         .expect("inbound open");
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::TaskCompleted {
@@ -727,6 +735,7 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
@@ -886,6 +895,7 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "p".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::TaskCompleted {
@@ -896,6 +906,7 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                         .expect("inbound open");
                     inbound
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "p".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
@@ -1029,6 +1040,7 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                     // Now finish the run.
                     inbound_tx
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
@@ -1127,6 +1139,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             if inbound_ka
                                 .send(DistributedMessage::Keepalive {
+                                    target: None,
                                     sender_id: "promoted-sec".into(),
                                     timestamp: 0.0,
                                     secondary_id: "promoted-sec".into(),
@@ -1145,6 +1158,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     // is what the timer-driven recovery later re-pulls off.
                     inbound_for_driver
                         .send(DistributedMessage::StateDigest {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             digest: ahead_digest,
@@ -1164,7 +1178,8 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     // no third pull and the test hangs to its 5s timeout.
                     let mut non_timer_pulls_left = 2u8;
                     while let Some(frame) = to_primary_rx.recv().await {
-                        if let DistributedMessage::RequestClusterSnapshot { .. } = frame {
+                        if let DistributedMessage::RequestClusterSnapshot {
+    target: None, .. } = frame {
                             let reply = if non_timer_pulls_left > 0 {
                                 non_timer_pulls_left -= 1;
                                 "{ this is not valid snapshot json".to_string()
@@ -1173,6 +1188,7 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                             };
                             inbound_for_driver
                                 .send(DistributedMessage::ClusterSnapshot {
+                                    target: None,
                                     sender_id: "promoted-sec".into(),
                                     timestamp: 0.0,
                                     snapshot_json: reply,
@@ -1256,6 +1272,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                         loop {
                             tokio::time::sleep(Duration::from_millis(15)).await;
                             let _ = inbound_ka.send(DistributedMessage::Keepalive {
+                                target: None,
                                 sender_id: "promoted-sec".into(),
                                 timestamp: 0.0,
                                 secondary_id: "promoted-sec".into(),
@@ -1263,6 +1280,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                                 emitter_role: KeepaliveRole::Primary,
                             });
                             let _ = inbound_ka.send(DistributedMessage::StateDigest {
+                                target: None,
                                 sender_id: "promoted-sec".into(),
                                 timestamp: 0.0,
                                 digest: converged_digest,
@@ -1276,7 +1294,8 @@ async fn recovery_cadence_quiesces_when_converged() {
                     // bootstrap request (1), never a recovery re-pull.
                     let count_task = tokio::task::spawn_local(async move {
                         while let Some(frame) = to_primary_rx.recv().await {
-                            if let DistributedMessage::RequestClusterSnapshot { .. } = frame {
+                            if let DistributedMessage::RequestClusterSnapshot {
+    target: None, .. } = frame {
                                 recovery_requests_drv
                                     .set(recovery_requests_drv.get() + 1);
                             }
@@ -1289,6 +1308,7 @@ async fn recovery_cadence_quiesces_when_converged() {
                     pump.abort();
                     inbound_for_driver
                         .send(DistributedMessage::ClusterMutation {
+                            target: None,
                             sender_id: "promoted-sec".into(),
                             timestamp: 0.0,
                             mutations: vec![ClusterMutation::RunComplete],
