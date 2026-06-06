@@ -337,6 +337,11 @@ impl PySecondaryCoordinator {
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
                     output_dir: memprofile_output_dir.clone(),
                     memuse_log_path: cfg_memuse_log_path.clone(),
+                    // Parity default (empty): threading this secondary's
+                    // cold-start-fetched run-config into `forwarded_argv`
+                    // (and into the promoted-primary recipe) is a separate
+                    // concern. Empty launch-constant until then.
+                    forwarded_argv: Vec::new(),
                 };
 
                 let factory = SubprocessWorkerFactory {

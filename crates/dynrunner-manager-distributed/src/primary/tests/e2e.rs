@@ -303,6 +303,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                         mem_manager_reserved_bytes: None,
                         output_dir: None,
                         memuse_log_path: None,
+                        forwarded_argv: Vec::new(),
                     };
                     // Drive the real secondary against the production
                     // mesh-pump and collect BOTH the own-worker count and the

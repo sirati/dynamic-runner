@@ -198,6 +198,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // the primary fell through the catch-all and timed out. See
             // `handle_request_cluster_snapshot`.
             MessageType::RequestClusterSnapshot => self.handle_request_cluster_snapshot(msg).await,
+            // Run-config-RPC responder. A joining / respawned peer (or one
+            // re-fetching after promotion) unicasts `RequestRunConfig`; the
+            // primary answers from its node-local `forwarded_argv`. PURE
+            // read-only responder — no PeerJoined / welcome / CRDT write
+            // (unlike the snapshot arm above). See `handle_request_run_config`.
+            MessageType::RequestRunConfig => self.handle_request_run_config(msg).await,
             // Anti-entropy receive arm. A peer's periodic `StateDigest`;
             // the primary compares it against its own and pulls a snapshot
             // only if it is somehow behind (almost always a NoOp on the

@@ -449,6 +449,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
 
             let mut secondary = make_secondary_channel(config, unified);
@@ -554,6 +555,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
 
             let mut secondary = make_secondary_channel(config, unified);
@@ -650,6 +652,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
 
             let mut secondary = make_secondary(config);

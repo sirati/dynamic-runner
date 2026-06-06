@@ -254,6 +254,7 @@ async fn e2e_primary_secondary_over_wss() {
                     mem_manager_reserved_bytes: None,
                     output_dir: None,
                     memuse_log_path: None,
+                    forwarded_argv: Vec::new(),
                 };
 
                 // Fold the bootstrap wire into a real mesh: the primary
@@ -369,6 +370,7 @@ async fn e2e_primary_secondary_over_quic() {
                     mem_manager_reserved_bytes: None,
                     output_dir: None,
                     memuse_log_path: None,
+                    forwarded_argv: Vec::new(),
                 };
 
                 // Fold the bootstrap wire into a real mesh: the primary

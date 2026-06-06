@@ -289,6 +289,21 @@ pub struct PrimaryConfig {
     /// immediately and never fires regardless of this value — the
     /// field is harmless for the legacy bootstrap path.
     pub setup_promote_deadline: Duration,
+
+    /// The consumer's run configuration — the byte-identical token
+    /// sequence the framework forwards onto a joining / respawned /
+    /// promoted node's own command line so it reconstructs the exact
+    /// run-config the submitter launched with. This is a NODE-LOCAL
+    /// launch constant (every node sources its own copy: the submitter
+    /// primary from a config kwarg, a secondary from its cold-start
+    /// fetch, a promoted node from the same fetched copy threaded into
+    /// its `PrimaryConfig`), NOT replicated lattice data — so it lives
+    /// on the config, never in `ClusterState`.
+    ///
+    /// Read-only on the coordinator: the `RequestRunConfig` responder
+    /// answers a requesting peer with this verbatim. Default empty (a
+    /// run with no forwarded args).
+    pub forwarded_argv: Vec<String>,
 }
 
 impl Default for PrimaryConfig {
@@ -319,6 +334,7 @@ impl Default for PrimaryConfig {
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: Duration::from_secs(600),
+            forwarded_argv: Vec::new(),
         }
     }
 }

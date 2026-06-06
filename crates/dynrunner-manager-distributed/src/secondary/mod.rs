@@ -462,4 +462,17 @@ where
     /// Mirrors the same field on
     /// [`dynrunner_manager_local::manager::LocalManager`].
     pub(super) sampler: Option<dynrunner_manager_local::memprofile::MemProfileSampler>,
+
+    /// The consumer's run configuration — the byte-identical token
+    /// sequence the framework forwards onto a joining / respawned /
+    /// promoted node's command line. A NODE-LOCAL launch constant
+    /// seeded from `config.forwarded_argv` at construction; NOT
+    /// replicated lattice data, so it never touches `cluster_state`.
+    /// The `RequestRunConfig` responder (the router's
+    /// `DistributedMessage::RequestRunConfig` arm) reads it READ-ONLY
+    /// and unicasts it back to a requesting peer — available on this
+    /// secondary role so a cold-start fetch is answerable before any
+    /// primary exists / promotes. Empty for a run with no forwarded
+    /// args.
+    pub(super) forwarded_argv: Vec<String>,
 }

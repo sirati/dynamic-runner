@@ -123,6 +123,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
 
             let mut secondary = make_secondary_channel(config, unified);
@@ -393,6 +394,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
 
             let mut secondary = make_secondary_channel(config, unified);
