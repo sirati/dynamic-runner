@@ -43,6 +43,21 @@ from .logging_setup import IMPORTANT_STDIO_ONLY_FLAG
 # it as `--full-log-dir=/app/log-network/{secondary_id}` (replacing the
 # pre-existing `DYNRUNNER_FULL_LOG_DIR` env injection), so the dispatcher's
 # own `--full-log-dir` (if any) must NOT also ride through.
+#
+# `--mem-manager-reserved` is in the same category: the dispatcher's value
+# flows through the SLURM pipeline and the wrapper RE-RENDERS it afresh onto
+# every secondary's launch line as `--mem-manager-reserved=<bytes>`
+# (`slurm-wrapper/wrapper/src/podman_run.rs`). Dropping it on forward keeps
+# the re-derived forward-set byte-identical across nodes (a cold-start
+# secondary re-runs `filter_framework_argv` over its full argv, which carries
+# the wrapper-injected copy) and avoids handing the secondary's argparse the
+# flag twice. NOTE — `--panik-file` is deliberately NOT in this set: the
+# wrapper injects a node-local reaper sentinel under that SAME flag, but the
+# operator's cluster-wide `--panik-file` paths legitimately ride
+# `forwarded_argv` (the only channel that reaches secondaries). A string-level
+# filter cannot tell the two values apart, so stripping `--panik-file` would
+# break the operator's cluster panik; the leftover wrapper-injected reaper
+# path is harmless (append/idempotent, node-local).
 FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
     {
         "--secondary",
@@ -51,6 +66,7 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
         "--src-network",
         "--cores",
         "--max-memory",
+        "--mem-manager-reserved",
         "--log-dir",
         "--full-log-dir",
     }
