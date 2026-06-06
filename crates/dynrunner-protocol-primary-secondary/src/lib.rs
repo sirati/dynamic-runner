@@ -26,4 +26,6 @@ pub use setup_bootstrap::{
     PrimaryPeerSetupBootstrap, SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapBroadcast,
     SetupBootstrapMessage,
 };
-pub use transport::{DEFAULT_JOIN_TIMEOUT, JoinError, PeerTransport, SecondaryTransport};
+pub use transport::{
+    DEFAULT_JOIN_TIMEOUT, FetchRunConfigError, JoinError, PeerTransport, SecondaryTransport,
+};
