@@ -10,7 +10,9 @@
 //! Scenario (a) — secondary dies → primary requeues — is covered in
 //! `crate::primary::heartbeat::tests`.
 
-use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
+use super::super::test_helpers::{
+    FakeWorkerFactory, election_config, make_secondary, make_secondary_recording,
+};
 use super::super::wire::timestamp_now;
 use super::*;
 use dynrunner_protocol_primary_secondary::KeepaliveRole;
@@ -278,6 +280,92 @@ async fn self_named_primary_resets_election_to_normal() {
         );
     }
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
+}
+
+/// C4 seam coverage (re-added `promotion_confirm_true_fires_activation_
+/// and_rebroadcasts`, rewired for the one-mesh signal model): an election
+/// win that names THIS node FIRES a typed `PromotionSignal` on the
+/// `promotion_tx` — the secondary NEVER builds a primary itself
+/// (SUPREME-LAW #3) — AND advances the CRDT primary identity AND
+/// rebroadcasts the `PrimaryChanged` so surviving peers re-point. The
+/// ACTIVATION half (building the primary) is now the `Node`'s concern off
+/// the signal; here we assert the signal fires, the identity advances, and
+/// the rebroadcast lands.
+///
+/// Drives `fire_local_promotion` (the election-win terminal action), which
+/// routes through `apply_cluster_mutations` → `apply_primary_changed` (the
+/// C4 fire site) for the local apply, then broadcasts the re-point.
+#[tokio::test(flavor = "current_thread")]
+async fn self_named_election_fires_promotion_signal_advances_identity_and_rebroadcasts() {
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
+
+    // A recording harness so the rebroadcast (a `Destination::All`
+    // `PrimaryChanged`) is observable in the log after `drain_egress`; the
+    // harness's `promotion_rx` is the C4 signal receiver.
+    let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    // Pre-promotion: Normal, no primary identity, no signal yet.
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
+    assert!(sec.cluster_state.current_primary().is_none());
+    assert!(
+        sec.promotion_rx.try_recv().is_err(),
+        "no promotion signal before the election win",
+    );
+
+    // Win the failover election: the terminal action originates + applies +
+    // broadcasts `PrimaryChanged { new = self, reason = Election }`.
+    sec.fire_local_promotion().await;
+    sec.drain_egress().await;
+
+    // (1) The C4 promotion signal FIRED on the `promotion_tx` — the
+    // secondary signalled the `Node` to build the primary; it did NOT build
+    // one itself.
+    let signal = sec
+        .promotion_rx
+        .try_recv()
+        .expect("a self-named election win must FIRE exactly one PromotionSignal");
+    assert_eq!(
+        signal.reason,
+        PrimaryChangeReason::Election,
+        "the election-win signal carries the Election reason",
+    );
+    assert_eq!(
+        signal.epoch,
+        sec.cluster_state.primary_epoch(),
+        "the signal carries the role-table epoch the promotion was raised at",
+    );
+    assert!(
+        sec.promotion_rx.try_recv().is_err(),
+        "exactly ONE signal per self-named promotion",
+    );
+
+    // (2) The CRDT primary identity advanced onto this node.
+    assert_eq!(
+        sec.cluster_state.current_primary(),
+        Some("sec-a"),
+        "the self-named PrimaryChanged advances the recognized primary identity",
+    );
+    // ... and the election reset to Normal (a primary now exists).
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
+
+    // (3) The re-point was REBROADCAST so surviving peers move their
+    // `current_primary()` onto this winner.
+    let rebroadcast = log.borrow().iter().any(|m| {
+        matches!(
+            m,
+            DistributedMessage::ClusterMutation { target: None, mutations, .. }
+                if mutations.iter().any(|mu| matches!(
+                    mu,
+                    ClusterMutation::PrimaryChanged { new, reason, .. }
+                        if new == "sec-a" && *reason == PrimaryChangeReason::Election
+                ))
+        )
+    });
+    assert!(
+        rebroadcast,
+        "the election win must rebroadcast PrimaryChanged(new=self); captured: {:?}",
+        log.borrow(),
+    );
 }
 
 /// Phase P: a `PrimaryChanged` clears any per-worker backoff accrued

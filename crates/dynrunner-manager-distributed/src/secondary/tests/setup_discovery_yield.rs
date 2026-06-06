@@ -83,6 +83,9 @@ async fn ingest_with_items_clears_pending_and_broadcasts() {
             )
             .await
             .expect("ingest must succeed");
+            // Flush the queued PhaseDepsSet + TaskAdded broadcast onto the
+            // RecordingPeer log (MeshClient::send is queued).
+            sec.drain_egress().await;
 
             // Ledger seeded → predicate false on the count axis.
             assert!(
@@ -138,6 +141,9 @@ async fn empty_discovery_latches_without_reyield() {
             sec.ingest_setup_discovery(vec![], deps)
                 .await
                 .expect("empty ingest must succeed");
+            // Flush the queued RunComplete broadcast onto the RecordingPeer
+            // log (MeshClient::send is queued).
+            sec.drain_egress().await;
 
             // Ledger is STILL empty (no TaskAdded), but the latch is set,
             // so the predicate must be false — the loop will not re-yield.

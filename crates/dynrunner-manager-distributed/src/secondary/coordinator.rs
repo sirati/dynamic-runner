@@ -12,7 +12,6 @@
 use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tracing::Instrument;
 
@@ -20,17 +19,30 @@ use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
 use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
+use crate::process::{MeshClient, PromotionSignal, RoleInbox};
 use crate::zip_extract::ExtractionCache;
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub fn new(config: SecondaryConfig, transport: Tr, scheduler: S, estimator: E) -> Self {
+    /// Build a secondary coordinator over the one mesh.
+    ///
+    /// `client` (egress) + `inbox` (ingress) are the coordinator's entire
+    /// view of the mesh — minted together with this role's `Arc<RoleSlot>`
+    /// by `Mesh::register_local_role(LocalRole::Secondary, peer_id)` and
+    /// handed in here. The coordinator never names a transport; the
+    /// `Node`'s `Mesh` owns it.
+    pub fn new(
+        config: SecondaryConfig,
+        client: MeshClient<I>,
+        inbox: RoleInbox<I>,
+        scheduler: S,
+        estimator: E,
+    ) -> Self {
         let tmp_dir = config.src_tmp.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
@@ -57,7 +69,9 @@ where
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
-            transport,
+            client,
+            inbox,
+            promotion_tx: None,
             bootstrap_primary_id: None,
             scheduler,
             estimator,
@@ -122,13 +136,37 @@ where
             .install_task_completed_sender(task_completed_tx);
         // NOTE: no transport role-cache attachment. "Who is primary now"
         // is resolved at THIS edge (`Self::send_to` reads
-        // `cluster_state.current_primary()` / the bootstrap fallback);
-        // the transport is `PeerId`-only and never mirrors the role
-        // table. The former `transport.register_with_cluster_state(..)`
-        // wiring (which subscribed a transport-resident write-through
-        // cache to drive `Address::Role(Primary)` routing) is removed —
-        // resolution moved to the edge.
+        // `cluster_state.current_primary()` / the bootstrap fallback) and
+        // stamped on the frame; the mesh-pump demuxes by that stamp. The
+        // coordinator holds no transport at all — only the `MeshClient` /
+        // `RoleInbox` — so there is nothing to attach a write-through role
+        // cache to. Resolution lives entirely at the edge.
         this
+    }
+
+    /// Register the C4 promotion-signal sender. Must be called BEFORE
+    /// `run_until_setup_or_done` enters; same pre-run, single-shot family
+    /// as [`Self::register_panik_signal_rx`] /
+    /// [`Self::register_fatal_exit_signal_rx`].
+    ///
+    /// On a self-named `PrimaryChanged` (an election win via
+    /// `fire_local_promotion`, or a transferred primary), the secondary
+    /// FIRES a [`PromotionSignal`] on this sender — it NEVER builds a
+    /// primary itself (SUPREME-LAW #3). The matching receiver lives on the
+    /// `Node`, which constructs the snapshot-seeded `PrimaryCoordinator` on
+    /// the signal (threading this secondary's `WorkerFactory` to the spawn
+    /// site). Absent registration (Rust-only unit fixtures) the fire site
+    /// is a best-effort no-op and the test asserts on the CRDT identity
+    /// advance directly.
+    ///
+    /// Single concern: own the registration surface for the promotion
+    /// egress; the build of the primary on the signal is the `Node`'s
+    /// concern.
+    pub fn register_promotion_signal(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<PromotionSignal>,
+    ) {
+        self.promotion_tx = Some(tx);
     }
 
     /// Set the bootstrap primary's peer-id — the id this secondary

@@ -11,15 +11,14 @@
 //! heal it, then goes quiescent once converged.
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId, election_config, make_transport,
+    FakeWorkerFactory, RecordingPeer, SecondaryHarness, TestId, election_config,
+    make_secondary_recording,
 };
-use super::super::*;
 use crate::cluster_state::{ClusterState, TaskState};
 use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, PrimaryChangeReason,
 };
-use dynrunner_scheduler::ResourceStealingScheduler;
 use std::path::PathBuf;
 
 /// Minimal `TaskInfo` for a named task (mirrors the secondary test
@@ -42,29 +41,16 @@ fn mk_task(name: &str) -> TaskInfo<TestId> {
 }
 
 /// Build a secondary over a `RecordingPeer` so the test can inspect the
-/// frames it emits (the anti-entropy snapshot pull lands in the log).
-#[allow(clippy::type_complexity)]
+/// frames it emits (the anti-entropy snapshot pull lands in the log). The
+/// coordinator's `MeshClient` QUEUES sends, so a test calls
+/// [`SecondaryHarness::drain_egress`] before reading the log.
 fn make_recording_secondary(
     secondary_id: &str,
 ) -> (
-    SecondaryCoordinator<
-        super::super::test_helpers::TestTransport<RecordingPeer<TestId>>,
-        dynrunner_transport_channel::ChannelManagerEnd,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    SecondaryHarness<RecordingPeer<TestId>>,
     std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
 ) {
-    let recorder = RecordingPeer::<TestId>::new(1);
-    let peer_log = recorder.log_handle();
-    let sec = SecondaryCoordinator::new(
-        election_config(secondary_id),
-        make_transport(recorder),
-        ResourceStealingScheduler::memory(),
-        FixedEstimator(100),
-    );
-    (sec, peer_log)
+    make_secondary_recording(election_config(secondary_id), 1)
 }
 
 /// Count `RequestClusterSnapshot` frames in the recorded peer-bus log
@@ -146,6 +132,9 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await
                 .expect("StateDigest dispatch succeeds");
+            // Drain the queued egress onto the RecordingPeer so the pull is
+            // observable in the log (MeshClient::send is queued).
+            sec.drain_egress().await;
 
             // The secondary detected it is behind and pulled a snapshot.
             assert_eq!(
@@ -193,6 +182,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             sec.dispatch_message(digest_frame_2, &mut FakeWorkerFactory)
                 .await
                 .expect("second StateDigest dispatch succeeds");
+            sec.drain_egress().await;
             assert_eq!(
                 count_snapshot_requests(&peer_log),
                 0,
@@ -234,6 +224,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
             sec.send_to(Destination::All, frame)
                 .await
                 .expect("digest broadcast send succeeds");
+            sec.drain_egress().await;
             assert!(
                 peer_log
                     .borrow()
@@ -254,6 +245,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
             sec.dispatch_message(digest_frame, &mut FakeWorkerFactory)
                 .await
                 .expect("StateDigest dispatch succeeds");
+            sec.drain_egress().await;
             assert_eq!(
                 count_snapshot_requests(&peer_log),
                 0,

@@ -11,17 +11,17 @@
 
 use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::election::ElectionState;
 use super::super::wire::timestamp_now;
 use crate::cluster_state::ApplyOutcome;
+use crate::process::PromotionSignal;
 
-impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
+impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
-    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -174,15 +174,37 @@ where
         if new == self.config.secondary_id {
             // (3) This node is the new primary.
             //
-            // PHASE-C-SEAM[C4]: promotion/transfer signal. The build of
-            // the `PrimaryCoordinator` on this promotion event is the
-            // Phase-C `Process` concern — the secondary SIGNALS `Process`
-            // (which constructs the snapshot-seeded primary on the event,
-            // threading the secondary's `WorkerFactory` to the spawn site)
-            // and NEVER builds a primary itself. The `reason`
-            // (Election vs Transferred) is the Phase-C signal discriminant;
-            // it is consumed by `Process`, not here.
-            let _ = &reason;
+            // C4 promotion/transfer signal. The build of the
+            // `PrimaryCoordinator` on this promotion event is the `Node`'s
+            // concern — the secondary SIGNALS the `Node` (which constructs
+            // the snapshot-seeded primary on the event, threading this
+            // secondary's `WorkerFactory` to the spawn site) and NEVER
+            // builds a primary itself (SUPREME-LAW #3). FIRE the typed
+            // `PromotionSignal { reason, epoch }`: `reason`
+            // (Election vs Transferred) lets the `Node` branch the
+            // build/seed path; `epoch` carries the role-table generation the
+            // promotion was raised at so the build is seeded against the
+            // right snapshot. Best-effort — a dropped receiver (or an
+            // unwired coordinator: Rust-only unit fixtures) means no `Node`
+            // is listening, which the CRDT mutation above has already
+            // recorded, so the test still observes the identity advance.
+            if let Some(tx) = &self.promotion_tx {
+                if tx.send(PromotionSignal { reason, epoch }).is_err() {
+                    tracing::debug!(
+                        secondary = %self.config.secondary_id,
+                        epoch,
+                        "promotion signal receiver dropped (node winding down); \
+                         CRDT primary identity already advanced"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    secondary = %self.config.secondary_id,
+                    epoch,
+                    "self-named PrimaryChanged with no promotion signal wired \
+                     (unit fixture); CRDT primary identity advanced, no primary built"
+                );
+            }
             // Reset the election: a primary now exists, so there is no
             // lingering Promoted state.
             self.reset_election_to_normal();

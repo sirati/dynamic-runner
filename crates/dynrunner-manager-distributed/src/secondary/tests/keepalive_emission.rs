@@ -27,6 +27,9 @@ async fn keepalive_is_emitted_exactly_once() {
     sec.set_bootstrap_primary_id("primary".to_string());
 
     sec.send_keepalive().await;
+    // Flush the queued keepalive fan-out onto the RecordingPeer log
+    // (MeshClient::send is queued, drained by the pump).
+    sec.drain_egress().await;
 
     let recorded = log.borrow();
     assert_eq!(
@@ -55,6 +58,7 @@ async fn keepalive_still_emitted_when_mesh_degraded() {
     sec.mesh.degraded = true;
 
     sec.send_keepalive().await;
+    sec.drain_egress().await;
 
     let recorded = log.borrow();
     assert_eq!(

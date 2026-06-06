@@ -7,12 +7,13 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::channel_mesh_to_primary;
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::{
+    FakeWorkerFactory, SecondaryHarness, TestId, channel_mesh_to_primary, make_secondary,
+    make_secondary_channel, run_secondary_to_completion,
+};
 use super::super::*;
 use super::processing::make_binary;
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
-use dynrunner_scheduler::ResourceStealingScheduler;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -32,36 +33,30 @@ mod r1_helpers {
 
     use super::*;
     use crate::secondary::test_helpers::{
-        FixedEstimator, TestId, channel_mesh_no_primary, election_config,
+        channel_mesh_no_primary, election_config, make_secondary_channel,
     };
-    use dynrunner_scheduler::ResourceStealingScheduler;
+    use dynrunner_transport_channel::ChannelPeerTransport;
 
-    pub(super) type R1Secondary = SecondaryCoordinator<
-        dynrunner_transport_channel::ChannelPeerTransport<TestId>,
-        dynrunner_transport_channel::ChannelManagerEnd,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >;
+    pub(super) type R1Secondary = SecondaryHarness<ChannelPeerTransport<TestId>>;
 
-    /// Construct a SecondaryCoordinator over a routing-aware channel-backed
-    /// mesh stub with `peers` peer outboxes but NO primary link, so
-    /// mesh-health reads observe the configured size while
-    /// `send_to_primary` returns a real no-route `Err`.
+    /// Construct a secondary over a routing-aware channel-backed mesh stub
+    /// with `peers` peer outboxes but NO primary link, so mesh-health reads
+    /// observe the configured size while `send_to_primary` returns a real
+    /// no-route `Err`.
     ///
-    /// The secondary holds the mesh transport directly. The egress edge
-    /// resolves `Destination::Primary` to the bootstrap id `"primary"`
-    /// (set below); the transport has no outbox for it, so `send_to_peer`
-    /// surfaces the NoRoute `Err` that drives the send-side
-    /// failover-health probe — the real routing-aware no-route signal the
-    /// R1 arming tests need (the prior `FixedPeerCount` stub was
-    /// identity-blind and could only no-op `Ok` on every send).
+    /// The egress edge resolves `Destination::Primary` to the bootstrap id
+    /// `"primary"` (set below); the mesh has no member with that id (the
+    /// stub registers no primary link), so the egress `has_peer("primary")`
+    /// gate surfaces the no-route `Err` that drives the send-side
+    /// failover-health probe — the real one-mesh no-route signal the R1
+    /// arming tests need (the prior `FixedPeerCount` stub was identity-blind
+    /// and could only no-op `Ok` on every send). `make_secondary_channel`
+    /// publishes the live membership, so the gate reads the stub's
+    /// `connected_ids` (which exclude `"primary"`).
     pub(super) fn make_with_peers(secondary_id: &str, peers: usize) -> R1Secondary {
-        let mut sec = SecondaryCoordinator::new(
+        let mut sec = make_secondary_channel(
             election_config(secondary_id),
             channel_mesh_no_primary(secondary_id, peers),
-            ResourceStealingScheduler::memory(),
-            FixedEstimator(100),
         );
         sec.set_bootstrap_primary_id("primary".to_string());
         sec
@@ -456,17 +451,18 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 memuse_log_path: None,
             };
 
-            let mut secondary = SecondaryCoordinator::new(
-                config,
-                unified,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
+            let mut secondary = make_secondary_channel(config, unified);
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             let mut factory = FakeWorkerFactory;
             let start = std::time::Instant::now();
-            let result = secondary.run(&mut factory).await;
+            // The primary never speaks, so the secondary blocks in
+            // `wait_for_setup`'s `inbox.recv()` until `unconfigured_deadline`
+            // fires — a one-way timeout, NOT a ping-pong handshake, so the
+            // sequential test pump drives it faithfully (it drains the
+            // welcome/cert egress, then parks on a silent inbound until the
+            // run's own deadline returns Err).
+            let result = run_secondary_to_completion(&mut secondary, &mut factory).await;
             let elapsed = start.elapsed();
 
             // Should be Err — the primary is unreachable AND no peers.
@@ -560,12 +556,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 memuse_log_path: None,
             };
 
-            let mut secondary = SecondaryCoordinator::new(
-                config,
-                unified,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
+            let mut secondary = make_secondary_channel(config, unified);
             secondary.set_bootstrap_primary_id("primary".to_string());
 
             // Two peer-secondaries are alive members in the replicated
@@ -595,7 +586,9 @@ async fn cold_start_with_peers_emits_distinct_error() {
             }
 
             let mut factory = FakeWorkerFactory;
-            let result = secondary.run(&mut factory).await;
+            // One-way setup-deadline timeout (the silent primary never
+            // replies), so the sequential test pump drives it faithfully.
+            let result = run_secondary_to_completion(&mut secondary, &mut factory).await;
             assert!(result.is_err(), "expected setup-deadline failure");
 
             let err = result.unwrap_err();
@@ -659,13 +652,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 memuse_log_path: None,
             };
 
-            let unified = super::super::test_helpers::make_transport(NoPeers);
-            let mut secondary = SecondaryCoordinator::new(
-                config,
-                unified,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
+            let mut secondary = make_secondary(config);
 
             // Initialise workers so `assign_task` has a target, then
             // land the lifecycle in Operational with that pool installed
