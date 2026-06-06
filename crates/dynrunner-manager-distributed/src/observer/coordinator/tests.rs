@@ -1080,22 +1080,6 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
 /// holdings to `Destination::Primary` — captured on the primary-keyed
 /// outbox — before the run completes.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "PRODUCTION BUG (not a timing-adaptation): the observer's send_to \
-            (observer/coordinator.rs ~L498) stamps Destination::Primary as the \
-            ROUTING target for a remote primary, but Mesh::dispatch's \
-            Destination::Primary arm (process/mesh.rs ~L170) can only \
-            deliver_local — a remote primary frame hits the \
-            'requires the resolved host id (C3 frame target)' error and is \
-            DROPPED. The secondary's send_to (secondary/resource.rs ~L119) \
-            already collapses (Destination::Primary, SendTarget::Peer(id)) → \
-            Destination::Secondary(id) as the routing target so the pump can \
-            route by host; the OBSERVER send_to is MISSING that collapse, so \
-            every observer→remote-primary frame (this holdings announce, the \
-            bootstrap RequestClusterSnapshot, anti-entropy pulls) is unroutable \
-            under the queued-egress pump. This is a production egress bug, not a \
-            test settle issue. Fix belongs in observer/coordinator.rs send_to \
-            (production — out of scope for this TEST-only wave). Left ignored \
-            per the do-not-paper-over-genuine-regressions rule."]
 async fn cold_join_announces_initial_holdings_after_restore() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let local = tokio::task::LocalSet::new();
