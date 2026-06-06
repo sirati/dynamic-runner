@@ -21,6 +21,7 @@ mod cascade_and_reinject;
 mod convergence;
 mod digest;
 mod dispatchers;
+mod grow_max;
 mod non_task_convergence;
 mod panik;
 mod peer_lifecycle;

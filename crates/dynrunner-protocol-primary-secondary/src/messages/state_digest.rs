@@ -101,6 +101,31 @@ pub struct StateDigest {
     /// reason string is not needed to detect divergence).
     #[serde(default)]
     pub run_aborted: bool,
+    /// Number of per-phase EVENT-tally entries (F4 grow-only-MAX map).
+    #[serde(default)]
+    pub phase_event_tallies_count: u64,
+    /// XOR-fold over the per-phase EVENT-tally `(key, value)` pairs (F4): a
+    /// divergent count at an equal key produces a different fold, so a
+    /// promoted-vs-stale count split is detected and healed via snapshot.
+    #[serde(default)]
+    pub phase_event_tallies_hash: u64,
+    /// Number of per-(phase, bucket) retry-pass USED entries (P3
+    /// grow-only-MAX map).
+    #[serde(default)]
+    pub retry_passes_used_count: u64,
+    /// XOR-fold over the retry-pass USED `(key, value)` pairs (P3): a
+    /// divergent used-count at an equal key is detected (was invisible to a
+    /// count-only compare).
+    #[serde(default)]
+    pub retry_passes_used_hash: u64,
+    /// Number of per-hash unfulfillable-reinject USED entries (P3
+    /// grow-only-MAX map).
+    #[serde(default)]
+    pub unfulfillable_reinject_used_count: u64,
+    /// XOR-fold over the unfulfillable-reinject USED `(key, value)` pairs
+    /// (P3): a divergent used-count at an equal hash is detected.
+    #[serde(default)]
+    pub unfulfillable_reinject_used_hash: u64,
 }
 
 impl StateDigest {
@@ -195,6 +220,28 @@ impl StateDigest {
                 && other.current_primary_hash != self.current_primary_hash)
             || (other.run_complete && !self.run_complete)
             || (other.run_aborted && !self.run_aborted)
+            // F4 + P3 grow-only-MAX maps: count-OR-hash compare, same shape
+            // as the other count-bearing fields. A promoted primary that
+            // bumped a count past a stale peer's snapshot makes the peer
+            // behind; the snapshot pull's per-key max-merge heals it.
+            || field_behind(
+                self.phase_event_tallies_count,
+                self.phase_event_tallies_hash,
+                other.phase_event_tallies_count,
+                other.phase_event_tallies_hash,
+            )
+            || field_behind(
+                self.retry_passes_used_count,
+                self.retry_passes_used_hash,
+                other.retry_passes_used_count,
+                other.retry_passes_used_hash,
+            )
+            || field_behind(
+                self.unfulfillable_reinject_used_count,
+                self.unfulfillable_reinject_used_hash,
+                other.unfulfillable_reinject_used_count,
+                other.unfulfillable_reinject_used_hash,
+            )
     }
 }
 

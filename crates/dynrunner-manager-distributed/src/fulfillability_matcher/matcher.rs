@@ -26,8 +26,9 @@ use dynrunner_core::TaskInfo;
 ///
 /// Return semantics:
 /// - `true` → coordinator auto-fires `PrimaryCommand::ReinjectTask{hash}`
-///   (shares the `unfulfillable_reinject_remaining` budget with
-///   consumer-explicit calls; budget exhaustion is logged at warn).
+///   (shares the replicated `unfulfillable_reinject_used` budget —
+///   `remaining = cap − used` — with consumer-explicit calls; budget
+///   exhaustion is logged at warn).
 /// - `false` → task stays `Unfulfillable`; subsequent batches will
 ///   re-invoke the matcher.
 ///

@@ -58,8 +58,6 @@ fn primary_with_pool_and_idle_worker(
     let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
         .expect("work-phase pool");
     primary.pending = Some(pool);
-    primary.phase_completed.insert(phase.clone(), 0);
-    primary.phase_failed.insert(phase, 0);
     primary.pool_mut().extend(tasks).expect("valid extend");
     primary.register_idle_worker_for_test(
         "sec-0".into(),
@@ -196,7 +194,7 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
                 "X's in-flight ledger entry drained on terminal"
             );
             assert_eq!(
-                *primary.phase_completed.get(&PhaseId::from("work")).unwrap(),
+                primary.phase_completed_for_test(&PhaseId::from("work")),
                 1,
                 "exactly one completion credited to phase work"
             );
@@ -359,8 +357,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // the now-held role) without renaming downstream asserts.
             let (hash_x, hash_y) = (first_hash, other_hash);
             assert_eq!(primary.in_flight_len_for_test(), 1, "only Y in flight");
-            let work_completed_before =
-                *primary.phase_completed.get(&PhaseId::from("work")).unwrap();
+            let work_completed_before = primary.phase_completed_for_test(&PhaseId::from("work"));
 
             // A STALE, duplicate TaskComplete for X lands now (a
             // delayed/redundant wire copy). The completed-dedup gate
@@ -381,7 +378,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
                 "Y's in-flight entry untouched by the stale X terminal"
             );
             assert_eq!(
-                *primary.phase_completed.get(&PhaseId::from("work")).unwrap(),
+                primary.phase_completed_for_test(&PhaseId::from("work")),
                 work_completed_before,
                 "no double-decrement / double-credit from the stale X terminal"
             );
@@ -427,8 +424,6 @@ fn primary_two_secondaries_with_pool(
     let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
         .expect("work-phase pool");
     primary.pending = Some(pool);
-    primary.phase_completed.insert(phase.clone(), 0);
-    primary.phase_failed.insert(phase, 0);
     primary.pool_mut().extend(tasks).expect("valid extend");
     let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
     primary.register_idle_worker_for_test("sec-0".into(), 0, budget.clone());
@@ -587,7 +582,7 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
                 "survivor's type slot released"
             );
             assert_eq!(
-                *primary.phase_completed.get(&phase).unwrap(),
+                primary.phase_completed_for_test(&phase),
                 1,
                 "exactly one completion credited to phase work"
             );

@@ -80,6 +80,12 @@ fn roundtrip_state_digest_payload() {
         primary_epoch: 42,
         run_complete: true,
         run_aborted: true,
+        phase_event_tallies_count: 9,
+        phase_event_tallies_hash: 0x1357_2468,
+        retry_passes_used_count: 5,
+        retry_passes_used_hash: 0x2468_1357,
+        unfulfillable_reinject_used_count: 2,
+        unfulfillable_reinject_used_hash: 0xABCD_1234,
     };
     let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
         target: None,

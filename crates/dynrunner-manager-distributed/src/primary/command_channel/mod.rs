@@ -47,11 +47,13 @@
 //!     discrete `TaskState::Unfulfillable { .. }` variant (the
 //!     operator-resolvable-failure class); flips the local pool's
 //!     Unfulfillable → re-injected, broadcasts `TaskReinjected{hash}`,
-//!     and decrements the per-task budget
-//!     `unfulfillable_reinject_remaining[hash]` (initialised from
-//!     `PrimaryConfig::unfulfillable_reinject_max_per_task`; `None`
-//!     means unbounded). Budget exhaustion is a structured-log event,
-//!     never a panic.
+//!     and (when a cap is set) bumps the replicated per-task USED counter
+//!     `ClusterState::unfulfillable_reinject_used[hash]` — the budget is
+//!     `remaining = cap − used` derived LOCALLY against
+//!     `PrimaryConfig::unfulfillable_reinject_max_per_task` (`None` means
+//!     unbounded, and originates no counter). The used count is grow-only
+//!     MAX so the budget survives failover. Budget exhaustion is a
+//!     structured-log event, never a panic.
 //!   * `UpdatePreferredSecondaries` — broadcasts
 //!     `TaskPreferredSecondariesUpdated{hash, secondaries}` so every
 //!     node's mirror sees the same update. Local `TaskInfo`-side

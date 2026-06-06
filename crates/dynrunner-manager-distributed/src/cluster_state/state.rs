@@ -19,7 +19,9 @@ use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
 use crate::worker_signal::WorkerMgmtSignal;
 
-use super::types::{CapabilityEntry, PeerEntry, RoleChangeHook, TaskState};
+use crate::primary::retry_bucket::BucketKind;
+
+use super::types::{CapabilityEntry, PeerEntry, PhaseTally, RoleChangeHook, TaskState};
 
 /// The replicated cluster-state CRDT.
 pub struct ClusterState<I> {
@@ -238,6 +240,48 @@ pub struct ClusterState<I> {
     /// against the (already-advanced) `primary_epoch`, so a post-promotion
     /// stamp still strictly exceeds every pre-promotion version.
     pub(super) task_seq: HashMap<String, u32>,
+    /// Replicated per-phase EVENT tallies (F4) — grow-only MAX of a
+    /// monotone event count, keyed by `(PhaseId, PhaseTally)`. Replaces the
+    /// two node-local `phase_completed` / `phase_failed` maps the
+    /// coordinator held. EVENT-shaped: a fail → reinject → succeed task
+    /// increments BOTH `Failed` and `Completed` (each terminal observation
+    /// is one event), so this is NOT a projection of the single terminal
+    /// `TaskState`. The live primary bumps it on every `note_item_*`; the
+    /// snapshot / AE path replicates it, so a promoted primary reports the
+    /// SAME event-shaped `on_phase_end` numbers and the
+    /// `phase_can_proceed` / `RunShouldFail` gate reads the replicated
+    /// tallies, not a wrong terminal-projection.
+    ///
+    /// Merge: grow-only MAX (see `grow_max.rs`); converges under per-key
+    /// `max`; never LWW, never decrement. Replicated via snapshot + AE
+    /// digest, NOT a new `ClusterMutation` variant.
+    pub(super) phase_event_tallies: HashMap<(PhaseId, PhaseTally), u32>,
+    /// Replicated per-(phase, bucket) retry-pass USED counter (P3) —
+    /// grow-only MAX of a monotone used count, keyed by
+    /// `(PhaseId, BucketKind)`. Replaces the node-local
+    /// `PrimaryCoordinator::retry_passes_used`. It already counts UP (the
+    /// retry-bucket core returns the new used count and the async caller
+    /// bumps it here), so MAX-merge is exactly right. The budget check
+    /// (`used >= max_passes`) reads this; a promoted primary inherits the
+    /// used-count via max-merge from the restored snapshot so the budget is
+    /// NOT re-granted on failover.
+    ///
+    /// Merge: grow-only MAX (see `grow_max.rs`). Replicated via snapshot +
+    /// AE digest.
+    pub(super) retry_passes_used: HashMap<(PhaseId, BucketKind), u32>,
+    /// Replicated per-hash unfulfillable-reinject USED counter (P3) —
+    /// grow-only MAX of a monotone used count, keyed by task hash. Replaces
+    /// the node-local DECREMENTING `unfulfillable_reinject_remaining`. The
+    /// reinject handler derives `remaining = cap − used_for(hash)` LOCALLY,
+    /// refuses when `remaining == 0`, and bumps the used count on a
+    /// successful reinject; when the cap is `None` (unbounded) no used
+    /// counter is originated (there is no cap to enforce). A promoted
+    /// primary inherits the used-count so the reinject budget is NOT
+    /// re-granted on failover.
+    ///
+    /// Merge: grow-only MAX (see `grow_max.rs`). Replicated via snapshot +
+    /// AE digest.
+    pub(super) unfulfillable_reinject_used: HashMap<String, u32>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -245,22 +289,59 @@ where
     I: Clone,
 {
     fn clone(&self) -> Self {
+        // Exhaustive destructure (NO `..` rest pattern) — the structural
+        // completeness guard, mirroring `snapshot()`/`digest()`. A new
+        // replicated field omitted here would be SILENTLY DROPPED on every
+        // clone with NO compile error (the historic hazard the hand-rolled
+        // builder hid); the destructure makes the omission a compile error.
+        let ClusterState {
+            tasks,
+            current_primary,
+            primary_epoch,
+            primary_epoch_mirror,
+            phase_deps,
+            run_complete,
+            run_aborted,
+            role_table,
+            // Deliberately not cloned — see field doc.
+            role_change_hooks: _role_change_hooks,
+            // Deliberately not cloned — see field doc.
+            peer_state: _peer_state,
+            capabilities,
+            // Deliberately not cloned — see field doc.
+            lifecycle_tx: _lifecycle_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            matcher_trigger_tx: _matcher_trigger_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            worker_mgmt_tx: _worker_mgmt_tx,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            task_completed_tx: _task_completed_tx,
+            peer_holdings,
+            task_outputs,
+            secondary_capacities,
+            // Node-local originator counter — reset on clone (a cloned
+            // replica originates nothing inherited from the source).
+            task_seq: _task_seq,
+            phase_event_tallies,
+            retry_passes_used,
+            unfulfillable_reinject_used,
+        } = self;
         Self {
-            tasks: self.tasks.clone(),
-            current_primary: self.current_primary.clone(),
-            primary_epoch: self.primary_epoch,
+            tasks: tasks.clone(),
+            current_primary: current_primary.clone(),
+            primary_epoch: *primary_epoch,
             // Arc-clone is the right semantics here — see field doc.
-            primary_epoch_mirror: Arc::clone(&self.primary_epoch_mirror),
-            phase_deps: self.phase_deps.clone(),
-            run_complete: self.run_complete,
-            run_aborted: self.run_aborted.clone(),
-            role_table: self.role_table.clone(),
+            primary_epoch_mirror: Arc::clone(primary_epoch_mirror),
+            phase_deps: phase_deps.clone(),
+            run_complete: *run_complete,
+            run_aborted: run_aborted.clone(),
+            role_table: role_table.clone(),
             // Deliberately not cloned — see field doc.
             role_change_hooks: Vec::new(),
             // Deliberately not cloned — see field doc.
             peer_state: HashMap::new(),
             // Replicated CRDT data — clone preserves it.
-            capabilities: self.capabilities.clone(),
+            capabilities: capabilities.clone(),
             // Deliberately not cloned — see field doc.
             lifecycle_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
@@ -270,14 +351,18 @@ where
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_completed_tx: None,
             // Replicated CRDT data — clone preserves it.
-            peer_holdings: self.peer_holdings.clone(),
+            peer_holdings: peer_holdings.clone(),
             // Replicated CRDT data — clone preserves it.
-            task_outputs: self.task_outputs.clone(),
+            task_outputs: task_outputs.clone(),
             // Replicated CRDT data — clone preserves it.
-            secondary_capacities: self.secondary_capacities.clone(),
+            secondary_capacities: secondary_capacities.clone(),
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: HashMap::new(),
+            // Replicated grow-only-MAX maps — clone preserves them.
+            phase_event_tallies: phase_event_tallies.clone(),
+            retry_passes_used: retry_passes_used.clone(),
+            unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
         }
     }
 }
@@ -287,25 +372,59 @@ where
     I: std::fmt::Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure (NO `..` rest pattern) — the structural
+        // completeness guard, mirroring `snapshot()`/`digest()`/`clone()`:
+        // a new field omitted here is a compile error, so the Debug never
+        // silently drops a field.
+        let ClusterState {
+            tasks,
+            current_primary,
+            primary_epoch,
+            primary_epoch_mirror: _primary_epoch_mirror,
+            phase_deps,
+            run_complete,
+            run_aborted,
+            role_table,
+            role_change_hooks,
+            peer_state,
+            capabilities,
+            lifecycle_tx,
+            matcher_trigger_tx,
+            worker_mgmt_tx,
+            task_completed_tx,
+            peer_holdings,
+            task_outputs,
+            secondary_capacities,
+            task_seq,
+            phase_event_tallies,
+            retry_passes_used,
+            unfulfillable_reinject_used,
+        } = self;
         f.debug_struct("ClusterState")
-            .field("tasks", &self.tasks)
-            .field("current_primary", &self.current_primary)
-            .field("primary_epoch", &self.primary_epoch)
-            .field("phase_deps", &self.phase_deps)
-            .field("run_complete", &self.run_complete)
-            .field("run_aborted", &self.run_aborted)
-            .field("role_table", &self.role_table)
-            .field("role_change_hooks", &self.role_change_hooks.len())
-            .field("peer_state", &self.peer_state)
-            .field("capabilities", &self.capabilities)
-            .field("lifecycle_tx", &self.lifecycle_tx.is_some())
-            .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
-            .field("worker_mgmt_tx", &self.worker_mgmt_tx.is_some())
-            .field("task_completed_tx", &self.task_completed_tx.is_some())
-            .field("peer_holdings", &self.peer_holdings)
-            .field("task_outputs", &self.task_outputs.len())
-            .field("secondary_capacities", &self.secondary_capacities)
-            .field("task_seq", &self.task_seq.len())
+            .field("tasks", tasks)
+            .field("current_primary", current_primary)
+            .field("primary_epoch", primary_epoch)
+            .field("phase_deps", phase_deps)
+            .field("run_complete", run_complete)
+            .field("run_aborted", run_aborted)
+            .field("role_table", role_table)
+            .field("role_change_hooks", &role_change_hooks.len())
+            .field("peer_state", peer_state)
+            .field("capabilities", capabilities)
+            .field("lifecycle_tx", &lifecycle_tx.is_some())
+            .field("matcher_trigger_tx", &matcher_trigger_tx.is_some())
+            .field("worker_mgmt_tx", &worker_mgmt_tx.is_some())
+            .field("task_completed_tx", &task_completed_tx.is_some())
+            .field("peer_holdings", peer_holdings)
+            .field("task_outputs", &task_outputs.len())
+            .field("secondary_capacities", secondary_capacities)
+            .field("task_seq", &task_seq.len())
+            .field("phase_event_tallies", &phase_event_tallies.len())
+            .field("retry_passes_used", &retry_passes_used.len())
+            .field(
+                "unfulfillable_reinject_used",
+                &unfulfillable_reinject_used.len(),
+            )
             .finish()
     }
 }
@@ -332,6 +451,9 @@ impl<I> Default for ClusterState<I> {
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
             task_seq: HashMap::new(),
+            phase_event_tallies: HashMap::new(),
+            retry_passes_used: HashMap::new(),
+            unfulfillable_reinject_used: HashMap::new(),
         }
     }
 }

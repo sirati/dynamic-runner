@@ -83,6 +83,9 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         alive_members,
         run_complete: false,
         run_aborted: None,
+        phase_event_tallies: HashMap::new(),
+        retry_passes_used: HashMap::new(),
+        unfulfillable_reinject_used: HashMap::new(),
     }
 }
 

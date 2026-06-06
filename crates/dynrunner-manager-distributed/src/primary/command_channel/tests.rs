@@ -68,10 +68,6 @@ async fn fail_permanent_via_channel() {
                 dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
                     .expect("pool init"),
             );
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
 
             let (reply_tx, reply_rx) = oneshot::channel();
             super::handle_primary_command(
@@ -139,10 +135,6 @@ async fn fail_permanent_oom_routes_into_per_phase_oom_bucket() {
                 dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
                     .expect("pool init"),
             );
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
             // `all_binaries` is the binary-lookup table the retry-bucket
             // primitive reads to map `failed_tasks` hashes back to
             // dispatchable `TaskInfo`s. In production this is populated
@@ -185,9 +177,10 @@ async fn fail_permanent_oom_routes_into_per_phase_oom_bucket() {
             // whether the failure came from a worker or an operator
             // command.
             coordinator.config.oom_retry_max_passes = 1;
-            // Reset the per-phase counter so the new cap takes effect
-            // for this bucket pass.
-            coordinator.retry_passes_used.clear();
+            // No counter reset needed: the OOM bucket's (phase, Oom) key was
+            // never bumped (the prior cap=0 pass hit budget-exhausted before
+            // any reinject), and the replicated grow-only-MAX counter has no
+            // clear() — it reads 0 for the never-bumped key.
             let phase = binary.phase_id.clone();
             let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> = None;
             let reinjected = coordinator
@@ -387,10 +380,6 @@ async fn command_channel_end_to_end() {
                 dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
                     .expect("pool init"),
             );
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
             let sender = coordinator.command_sender();
             let (reply_tx, reply_rx) = oneshot::channel();
             // Send through the channel (the same `tokio::sync::mpsc`
@@ -465,10 +454,6 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
             pool.extend(vec![prereq.clone(), dep.clone()])
                 .expect("pool extend");
             coordinator.pending = Some(pool);
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
             // Mark the prereq in flight so on_item_failed_permanent's
             // in_flight bookkeeping doesn't saturate.
             coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
@@ -561,10 +546,6 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             pool.extend(vec![prereq.clone(), dep.clone()])
                 .expect("pool extend");
             coordinator.pending = Some(pool);
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
             coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
 
             // Step 1: prereq fails Unfulfillable → dep moves to
@@ -694,10 +675,6 @@ async fn reinject_resets_blocked_dependents_pool_state() {
             pool.extend(vec![prereq.clone(), dep.clone()])
                 .expect("pool extend");
             coordinator.pending = Some(pool);
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
             coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
 
             // Cascade: prereq Unfulfillable → dep Blocked.
@@ -782,10 +759,6 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
                 .expect("pool init");
             pool.extend(vec![binary.clone()]).expect("pool extend");
             coordinator.pending = Some(pool);
-            for p in coordinator.pool().active_phases() {
-                coordinator.phase_completed.insert(p.clone(), 0);
-                coordinator.phase_failed.insert(p.clone(), 0);
-            }
 
             // Pre-condition: pool's clone has empty preferred_secondaries.
             let pre = coordinator
@@ -865,10 +838,6 @@ fn seed_pool(
     coordinator.pending = Some(
         dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new()).expect("pool init"),
     );
-    for p in coordinator.pool().active_phases() {
-        coordinator.phase_completed.insert(p.clone(), 0);
-        coordinator.phase_failed.insert(p.clone(), 0);
-    }
 }
 
 /// Drive a `SpawnTasks` command through the dispatch path and
@@ -1598,4 +1567,196 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
         }
         other => panic!("variant lost in round-trip: {other:?}"),
     }
+}
+
+/// F4 event-shape: a fail → (retry) succeed sequence for the SAME phase
+/// increments BOTH the Failed and Completed per-phase EVENT tallies (each
+/// terminal OBSERVATION is one event), and the tallies survive a promotion
+/// (snapshot → restore) reporting the SAME event-shaped numbers — NOT a
+/// terminal-state projection (the CRDT holds one terminal state, but the
+/// event count of 1 failed + 1 completed is what `on_phase_end` reports).
+#[tokio::test(flavor = "current_thread")]
+async fn phase_event_tallies_are_event_shaped_and_survive_promotion() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            let phase = PhaseId::from("default");
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(phase.clone());
+            coordinator.pending = Some(
+                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                    .expect("pool init"),
+            );
+
+            // The task fails once, then (after a retry reinject) completes —
+            // the live primary observes BOTH terminal events.
+            coordinator
+                .note_item_failed(&phase, Some("a_id"), &mut None)
+                .await;
+            coordinator
+                .note_item_completed(&phase, Some("a_id"), &mut None)
+                .await;
+
+            // BOTH event tallies are 1 — event-shaped, not a terminal
+            // projection (a terminal projection of the single converged
+            // state would show failed=0).
+            assert_eq!(
+                coordinator.phase_failed_for_test(&phase),
+                1,
+                "the fail event is counted even after the later success"
+            );
+            assert_eq!(coordinator.phase_completed_for_test(&phase), 1);
+
+            // Promotion: a fresh primary restores the live snapshot and
+            // reports the SAME event numbers (the events were replicated).
+            let snap = coordinator.cluster_state_for_test().snapshot();
+            let (mut promoted, _mesh2) = make_coordinator();
+            promoted.cluster_state_mut_for_test().restore(snap);
+            assert_eq!(
+                promoted.phase_failed_for_test(&phase),
+                1,
+                "the failed EVENT tally survives promotion"
+            );
+            assert_eq!(
+                promoted.phase_completed_for_test(&phase),
+                1,
+                "the completed EVENT tally survives promotion"
+            );
+        })
+        .await;
+}
+
+/// P3-reinject: with an UNBOUNDED cap (`None`), the reinject handler accepts
+/// repeatedly and NEVER originates the used counter (no cap to enforce), so
+/// the replicated `unfulfillable_reinject_used` stays empty.
+#[tokio::test(flavor = "current_thread")]
+async fn unbounded_reinject_cap_skips_used_origination() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            // `None` == unbounded.
+            coordinator.set_unfulfillable_reinject_max_per_task(None);
+            let binary = make_binary("a", 100);
+            let hash = compute_task_hash(&binary);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task: binary.clone(),
+            });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(binary.phase_id.clone());
+            coordinator.pending = Some(
+                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                    .expect("pool init"),
+            );
+
+            // Reinject twice; each time re-set to Unfulfillable first.
+            for round in 0..2 {
+                coordinator
+                    .cluster_state
+                    .apply(ClusterMutation::TaskFailed {
+                        attempt: 0,
+                        hash: hash.clone(),
+                        kind: ErrorType::Unfulfillable {
+                            reason: format!("missing {round}").into(),
+                        },
+                        error: "unfulfillable".into(),
+                        version: Default::default(),
+                    });
+                let (reply_tx, reply_rx) = oneshot::channel();
+                super::handle_primary_command(
+                    &mut coordinator,
+                    PrimaryCommand::ReinjectTask {
+                        hash: hash.clone(),
+                        reply: reply_tx,
+                    },
+                    &mut None,
+                )
+                .await;
+                assert!(
+                    reply_rx.await.unwrap().is_ok(),
+                    "unbounded reinject always accepts (round {round})"
+                );
+            }
+
+            // No used counter was ever originated for an unbounded cap.
+            assert_eq!(
+                coordinator
+                    .cluster_state_for_test()
+                    .unfulfillable_reinject_used_for(&hash),
+                0,
+                "unbounded cap must not originate the used counter"
+            );
+        })
+        .await;
+}
+
+/// P3-reinject: with a BOUNDED cap the used counter IS originated and
+/// survives a promotion, so a promoted primary does NOT re-grant the
+/// reinject budget (the budget is clear-gated by grow-only-MAX inheritance).
+#[tokio::test(flavor = "current_thread")]
+async fn bounded_reinject_used_survives_promotion() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            coordinator.set_unfulfillable_reinject_max_per_task(Some(2));
+            let binary = make_binary("a", 100);
+            let hash = compute_task_hash(&binary);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task: binary.clone(),
+            });
+            coordinator
+                .cluster_state
+                .apply(ClusterMutation::TaskFailed {
+                    attempt: 0,
+                    hash: hash.clone(),
+                    kind: ErrorType::Unfulfillable {
+                        reason: "missing".into(),
+                    },
+                    error: "unfulfillable".into(),
+                    version: Default::default(),
+                });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(binary.phase_id.clone());
+            coordinator.pending = Some(
+                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                    .expect("pool init"),
+            );
+
+            // One successful reinject — used bumps to 1.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::ReinjectTask {
+                    hash: hash.clone(),
+                    reply: reply_tx,
+                },
+                &mut None,
+            )
+            .await;
+            assert!(reply_rx.await.unwrap().is_ok());
+            assert_eq!(
+                coordinator
+                    .cluster_state_for_test()
+                    .unfulfillable_reinject_used_for(&hash),
+                1
+            );
+
+            // Promotion inherits the used count via max-merge: the promoted
+            // primary derives remaining = 2 − 1 = 1 (NOT a fresh cap of 2).
+            let snap = coordinator.cluster_state_for_test().snapshot();
+            let (mut promoted, _mesh2) = make_coordinator();
+            promoted.cluster_state_mut_for_test().restore(snap);
+            assert_eq!(
+                promoted
+                    .cluster_state_for_test()
+                    .unfulfillable_reinject_used_for(&hash),
+                1,
+                "the consumed reinject budget survives promotion"
+            );
+        })
+        .await;
 }

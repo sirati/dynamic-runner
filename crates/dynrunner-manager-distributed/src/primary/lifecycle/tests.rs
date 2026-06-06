@@ -90,10 +90,9 @@ fn install_pool_for_phase(
     phase_set.insert(binary.phase_id.clone());
     coordinator.pending =
         Some(PendingPool::<TestId>::new(phase_set, HashMap::new()).expect("pool init"));
-    coordinator
-        .phase_completed
-        .insert(binary.phase_id.clone(), 0);
-    coordinator.phase_failed.insert(binary.phase_id.clone(), 0);
+    // Per-phase EVENT tallies are the replicated CRDT `phase_event_tallies`
+    // now (F4); a never-incremented phase reads 0 via the accessor, so no
+    // pre-seed-to-0 is needed.
 }
 
 /// Build a `PrimaryCoordinator` whose SINGLE transport is a
@@ -918,8 +917,6 @@ fn prime_pool_with_queued(
         .collect();
     pool.extend(binaries.clone()).expect("valid extend");
     coordinator.pending = Some(pool);
-    coordinator.phase_completed.insert(phase.clone(), 0);
-    coordinator.phase_failed.insert(phase, 0);
     coordinator.all_binaries = binaries.clone();
     coordinator.total_tasks = binaries.len();
 }

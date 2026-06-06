@@ -162,6 +162,12 @@ fn roundtrip_all_message_types() {
                 primary_epoch: 3,
                 run_complete: true,
                 run_aborted: false,
+                phase_event_tallies_count: 6,
+                phase_event_tallies_hash: 0x88,
+                retry_passes_used_count: 2,
+                retry_passes_used_hash: 0x99,
+                unfulfillable_reinject_used_count: 1,
+                unfulfillable_reinject_used_hash: 0xAA,
             },
         },
         DistributedMessage::TaskComplete {

@@ -7,7 +7,8 @@
 //! whether to reinject, and on `true` enqueue a
 //! `PrimaryCommand::ReinjectTask{hash}` onto the coordinator's own
 //! command channel. Auto-fired reinjects share the per-task
-//! `unfulfillable_reinject_remaining` budget with consumer-explicit
+//! `ClusterState::unfulfillable_reinject_used` budget (the replicated
+//! USED counter, `remaining = cap − used`) with consumer-explicit
 //! `PrimaryHandle::reinject_task` calls; the existing
 //! `apply_reinject_task` handler is the single chokepoint for the
 //! budget check.
@@ -67,9 +68,9 @@ where
     /// entry calls `matcher.should_reinject(task, reason, holdings)`.
     /// `true` fires `PrimaryCommand::ReinjectTask { hash }` onto the
     /// coordinator's own command channel — the same path a PyO3 /
-    /// external caller would use, so the budget check
-    /// (`unfulfillable_reinject_remaining`) is enforced once at
-    /// `apply_reinject_task` regardless of fire origin.
+    /// external caller would use, so the budget check (against the
+    /// replicated `ClusterState::unfulfillable_reinject_used` counter) is
+    /// enforced once at `apply_reinject_task` regardless of fire origin.
     ///
     /// Idempotency: re-firing `ReinjectTask` for a hash whose state
     /// has since transitioned off `Unfulfillable` is a NoOp at
