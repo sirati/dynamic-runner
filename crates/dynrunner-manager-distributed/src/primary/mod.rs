@@ -39,6 +39,7 @@ mod peer_setup;
 pub mod preferred_secondaries;
 pub mod respawn;
 pub(crate) mod retry_bucket;
+mod secondary_id;
 pub mod staging;
 pub(crate) mod task;
 pub mod wire;
