@@ -6,7 +6,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::apply_locally_for_broadcast;
 use crate::primary::PrimaryCoordinator;
-use crate::primary::wire::{compute_task_hash, timestamp_now};
+use crate::primary::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -335,56 +335,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
         }])
         .await;
-    }
-
-    /// Phase-S/B: seed the replicated cluster ledger with the run's
-    /// task graph and phase-dependency graph. Emits one
-    /// `PhaseDepsSet` (carrying the canonical per-run dep graph)
-    /// followed by one `TaskAdded` per binary in `all_binaries`; the
-    /// originator-side `apply_and_broadcast_cluster_mutations` applies
-    /// locally and ships the batch to every secondary.
-    ///
-    /// `PhaseDepsSet` rides ahead of `TaskAdded` so receivers'
-    /// `cluster_state.phase_deps()` is populated before any
-    /// post-promotion hydration that consults it. The mutation is
-    /// idempotent (re-application is a no-op when local is non-empty),
-    /// so multiple snapshot sources or duplicate broadcasts are safe.
-    ///
-    /// Called once at run start, after every secondary has connected
-    /// (so `transport.broadcast` reaches the full fleet) and before
-    /// `perform_initial_assignment` runs (so the originator's mirror
-    /// is non-empty when the first dispatch happens).
-    pub(crate) async fn seed_cluster_state(&mut self) {
-        let mut mutations: Vec<ClusterMutation<I>> =
-            Vec::with_capacity(self.all_binaries.len() + 1);
-        mutations.push(ClusterMutation::PhaseDepsSet {
-            deps: self.phase_deps.clone(),
-        });
-        mutations.extend(
-            self.all_binaries
-                .iter()
-                .map(|b| ClusterMutation::TaskAdded {
-                    hash: compute_task_hash(b),
-                    task: b.clone(),
-                }),
-        );
-        let task_count = self.all_binaries.len();
-        self.apply_and_broadcast_cluster_mutations(mutations).await;
-        // Validate `preferred_secondaries` lists against the known
-        // secondary set NOW that both inputs are settled: the seed
-        // batch finished applying (so every task's
-        // `preferred_secondaries` is in `all_binaries`) and the
-        // pre-loop handshake has populated `self.secondaries` with
-        // every secondary the primary has connected to. The
-        // validator emits one structured warn per unknown id; a
-        // later `PeerLifecycleEvent::Added` may make a previously-
-        // unknown id known and the re-validation in
-        // `handle_cluster_mutation` will silence it.
-        let known: std::collections::HashSet<&str> =
-            self.secondaries.keys().map(|s| s.as_str()).collect();
-        self.preferred_secondaries_validator
-            .validate(self.all_binaries.iter(), &known);
-        tracing::info!(tasks = task_count, "seeded cluster ledger");
     }
 
     /// React to a panik-watcher signal on the primary.

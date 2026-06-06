@@ -172,8 +172,10 @@ where
 
     {
         let run = primary.run(
-            binaries,
-            std::collections::HashMap::new(),
+            dynrunner_manager_distributed::process::SeedSource::ColdStart {
+                binaries,
+                phase_deps: std::collections::HashMap::new(),
+            },
             Box::new(|_| {}),
             Box::new(|_, _, _, _| {}),
         );

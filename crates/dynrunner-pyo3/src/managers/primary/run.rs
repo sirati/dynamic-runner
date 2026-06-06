@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal,
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, SeedSource, RunTerminal,
 };
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
 use dynrunner_protocol_primary_secondary::address::PeerId;
@@ -533,8 +533,10 @@ impl PyPrimaryCoordinator {
                     RunnerIdentifier,
                 > = NodeRunInputs {
                     primary_run_args: Some(PrimaryRunArgs {
-                        binaries: rust_binaries,
-                        phase_deps,
+                        seed: SeedSource::ColdStart {
+                            binaries: rust_binaries,
+                            phase_deps,
+                        },
                         on_phase_start,
                         on_phase_end,
                     }),

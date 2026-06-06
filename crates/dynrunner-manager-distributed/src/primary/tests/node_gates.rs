@@ -381,8 +381,10 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 .collect();
             let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 primary_run_args: Some(PrimaryRunArgs {
-                    binaries,
-                    phase_deps: HashMap::new(),
+                    seed: SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: HashMap::new(),
+                    },
                     on_phase_start: Box::new(|_| {}),
                     on_phase_end: Box::new(|_, _, _, _| {}),
                 }),

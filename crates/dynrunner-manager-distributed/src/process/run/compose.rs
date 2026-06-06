@@ -10,15 +10,18 @@
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
-use super::super::run_inputs::PrimaryRunArgs;
+use super::super::run_inputs::{PrimaryRunArgs, SeedSource};
 
 /// Empty primary args (no binaries / deps / narration) — the fallback when a
 /// primary entry is live but no run args were supplied (a node that composed
-/// a primary but drives no pipeline, e.g. a unit fixture).
+/// a primary but drives no pipeline, e.g. a unit fixture). A degenerate
+/// cold-start (no binaries, no deps): hydrate yields an empty pool.
 pub(super) fn empty_primary_args<I: Identifier>() -> PrimaryRunArgs<I> {
     PrimaryRunArgs {
-        binaries: Vec::new(),
-        phase_deps: std::collections::HashMap::new(),
+        seed: SeedSource::ColdStart {
+            binaries: Vec::new(),
+            phase_deps: std::collections::HashMap::new(),
+        },
         on_phase_start: Box::new(|_| {}),
         on_phase_end: Box::new(|_, _, _, _| {}),
     }

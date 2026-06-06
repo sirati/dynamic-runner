@@ -6,7 +6,6 @@
 //! `task.discover_items` OFF the runtime thread so the mesh-pump's
 //! keepalives keep flowing). Also exposes the `completed` getter.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -15,7 +14,7 @@ use pyo3::types::PyList;
 
 use dynrunner_core::TaskInfo;
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal,
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, SeedSource, RunTerminal,
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator, SetupDiscovery,
@@ -731,13 +730,12 @@ fn build_promoted_primary_recipe(
         primary.seed_from_promotion_snapshot(snapshot);
         PromotedPrimary {
             coordinator: primary,
-            // The snapshot carries the tasks + phase-deps; a promoted primary
-            // enters `run` with empty binaries (the setup-defer / seeded
-            // path), exactly like the submitter's setup-deferred local
-            // primary.
+            // The snapshot already carries the tasks + phase-deps and was
+            // restored + hydrated by `seed_from_promotion_snapshot` above, so
+            // the promoted primary enters `run` on the inherited CRDT: its
+            // run-init originates nothing and just re-hydrates.
             run_args: PrimaryRunArgs {
-                binaries: Vec::new(),
-                phase_deps: HashMap::new(),
+                seed: SeedSource::PromotionSnapshot,
                 on_phase_start: Box::new(|_| {}),
                 on_phase_end: Box::new(|_, _, _, _| {}),
             },

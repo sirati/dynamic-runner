@@ -495,7 +495,7 @@ async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(binaries, deps, ops, ope).await.unwrap();
+            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
 
             // Post-run: cleanup_lifecycle_dispatcher must have taken the
             // handle out of `self`. A surviving `Some` would mean the

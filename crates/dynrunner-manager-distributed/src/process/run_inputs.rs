@@ -31,16 +31,46 @@ use tokio::sync::mpsc;
 use crate::primary::{OnPhaseEnd, OnPhaseStart, PrimaryCoordinator};
 use crate::process::{MeshClient, RoleInbox};
 
+/// Where `run_pipeline`'s task set comes from — the EXPLICIT, typed
+/// discriminator the builder threads in, never a shape `run_pipeline`
+/// infers from `task_count()` / `binaries.is_empty()`.
+///
+/// Both arms converge on ONE init path: land the seed into the CRDT, then
+/// always `hydrate_from_cluster_state` (the sole builder of the pool +
+/// progress caches + `total_tasks`). The arm selects ONLY who originates the
+/// CRDT first:
+///   * [`SeedSource::ColdStart`] ORIGINATES the CRDT (the `originate_cold_seed`
+///     work — `PhaseDepsSet` + `TaskAdded` fan-out, the `#3a`/`#2` ingest
+///     directives), then hydrate builds the pool from the freshly-seeded CRDT.
+///   * [`SeedSource::PromotionSnapshot`] TRUSTS a CRDT that
+///     `seed_from_promotion_snapshot` already restored + hydrated; the seed
+///     step is a no-op and hydrate (re-)derives the pool from the inherited
+///     ledger.
+pub enum SeedSource<I: Identifier> {
+    /// Bootstrap: this primary originates the run's task set into the CRDT.
+    ColdStart {
+        /// The task binaries to seed.
+        binaries: Vec<TaskInfo<I>>,
+        /// The phase dependency graph.
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    },
+    /// Promotion: the coordinator was ALREADY
+    /// `seed_from_promotion_snapshot`'d before `run`. Carries nothing — the
+    /// pool / caches / `total_tasks` are derived from the inherited CRDT by
+    /// the always-run hydrate.
+    PromotionSnapshot,
+}
+
 /// The pipeline args a primary's `run` / `run_consuming` consumes.
 ///
 /// Single-use (the `on_phase_*` closures are `Box<dyn FnMut>`, not `Clone`):
 /// a bootstrap primary consumes one set; a promoted primary gets a FRESH set
 /// from its [`PromotedPrimaryBuilder`].
 pub struct PrimaryRunArgs<I: Identifier> {
-    /// The task binaries the pipeline dispatches.
-    pub binaries: Vec<TaskInfo<I>>,
-    /// The phase dependency graph.
-    pub phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// How the pipeline's task set is seeded (cold-start origination vs.
+    /// inherited promotion snapshot). Replaces the bare `binaries` +
+    /// `phase_deps`: the builder KNOWS which path it is and says so.
+    pub seed: SeedSource<I>,
     /// Per-phase-start narration hook.
     pub on_phase_start: OnPhaseStart,
     /// Per-phase-end narration hook.

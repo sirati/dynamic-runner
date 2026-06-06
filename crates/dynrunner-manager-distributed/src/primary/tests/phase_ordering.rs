@@ -415,7 +415,7 @@ async fn run_producer_zero_dispatch_scenario(
         }
     });
 
-    let result = primary.run(binaries, phase_deps, on_start, on_end).await;
+    let result = primary.run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end).await;
 
     drop(primary);
     for h in sec_handles {
@@ -561,7 +561,7 @@ async fn run_phase_ordering_scenario(
     });
 
     primary
-        .run(binaries, phase_deps, on_start, on_end)
+        .run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end)
         .await
         .unwrap();
 
@@ -802,7 +802,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             });
 
             primary
-                .run(binaries, phase_deps, on_start, on_end)
+                .run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end)
                 .await
                 .unwrap();
 

@@ -355,6 +355,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                          tasks become dispatchable"
                     );
                     self.hydrate_from_cluster_state();
+                    // `hydrate_from_cluster_state` no longer self-drains empty
+                    // phases (the primary's coordinator owns the narrated
+                    // cascade at run-entry). At this MID-RUN rebuild there is
+                    // no run-entry cascade to follow, so drain trivially-empty
+                    // phases here for dependent visibility — the same silent
+                    // cascade the secondary-hydration port performed in-line
+                    // before. Callback narration is owned by the operational
+                    // loop's `process_phase_lifecycle` and is suppressed while
+                    // `setup_pending()` holds (this rebuild's only caller).
+                    crate::secondary::origination::cascade_drain_done(self.pool_mut());
                     self.cluster_state
                         .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
                 } else {
