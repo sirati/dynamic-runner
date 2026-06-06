@@ -24,6 +24,8 @@ use tokio::sync::mpsc;
 
 use super::{ObserverConfig, ObserverCoordinator, ObserverTerminal};
 use crate::cluster_state::ClusterState;
+use crate::process::{LocalRole, Mesh, MeshClient, RoleInbox};
+use dynrunner_protocol_primary_secondary::address::PeerId;
 
 /// Minimal serializable identifier for the observer tests.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -118,6 +120,87 @@ fn transport_with_peers(
     (transport, inbound_tx, keepalive)
 }
 
+/// Mint the Observer mesh trio over `transport` and hand back the
+/// coordinator's `(client, inbox)` plus a PUMP future to drive concurrently
+/// on the same `LocalSet` as `observer.run()`.
+///
+/// Post-Phase-C the observer never names a transport: it reaches the mesh
+/// through a [`MeshClient`] (egress) + a [`RoleInbox`] (ingress), both
+/// minted by [`Mesh::register_local_role`] (the C0 `process/tests`
+/// pattern). The pump is a faithful single-role mirror of C-NODE's real
+/// mesh-pump — it is what bridges the test's `ChannelPeerTransport` to the
+/// detached client/inbox:
+///   - INGRESS: a frame off the wire (`recv_peer`, fed by a test's
+///     `inbound_tx`) is demuxed to the observer's slot via
+///     `deliver_local(Observer)` → the observer's `inbox.recv()`. (These
+///     tests are single-observer, so every inbound frame is observer-bound;
+///     this is exactly what `route_incoming` would do for an
+///     `Observer`/`All`-stamped frame, without needing the test to stamp.)
+///   - EGRESS: a queued `client.send` (`next_local_dispatch`) is applied
+///     via `apply_local_dispatch` → the wire (`send_to_peer`/`broadcast`),
+///     so a test draining a peer outbox still observes the observer's sends.
+///   - MEMBERSHIP: the pump publishes the live transport cardinality each
+///     cycle (and ONCE upfront, before the observer's first `evaluate_exit`,
+///     so the strand guards read the real peer count rather than the
+///     fresh-view 0). The channel transport's membership is static for a
+///     test's lifetime (peers held by the `PeerKeepalive`).
+fn observer_mesh(
+    transport: ChannelPeerTransport<TestId>,
+    node_id: &str,
+) -> (
+    MeshClient<TestId>,
+    RoleInbox<TestId>,
+    std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
+) {
+    let mut mesh = Mesh::<TestId, _>::new(transport);
+    let (slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Observer, PeerId::from(node_id));
+    // Seed the membership view BEFORE the observer's run loop reads it, so a
+    // resident-peer test sees `peer_count > 0` on the first `evaluate_exit`.
+    mesh.publish_membership();
+    let pump = async move {
+        // Keep `slot` alive for the pump's lifetime: dropping it would let
+        // the mesh `Weak` lapse and close the observer's inbox prematurely.
+        let _slot = slot;
+        // `recv_peer` and `next_local_dispatch`/`apply_local_dispatch` both
+        // take `&mut mesh` (they share the transport), so they cannot be two
+        // live branches of one `select!`. Drive them as SEQUENTIAL
+        // zero-timeout polls each tick instead — one `&mut mesh` borrow at a
+        // time. A 1ms cadence keeps both directions responsive for the
+        // wall-clock-bounded tests; the membership republish rides the same
+        // tick (its value is always a live transport read).
+        let mut wire_open = true;
+        loop {
+            // INGRESS: demux any ready inbound frame to the observer slot
+            // (the single local role in these tests). A closed wire latches
+            // `wire_open = false` so we stop polling it.
+            if wire_open
+                && let Ok(maybe) =
+                    tokio::time::timeout(Duration::ZERO, mesh.recv_peer()).await
+            {
+                match maybe {
+                    Some(frame) => {
+                        mesh.deliver_local(LocalRole::Observer, frame);
+                    }
+                    None => wire_open = false,
+                }
+            }
+            // EGRESS: apply every queued client send against the live slots
+            // / the wire (so a test draining a peer outbox observes the
+            // observer's sends).
+            while let Ok(Some(item)) =
+                tokio::time::timeout(Duration::ZERO, mesh.next_local_dispatch()).await
+            {
+                let _ = mesh.apply_local_dispatch(item).await;
+            }
+            // MEMBERSHIP: republish the live transport cardinality.
+            mesh.publish_membership();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    (client, inbox, Box::pin(pump))
+}
+
 /// `run_complete` already applied ⇒ the observer returns `Done` (exit 0)
 /// immediately, without arming any backstop.
 #[tokio::test(flavor = "current_thread")]
@@ -128,7 +211,9 @@ async fn observer_returns_on_run_complete() {
             let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
             let mut cs = ClusterState::<TestId>::new();
             cs.apply(ClusterMutation::RunComplete);
-            let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
             let terminal = observer.run().await.expect("Ok on run_complete");
             assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
         })
@@ -145,8 +230,10 @@ async fn observer_exits_on_dead_fleet() {
             .run_until(async {
                 let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
                 let cs = ClusterState::<TestId>::new();
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
                 let mut observer =
-                    ObserverCoordinator::new(transport, cs, observer_config("obs"));
+                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
                 let err = observer
                     .run()
                     .await
@@ -184,7 +271,9 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
                 // backstop before peer_timeout's deadline.
                 config.peer_timeout = Duration::from_millis(80);
                 config.fleet_dead_timeout = Duration::from_millis(30);
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
                 let err = observer
                     .run()
                     .await
@@ -248,7 +337,9 @@ async fn observer_narrates_phases_and_one_completion_summary() {
 
             // Drive the real observer to its terminal so the narration is
             // asserted over the ledger `run()` actually converged + exited on.
-            let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
             let terminal = observer.run().await.expect("Ok on run_complete");
             assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
 
@@ -322,7 +413,9 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                 // Re-check cadence well under peer_timeout so the backstop
                 // WOULD fire by ~120ms if the refresh didn't reset it.
                 config.fleet_dead_timeout = Duration::from_millis(40);
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
 
                 tokio::task::spawn_local(async move {
                     tokio::time::sleep(Duration::from_millis(60)).await;
@@ -427,7 +520,9 @@ async fn observer_recovers_from_snapshot_reply() {
                     })
                     .unwrap();
 
-                let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
                 assert_eq!(
                     observer.cluster_state().outcome_counts().succeeded,
                     0,
@@ -482,7 +577,9 @@ async fn observer_no_reply_still_terminates_via_deadline() {
                 config.peer_timeout = Duration::from_secs(60);
                 config.fleet_dead_timeout = Duration::from_secs(60);
 
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
                 let err = observer
                     .run()
                     .await
@@ -516,7 +613,9 @@ async fn observer_run_aborted_exits_non_zero() {
                 reason: "duplicate task id in initial batch".into(),
             });
             cs.apply(ClusterMutation::RunComplete);
-            let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
             let terminal = observer.run().await.expect("aborted is a terminal, not an Err");
             match terminal {
                 ObserverTerminal::Aborted { reason } => {
@@ -549,8 +648,11 @@ async fn observer_panik_arm_returns_panik_terminal() {
                 config.fleet_dead_timeout = Duration::from_secs(60);
                 config.peer_timeout = Duration::from_secs(60);
 
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
                 let mut observer = super::build_cold_join_observer(
-                    transport,
+                    client,
+                    inbox,
                     ClusterState::<TestId>::new(),
                     config,
                     Vec::new(),
@@ -629,7 +731,9 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                 config.peer_timeout = Duration::from_millis(80);
                 config.fleet_dead_timeout = Duration::from_millis(30);
 
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
 
                 tokio::task::spawn_local(async move {
                     // Land the re-pointing snapshot well into the run (past
@@ -700,7 +804,9 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                 config.peer_timeout = Duration::from_secs(60);
                 config.fleet_dead_timeout = Duration::from_secs(60);
 
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
 
                 tokio::task::spawn_local(async move {
                     // Seed the ledger BEFORE the 150ms deadline ⇒ task_count
@@ -761,7 +867,12 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
 
 /// The shared inbound + bookkeeping a [`build_test_handoff`] hands back.
 struct HandoffTestRig {
-    handoff: super::ObserverHandoff<ChannelPeerTransport<TestId>, TestId>,
+    handoff: super::ObserverHandoff<TestId>,
+    /// The mesh-pump the test must `spawn_local` alongside `observer.run()`
+    /// — it carries the SAME mesh whose `(client, inbox)` rode the handoff,
+    /// so the observer's ingress/egress/membership are driven exactly as the
+    /// `new`-path tests (the retag preserves the slot/channel — H5).
+    pump: std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>,
     /// Feed mesh frames the observer's run loop applies.
     inbound: mpsc::UnboundedSender<DistributedMessage<TestId>>,
     /// Count of events the INHERITED (primary) dispatcher received. The
@@ -786,6 +897,9 @@ fn build_test_handoff(
     config: ObserverConfig,
 ) -> HandoffTestRig {
     let (transport, inbound, peers) = transport_with_peers(node_id, 1);
+    // Mint the SAME mesh trio the primary held + retagged to observer (H5):
+    // the handoff carries `client + inbox`, and the test drives the pump.
+    let (client, inbox, pump) = observer_mesh(transport, node_id);
 
     // The inherited primary fabric: a task-completed channel already
     // installed on the moved-in cluster_state, with a dummy dispatcher
@@ -809,7 +923,8 @@ fn build_test_handoff(
         tokio::task::spawn_local(async { std::future::pending::<()>().await });
 
     let handoff = super::ObserverHandoff {
-        transport,
+        client,
+        inbox,
         cluster_state,
         node_id: node_id.to_string(),
         deadlines: config.clone(),
@@ -822,6 +937,7 @@ fn build_test_handoff(
     };
     HandoffTestRig {
         handoff,
+        pump,
         inbound,
         inherited_event_count,
         _peers: peers,
@@ -850,6 +966,7 @@ async fn from_handoff_resumes_moved_in_state_and_exits_on_run_complete() {
             cs.apply(ClusterMutation::RunComplete);
 
             let rig = build_test_handoff("obs", cs, observer_config("obs"));
+            tokio::task::spawn_local(rig.pump);
             let mut observer = ObserverCoordinator::from_handoff(rig.handoff);
 
             let terminal = observer.run().await.expect("Ok on the moved-in run_complete");
@@ -886,6 +1003,7 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                 let rig = build_test_handoff("obs", cs, observer_config("obs"));
                 let inherited_count = rig.inherited_event_count.clone();
                 let inbound = rig.inbound.clone();
+                tokio::task::spawn_local(rig.pump);
                 let mut observer = ObserverCoordinator::from_handoff(rig.handoff);
 
                 // Apply a TaskCompleted AFTER from_handoff (so it routes via
@@ -986,8 +1104,11 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                 config.peer_timeout = Duration::from_secs(60);
                 config.fleet_dead_timeout = Duration::from_secs(60);
 
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
                 let mut observer = super::build_cold_join_observer(
-                    transport,
+                    client,
+                    inbox,
                     ClusterState::<TestId>::new(),
                     config,
                     vec![snapshot],
@@ -1126,7 +1247,9 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                 config.peer_timeout = Duration::from_millis(50);
                 config.fleet_dead_timeout = Duration::from_secs(60);
 
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
 
                 let inbound_for_driver = inbound_tx.clone();
                 tokio::task::spawn_local(async move {
@@ -1258,7 +1381,9 @@ async fn recovery_cadence_quiesces_when_converged() {
                 config.peer_timeout = Duration::from_millis(40);
                 config.fleet_dead_timeout = Duration::from_secs(60);
 
-                let mut observer = ObserverCoordinator::new(transport, cs, config);
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
 
                 let inbound_for_driver = inbound_tx.clone();
                 let recovery_requests = std::rc::Rc::new(std::cell::Cell::new(0usize));
@@ -1351,7 +1476,10 @@ async fn peer_digests_pruned_on_peer_removed() {
         .run_until(async {
             let (transport, inbound_tx, _keepalive) = transport_with_peers("obs", 1);
             let cs = ClusterState::<TestId>::new();
-            let mut observer = ObserverCoordinator::new(transport, cs, observer_config("obs"));
+            // This test drives `on_cluster_mutation` synchronously (no run
+            // loop), so the mesh-pump is not needed — only a valid trio.
+            let (client, inbox, _pump) = observer_mesh(transport, "obs");
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
 
             // Two recorded last-seen digests, one of which is about to depart.
             observer
