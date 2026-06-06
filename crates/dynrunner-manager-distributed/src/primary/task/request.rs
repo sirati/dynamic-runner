@@ -1,16 +1,12 @@
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, PeerId, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(crate) async fn handle_task_request(
         &mut self,
         msg: DistributedMessage<I>,

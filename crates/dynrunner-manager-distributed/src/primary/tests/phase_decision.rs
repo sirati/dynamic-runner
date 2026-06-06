@@ -35,16 +35,14 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
     t
 }
 
-fn make_primary() -> PrimaryCoordinator<
-    ChannelPeerTransport<TestId>,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
+fn make_primary() -> (
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryMeshKeepalive,
+) {
     // The channel ends are unused by these synchronous tests (no
     // transport I/O is driven); dropping them is harmless.
     let (transport, _ends) = setup_test(1);
-    PrimaryCoordinator::new(
+    build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -78,7 +76,7 @@ fn cross_binary(phase: &str, id: &str, deps: &[(&str, &str)]) -> TaskInfo<TestId
 /// successful `ingest_initial_batch`.
 #[test]
 fn ingest_initial_batch_cross_phase_same_task_id_is_not_a_duplicate() {
-    let mut primary = make_primary();
+    let (mut primary, _mesh) = make_primary();
     // Two phases, no deps. Install the pool the way `process_binaries`
     // would, so `ingest_initial_batch` runs against a real pool.
     let mut phase_set = std::collections::HashSet::new();
@@ -111,7 +109,7 @@ fn ingest_initial_batch_cross_phase_same_task_id_is_not_a_duplicate() {
 /// some siblings failed.
 #[test]
 fn phase_can_proceed_when_some_completed() {
-    let primary = make_primary();
+    let (primary, _mesh) = make_primary();
     let p = PhaseId::from("compile");
     assert!(primary.phase_can_proceed(&p, 3, 0));
     assert!(primary.phase_can_proceed(&p, 1, 2));
@@ -122,7 +120,7 @@ fn phase_can_proceed_when_some_completed() {
 /// worker demand and blocks nothing.
 #[test]
 fn phase_can_proceed_when_zero_items() {
-    let primary = make_primary();
+    let (primary, _mesh) = make_primary();
     let p = PhaseId::from("empty");
     // No pool item carries phase "empty" and no in-flight counter ⇒
     // phase_min_workers == 0 ⇒ proceed.
@@ -136,7 +134,7 @@ fn phase_can_proceed_when_zero_items() {
 /// aborting the run (see `retry_bucket` budget-exhausted branch).
 #[test]
 fn phase_can_proceed_when_all_items_failed_terminally() {
-    let primary = make_primary();
+    let (primary, _mesh) = make_primary();
     let p = PhaseId::from("compile");
     assert!(primary.phase_can_proceed(&p, 0, 1));
     assert!(primary.phase_can_proceed(&p, 0, 5));
@@ -149,7 +147,7 @@ fn phase_can_proceed_when_all_items_failed_terminally() {
 /// `phase_min_workers` reports residual work, then assert the veto.
 #[test]
 fn phase_cannot_proceed_with_residual_unresolved_work() {
-    let mut primary = make_primary();
+    let (mut primary, _mesh) = make_primary();
 
     // Seed one Pending item in a zero-dep phase so it hydrates Active
     // with residual work and no terminal accounting.
@@ -174,7 +172,7 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
 /// further when re-run (idempotent: only newly-inserted phases emit).
 #[test]
 fn fire_initial_phase_starts_emits_needs_workers_for_phase_with_work() {
-    let mut primary = make_primary();
+    let (mut primary, _mesh) = make_primary();
 
     // Seed a completed `build`-phase prereq plus two `compile`-phase
     // dependents so `compile` hydrates as Active-with-items.
@@ -249,7 +247,7 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
 
-    let mut primary = make_primary();
+    let (mut primary, _mesh) = make_primary();
 
     let toolchain = dep_binary("toolchain", "build", &[]);
     let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);

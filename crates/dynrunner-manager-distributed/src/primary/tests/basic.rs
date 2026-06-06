@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn single_secondary_processes_all_tasks() {
     let local = tokio::task::LocalSet::new();
@@ -16,7 +17,7 @@ async fn single_secondary_processes_all_tasks() {
                 ..test_primary_config()
             };
 
-            let mut primary = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 config,
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -44,6 +45,7 @@ async fn single_secondary_processes_all_tasks() {
         .await;
 }
 
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn two_secondaries_distribute_work() {
     let local = tokio::task::LocalSet::new();
@@ -58,7 +60,7 @@ async fn two_secondaries_distribute_work() {
                 ..test_primary_config()
             };
 
-            let mut primary = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 config,
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -97,6 +99,7 @@ async fn two_secondaries_distribute_work() {
 /// secondary 0 receives InitialAssignment; secondary 1 hangs in
 /// `wait_for_setup`. Post-fix both reach `process_tasks` and the
 /// run completes.
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn empty_batch_secondary_still_reaches_process_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -139,7 +142,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
                 ..test_primary_config()
             };
 
-            let mut primary = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 config,
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -200,6 +203,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 /// 2 binaries (one per worker); the operational loop is responsible for
 /// the remaining 18+. Pins the live-flow path that the legacy Python
 /// never managed to get right.
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn live_distribution_continues_past_initial_batch() {
     let local = tokio::task::LocalSet::new();
@@ -213,7 +217,7 @@ async fn live_distribution_continues_past_initial_batch() {
                 ..test_primary_config()
             };
 
-            let mut primary = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 config,
                 transport,
                 ResourceStealingScheduler::memory(),

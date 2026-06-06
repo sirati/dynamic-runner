@@ -1,16 +1,13 @@
 use std::collections::HashSet;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Block on every connected secondary reporting `MeshReady`
     /// before letting `promote_primary` fire. The 750µs gap
     /// between "all secondaries cert-exchanged" and the previous
@@ -97,7 +94,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             }
 
             tokio::select! {
-                msg = self.transport.recv_peer() => {
+                msg = self.inbox.recv() => {
                     match msg {
                         // Pre-operational-loop site. See
                         // `wait_for_connections` for the matching
@@ -201,5 +198,4 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
         Ok(())
     }
-
 }

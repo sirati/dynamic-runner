@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, PeerId, PeerTransport, StagedFileRecord, WorkerReadyInfo,
-    ZipBinaryEntry, ZipFileAssignment,
+    Destination, DistributedMessage, PeerId, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
+    ZipFileAssignment,
 };
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler};
 
@@ -12,9 +12,7 @@ use crate::state::SecondaryConnectionState;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 use super::{PrimaryCoordinator, RemoteWorkerState};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
 

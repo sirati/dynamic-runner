@@ -1,6 +1,6 @@
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, PeerId, PeerTransport,
+    ClusterMutation, Destination, DistributedMessage, PeerId,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -8,9 +8,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::timestamp_now;
 use crate::worker_signal::WorkerMgmtSignal;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Apply a replicated `DistributedMessage::ClusterMutation` batch.
     ///
     /// Single concern: keep the demoted primary's CRDT mirror — and the
@@ -142,7 +140,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     pub(crate) async fn handle_state_digest(&mut self, msg: DistributedMessage<I>) {
         let DistributedMessage::StateDigest {
             target: None,
-            digest, sender_id, ..
+            digest,
+            sender_id,
+            ..
         } = msg
         else {
             return;
@@ -179,7 +179,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     pub(crate) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::ClusterMutation {
-    target: None, mutations, .. } = msg {
+            target: None,
+            mutations,
+            ..
+        } = msg
+        {
             // Note whether any ledger-growing mutation rides in this
             // batch BEFORE moving the mutations into apply, so the
             // post-apply `total_tasks` refresh below absorbs runtime

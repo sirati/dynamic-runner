@@ -11,10 +11,14 @@ use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport,
 };
-use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use dynrunner_transport_channel::{ChannelManagerEnd, ChannelPeerTransport, channel_pair};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::primary::{PrimaryConfig, PrimaryCoordinator};
+use crate::process::{LocalRole, Mesh, RoleSlot};
 
 /// Minimal serializable identifier used by every primary test.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -578,6 +582,63 @@ pub(super) async fn fake_secondary_with_addrs(
             _ => {}
         }
     }
+}
+
+/// Keeps the test mesh + the primary role-slot `Arc` + the demote sender
+/// alive for as long as the [`PrimaryCoordinator`] built by
+/// [`build_test_primary`] lives.
+///
+/// In production the [`crate::process::Node`] owns the `Mesh`, the
+/// `Arc<RoleSlot>`, and the demote channel; the mesh-pump drains the
+/// coordinator's queued egress and feeds its inbox. The unit tests have no
+/// pump (that is `Node::run`, owned by C-NODE), so a test that needs wire
+/// round-trips is `#[ignore]`d until C-NODE re-enables it against the real
+/// `Node::run`. This guard exists only so the LOCAL-only tests — which
+/// exercise the rewired coordinator's in-memory state without round-trips —
+/// can construct a coordinator: the slot `Arc` keeps the mesh `Weak`
+/// upgradeable and the `Mesh` keeps the egress queue's receiver alive so a
+/// queued `client.send` does not error as "pump dropped". Hold it for the
+/// coordinator's lifetime (bind to `_mesh` at the call site); dropping it
+/// early would tear the mesh out from under the coordinator.
+pub(super) struct PrimaryMeshKeepalive {
+    _mesh: Mesh<TestId, ChannelPeerTransport<TestId>>,
+    _slot: Arc<RoleSlot<TestId>>,
+    _demote_tx: tokio_mpsc::UnboundedSender<()>,
+}
+
+/// Mint the primary's mesh capability trio from a test `Mesh` (mirroring
+/// C0's `process/tests`) and build a [`PrimaryCoordinator`] over them.
+///
+/// Returns the coordinator plus the [`PrimaryMeshKeepalive`] guard the
+/// caller MUST keep alive alongside it (`let (mut primary, _mesh) = …`).
+/// This is the single construction choke point the tests share so the
+/// `register_local_role` → `new(client, inbox, demote_rx, …)` wiring lives
+/// in ONE place. It spawns no pump: a test that drives wire traffic through
+/// `primary.run(..)` needs the real `Node::run` pump and is `#[ignore]`d
+/// until C-NODE.
+pub(super) fn build_test_primary<S, E>(
+    config: PrimaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    scheduler: S,
+    estimator: E,
+) -> (PrimaryCoordinator<S, E, TestId>, PrimaryMeshKeepalive)
+where
+    S: Scheduler<TestId>,
+    E: ResourceEstimator<TestId>,
+{
+    let mut mesh = Mesh::new(transport);
+    let (slot, client, inbox) =
+        mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
+    let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    (
+        primary,
+        PrimaryMeshKeepalive {
+            _mesh: mesh,
+            _slot: slot,
+            _demote_tx: demote_tx,
+        },
+    )
 }
 
 /// Allocate the channel-pairs for `num_secondaries` and return the

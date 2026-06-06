@@ -10,21 +10,20 @@ use tokio::sync::oneshot;
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryConfig;
 use crate::primary::PrimaryCoordinator;
-use crate::primary::test_helpers::{FixedEstimator, TestId, make_binary, setup_test};
+use crate::primary::test_helpers::{
+    FixedEstimator, PrimaryMeshKeepalive, TestId, build_test_primary, make_binary, setup_test,
+};
 use crate::primary::wire::compute_task_hash;
-use dynrunner_transport_channel::ChannelPeerTransport;
 
 /// Build a `PrimaryCoordinator` against the in-process channel
 /// transport stub used by the rest of the primary tests. We
 /// don't drive a full run; the tests below call the command-
 /// channel handlers directly to assert per-command semantics
 /// without coupling to the operational loop's exit conditions.
-fn make_coordinator() -> PrimaryCoordinator<
-    ChannelPeerTransport<TestId>,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
+fn make_coordinator() -> (
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryMeshKeepalive,
+) {
     let (transport, _secondary_ends) = setup_test(0);
     let config = PrimaryConfig {
         num_secondaries: 0,
@@ -37,7 +36,7 @@ fn make_coordinator() -> PrimaryCoordinator<
         mesh_ready_timeout: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
-    PrimaryCoordinator::new(
+    build_test_primary(
         config,
         transport,
         ResourceStealingScheduler::memory(),
@@ -52,7 +51,7 @@ async fn fail_permanent_via_channel() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             // Seed a single Pending task into cluster_state so the
             // hash-to-meta lookup succeeds. Also pre-initialise the
             // pool so `pool.on_item_failed_permanent` has a phase
@@ -124,7 +123,7 @@ async fn fail_permanent_oom_routes_into_per_phase_oom_bucket() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             // Disable the OOM bucket so the cascade can't auto-drain the
             // entry — we want to inspect `failed_tasks` post-apply.
             coordinator.config.oom_retry_max_passes = 0;
@@ -218,7 +217,7 @@ async fn fail_permanent_unknown_hash() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let (reply_tx, reply_rx) = oneshot::channel();
             super::handle_primary_command(
                 &mut coordinator,
@@ -246,7 +245,7 @@ async fn reinject_task_budget_exhaustion() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             coordinator.set_unfulfillable_reinject_max_per_task(Some(1));
             let binary = make_binary("a", 100);
             let hash = compute_task_hash(&binary);
@@ -335,7 +334,7 @@ async fn update_preferred_secondaries_smoke() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let binary = make_binary("a", 100);
             let hash = compute_task_hash(&binary);
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
@@ -373,7 +372,7 @@ async fn command_channel_end_to_end() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let binary = make_binary("a", 100);
             let hash = compute_task_hash(&binary);
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
@@ -427,7 +426,7 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
 
             // Prereq carries an explicit task_id so the pool can wire
             // the dep-cascade reverse-index.
@@ -529,7 +528,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
 
             let mut prereq = make_binary("prereq", 100);
             prereq.task_id = "prereq_id".into();
@@ -662,7 +661,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
 
             let mut prereq = make_binary("prereq", 100);
             prereq.task_id = "prereq_id".into();
@@ -766,7 +765,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut binary = make_binary("a", 100);
             binary.task_id = "a_id".into();
             let hash = compute_task_hash(&binary);
@@ -853,12 +852,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
 /// so every spawn-tasks test starts from the same shape the
 /// production operational loop uses.
 fn seed_pool(
-    coordinator: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     phases: &[&dynrunner_core::PhaseId],
 ) {
     let mut phase_set = std::collections::HashSet::new();
@@ -878,12 +872,7 @@ fn seed_pool(
 /// return the per-index error list. Centralised so every test
 /// uses the same call sequence.
 async fn spawn_via_handler(
-    coordinator: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     tasks: Vec<dynrunner_core::TaskInfo<TestId>>,
 ) -> Result<Vec<(usize, super::SpawnError)>, String> {
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -906,7 +895,7 @@ async fn spawn_tasks_all_pending_dispatched() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut a = make_binary("a", 100);
             a.task_id = "a_id".into();
             let mut b = make_binary("b", 100);
@@ -953,7 +942,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut b = make_binary("b", 100);
             b.task_id = "b_id".into();
             let b_hash = compute_task_hash(&b);
@@ -1001,7 +990,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut b = make_binary("b", 100);
             b.task_id = "b_id".into();
             let b_hash = compute_task_hash(&b);
@@ -1058,7 +1047,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut b = make_binary("b", 100);
             b.task_id = "b_id".into();
             let b_hash = compute_task_hash(&b);
@@ -1117,7 +1106,7 @@ async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             // Pre-seed `dup` so the second input clashes.
             let mut dup = make_binary("dup", 100);
             dup.task_id = "dup_id".into();
@@ -1190,7 +1179,7 @@ async fn spawn_tasks_runtime_duplicate_invalidates_all_pending_run_wide() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
 
             let mut done = make_binary("done", 100);
             done.task_id = "done_id".into();
@@ -1270,7 +1259,7 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut a = make_binary("a", 100);
             a.task_id = "a_id".into();
             seed_pool(&mut coordinator, &[&a.phase_id]);
@@ -1352,7 +1341,7 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
 
             // Pre-spawn: N=4 binaries seeded into the CRDT, exactly the
             // shape `seed_cluster_state` produces at run start.
@@ -1472,7 +1461,7 @@ async fn spawn_tasks_cross_phase_missing_dep_is_invalid_not_silent_pending() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             // `foo` exists in phase A only (seeded Pending in the ledger).
             let mut foo = make_binary("foo", 100);
             foo.phase_id = PhaseId::from("A");
@@ -1530,7 +1519,7 @@ async fn spawn_tasks_cross_phase_dep_naming_right_phase_resolves() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let mut foo = make_binary("foo", 100);
             foo.phase_id = PhaseId::from("A");
             foo.task_id = "foo".into();

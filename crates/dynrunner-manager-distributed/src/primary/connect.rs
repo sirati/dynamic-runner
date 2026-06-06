@@ -1,7 +1,5 @@
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, MessageType, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, MessageType};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -10,9 +8,7 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(super) async fn wait_for_connections(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -43,7 +39,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // this loop counts arrives with its secondary already
             // registered (FIFO welcome → registration → cert-exchange).
             tokio::select! {
-                msg = self.transport.recv_peer() => {
+                msg = self.inbox.recv() => {
                     match msg {
                         // Pre-operational-loop site. Threading
                         // `command_rx` through so an `on_phase_end`

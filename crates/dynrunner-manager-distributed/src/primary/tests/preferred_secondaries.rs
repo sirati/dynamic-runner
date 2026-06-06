@@ -21,12 +21,7 @@ fn preferred_secondaries_test_config() -> PrimaryConfig {
 /// `ClusterMutation` broadcast loops only over registered outgoing
 /// senders, of which there are none).
 fn register_operational_secondary(
-    primary: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    primary: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     secondary_id: &str,
 ) {
     use crate::state::{SecondaryConnection, SecondaryConnectionState};
@@ -53,7 +48,7 @@ async fn seed_cluster_state_warns_on_unknown_preferred_secondary_id() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(0);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 preferred_secondaries_test_config(),
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -136,7 +131,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(0);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 preferred_secondaries_test_config(),
                 transport,
                 ResourceStealingScheduler::memory(),

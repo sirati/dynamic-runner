@@ -5,7 +5,7 @@
 //! alongside the rest of the coordinator's state.
 
 use dynrunner_core::{ErrorType, Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -27,12 +27,11 @@ use super::types::{PrimaryCommand, SpawnError, validate_spawn_tasks};
 /// the first place (when the dispatcher was invoked from inside
 /// `process_phase_lifecycle`), so the drain remains a single source
 /// of truth across nested cascade levels.
-pub async fn handle_primary_command<Tr, S, E, I>(
-    coordinator: &mut PrimaryCoordinator<Tr, S, E, I>,
+pub async fn handle_primary_command<S, E, I>(
+    coordinator: &mut PrimaryCoordinator<S, E, I>,
     command: PrimaryCommand<I>,
     command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 ) where
-    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
@@ -80,9 +79,8 @@ pub async fn handle_primary_command<Tr, S, E, I>(
     }
 }
 
-impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
+impl<S, E, I> PrimaryCoordinator<S, E, I>
 where
-    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,

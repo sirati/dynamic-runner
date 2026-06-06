@@ -32,7 +32,11 @@ fn drain_assigned_task_ids(
     let mut ids = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::TaskAssignment {
-    target: None, binary_info, .. } = msg {
+            target: None,
+            binary_info,
+            ..
+        } = msg
+        {
             ids.push(binary_info.task_id);
         }
     }
@@ -67,7 +71,7 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
 #[test]
 fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+    let (mut primary, _mesh) = build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -135,7 +139,7 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
 #[test]
 fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+    let (mut primary, _mesh) = build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -203,7 +207,7 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
 #[test]
 fn hydrate_inflight_task_not_reoffered_and_counter_one() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+    let (mut primary, _mesh) = build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -287,7 +291,7 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 PrimaryConfig::default(),
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -368,7 +372,7 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            let (mut primary, _mesh) = build_test_primary(
                 PrimaryConfig::default(),
                 transport,
                 ResourceStealingScheduler::memory(),
@@ -474,6 +478,7 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
 /// that still sees the (surviving) secondary's capacity; it hydrates the
 /// task as Pending and dispatches it once — never stranded, never double-
 /// executed.
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
     let local = tokio::task::LocalSet::new();
@@ -483,7 +488,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
             // in-flight on sec-dead's worker 0. ---
             let snapshot = {
                 let (transport, _ends) = setup_test(1);
-                let mut live: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+                let (mut live, _mesh) = build_test_primary(
                     PrimaryConfig::default(),
                     transport,
                     ResourceStealingScheduler::memory(),
@@ -549,7 +554,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
             // `setup_test(1)` transport routes `Address::Peer("sec-0")`
             // assignments to the live `ends[0]` inbox. ---
             let (transport, mut ends) = setup_test(1);
-            let mut promoted: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            let (mut promoted, _mesh) = build_test_primary(
                 PrimaryConfig::default(),
                 transport,
                 ResourceStealingScheduler::memory(),

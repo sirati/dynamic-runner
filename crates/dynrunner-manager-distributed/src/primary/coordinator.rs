@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -201,17 +201,28 @@ pub(crate) struct InFlightEntry<I: Identifier> {
     pub(super) task: TaskInfo<I>,
 }
 
-/// The post-run accounting surfaced by
-/// [`PrimaryCoordinator::run_consuming`].
+/// The outcome surfaced by [`PrimaryCoordinator::run_consuming`].
 ///
-/// After the owned-`self` `run_consuming` returns, the submitter binding is
-/// gone — so the post-run counts the PyO3 boundary used to read off
-/// `primary.completed_count()` must travel back through this value. They are
-/// read off this coordinator's own `cluster_state`. The `result` carries
-/// the structured exit contract: `Ok(())` ⇒ exit 0, an `Err` ⇒ a non-zero
-/// exit at the PyO3 boundary.
-#[derive(Debug)]
-pub enum PrimaryRunOutcome {
+/// Two regimes:
+///
+/// - [`PrimaryRunOutcome::Local`]: the submitter stayed local and ran the
+///   operational loop to completion in-place. After the owned-`self`
+///   `run_consuming` returns, the submitter binding is gone — so the
+///   post-run counts the PyO3 boundary used to read off
+///   `primary.completed_count()` travel back through this value, read off
+///   this coordinator's own `cluster_state`. The `result` carries the
+///   structured exit contract: `Ok(())` ⇒ exit 0, an `Err` ⇒ a non-zero
+///   exit at the PyO3 boundary.
+/// - [`PrimaryRunOutcome::Relocated`]: the submitter relinquished the
+///   primary role at bootstrap and `run_consuming` destructured `self`
+///   into an [`crate::observer::ObserverHandoff`] (a submitter can never
+///   run the observer on its OWN primary — claudemd-HIGH-1). The handoff
+///   is the ONLY field: the [`crate::process::Node`], NOT this coordinator
+///   and NOT the PyO3 boundary, builds + runs the standalone observer from
+///   it and re-sources the final counts from the observer's converged
+///   ledger after `observer.run()`. This keeps the primary from owning the
+///   observer's lifecycle.
+pub enum PrimaryRunOutcome<I: Identifier> {
     /// The local primary ran the operational loop to completion in-place.
     /// `result` follows the in-place pipeline outcome; the counts come from
     /// the primary's own replicated ledger. The PyO3 boundary applies its
@@ -222,42 +233,73 @@ pub enum PrimaryRunOutcome {
         failed: usize,
         stranded: usize,
     },
+    /// The submitter relocated: it relinquished the primary role and handed
+    /// off everything a freshly-spun observer needs to resume seamlessly.
+    /// The `Node` builds the observer via
+    /// [`crate::observer::ObserverCoordinator::from_handoff`], runs it to
+    /// its terminal, and produces the final accounting — none of which is
+    /// this coordinator's (now-consumed) concern.
+    Relocated {
+        handoff: crate::observer::ObserverHandoff<I>,
+    },
+}
+
+// Manual `Debug` (not derived): the `Relocated` payload, `ObserverHandoff`,
+// carries non-`Debug` live resources (the `MeshClient`/`RoleInbox` mesh ends
+// + the dispatcher `JoinHandle`s), so it cannot be `Debug`. The `Local`
+// variant keeps its full structural debug (a test formats it, `{outcome:?}`);
+// `Relocated` prints an opaque marker — there is nothing safely printable on
+// a live-handle handoff, and no caller debug-formats a relocated outcome.
+impl<I: Identifier> std::fmt::Debug for PrimaryRunOutcome<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrimaryRunOutcome::Local {
+                result,
+                completed,
+                failed,
+                stranded,
+            } => f
+                .debug_struct("PrimaryRunOutcome::Local")
+                .field("result", result)
+                .field("completed", completed)
+                .field("failed", failed)
+                .field("stranded", stranded)
+                .finish(),
+            PrimaryRunOutcome::Relocated { .. } => f
+                .debug_struct("PrimaryRunOutcome::Relocated")
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// The primary coordinator: orchestrates work across secondaries.
 ///
-/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send goes
-/// through the [`Self::send_to`] egress edge, which resolves a typed
-/// `Destination` to a concrete peer-id — `Destination::Secondary(id)`
-/// for per-secondary writes (initial assignment, task fan-out),
-/// `Destination::All` for the keepalive + CRDT fan-out — then calls the
-/// `PeerId`-only transport; `recv_peer()` is the unified inbound. The
-/// transport is real-by-construction in every primary construction path
-/// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
-/// in-process / tests, the role-blind mesh transport over the host's
-/// shared mesh for a primary composed on a promoted host that advertises
-/// both roles under one peer-id) — there is no no-op send path and no
-/// per-site "which transport is real" hazard. That promoted-host primary's
-/// own-secondary loopback is NOT a transport leg: it is delivered at the
-/// egress edge (`SendTarget::Loopback` + the `Destination::All` broadcast
-/// loopback leg), so the transport itself stays role-blind. This mirrors
-/// the secondary side's collapse onto a single `Tr: PeerTransport`.
-pub struct PrimaryCoordinator<
-    Tr: PeerTransport<I>,
-    S: Scheduler<I>,
-    E: ResourceEstimator<I>,
-    I: Identifier,
-> {
+/// Holds a [`crate::process::MeshClient`] (egress) + a
+/// [`crate::process::RoleInbox`] (ingress) — its entire view of the mesh —
+/// never a transport. Every primary send goes through the [`Self::send_to`]
+/// egress edge, which resolves a typed `Destination` to a concrete peer-id
+/// with the primary's own `node_id` as the bootstrap fallback (H1), STAMPS
+/// the resolved role-bearing `Destination` on the frame, and hands it to
+/// `self.client.send(..)` — a single queued send the mesh-pump (owned by
+/// the [`crate::process::Node`]) drains and resolves loopback-vs-remote
+/// against the live slot set. The coordinator never decides loopback
+/// itself: a self-addressed `Destination` simply loopbacks at the mesh;
+/// `Destination::Secondary(id)` / `Destination::All` route or fan.
+/// `self.inbox.recv()` is the unified inbound — the pump has already
+/// demuxed each frame to this role's slot. This mirrors the secondary /
+/// observer side's collapse onto the same `MeshClient` + `RoleInbox` pair.
+pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
     pub(super) config: PrimaryConfig,
-    /// THE single mesh transport. Owns the write-through `RoleTable`
-    /// cache attached to `cluster_state` at construction; drives every
-    /// primary send (`Address`-routed) and the single `recv_peer()`
-    /// inbound surface. For the submitter primary its backend is the
-    /// per-secondary tunnel writers + the relocated `NetworkServer`
-    /// inbound demux; for a primary composed on a promoted host its backend
-    /// is the same-peer loopback + shared mesh — in both cases a real
-    /// send path.
-    pub(super) transport: Tr,
+    /// Egress capability: the locality-oblivious mesh send handle. Every
+    /// primary send routes through [`Self::send_to`] → `self.client.send`,
+    /// queued onto the mesh-pump (M4). The pump resolves loopback-vs-remote
+    /// against the live slot set; a `Destination` resolving to this host's
+    /// own role loopbacks in-process, all others go over the wire.
+    pub(super) client: crate::process::MeshClient<I>,
+    /// Ingress stream: frames the mesh-pump demuxed to this primary's slot
+    /// (loopback siblings + remote peers). Drained by `self.inbox.recv()`
+    /// in the operational loop's inbound arm; `None` is teardown.
+    pub(super) inbox: crate::process::RoleInbox<I>,
     pub(super) scheduler: S,
     pub(super) estimator: E,
 
@@ -642,6 +684,20 @@ pub struct PrimaryCoordinator<
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
+    /// Runtime loss-of-primacy signal (BUG-6). The owning
+    /// [`crate::process::Node`] installs the receive end; a self→other
+    /// `RoleTable.primary` flip (a `PrimaryChanged` / merge / restore
+    /// naming another peer, fired through the `register_role_change_hook`
+    /// fabric on apply AND restore) sends `()` here. [`Self::run_consuming`]
+    /// races this against the pipeline future: a signal makes the submitter
+    /// primary destructure itself into an [`crate::observer::ObserverHandoff`]
+    /// and return [`PrimaryRunOutcome::Relocated`] so the `Node` builds the
+    /// standalone observer. This coordinator NEVER produces the signal and
+    /// never decides the disposition — both are the `Node`'s concern; this
+    /// is purely the receive end. `None` once taken at run start, or when no
+    /// demote source is wired (the `select!` arm parks forever then).
+    pub(super) demote_rx: Option<tokio_mpsc::UnboundedReceiver<()>>,
+
     /// Set by the panik arm in the operational `select!` loop when
     /// the watcher signal fires. Carries the (matched_path, reason)
     /// pair the panik handler produced.
@@ -745,10 +801,15 @@ pub struct PrimaryCoordinator<
     pub(super) single_worker_mode: bool,
 }
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
-    pub fn new(config: PrimaryConfig, transport: Tr, scheduler: S, estimator: E) -> Self {
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    pub fn new(
+        config: PrimaryConfig,
+        client: crate::process::MeshClient<I>,
+        inbox: crate::process::RoleInbox<I>,
+        demote_rx: tokio_mpsc::UnboundedReceiver<()>,
+        scheduler: S,
+        estimator: E,
+    ) -> Self {
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         // Peer-lifecycle dispatcher channel: built at construction so
         // the apply path on `cluster_state` has a sender to enqueue
@@ -791,7 +852,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         let next_secondary_id = config.num_secondaries;
         let mut this = Self {
             config,
-            transport,
+            client,
+            inbox,
             scheduler,
             estimator,
             secondaries: HashMap::new(),
@@ -843,6 +905,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             preferred_secondaries_validator:
                 preferred_secondaries::PreferredSecondariesValidator::new(),
             panik_signal_rx: None,
+            demote_rx: Some(demote_rx),
             panik_outcome: None,
             setup_deadline_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
@@ -896,26 +959,38 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     }
 
     /// THE egress edge: resolve a typed
-    /// [`dynrunner_protocol_primary_secondary::Destination`] to a
-    /// concrete transport target by reading this coordinator's own role
-    /// facts, then dispatch the `PeerId`-only transport. The transport
-    /// never resolves a role.
+    /// [`dynrunner_protocol_primary_secondary::Destination`], STAMP the
+    /// resolved role-bearing `Destination` on the frame, and hand it to
+    /// `self.client.send(..)` — a single queued send the mesh-pump drains
+    /// and resolves loopback-vs-remote against the live slot set. This edge
+    /// never touches a transport and never decides loopback itself.
     ///
-    /// Resolution reads `cluster_state.current_primary()` with this
-    /// primary's own `config.node_id` as the bootstrap fallback (the
-    /// submitter primary IS the bootstrap primary), so
-    /// `Destination::Primary` is always resolvable on the primary.
-    /// `Secondary`/`Observer` destinations resolve to their carried host
-    /// id; `All` is the mesh broadcast. A resolved host id equal to this
-    /// node's own id is [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`].
+    /// The `resolve_destination` HEAD stays here because its bootstrap
+    /// fallback is primary-specific (H1): this primary's own
+    /// `config.node_id` (the submitter primary IS the bootstrap primary),
+    /// so `Destination::Primary` is always resolvable. The HEAD's role is
+    /// the resolvability check — a `None` is the honest "no route to
+    /// primary" surfaced as `Err`, matching the prior cold-cache hard
+    /// error. The resolved [`dynrunner_protocol_primary_secondary::SendTarget`]
+    /// itself is NOT routed here: the role-bearing `Destination` is what the
+    /// mesh demuxes against. `Secondary(id)` / `Observer(id)` already carry
+    /// their host (the mesh resolves loopback-vs-remote off that id);
+    /// `All` fans (origin-excluded at the mesh); `Primary` on the primary
+    /// resolves to a loopback — it IS the primary — and the mesh delivers
+    /// the stamped `Destination::Primary` to the local primary slot.
     pub(super) async fn send_to(
         &mut self,
         dst: dynrunner_protocol_primary_secondary::Destination,
         msg: dynrunner_protocol_primary_secondary::DistributedMessage<I>,
     ) -> Result<(), String> {
-        use dynrunner_protocol_primary_secondary::{SendTarget, resolve_destination};
-        let target = resolve_destination(
-            dst,
+        use dynrunner_protocol_primary_secondary::resolve_destination;
+        // Resolvability check (H1 bootstrap fallback = this primary's own
+        // node_id). The concrete `SendTarget` is discarded — the mesh
+        // resolves loopback-vs-remote off the stamped role-bearing
+        // `Destination` against its live slots; we only need to know the
+        // destination HAS a route before queuing.
+        resolve_destination(
+            dst.clone(),
             self.cluster_state.current_primary(),
             Some(&self.config.node_id),
             &self.config.node_id,
@@ -923,27 +998,10 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         .ok_or_else(|| {
             "Destination unresolvable: no current primary in the role table".to_string()
         })?;
-        match target {
-            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
-            // PHASE-C-SEAM[C2]: egress collapse — the resolved
-            // `SendTarget` match becomes `mesh.dispatch(self.role, target,
-            // msg)`. Broadcast fans out to every wire peer plus every
-            // OTHER local role slot through the mesh; Phase B leaves the
-            // plain wire fan-out tail.
-            SendTarget::Broadcast => self.transport.broadcast(msg).await,
-            // PHASE-C-SEAM[C2]: a `Destination` that resolves to this
-            // host's own id. In Phase C the mesh delivers it to the local
-            // role slot; in Phase B (CH1 loopback removed) it is the
-            // benign self-relay no-op — the message is already at this
-            // host.
-            SendTarget::Loopback => {
-                tracing::debug!(
-                    "Destination resolved to self (live-primary self-relay); \
-                     no-op — the message is already at this host"
-                );
-                Ok(())
-            }
-        }
+        // Stamp the role-bearing target so the receiving pump demuxes it
+        // (C3), then queue. The mesh decides loopback-vs-remote; nothing is
+        // silently dropped here.
+        self.client.send(dst.clone(), msg.with_target(dst))
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
@@ -1923,16 +1981,6 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         &mut self.cluster_state
     }
 
-    /// Test-only mutable borrow of the single mesh transport. Lets the
-    /// composition routing hazard test drive a
-    /// `send(Address::Peer(local_secondary_id), ..)` directly and assert
-    /// it reaches the loopback secondary's inbound without echoing back
-    /// to the primary.
-    #[cfg(test)]
-    pub fn transport_mut_for_test(&mut self) -> &mut Tr {
-        &mut self.transport
-    }
-
     /// Test-only count of workers the primary currently tracks as
     /// mid-dispatch (slot `Assigned`). Used by the composition hazard
     /// tests to assert a hydrated remote-in-flight task is NOT also
@@ -2118,37 +2166,108 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// Owned-`self` run entry for the PyO3 boundary.
     ///
     /// Mirrors [`Self::run`] but OWNS `self`, returning a
-    /// [`PrimaryRunOutcome`] that surfaces the post-run accounting
-    /// (`completed`/`failed`/`stranded`) sourced from this coordinator's
-    /// own `cluster_state`, plus the structured exit-contract `result`
-    /// (the `RunError`-or-`Ok` shape the PyO3 boundary maps to exit codes).
+    /// [`PrimaryRunOutcome`].
+    ///
+    /// Two regimes, selected by which future resolves first:
+    ///
+    /// - The pipeline runs to completion → [`PrimaryRunOutcome::Local`]: the
+    ///   post-run accounting (`completed`/`failed`/`stranded`) sourced from
+    ///   this coordinator's own `cluster_state`, plus the structured
+    ///   exit-contract `result` (the `RunError`-or-`Ok` shape the PyO3
+    ///   boundary maps to exit codes). The dispatchers tear down in-place.
+    /// - The runtime loss-of-primacy signal (`demote_rx`, BUG-6) fires first
+    ///   → [`PrimaryRunOutcome::Relocated`]: the pipeline future is dropped,
+    ///   `self` destructures into an [`crate::observer::ObserverHandoff`]
+    ///   (carrying the live dispatcher handles across — they are NOT torn
+    ///   down here; the observer's single-teardown owns them), and the
+    ///   handoff rides out to the [`crate::process::Node`], which builds and
+    ///   runs the standalone observer. The submitter never runs the observer
+    ///   on its own primary (claudemd-HIGH-1); this coordinator only carries
+    ///   the handoff out.
+    ///
+    /// `run_consuming` owns `self`, so it is the ONLY entry that can perform
+    /// the by-value handoff — the `&mut self` [`Self::run`] cannot surrender
+    /// `self` and so ignores the demote signal entirely.
     pub async fn run_consuming(
         mut self,
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
-    ) -> Result<PrimaryRunOutcome, RunError> {
+    ) -> Result<PrimaryRunOutcome<I>, RunError> {
         let span = tracing::info_span!(
             dynrunner_core::PRIMARY_ROLE_SPAN,
             kind = "primary",
             node = %self.config.node_id
         );
         async move {
-            let result = self
-                .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
-                .await;
-            // Tear the dispatchers down in-place (same contract as `run`),
-            // read the counts off this coordinator's own replicated ledger,
-            // and carry the pipeline outcome through `result`, then drop
-            // `self`.
-            self.cleanup_run_dispatchers().await;
-            Ok(PrimaryRunOutcome::Local {
-                result,
-                completed: self.completed_count(),
-                failed: self.failed_count(),
-                stranded: self.stranded_count(),
-            })
+            // Take the demote receiver out so the `select!` arm can borrow
+            // it without aliasing the `&mut self` the pipeline future holds.
+            // The pipeline never touches `demote_rx`, so leaving the field
+            // `None` for the duration is safe.
+            let mut demote_rx = self.demote_rx.take();
+            // Which arm of the race won. Local-only enum so the borrow of
+            // `self` (via the pipeline future) is fully released before the
+            // by-value relocate handoff.
+            enum Pipeline {
+                Completed(Result<(), RunError>),
+                Demoted,
+            }
+            // Race the pipeline against the runtime loss-of-primacy signal.
+            // The losing future is dropped at the end of the `select!`, so
+            // after it returns we can move `self` by value (the pipeline
+            // future no longer borrows it) on the relocate branch.
+            let demoted = {
+                let pipeline =
+                    self.run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end);
+                tokio::pin!(pipeline);
+                tokio::select! {
+                    result = &mut pipeline => {
+                        // Pipeline finished first: stay local.
+                        Pipeline::Completed(result)
+                    }
+                    _ = async {
+                        match demote_rx.as_mut() {
+                            Some(rx) => {
+                                // `None` (every sender dropped) means no
+                                // demote will ever arrive — park forever so
+                                // this arm never resolves on a closed channel.
+                                if rx.recv().await.is_none() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                            // No demote source wired: park forever.
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => Pipeline::Demoted,
+                }
+            };
+            match demoted {
+                Pipeline::Completed(result) => {
+                    // Stay-local: tear the dispatchers down in-place (same
+                    // contract as `run`), read the counts off this
+                    // coordinator's own replicated ledger, carry the pipeline
+                    // outcome through `result`, then drop `self`.
+                    self.cleanup_run_dispatchers().await;
+                    Ok(PrimaryRunOutcome::Local {
+                        result,
+                        completed: self.completed_count(),
+                        failed: self.failed_count(),
+                        stranded: self.stranded_count(),
+                    })
+                }
+                Pipeline::Demoted => {
+                    // Relocated: destructure `self` into the handoff. The two
+                    // dispatcher handles ride across into the observer's
+                    // single-teardown, so we deliberately do NOT call
+                    // `cleanup_run_dispatchers` here. The `Node` builds the
+                    // observer from the handoff and re-sources the final
+                    // counts from the observer's converged ledger.
+                    Ok(PrimaryRunOutcome::Relocated {
+                        handoff: self.into_observer_handoff(),
+                    })
+                }
+            }
         }
         .instrument(span)
         .await
@@ -2174,28 +2293,32 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// `self`; the move is compiler-checked by the destructure pattern.
     ///
     /// Carries across exactly what the observer needs to resume without
-    /// dropping a live event: the mesh `transport`, the replicated
-    /// `cluster_state` (with its already-installed `task_completed_tx`),
-    /// the node id, the deadlines as an [`ObserverConfig`], the
-    /// `started_phases` narration seed (the `phase_started_emitted` set),
-    /// the STABLE `required_setup_on_promote` config bool (the observer
-    /// recomputes `setup_pending` LIVE — never a frozen snapshot), the
-    /// panik signal receiver, and the two dispatcher join handles. The
-    /// `holdings` are empty: the submitter primary advertised no
-    /// resource-holdings (workers run on secondaries).
+    /// dropping a live event: the mesh `client` (egress) + `inbox`
+    /// (ingress), the replicated `cluster_state` (with its already-installed
+    /// `task_completed_tx`), the node id, the deadlines as an
+    /// [`ObserverConfig`], the `started_phases` narration seed (the
+    /// `phase_started_emitted` set), the STABLE `required_setup_on_promote`
+    /// config bool (the observer recomputes `setup_pending` LIVE — never a
+    /// frozen snapshot), the panik signal receiver, and the two dispatcher
+    /// join handles. The `holdings` are empty: the submitter primary
+    /// advertised no resource-holdings (workers run on secondaries). The
+    /// `client` + `inbox` move across unchanged — the observer keeps
+    /// addressing the mesh through the SAME role slot (the `Process` retags
+    /// the slot primary→observer in place, so the channel is stable and no
+    /// frame is lost across the swap).
     // PHASE-C-SEAM[C4]: the submitter→observer swap is owned by the
-    // `Process`. `Process` ALONE calls `into_observer_handoff` →
-    // `ObserverCoordinator::from_handoff` + `observer.run()`. This
-    // payload-migration edit is PRESERVED for that rewire; it has no
-    // caller in Phase B.
-    #[allow(dead_code)] // TODO(C4): called from Process (submitter→observer swap)
-    fn into_observer_handoff(self) -> crate::observer::ObserverHandoff<Tr, I> {
+    // `Node`. `Node` ALONE calls `into_observer_handoff` →
+    // `ObserverCoordinator::from_handoff` + `observer.run()`. The relocate
+    // fork's `run_consuming` arm carries this handoff out as
+    // `PrimaryRunOutcome::Relocated { handoff }`.
+    fn into_observer_handoff(self) -> crate::observer::ObserverHandoff<I> {
         // Full destructure: every field NOT named below is dropped by the
         // `..` — scheduler/estimator/pool/secondaries/etc. — so the larger
         // `PrimaryCoordinator` is structurally consumed.
         let Self {
             config,
-            transport,
+            client,
+            inbox,
             cluster_state,
             phase_started_emitted,
             lifecycle_dispatcher_handle,
@@ -2205,7 +2328,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         } = self;
 
         crate::observer::ObserverHandoff {
-            transport,
+            client,
+            inbox,
             cluster_state,
             node_id: config.node_id.clone(),
             deadlines: crate::observer::ObserverConfig {

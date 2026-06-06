@@ -8,10 +8,11 @@ use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler::ResourceStealingScheduler;
 
 use crate::fulfillability_matcher::{FulfillabilityMatcher, MatcherBatch, MatcherTriggerEvent};
-use crate::primary::test_helpers::{FixedEstimator, TestId, make_binary, setup_test};
+use crate::primary::test_helpers::{
+    FixedEstimator, PrimaryMeshKeepalive, TestId, build_test_primary, make_binary, setup_test,
+};
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryCommand, PrimaryConfig, PrimaryCoordinator};
-use dynrunner_transport_channel::ChannelPeerTransport;
 
 /// Capturing matcher: records every `(hash, reason)` pair it is
 /// asked about so the tests can assert which tasks the pipeline
@@ -65,12 +66,10 @@ impl FulfillabilityMatcher<TestId> for PanickyOnHashMatcher {
 
 /// Same shape as command_channel::tests::make_coordinator — built
 /// in this file to avoid leaking the helper across modules.
-fn make_coordinator() -> PrimaryCoordinator<
-    ChannelPeerTransport<TestId>,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
+fn make_coordinator() -> (
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryMeshKeepalive,
+) {
     let (transport, _secondary_ends) = setup_test(0);
     let config = PrimaryConfig {
         num_secondaries: 0,
@@ -83,7 +82,7 @@ fn make_coordinator() -> PrimaryCoordinator<
         mesh_ready_timeout: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
-    PrimaryCoordinator::new(
+    build_test_primary(
         config,
         transport,
         ResourceStealingScheduler::memory(),
@@ -96,12 +95,7 @@ fn make_coordinator() -> PrimaryCoordinator<
 /// via the apply path so the dispatcher sees the same shape the
 /// production CRDT does.
 fn seed_tasks(
-    coordinator: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     entries: &[(&str, &str)],
 ) -> HashMap<String, String> {
     let mut hashes = HashMap::new();
@@ -154,12 +148,7 @@ fn seed_tasks(
 /// Pool init helper so `apply_reinject_task` has the phase pre-
 /// registered when an auto-fire lands.
 fn init_pool(
-    coordinator: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
 ) {
     let mut phase_set = std::collections::HashSet::new();
     phase_set.insert(dynrunner_core::PhaseId::from("default"));
@@ -171,12 +160,7 @@ fn init_pool(
 /// Drain the command channel until empty, returning the
 /// `(hash, _reply)` pairs of every `ReinjectTask` command seen.
 fn drain_reinject_commands(
-    coordinator: &mut PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    coordinator: &mut PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
 ) -> Vec<String> {
     let mut hashes = Vec::new();
     let rx = coordinator.command_rx.as_mut().expect("command_rx present");
@@ -197,7 +181,7 @@ async fn matcher_fires_only_on_unfulfillable_tasks() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             init_pool(&mut coordinator);
             let hashes = seed_tasks(
                 &mut coordinator,
@@ -243,7 +227,7 @@ async fn matcher_true_fires_reinject_task_command() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             init_pool(&mut coordinator);
             let hashes = seed_tasks(
                 &mut coordinator,
@@ -284,7 +268,7 @@ async fn matcher_exception_swallowed_and_other_tasks_continue() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             init_pool(&mut coordinator);
             let hashes = seed_tasks(
                 &mut coordinator,
@@ -372,7 +356,7 @@ async fn matcher_batched_per_holdings_update_burst() {
             // confirm it fires exactly once per Unfulfillable
             // task (here: 2 tasks → 2 calls, regardless of the
             // 50 input events).
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             init_pool(&mut coordinator);
             let _hashes = seed_tasks(
                 &mut coordinator,

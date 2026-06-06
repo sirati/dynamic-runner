@@ -1,7 +1,5 @@
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, PeerId, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
@@ -10,9 +8,7 @@ use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_n
 
 use super::dispatch_order;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Iterate every free worker and dispatch a task from the pool if
     /// one fits. This is worker management's dispatch RECHECK: the
     /// operational loop's worker-management `select!` arm calls it on a

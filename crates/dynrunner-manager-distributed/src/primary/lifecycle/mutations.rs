@@ -1,6 +1,6 @@
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, PeerTransport, RemovalCause,
+    ClusterMutation, Destination, DistributedMessage, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -9,9 +9,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::{compute_task_hash, timestamp_now};
 use crate::worker_signal::WorkerMgmtSignal;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Apply each mutation locally and broadcast the same batch so every
     /// secondary mirrors the change. Per-secondary delivery failures are
     /// logged at warn — the CRDT is idempotent, so a missed mutation is

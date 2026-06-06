@@ -39,12 +39,7 @@ fn phased(name: &str, phase: &str) -> TaskInfo<TestId> {
 fn primary_with_pool_and_idle_worker(
     tasks: Vec<TaskInfo<TestId>>,
 ) -> (
-    PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     Vec<(
         String,
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -52,7 +47,7 @@ fn primary_with_pool_and_idle_worker(
     )>,
 ) {
     let (transport, ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+    let (mut primary, _mesh) = build_test_primary(
         PrimaryConfig::default(),
         transport,
         ResourceStealingScheduler::memory(),
@@ -396,12 +391,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
 fn primary_two_secondaries_with_pool(
     tasks: Vec<TaskInfo<TestId>>,
 ) -> (
-    PrimaryCoordinator<
-        ChannelPeerTransport<TestId>,
-        ResourceStealingScheduler,
-        FixedEstimator,
-        TestId,
-    >,
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
     Vec<(
         String,
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -420,7 +410,7 @@ fn primary_two_secondaries_with_pool(
         max_concurrent_per_type: HashMap::from([(TypeId::from("default"), 100)]),
         ..PrimaryConfig::default()
     };
-    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+    let (mut primary, _mesh) = build_test_primary(
         config,
         transport,
         ResourceStealingScheduler::memory(),
