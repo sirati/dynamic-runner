@@ -366,52 +366,48 @@ async fn exactly_one_node_yields_by_designation() {
     );
 }
 
-/// Acceptance #2 — the designated node skips until the authority is ready
-/// (ordering, axis 5). sec-a is the lowest-id designate but the
-/// post-promotion authority is not yet recognized (`current_primary =
-/// None`, then another node) → no yield. Only once `current_primary` is
-/// sec-a itself does the yield fire. Pins "no discovery into the void".
+/// Acceptance #2 (post-`3f3aef7e`) — designation is `current_primary`-
+/// INDEPENDENT. Commit `3f3aef7e` ("secondary: remove the co-located
+/// primary concept") deleted the setup-discovery self-recognition axis
+/// (`current_primary() == self`): `setup_discovery_pending` /
+/// `is_designated_discoverer` now gate ONLY on the lowest-id-eligible
+/// rule (coordinator.rs `is_designated_discoverer`), never on
+/// authority-readiness. This test pins that contract by holding
+/// designation fixed (sec-a is the lowest-id eligible node) and varying
+/// `current_primary` across all three states — none recognized, another
+/// node, self — asserting the yield fires in EVERY case. It is the
+/// inverse-guard for the deleted axis: were `current_primary() == self`
+/// re-introduced, the `None` / other-node cases would flip false and this
+/// test would catch the regression.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "OBSOLETE — tests a DELETED invariant (not a timing-adaptation): commit \
-            3f3aef7e ('secondary: remove the co-located primary concept') \
-            intentionally removed the setup-discovery SELF-RECOGNITION axis \
-            (axis 5: `current_primary() == self`) from setup_discovery_pending / \
-            is_designated_discoverer (coordinator.rs ~L510/L548 now gate ONLY on \
-            the lowest-id-eligible rule, not on authority-readiness). This test \
-            asserts the removed axis fires (a None / other-node current_primary \
-            must suppress the yield), which no longer holds: sec_a is the \
-            lowest-id designate regardless of current_primary, so \
-            setup_discovery_pending is true even at current_primary=None \
-            (observed). This is a deliberate behavioral change, NOT a \
-            queued-egress settle issue — the test should be retired or rewritten \
-            to the post-3f3aef7e contract. Needs owner adjudication. Left \
-            ignored per the do-not-paper-over-genuine-changes rule."]
-async fn designated_node_skips_until_authority_ready() {
+async fn designation_is_current_primary_independent() {
     let roster = [("sec-a", true, false), ("sec-b", true, false)];
 
-    // No recognized primary yet: designated, but axis (5) false.
+    // No recognized primary yet: the lowest-id designate yields anyway —
+    // the deleted axis would have suppressed this.
     let (sec_a_none, _l1) = node_with_roster("sec-a", &roster, None);
     assert!(
-        !sec_a_none.setup_discovery_pending(),
-        "the designate must NOT discover before any authority is \
-         recognized — discovering here is 'into the void'",
+        sec_a_none.setup_discovery_pending(),
+        "the lowest-id designate must yield even before any authority is \
+         recognized (post-3f3aef7e: no current_primary axis)",
     );
 
-    // A different node is the recognized authority: still no yield (axis
-    // 5 requires current_primary == self).
+    // A different node is the recognized authority: the designate STILL
+    // yields — designation does not require self-recognition.
     let (sec_a_other, _l2) = node_with_roster("sec-a", &roster, Some("sec-b"));
     assert!(
-        !sec_a_other.setup_discovery_pending(),
-        "the designate must NOT discover while another node holds the \
-         recognized authority",
+        sec_a_other.setup_discovery_pending(),
+        "the lowest-id designate must yield even while another node holds \
+         the recognized authority (the deleted axis would suppress this)",
     );
 
-    // The designate has become the recognized authority: yield fires.
-    let (sec_a_ready, _l3) = node_with_roster("sec-a", &roster, Some("sec-a"));
+    // The designate is also the recognized authority: yield fires (the one
+    // case that held under the old axis too).
+    let (sec_a_self, _l3) = node_with_roster("sec-a", &roster, Some("sec-a"));
     assert!(
-        sec_a_ready.setup_discovery_pending(),
-        "once the designate is the recognized current primary, discovery \
-         fires — its ingest broadcast lands on its own live authority",
+        sec_a_self.setup_discovery_pending(),
+        "the lowest-id designate yields when it is also the recognized \
+         current primary",
     );
 }
 

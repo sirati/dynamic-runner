@@ -7,7 +7,7 @@
 
 use super::super::test_helpers::{
     FakeWorkerFactory, SecondaryHarness, TestId, channel_mesh_to_primary, make_secondary_channel,
-    run_secondary_to_completion,
+    run_secondary_node,
 };
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
@@ -284,9 +284,10 @@ async fn watchdog_still_fires_pre_run_complete() {
 /// regressions. Pre-setting also makes the test deterministic
 /// regardless of how fast the FakeWorker churns through 3 tasks
 /// vs the 50ms keepalive tick.
-// PENDING-C-NODE: full request/assign ping-pong against `fake_primary`;
-// needs the concurrent mesh-pump (Node::run). See processing.rs's note.
-#[ignore = "pending C-NODE concurrent mesh-pump (Node::run)"]
+///
+/// Driven over the PRODUCTION concurrent mesh-pump (`run_secondary_node`):
+/// the degraded secondary's full request/assign handshake against
+/// `fake_primary` runs to a clean `RunComplete` exit.
 #[tokio::test(flavor = "current_thread")]
 async fn degraded_secondary_continues_dispatching_over_wss() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -348,9 +349,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             secondary.mesh.peer_dial_count = 2;
 
             let mut factory = FakeWorkerFactory;
-            run_secondary_to_completion(&mut secondary, &mut factory)
-                .await
-                .expect("degraded run must complete cleanly over WSS");
+            let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
+            result.expect("degraded run must complete cleanly over WSS");
 
             assert_eq!(
                 secondary.local_tasks_run_for_test(),
