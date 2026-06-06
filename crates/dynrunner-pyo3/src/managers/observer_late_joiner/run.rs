@@ -213,7 +213,7 @@ impl PyObserverLateJoiner {
                     //    secondary fires promotion, no primary to demote). The
                     //    `Node` owns the mesh-pump (ingress demux + PeerInfo
                     //    dialing) that the observer's ingress depends on.
-                    let (node, _node_promo_tx, _node_demote_tx) = Node::new(mesh);
+                    let (node, _node_promo_tx) = Node::new(mesh);
                     let node = node.with_observer(observer, obs_slot);
                     let inputs: NodeRunInputs<
                         crate::subprocess_factory::SubprocessWorkerFactory,

@@ -466,7 +466,7 @@ impl PySecondaryCoordinator {
                 // `promote` recipe (below) is what `Node::run` calls on that
                 // signal to BUILD the snapshot-seeded `PrimaryCoordinator` —
                 // the secondary NEVER constructs a primary (SUPREME-LAW #3).
-                let (node, promotion_tx, _node_demote_tx) = Node::new(mesh);
+                let (node, promotion_tx) = Node::new(mesh);
                 secondary.register_promotion_signal(promotion_tx);
 
                 // The promoted primary's build recipe. Captures the config

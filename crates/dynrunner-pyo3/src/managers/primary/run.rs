@@ -403,8 +403,7 @@ impl PyPrimaryCoordinator {
                 // flip. The RECEIVER goes to `PrimaryCoordinator::new`; the
                 // SENDER goes to `NodeRunInputs.primary_demote_tx`, where
                 // `Node::run` installs it on the primary's role-change hook
-                // (`register_demote_on_displaced`). The node-level demote
-                // channel `Node::new` returns is a separate, unused leg here.
+                // (`register_demote_on_displaced`).
                 let (demote_tx, demote_rx) =
                     tokio::sync::mpsc::unbounded_channel::<()>();
 
@@ -516,7 +515,7 @@ impl PyPrimaryCoordinator {
                 // an observer, never promote). `Node::run` owns the
                 // coordinator + the mesh-pump + the lifecycle; the boundary
                 // composes the inputs and drives it to a single outcome.
-                let (node, _node_promo_tx, _node_demote_tx) = Node::new(mesh);
+                let (node, _node_promo_tx) = Node::new(mesh);
                 let node = node.with_primary(primary, pri_slot);
                 let inputs: NodeRunInputs<
                     crate::subprocess_factory::SubprocessWorkerFactory,

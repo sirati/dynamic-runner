@@ -547,7 +547,7 @@ impl PyDistributedManager {
                         // ladder (gated off panik). A pure-secondary node with
                         // no promotion recipe — the in-process secondary never
                         // becomes primary.
-                        let (node, _promo_tx, _demote_tx) = Node::new(sec_mesh);
+                        let (node, _promo_tx) = Node::new(sec_mesh);
                         let node = node.with_secondary(secondary, sec_slot);
                         let inputs: NodeRunInputs<
                             SubprocessWorkerFactory,
@@ -729,7 +729,7 @@ impl PyDistributedManager {
                 // primary is the sole authority). `Node::run` owns the
                 // mesh-pump + the primary's lifecycle and resolves to ONE
                 // role-agnostic terminal (+ counts).
-                let (node, _node_promo_tx, _node_demote_tx) = Node::new(pri_mesh);
+                let (node, _node_promo_tx) = Node::new(pri_mesh);
                 let node = node.with_primary(primary, pri_slot);
                 let inputs: NodeRunInputs<
                     SubprocessWorkerFactory,
