@@ -418,11 +418,11 @@ impl<I: Identifier> ClusterState<I> {
     /// Positive-filter rationale: roles are an independent subset of
     /// {primary, secondary, observer} per host, so "is an alive secondary"
     /// MUST be answered by the secondary capability itself, not by
-    /// `!primary && !observer`. A co-located primary+secondary host counts
-    /// (it advertised workers); an observer is excluded by lacking worker
-    /// capacity (`worker_count == 0` is structural for observers), NOT by a
-    /// `!is_observer` test; a primary-only host is excluded by having no
-    /// worker capacity.
+    /// `!primary && !observer`. A peer that advertises BOTH a primary and a
+    /// worker-secondary under one peer-id counts (it advertised workers); an
+    /// observer is excluded by lacking worker capacity (`worker_count == 0`
+    /// is structural for observers), NOT by a `!is_observer` test; a
+    /// primary-only host is excluded by having no worker capacity.
     ///
     /// Membership is the faithful liveness signal in the SETUP /
     /// pre-operational window, where no `peer_keepalives` map exists yet:
@@ -447,26 +447,24 @@ impl<I: Identifier> ClusterState<I> {
     ///
     /// The `id != current_primary` cut is the single thing that
     /// distinguishes this from the raw `alive_secondary_members` count,
-    /// and it is exactly what makes the fleet-dead arming honest on a
-    /// co-located (Phase-E) host. A host that runs a `PrimaryCoordinator`
-    /// ALONGSIDE its own co-located secondary advertises BOTH a primary
-    /// and a worker-secondary under one peer-id, so its id IS
-    /// `current_primary` AND appears in `alive_secondary_members`. The
-    /// filter excludes that single co-located entry by IDENTITY — never
-    /// by a magic string and never by counting its loopback workers — so
-    /// the count drops to zero exactly when every OTHER worker-secondary
-    /// is gone, even though the primary's own secondary is still alive.
-    /// That is the fleet-dead arming condition (run cannot make progress)
-    /// without the split-brain hazard of keeping a superseded primary
-    /// alive on the strength of its own loopback secondary.
+    /// and it is exactly what excludes the recognized primary's OWN
+    /// same-peer secondary capability. When the peer that is recognized as
+    /// primary also advertises a worker-secondary under that same peer-id,
+    /// its id IS `current_primary` AND appears in `alive_secondary_members`.
+    /// The filter excludes that single same-peer entry by IDENTITY — never
+    /// by a magic string and never by counting its own workers — so the
+    /// count drops to zero exactly when every OTHER worker-secondary is
+    /// gone, even though the recognized primary's own secondary is still
+    /// alive. That is the fleet-dead arming condition (run cannot make
+    /// progress) without the split-brain hazard of keeping a superseded
+    /// primary alive on the strength of its own same-peer secondary.
     ///
-    /// For a submitter primary (no co-located secondary) the recognized
-    /// primary is not a worker-secondary, so it is absent from
-    /// `alive_secondary_members` and the filter is a no-op — the count is
-    /// simply "all alive worker-secondaries", matching the pre-co-located
-    /// semantics. A `None` `current_primary` (pre-`PrimaryChanged`) makes
-    /// the `Some(id) != None` filter universally true, so it is likewise
-    /// a no-op.
+    /// When the recognized primary advertises no worker-secondary under its
+    /// peer-id, it is absent from `alive_secondary_members` and the filter
+    /// is a no-op — the count is simply "all alive worker-secondaries". A
+    /// `None` `current_primary` (pre-`PrimaryChanged`) makes the
+    /// `Some(id) != None` filter universally true, so it is likewise a
+    /// no-op.
     pub fn alive_remote_secondary_count(&self) -> usize {
         let current_primary = self.current_primary();
         self.alive_secondary_members()
