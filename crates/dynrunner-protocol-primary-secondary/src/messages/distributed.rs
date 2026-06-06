@@ -372,6 +372,50 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         snapshot_json: String,
     },
+    /// Joining / reconnecting / respawned secondary asks any connected
+    /// peer for the cluster-wide run configuration (the consumer's
+    /// `forwarded_argv`). The run-config is replicated, so any peer can
+    /// answer — the originator targets a specific peer via the unicast
+    /// transport; no broadcast (one response is enough). Carries no
+    /// payload beyond the routing/common fields: the request says only
+    /// "send me the run-config".
+    RequestRunConfig {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+    },
+    /// Response to `RequestRunConfig`: the cluster-wide run configuration
+    /// the requester splices onto its own argv to reconstruct the
+    /// identical run-config the consumer would have passed on the launch
+    /// command line. A SINGLE authoritative field — `forwarded_argv` — is
+    /// the run-config; there is no second derived/split copy.
+    ///
+    /// `#[serde(default)]` keeps pre-field senders wire-compatible: a
+    /// frame omitting `forwarded_argv` entirely decodes as an empty vec
+    /// (the conservative "no extra run-config" value).
+    RunConfig {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        #[serde(default)]
+        forwarded_argv: Vec<String>,
+    },
     /// Periodic anti-entropy fingerprint. Every role broadcasts its
     /// [`StateDigest`] on the convergence cadence; a receiver compares
     /// the carried digest against its own (`StateDigest::is_behind`) and,

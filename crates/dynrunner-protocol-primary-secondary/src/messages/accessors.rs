@@ -29,6 +29,8 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { target, .. }
             | Self::RequestClusterSnapshot { target, .. }
             | Self::ClusterSnapshot { target, .. }
+            | Self::RequestRunConfig { target, .. }
+            | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
@@ -65,6 +67,8 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { target, .. }
             | Self::RequestClusterSnapshot { target, .. }
             | Self::ClusterSnapshot { target, .. }
+            | Self::RequestRunConfig { target, .. }
+            | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
@@ -115,6 +119,8 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { target, .. }
             | Self::RequestClusterSnapshot { target, .. }
             | Self::ClusterSnapshot { target, .. }
+            | Self::RequestRunConfig { target, .. }
+            | Self::RunConfig { target, .. }
             | Self::StateDigest { target, .. }
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
@@ -146,6 +152,8 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { sender_id, .. }
             | Self::RequestClusterSnapshot { sender_id, .. }
             | Self::ClusterSnapshot { sender_id, .. }
+            | Self::RequestRunConfig { sender_id, .. }
+            | Self::RunConfig { sender_id, .. }
             | Self::StateDigest { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
@@ -176,6 +184,8 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { timestamp, .. }
             | Self::RequestClusterSnapshot { timestamp, .. }
             | Self::ClusterSnapshot { timestamp, .. }
+            | Self::RequestRunConfig { timestamp, .. }
+            | Self::RunConfig { timestamp, .. }
             | Self::StateDigest { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
@@ -206,6 +216,8 @@ impl<I> DistributedMessage<I> {
             Self::StageFile { .. } => MessageType::StageFile,
             Self::RequestClusterSnapshot { .. } => MessageType::RequestClusterSnapshot,
             Self::ClusterSnapshot { .. } => MessageType::ClusterSnapshot,
+            Self::RequestRunConfig { .. } => MessageType::RequestRunConfig,
+            Self::RunConfig { .. } => MessageType::RunConfig,
             Self::StateDigest { .. } => MessageType::StateDigest,
             Self::MeshReady { .. } => MessageType::MeshReady,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
