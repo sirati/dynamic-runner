@@ -100,6 +100,15 @@ pub enum MeshControl<I: Identifier> {
     /// `Weak` between role fields (D-RETAG / H5). Used by the
     /// submitter-primary→observer swap.
     Retag { old: LocalRole, new: LocalRole },
+    /// Defensive final egress drain on a clean wind-down. The node sends
+    /// this AFTER its headline role resolved and BEFORE it aborts the pump,
+    /// so any egress queued in the same sync step as the run-future
+    /// resolving (e.g. a final keepalive / completion broadcast) is applied
+    /// through the mesh rather than discarded by the abort. The pump drains
+    /// what is queued NOW (bounded `try_recv`, never awaits a fresh item)
+    /// and `ack`s — the node awaits that ack so the drain provably precedes
+    /// the abort.
+    WindDown { ack: oneshot::Sender<()> },
 }
 
 /// The node's handle to send [`MeshControl`] requests to the pump.
@@ -130,6 +139,23 @@ impl<I: Identifier> MeshControlHandle<I> {
     /// a closed pump means the mesh is already gone.
     pub fn retag(&self, old: LocalRole, new: LocalRole) {
         let _ = self.tx.send(MeshControl::Retag { old, new });
+    }
+
+    /// Request a defensive final egress drain and AWAIT it.
+    ///
+    /// Called once at wind-down, before the node aborts the pump: the pump
+    /// drains every egress item queued NOW (bounded — `try_recv` to empty,
+    /// it never awaits a fresh item) and applies each through the mesh, then
+    /// acks. Awaiting the ack makes the drain provably precede the abort, so
+    /// a final keepalive / completion broadcast queued in the same sync step
+    /// as the headline role's run future resolving is NOT lost. A closed
+    /// pump (mesh already gone) yields immediately — nothing left to drain.
+    pub async fn wind_down(&self) {
+        let (ack, rx) = oneshot::channel();
+        if self.tx.send(MeshControl::WindDown { ack }).is_err() {
+            return;
+        }
+        let _ = rx.await;
     }
 }
 
@@ -165,6 +191,14 @@ pub async fn run_pump<I, Tr>(
 
     // Seed the detached clients' view from the live transport before the
     // first coordinator read (BUG-4).
+    //
+    // ORDERING INVARIANT (R5 — entry publish precedes any coordinator
+    // egress): this runs synchronously BEFORE the loop's first await, and
+    // the node spawns this pump before any coordinator (`run.rs`), so the
+    // membership view is truthful from a coordinator's FIRST read. A
+    // coordinator's first `has_peer`-gated egress (e.g. the secondary setup
+    // Welcome) must never observe an empty `MembershipView`. Keep this
+    // publish synchronous-before-await and ahead of any coordinator spawn.
     mesh.publish_membership();
 
     let mut ticker = tokio::time::interval(MEMBERSHIP_PUBLISH_INTERVAL);
@@ -198,6 +232,23 @@ pub async fn run_pump<I, Tr>(
                     }
                     Some(MeshControl::Retag { old, new }) => {
                         mesh.retag_local_role(old, new);
+                    }
+                    Some(MeshControl::WindDown { ack }) => {
+                        // Defensive final egress drain (NEW-C): apply every
+                        // item queued NOW so a final keepalive / completion
+                        // broadcast isn't lost when the node aborts the pump.
+                        // Bounded — `try_recv` to empty, never awaiting a
+                        // fresh item — so it cannot block the wind-down.
+                        while let Ok(item) = dispatch_rx.try_recv() {
+                            if let Err(reason) = mesh.apply_local_dispatch(item).await {
+                                tracing::debug!(%reason, "mesh-pump: wind-down egress apply returned an error");
+                            }
+                        }
+                        // Ack so the node's `wind_down().await` returns only
+                        // after the drain — the drain provably precedes the
+                        // abort. A dropped receiver (node already gone) is
+                        // fine; the drain still happened.
+                        let _ = ack.send(());
                     }
                     None => control_open = false,
                 }
