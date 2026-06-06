@@ -627,6 +627,8 @@ mod tests {
             "-2",
             "--max-memory-spec",
             "-2G",
+            "--secondary-module",
+            "pkg.secondary",
             "--srcbins-network",
             "/net/srcbins",
             "--output-network",
@@ -644,6 +646,7 @@ mod tests {
         ];
         let cfg = dynrunner_slurm_wrapper_config::parse_args(argv).unwrap();
         assert_eq!(cfg.secondary_id, "sec-0");
+        assert_eq!(cfg.secondary_module, "pkg.secondary");
         assert_eq!(cfg.image_digest, "a1b2c3d4e5f6");
         assert_eq!(
             cfg.connection,

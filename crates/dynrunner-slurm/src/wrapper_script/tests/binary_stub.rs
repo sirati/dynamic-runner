@@ -120,11 +120,11 @@ fn expected_wire(cfg_name_prefix: &str, rand_suffix: &str) -> WrapperConfig {
         load_command:
             "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\""
                 .to_string(),
-        container_command: "dynamic_batch_tokenizer".to_string(),
+        container_command: "dynamic_runner._secondary_bootstrap".to_string(),
         cores_spec: "0".to_string(),
         max_memory_spec: "-2G".to_string(),
         mem_manager_reserved_bytes: None,
-        forwarded_argv: vec![],
+        secondary_module: "dynamic_batch_tokenizer".to_string(),
         extra_run_args: vec![],
         // `srcbins_mount_source`/`output_dir`/`run_log_dir` are None in the
         // baseline, so the stub resolves them from the SlurmConfig
@@ -186,7 +186,6 @@ fn binary_stub_round_trips_reverse_with_optionals() {
     let config = cfg_config();
     let bin = Path::new("/gw/dynrunner-slurm-wrapper");
     let extras = vec!["--ulimit".to_string(), "nofile=8192:8192".to_string()];
-    let fwd = vec!["--platform".to_string(), "x86".to_string()];
     let mut cfg = standard_cfg(&config, &extras);
     cfg.name_prefix = "asm";
     cfg.wrapper_bin_path = bin;
@@ -197,7 +196,7 @@ fn binary_stub_round_trips_reverse_with_optionals() {
     cfg.mem_manager_reserved_bytes = Some(524_288_000);
     let sm_bin = Path::new("/gw/dynrunner-slurm-shutdown");
     cfg.shutdown_manager_bin_path = Some(sm_bin);
-    cfg.forwarded_argv = &fwd;
+    cfg.secondary_module = "asm_tokenizer.secondary";
     let script = generate_wrapper_script(&cfg);
 
     let exec_line = script.lines().nth(1).expect("stub has an exec line");
@@ -222,6 +221,6 @@ fn binary_stub_round_trips_reverse_with_optionals() {
         parsed.shutdown_manager_bin_path.as_deref(),
         Some(Path::new("/gw/dynrunner-slurm-shutdown"))
     );
-    assert_eq!(parsed.forwarded_argv, vec!["--platform", "x86"]);
+    assert_eq!(parsed.secondary_module, "asm_tokenizer.secondary");
     assert_eq!(parsed.extra_run_args, vec!["--ulimit", "nofile=8192:8192"]);
 }

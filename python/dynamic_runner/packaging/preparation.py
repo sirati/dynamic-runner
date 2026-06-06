@@ -83,7 +83,6 @@ class SlurmPreparation:
         run_id: str = "default",
         cores_spec: str = "0",
         max_memory_spec: str = "-2G",
-        forwarded_argv: list[str] | None = None,
     ):
         self.slurm_config = slurm_config
         self.job_manager = job_manager
@@ -93,7 +92,6 @@ class SlurmPreparation:
         self.run_id = run_id
         self.cores_spec = cores_spec
         self.max_memory_spec = max_memory_spec
-        self.forwarded_argv = list(forwarded_argv) if forwarded_argv else []
         # Populated by ``prepare`` when reverse-connection mode spawns
         # per-secondary tunnels. ``cleanup`` is a no-op when this stays
         # ``None`` (non-reverse runs, or ``prepare`` not yet called).
@@ -122,7 +120,6 @@ class SlurmPreparation:
             skip_image_build,
             self.cores_spec,
             self.max_memory_spec,
-            self.forwarded_argv,
             logger,
         )
         self._tunnel_manager = tunnel_manager

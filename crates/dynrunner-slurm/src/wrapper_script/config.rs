@@ -59,10 +59,22 @@ pub struct WrapperScriptConfig<'a> {
     /// `if ! { ... }` failure-marker block.
     pub load_command: &'a str,
     /// In-container entrypoint and its args after `--secondary` URL,
-    /// `--secondary-id`, `--secondary-quic-port`, and `--cores` are
-    /// appended. For the typical case this is the consumer's
-    /// `TaskDeploymentSpec.secondary_module`.
+    /// `--secondary-id`, `--secondary-module`, `--secondary-quic-port`,
+    /// and `--cores` are appended. On the SLURM dispatch path this is
+    /// the framework bootstrap shim (`dynamic_runner._secondary_bootstrap`):
+    /// the image entrypoint (`python -m`) runs it, it fetches the run
+    /// config over the peer mesh, then `runpy`s the consumer's real
+    /// [`secondary_module`](Self::secondary_module).
     pub container_command: &'a str,
+    /// Consumer's real secondary entrypoint module (the consumer's
+    /// `TaskDeploymentSpec.secondary_module`). Threaded into the wrapper
+    /// binary's [`WrapperConfig::secondary_module`] and emitted onto the
+    /// container argv as `--secondary-module <module>` for the bootstrap
+    /// shim to `runpy` after its mesh fetch. Replaces the old
+    /// `forwarded_argv` launch-line splice — the dispatcher's
+    /// task-specific argv now travels over the peer mesh, not the
+    /// container command line.
+    pub secondary_module: &'a str,
     /// CLI `--cores` spec (verbatim string: `"0"`, `"N"`, `"+N"`,
     /// `"-N"`) forwarded to the secondary subprocess inside the
     /// container. Each secondary parses this locally against its
@@ -121,21 +133,6 @@ pub struct WrapperScriptConfig<'a> {
     /// bash-quoted by the generator (callers MUST NOT pre-quote).
     /// Mirrors `TaskDeploymentSpec.extra_run_args`.
     pub extra_run_args: &'a [String],
-    /// Dispatcher's task-specific argv (pre-filtered by
-    /// `dynamic_runner._forwarded_argv.filter_framework_argv` to
-    /// remove the framework-regenerated flags this template emits
-    /// from per-job state — `--secondary`, `--secondary-id`,
-    /// `--secondary-quic-port`, `--src-network`, `--cores`,
-    /// `--max-memory`). Each entry is bash-quoted by the generator
-    /// and spliced into the secondary's container-command argv
-    /// directly after `--src-network={...}`, so the setup-promoted
-    /// secondary's argparse re-parses task-side filter flags
-    /// (`--platform`, `--compiler`, `--name-regex`, …) and
-    /// `task.discover_items` sees the same selection the dispatcher
-    /// saw. Without this forward, the Tier-2 setup-promote dispatch
-    /// path discovers `tasks=0` whenever the user supplied any
-    /// task-side filter on the dispatcher CLI.
-    pub forwarded_argv: &'a [String],
     /// Whether the secondary launched by this wrapper script is an
     /// observer (Task #36 / Step 7 of the transport-unification
     /// refactor): no workers, non-promotable. The flag is written

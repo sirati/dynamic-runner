@@ -30,7 +30,8 @@ const SRC_NETWORK_CONTAINER_PATH: &str = "/app/src-network";
 /// flags, before `run`; it makes podman run conmon at debug too).
 ///
 /// ASSUMPTION: `cfg.container_command` holds no embedded shell quotes or
-/// globs — the common `python -m module` case. The legacy bash splices it
+/// globs — the bare `dynamic_runner._secondary_bootstrap` shim module the
+/// image entrypoint (`python -m`) runs. The legacy bash splices it
 /// unquoted into the heredoc, so word-splitting on ASCII whitespace is the
 /// faithful equivalent. If a consumer is found to pass quoted/space-bearing
 /// container-command args, this split would diverge from bash and the
@@ -159,6 +160,14 @@ pub fn build_run_argv(
     argv.push(secondary_url.to_string());
     argv.push("--secondary-id".to_string());
     argv.push(cfg.secondary_id.clone());
+    // The container entrypoint runs the framework bootstrap shim
+    // (`container_command` = `dynamic_runner._secondary_bootstrap`);
+    // `--secondary-module` names the consumer's REAL secondary
+    // entrypoint, which the shim `runpy`s after fetching the run config
+    // over the peer mesh. Replaces the old `forwarded_argv` argv splice
+    // (the dispatcher's task-specific argv now travels over the mesh).
+    argv.push("--secondary-module".to_string());
+    argv.push(cfg.secondary_module.clone());
     argv.push("--secondary-quic-port".to_string());
     argv.push(quic_port.to_string());
     argv.push(format!("--cores={}", cfg.cores_spec));
@@ -190,10 +199,6 @@ pub fn build_run_argv(
     // mem-manager-reserved — generate.rs:748-751 (omitted when None).
     if let Some(b) = cfg.mem_manager_reserved_bytes {
         argv.push(format!("--mem-manager-reserved={b}"));
-    }
-    // forwarded_argv — generate.rs:770-774 (each its own token, in order).
-    for arg in &cfg.forwarded_argv {
-        argv.push(arg.clone());
     }
 
     argv
@@ -244,11 +249,11 @@ mod tests {
             image_name: "asm-tokenizer".to_string(),
             image_tag: "latest".to_string(),
             load_command: "podman load -i \"$LOCAL_IMAGE\"".to_string(),
-            container_command: "python -m asm_tokenizer.secondary".to_string(),
+            container_command: "dynamic_runner._secondary_bootstrap".to_string(),
             cores_spec: "-2".to_string(),
             max_memory_spec: "-2G".to_string(),
             mem_manager_reserved_bytes: Some(524_288_000),
-            forwarded_argv: vec!["--platform".to_string(), "x86".to_string()],
+            secondary_module: "asm_tokenizer.secondary".to_string(),
             extra_run_args: vec!["--ulimit".to_string(), "nofile=8192:8192".to_string()],
             srcbins_network: "/net/srcbins".to_string(),
             output_network: "/net/out".to_string(),
@@ -264,7 +269,6 @@ mod tests {
     fn minimal_cfg(connection: ConnectionMode) -> WrapperConfig {
         let mut cfg = maximal_cfg(connection);
         cfg.mem_manager_reserved_bytes = None;
-        cfg.forwarded_argv.clear();
         cfg.extra_run_args.clear();
         cfg.dynrunner_network_dir = None;
         cfg.shutdown_manager_bin_path = None;
@@ -341,13 +345,13 @@ mod tests {
             "--ulimit",
             "nofile=8192:8192",
             "asm-tokenizer:latest",
-            "python",
-            "-m",
-            "asm_tokenizer.secondary",
+            "dynamic_runner._secondary_bootstrap",
             "--secondary",
             "tcp://gw.cluster:4433",
             "--secondary-id",
             "sec-0",
+            "--secondary-module",
+            "asm_tokenizer.secondary",
             "--secondary-quic-port",
             "7777",
             "--cores=-2",
@@ -358,8 +362,6 @@ mod tests {
             "--panik-file",
             "/app/log-tmp/.dynrunner-reaper.panik",
             "--mem-manager-reserved=524288000",
-            "--platform",
-            "x86",
         ]
         .into_iter()
         .map(String::from)
@@ -367,6 +369,24 @@ mod tests {
 
         assert_eq!(argv, expected);
         assert!(argv.contains(&"--log-level=debug".to_string()));
+        // The dispatcher's task-specific argv now travels over the peer
+        // mesh (cold-start fetch), NOT on the launch command line: no
+        // `--forwarded-arg` flag and none of its values appear.
+        assert!(
+            !argv.iter().any(|a| a == "--forwarded-arg"),
+            "container argv must not carry a --forwarded-arg flag"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--platform" || a == "x86"),
+            "forwarded task-argv tokens must not reach the container argv"
+        );
+        // The consumer's real module is named via --secondary-module for
+        // the bootstrap shim, never spliced as the entrypoint itself.
+        let sm = argv
+            .iter()
+            .position(|a| a == "--secondary-module")
+            .expect("--secondary-module present");
+        assert_eq!(argv[sm + 1], "asm_tokenizer.secondary");
     }
 
     /// (a1) With a delegated job cgroup the caller passes `Some(parent)`:
@@ -484,13 +504,13 @@ mod tests {
             "-v",
             "/tmp/asm-2f1d4e89/sockets:/app/sockets",
             "asm-tokenizer:latest",
-            "python",
-            "-m",
-            "asm_tokenizer.secondary",
+            "dynamic_runner._secondary_bootstrap",
             "--secondary",
             "tcp://gw:1",
             "--secondary-id",
             "sec-0",
+            "--secondary-module",
+            "asm_tokenizer.secondary",
             "--secondary-quic-port",
             "5555",
             "--cores=-2",
@@ -546,9 +566,9 @@ mod tests {
 
     /// Importance-stdio mode is SUBMITTER-LOCAL: it must never reach a
     /// secondary container, neither as a `-e DYNRUNNER_IMPORTANT_STDIO_ONLY`
-    /// env nor as an `--important-stdio-only` CLI token. The submitter's
-    /// `_forwarded_argv.filter_framework_argv` strips the flag before it
-    /// reaches `forwarded_argv`, and `build_run_argv` injects a fixed env
+    /// env nor as an `--important-stdio-only` CLI token. `build_run_argv`
+    /// no longer splices ANY dispatcher task-argv onto the launch command
+    /// line (it now travels over the peer mesh) and injects a fixed env
     /// set that does not include the importance vars. This pins the
     /// guarantee at the spawn-argv level so a future env addition can't
     /// silently flip a secondary into important-only mode.

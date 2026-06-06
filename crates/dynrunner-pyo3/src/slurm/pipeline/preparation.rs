@@ -119,7 +119,6 @@ pub(super) fn run_preparation<'py>(
     cert_dir: &Bound<'py, PyAny>,
     cores_spec: &str,
     max_memory_spec: &str,
-    forwarded_argv: &[String],
     num_secondaries: u32,
     primary_quic_port: u16,
     use_reverse_connection: bool,
@@ -291,7 +290,6 @@ pub(super) fn run_preparation<'py>(
         wrapper_kwargs.set_item("gateway_port", primary_quic_port)?;
         wrapper_kwargs.set_item("cores_spec", cores_spec)?;
         wrapper_kwargs.set_item("max_memory_spec", max_memory_spec)?;
-        wrapper_kwargs.set_item("forwarded_argv", forwarded_argv.to_vec())?;
         wrapper_kwargs.set_item("reverse_connection", use_reverse_connection)?;
         wrapper_kwargs.set_item("run_log_dir", &run_log_dir)?;
         wrapper_kwargs.set_item(
@@ -456,7 +454,6 @@ pub(super) fn run_preparation<'py>(
     skip_image_build,
     cores_spec,
     max_memory_spec,
-    forwarded_argv,
     log,
     mem_manager_reserved_bytes = None,
 ))]
@@ -475,7 +472,6 @@ pub(crate) fn run_preparation_py<'py>(
     skip_image_build: bool,
     cores_spec: String,
     max_memory_spec: String,
-    forwarded_argv: Vec<String>,
     log: &Bound<'py, PyAny>,
     mem_manager_reserved_bytes: Option<u64>,
 ) -> PyResult<Py<PyTuple>> {
@@ -489,7 +485,6 @@ pub(crate) fn run_preparation_py<'py>(
         cert_dir,
         &cores_spec,
         &max_memory_spec,
-        &forwarded_argv,
         num_secondaries,
         primary_quic_port,
         use_reverse_connection,

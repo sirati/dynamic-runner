@@ -53,7 +53,12 @@ impl Gateway for RecordingGateway {
         _cwd: Option<&str>,
     ) -> Result<CommandResult, GatewayError> {
         self.commands.lock().unwrap().push(cmd.to_string());
-        let is_sbatch = cmd.starts_with("sbatch ");
+        // `submit_job` pipes the wrapper body to sbatch over STDIN
+        // (`printf '%s' '<body>' | sbatch --parsable …`), so the
+        // recorded command CONTAINS `| sbatch ` rather than starting
+        // with `sbatch `. Match that shape so the canned job-id stdout
+        // still flows back.
+        let is_sbatch = cmd.contains("| sbatch ");
         if is_sbatch && self.sbatch_fails {
             return Ok(CommandResult {
                 return_code: 1,
@@ -227,7 +232,7 @@ async fn slurm_spawner_submit_job_called_with_new_id() {
             let cmds = mgr_locked.gateway().commands();
             let sbatch = cmds
                 .iter()
-                .find(|c| c.starts_with("sbatch "))
+                .find(|c| c.contains("| sbatch "))
                 .expect("sbatch command must have been issued");
             assert!(
                 sbatch.contains("--job-name=sec-replacement-7"),
@@ -372,7 +377,7 @@ async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
             let mgr_locked = mgr.lock().await;
             let cmds = mgr_locked.gateway().commands();
             assert!(
-                cmds.iter().any(|c| c.starts_with("sbatch ")),
+                cmds.iter().any(|c| c.contains("| sbatch ")),
                 "submit_job must have issued an sbatch command",
             );
         })
@@ -434,10 +439,12 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
                 spawner_for_task.spawn(make_spec("sec-orphan-test")).await
             });
 
-            // Yield until sbatch has run. The recording gateway logs
-            // every `execute_command`; sbatch is the second one (the
-            // first writes the wrapper script via `printf`). We poll
-            // for the sbatch line rather than sleeping a fixed
+            // Yield until sbatch has run. `submit_job` pipes the wrapper
+            // body to sbatch over STDIN in a SINGLE command
+            // (`printf '%s' '<body>' | sbatch --parsable …`) — there is
+            // no separate script-write command, so the recorded command
+            // CONTAINS `| sbatch ` rather than starting with `sbatch `.
+            // We poll for that line rather than sleeping a fixed
             // duration so the test stays deterministic on slow CI.
             let sbatch_seen = async {
                 loop {
@@ -447,7 +454,7 @@ async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() 
                             .gateway()
                             .commands()
                             .iter()
-                            .any(|c| c.starts_with("sbatch "))
+                            .any(|c| c.contains("| sbatch "))
                         {
                             break;
                         }

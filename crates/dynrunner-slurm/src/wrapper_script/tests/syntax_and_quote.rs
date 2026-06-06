@@ -1,7 +1,7 @@
 //! Bash-syntax smoke checks on the rendered secondary wrapper (with
-//! and without `forwarded_argv`) and the unit test for the inline
-//! `bash_quote` helper. Both checks shell out to `/bin/bash -n` so
-//! they no-op on stripped CI sandboxes without `bash` on PATH.
+//! and without tricky bash-quoted payloads) and the unit test for the
+//! inline `bash_quote` helper. Both checks shell out to `/bin/bash -n`
+//! so they no-op on stripped CI sandboxes without `bash` on PATH.
 
 use crate::config::SlurmConfig;
 use crate::wrapper_script::quote::bash_quote;
@@ -13,7 +13,7 @@ use crate::wrapper_script::{
 use super::standard_cfg;
 
 #[test]
-fn rendered_script_with_forwarded_argv_passes_bash_syntax_check() {
+fn rendered_script_with_quoted_payload_passes_bash_syntax_check() {
     use std::io::Write;
     let bash_available = std::process::Command::new("bash")
         .arg("--version")
@@ -27,9 +27,11 @@ fn rendered_script_with_forwarded_argv_passes_bash_syntax_check() {
     }
     let config = SlurmConfig::default();
     // Mix of safe tokens, single-quoted globs, embedded apostrophes,
-    // and spaces. Spans every branch of bash_quote that the field
-    // payload might exercise.
-    let forwarded = vec![
+    // and spaces. Spans every branch of bash_quote that a list-flag
+    // payload might exercise. Routed through `extra_run_args` (the
+    // surviving bash-quoted list field) now that the dispatcher's
+    // task argv travels over the peer mesh instead of the launch line.
+    let extras = vec![
         "--platform".to_string(),
         "x64".to_string(),
         "--name-regex".to_string(),
@@ -37,10 +39,7 @@ fn rendered_script_with_forwarded_argv_passes_bash_syntax_check() {
         "--label=it's".to_string(),
         "--annotation=hello world".to_string(),
     ];
-    let cfg = WrapperScriptConfig {
-        forwarded_argv: &forwarded,
-        ..standard_cfg(&config, &[])
-    };
+    let cfg = standard_cfg(&config, &extras);
     let script = generate_wrapper_script(&cfg);
     let mut child = std::process::Command::new("bash")
         .args(["-n", "/dev/stdin"])
@@ -58,7 +57,7 @@ fn rendered_script_with_forwarded_argv_passes_bash_syntax_check() {
     let out = child.wait_with_output().expect("wait bash");
     assert!(
         out.status.success(),
-        "bash -n rejected the wrapper with non-empty forwarded_argv:\n\
+        "bash -n rejected the wrapper with a tricky bash-quoted payload:\n\
          STDERR:\n{}\n--- script ---\n{}",
         String::from_utf8_lossy(&out.stderr),
         script,

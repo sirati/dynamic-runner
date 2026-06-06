@@ -298,7 +298,6 @@ class SlurmJobManager:
         gateway_port: int | None,
         cores_spec: str = "0",
         max_memory_spec: str = "-2G",
-        forwarded_argv: list[str] | None = None,
         reverse_connection: bool = False,
         run_log_dir: str | None = None,
         is_observer: bool = False,
@@ -337,16 +336,13 @@ class SlurmJobManager:
         secondaries are each on a different host with their own
         budget so per-machine semantic applies.
 
-        ``forwarded_argv`` is the dispatcher's ``sys.argv[1:]`` with
-        the framework-regenerated flags removed (filtering owned by
-        :func:`dynamic_runner._forwarded_argv.filter_framework_argv`).
-        Each entry is bash-quoted by the Rust generator and spliced
-        into the secondary's container-command argv after
-        ``--src-network``, so the setup-promoted secondary's argparse
-        re-parses task-specific filter flags (``--platform``,
-        ``--compiler``, ``--name-regex``, …) and ``task.discover_items``
-        sees them. Defaults to an empty list (back-compat with callers
-        that haven't been updated).
+        The dispatcher's task-specific argv is NOT a parameter here: the
+        container runs the framework bootstrap shim
+        (``dynamic_runner._secondary_bootstrap``), which fetches the run
+        config — including that argv — over the peer mesh and then
+        ``runpy``s the consumer's real ``secondary_module``. The launch
+        command line carries only the framework-regenerated flags plus
+        ``--secondary-module``.
 
         ``shutdown_manager_bin_path`` is the gateway-side absolute path
         of the ``dynrunner-slurm-shutdown`` binary (as recorded by
@@ -394,12 +390,17 @@ class SlurmJobManager:
             load_command=self.packaging.get_load_command(
                 "$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN"
             ),
-            container_command=self.deployment.secondary_module,
+            # The container entrypoint (`python -m`) runs the framework
+            # bootstrap shim, which fetches the run config over the peer
+            # mesh and then `runpy`s the consumer's real secondary module
+            # (named via `secondary_module`). The dispatcher's
+            # task-specific argv no longer rides the launch command line.
+            container_command="dynamic_runner._secondary_bootstrap",
+            secondary_module=self.deployment.secondary_module,
             srcbins_mount_source=self._expand_path(self.slurm_config.get_srcbins_mount_source()),
             output_dir=self._expand_path(self.slurm_config.get_output_dir()),
             cores_spec=cores_spec,
             max_memory_spec=max_memory_spec,
-            forwarded_argv=list(forwarded_argv) if forwarded_argv else [],
             run_log_dir=self._expand_path(run_log_dir or self.slurm_config.get_log_dir()),
             dynrunner_network_dir=(
                 self._expand_path(self.deployment.dynrunner_network_dir)
