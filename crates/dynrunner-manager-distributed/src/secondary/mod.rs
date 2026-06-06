@@ -238,7 +238,7 @@ where
     /// every `DistributedMessage::ClusterMutation` observed on the mesh.
     /// Read-only authority-wise on this node — the secondary never
     /// originates a terminal mutation. The authority (the live primary,
-    /// or this node's co-located primary once promoted) owns
+    /// or this node's same-node primary once promoted) owns
     /// origination. The secondary DOES originate the two non-authority
     /// mutations the unified model keeps on this side: the
     /// `ingest_setup_discovery` `PhaseDepsSet + TaskAdded` batch and the

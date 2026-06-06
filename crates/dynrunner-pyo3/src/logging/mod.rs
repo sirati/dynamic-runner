@@ -28,7 +28,7 @@
 //!     gateway-shared `--log-dir` mount. When set, the framework's own
 //!     runner log is persisted under it, SPLIT BY ROLE: primary-role
 //!     events to `<dir>/primary.log`, secondary-role events to
-//!     `<dir>/secondary.log`. So the log of a relocated/co-located primary
+//!     `<dir>/secondary.log`. So the log of a relocated same-host primary
 //!     is isolated from its host secondary's, and both land host-readably.
 //!     The role is read off the run future's role span (see
 //!     [`role_full_layer`] and `dynrunner_core::role_span`), never a
@@ -87,7 +87,7 @@ pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 /// Filename for primary-role events under the per-node full-log dir: every
 /// event a primary coordinator's run future emits (it carries the
 /// [`PRIMARY_ROLE_SPAN`]). Separate from [`SECONDARY_LOG_FILENAME`] so a
-/// relocated/co-located primary's log is isolated from its host
+/// relocated same-host primary's log is isolated from its host
 /// secondary's in the one-process promoted case.
 const PRIMARY_LOG_FILENAME: &str = "primary.log";
 
@@ -116,7 +116,7 @@ pub(crate) enum FullSink {
     /// A per-node directory (the `full_log_dir` mount path for this node).
     /// The verbose sink splits by role: primary-span events to
     /// `<dir>/primary.log`, secondary-span events to `<dir>/secondary.log`.
-    /// In the one-process promoted case the relocated/co-located primary
+    /// In the one-process promoted case the relocated same-host primary
     /// and its host secondary are distinct `spawn_local` tasks carrying
     /// distinct role spans, so their events land in distinct files.
     PerNodeDir(PathBuf),
