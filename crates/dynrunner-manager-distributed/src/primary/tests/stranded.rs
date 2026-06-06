@@ -42,7 +42,17 @@ async fn stranded_count_is_zero_on_clean_run() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             assert_eq!(primary.completed_count(), 3);
             assert_eq!(primary.failed_count(), 0);
@@ -229,7 +239,16 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
-            let outcome = primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await;
+            let outcome = primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await;
 
             match outcome {
                 Err(RunError::ClusterCollapsed { stranded, outcome }) => {
@@ -327,7 +346,16 @@ async fn strand_broadcasts_run_aborted_not_run_complete() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
-            let outcome = primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await;
+            let outcome = primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await;
 
             // Local return is the unchanged ClusterCollapsed.
             assert!(
@@ -401,15 +429,19 @@ async fn clean_run_broadcasts_run_complete_not_aborted() {
 
             let (deps, ops, ope) = noop_phase_args();
             primary
-                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("clean run must return Ok");
 
             let state = primary.cluster_state_for_test();
-            assert!(
-                state.run_complete(),
-                "clean run must latch RunComplete"
-            );
+            assert!(state.run_complete(), "clean run must latch RunComplete");
             assert!(
                 state.run_aborted().is_none(),
                 "clean run must NOT broadcast RunAborted, got reason: {:?}",
@@ -672,7 +704,14 @@ async fn clean_run_does_not_false_positive_stranded() {
 
             let (deps, ops, ope) = noop_phase_args();
             primary
-                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .expect("clean multi-secondary run must return Ok");
 

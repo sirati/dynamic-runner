@@ -98,7 +98,17 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             let binaries = vec![make_binary("ok", 50), make_binary("flaky", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // The authoritative retry cascade lives on the PRIMARY (the
             // secondary is a pure flaky-worker driver / reporter). Read the
@@ -206,7 +216,17 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             let binaries = vec![make_binary("ok", 50), make_binary("doomed", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // Read the PRIMARY's authoritative counters before drop: by
             // this point the primary has fully consumed its retry budget on
@@ -336,7 +356,17 @@ async fn recoverable_failure_twice_becomes_permanent() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // Main pass fails, retry pass fails again → permanent.
             assert_eq!(primary.completed_count(), 0);
@@ -447,7 +477,17 @@ async fn retry_max_passes_zero_disables_retry() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // Main pass fails once; retry loop is skipped entirely
             // because budget is 0 → permanent failure with no retry.
@@ -571,10 +611,11 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             let recorded_ends: Arc<Mutex<Vec<(String, u32, u32)>>> =
                 Arc::new(Mutex::new(Vec::new()));
             let ends_cb = recorded_ends.clone();
-            let on_end: crate::primary::OnPhaseEnd =
-                Box::new(move |p: &dynrunner_core::PhaseId, c: u32, f: u32, _outputs| {
+            let on_end: crate::primary::OnPhaseEnd = Box::new(
+                move |p: &dynrunner_core::PhaseId, c: u32, f: u32, _outputs| {
                     ends_cb.lock().unwrap().push((p.to_string(), c, f));
-                });
+                },
+            );
             let on_start: crate::primary::OnPhaseStart = Box::new(|_| {});
 
             // Bound the test so a wedged phase surfaces as a timeout, not
@@ -582,7 +623,10 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             // post-promotion the secondary's quiesce grace contributes
             // ~2s, hence the 10s budget.
             let run_fut = primary.run(
-                SeedSource::ColdStart { binaries, phase_deps: HashMap::new() },
+                SeedSource::ColdStart {
+                    binaries,
+                    phase_deps: HashMap::new(),
+                },
                 on_start,
                 on_end,
             );
@@ -686,7 +730,17 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
 
             let binaries = vec![make_binary("flaky", 50)];
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // 1 completion, 0 residual failures: the per-phase bucket
             // reinjected the Recoverable failure inside the same `run()`
@@ -865,7 +919,10 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
             });
 
             let run_fut = primary.run(
-                SeedSource::ColdStart { binaries, phase_deps },
+                SeedSource::ColdStart {
+                    binaries,
+                    phase_deps,
+                },
                 on_start,
                 on_end,
             );

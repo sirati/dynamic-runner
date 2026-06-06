@@ -36,8 +36,7 @@
 use dynrunner_core::Identifier;
 use dynrunner_manager_distributed::PeerCertInfo;
 use dynrunner_transport_quic::{
-    EitherPeerTransport, MeshSendHandle, NetworkClient, NetworkServer, NoPeerTransport,
-    PeerNetwork,
+    EitherPeerTransport, MeshSendHandle, NetworkClient, NetworkServer, NoPeerTransport, PeerNetwork,
 };
 use dynrunner_transport_tunnel::{InboundTap, SharedOutgoing, TunneledPeerTransport};
 

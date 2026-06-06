@@ -62,8 +62,12 @@ fn count_snapshot_requests(
 ) -> usize {
     log.borrow()
         .iter()
-        .filter(|m| matches!(m, DistributedMessage::RequestClusterSnapshot {
-    target: _, .. }))
+        .filter(|m| {
+            matches!(
+                m,
+                DistributedMessage::RequestClusterSnapshot { target: _, .. }
+            )
+        })
         .count()
 }
 
@@ -231,8 +235,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
                 peer_log
                     .borrow()
                     .iter()
-                    .any(|m| matches!(m, DistributedMessage::StateDigest {
-    target: _, .. })),
+                    .any(|m| matches!(m, DistributedMessage::StateDigest { target: _, .. })),
                 "the cadence emit must put a StateDigest on the wire"
             );
 

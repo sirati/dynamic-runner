@@ -11,8 +11,10 @@
 use dynrunner_core::Identifier;
 use tokio::sync::{mpsc, oneshot};
 
-use super::outcome::{ObserverJoinHandle, ObserverRunResult, SecondaryJoinHandle, SecondaryRunResult};
 use super::outcome::RunTerminal;
+use super::outcome::{
+    ObserverJoinHandle, ObserverRunResult, SecondaryJoinHandle, SecondaryRunResult,
+};
 use crate::primary::{PrimaryRunOutcome, RunError};
 
 /// `recv` on an `Option<Receiver>`, parking forever when `None` so the arm

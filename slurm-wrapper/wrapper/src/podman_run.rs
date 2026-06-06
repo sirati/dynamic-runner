@@ -122,7 +122,11 @@ pub fn build_run_argv(
     argv.push("-v".to_string());
     argv.push(format!("{}:/app/out-tmp", layout.out_tmp.display()));
     argv.push("-v".to_string());
-    argv.push(format!("{}:{}", layout.log_tmp.display(), LOG_TMP_CONTAINER_PATH));
+    argv.push(format!(
+        "{}:{}",
+        layout.log_tmp.display(),
+        LOG_TMP_CONTAINER_PATH
+    ));
     argv.push("-v".to_string());
     argv.push(format!(
         "{}:{}:ro",
@@ -434,7 +438,8 @@ mod tests {
             "--cgroup-parent must follow --rm"
         );
         assert_eq!(
-            with_parent[rm_idx + 2], "--cgroups=enabled",
+            with_parent[rm_idx + 2],
+            "--cgroups=enabled",
             "--cgroups=enabled must follow --cgroup-parent"
         );
         // Removing the two inserted tokens reproduces the None argv exactly.
@@ -590,7 +595,9 @@ mod tests {
         );
 
         assert!(
-            !argv.iter().any(|a| a.contains("DYNRUNNER_IMPORTANT_STDIO_ONLY")),
+            !argv
+                .iter()
+                .any(|a| a.contains("DYNRUNNER_IMPORTANT_STDIO_ONLY")),
             "container env must not carry DYNRUNNER_IMPORTANT_STDIO_ONLY"
         );
         assert!(

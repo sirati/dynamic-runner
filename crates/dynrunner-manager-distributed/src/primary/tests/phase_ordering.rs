@@ -203,11 +203,7 @@ fn phased_binary_dep(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<T
 /// names a prerequisite in a DIFFERENT phase. Mirrors the consumer's
 /// `build_variant` tasks whose `build_compilers_depends_on` point at
 /// `build_compilers`-phase toolchain tasks.
-fn phased_binary_xdep(
-    name: &str,
-    phase: &str,
-    cross_deps: &[(&str, &str)],
-) -> TaskInfo<TestId> {
+fn phased_binary_xdep(name: &str, phase: &str, cross_deps: &[(&str, &str)]) -> TaskInfo<TestId> {
     TaskInfo {
         task_depends_on: cross_deps
             .iter()
@@ -285,7 +281,8 @@ async fn producer_path_build_spawn_dispatches_after_dependency_graph() {
                 vec![],
                 Some(("dependency_graph".into(), build_items)),
                 // 2 seeded + 5 spawned build tasks must ALL complete.
-                /* expected_total_completed: */ 7,
+                /* expected_total_completed: */
+                7,
             )
             .await;
         })
@@ -416,7 +413,16 @@ async fn run_producer_zero_dispatch_scenario(
         }
     });
 
-    let result = primary.run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end).await;
+    let result = primary
+        .run(
+            SeedSource::ColdStart {
+                binaries,
+                phase_deps,
+            },
+            on_start,
+            on_end,
+        )
+        .await;
 
     drop(primary);
     for h in sec_handles {
@@ -562,7 +568,14 @@ async fn run_phase_ordering_scenario(
     });
 
     primary
-        .run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end)
+        .run(
+            SeedSource::ColdStart {
+                binaries,
+                phase_deps,
+            },
+            on_start,
+            on_end,
+        )
         .await
         .unwrap();
 
@@ -803,7 +816,14 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             });
 
             primary
-                .run(SeedSource::ColdStart { binaries, phase_deps }, on_start, on_end)
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps,
+                    },
+                    on_start,
+                    on_end,
+                )
                 .await
                 .unwrap();
 

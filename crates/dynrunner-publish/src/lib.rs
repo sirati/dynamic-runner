@@ -63,8 +63,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nix::sys::signal::{sigprocmask, SigSet, SigmaskHow, Signal};
-use nix::unistd::{gethostname, Pid};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
+use nix::unistd::{Pid, gethostname};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -150,7 +150,10 @@ pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), Publis
     // one-element batch. Same final state as a standalone rename/copy
     // (a one-item batch has nothing to interleave), so no behaviour
     // change for existing callers.
-    publish_all(std::slice::from_ref(&(src.to_path_buf(), dst.to_path_buf())), src_root)
+    publish_all(
+        std::slice::from_ref(&(src.to_path_buf(), dst.to_path_buf())),
+        src_root,
+    )
 }
 
 /// Atomically publish a batch of `(src, dst)` items as one staged
@@ -911,13 +914,19 @@ mod tests {
         }
 
         // No final committed for either item.
-        assert!(!good_dst.exists(), "earlier item committed before batch validated");
+        assert!(
+            !good_dst.exists(),
+            "earlier item committed before batch validated"
+        );
         assert!(!bad_dst.exists(), "rejected item committed");
         // Sources untouched.
         assert!(good_src.exists(), "good src wrongly removed");
         assert!(bad_src.exists(), "bad src wrongly removed");
         // No temp from this batch survives anywhere under the dst tree.
-        assert!(!any_tmp_in(&dst_root.join("out")), "phase-1 temp not unwound");
+        assert!(
+            !any_tmp_in(&dst_root.join("out")),
+            "phase-1 temp not unwound"
+        );
     }
 
     #[test]
@@ -1045,11 +1054,17 @@ mod tests {
             .collect();
         // The reaped one is gone.
         assert!(
-            !surviving.iter().any(|n| n.ends_with(&format!(".{dead_pid}.1"))),
+            !surviving
+                .iter()
+                .any(|n| n.ends_with(&format!(".{dead_pid}.1"))),
             "own-host dead-pid temp not reaped"
         );
         // Live-pid temp, foreign-host temp, and real file survive.
-        assert!(surviving.iter().any(|n| n.ends_with(&format!(".{live_pid}.2"))));
+        assert!(
+            surviving
+                .iter()
+                .any(|n| n.ends_with(&format!(".{live_pid}.2")))
+        );
         assert!(surviving.iter().any(|n| n.contains("some-other-host")));
         assert!(surviving.iter().any(|n| n == "data.tar.zst"));
     }

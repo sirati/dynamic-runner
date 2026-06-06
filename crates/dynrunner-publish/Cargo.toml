@@ -13,13 +13,17 @@ readme.workspace       = true
 
 [dependencies]
 thiserror = { workspace = true }
-# `signal` (workspace default): RAII signal-mask guard that holds
-# {SIGTERM,SIGINT,SIGHUP} pending across the back-to-back rename phase
-# (sigprocmask, mirroring slurm-wrapper/wrapper/src/signals.rs).
+# `signal`: RAII signal-mask guard that holds {SIGTERM,SIGINT,SIGHUP}
+# pending across the back-to-back rename phase (`sigprocmask`/`SigSet`/
+# `Signal`, mirroring slurm-wrapper/wrapper/src/signals.rs), plus the
+# stale-temp sweep's `kill(pid, None)` liveness probe.
+# `process`: `Pid` for that liveness probe.
 # `hostname`: `gethostname()` for the host token embedded in the
 # `.publish-tmp` sibling name, which makes the stale-temp sweep
 # shared-NFS-safe (own-host scope + local pid-liveness check).
-nix = { workspace = true, features = ["hostname"] }
+# Declared explicitly so the crate is self-describing rather than
+# relying on the workspace feature union pulling `signal`/`process` in.
+nix = { workspace = true, features = ["hostname", "signal", "process"] }
 
 [dev-dependencies]
 tempfile = "3"

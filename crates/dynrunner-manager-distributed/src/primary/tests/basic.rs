@@ -35,7 +35,17 @@ async fn single_secondary_processes_all_tasks() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             assert_eq!(primary.completed_count(), 3);
@@ -75,7 +85,17 @@ async fn two_secondaries_distribute_work() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             assert_eq!(primary.completed_count(), 6);
@@ -162,7 +182,17 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             // the "both secondaries reached process_tasks and observed the
             // run-complete cue" signal under the composed semantics.
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             let completed = primary.completed_count();
             let failed = primary.failed_count();
@@ -230,7 +260,17 @@ async fn live_distribution_continues_past_initial_batch() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             // All 20 must complete; ≥ 18 went via the operational TaskRequest

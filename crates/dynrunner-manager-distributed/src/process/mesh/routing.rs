@@ -75,9 +75,11 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 if self.deliver_local(LocalRole::Primary, frame) {
                     return Ok(());
                 }
-                Err("Mesh::dispatch: remote Destination::Primary requires the resolved \
+                Err(
+                    "Mesh::dispatch: remote Destination::Primary requires the resolved \
                      host id (C3 frame target)"
-                    .to_string())
+                        .to_string(),
+                )
             }
             Destination::Secondary(id) | Destination::Observer(id) => {
                 let role = LocalRole::from_destination(&target)
@@ -166,7 +168,11 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// of an egress broadcast is the caller's separate concern.
     fn fan_local(&mut self, exclude: Option<LocalRole>, frame: DistributedMessage<I>) {
         let mut to_prune: Vec<LocalRole> = Vec::new();
-        for role in [LocalRole::Primary, LocalRole::Secondary, LocalRole::Observer] {
+        for role in [
+            LocalRole::Primary,
+            LocalRole::Secondary,
+            LocalRole::Observer,
+        ] {
             if Some(role) == exclude {
                 continue;
             }

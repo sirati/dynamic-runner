@@ -39,8 +39,7 @@ async fn keepalive_is_emitted_exactly_once() {
          not a primary-unicast + peer-broadcast double-send); got {recorded:?}"
     );
     assert!(
-        matches!(recorded[0], DistributedMessage::Keepalive {
-    target: _, .. }),
+        matches!(recorded[0], DistributedMessage::Keepalive { target: _, .. }),
         "the single emitted frame must be the Keepalive"
     );
 }
@@ -67,6 +66,8 @@ async fn keepalive_still_emitted_when_mesh_degraded() {
         "a degraded mesh must still emit EXACTLY ONE keepalive fan-out so the \
          primary keeps seeing this secondary alive; got {recorded:?}"
     );
-    assert!(matches!(recorded[0], DistributedMessage::Keepalive {
-    target: _, .. }));
+    assert!(matches!(
+        recorded[0],
+        DistributedMessage::Keepalive { target: _, .. }
+    ));
 }

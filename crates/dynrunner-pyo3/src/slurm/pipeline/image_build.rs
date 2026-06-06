@@ -71,11 +71,7 @@ impl ImageBuild {
     /// `job_manager`, `project_root`, and `log` are `Py<PyAny>` so they
     /// cross the thread boundary (`Send`); each is re-`bind`ed under the
     /// thread's GIL token.
-    pub(super) fn spawn(
-        job_manager: Py<PyAny>,
-        project_root: Py<PyAny>,
-        log: Py<PyAny>,
-    ) -> Self {
+    pub(super) fn spawn(job_manager: Py<PyAny>, project_root: Py<PyAny>, log: Py<PyAny>) -> Self {
         let handle = std::thread::spawn(move || {
             Python::attach(|py| build_and_emit(py, &job_manager, &project_root, &log))
         });

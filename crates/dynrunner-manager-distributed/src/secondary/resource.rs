@@ -117,9 +117,7 @@ where
         // resolved host ONLY for a remote `Destination::Primary` (id-less, so
         // the mesh can't route it by host without the resolution done here).
         let send_target = match (&dst, &target) {
-            (Destination::Primary, SendTarget::Peer(id)) => {
-                Destination::Secondary(id.clone())
-            }
+            (Destination::Primary, SendTarget::Peer(id)) => Destination::Secondary(id.clone()),
             _ => dst.clone(),
         };
         // Queue it. `MeshClient::send` is QUEUED (M4): the pump drains it and

@@ -248,8 +248,7 @@ mod tests {
         // And via the kwarg-merge constructor with everything omitted.
         let cfg = DistributedConfig::new(
             None, None, None, None, None, None, None, None, None, None,
-            /* unconfigured_deadline_secs */ None,
-            None, None, None,
+            /* unconfigured_deadline_secs */ None, None, None, None,
         );
         assert_eq!(
             cfg.unconfigured_deadline(),
@@ -265,9 +264,20 @@ mod tests {
     #[test]
     fn unconfigured_deadline_kwarg_propagates() {
         let cfg = DistributedConfig::new(
-            None, None, None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             /* unconfigured_deadline_secs */ Some(123.0),
-            None, None, None,
+            None,
+            None,
+            None,
         );
         assert_eq!(
             cfg.unconfigured_deadline(),

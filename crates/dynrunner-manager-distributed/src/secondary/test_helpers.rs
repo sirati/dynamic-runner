@@ -68,12 +68,8 @@ pub(super) fn make_transport<P: PeerTransport<TestId>>(peer: P) -> TestTransport
 /// coordinator no longer carries a transport generic — the mesh does — so
 /// this type is the same regardless of which peer-mesh stub backs the
 /// harness's `Mesh`.
-pub(super) type TestSecondary = SecondaryCoordinator<
-    ChannelManagerEnd,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
->;
+pub(super) type TestSecondary =
+    SecondaryCoordinator<ChannelManagerEnd, ResourceStealingScheduler, FixedEstimator, TestId>;
 
 /// A built secondary plus the mesh plumbing a test must keep alive to
 /// drive it.
@@ -540,11 +536,12 @@ pub(super) fn set_current_primary<P: PeerTransport<TestId>>(
     id: &str,
 ) {
     use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
-    sec.cluster_state.apply(ClusterMutation::<TestId>::PrimaryChanged {
-        new: id.into(),
-        epoch: 1,
-        reason: PrimaryChangeReason::Transferred,
-    });
+    sec.cluster_state
+        .apply(ClusterMutation::<TestId>::PrimaryChanged {
+            new: id.into(),
+            epoch: 1,
+            reason: PrimaryChangeReason::Transferred,
+        });
 }
 
 /// Arm a pre-staged secondary as the SINGLE designated discoverer AND the

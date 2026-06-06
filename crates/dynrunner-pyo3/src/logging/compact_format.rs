@@ -165,11 +165,8 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
     N: for<'a> FormatFields<'a> + 'static,
 {
-    ctx.event_scope()?.find_map(|span| {
-        span.extensions()
-            .get::<RoleTag>()
-            .map(|tag| tag.render())
-    })
+    ctx.event_scope()?
+        .find_map(|span| span.extensions().get::<RoleTag>().map(|tag| tag.render()))
 }
 
 /// The compact per-role-file event formatter. Emits
@@ -310,7 +307,8 @@ mod tests {
         let hms: Vec<&str> = ts.split(':').collect();
         assert_eq!(hms.len(), 3, "timestamp not `HH:MM:SS`: {ts:?}");
         assert!(
-            hms.iter().all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
+            hms.iter()
+                .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit())),
             "timestamp not two-digit `HH:MM:SS`: {ts:?}"
         );
         // Local, not UTC: the stamp's `HH:MM` matches the local clock.
@@ -327,7 +325,10 @@ mod tests {
         assert_eq!(role, "P-secondary-0", "primary role prefix wrong: {line:?}");
 
         // Message and event k=v field survive after the role prefix.
-        assert!(line.contains("task dispatched"), "message missing: {line:?}");
+        assert!(
+            line.contains("task dispatched"),
+            "message missing: {line:?}"
+        );
         assert!(line.contains("attempt=3"), "event field dropped: {line:?}");
     }
 
@@ -351,15 +352,18 @@ mod tests {
         // `record_debug` whose `{:?}` forwards to `Display`. The token must
         // carry the bare id, not a `Debug`-quoted string.
         let node = String::from("primary-host-2");
-        let out = capture_role_line(|| {
-            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary", node = %node)
-        });
+        let out = capture_role_line(
+            || tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary", node = %node),
+        );
         let line = out
             .lines()
             .find(|l| l.contains("task dispatched"))
             .unwrap_or_else(|| panic!("line missing: {out:?}"));
         let role = line.split_whitespace().nth(2).expect("role token");
-        assert_eq!(role, "P-primary-host-2", "display-adapter id mangled: {line:?}");
+        assert_eq!(
+            role, "P-primary-host-2",
+            "display-adapter id mangled: {line:?}"
+        );
     }
 
     #[test]
@@ -377,7 +381,13 @@ mod tests {
             .with(fmt_layer);
         with_default(subscriber, || tracing::info!("orphan"));
         let line = buf.contents();
-        assert!(line.contains("?-?"), "off-span fallback prefix missing: {line:?}");
-        assert!(line.contains("orphan"), "off-span message dropped: {line:?}");
+        assert!(
+            line.contains("?-?"),
+            "off-span fallback prefix missing: {line:?}"
+        );
+        assert!(
+            line.contains("orphan"),
+            "off-span message dropped: {line:?}"
+        );
     }
 }

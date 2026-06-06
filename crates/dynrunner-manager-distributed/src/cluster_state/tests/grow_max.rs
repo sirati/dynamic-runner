@@ -32,18 +32,27 @@ fn phase(name: &str) -> PhaseId {
 fn phase_event_tally_originate_and_read() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
     let p = phase("build");
-    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)), 0);
+    assert_eq!(
+        s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        0
+    );
     assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 0);
 
     // Event-shaped: a fail then a (retry) success bumps BOTH keys.
     s.record_phase_event_tally((p.clone(), PhaseTally::Failed), 1);
     s.record_phase_event_tally((p.clone(), PhaseTally::Completed), 1);
     assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 1);
-    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)), 1);
+    assert_eq!(
+        s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        1
+    );
 
     // A lower re-bump is a no-op (grow-only MAX); a higher one ratchets.
     s.record_phase_event_tally((p.clone(), PhaseTally::Completed), 1);
-    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)), 1);
+    assert_eq!(
+        s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        1
+    );
     s.record_phase_event_tally((p.clone(), PhaseTally::Completed), 3);
     assert_eq!(s.phase_event_tally_for(&(p, PhaseTally::Completed)), 3);
 }
@@ -61,7 +70,10 @@ fn phase_event_tallies_snapshot_round_trip() {
     let mut promoted = ClusterState::<RunnerIdentifier>::new();
     promoted.restore(live.snapshot());
 
-    assert_eq!(promoted.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 2);
+    assert_eq!(
+        promoted.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)),
+        2
+    );
     assert_eq!(
         promoted.phase_event_tally_for(&(p, PhaseTally::Completed)),
         5
@@ -143,11 +155,17 @@ fn phase_event_tallies_digest_detect_then_quiesce() {
 fn retry_passes_used_originate_round_trip_and_max() {
     let p = phase("work");
     let mut live = ClusterState::<RunnerIdentifier>::new();
-    assert_eq!(live.retry_pass_used_for(&(p.clone(), BucketKind::Recoverable)), 0);
+    assert_eq!(
+        live.retry_pass_used_for(&(p.clone(), BucketKind::Recoverable)),
+        0
+    );
 
     live.record_retry_pass_used((p.clone(), BucketKind::Recoverable), 1);
     live.record_retry_pass_used((p.clone(), BucketKind::Oom), 2);
-    assert_eq!(live.retry_pass_used_for(&(p.clone(), BucketKind::Recoverable)), 1);
+    assert_eq!(
+        live.retry_pass_used_for(&(p.clone(), BucketKind::Recoverable)),
+        1
+    );
     assert_eq!(live.retry_pass_used_for(&(p.clone(), BucketKind::Oom)), 2);
 
     // Promotion inherits the used budget via max-merge.
@@ -157,7 +175,10 @@ fn retry_passes_used_originate_round_trip_and_max() {
         promoted.retry_pass_used_for(&(p.clone(), BucketKind::Recoverable)),
         1
     );
-    assert_eq!(promoted.retry_pass_used_for(&(p.clone(), BucketKind::Oom)), 2);
+    assert_eq!(
+        promoted.retry_pass_used_for(&(p.clone(), BucketKind::Oom)),
+        2
+    );
 
     // A stale peer's lower count can't re-grant the budget.
     let mut stale = ClusterState::<RunnerIdentifier>::new();

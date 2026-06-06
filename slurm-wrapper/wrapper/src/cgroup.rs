@@ -251,7 +251,10 @@ mod tests {
 
         adopt_into_cgroup(root, &job, 4242).expect("adopt write must succeed");
         let written = std::fs::read_to_string(dir.join("cgroup.procs")).unwrap();
-        assert_eq!(written, "4242", "the bare PID must be written to cgroup.procs");
+        assert_eq!(
+            written, "4242",
+            "the bare PID must be written to cgroup.procs"
+        );
     }
 
     #[test]

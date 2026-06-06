@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, SeedSource, RunTerminal,
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
 use dynrunner_protocol_primary_secondary::address::PeerId;
@@ -413,8 +413,7 @@ impl PyPrimaryCoordinator {
                 // SENDER goes to `NodeRunInputs.primary_demote_tx`, where
                 // `Node::run` installs it on the primary's role-change hook
                 // (`register_demote_on_displaced`).
-                let (demote_tx, demote_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<()>();
+                let (demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
                 // The coordinator never names a transport: the `Mesh` (owned
                 // by the `Node`'s pump) holds it; the coordinator reaches the

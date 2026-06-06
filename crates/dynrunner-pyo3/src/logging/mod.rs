@@ -66,13 +66,13 @@ use chrono::Local;
 use compact_format::{CompactRoleFormat, RoleTagLayer};
 use pyo3::prelude::*;
 use tracing::{Event, Metadata};
+use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{FilterFn, LevelFilter};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::{Context, Filter, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 
 /// Tracing target that marks an event as "important" (LLM-wake-worthy).
 /// Events emitted at this target reach stdio even in importance mode.
@@ -751,7 +751,12 @@ mod tests {
         // the per-node dir takes precedence over the single file, and a
         // whitespace-only value collapses to "unset" so an empty CLI value
         // is treated the same as an omitted one.
-        let cfg = LogConfig::new(true, Some("/x/full.log".into()), Some("/x/dir".into()), false);
+        let cfg = LogConfig::new(
+            true,
+            Some("/x/full.log".into()),
+            Some("/x/dir".into()),
+            false,
+        );
         assert!(matches!(cfg.full_sink, FullSink::PerNodeDir(_)));
         assert!(cfg.important_stdio_only);
 
@@ -920,13 +925,15 @@ mod tests {
             true, // important_stdio_only — the cluster flag
             None,
             Some(node_dir.display().to_string()), // PerNodeDir → role_full_layers
-            true,                                  // --debug → DEBUG level
+            true,                                 // --debug → DEBUG level
         );
         // Compose EXACTLY as `init_with`: the level is one global subscriber-
         // level filter, the per-sink layers only narrow by target/role. The
         // layers are generic over the post-level subscriber type (inferred),
         // matching `init_with`'s `registry().with(level).with(build_layers())`.
-        let subscriber = Registry::default().with(config.level).with(build_layers(&config));
+        let subscriber = Registry::default()
+            .with(config.level)
+            .with(build_layers(&config));
 
         with_default(subscriber, || {
             // The verbosity ceiling is now an explicit GLOBAL filter, so the
@@ -1040,10 +1047,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let full_file = dir.path().join("dynrunner-full.log");
         let config = LogConfig::new(
-            true,                                          // important_stdio_only
-            Some(full_file.display().to_string()),         // File full sink
+            true,                                  // important_stdio_only
+            Some(full_file.display().to_string()), // File full sink
             None,
-            true,                                          // --debug
+            true, // --debug
         );
         init_with(&config);
 

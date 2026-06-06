@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use super::types::{
-    RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec,
-};
+use super::types::{RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec};
 
 use crate::cluster_state::RespawnEventRecord;
 
@@ -60,8 +58,11 @@ where
         };
 
         let now = std::time::SystemTime::now();
-        let decision =
-            budget.should_respawn(&request.original_id, self.cluster_state.respawn_events(), now);
+        let decision = budget.should_respawn(
+            &request.original_id,
+            self.cluster_state.respawn_events(),
+            now,
+        );
         match decision {
             RespawnDecision::Accept => {}
             RespawnDecision::RejectFamilyBudget

@@ -207,9 +207,16 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             let primary_handle = tokio::task::spawn_local(async move {
                 let (deps, ops, ope) = noop_phase_args();
                 primary
-                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
-                .await
-                .unwrap();
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap();
                 primary.completed_count()
             });
 
@@ -562,7 +569,14 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
 
             let (deps, ops, ope) = noop_phase_args();
             primary
-                .run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope)
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
                 .await
                 .unwrap();
 
@@ -642,7 +656,10 @@ async fn retry_reset_survives_anti_entropy_heal() {
                 attempt: 0,
             });
             assert_eq!(
-                p1.cluster_state_for_test().task_state(&h).unwrap().attempt(),
+                p1.cluster_state_for_test()
+                    .task_state(&h)
+                    .unwrap()
+                    .attempt(),
                 0,
                 "seed: H is at the cold generation"
             );
@@ -701,7 +718,10 @@ async fn retry_reset_survives_anti_entropy_heal() {
             // P2 starts from the stale Failed view, then heals from P1.
             p2.cluster_state_mut_for_test().restore(stale);
             assert_eq!(
-                p2.cluster_state_for_test().task_state(&h).unwrap().attempt(),
+                p2.cluster_state_for_test()
+                    .task_state(&h)
+                    .unwrap()
+                    .attempt(),
                 0,
                 "P2 begins at the stale generation"
             );
@@ -1426,7 +1446,10 @@ async fn promoted_combined_state_reconstructs_faithfully() {
                 .task_state(&failed_h)
                 .expect("failed task in ledger");
             assert!(
-                matches!(failed_state, crate::cluster_state::TaskState::Pending { .. }),
+                matches!(
+                    failed_state,
+                    crate::cluster_state::TaskState::Pending { .. }
+                ),
                 "the inherited Failed task was retried (reset to Pending)"
             );
             assert_eq!(failed_state.attempt(), 1, "retry bumped the attempt");
@@ -1566,8 +1589,7 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
                 "total_tasks hydrated from the inherited ledger"
             );
             assert!(
-                promoted.completed_tasks.len() + promoted.failed_tasks.len()
-                    < promoted.total_tasks,
+                promoted.completed_tasks.len() + promoted.failed_tasks.len() < promoted.total_tasks,
                 "the run-complete counter must be below total while the inherited \
                  Pending is still undispatched (pre-fix the double-counted Failed \
                  inflates this to >= total → premature RunComplete)"

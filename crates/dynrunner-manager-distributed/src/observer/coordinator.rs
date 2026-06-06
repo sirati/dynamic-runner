@@ -69,9 +69,9 @@ use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonit
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
-use crate::process::{MeshClient, RoleInbox};
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
 use crate::primary::RunError;
+use crate::process::{MeshClient, RoleInbox};
 use crate::run_narrator::RunNarrator;
 use crate::task_completed::{
     TaskCompletedEvent, TaskCompletedListener, run_collector, run_task_completed_dispatcher,
@@ -604,19 +604,15 @@ where
 
         // Drive each policy's window timer.
         let (invalid_cancel_tx, invalid_cancel_rx) = oneshot::channel::<()>();
-        let invalid_driver_task = tokio::task::spawn_local(run_collector(
-            invalid_task_driver,
-            async move {
+        let invalid_driver_task =
+            tokio::task::spawn_local(run_collector(invalid_task_driver, async move {
                 let _ = invalid_cancel_rx.await;
-            },
-        ));
+            }));
         let (aggregation_cancel_tx, aggregation_cancel_rx) = oneshot::channel::<()>();
-        let aggregation_driver_task = tokio::task::spawn_local(run_collector(
-            aggregation_driver,
-            async move {
+        let aggregation_driver_task =
+            tokio::task::spawn_local(run_collector(aggregation_driver, async move {
                 let _ = aggregation_cancel_rx.await;
-            },
-        ));
+            }));
 
         // Observer announcer. The role-change hook was attached at
         // CONSTRUCTION (before the cold-join factory's snapshot restore), so
@@ -649,13 +645,10 @@ where
             SharedSnapshotSource::new(StatsSnapshot::from_cluster_state(&self.cluster_state));
         let snapshot_publisher = snapshot_source.clone();
         let (reporter_cancel_tx, reporter_cancel_rx) = oneshot::channel::<()>();
-        let reporter_task = tokio::task::spawn_local(run_reporter(
-            snapshot_source,
-            TokioClock,
-            async move {
+        let reporter_task =
+            tokio::task::spawn_local(run_reporter(snapshot_source, TokioClock, async move {
                 let _ = reporter_cancel_rx.await;
-            },
-        ));
+            }));
 
         // Bootstrap recovery REQUEST half (§6): fire one snapshot request
         // to `Destination::Primary` at entry, gated on a known primary,
@@ -683,7 +676,8 @@ where
         // cleanup-before-each-return).
         let loop_result: Result<ObserverTerminal, RunError> = async {
             // ── Backstop clocks ──
-            let mut narrator = RunNarrator::with_started_phases(std::mem::take(&mut self.started_phases));
+            let mut narrator =
+                RunNarrator::with_started_phases(std::mem::take(&mut self.started_phases));
             let mut fleet_dead_since: Option<Instant> = None;
             let mut primary_last_seen = Instant::now();
             let mut transport_closed = false;
@@ -700,7 +694,8 @@ where
             // Anti-entropy tick (item 3): per-node-jittered cadence; Skip +
             // immediate-tick-consume so a converged mesh's digest traffic
             // starts one period out.
-            let mut ae_tick = tokio::time::interval(anti_entropy::tick_period(&self.config.node_id));
+            let mut ae_tick =
+                tokio::time::interval(anti_entropy::tick_period(&self.config.node_id));
             ae_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let _ = ae_tick.tick().await;
 
@@ -712,8 +707,8 @@ where
             // its last-seen digest — this is what re-converges a WARN-dropped
             // steady-state decode. Skip + immediate-tick-consume mirrors the
             // digest cadence so the first recovery probe is one period out.
-            let recovery_period = anti_entropy::tick_period(&self.config.node_id)
-                .min(self.config.peer_timeout);
+            let recovery_period =
+                anti_entropy::tick_period(&self.config.node_id).min(self.config.peer_timeout);
             let mut recovery_tick = tokio::time::interval(recovery_period);
             recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let _ = recovery_tick.tick().await;
@@ -740,11 +735,9 @@ where
 
                 // 2. Terminal backstop block (top-of-loop). Ordering is
                 //    load-bearing — see the module + spec §9.
-                if let Some(terminal) = self.evaluate_exit(
-                    transport_closed,
-                    &mut fleet_dead_since,
-                    primary_last_seen,
-                )? {
+                if let Some(terminal) =
+                    self.evaluate_exit(transport_closed, &mut fleet_dead_since, primary_last_seen)?
+                {
                     return Ok(terminal);
                 }
 
@@ -930,11 +923,7 @@ where
     /// CRDT mutations, refreshes primary-liveness on recognised signals,
     /// heals from snapshots, and reconciles digests. It NEVER originates a
     /// mutation or re-broadcasts.
-    async fn on_inbound(
-        &mut self,
-        msg: DistributedMessage<I>,
-        primary_last_seen: &mut Instant,
-    ) {
+    async fn on_inbound(&mut self, msg: DistributedMessage<I>, primary_last_seen: &mut Instant) {
         match msg {
             DistributedMessage::ClusterMutation { mutations, .. } => {
                 self.on_cluster_mutation(mutations, primary_last_seen);
@@ -1075,7 +1064,8 @@ where
     /// Anti-entropy tick (item 3): broadcast our digest to the mesh.
     async fn on_anti_entropy_tick(&mut self) {
         let digest = self.cluster_state.digest();
-        let msg = anti_entropy::digest_broadcast::<I>(&self.config.node_id, timestamp_now(), digest);
+        let msg =
+            anti_entropy::digest_broadcast::<I>(&self.config.node_id, timestamp_now(), digest);
         if let Err(e) = self.send_to(Destination::All, msg).await {
             tracing::debug!(
                 error = %e,

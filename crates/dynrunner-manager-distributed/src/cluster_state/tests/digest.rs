@@ -90,6 +90,59 @@ fn same_count_state_advance_changes_fold() {
     assert!(stale.is_behind(&advanced));
 }
 
+/// The retry-attempt generation (F2) participates in the `tasks_hash` fold
+/// directly: a `Failed { attempt: 0 }` and a `Pending { attempt: 1 }` for
+/// the SAME task hash produce DIFFERENT digests even though the task count
+/// is unchanged. This pins the attempt-prepended leg of `hashable_join_key`
+/// — the retry reset is at a lower band/rank than the Failed it supersedes,
+/// so without the prepended `attempt` the fold could collapse them; with it,
+/// the higher-attempt replica is detected as ahead and drives the heal.
+#[test]
+fn retry_attempt_advance_changes_fold() {
+    // Replica `a`: task added then failed → `Failed { attempt: 0 }`.
+    let mut a = ClusterState::<RunnerIdentifier>::new();
+    a.apply(ClusterMutation::TaskAdded {
+        hash: "t".into(),
+        task: mk_task("t"),
+    });
+    a.apply(ClusterMutation::TaskFailed {
+        hash: "t".into(),
+        kind: ErrorType::Recoverable,
+        error: "boom".into(),
+        version: Default::default(),
+        attempt: 0,
+    });
+
+    // Replica `b`: same up to the failure, then the F2 retry reset
+    // `Failed { attempt: 0 } → Pending { attempt: 1 }`.
+    let mut b = ClusterState::<RunnerIdentifier>::new();
+    b.apply(ClusterMutation::TaskAdded {
+        hash: "t".into(),
+        task: mk_task("t"),
+    });
+    b.apply(ClusterMutation::TaskFailed {
+        hash: "t".into(),
+        kind: ErrorType::Recoverable,
+        error: "boom".into(),
+        version: Default::default(),
+        attempt: 0,
+    });
+    b.apply(ClusterMutation::TaskRetried {
+        hash: "t".into(),
+        attempt: 1,
+        version: Default::default(),
+    });
+
+    // Same single task on each replica, but the prepended `attempt` makes
+    // the per-entry fold differ.
+    assert_eq!(a.digest().tasks_count, b.digest().tasks_count);
+    assert_ne!(a.digest().tasks_hash, b.digest().tasks_hash);
+    // The `Failed { attempt: 0 }` replica is behind the `Pending {
+    // attempt: 1 }` one — the divergence drives a pull of the higher
+    // generation.
+    assert!(a.digest().is_behind(&b.digest()));
+}
+
 /// A divergence in the role-capability 2P-set IS detected by the
 /// anti-entropy detector (C6 — reversed from the pre-C6 detector, which
 /// excluded role sets). The capability lattice is a proper CRDT (merged

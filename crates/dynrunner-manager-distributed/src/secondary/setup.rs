@@ -240,7 +240,11 @@ where
                         MessageType::PeerInfo => {
                             got_peer_info = true;
                             if let DistributedMessage::PeerInfo {
-    target: None, peers, .. } = &msg {
+                                target: None,
+                                peers,
+                                ..
+                            } = &msg
+                            {
                                 let peer_count = peers
                                     .iter()
                                     .filter(|p| p.secondary_id != self.config.secondary_id)
@@ -340,7 +344,11 @@ where
                             // semantics make this idempotent against any
                             // re-applied mutation post-setup.
                             if let DistributedMessage::ClusterMutation {
-    target: None, mutations, .. } = msg {
+                                target: None,
+                                mutations,
+                                ..
+                            } = msg
+                            {
                                 self.apply_cluster_mutations(mutations);
                             }
                         }

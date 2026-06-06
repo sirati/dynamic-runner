@@ -340,7 +340,11 @@ fn phase_task_outputs_gathers_only_the_named_phase() {
     // output-less `variant` contributes no entry (mirrors `outputs_for`'s
     // None for a task that published nothing).
     let build_phase = s.phase_task_outputs(&dynrunner_core::PhaseId::from("build"));
-    assert_eq!(build_phase.len(), 1, "only common_dep published: {build_phase:?}");
+    assert_eq!(
+        build_phase.len(),
+        1,
+        "only common_dep published: {build_phase:?}"
+    );
     assert_eq!(build_phase.get("common_dep"), Some(&common_outputs));
     assert!(!build_phase.contains_key("variant"));
 

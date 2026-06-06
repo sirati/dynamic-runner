@@ -264,10 +264,7 @@ impl<I: Identifier> ClusterState<I> {
                              restore reconciles deterministically (lower \
                              content-hash wins)."
                         );
-                        debug_assert!(
-                            false,
-                            "PhaseDepsSet re-applied with a divergent graph"
-                        );
+                        debug_assert!(false, "PhaseDepsSet re-applied with a divergent graph");
                     }
                     return ApplyOutcome::NoOp;
                 }

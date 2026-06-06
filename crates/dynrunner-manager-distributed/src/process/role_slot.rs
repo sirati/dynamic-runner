@@ -190,7 +190,8 @@ mod tests {
         assert_eq!(slot.role(), LocalRole::Primary);
 
         // Deliver before the retag.
-        slot.deliver(frame("before")).expect("inbound live pre-retag");
+        slot.deliver(frame("before"))
+            .expect("inbound live pre-retag");
 
         // Retag primary → observer in place.
         slot.set_role(LocalRole::Observer);
@@ -202,7 +203,8 @@ mod tests {
         );
 
         // The same channel still delivers after the retag.
-        slot.deliver(frame("after")).expect("inbound live post-retag");
+        slot.deliver(frame("after"))
+            .expect("inbound live post-retag");
 
         let first = rx.try_recv().expect("pre-retag frame");
         let second = rx.try_recv().expect("post-retag frame");

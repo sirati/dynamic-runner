@@ -72,7 +72,11 @@ fn respawn_events_snapshot_round_trip() {
 
     assert_eq!(promoted.respawn_events().len(), 2);
     assert_eq!(
-        promoted.respawn_events().get("secondary-2").unwrap().original_id,
+        promoted
+            .respawn_events()
+            .get("secondary-2")
+            .unwrap()
+            .original_id,
         "secondary-1"
     );
 }

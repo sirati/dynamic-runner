@@ -121,8 +121,7 @@ where
     S: Scheduler<TestId> + 'static,
     E: ResourceEstimator<TestId> + 'static,
 {
-    let (primary, mesh, slot, demote_tx) =
-        mint_primary(config, transport, scheduler, estimator);
+    let (primary, mesh, slot, demote_tx) = mint_primary(config, transport, scheduler, estimator);
     // Publish live membership before the pump spawns (the pump republishes
     // every cycle thereafter).
     mesh.publish_membership();

@@ -74,7 +74,10 @@ async fn dispatch_all_fans_like_broadcast() {
     );
     assert!(primary_inbox.try_recv().is_none(), "origin excluded");
     let rx = receivers.get_mut("remote-1").unwrap();
-    assert_eq!(sender_of(&rx.try_recv().expect("remote got All")), "pri-all");
+    assert_eq!(
+        sender_of(&rx.try_recv().expect("remote got All")),
+        "pri-all"
+    );
 }
 
 /// A directed `dispatch` to a SAME-HOST secondary loopbacks to the local
@@ -97,7 +100,11 @@ async fn dispatch_directed_loopback_vs_remote() {
     .await
     .expect("loopback dispatch succeeds");
     assert_eq!(
-        sender_of(&secondary_inbox.try_recv().expect("local secondary loopback")),
+        sender_of(
+            &secondary_inbox
+                .try_recv()
+                .expect("local secondary loopback")
+        ),
         "to-local-sec"
     );
 
@@ -145,7 +152,11 @@ async fn mesh_client_send_is_queued_and_applied_by_pump() {
     let item = mesh.next_local_dispatch().await.expect("one queued item");
     mesh.apply_local_dispatch(item).await.expect("apply routes");
     assert_eq!(
-        sender_of(&primary_inbox.try_recv().expect("primary got the queued send")),
+        sender_of(
+            &primary_inbox
+                .try_recv()
+                .expect("primary got the queued send")
+        ),
         "queued-to-primary"
     );
 }
@@ -206,7 +217,10 @@ async fn retag_local_role_moves_weak_and_keeps_channel() {
     // Before the retag: the mesh delivers a Primary-directed frame to the
     // slot; the Observer field is empty.
     assert!(mesh.deliver_local(LocalRole::Primary, frame("pre-retag")));
-    assert_eq!(sender_of(&inbox.try_recv().expect("primary pre-retag")), "pre-retag");
+    assert_eq!(
+        sender_of(&inbox.try_recv().expect("primary pre-retag")),
+        "pre-retag"
+    );
     assert!(
         !mesh.deliver_local(LocalRole::Observer, frame("no-observer-yet")),
         "no observer slot is registered before the retag"
@@ -219,7 +233,11 @@ async fn retag_local_role_moves_weak_and_keeps_channel() {
     // The slot's role flipped, and it is the SAME `Arc` (identity + channel
     // preserved — the `Node`'s `RoleEntry` still holds it).
     assert_eq!(slot.role(), LocalRole::Observer, "set_role took effect");
-    assert_eq!(std::sync::Arc::as_ptr(&slot), arc_before, "same Arc, no recreate");
+    assert_eq!(
+        std::sync::Arc::as_ptr(&slot),
+        arc_before,
+        "same Arc, no recreate"
+    );
 
     // The OLD field is now empty: a Primary-directed delivery finds no slot.
     assert!(
@@ -257,7 +275,11 @@ async fn route_incoming_directed_delivers_to_target_slot() {
     ));
 
     assert_eq!(
-        sender_of(&secondary_inbox.try_recv().expect("secondary got the directed frame")),
+        sender_of(
+            &secondary_inbox
+                .try_recv()
+                .expect("secondary got the directed frame")
+        ),
         "wire"
     );
     assert!(
@@ -283,7 +305,10 @@ async fn route_incoming_all_fans_to_local_slots_not_wire() {
     mesh.route_incoming(frame_to("wire", Destination::All));
 
     // Both local slots got it (no origin to exclude — the sender is remote).
-    assert_eq!(sender_of(&primary_inbox.try_recv().expect("primary got All")), "wire");
+    assert_eq!(
+        sender_of(&primary_inbox.try_recv().expect("primary got All")),
+        "wire"
+    );
     assert_eq!(
         sender_of(&secondary_inbox.try_recv().expect("secondary got All")),
         "wire"
@@ -313,7 +338,11 @@ async fn route_incoming_none_fans_safely_never_drops() {
     // default fans it to every live local slot rather than dropping it.
     mesh.route_incoming(frame("unstamped"));
     assert_eq!(
-        sender_of(&inbox.try_recv().expect("unstamped frame fanned to the primary slot")),
+        sender_of(
+            &inbox
+                .try_recv()
+                .expect("unstamped frame fanned to the primary slot")
+        ),
         "unstamped"
     );
 }

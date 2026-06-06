@@ -167,7 +167,10 @@ async fn responder_pump(
             Err(_) => return, // timeout = inbox quiescent
             Ok(None) => return,
             Ok(Some(DistributedMessage::RequestClusterSnapshot {
-    target: None, sender_id, .. })) => {
+                target: None,
+                sender_id,
+                ..
+            })) => {
                 let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
                     target: None,
                     sender_id: responder_id.to_string(),
@@ -464,7 +467,9 @@ async fn join_running_cluster_empty_seed_errors_fast() {
     let timeout = Duration::from_millis(500);
     // `is_observer = false`: a joining worker (the common case); the
     // role is irrelevant here since no request is ever sent.
-    let result = joiner.join_running_cluster(&seed, timeout, false, false).await;
+    let result = joiner
+        .join_running_cluster(&seed, timeout, false, false)
+        .await;
     match result {
         Err(JoinError::SendFailed(_)) | Err(JoinError::NoReachablePeer) => {}
         other => panic!("expected SendFailed or NoReachablePeer, got {other:?}"),

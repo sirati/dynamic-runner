@@ -9,9 +9,7 @@ use pyo3::prelude::*;
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
 use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
 use dynrunner_manager_distributed::primary::RunError;
-use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, RunTerminal,
-};
+use dynrunner_manager_distributed::process::{LocalRole, Mesh, Node, NodeRunInputs, RunTerminal};
 use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
 use dynrunner_scheduler::ResourceStealingScheduler;
@@ -102,15 +100,14 @@ impl PyObserverLateJoiner {
                     //    validates the SAN against the logical id. The
                     //    standalone observer holds this mesh transport
                     //    directly (no cert bundle — it ships no PeerCertInfo).
-                    let mut peer_network = transport_factory::observer_mesh::<RunnerIdentifier>(
-                        &observer_id,
-                    )
-                    .await
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "observer late-joiner: {e}"
-                        ))
-                    })?;
+                    let mut peer_network =
+                        transport_factory::observer_mesh::<RunnerIdentifier>(&observer_id)
+                            .await
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "observer late-joiner: {e}"
+                                ))
+                            })?;
 
                     // 2. Bootstrap rendezvous: hand the seed list to the
                     //    trait default impl, which sequences the dial +
@@ -182,8 +179,10 @@ impl PyObserverLateJoiner {
                     //    minting the coordinator's `(client, inbox)` ends + the
                     //    `Arc<RoleSlot>` the `Node` holds as the teardown lever.
                     let mut mesh = Mesh::new(peer_network);
-                    let (obs_slot, obs_client, obs_inbox) =
-                        mesh.register_local_role(LocalRole::Observer, PeerId::from(observer_id.as_str()));
+                    let (obs_slot, obs_client, obs_inbox) = mesh.register_local_role(
+                        LocalRole::Observer,
+                        PeerId::from(observer_id.as_str()),
+                    );
 
                     // 6. Cold-join: build the standalone ObserverCoordinator
                     //    over the mesh ends + the bootstrap snapshot(s). The

@@ -347,7 +347,11 @@ async fn setup_discovered_tasks_reach_crdt_terminal_on_completion() {
 /// assertion: the multiplicity bug had every secondary yield.
 #[tokio::test(flavor = "current_thread")]
 async fn exactly_one_node_yields_by_designation() {
-    let roster = [("sec-a", true, false), ("sec-b", true, false), ("sec-c", true, false)];
+    let roster = [
+        ("sec-a", true, false),
+        ("sec-b", true, false),
+        ("sec-c", true, false),
+    ];
     let (sec_a, _la) = node_with_roster("sec-a", &roster, Some("sec-a"));
     let (sec_b, _lb) = node_with_roster("sec-b", &roster, Some("sec-a"));
     let (sec_c, _lc) = node_with_roster("sec-c", &roster, Some("sec-a"));
@@ -426,8 +430,14 @@ async fn re_designation_on_designated_node_death() {
     // Healthy: sec-a designated + authority → only sec-a pending.
     let (sec_a, _la) = node_with_roster("sec-a", &roster, Some("sec-a"));
     let (sec_b, _lb) = node_with_roster("sec-b", &roster, Some("sec-a"));
-    assert!(sec_a.setup_discovery_pending(), "sec-a is the live designate + authority");
-    assert!(!sec_b.setup_discovery_pending(), "sec-b defers to the lower-id designate");
+    assert!(
+        sec_a.setup_discovery_pending(),
+        "sec-a is the live designate + authority"
+    );
+    assert!(
+        !sec_b.setup_discovery_pending(),
+        "sec-b defers to the lower-id designate"
+    );
 
     // sec-a dies: sec-b's mirror loses sec-a from the alive set and sec-b
     // becomes the recognized authority. sec-b is now the lowest-id alive

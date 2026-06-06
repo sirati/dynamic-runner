@@ -370,10 +370,15 @@ pub(super) fn canonical_phase_deps_hash(deps: &HashMap<PhaseId, Vec<PhaseId>>) -
 /// element; the `Advertised` fold is field-wise OR + a max-versioned
 /// pick, all of which are order-independent. Returns the merged entry so
 /// the caller writes it back into the `capabilities` map.
-pub(super) fn merge_capability(local: &CapabilityEntry, incoming: &CapabilityEntry) -> CapabilityEntry {
+pub(super) fn merge_capability(
+    local: &CapabilityEntry,
+    incoming: &CapabilityEntry,
+) -> CapabilityEntry {
     match (local, incoming) {
         // The tombstone absorbs everything (genuine departure dominates).
-        (CapabilityEntry::Departed, _) | (_, CapabilityEntry::Departed) => CapabilityEntry::Departed,
+        (CapabilityEntry::Departed, _) | (_, CapabilityEntry::Departed) => {
+            CapabilityEntry::Departed
+        }
         (
             CapabilityEntry::Advertised {
                 is_observer: lo,

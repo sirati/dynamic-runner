@@ -14,7 +14,7 @@ use pyo3::types::PyList;
 
 use dynrunner_core::TaskInfo;
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, SeedSource, RunTerminal,
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator, SetupDiscovery,
@@ -801,7 +801,8 @@ fn build_setup_discovery_fn(
             .await
             .map_err(|e| format!("setup-discovery blocking task panicked/aborted: {e}"))?
         };
-        Box::pin(fut) as Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<RunnerIdentifier>>, String>>>>
+        Box::pin(fut)
+            as Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<RunnerIdentifier>>, String>>>>
     })
 }
 
@@ -953,9 +954,7 @@ fn resolve_secondary_memprofile_dir_with_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        resolve_secondary_memprofile_dir, resolve_secondary_memprofile_dir_with_probe,
-    };
+    use super::{resolve_secondary_memprofile_dir, resolve_secondary_memprofile_dir_with_probe};
     use std::path::Path;
 
     #[test]

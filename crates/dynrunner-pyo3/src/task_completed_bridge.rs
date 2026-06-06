@@ -261,8 +261,7 @@ mod tests {
             last_error: None,
         });
 
-        let (failed_id, failed_ok, _failed_kind, failed_last_error) =
-            captured_call(&globals, 0);
+        let (failed_id, failed_ok, _failed_kind, failed_last_error) = captured_call(&globals, 0);
         assert_eq!(failed_id, "fails");
         assert!(!failed_ok);
         assert_eq!(

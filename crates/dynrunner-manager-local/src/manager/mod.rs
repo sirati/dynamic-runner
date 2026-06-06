@@ -47,7 +47,8 @@ pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
 /// task's output WITHOUT a filesystem path. Empty for a phase whose
 /// tasks published nothing. Uniform with the distributed primary's
 /// `OnPhaseEnd` so the pyo3 bridge wires ONE callback shape.
-pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, TaskOutputs>) + Send>;
+pub type OnPhaseEnd =
+    Box<dyn FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, TaskOutputs>) + Send>;
 
 /// Configuration for the local manager.
 pub struct LocalManagerConfig {

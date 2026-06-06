@@ -208,8 +208,7 @@ impl<I: Identifier> PendingPool<I> {
     /// in-flight/blocked" (the starvation oracle) compose this with their
     /// own in-flight/blocked reads.
     pub fn has_queued_dispatchable(&self) -> bool {
-        let active: std::collections::HashSet<PhaseId> =
-            self.active_phases().into_iter().collect();
+        let active: std::collections::HashSet<PhaseId> = self.active_phases().into_iter().collect();
         self.buckets
             .iter()
             .any(|(key, bucket)| !bucket.items.is_empty() && active.contains(&key.0))

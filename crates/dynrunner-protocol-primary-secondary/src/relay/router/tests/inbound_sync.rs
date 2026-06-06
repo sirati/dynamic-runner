@@ -26,8 +26,10 @@ fn process_inbound_sync_delivers_relay_for_self_and_emits_redial() {
     let outcome = router.process_inbound_sync(inbound, clocks_at(now, 1.0));
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
-            assert!(matches!(&*msg, DistributedMessage::Keepalive {
-    target: None, .. }));
+            assert!(matches!(
+                &*msg,
+                DistributedMessage::Keepalive { target: None, .. }
+            ));
             assert_eq!(redial_target.as_deref(), Some("d"));
         }
         other => panic!("expected Deliver: {other:?}"),

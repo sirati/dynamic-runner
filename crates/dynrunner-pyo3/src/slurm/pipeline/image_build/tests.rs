@@ -70,8 +70,12 @@ log = SimpleNamespace(info=lambda *a, **k: None)
     PyModule::from_code(
         py,
         std::ffi::CString::new(source).unwrap().as_c_str(),
-        std::ffi::CString::new("stub_concurrent_build.py").unwrap().as_c_str(),
-        std::ffi::CString::new("stub_concurrent_build").unwrap().as_c_str(),
+        std::ffi::CString::new("stub_concurrent_build.py")
+            .unwrap()
+            .as_c_str(),
+        std::ffi::CString::new("stub_concurrent_build")
+            .unwrap()
+            .as_c_str(),
     )
     .expect("compile concurrent-build stub module")
 }
@@ -92,8 +96,12 @@ log = SimpleNamespace(info=lambda *a, **k: None)
     PyModule::from_code(
         py,
         std::ffi::CString::new(source).unwrap().as_c_str(),
-        std::ffi::CString::new("stub_failing_build.py").unwrap().as_c_str(),
-        std::ffi::CString::new("stub_failing_build").unwrap().as_c_str(),
+        std::ffi::CString::new("stub_failing_build.py")
+            .unwrap()
+            .as_c_str(),
+        std::ffi::CString::new("stub_failing_build")
+            .unwrap()
+            .as_c_str(),
     )
     .expect("compile failing-build stub module")
 }
@@ -105,8 +113,7 @@ fn build_overlaps_independent_work_instead_of_serializing_before_it() {
         let job_manager = module.getattr("job_manager").unwrap();
         let log = module.getattr("log").unwrap();
         let gate = module.getattr("gate").unwrap();
-        let events: Bound<'_, PyList> =
-            module.getattr("events").unwrap().cast_into().unwrap();
+        let events: Bound<'_, PyList> = module.getattr("events").unwrap().cast_into().unwrap();
         let project_root = py
             .import("pathlib")
             .unwrap()
@@ -137,11 +144,7 @@ fn build_overlaps_independent_work_instead_of_serializing_before_it() {
         // below reject that.
         let metadata = build.join(py).expect("build must succeed");
         let metadata = metadata.bind(py);
-        let remote_path: String = metadata
-            .getattr("remote_path")
-            .unwrap()
-            .extract()
-            .unwrap();
+        let remote_path: String = metadata.getattr("remote_path").unwrap().extract().unwrap();
         assert_eq!(remote_path, "/srv/img/app.tar.gz");
 
         let recorded: Vec<String> = events.extract().unwrap();
@@ -191,11 +194,7 @@ fn build_failure_propagates_through_join() {
             .call0()
             .unwrap();
 
-        let build = ImageBuild::spawn(
-            job_manager.unbind(),
-            project_root.unbind(),
-            log.unbind(),
-        );
+        let build = ImageBuild::spawn(job_manager.unbind(), project_root.unbind(), log.unbind());
         let err = build.join(py).expect_err("a failed build must propagate");
         let msg = err.to_string();
         assert!(

@@ -112,7 +112,11 @@ mod tests {
     /// foreign discriminants — the contract the slot's atomic relies on.
     #[test]
     fn u8_round_trip_total_over_roles() {
-        for role in [LocalRole::Primary, LocalRole::Secondary, LocalRole::Observer] {
+        for role in [
+            LocalRole::Primary,
+            LocalRole::Secondary,
+            LocalRole::Observer,
+        ] {
             assert_eq!(LocalRole::from_u8(role.as_u8()), Some(role));
         }
         assert_eq!(LocalRole::from_u8(3), None);

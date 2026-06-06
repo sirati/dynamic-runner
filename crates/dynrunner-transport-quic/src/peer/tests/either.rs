@@ -33,7 +33,10 @@ async fn no_peer_transport_never_receives() {
     assert!(PeerTransport::<TestId>::try_recv_peer(&mut noop).is_none());
     // No id is ever a member of the no-op overlay — `has_peer` is a
     // constant `false`, consistent with `peer_count == 0`.
-    assert!(!PeerTransport::<TestId>::has_peer(&noop, &PeerId::from("x")));
+    assert!(!PeerTransport::<TestId>::has_peer(
+        &noop,
+        &PeerId::from("x")
+    ));
     assert!(!PeerTransport::<TestId>::has_peer(
         &noop,
         &PeerId::from("anyone")
@@ -163,12 +166,11 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
     // contract (mirrors `primary_link.rs` for the `Real` arm), wire-free.
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-    let mut either: EitherPeerTransport<TestId> =
-        EitherPeerTransport::disabled_with_staged_primary(
-            "primary".to_string(),
-            outbound_tx,
-            incoming_rx,
-        );
+    let mut either: EitherPeerTransport<TestId> = EitherPeerTransport::disabled_with_staged_primary(
+        "primary".to_string(),
+        outbound_tx,
+        incoming_rx,
+    );
 
     // The primary is a reachable member; no other id is.
     assert!(PeerTransport::<TestId>::has_peer(
@@ -202,7 +204,10 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
         )
         .await
         .expect("send to the folded primary must succeed");
-    match outbound_rx.try_recv().expect("primary must receive the send") {
+    match outbound_rx
+        .try_recv()
+        .expect("primary must receive the send")
+    {
         DistributedMessage::Keepalive { active_workers, .. } => assert_eq!(active_workers, 7),
         _ => panic!("expected Keepalive"),
     }

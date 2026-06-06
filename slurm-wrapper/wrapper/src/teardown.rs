@@ -198,7 +198,10 @@ fn inspect_pid(podman: &str, layout: &Layout, name: &str, format: &str) -> Optio
 /// `false`, never blocking the kill(2) reap that follows.
 fn podman_stop(podman: &str, layout: &Layout, name: &str, grace_secs: u32) -> bool {
     let mut cmd = podman_base(podman, layout);
-    cmd.arg("stop").arg("-t").arg(grace_secs.to_string()).arg(name);
+    cmd.arg("stop")
+        .arg("-t")
+        .arg(grace_secs.to_string())
+        .arg(name);
     run_silent_bounded(cmd, STOP_BUDGET)
 }
 
