@@ -1151,6 +1151,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.hydrate_from_cluster_state();
         self.reconstruct_workers_from_cluster_state();
         self.reconstruct_secondaries_from_cluster_state();
+        // Promote-ONLY projection (this method is the promote-path's
+        // construction primitive; cold start never calls it — so the call
+        // site IS the discriminator, no runtime `if seeded` fork). A phase
+        // is "started" iff its rollup `has_any` (≥1 ledger entry), the same
+        // predicate that fired `on_phase_start` pre-failover; seeding this
+        // here keeps `phase_started_emitted` symmetric with the relocate
+        // path's `started_phases` threading so a promoted primary does NOT
+        // re-fire `on_phase_start` for an already-started phase. It does NOT
+        // live in the shared `hydrate_from_cluster_state` because the cold
+        // path's freshly-seeded CRDT is all-`Pending` (`has_any` would be
+        // prematurely true and suppress the legitimate first fire).
+        self.phase_started_emitted = self
+            .cluster_state
+            .phase_rollups()
+            .iter()
+            .filter(|(_, r)| r.has_any)
+            .map(|(p, _)| (*p).clone())
+            .collect();
     }
 
     /// Tear down the peer-lifecycle dispatcher task spawned at
@@ -1236,7 +1254,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     pub fn mint_secondary_id(&mut self) -> String {
         let n = self.next_secondary_id;
         self.next_secondary_id += 1;
-        format!("secondary-{}", n)
+        super::secondary_id::format_secondary_id(n)
     }
 
     /// Park the deployment-mode job manager on the coordinator so the
@@ -1668,6 +1686,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         local_worker_id: u32,
         task: TaskInfo<I>,
     ) {
+        // Mirror `commit_assignment`'s per-type slot reservation so the
+        // inherited InFlight task's eventual terminal release
+        // (`free_slot_on_terminal`'s `saturating_sub`) is symmetric. Without
+        // this the cap counter underflows-to-clamped-0 and the type cap
+        // desyncs (over-dispatch past `max_concurrent_per_type`) after
+        // promotion. Read the type id before the move; `reserve_type_slot`
+        // no-ops for uncapped types.
+        let type_id = task.type_id.clone();
         self.in_flight.insert(
             task_hash,
             InFlightEntry {
@@ -1677,6 +1703,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 task,
             },
         );
+        self.reserve_type_slot(&type_id);
     }
 
     /// THE single terminal-free helper. Given an inbound terminal's
@@ -2132,6 +2159,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     #[cfg(test)]
     pub fn in_flight_len_for_test(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Test-only inspector for the per-type concurrency counter
+    /// (`in_flight_per_type[type_id]`, 0 when never reserved). Lets the
+    /// failover tests assert that an inherited InFlight task's type slot
+    /// was reserved on hydrate so its terminal release stays symmetric.
+    #[cfg(test)]
+    pub fn in_flight_per_type_for_test(&self, type_id: &dynrunner_core::TypeId) -> u32 {
+        self.in_flight_per_type.get(type_id).copied().unwrap_or(0)
     }
 
     /// Test-only inspector: does the `(secondary_id, worker_id)` slot
