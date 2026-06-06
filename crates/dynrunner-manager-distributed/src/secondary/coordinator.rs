@@ -67,6 +67,9 @@ where
         // `SetupPending` re-entries keep the channel.
         let (command_tx, command_rx) =
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
+        // Snapshot the node-local run-config off the config before it moves
+        // into `this.config`. The responder reads this verbatim.
+        let forwarded_argv = config.forwarded_argv.clone();
         let mut this = Self {
             config,
             client,
@@ -119,6 +122,7 @@ where
             // post-`initialize_workers` — see the doc on the
             // `sampler` field for the runtime-context rationale.
             sampler: None,
+            forwarded_argv,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route

@@ -13,6 +13,7 @@ sequence directly.
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import unittest
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from dynamic_runner.worker import (
     run,
     task_function,
 )
+from dynamic_runner.worker import runtime as runtime_mod
 from dynamic_runner.worker.runtime import _REGISTRY, _encode_done_payload
 
 
@@ -674,6 +676,90 @@ class KeyedOutputsEndToEndTests(unittest.TestCase):
 
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].predecessor_outputs, {})
+
+
+class RunStartSweepTests(unittest.TestCase):
+    """The worker reaps stale ``.publish-tmp`` leftovers exactly once
+    at run-start, before processing any task.
+    """
+
+    def test_sweep_invoked_once_at_run_start(self):
+        _REGISTRY.default = None
+        with patch.object(runtime_mod, "_sweep_stale_publish_tmps") as sweep:
+            comm = ScriptedComm(inbox=[StopCommand()])
+            run(lambda task: None, comm=comm)
+        sweep.assert_called_once_with()
+
+    def test_helper_delegates_to_publish_sweep_with_dst_root(self):
+        # The helper resolves the destination root and reaps via the
+        # publish module's sweep. Patch the publish-module surface so
+        # no real dest dir / native call is needed.
+        with patch("dynamic_runner.worker.publish.dst_root",
+                   return_value="/some/dst") as droot, \
+             patch("dynamic_runner.worker.publish.sweep_stale_tmps",
+                   return_value=0) as sweep:
+            runtime_mod._sweep_stale_publish_tmps()
+        droot.assert_called_once_with()
+        sweep.assert_called_once_with("/some/dst")
+
+    def test_helper_swallows_sweep_failure(self):
+        # A sweep error at startup must not stop the worker.
+        with patch("dynamic_runner.worker.publish.dst_root",
+                   return_value="/some/dst"), \
+             patch("dynamic_runner.worker.publish.sweep_stale_tmps",
+                   side_effect=RuntimeError("boom")):
+            runtime_mod._sweep_stale_publish_tmps()  # must not raise
+
+
+class ExitSignalHandlerTests(unittest.TestCase):
+    """SIGTERM and SIGHUP are installed as SystemExit-raising handlers
+    for the duration of ``run()`` and restored on exit. SIGHUP is the
+    new strand: it must be handled (not hit the default
+    terminate-without-cleanup) so a publish-rename-deferred SIGHUP
+    delivered post-unblock falls into the loop's clean SystemExit
+    path.
+    """
+
+    def test_sighup_and_sigterm_installed_during_run_and_restored(self):
+        _REGISTRY.default = None
+        before = {
+            signal.SIGHUP: signal.getsignal(signal.SIGHUP),
+            signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+        }
+
+        installed: dict[int, object] = {}
+
+        def handle(task):
+            # Snapshot the live handlers while run() is mid-loop.
+            installed[signal.SIGHUP] = signal.getsignal(signal.SIGHUP)
+            installed[signal.SIGTERM] = signal.getsignal(signal.SIGTERM)
+            return None
+
+        comm = ScriptedComm(inbox=[_process(), StopCommand()])
+        run(handle, comm=comm)
+
+        # During the run, both signals carried the runtime's handler —
+        # a callable distinct from the prior disposition.
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            self.assertTrue(callable(installed[signum]))
+            self.assertIsNot(installed[signum], before[signum])
+
+        # After the run, both are restored to their prior disposition.
+        self.assertEqual(signal.getsignal(signal.SIGHUP), before[signal.SIGHUP])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before[signal.SIGTERM])
+
+    def test_installed_handler_raises_systemexit(self):
+        # The installed handler converts the signal into SystemExit so
+        # the loop's KeyboardInterrupt/SystemExit branch owns shutdown.
+        prev = runtime_mod._install_exit_signal_handlers()
+        try:
+            handler = signal.getsignal(signal.SIGHUP)
+            self.assertTrue(callable(handler))
+            with self.assertRaises(SystemExit):
+                handler(signal.SIGHUP, None)
+        finally:
+            for signum, p in prev.items():
+                signal.signal(signum, p)
 
 
 if __name__ == "__main__":

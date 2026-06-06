@@ -123,6 +123,52 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         .await;
     }
 
+    /// Answer a peer's `RequestRunConfig` from this primary's node-local
+    /// `forwarded_argv`.
+    ///
+    /// Single concern: the run-config-RPC responder on the primary side. It
+    /// is a PURE READ-ONLY responder — it reads `self.forwarded_argv` and
+    /// unicasts exactly ONE `RunConfig` back to the requester (its return
+    /// address rides `sender_id`, mirroring the snapshot responder's reply
+    /// edge). Unlike `handle_request_cluster_snapshot`, it does NOT
+    /// originate `PeerJoined`, does NOT send `SecondaryWelcome`, and never
+    /// touches roster / quorum / capacity / CRDT: the run-config is a
+    /// node-local launch constant, not lattice data, and answering for it
+    /// is read-only peer gossip, NOT primary authority (the work-split is
+    /// preserved). The SAME read-only responder lives on the secondary
+    /// router so a cold-start fetch is answerable before any primary
+    /// exists / promotes.
+    ///
+    /// A send failure is logged best-effort, exactly as the snapshot
+    /// responder treats its own; the requester's bounded recv wait falls
+    /// back to its own deadline.
+    pub(crate) async fn handle_request_run_config(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::RequestRunConfig {
+            target: None,
+            sender_id,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        let response = DistributedMessage::RunConfig {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            forwarded_argv: self.forwarded_argv.clone(),
+        };
+        if let Err(e) = self
+            .send_to(Destination::Secondary(PeerId::from(sender_id.clone())), response)
+            .await
+        {
+            tracing::warn!(
+                target = %sender_id,
+                error = %e,
+                "failed to deliver RunConfig response from primary"
+            );
+        }
+    }
+
     /// Anti-entropy receive: compare a peer's `StateDigest` against the
     /// primary's own and pull a snapshot iff the primary is somehow behind.
     ///

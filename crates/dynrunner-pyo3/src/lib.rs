@@ -40,6 +40,7 @@ use managers::observer_late_joiner::{PyObserverLateJoiner, run_observer_late_joi
 use managers::primary::PyPrimaryCoordinator;
 use managers::primary_handle::PyPrimaryHandle;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
+use managers::run_config_fetch::fetch_run_config;
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView};
@@ -94,6 +95,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_secondary, m)?)?;
     m.add_function(wrap_pyfunction!(run_distributed, m)?)?;
     m.add_function(wrap_pyfunction!(run_observer_late_joiner, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_run_config, m)?)?;
     m.add_function(wrap_pyfunction!(compute_task_hash, m)?)?;
     m.add_function(wrap_pyfunction!(parse_cores, m)?)?;
     m.add_function(wrap_pyfunction!(parse_memory, m)?)?;
@@ -103,6 +105,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(discovery::find_items, m)?)?;
     m.add("PublishError", m.py().get_type::<publish::PublishError>())?;
     m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
+    m.add_function(wrap_pyfunction!(publish::publish_all, m)?)?;
+    m.add_function(wrap_pyfunction!(publish::sweep_stale_tmps, m)?)?;
     m.add_function(wrap_pyfunction!(
         slurm::wrapper_script::generate_wrapper_script,
         m

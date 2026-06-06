@@ -67,6 +67,7 @@ fn arm_watchdog_no_peers(
         mem_manager_reserved_bytes: None,
         output_dir: None,
         memuse_log_path: None,
+        forwarded_argv: Vec::new(),
     };
     let mut secondary = make_secondary_channel(config, unified);
     secondary.set_bootstrap_primary_id("primary".to_string());
@@ -327,6 +328,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
                 memuse_log_path: None,
+                forwarded_argv: Vec::new(),
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -461,6 +463,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         mem_manager_reserved_bytes: None,
         output_dir: None,
         memuse_log_path: None,
+        forwarded_argv: Vec::new(),
     };
     let mut secondary = make_secondary_channel(config, unified);
     secondary.set_bootstrap_primary_id("primary".to_string());

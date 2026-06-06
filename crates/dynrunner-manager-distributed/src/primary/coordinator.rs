@@ -822,6 +822,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// dispatch tends to share secondaries with the OOM-bucket
     /// retries anyway).
     pub(super) single_worker_mode: bool,
+
+    /// The consumer's run configuration — the byte-identical token
+    /// sequence the framework forwards onto a joining / respawned /
+    /// promoted node's command line. A NODE-LOCAL launch constant
+    /// seeded from `config.forwarded_argv` at construction (mirroring
+    /// `next_secondary_id`); NOT replicated lattice data, so it never
+    /// touches `cluster_state`. The `RequestRunConfig` responder
+    /// (`task::mutation::handle_request_run_config`) reads it READ-ONLY
+    /// and unicasts it back to a requesting peer. Empty for a run with
+    /// no forwarded args.
+    pub(super) forwarded_argv: Vec<String>,
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -873,6 +884,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // already minted (`secondary-0..secondary-{num_secondaries - 1}`)
         // so the first respawn lands on `secondary-{num_secondaries}`.
         let next_secondary_id = config.num_secondaries;
+        // Snapshot the node-local run-config off the config before it
+        // moves into `this.config`, mirroring `next_secondary_id`. The
+        // responder reads this verbatim; it never re-reads `config`.
+        let forwarded_argv = config.forwarded_argv.clone();
         let mut this = Self {
             config,
             client,
@@ -937,6 +952,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             pending_run_abort: None,
             pending_invalid_dep_tasks: Vec::new(),
             single_worker_mode: false,
+            forwarded_argv,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -2989,19 +3005,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.stranded_count = total.saturating_sub(outcome.total_terminal());
         let stranded = self.stranded_count;
 
-        // Broadcast `RunComplete` so non-promoted secondaries on the
-        // peer mesh know the run is genuinely over and can exit. Without
-        // this, after a post-promotion handoff scenario, the local
+        // Terminal broadcast so non-promoted secondaries / the connected
+        // observer on the peer mesh know the run is over and can exit.
+        // Without this, after a post-promotion handoff scenario, the local
         // primary disconnects but peers can't tell whether the run
         // finished or the primary just crashed — they sit in failover
         // detection holding SLURM job slots indefinitely. Idempotent on
-        // re-application; failures here are non-fatal (the run already
-        // succeeded, this is a cleanup signal).
+        // re-application; failures here are non-fatal (this is a cleanup
+        // signal).
         //
-        // Issued whether or not stranded > 0: even on the cluster-
-        // collapse path, any peer still on the mesh deserves the same
-        // run-is-over signal so it can release its SLURM slot.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete])
+        // The variant is gated on the terminal fact: a routing collapse
+        // (`stranded > 0`) broadcasts `RunAborted { reason }`, a clean run
+        // broadcasts `RunComplete`. Both settle identically — same
+        // `apply_and_broadcast_cluster_mutations` pipeline + the
+        // `PRIMARY_BROADCAST_SETTLE` window below — and both are terminal
+        // for a straggler secondary (`RunAborted` → `SecondaryTerminal::
+        // Aborted`, `RunComplete` → done), so either way every peer still
+        // on the mesh releases its SLURM slot. The honest variant is what
+        // makes the strand reach the observer's important channel: the
+        // narrator projects `RunAborted` to "run aborted — …" on
+        // `IMPORTANT_TARGET` (a `RunComplete` would have narrated a false
+        // success over a collapsed cluster). The local `run()` return is
+        // unchanged — only the peer-facing broadcast becomes honest.
+        //
+        // `reason` reuses the `RunError::ClusterCollapsed` Display render
+        // (the per-class succeeded/fail_retry/fail_oom/fail_final/stranded
+        // breakdown); `outcome` is `Copy`, so the later `ClusterCollapsed`
+        // return is unaffected.
+        let terminal_mutation = if stranded > 0 {
+            ClusterMutation::RunAborted {
+                reason: RunError::ClusterCollapsed { stranded, outcome }.to_string(),
+            }
+        } else {
+            ClusterMutation::RunComplete
+        };
+        self.apply_and_broadcast_cluster_mutations(vec![terminal_mutation])
             .await;
 
         // Brief settle window so the broadcast lands on every

@@ -1529,3 +1529,116 @@ async fn peer_digests_pruned_on_peer_removed() {
         })
         .await;
 }
+
+/// #235 observer half (primitive): `emit_terminal_reason_important` lands
+/// exactly one event on the importance channel, carrying the terminal
+/// reason. This is the single emit site every exit arm (strand backstop,
+/// setup-deadline, fatal-policy, panik) routes through; the synchronous,
+/// yield-free drive (no `.await` between subscriber install and emit) makes
+/// the importance assertion immune to the cross-test per-callsite Interest
+/// cache poisoning — the documented requirement for `capture_important`.
+#[tokio::test(flavor = "current_thread")]
+async fn emit_terminal_reason_lands_on_important_channel() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+            let cs = ClusterState::<TestId>::new();
+            let (client, inbox, _pump) = observer_mesh(transport, "obs");
+            let observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+            let events = crate::test_capture::capture_important(|| {
+                observer.emit_terminal_reason_important("fleet-dead: every peer left");
+            });
+
+            assert_eq!(
+                events.len(),
+                1,
+                "exactly one important event per terminal emit: {events:?}"
+            );
+            assert!(
+                events[0].message.contains("run terminated")
+                    && events[0].message.contains("fleet-dead: every peer left"),
+                "the terminal reason must reach the important channel: {events:?}"
+            );
+        })
+        .await;
+}
+
+/// #235 observer half (end-to-end): the strand backstop arm, when it fires
+/// inside the real `run()` loop, emits the terminal reason on the importance
+/// channel — covering the fully-partitioned case where the observer can't
+/// receive the primary's `RunAborted` broadcast (so the narrator never
+/// projects an aborted summary). Drives the dead-fleet strand (the existing
+/// `observer_exits_on_dead_fleet` path) under a thread-local importance
+/// capture held across the await — the same `current_thread` single-thread
+/// capture idiom the failure-policy tests use.
+#[tokio::test(flavor = "current_thread")]
+async fn strand_arm_emits_terminal_reason_on_important_channel() {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct ImportantMessages(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ImportantMessages {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != dynrunner_core::IMPORTANT_TARGET {
+                return;
+            }
+            struct V(String);
+            impl tracing::field::Visit for V {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut v = V(String::new());
+            event.record(&mut v);
+            self.0.lock().unwrap().push(v.0);
+        }
+    }
+
+    let records: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber =
+        tracing_subscriber::Registry::default().with(ImportantMessages(Arc::clone(&records)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+                let cs = ClusterState::<TestId>::new();
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+                let mut observer =
+                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+                let err = observer
+                    .run()
+                    .await
+                    .expect_err("dead fleet with no RunComplete must exit Err");
+                assert!(
+                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
+                    "dead-fleet exit must surface a structured ClusterCollapsed strand: {err}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the dead-fleet observer must terminate, not hang");
+
+    let captured = records.lock().unwrap().clone();
+    assert!(
+        captured.iter().any(|m| m.contains("run terminated")),
+        "the strand backstop must emit the terminal reason on the importance \
+         channel (partitioned-observer backstop): {captured:?}"
+    );
+}

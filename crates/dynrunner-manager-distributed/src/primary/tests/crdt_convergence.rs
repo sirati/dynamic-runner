@@ -431,3 +431,148 @@ async fn primary_answers_request_cluster_snapshot() {
         })
         .await;
 }
+
+/// (d) The primary answers `RequestRunConfig` as a PURE responder: it
+/// unicasts exactly ONE `RunConfig` carrying its node-local
+/// `forwarded_argv` verbatim, and originates ZERO membership/authority
+/// frames (no `PeerJoined` / `ClusterMutation`, no `SecondaryWelcome`) —
+/// distinct from the snapshot responder above, which DOES originate a
+/// `PeerJoined`. The replicated ledger + the connection (quorum) table are
+/// left untouched: answering for the run-config is read-only peer gossip,
+/// NOT primary authority (the work-split is preserved).
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_request_run_config_purely() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // One existing secondary slot so the requester's unicast reply
+            // has somewhere to land. Keyed "sec-0" by setup_test; the
+            // request rides sender_id == "sec-0" so the reply re-keys onto it.
+            let (transport, mut ends) = setup_test(1);
+            let mut requester_inbox = ends.remove(0).1;
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seed the node-local run-config directly (production seeding
+            // from the pyo3 kwarg is B3; this test seeds the field itself).
+            let seeded = vec![
+                "--jobs".to_string(),
+                "8".to_string(),
+                "--log-oom-watcher".to_string(),
+            ];
+            primary.forwarded_argv = seeded.clone();
+
+            // Fingerprints BEFORE: a pure responder leaves the replicated
+            // ledger AND the quorum/connection table untouched.
+            let digest_before = primary.cluster_state_for_test().digest();
+            let quorum_before = primary.secondaries.len();
+
+            primary
+                .handle_request_run_config(DistributedMessage::RequestRunConfig {
+                    target: None,
+                    sender_id: "sec-0".into(),
+                    timestamp: 0.0,
+                })
+                .await;
+
+            settle_pump().await;
+
+            let mut run_configs: Vec<Vec<String>> = Vec::new();
+            let mut saw_cluster_mutation = false;
+            let mut saw_welcome = false;
+            while let Ok(msg) = requester_inbox.try_recv() {
+                match msg.msg_type() {
+                    MessageType::RunConfig => {
+                        if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                            run_configs.push(forwarded_argv);
+                        }
+                    }
+                    MessageType::ClusterMutation => saw_cluster_mutation = true,
+                    MessageType::SecondaryWelcome => saw_welcome = true,
+                    _ => {}
+                }
+            }
+
+            assert_eq!(
+                run_configs.len(),
+                1,
+                "primary must unicast exactly one RunConfig reply; got {run_configs:?}"
+            );
+            assert_eq!(
+                run_configs[0], seeded,
+                "the RunConfig must carry the seeded forwarded_argv token-for-token"
+            );
+            assert!(
+                !saw_cluster_mutation,
+                "pure responder must NOT originate any ClusterMutation (no PeerJoined)"
+            );
+            assert!(
+                !saw_welcome,
+                "pure responder must NOT send a SecondaryWelcome"
+            );
+
+            // Replicated ledger + quorum table unchanged.
+            assert_eq!(
+                primary.cluster_state_for_test().digest(),
+                digest_before,
+                "pure responder must NOT mutate the replicated ledger \
+                 (roster / capacity / CRDT convergence state)"
+            );
+            assert_eq!(
+                primary.secondaries.len(),
+                quorum_before,
+                "pure responder must NOT touch the connection (quorum) table"
+            );
+        })
+        .await;
+}
+
+/// (e) Empty pre-seed → empty argv (graceful): a primary that never had a
+/// run-config threaded in still answers, with an empty `forwarded_argv`.
+#[tokio::test(flavor = "current_thread")]
+async fn primary_answers_request_run_config_empty_preseed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let mut requester_inbox = ends.remove(0).1;
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // No seeding: forwarded_argv defaults empty.
+
+            primary
+                .handle_request_run_config(DistributedMessage::RequestRunConfig {
+                    target: None,
+                    sender_id: "sec-0".into(),
+                    timestamp: 0.0,
+                })
+                .await;
+            settle_pump().await;
+
+            let mut run_configs: Vec<Vec<String>> = Vec::new();
+            while let Ok(msg) = requester_inbox.try_recv() {
+                if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                    run_configs.push(forwarded_argv);
+                }
+            }
+            assert_eq!(
+                run_configs.len(),
+                1,
+                "primary must still answer with one RunConfig on empty pre-seed; got {run_configs:?}"
+            );
+            assert!(
+                run_configs[0].is_empty(),
+                "empty pre-seed must answer with an empty forwarded_argv; got {:?}",
+                run_configs[0]
+            );
+        })
+        .await;
+}
