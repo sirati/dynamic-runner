@@ -60,8 +60,10 @@ async fn send_to_primary_routes_over_registered_link() {
             let got = primary_rx
                 .try_recv()
                 .expect("the primary writer must have received the directed send");
-            assert!(matches!(got, DistributedMessage::Keepalive {
-    target: None, .. }));
+            assert!(matches!(
+                got,
+                DistributedMessage::Keepalive { target: None, .. }
+            ));
         })
         .await;
 }
@@ -96,13 +98,17 @@ async fn folded_primary_is_a_plain_mesh_peer() {
             // Both the real peer AND the folded primary receive the
             // broadcast — uniform fan-out, no role exclusion.
             assert!(
-                matches!(peer_rx.try_recv(), Ok(DistributedMessage::Keepalive {
-    target: None, .. })),
+                matches!(
+                    peer_rx.try_recv(),
+                    Ok(DistributedMessage::Keepalive { target: None, .. })
+                ),
                 "a real peer must receive the mesh broadcast",
             );
             assert!(
-                matches!(primary_rx.try_recv(), Ok(DistributedMessage::Keepalive {
-    target: None, .. })),
+                matches!(
+                    primary_rx.try_recv(),
+                    Ok(DistributedMessage::Keepalive { target: None, .. })
+                ),
                 "the folded primary receives the mesh broadcast like any other peer",
             );
         })

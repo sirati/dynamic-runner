@@ -149,7 +149,11 @@ async fn peer_count_reflects_live_membership_no_shadow() {
 
     // The pump publishes the live transport read; the client now sees it.
     mesh.publish_membership();
-    assert_eq!(client.peer_count(), 2, "client reads the live-published count");
+    assert_eq!(
+        client.peer_count(),
+        2,
+        "client reads the live-published count"
+    );
     assert!(client.has_peer(&PeerId::from("remote-1")));
     assert!(client.has_peer(&PeerId::from("remote-2")));
     assert!(!client.has_peer(&PeerId::from("absent")));

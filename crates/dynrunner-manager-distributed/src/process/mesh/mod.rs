@@ -30,7 +30,6 @@
 //! auto-die — `deliver_local` self-prunes a stale `Weak` (clarification
 //! BUG-2).
 
-
 mod egress;
 mod ingress;
 mod membership;
@@ -39,8 +38,8 @@ mod routing;
 use std::sync::{Arc, Weak};
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_protocol_primary_secondary::address::PeerId;
 use tokio::sync::mpsc;
 
 use super::membership::MembershipView;
@@ -123,7 +122,11 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             LocalRole::Secondary => self.secondary = Some(weak),
             LocalRole::Observer => self.observer = Some(weak),
         }
-        let client = MeshClient::new(role, self.local_dispatch_tx.clone(), self.membership.clone());
+        let client = MeshClient::new(
+            role,
+            self.local_dispatch_tx.clone(),
+            self.membership.clone(),
+        );
         let inbox = RoleInbox::new(inbound_rx);
         (slot, client, inbox)
     }
@@ -170,10 +173,14 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// slot runs on it. A secondary/observer `Destination` carrying the
     /// local host id is a loopback.
     fn is_local_host(&self, id: &PeerId) -> bool {
-        [LocalRole::Primary, LocalRole::Secondary, LocalRole::Observer]
-            .into_iter()
-            .filter_map(|r| self.slot_for(r))
-            .filter_map(|w| w.upgrade())
-            .any(|arc| arc.peer_id() == id)
+        [
+            LocalRole::Primary,
+            LocalRole::Secondary,
+            LocalRole::Observer,
+        ]
+        .into_iter()
+        .filter_map(|r| self.slot_for(r))
+        .filter_map(|w| w.upgrade())
+        .any(|arc| arc.peer_id() == id)
     }
 }

@@ -456,7 +456,10 @@ pub trait PeerTransport<I: Identifier> {
                         };
                     }
                     Ok(Some(DistributedMessage::ClusterSnapshot {
-    target: None, snapshot_json, .. })) => {
+                        target: None,
+                        snapshot_json,
+                        ..
+                    })) => {
                         snapshots.push(snapshot_json);
                         continue;
                     }

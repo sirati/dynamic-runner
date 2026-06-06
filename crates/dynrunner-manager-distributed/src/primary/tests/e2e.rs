@@ -55,7 +55,17 @@ async fn e2e_primary_and_secondary_single_node() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             let completed = primary.completed_count();
@@ -131,7 +141,17 @@ async fn e2e_primary_and_two_secondaries() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             let completed = primary.completed_count();
@@ -349,7 +369,17 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 .collect();
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             let primary_counts = primary.cluster_state_counts_for_test();
             assert_eq!(
@@ -483,7 +513,17 @@ async fn e2e_pre_staged_source_mode() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             let completed = primary.completed_count();
@@ -571,7 +611,17 @@ async fn e2e_uses_file_based_items_false() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             let completed = primary.completed_count();
@@ -661,7 +711,17 @@ async fn e2e_per_type_max_concurrent() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
-                primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap()
+                primary
+                    .run(
+                        SeedSource::ColdStart {
+                            binaries,
+                            phase_deps: deps,
+                        },
+                        ops,
+                        ope,
+                    )
+                    .await
+                    .unwrap()
             };
 
             let completed = primary.completed_count();
@@ -744,7 +804,17 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             let binaries = vec![make_relative_binary("missing/binary", 50)];
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             // Failure mode reached: 0 completed, 1 permanent failure.
             assert_eq!(
@@ -879,7 +949,17 @@ async fn run_with_initial_staging_succeeds() {
                 .expect("staging walk should succeed for a present, readable file");
 
             let (deps, ops, ope) = noop_phase_args();
-            primary.run(SeedSource::ColdStart { binaries, phase_deps: deps }, ops, ope).await.unwrap();
+            primary
+                .run(
+                    SeedSource::ColdStart {
+                        binaries,
+                        phase_deps: deps,
+                    },
+                    ops,
+                    ope,
+                )
+                .await
+                .unwrap();
 
             assert_eq!(
                 primary.completed_count(),

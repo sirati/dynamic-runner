@@ -198,7 +198,14 @@ where
             // advance.
             if let Some(tx) = &self.promotion_tx {
                 let snapshot = self.cluster_state.snapshot();
-                if tx.send(PromotionSignal { reason, epoch, snapshot }).is_err() {
+                if tx
+                    .send(PromotionSignal {
+                        reason,
+                        epoch,
+                        snapshot,
+                    })
+                    .is_err()
+                {
                     tracing::debug!(
                         secondary = %self.config.secondary_id,
                         epoch,

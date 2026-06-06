@@ -154,10 +154,12 @@ async fn relay_envelope_forwarded_through_submitter_to_target() {
     // delivers the trailing direct frame — so the FIRST yield is the
     // trailing frame, proving the relay was consumed not yielded.
     // Fully deterministic: no timer, both frames are already queued.
-    let got = transport.recv_peer().await.expect("trailing frame delivers");
+    let got = transport
+        .recv_peer()
+        .await
+        .expect("trailing frame delivers");
     assert!(
-        matches!(got, DistributedMessage::Keepalive {
-    target: None, .. }),
+        matches!(got, DistributedMessage::Keepalive { target: None, .. }),
         "first yielded frame must be the trailing direct keepalive, \
          not the forwarded relay: {got:?}"
     );
@@ -181,11 +183,13 @@ async fn relay_envelope_addressed_to_self_is_unwrapped() {
     let (mut transport, _sec_a_rx, _sec_b_rx, tap) = fixture();
     tap.send(relay_envelope("sec-A", "primary", keepalive("sec-A")))
         .unwrap();
-    let got = transport.recv_peer().await.expect("must deliver unwrapped inner");
+    let got = transport
+        .recv_peer()
+        .await
+        .expect("must deliver unwrapped inner");
     assert_eq!(got.sender_id(), "sec-A");
     assert!(
-        matches!(got, DistributedMessage::Keepalive {
-    target: None, .. }),
+        matches!(got, DistributedMessage::Keepalive { target: None, .. }),
         "delivered frame must be the unwrapped inner, not the Relay wrapper: {got:?}"
     );
 }

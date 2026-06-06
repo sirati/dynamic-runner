@@ -100,8 +100,13 @@ where
     let id = config.secondary_id.clone();
     let (_slot, client, inbox) =
         mesh.register_local_role(LocalRole::Secondary, PeerId::from(id.as_str()));
-    let mut secondary =
-        SecondaryCoordinator::new(config, client, inbox, ResourceStealingScheduler::memory(), FixedEstimator(100));
+    let mut secondary = SecondaryCoordinator::new(
+        config,
+        client,
+        inbox,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
     secondary.set_bootstrap_primary_id("primary".to_string());
 
     // Publish the live membership BEFORE the coordinator's first egress —
@@ -470,8 +475,10 @@ async fn unified_inbound_surfaces_cluster_mutation_via_recv_peer() {
                 .await
                 .expect("unified inbound must deliver");
             assert!(
-                matches!(via_peer, DistributedMessage::ClusterMutation {
-    target: None, .. }),
+                matches!(
+                    via_peer,
+                    DistributedMessage::ClusterMutation { target: None, .. }
+                ),
                 "recv_peer must surface the mutation: {via_peer:?}"
             );
 

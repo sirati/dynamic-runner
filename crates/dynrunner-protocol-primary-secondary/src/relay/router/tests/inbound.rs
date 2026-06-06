@@ -73,8 +73,10 @@ fn process_inbound_relay_for_self_emits_redial() {
     let outcome = router.process_inbound(inbound, &mut conns, clocks_at(now, 1.0));
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
-            assert!(matches!(&*msg, DistributedMessage::Keepalive {
-    target: None, .. }));
+            assert!(matches!(
+                &*msg,
+                DistributedMessage::Keepalive { target: None, .. }
+            ));
             assert_eq!(redial_target.as_deref(), Some("d"));
         }
         other => panic!("expected Deliver with redial target d: {other:?}"),
@@ -206,8 +208,10 @@ fn process_inbound_backoff_retries_via_next_candidate() {
     let entries = log.borrow();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].addressee, "c", "retry went to next candidate");
-    assert!(matches!(entries[0].msg, DistributedMessage::Relay {
-    target: None, .. }));
+    assert!(matches!(
+        entries[0].msg,
+        DistributedMessage::Relay { target: None, .. }
+    ));
     // Failed_via b is now blacklisted for target d.
     assert!(
         router
@@ -313,8 +317,10 @@ fn process_inbound_non_routing_delivers() {
         router.process_inbound(keepalive("b"), &mut conns, clocks_at(Instant::now(), 1.0));
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
-            assert!(matches!(&*msg, DistributedMessage::Keepalive {
-    target: None, .. }));
+            assert!(matches!(
+                &*msg,
+                DistributedMessage::Keepalive { target: None, .. }
+            ));
             assert!(redial_target.is_none());
         }
         other => panic!("expected Deliver: {other:?}"),

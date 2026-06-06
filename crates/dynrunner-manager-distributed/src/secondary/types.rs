@@ -40,9 +40,8 @@ use dynrunner_core::{Identifier, TaskInfo};
 /// principle (the fire-once latch makes it once in practice); the boxed
 /// future need not be `Send` — it is awaited on the secondary's own
 /// `!Send` task.
-pub type SetupDiscoveryFn<I> = Box<
-    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<I>>, String>>>>,
->;
+pub type SetupDiscoveryFn<I> =
+    Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<I>>, String>>>>>;
 
 /// The consumer's setup-discovery policy plus the phase-dependency graph
 /// the secondary feeds alongside the discovered binaries into
@@ -57,7 +56,8 @@ pub struct SetupDiscovery<I: Identifier> {
     /// consumer resolves this from its `TaskDefinition.get_phases()` once at
     /// construction; the per-yield discovery only resolves the per-task
     /// list.
-    pub phase_deps: std::collections::HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+    pub phase_deps:
+        std::collections::HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
 }
 
 /// Per-run control signal reported by

@@ -127,8 +127,7 @@ where
             // self arm). Anything else means the Router or accept
             // loop misrouted.
             assert!(
-                matches!(msg, DistributedMessage::Keepalive {
-    target: None, .. }),
+                matches!(msg, DistributedMessage::Keepalive { target: None, .. }),
                 "unexpected delivered variant on peer-b: {msg:?}"
             );
             received += 1;

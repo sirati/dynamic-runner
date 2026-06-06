@@ -325,11 +325,7 @@ async fn cross_phase_same_task_id_both_run_local() {
                 .await
                 .expect("cross-phase same task_id must NOT be a duplicate");
 
-            assert_eq!(
-                manager.stats().completed,
-                2,
-                "both cross-phase tasks ran"
-            );
+            assert_eq!(manager.stats().completed, 2, "both cross-phase tasks ran");
             assert!(
                 manager.failed_tasks().is_empty(),
                 "no false invalid/duplicate rejection"

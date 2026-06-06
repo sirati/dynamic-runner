@@ -158,10 +158,7 @@ mod tests {
         Python::attach(|_py| {
             let root = tempfile::tempdir().unwrap();
             let missing = root.path().join("does-not-exist");
-            assert_eq!(
-                sweep_stale_tmps(missing).expect("missing dir is ok"),
-                0
-            );
+            assert_eq!(sweep_stale_tmps(missing).expect("missing dir is ok"), 0);
         });
     }
 }

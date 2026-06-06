@@ -218,7 +218,8 @@ mod tests {
         let result = decode_bootstrap_snapshots(&["{not valid json".to_string()]);
         let err = result.expect_err("a malformed bootstrap snapshot must hard-fail");
         assert!(
-            err.to_string().contains("failed to decode ClusterStateSnapshot"),
+            err.to_string()
+                .contains("failed to decode ClusterStateSnapshot"),
             "the bootstrap-fatal error must name the decode failure: {err}"
         );
     }

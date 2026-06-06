@@ -152,7 +152,12 @@ mod tests {
     #[test]
     fn fast_command_nonzero_exit() {
         let mut cmd = Command::new("false");
-        let out = run_bounded(cmd_silence(&mut cmd), Duration::from_secs(5), &RealClock, false);
+        let out = run_bounded(
+            cmd_silence(&mut cmd),
+            Duration::from_secs(5),
+            &RealClock,
+            false,
+        );
         assert_eq!(
             out,
             BoundedOutcome::Exited {

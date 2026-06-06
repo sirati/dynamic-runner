@@ -50,7 +50,13 @@ fn state_variants() -> Vec<(&'static str, TaskState<RunnerIdentifier>)> {
                 on: "p".into(),
             },
         ),
-        ("completed", TaskState::Completed { task: t(), attempt: 0 }),
+        (
+            "completed",
+            TaskState::Completed {
+                task: t(),
+                attempt: 0,
+            },
+        ),
         (
             "failed",
             TaskState::Failed {
@@ -158,7 +164,10 @@ fn dominance_is_strict_and_antisymmetric() {
 #[test]
 fn completed_vs_invalidtask_invalidtask_wins() {
     // Merge-level: both orders → InvalidTask.
-    let completed = TaskState::Completed { task: mk_task("x"), attempt: 0 };
+    let completed = TaskState::Completed {
+        task: mk_task("x"),
+        attempt: 0,
+    };
     let invalid = TaskState::InvalidTask {
         attempt: 0,
         task: mk_task("x"),
@@ -234,7 +243,10 @@ fn completed_vs_invalidtask_invalidtask_wins() {
 /// failure-likes; InvalidTask dominates Completed).
 #[test]
 fn terminal_total_order_holds() {
-    let completed = TaskState::Completed { task: mk_task("x"), attempt: 0 };
+    let completed = TaskState::Completed {
+        task: mk_task("x"),
+        attempt: 0,
+    };
     let failed = TaskState::Failed {
         attempt: 0,
         task: mk_task("x"),
@@ -910,7 +922,10 @@ fn post_promotion_demoted_and_promoted_outcome_counts_converge() {
     let observer_pre = observer.outcome_counts();
     // The promoted primary has the real count: 4 succeeded (c1, c2, d1, d2),
     // 1 genuine fail_final (f1 NonRecoverable).
-    assert_eq!(primary_pre.succeeded, 4, "promoted primary holds the real N");
+    assert_eq!(
+        primary_pre.succeeded, 4,
+        "promoted primary holds the real N"
+    );
     // The demoted observer UNDERCOUNTS succeeded (the asm-tokenizer
     // "succeeded too low / stranded=N" symptom): only c1, c2 succeeded on
     // its ledger; d1, d2 are mis-accounted as failures.

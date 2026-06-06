@@ -9,8 +9,8 @@
 //! transport read — never a shadow counter (the SETTLED no-shadow rule).
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::PeerTransport;
+use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use super::Mesh;
 

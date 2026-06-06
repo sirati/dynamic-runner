@@ -1082,7 +1082,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// the node is already winding down. Must be called pre-`run`, alongside
     /// the other registration setters; the `Node` registers it the moment it
     /// builds the primary (bootstrap submitter OR promotion).
-    pub fn register_demote_on_displaced(&mut self, demote_tx: tokio::sync::mpsc::UnboundedSender<()>) {
+    pub fn register_demote_on_displaced(
+        &mut self,
+        demote_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
         use dynrunner_protocol_primary_secondary::RoleChangeHookRegistrar;
         let own_id = self.config.node_id.clone();
         self.cluster_state.register_role_change_hook(Box::new(
@@ -2293,9 +2296,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             node = %self.config.node_id
         );
         async {
-            let result = self
-                .run_pipeline(seed, on_phase_start, on_phase_end)
-                .await;
+            let result = self.run_pipeline(seed, on_phase_start, on_phase_end).await;
             // Cleanup BOTH dispatchers on every exit (Ok or Err). The two
             // dispatchers own independent channels + listener vectors; both
             // run from spawn-at-`run()`-start to abort-at-`run()`-exit and
@@ -2362,8 +2363,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // after it returns we can move `self` by value (the pipeline
             // future no longer borrows it) on the relocate branch.
             let demoted = {
-                let pipeline =
-                    self.run_pipeline(seed, on_phase_start, on_phase_end);
+                let pipeline = self.run_pipeline(seed, on_phase_start, on_phase_end);
                 tokio::pin!(pipeline);
                 tokio::select! {
                     result = &mut pipeline => {
@@ -3387,9 +3387,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // shaped — a fail → reinject → succeed task contributed to
                 // BOTH — so `on_phase_end` reports the same event numbers a
                 // promoted primary would, not a terminal projection.
-                let completed = self
-                    .cluster_state
-                    .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Completed));
+                let completed = self.cluster_state.phase_event_tally_for(&(
+                    p.clone(),
+                    crate::cluster_state::PhaseTally::Completed,
+                ));
                 let failed = self
                     .cluster_state
                     .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Failed));
@@ -3517,7 +3518,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // EVENT-shaped — a fail → reinject → succeed task increments BOTH
         // Failed and Completed — so this counts terminal OBSERVATIONS, not a
         // terminal-state projection.
-        let key = (phase_id.clone(), crate::cluster_state::PhaseTally::Completed);
+        let key = (
+            phase_id.clone(),
+            crate::cluster_state::PhaseTally::Completed,
+        );
         let new_count = self.cluster_state.phase_event_tally_for(&key) + 1;
         self.cluster_state.record_phase_event_tally(key, new_count);
         self.pool_mut().on_item_finished(phase_id, task_id);

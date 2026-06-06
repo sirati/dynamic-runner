@@ -112,9 +112,7 @@ pub(crate) fn drive_fetch_run_config(
                 .fetch_run_config(&secondary_id, unconfigured_deadline)
                 .await
                 .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "fetch_run_config: {e}"
-                    ))
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("fetch_run_config: {e}"))
                 })?;
 
             Ok(argv)

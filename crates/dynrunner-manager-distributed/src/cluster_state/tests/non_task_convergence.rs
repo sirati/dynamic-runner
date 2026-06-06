@@ -9,8 +9,8 @@
 //! partition-reconcile phase-deps merge, and the capability lattice's
 //! snapshot-healable convergence across a failover.
 
-use super::*;
 use super::super::CapabilityEntry;
+use super::*;
 
 // ── CRD-2 / D-P: current_primary equal-epoch register ──
 

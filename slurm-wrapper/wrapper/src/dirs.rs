@@ -265,7 +265,11 @@ mod tests {
         // The host and container paths share the SAME basename — the
         // load-bearing property that makes the bind-mount mirror work.
         assert_eq!(
-            l.reaper_panik_host_path().file_name().unwrap().to_str().unwrap(),
+            l.reaper_panik_host_path()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
             reaper_panik_container_path().rsplit('/').next().unwrap(),
         );
     }

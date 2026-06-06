@@ -158,7 +158,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             forwarded_argv: self.forwarded_argv.clone(),
         };
         if let Err(e) = self
-            .send_to(Destination::Secondary(PeerId::from(sender_id.clone())), response)
+            .send_to(
+                Destination::Secondary(PeerId::from(sender_id.clone())),
+                response,
+            )
             .await
         {
             tracing::warn!(

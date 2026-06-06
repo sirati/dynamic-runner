@@ -177,8 +177,7 @@ fn observer_mesh(
             // (the single local role in these tests). A closed wire latches
             // `wire_open = false` so we stop polling it.
             if wire_open
-                && let Ok(maybe) =
-                    tokio::time::timeout(Duration::ZERO, mesh.recv_peer()).await
+                && let Ok(maybe) = tokio::time::timeout(Duration::ZERO, mesh.recv_peer()).await
             {
                 match maybe {
                     Some(frame) => {
@@ -217,7 +216,10 @@ async fn observer_returns_on_run_complete() {
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
             let terminal = observer.run().await.expect("Ok on run_complete");
-            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+            assert!(
+                matches!(terminal, ObserverTerminal::Done),
+                "got {terminal:?}"
+            );
         })
         .await;
 }
@@ -357,7 +359,10 @@ async fn observer_narrates_phases_and_one_completion_summary() {
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
             let terminal = observer.run().await.expect("Ok on run_complete");
-            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+            assert!(
+                matches!(terminal, ObserverTerminal::Done),
+                "got {terminal:?}"
+            );
 
             // Re-derive the observer's narration synchronously over its
             // converged ledger, capturing through the narrator's own emit
@@ -392,7 +397,11 @@ async fn observer_narrates_phases_and_one_completion_summary() {
                 .iter()
                 .filter(|e| e.message.contains("run complete"))
                 .collect();
-            assert_eq!(summary.len(), 1, "exactly one completion summary: {events:?}");
+            assert_eq!(
+                summary.len(),
+                1,
+                "exactly one completion summary: {events:?}"
+            );
             assert_eq!(
                 summary[0].fields.get("succeeded").map(String::as_str),
                 Some("2")
@@ -474,7 +483,10 @@ async fn observer_rides_through_failover_and_exits_on_run_complete() {
                     .run()
                     .await
                     .expect("a legitimate failover must NOT trip the silence backstop");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 assert_eq!(
                     observer.cluster_state().current_primary(),
                     Some("sec-1"),
@@ -538,14 +550,18 @@ async fn observer_recovers_from_snapshot_reply() {
 
                 let (client, inbox, pump) = observer_mesh(transport, "obs");
                 tokio::task::spawn_local(pump);
-                let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+                let mut observer =
+                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
                 assert_eq!(
                     observer.cluster_state().outcome_counts().succeeded,
                     0,
                     "pre-recovery the observer's ledger is empty"
                 );
                 let terminal = observer.run().await.expect("Ok after recovery");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 assert_eq!(
                     observer.cluster_state().outcome_counts().succeeded,
                     2,
@@ -568,7 +584,8 @@ async fn observer_no_reply_still_terminates_via_deadline() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+                let (inbound_tx, inbound_rx) =
+                    mpsc::unbounded_channel::<DistributedMessage<TestId>>();
                 let (to_primary_tx, _to_primary_rx) = mpsc::unbounded_channel();
                 let mut outgoing = HashMap::new();
                 outgoing.insert("promoted-sec".to_string(), to_primary_tx);
@@ -632,10 +649,16 @@ async fn observer_run_aborted_exits_non_zero() {
             let (client, inbox, pump) = observer_mesh(transport, "obs");
             tokio::task::spawn_local(pump);
             let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
-            let terminal = observer.run().await.expect("aborted is a terminal, not an Err");
+            let terminal = observer
+                .run()
+                .await
+                .expect("aborted is a terminal, not an Err");
             match terminal {
                 ObserverTerminal::Aborted { reason } => {
-                    assert!(reason.contains("duplicate"), "carries the abort reason: {reason}");
+                    assert!(
+                        reason.contains("duplicate"),
+                        "carries the abort reason: {reason}"
+                    );
                 }
                 other => panic!("aborted must win over complete: got {other:?}"),
             }
@@ -680,7 +703,10 @@ async fn observer_panik_arm_returns_panik_terminal() {
                     std::fs::write(&panik_path, b"stop").unwrap();
                 });
 
-                let terminal = observer.run().await.expect("panik is a terminal, not an Err");
+                let terminal = observer
+                    .run()
+                    .await
+                    .expect("panik is a terminal, not an Err");
                 match terminal {
                     ObserverTerminal::Panik { matched_path } => {
                         assert!(
@@ -784,7 +810,10 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
                     .run()
                     .await
                     .expect("the restore-driven re-point must refresh the clock, not strand");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 assert_eq!(
                     observer.cluster_state().current_primary(),
                     Some("promoted-sec"),
@@ -870,7 +899,10 @@ async fn observer_setup_deadline_uses_live_setup_pending() {
                     .run()
                     .await
                     .expect("a seeded ledger must make the deadline arm inert (live gate)");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 assert!(
                     observer.setup_deadline_elapsed().is_none(),
                     "the deadline must NOT have fired"
@@ -986,13 +1018,23 @@ async fn from_handoff_resumes_moved_in_state_and_exits_on_run_complete() {
             tokio::task::spawn_local(rig.pump);
             let mut observer = ObserverCoordinator::from_handoff(rig.handoff);
 
-            let terminal = observer.run().await.expect("Ok on the moved-in run_complete");
-            assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+            let terminal = observer
+                .run()
+                .await
+                .expect("Ok on the moved-in run_complete");
+            assert!(
+                matches!(terminal, ObserverTerminal::Done),
+                "got {terminal:?}"
+            );
 
             // Post-run accounting is re-sourced from the observer's moved-in
             // (converged) ledger — the surface the relocated `PrimaryRunOutcome`
             // reads after the submitter binding is consumed.
-            assert_eq!(observer.completed_count(), 2, "completions off the moved-in ledger");
+            assert_eq!(
+                observer.completed_count(),
+                2,
+                "completions off the moved-in ledger"
+            );
             assert_eq!(observer.failed_count(), 0);
             assert_eq!(observer.stranded_count(), 0, "an observer strands nothing");
         })
@@ -1051,9 +1093,16 @@ async fn from_handoff_fresh_sender_supersedes_inherited_dispatcher() {
                 });
 
                 let terminal = observer.run().await.expect("Ok on RunComplete");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 // The completion was observed on the FRESH ledger.
-                assert_eq!(observer.completed_count(), 1, "completion applied via fresh sender");
+                assert_eq!(
+                    observer.completed_count(),
+                    1,
+                    "completion applied via fresh sender"
+                );
                 // The INHERITED dispatcher received NOTHING after the swap —
                 // its sender was replaced by the fresh one in from_handoff.
                 assert_eq!(
@@ -1191,7 +1240,10 @@ async fn cold_join_announces_initial_holdings_after_restore() {
                     .run()
                     .await
                     .expect("Ok after the announce + RunComplete");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
             })
             .await;
     })
@@ -1319,8 +1371,8 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     // no third pull and the test hangs to its 5s timeout.
                     let mut non_timer_pulls_left = 2u8;
                     while let Some(frame) = to_primary_rx.recv().await {
-                        if let DistributedMessage::RequestClusterSnapshot {
-    target: _, .. } = frame {
+                        if let DistributedMessage::RequestClusterSnapshot { target: _, .. } = frame
+                        {
                             let reply = if non_timer_pulls_left > 0 {
                                 non_timer_pulls_left -= 1;
                                 "{ this is not valid snapshot json".to_string()
@@ -1344,7 +1396,10 @@ async fn warn_dropped_decode_is_repulled_and_converges_via_recovery() {
                     .run()
                     .await
                     .expect("a WARN-dropped decode must NOT strand; recovery re-pulls + heals");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 assert_eq!(
                     observer.cluster_state().outcome_counts().succeeded,
                     1,
@@ -1438,9 +1493,10 @@ async fn recovery_cadence_quiesces_when_converged() {
                     let count_task = tokio::task::spawn_local(async move {
                         while let Some(frame) = to_primary_rx.recv().await {
                             if let DistributedMessage::RequestClusterSnapshot {
-    target: _, .. } = frame {
-                                recovery_requests_drv
-                                    .set(recovery_requests_drv.get() + 1);
+                                target: _, ..
+                            } = frame
+                            {
+                                recovery_requests_drv.set(recovery_requests_drv.get() + 1);
                             }
                         }
                     });
@@ -1463,7 +1519,10 @@ async fn recovery_cadence_quiesces_when_converged() {
                 });
 
                 let terminal = observer.run().await.expect("Ok on RunComplete");
-                assert!(matches!(terminal, ObserverTerminal::Done), "got {terminal:?}");
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
                 // The ONLY snapshot request is the at-entry bootstrap one;
                 // the converged recovery cadence emitted ZERO re-pulls.
                 assert!(

@@ -45,7 +45,9 @@ where
 {
     let builder = promote.as_mut()?;
     // Register the Primary slot + mint its trio through the pump.
-    let (slot, client, inbox) = control.register(LocalRole::Primary, own_peer_id.clone()).await?;
+    let (slot, client, inbox) = control
+        .register(LocalRole::Primary, own_peer_id.clone())
+        .await?;
 
     // BUG-6 demote channel: the node owns `demote_tx` (fed by the role-change
     // hook), the promoted primary owns `demote_rx` (its `run_consuming`

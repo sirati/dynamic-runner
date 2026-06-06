@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn publish_replaces_not_accumulates() {
         let view = MembershipView::new();
-        view.publish(3, vec![PeerId::from("a"), PeerId::from("b"), PeerId::from("c")]);
+        view.publish(
+            3,
+            vec![PeerId::from("a"), PeerId::from("b"), PeerId::from("c")],
+        );
         assert_eq!(view.peer_count(), 3);
 
         // Peer "b" left; the mesh re-reads the live transport (count 2,
@@ -144,7 +147,10 @@ mod tests {
         view.publish(2, vec![PeerId::from("a"), PeerId::from("c")]);
         assert_eq!(view.peer_count(), 2);
         assert!(view.has_peer(&PeerId::from("a")));
-        assert!(!view.has_peer(&PeerId::from("b")), "departed peer is gone, not decremented");
+        assert!(
+            !view.has_peer(&PeerId::from("b")),
+            "departed peer is gone, not decremented"
+        );
         assert!(view.has_peer(&PeerId::from("c")));
     }
 }

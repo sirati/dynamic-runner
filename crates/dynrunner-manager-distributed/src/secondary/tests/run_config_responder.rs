@@ -48,9 +48,7 @@ fn operational_secondary_with_argv(
 
 /// Pull every `RunConfig` frame's `forwarded_argv` out of the recorded
 /// peer-bus traffic (the unicast reply lands here via `send_to_peer`).
-fn run_config_argvs(
-    log: &Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
-) -> Vec<Vec<String>> {
+fn run_config_argvs(log: &Rc<RefCell<Vec<DistributedMessage<TestId>>>>) -> Vec<Vec<String>> {
     log.borrow()
         .iter()
         .filter_map(|msg| match msg {
@@ -82,8 +80,7 @@ async fn run_config_responder_is_pure_and_round_trips_argv() {
                 "8".to_string(),
                 "--log-oom-watcher".to_string(),
             ];
-            let (mut sec, log) =
-                operational_secondary_with_argv("responder", seeded.clone());
+            let (mut sec, log) = operational_secondary_with_argv("responder", seeded.clone());
 
             // Capture the replicated-state fingerprint + the role-table
             // projection BEFORE the request: a pure responder leaves both

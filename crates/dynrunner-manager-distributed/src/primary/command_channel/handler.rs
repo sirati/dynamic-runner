@@ -401,8 +401,7 @@ where
         // `tasks`, so the run-level loud-fail backstop below can name the
         // rejected identities. The validator's `errors` carry the index
         // into THIS vec, so the index resolves a `task_id` here.
-        let task_ids_by_index: Vec<String> =
-            tasks.iter().map(|t| t.task_id.clone()).collect();
+        let task_ids_by_index: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
         // Shared validator: pure read against `cluster_state` —
         // mirrored on the promoted-secondary path
         // (`SecondaryCoordinator::apply_spawn_tasks`) AND on the local

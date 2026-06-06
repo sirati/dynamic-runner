@@ -400,7 +400,10 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 "Node::run primary outcome: {:?}",
                 outcome.terminal
             );
-            assert_eq!(outcome.completed, 3, "all 3 tasks complete through Node::run");
+            assert_eq!(
+                outcome.completed, 3,
+                "all 3 tasks complete through Node::run"
+            );
             assert_eq!(outcome.failed, 0);
 
             // The compute node winds down once the wire closes.

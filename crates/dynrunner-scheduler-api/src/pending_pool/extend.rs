@@ -99,8 +99,8 @@ impl<I: Identifier> PendingPool<I> {
         for item in &new_items {
             for dep in &item.task_depends_on {
                 let dep_key = (dep.phase_id.clone(), dep.task_id.clone());
-                let resolves =
-                    known_full.contains(&dep_key) || known_ids_phaseless.contains(dep.task_id.as_str());
+                let resolves = known_full.contains(&dep_key)
+                    || known_ids_phaseless.contains(dep.task_id.as_str());
                 if !resolves {
                     return Err(PendingPoolError::UnknownTaskDep {
                         task: dep.task_id.clone(),

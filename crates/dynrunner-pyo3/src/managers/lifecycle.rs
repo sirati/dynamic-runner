@@ -437,7 +437,10 @@ mod tests {
             "dependency_graph_pkl".to_string(),
             dynrunner_core::ResultValue::Inline("BASE64PICKLE".to_string()),
         );
-        outputs.insert("dependency_graph".to_string(), dynrunner_core::TaskOutputs(m));
+        outputs.insert(
+            "dependency_graph".to_string(),
+            dynrunner_core::TaskOutputs(m),
+        );
 
         let mut cb = make_on_phase_end(task_obj);
         cb(&PhaseId::from("dependency_graph"), 1, 0, &outputs);

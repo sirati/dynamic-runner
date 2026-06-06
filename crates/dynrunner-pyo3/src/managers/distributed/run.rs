@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::process::{
-    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, SeedSource, RunTerminal,
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
@@ -347,14 +347,13 @@ impl PyDistributedManager {
                         // `"primary"` (no per-role uplink leg). Inbound is
                         // the primary→secondary channel; the outbound
                         // primary link is the secondary→primary channel.
-                        let transport = transport_factory::inprocess_secondary_mesh::<
-                            RunnerIdentifier,
-                        >(
-                            secondary_id.clone(),
-                            "primary".to_string(),
-                            pri_to_sec_rx,
-                            sec_to_pri_tx,
-                        );
+                        let transport =
+                            transport_factory::inprocess_secondary_mesh::<RunnerIdentifier>(
+                                secondary_id.clone(),
+                                "primary".to_string(),
+                                pri_to_sec_rx,
+                                sec_to_pri_tx,
+                            );
                         // The local-slot peer-id for the secondary's `Node`
                         // mesh registration (the same logical id the channel
                         // mesh keys this secondary under).
@@ -474,8 +473,10 @@ impl PyDistributedManager {
                         // minting the coordinator's `(client, inbox)` ends + the
                         // `Arc<RoleSlot>` the per-secondary `Node` holds.
                         let mut sec_mesh = Mesh::new(transport);
-                        let (sec_slot, sec_client, sec_inbox) = sec_mesh
-                            .register_local_role(LocalRole::Secondary, PeerId::from(sec_id_for_slot.as_str()));
+                        let (sec_slot, sec_client, sec_inbox) = sec_mesh.register_local_role(
+                            LocalRole::Secondary,
+                            PeerId::from(sec_id_for_slot.as_str()),
+                        );
 
                         let mut secondary: SecondaryCoordinator<_, _, _, RunnerIdentifier> =
                             SecondaryCoordinator::new(
@@ -663,8 +664,7 @@ impl PyDistributedManager {
                 let mut pri_mesh = Mesh::new(peer_transport);
                 let (pri_slot, pri_client, pri_inbox) =
                     pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
-                let (_pri_demote_tx, pri_demote_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<()>();
+                let (_pri_demote_tx, pri_demote_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
                 let mut primary = PrimaryCoordinator::new(
                     config,

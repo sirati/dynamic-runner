@@ -408,7 +408,11 @@ mod tests {
                 .await;
                 let elapsed = start.elapsed();
 
-                assert!(result.is_ok(), "wait_for_socket errored: {:?}", result.err());
+                assert!(
+                    result.is_ok(),
+                    "wait_for_socket errored: {:?}",
+                    result.err()
+                );
                 assert!(
                     elapsed >= std::time::Duration::from_millis(250),
                     "returned before the file could have appeared: {:?}",
@@ -473,8 +477,15 @@ mod tests {
         let manager = NamedSocketManagerEnd::bind(&requested).unwrap();
         let bound = manager.socket_path().to_owned();
 
-        assert_ne!(bound, requested, "bind must not use the requested path verbatim");
-        assert_eq!(bound.parent(), requested.parent(), "must stay in the requested dir");
+        assert_ne!(
+            bound, requested,
+            "bind must not use the requested path verbatim"
+        );
+        assert_eq!(
+            bound.parent(),
+            requested.parent(),
+            "must stay in the requested dir"
+        );
         assert_eq!(
             bound.extension().and_then(|e| e.to_str()),
             Some("sock"),

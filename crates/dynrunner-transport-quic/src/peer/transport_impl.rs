@@ -53,8 +53,10 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // prune cannot delete a freshly-reconnected entry whose channel
         // differs from the dead one. We capture the dead `tx` (not just
         // the id) precisely for that `same_channel` check.
-        let mut dead: Vec<(String, tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>)> =
-            Vec::new();
+        let mut dead: Vec<(
+            String,
+            tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>,
+        )> = Vec::new();
         for (peer_id, tx) in &self.connections {
             if tx.send(msg.clone()).is_err() {
                 dead.push((peer_id.clone(), tx.clone()));

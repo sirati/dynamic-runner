@@ -189,8 +189,13 @@ impl<I: Identifier> PeerNetwork<I> {
             let new_conn_tx = new_conn_tx.clone();
             let disconnect_tx = disconnect_tx.clone();
             tokio::task::spawn_local(async move {
-                accept::quic_accept_loop::<I>(quic_listener, incoming_tx, new_conn_tx, disconnect_tx)
-                    .await;
+                accept::quic_accept_loop::<I>(
+                    quic_listener,
+                    incoming_tx,
+                    new_conn_tx,
+                    disconnect_tx,
+                )
+                .await;
             });
         }
 

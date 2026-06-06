@@ -265,8 +265,10 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
 
             let first = transport.recv_peer().await.expect("welcome");
             assert!(
-                matches!(first, DistributedMessage::SecondaryWelcome {
-    target: None, .. }),
+                matches!(
+                    first,
+                    DistributedMessage::SecondaryWelcome { target: None, .. }
+                ),
                 "first frame must be the welcome, got {first:?}"
             );
             // The writer must be registered by the time the welcome
@@ -289,8 +291,10 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
 
             let second = transport.recv_peer().await.expect("cert");
             assert!(
-                matches!(second, DistributedMessage::CertExchange {
-    target: None, .. }),
+                matches!(
+                    second,
+                    DistributedMessage::CertExchange { target: None, .. }
+                ),
                 "second frame must be the cert exchange, got {second:?}"
             );
         })
@@ -357,8 +361,10 @@ async fn mesh_writer_fans_into_the_same_wire() {
             });
 
             let first = transport.recv_peer().await.expect("welcome");
-            assert!(matches!(first, DistributedMessage::SecondaryWelcome {
-    target: None, .. }));
+            assert!(matches!(
+                first,
+                DistributedMessage::SecondaryWelcome { target: None, .. }
+            ));
             let second = transport.recv_peer().await.expect("mesh_writer frame");
             match second {
                 DistributedMessage::Keepalive { active_workers, .. } => {

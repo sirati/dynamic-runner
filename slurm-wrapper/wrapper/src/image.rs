@@ -105,8 +105,12 @@ fn provide_local_image(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, 
     let cache_dir = cache
         .parent()
         .expect("cache_path always has a parent under /tmp");
-    std::fs::create_dir_all(cache_dir)
-        .map_err(|e| format!("failed to create image cache dir {}: {e}", cache_dir.display()))?;
+    std::fs::create_dir_all(cache_dir).map_err(|e| {
+        format!(
+            "failed to create image cache dir {}: {e}",
+            cache_dir.display()
+        )
+    })?;
 
     // Temp name disambiguated by (rand_suffix, pid): two cold-start
     // secondaries racing to populate the same digest each write their

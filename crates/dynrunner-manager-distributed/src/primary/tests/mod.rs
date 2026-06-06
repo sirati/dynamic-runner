@@ -167,9 +167,7 @@ fn channel_mesh_secondary_ends(
 async fn run_secondary_node(
     config: SecondaryConfig,
     transport: ChannelPeerTransport<TestId>,
-    factory: impl dynrunner_manager_local::WorkerFactory<
-        dynrunner_transport_channel::ChannelManagerEnd,
-    >,
+    factory: impl dynrunner_manager_local::WorkerFactory<dynrunner_transport_channel::ChannelManagerEnd>,
 ) -> usize {
     run_secondary_node_reading(config, transport, factory, |s| s.local_tasks_run_for_test()).await
 }

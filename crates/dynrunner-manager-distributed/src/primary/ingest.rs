@@ -161,9 +161,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             .map(|(task, _)| task.task_id.clone())
             .collect();
         validation_pool.mark_tasks_failed(invalid_ids);
-        validation_pool.extend(partition.valid.clone()).map_err(|e| {
-            RunError::Other(format!("PendingPool::extend rejected task graph: {e}"))
-        })?;
+        validation_pool
+            .extend(partition.valid.clone())
+            .map_err(|e| {
+                RunError::Other(format!("PendingPool::extend rejected task graph: {e}"))
+            })?;
         // The validation pool has served its purpose; hydrate is the
         // authoritative builder.
         drop(validation_pool);
@@ -193,10 +195,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         seed.push(ClusterMutation::PhaseDepsSet {
             deps: self.phase_deps.clone(),
         });
-        seed.extend(self.all_binaries.iter().map(|b| ClusterMutation::TaskAdded {
-            hash: compute_task_hash(b),
-            task: b.clone(),
-        }));
+        seed.extend(
+            self.all_binaries
+                .iter()
+                .map(|b| ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(b),
+                    task: b.clone(),
+                }),
+        );
         // #2: transition each missing-dep task `Pending → InvalidTask` in the
         // SAME local-apply pass, so hydrate sees them terminal (dep-seed, out
         // of pool) — the faithful equivalent of the pre-F1 pool pre-fail. The

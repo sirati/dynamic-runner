@@ -151,8 +151,7 @@ async fn busy_genuine_death_arms_fast_via_leg_a() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: _, .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { target: _, .. })),
         "fast (leg A) election must broadcast TimeoutQuery",
     );
 }
@@ -201,8 +200,7 @@ async fn wedged_primary_elects_at_backstop() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: _, .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { target: _, .. })),
         "backstop (leg B) election must broadcast TimeoutQuery",
     );
 }

@@ -254,10 +254,7 @@ async fn submit_job_matches_python_invocation_shape() {
         "STDIN pipe must not write a per-secondary job script; got: {cmds:?}",
     );
     assert!(
-        cmds.iter()
-            .filter(|c| c.contains("sbatch "))
-            .count()
-            == 1,
+        cmds.iter().filter(|c| c.contains("sbatch ")).count() == 1,
         "exactly one sbatch command (the STDIN pipe) is issued; got: {cmds:?}",
     );
 

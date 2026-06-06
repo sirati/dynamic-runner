@@ -83,8 +83,7 @@ async fn reader_exit_prunes_connection() {
             // control so we can re-check peer_count.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(100), peer_b.recv_peer()).await;
+                let _ = tokio::time::timeout(Duration::from_millis(100), peer_b.recv_peer()).await;
                 if PeerTransport::<TestId>::peer_count(&peer_b) == 0 {
                     break;
                 }
@@ -116,7 +115,8 @@ async fn stale_disconnect_does_not_prune_reconnected_entry() {
             // same peer id.
             let (fresh_tx, _fresh_rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
 
-            net.connections.insert("peer-x".to_string(), fresh_tx.clone());
+            net.connections
+                .insert("peer-x".to_string(), fresh_tx.clone());
 
             // Stale signal for the OLD channel: must be a no-op.
             net.handle_peer_disconnect("peer-x", &old_tx);

@@ -43,7 +43,7 @@ use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome};
 use crate::secondary::SecondaryCoordinator;
 
 use compose::{empty_primary_args, first_live_peer_id};
-use outcome::{finalize_observer, secondary_terminal, ObserverJoinHandle, SecondaryJoinHandle};
+use outcome::{ObserverJoinHandle, SecondaryJoinHandle, finalize_observer, secondary_terminal};
 use promotion::{self_build_promoted_primary, spawn_primary_with};
 use select::{join_opt_run, join_secondary, recv_opt, recv_primary};
 use swap::{spawn_observer, swap_primary_to_observer};
@@ -51,7 +51,13 @@ use swap::{spawn_observer, swap_primary_to_observer};
 pub use outcome::{NodeRunOutcome, RunTerminal};
 
 impl<I, Tr, Mgr, Sched, Est>
-    Node<I, Tr, PrimaryCoordinator<Sched, Est, I>, SecondaryCoordinator<Mgr, Sched, Est, I>, ObserverCoordinator<I>>
+    Node<
+        I,
+        Tr,
+        PrimaryCoordinator<Sched, Est, I>,
+        SecondaryCoordinator<Mgr, Sched, Est, I>,
+        ObserverCoordinator<I>,
+    >
 where
     I: Identifier + 'static,
     Tr: PeerTransport<I> + 'static,
@@ -105,7 +111,10 @@ where
         // `primary_done`.
         let mut primary_done: Option<oneshot::Receiver<PrimaryRunOutcome<I>>> = None;
         if let Some(entry) = primary {
-            let args = inputs.primary_run_args.take().unwrap_or_else(empty_primary_args);
+            let args = inputs
+                .primary_run_args
+                .take()
+                .unwrap_or_else(empty_primary_args);
             let mut coordinator = entry.coordinator;
             // BUG-6: the bootstrap primary demotes on any self→other flip
             // (apply OR restore/merge heal). The caller paired the demote_rx
@@ -291,5 +300,4 @@ where
 
         outcome
     }
-
 }

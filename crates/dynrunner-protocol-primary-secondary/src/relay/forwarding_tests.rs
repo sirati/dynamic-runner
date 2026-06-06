@@ -90,8 +90,10 @@ fn route_send_relays_via_lowest_when_target_unreachable() {
                 assert_eq!(target_id, "b");
                 assert_eq!(relay_id, 7);
                 assert_eq!(path, vec!["a".to_string()]);
-                assert!(matches!(*inner, DistributedMessage::Keepalive {
-    target: None, .. }));
+                assert!(matches!(
+                    *inner,
+                    DistributedMessage::Keepalive { target: None, .. }
+                ));
             } else {
                 panic!("not a relay");
             }
@@ -137,8 +139,10 @@ fn forward_step_unwraps_when_target_directly_reachable() {
     let d = forward_step::<(), _>(&c, "c", "b", 1, &path, 1.0, "a", inner, &empty_blacklist());
     match d {
         RouteDecision::Direct(m) => {
-            assert!(matches!(m, DistributedMessage::Keepalive {
-    target: None, .. }));
+            assert!(matches!(
+                m,
+                DistributedMessage::Keepalive { target: None, .. }
+            ));
         }
         other => panic!("expected Direct: {:?}", other),
     }
@@ -257,7 +261,12 @@ fn handle_backoff_retries_with_next_lowest() {
         BackoffDecision::Retry { via, wrapped } => {
             assert_eq!(via, "d");
             if let DistributedMessage::Relay {
-    target: None, relay_id, path, .. } = wrapped {
+                target: None,
+                relay_id,
+                path,
+                ..
+            } = wrapped
+            {
                 assert_eq!(relay_id, 1);
                 assert_eq!(path, vec!["a".to_string()]);
             } else {
