@@ -160,18 +160,18 @@ pub enum EitherPeerTransport<I: Identifier> {
 }
 
 impl<I: Identifier> EitherPeerTransport<I> {
-    /// Mint a cloneable [`MeshSendHandle`] for an on-demand co-located
+    /// Mint a cloneable [`MeshSendHandle`] for a promoted-host
     /// primary's send-proxy, when a real mesh exists.
     ///
     /// `Some` for `Real` (a live `PeerNetwork` whose `recv_peer` drains
     /// the proxy); `None` for `Disabled` — a firewalled / single-
     /// secondary deployment has no mesh and therefore no remote
-    /// secondaries for a co-located primary to reach. The composition
-    /// only wires a co-located primary when this returns `Some`.
+    /// secondaries for a promoted-host primary to reach. The composition
+    /// only wires such a primary when this returns `Some`.
     pub fn mesh_send_handle(&self) -> Option<MeshSendHandle<I>> {
         match self {
             Self::Real(p) => Some(p.mesh_send_handle()),
-            // No mesh → no remote secondaries for a co-located primary to
+            // No mesh → no remote secondaries for a promoted-host primary to
             // reach, whether or not the bootstrap primary wire is folded.
             Self::Disabled(_) | Self::DisabledWithPrimary(_) => None,
         }

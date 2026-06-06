@@ -328,9 +328,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // real task discovery + assignment happens post-relocation on the
         // promoted primary. That promoted-side spawning is NOT surfaced
         // here, by design: this is a submitter-local important-stdio site,
-        // and the promoted primary enters via `run_activated` (a separate
-        // process / coordinator) whose own assignment is out of this
-        // emitter's reach. So under setup-defer the operator sees no
+        // and the promoted primary is constructed by `Process` on the
+        // promotion event (a separate coordinator) whose own assignment is
+        // out of this emitter's reach. So under setup-defer the operator sees no
         // "initial assignment complete" from the submitter — the boundary
         // is honest, not a gap to paper over here.
         tracing::info!(

@@ -20,7 +20,7 @@ dynrunner-scheduler = { workspace = true }
 dynrunner-manager-local = { workspace = true }
 dynrunner-transport-quic = { workspace = true }
 # Channel (in-process mpsc) primary↔secondary transport. The composed
-# authoritative primary (`primary::compose`) reaches its co-located
+# authoritative primary (`primary::compose`) reaches its same-peer
 # secondary over a `ChannelSecondaryTransportEnd` loopback, so this is a
 # runtime dependency of the composition path — not test-only.
 dynrunner-transport-channel = { workspace = true }

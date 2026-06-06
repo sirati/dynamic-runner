@@ -33,7 +33,8 @@ where
     /// "How many peers connected" is the role-aware
     /// [`SecondaryCoordinator::alive_secondary_count`] — alive secondaries
     /// over GLOBAL STATE, filtered POSITIVELY on the secondary capability
-    /// (a co-located primary+secondary counts; an observer does not) —
+    /// (a host running primary+secondary under one peer-id counts; an
+    /// observer does not) —
     /// NEVER the transport's role-blind `peer_count()`: post-de-role the
     /// transport counts the folded primary as an ordinary mesh peer, so
     /// asking IT "how many peer-secondaries" would falsely report a lone

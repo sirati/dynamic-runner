@@ -214,7 +214,7 @@ async fn promote_primary_routing_survives_keepalive() {
 /// election to `Normal` (NOT `Promoted`): a peer becomes primary by
 /// its HOST spawning a primary coordinator alongside its unchanged
 /// normal secondary, and after the spawn the election state resets —
-/// there is no lingering `Promoted`. Post-reset, the co-located
+/// there is no lingering `Promoted`. Post-reset, the same-peer
 /// primary's OWN keepalives (recognized because `current_primary()`
 /// names this node) keep `primary_last_seen` fresh, so the node stays
 /// `Normal` and drives no self-re-promotion cascade.
@@ -252,7 +252,7 @@ async fn self_named_primary_resets_election_to_normal() {
         "self-named primary resets to Normal, not Promoted"
     );
 
-    // The co-located primary's own keepalives (recognized: `from` ==
+    // The same-peer primary's own keepalives (recognized: `from` ==
     // current_primary == self) keep `primary_last_seen` fresh — the
     // node stays Normal and originates no election even after the
     // keepalive cadence ticks.

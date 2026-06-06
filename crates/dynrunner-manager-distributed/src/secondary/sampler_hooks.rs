@@ -17,7 +17,7 @@
 //!   * `secondary/dispatch/router.rs` (`TaskAssignment` arm) — every
 //!     in-loop assignment (a `TaskAssignment` addressed to this node's
 //!     own worker arrives here whether it came over the wire from the
-//!     authority or via the co-located primary's loopback — the unified
+//!     authority or via the same-peer primary's loopback — the unified
 //!     transport made the origin opaque, subsuming the old
 //!     self-assign-vs-wire split).
 //!   * `secondary/processing/worker_event.rs` (`WorkerEvent::Ready`

@@ -2,11 +2,11 @@
 //! whose originator is the current primary refreshes `primary_last_seen`
 //! (primary-liveness), while a `Secondary`-tagged keepalive ALWAYS feeds
 //! `peer_keepalives` (peer-mesh liveness) — even when its originator id is
-//! the current primary, because a co-located primary+secondary host is a
-//! live mesh peer in its own right and is tracked as BOTH. This is the
-//! recognition half of the primary-liveness ≠ peer-liveness invariant:
-//! the two signals no longer collide on one entry, so primary liveness is
-//! not parasitic on workload dispatch and a co-located host is never
+//! the current primary, because a host running primary+secondary under one
+//! peer-id is a live mesh peer in its own right and is tracked as BOTH.
+//! This is the recognition half of the primary-liveness ≠ peer-liveness
+//! invariant: the two signals no longer collide on one entry, so primary
+//! liveness is not parasitic on workload dispatch and such a host is never
 //! dropped from `peer_keepalives` (which would corrupt election quorum).
 
 #![cfg(test)]
@@ -185,7 +185,7 @@ async fn multi_role_host_tracked_as_both_primary_and_peer() {
         "the earlier peer entry survives — the two liveness signals are independent"
     );
 
-    // And the quorum view excludes the co-located primary from the live
+    // And the quorum view excludes the same-peer primary from the live
     // peer set, so the peer entry never inflates election counts.
     assert!(
         sec.live_peer_ids().all(|id| id != "sec-a"),

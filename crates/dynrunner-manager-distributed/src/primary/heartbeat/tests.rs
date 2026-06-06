@@ -879,7 +879,7 @@ async fn oracle_true_when_only_silent_held_work_remains() {
 /// self here would yank the self's LIVE in-flight task before the next
 /// keepalive refreshes the clock and before the hard backstop. The identity
 /// filter (`id != current_primary`, the same cut `alive_remote_secondary_count`
-/// uses) excludes that single co-located entry by IDENTITY. The hard backstop
+/// uses) excludes that single same-peer entry by IDENTITY. The hard backstop
 /// is deliberately left unfiltered — this guard is the EARLY (WARN-only) path.
 ///
 /// The schedule here puts the hard backstop far above the sleep (HARD at 10x =
@@ -906,7 +906,7 @@ async fn self_secondary_excluded_from_silent_set_and_oracle() {
     install_default_pool(&mut primary);
 
     // The recognized primary is the local host ("primary", the default
-    // `node_id`); its OWN co-located secondary advertises under the same
+    // `node_id`); its OWN same-peer secondary advertises under the same
     // peer-id and holds the only in-flight task.
     primary
         .cluster_state_mut_for_test()

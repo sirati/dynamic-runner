@@ -374,7 +374,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // Cancellation safety: `transport.recv_peer` is the
             // mpsc-backed unified inbound demux (cancel-safe — see
             // `TunneledPeerTransport::recv_peer` /
-            // `MeshHandleTransport::recv_peer`). The two timer
+            // `EitherPeerTransport::recv_peer`). The two timer
             // arms (heartbeat tick + 5-min sleep) are tokio time
             // primitives which are themselves cancel-safe.
             //

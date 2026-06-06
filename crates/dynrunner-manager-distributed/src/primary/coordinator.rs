@@ -234,14 +234,14 @@ pub enum PrimaryRunOutcome {
 /// `PeerId`-only transport; `recv_peer()` is the unified inbound. The
 /// transport is real-by-construction in every primary construction path
 /// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
-/// in-process / tests, the role-blind `MeshHandleTransport` over the
-/// host's shared mesh for the on-demand co-located authority) — there is no
-/// no-op send path and no per-site "which transport is real" hazard. The
-/// on-demand co-located primary's own-secondary loopback is NOT a transport
-/// leg: it is delivered at the egress edge (`SendTarget::Loopback` +
-/// the `Destination::All` broadcast loopback leg), so the transport
-/// itself stays role-blind. This mirrors the secondary side's collapse
-/// onto a single `Tr: PeerTransport`.
+/// in-process / tests, the role-blind mesh transport over the host's
+/// shared mesh for a primary composed on a promoted host that advertises
+/// both roles under one peer-id) — there is no no-op send path and no
+/// per-site "which transport is real" hazard. That promoted-host primary's
+/// own-secondary loopback is NOT a transport leg: it is delivered at the
+/// egress edge (`SendTarget::Loopback` + the `Destination::All` broadcast
+/// loopback leg), so the transport itself stays role-blind. This mirrors
+/// the secondary side's collapse onto a single `Tr: PeerTransport`.
 pub struct PrimaryCoordinator<
     Tr: PeerTransport<I>,
     S: Scheduler<I>,
@@ -254,8 +254,8 @@ pub struct PrimaryCoordinator<
     /// primary send (`Address`-routed) and the single `recv_peer()`
     /// inbound surface. For the submitter primary its backend is the
     /// per-secondary tunnel writers + the relocated `NetworkServer`
-    /// inbound demux; for the on-demand co-located primary its backend is
-    /// the co-located loopback + shared mesh — in both cases a real
+    /// inbound demux; for a primary composed on a promoted host its backend
+    /// is the same-peer loopback + shared mesh — in both cases a real
     /// send path.
     pub(super) transport: Tr,
     pub(super) scheduler: S,
@@ -417,8 +417,8 @@ pub struct PrimaryCoordinator<
     pub(super) cluster_state: ClusterState<I>,
 
     /// Cross-thread / cross-runtime ingress for the
-    /// `PrimaryHandle` PyO3 surface. Each handler is co-located
-    /// with the coordinator's per-mutation semantics; the receiver
+    /// `PrimaryHandle` PyO3 surface. Each handler sits alongside
+    /// the coordinator's per-mutation semantics; the receiver
     /// is read inside the operational loop's `select!` and the
     /// sender is cloned out via `command_sender()` before `run()`
     /// starts.
@@ -890,7 +890,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         // the post-mutation `RoleTable` the hook is handed and emits at
         // `target: dynrunner_important`, so the CRDT apply path stays
         // free of any logging coupling. A promoted secondary runs its
-        // co-located primary coordinator, so the hook rides promotion.
+        // own same-peer primary coordinator, so the hook rides promotion.
         super::important_events::register_primary_changed_important_hook(&mut this.cluster_state);
         this
     }

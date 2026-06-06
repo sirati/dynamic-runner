@@ -168,7 +168,7 @@ pub(crate) struct AppliedBatch<I: Identifier> {
 /// re-injection step are both caller-specific (the authority primary
 /// re-injects resumed dependents into its dispatch pool; the secondary
 /// originator holds no pool and discards the resumed list — the
-/// co-located authority drives dispatch off the same mutation), so they
+/// same-peer authority drives dispatch off the same mutation), so they
 /// stay at the call sites. This free function is the canonical place to
 /// perform the apply+filter so the two originator paths can't drift on
 /// the filter semantics.

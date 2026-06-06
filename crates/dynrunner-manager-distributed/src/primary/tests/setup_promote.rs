@@ -114,7 +114,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
             })
             .unwrap();
         // The completion arrives as a `TaskComplete` wire report — the
-        // shape the co-located secondary's worker uses to report to the
+        // shape the same-peer secondary's worker uses to report to the
         // authoritative primary in the composed model. The authority's
         // `handle_task_complete` inserts the hash into `completed_tasks`
         // (the set the operational-loop counter exit reads) and
@@ -904,7 +904,7 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
 }
 
 /// T6 — RACE-ROBUST seeded-resume ordering (the `--source-already-staged`
-/// co-located-primary regression). A primary activated from an EMPTY
+/// promoted-host-primary regression). A primary activated from an EMPTY
 /// ledger on the discovery node MUST NOT declare run-complete before its
 /// own setup-discovery batch is ingested — EVEN when that batch arrives
 /// AFTER the point at which the first would-be completion check fires.
@@ -934,10 +934,10 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
                 connect_timeout: Duration::from_secs(5),
                 peer_timeout: Duration::from_secs(5),
                 keepalive_interval: Duration::from_millis(50),
-                // Setup-defer mode — the gate under test. The activated
-                // co-located primary on the `--source-already-staged` path
-                // is built with exactly this flag set (see the activator in
-                // `managers/secondary/run.rs`).
+                // Setup-defer mode — the gate under test. The promoted-host
+                // primary on the `--source-already-staged` path is built
+                // with exactly this flag set (Phase C builds it in
+                // `Process`; see `managers/secondary/run.rs`).
                 required_setup_on_promote: true,
                 // A long deadline so the test can ONLY exit via the counter
                 // path after the late batch lands, never via the backstop.
@@ -1059,7 +1059,7 @@ async fn setup_pending_blocks_exit_when_discovery_batch_arrives_after_first_chec
 /// directly (see `secondary::origination::ingest_setup_discovery`'s
 /// empty-discovery arm) because there will never be a `TaskCompleted` to
 /// drive the counter exit. That `RunComplete` loops back to the
-/// co-located primary and trips the UNGATED `cluster_state.run_complete()`
+/// same-peer primary and trips the UNGATED `cluster_state.run_complete()`
 /// exit in `run_complete_check` — so the primary exits IMMEDIATELY, NOT
 /// after waiting out `setup_promote_deadline`.
 ///
