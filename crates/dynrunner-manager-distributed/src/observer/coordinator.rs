@@ -54,8 +54,8 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerTransport, RemovalCause,
-    SendTarget, StateDigest, resolve_destination,
+    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, RemovalCause, SendTarget,
+    StateDigest, resolve_destination,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -69,6 +69,7 @@ use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonit
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
+use crate::process::{MeshClient, RoleInbox};
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
 use crate::primary::RunError;
 use crate::run_narrator::RunNarrator;
@@ -117,13 +118,16 @@ pub struct ObserverConfig {
 /// this; this struct + [`ObserverCoordinator::from_handoff`] only DEFINE
 /// the shape. The observer's single-teardown OWNS the two inherited
 /// dispatcher handles plus any task it spawns.
-pub struct ObserverHandoff<Tr, I>
+pub struct ObserverHandoff<I>
 where
-    Tr: PeerTransport<I>,
     I: Identifier,
 {
-    /// The live mesh transport, moved across.
-    pub transport: Tr,
+    /// The mesh send capability the primary held, moved across (egress).
+    /// The SAME client + inbox the primary used, so the slot/channel is
+    /// stable across the primary→observer retag (H5) — no delivery gap.
+    pub client: MeshClient<I>,
+    /// The mesh inbound stream the primary held, moved across (ingress).
+    pub inbox: RoleInbox<I>,
     /// The replicated ledger, carrying its already-installed
     /// `task_completed_tx` sender (the inherited dispatcher reads its
     /// receiver). Moved across so no live mutation is lost.
@@ -169,17 +173,24 @@ pub enum ObserverTerminal {
 
 /// The standalone, zero-authority observer.
 ///
-/// `Tr: PeerTransport<I>` is the mesh transport (held directly — an
-/// observer never dialled a bootstrap primary, so there is no uplink leg
-/// and no `bootstrap_primary_id`). The observer holds the replicated
+/// The observer reaches the mesh through a [`MeshClient`] (egress) and a
+/// [`RoleInbox`] (ingress) — it never names a transport (an observer never
+/// dialled a bootstrap primary, so there is no uplink leg and no
+/// `bootstrap_primary_id`). The observer holds the replicated
 /// [`ClusterState`] DIRECTLY (it carries no pool / scheduler to wrap it
 /// in).
-pub struct ObserverCoordinator<Tr, I>
+pub struct ObserverCoordinator<I>
 where
-    Tr: PeerTransport<I>,
     I: Identifier,
 {
-    transport: Tr,
+    /// The mesh send capability (egress). Locality-oblivious + QUEUED
+    /// (drained by the mesh-pump); the observer hands it a role-bearing
+    /// [`Destination`] and the frame and never sees the transport.
+    client: MeshClient<I>,
+    /// The mesh inbound stream (ingress). The mesh-pump demuxes frames
+    /// addressed to the observer slot into this inbox; the run loop drains
+    /// it.
+    inbox: RoleInbox<I>,
     cluster_state: ClusterState<I>,
     config: ObserverConfig,
     /// Seed for the `RunNarrator` — phases already announced upstream.
@@ -225,13 +236,12 @@ where
     recovery_cursor: usize,
 }
 
-impl<Tr, I> ObserverCoordinator<Tr, I>
+impl<I> ObserverCoordinator<I>
 where
-    Tr: PeerTransport<I>,
     I: Identifier,
 {
-    /// Cold-join constructor: build a fresh observer over a live mesh
-    /// transport and a (possibly already-restored) cluster state.
+    /// Cold-join constructor: build a fresh observer over a mesh client +
+    /// inbox and a (possibly already-restored) cluster state.
     ///
     /// Setup ORDERING (load-bearing for Policy B/D — a restore-delivered
     /// event must reach the listeners): the caller installs the
@@ -241,11 +251,17 @@ where
     /// unbounded channel; [`Self::run`] then registers the failure-policy
     /// listeners and spawns the dispatcher, which drains the buffered
     /// events on first poll. No dispatcher is spawned here.
-    pub fn new(transport: Tr, cluster_state: ClusterState<I>, config: ObserverConfig) -> Self {
+    pub fn new(
+        client: MeshClient<I>,
+        inbox: RoleInbox<I>,
+        cluster_state: ClusterState<I>,
+        config: ObserverConfig,
+    ) -> Self {
         let node_id = config.node_id.clone();
         let required_setup = config.required_setup_on_promote;
         Self::with_pieces(
-            transport,
+            client,
+            inbox,
             cluster_state,
             node_id,
             config,
@@ -282,9 +298,10 @@ where
     /// (Events that were mid-flight inside the primary's dispatcher at
     /// teardown are recovered later by the CRDT track's restore-emit over the
     /// converged state — this is noted, NOT depended on here.)
-    pub fn from_handoff(handoff: ObserverHandoff<Tr, I>) -> Self {
+    pub fn from_handoff(handoff: ObserverHandoff<I>) -> Self {
         let ObserverHandoff {
-            transport,
+            client,
+            inbox,
             mut cluster_state,
             node_id,
             deadlines,
@@ -311,7 +328,8 @@ where
         let announcer_handle =
             attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
         Self {
-            transport,
+            client,
+            inbox,
             cluster_state,
             config: ObserverConfig {
                 node_id,
@@ -341,7 +359,8 @@ where
     /// [`build_cold_join_observer`] factory + `run`).
     #[allow(clippy::too_many_arguments)]
     fn with_pieces(
-        transport: Tr,
+        client: MeshClient<I>,
+        inbox: RoleInbox<I>,
         mut cluster_state: ClusterState<I>,
         node_id: String,
         config: ObserverConfig,
@@ -371,7 +390,8 @@ where
         let announcer_handle =
             attach_observer_announcer(&mut cluster_state, holdings, node_id.clone());
         Self {
-            transport,
+            client,
+            inbox,
             cluster_state,
             config: ObserverConfig {
                 node_id,
@@ -438,22 +458,29 @@ where
 
     /// The observer's OWN egress edge: resolve `Destination::Primary`
     /// against `current_primary()` (no bootstrap-primary fallback — an
-    /// observer never dialled one) and dispatch the `PeerId`-only
-    /// transport. NO loopback delivery: the observer is never the primary,
-    /// so a resolved self-id is a no-op drop (it would only happen if the
-    /// ledger named the observer primary, which never occurs).
+    /// observer never dialled one) and QUEUE the frame onto the mesh client.
+    /// NO loopback delivery: the observer is never the primary, so a
+    /// resolved self-id is a no-op drop (it would only happen if the ledger
+    /// named the observer primary, which never occurs).
     ///
-    /// NOTE: this is a THIRD copy of the `resolve_destination` egress
-    /// idiom (primary `send_to`, secondary `send_to`, and here). Extracting
-    /// a shared `send_resolved` is a possible follow-up — NOT this
-    /// concern's scope.
+    /// The resolve HEAD stays AT the coordinator (H1): an observer has NO
+    /// bootstrap-primary fallback (it never dialled one), so `Primary`
+    /// resolves against `current_primary()` alone. `None` ⇒ no route to the
+    /// primary, surfaced as `Err`. The TAIL collapses onto a single queued
+    /// [`MeshClient::send`]: we map the resolved [`SendTarget`] back to the
+    /// role-bearing [`Destination`] (NEVER the role-erased `SendTarget` on
+    /// the wire — dirty-D2), STAMP it on the frame (the C3 routing target
+    /// the receiver's mesh-pump demuxes against its slots), and queue it.
+    /// The mesh-pump (not this coordinator) does loopback-vs-remote; an
+    /// observer never loops back, so the resolved self case is the same
+    /// best-effort drop the original held.
     async fn send_to(
         &mut self,
         dst: Destination,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         let target = resolve_destination(
-            dst,
+            dst.clone(),
             self.cluster_state.current_primary(),
             None,
             &self.config.node_id,
@@ -463,20 +490,25 @@ where
              (an observer has no bootstrap primary link) — no route to the primary"
                 .to_string()
         })?;
-        match target {
-            SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
-            SendTarget::Broadcast => self.transport.broadcast(msg).await,
+        // Map the resolved SendTarget back to the role-bearing Destination
+        // the receiver's pump demuxes against. `dst` is already role-bearing
+        // (the observer only ever sends `Destination::Primary` directed or
+        // `Destination::All`), so a resolved `Peer`/`Broadcast` carries the
+        // SAME role as `dst`; the resolution only told us it is routable.
+        let resolved: Destination = match target {
+            SendTarget::Peer(_) | SendTarget::Broadcast => dst,
             // The observer is never the primary, so a self-resolved
             // Destination::Primary is a logic-impossible case; drop it
-            // best-effort rather than self-connecting.
+            // best-effort rather than self-addressing.
             SendTarget::Loopback => {
                 tracing::debug!(
                     "observer send resolved to self (impossible for a zero-authority \
                      observer); dropping"
                 );
-                Ok(())
+                return Ok(());
             }
-        }
+        };
+        self.client.send(resolved.clone(), msg.with_target(resolved))
     }
 
     /// Drive the observer until the run terminates or a strand backstop
@@ -666,15 +698,19 @@ where
 
                 // 3. Await events.
                 tokio::select! {
-                    // Inbound mesh frame.
-                    maybe = self.transport.recv_peer() => {
+                    // Inbound mesh frame — the mesh-pump has already demuxed
+                    // it to the observer's slot, so this inbox carries only
+                    // frames addressed to the observer.
+                    maybe = self.inbox.recv() => {
                         match maybe {
                             Some(msg) => {
                                 self.on_inbound(msg, &mut primary_last_seen).await;
                             }
                             None => {
                                 // Latch + disable this arm; the exit
-                                // decision is made at top-of-loop (§4).
+                                // decision is made at top-of-loop (§4). A
+                                // `None` is the role's teardown signal (every
+                                // write end of the slot's inbound dropped).
                                 transport_closed = true;
                             }
                         }
@@ -783,7 +819,16 @@ where
             return Ok(Some(ObserverTerminal::Done));
         }
         // 4. Closed transport with peers present → clean exit 0 (§4-int).
-        let peer_count = self.transport.peer_count();
+        //    Read off the mesh client's pump-published `MembershipView`
+        //    (≤1-cycle stale, monotone-toward-truth — it republishes the
+        //    whole live set each pump cycle, so it can never MISS a remove).
+        //    This is a clean-EXIT permit, NEVER a death trigger: a
+        //    stale-HIGH count only delays a clean exit by one cycle, and a
+        //    stale-LOW count falls through to the timeout-gated grace at
+        //    step 5 (which a ≤1-cycle blip cannot drive to fire — the count
+        //    corrects within one cycle and clears the grace at line below).
+        //    So no strand decision keys on a live-vs-stale distinction.
+        let peer_count = self.client.peer_count();
         if transport_closed && peer_count > 0 {
             return Ok(Some(ObserverTerminal::Done));
         }
@@ -1080,15 +1125,15 @@ where
 /// pinned by the spec: install sender → restore snapshot → (listeners +
 /// dispatcher happen in `run`). This helper wires the panik watcher whose
 /// signal the run loop's panik arm consumes.
-pub fn build_cold_join_observer<Tr, I>(
-    transport: Tr,
+pub fn build_cold_join_observer<I>(
+    client: MeshClient<I>,
+    inbox: RoleInbox<I>,
     cluster_state: ClusterState<I>,
     config: ObserverConfig,
     snapshots: Vec<crate::cluster_state::ClusterStateSnapshot<I>>,
     holdings: HashSet<String>,
-) -> ObserverCoordinator<Tr, I>
+) -> ObserverCoordinator<I>
 where
-    Tr: PeerTransport<I> + 'static,
     I: Identifier + 'static,
 {
     // Spawn the panik watcher (observer-role: SIGTERM listening OFF) and
@@ -1124,7 +1169,8 @@ where
     // idempotent lattice merge; applying each responder's snapshot unions
     // them.
     let mut coordinator = ObserverCoordinator::with_pieces(
-        transport,
+        client,
+        inbox,
         cluster_state,
         node_id,
         config,
