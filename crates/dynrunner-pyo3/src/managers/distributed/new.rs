@@ -41,6 +41,7 @@ impl PyDistributedManager {
         panik_watcher_paths = None,
         panik_watcher_poll_interval_secs = 10.0,
         memprofile_enabled = false,
+        forwarded_argv = Vec::new(),
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -68,6 +69,7 @@ impl PyDistributedManager {
         panik_watcher_paths: Option<Vec<PathBuf>>,
         panik_watcher_poll_interval_secs: f64,
         memprofile_enabled: bool,
+        forwarded_argv: Vec<String>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -123,6 +125,7 @@ impl PyDistributedManager {
             panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
             panik_watcher_poll_interval_secs,
             memprofile_enabled,
+            forwarded_argv,
         })
     }
 

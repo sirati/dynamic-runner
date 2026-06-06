@@ -37,6 +37,10 @@ impl PyPrimaryCoordinator {
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let source_dir = self.source_dir.clone();
+        // The node-local run-config (the operator's `args.forwarded_argv`),
+        // captured on the GIL thread for the detached-runtime `PrimaryConfig`
+        // so this primary answers `RequestRunConfig` from its own copy.
+        let forwarded_argv = self.forwarded_argv.clone();
         // Take the parked deployment-mode job-manager handle (if any)
         // out for the detached runtime so the inner coordinator can
         // park it on itself before `run()` enters. `None` for the
@@ -382,6 +386,11 @@ impl PyPrimaryCoordinator {
                     source_dir,
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // The submitter's node-local run-config (the operator's
+                    // `args.forwarded_argv`). Answered verbatim on
+                    // `RequestRunConfig` so every joining / promoted node
+                    // sources a byte-identical copy from the submitter.
+                    forwarded_argv,
                     // Staged silence schedule: keepalive-interval-relative
                     // defaults (not surfaced on the Python config today).
                     ..PrimaryConfig::default()

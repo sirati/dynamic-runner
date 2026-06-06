@@ -65,6 +65,13 @@ pub(super) fn drive_rust_primary<'py>(
         coord_kwargs.set_item("distributed_config", dc)?;
     }
     coord_kwargs.set_item("listen_port", primary_quic_port)?;
+    // The operator's run-config: the same filtered token sequence the
+    // mesh-launched secondaries fetch + re-serve. Threaded into the
+    // submitter primary's `PrimaryConfig.forwarded_argv` so the
+    // `RequestRunConfig` responder serves the real argv (not an empty
+    // default) — the single source every cold-start / promoted node
+    // reconstructs from.
+    coord_kwargs.set_item("forwarded_argv", forwarded_argv.to_vec())?;
     if attr_truthy(args, "source_already_staged") {
         let root = slurm_config.call_method0("get_srcbins_mount_source")?;
         coord_kwargs.set_item("source_pre_staged_root", root)?;

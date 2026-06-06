@@ -142,4 +142,12 @@ pub(crate) struct PyDistributedManager {
     /// receive the same memprofile output dir as their
     /// out-of-process counterparts.
     pub(super) memprofile_enabled: bool,
+    /// The consumer's run-config (the operator's `args.forwarded_argv`),
+    /// shared by both the in-process primary AND every in-process secondary
+    /// the manager spawns. Every node shares the submitter's argv directly
+    /// (one process, no cold-start mesh fetch), so the same byte-identical
+    /// copy seeds each node's node-local `forwarded_argv` — the
+    /// `RequestRunConfig` responder then serves it uniformly regardless of
+    /// which node a peer happens to query.
+    pub(super) forwarded_argv: Vec<String>,
 }

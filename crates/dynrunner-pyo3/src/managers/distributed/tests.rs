@@ -115,6 +115,7 @@ fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedM
         /* panik_watcher_paths */ None,
         /* panik_watcher_poll_interval_secs */ 10.0,
         /* memprofile_enabled */ false,
+        /* forwarded_argv */ Vec::new(),
     )?;
     Py::new(py, mgr)
 }

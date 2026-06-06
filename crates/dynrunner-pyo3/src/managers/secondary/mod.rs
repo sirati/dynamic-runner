@@ -141,4 +141,14 @@ pub(crate) struct PySecondaryCoordinator {
     /// supplies no dir. See
     /// `dynrunner_manager_distributed::SecondaryConfig::output_dir`.
     pub(super) memprofile_enabled: bool,
+    /// The consumer's run-config — the byte-identical token sequence the
+    /// framework forwards onto a joining / promoted node's command line.
+    /// Sourced from the consumer's parsed `args.forwarded_argv`: on a
+    /// cold-start secondary that argv was spliced onto `sys.argv` by the
+    /// `_secondary_bootstrap` mesh-fetch shim, so it is byte-identical to
+    /// the submitter's. Threaded at `run()` entry into BOTH this
+    /// secondary's `SecondaryConfig.forwarded_argv` (so it can re-serve
+    /// `RequestRunConfig`) AND the PROMOTED `PrimaryConfig.forwarded_argv`
+    /// (so a node promoted to primary answers identically — no split-brain).
+    pub(super) forwarded_argv: Vec<String>,
 }

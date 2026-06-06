@@ -410,6 +410,11 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             coord_kwargs.set_item("distributed_config", dc)?;
         }
         coord_kwargs.set_item("listen_port", primary_quic_port)?;
+        // The operator's run-config: the same filtered tokens the spawned
+        // secondary fetches + re-serves. Threaded into the primary's
+        // node-local `forwarded_argv` so the `RequestRunConfig` responder
+        // serves the real argv (same shape as `drive_rust_primary`).
+        coord_kwargs.set_item("forwarded_argv", forwarded_argv.clone())?;
         if attr_truthy(args, "source_already_staged") {
             let root = slurm_config.call_method0("get_srcbins_mount_source")?;
             coord_kwargs.set_item("source_pre_staged_root", root)?;

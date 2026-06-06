@@ -134,6 +134,12 @@ impl PyDistributedManager {
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         let phase_deps = self.phase_deps.clone();
+        // The shared node-local run-config (the operator's
+        // `args.forwarded_argv`). One copy seeds the in-process primary's
+        // `PrimaryConfig` and a per-secondary clone seeds each in-process
+        // `SecondaryConfig`, so every node answers `RequestRunConfig`
+        // identically.
+        let forwarded_argv = self.forwarded_argv.clone();
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         // Pre-staged mode: the submitter has no local view of the
         // staged corpus, so `_dispatch_single_process` handed us an
@@ -329,6 +335,10 @@ impl PyDistributedManager {
                     let sec_panik_poll = panik_watcher_poll_interval;
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
                     let sec_memuse_log_path = memuse_log_path.clone();
+                    // Per-secondary clone so the spawned `move` task owns its
+                    // own copy; the primary config below still holds the
+                    // original to seed itself identically.
+                    let sec_forwarded_argv = forwarded_argv.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         // Channel-backed mesh built through the
@@ -434,12 +444,13 @@ impl PyDistributedManager {
                             // `Option<PathBuf>` test-fixture
                             // flexibility (None = silent).
                             memuse_log_path: sec_memuse_log_path.clone(),
-                            // Parity default (empty): the in-process
-                            // distributed manager dials no cold-start
-                            // run-config fetch (every node shares the
-                            // submitter's argv directly), so the
-                            // node-local launch constant stays empty.
-                            forwarded_argv: Vec::new(),
+                            // The shared node-local run-config: the
+                            // in-process distributed manager dials no
+                            // cold-start fetch (every node shares the
+                            // submitter's argv directly), so each
+                            // in-process secondary seeds the SAME
+                            // operator argv the primary holds.
+                            forwarded_argv: sec_forwarded_argv,
                         };
 
                         let estimator = sec_estimator;
@@ -632,6 +643,11 @@ impl PyDistributedManager {
                     // single source of truth for the inner loop.
                     unfulfillable_reinject_max_per_task,
                     setup_promote_deadline: dist_setup_promote_deadline,
+                    // The shared node-local run-config (the operator's
+                    // `args.forwarded_argv`), seeded identically on the
+                    // in-process primary and every in-process secondary so
+                    // the `RequestRunConfig` responder answers uniformly.
+                    forwarded_argv,
                     // Staged silence schedule: keepalive-interval-relative
                     // defaults (not surfaced on the Python config today).
                     ..PrimaryConfig::default()

@@ -133,6 +133,16 @@ pub(crate) fn run_distributed<'py>(
     // pipeline silently dropped the flag and `--memprofile` on
     // single-process runs produced no `.jsonl.zst` files.
     kwargs.set_item("memprofile_enabled", secondary_template.memprofile_enabled)?;
+    // The operator's run-config (parsed `args.forwarded_argv`), seeded onto
+    // every in-process node's node-local `forwarded_argv` so the
+    // `RequestRunConfig` responder answers uniformly. Absent / not-a-list
+    // (an out-of-tree caller driving the manager with a bare Namespace)
+    // collapses to the constructor's empty default.
+    if let Ok(fwd) = task_args.getattr("forwarded_argv")
+        && let Ok(fwd) = fwd.extract::<Vec<String>>()
+    {
+        kwargs.set_item("forwarded_argv", fwd)?;
+    }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
     let args = (

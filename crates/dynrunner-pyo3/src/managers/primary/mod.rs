@@ -194,6 +194,13 @@ pub(crate) struct PyPrimaryCoordinator {
     /// Poll cadence (seconds) for the panik watcher. Default 10.0
     /// per the 2026-05-17 design thread.
     pub(super) panik_watcher_poll_interval_secs: f64,
+    /// The consumer's run-config — the byte-identical token sequence the
+    /// submitter primary forwards onto a joining / respawned / promoted
+    /// node's command line. Sourced from the operator's parsed
+    /// `args.forwarded_argv` (the SLURM `drive_rust_primary` threads it as
+    /// a kwarg). Threaded at `run()` entry into `PrimaryConfig.forwarded_argv`
+    /// so this primary answers `RequestRunConfig` from its node-local copy.
+    pub(super) forwarded_argv: Vec<String>,
 }
 
 // Rust-only surface for the SLURM-pipeline orchestrator. Not exposed
