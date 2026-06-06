@@ -1,6 +1,6 @@
-use dynrunner_core::{BoundedString, Identifier, PhaseId};
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, RemovalCause, RunMilestoneKind,
+    ClusterMutation, Destination, DistributedMessage, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -142,28 +142,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             worker,
             // Stamped at the origination choke point (apply_locally_for_broadcast).
             version: Default::default(),
-        }])
-        .await;
-    }
-
-    /// Originate an A7 run-milestone fact: the promoted primary reached a
-    /// phase-progress milestone (`kind`) for `phase`.
-    ///
-    /// Single concern: record the authority-side phase-transition the
-    /// observer cannot infer from per-task deltas (phase-task-spawning,
-    /// error- / OOM-retry-pass start) as a replicated grow-only set
-    /// element. Routed through the canonical
-    /// `apply_and_broadcast_cluster_mutations` path, so it inherits the
-    /// same local-apply + wire-fan-out + apply-filter semantics as every
-    /// other primary-originated mutation: the apply is a monotone
-    /// `HashSet::insert`, so a re-emit for an already-reached `(kind,
-    /// phase)` NoOps and is filtered off the wire (idempotent — at most
-    /// one broadcast per genuinely-new milestone). The narrator (Wave 3b)
-    /// projects the converged set off `ClusterState::run_milestones`.
-    pub(crate) async fn originate_run_milestone(&mut self, kind: RunMilestoneKind, phase: PhaseId) {
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunMilestone {
-            kind,
-            phase,
         }])
         .await;
     }

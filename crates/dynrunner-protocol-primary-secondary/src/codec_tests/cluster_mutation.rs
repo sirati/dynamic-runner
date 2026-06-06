@@ -1,6 +1,6 @@
 use super::*;
-use crate::cluster_mutation::{ClusterMutation, PrimaryChangeReason, RunMilestoneKind};
-use dynrunner_core::{PhaseId, TaskVersion};
+use crate::cluster_mutation::{ClusterMutation, PrimaryChangeReason};
+use dynrunner_core::TaskVersion;
 
 #[test]
 fn roundtrip_task_completed_with_result_data() {
@@ -487,77 +487,6 @@ fn legacy_set_can_be_primary_decodes_cap_version_as_default() {
             assert_eq!(cap_version, TaskVersion::default());
         }
         _ => panic!("expected SetCanBePrimary"),
-    }
-}
-
-/// `RunMilestone` (A7) round-trips through serde carrying a NON-DEFAULT
-/// `kind` (the OOM-retry-pass-start marker, not the `PhaseTaskSpawning`
-/// default) and its `phase`. A default-`kind` test would pass even if the
-/// field were dropped on the wire, so the assertion is pinned on the
-/// non-default.
-#[test]
-fn roundtrip_run_milestone_oom_retry() {
-    let mutation: ClusterMutation<TestId> = ClusterMutation::RunMilestone {
-        kind: RunMilestoneKind::OomRetryPassStart,
-        phase: PhaseId::from("compile"),
-    };
-
-    let json = serde_json::to_string(&mutation).unwrap();
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
-
-    match decoded {
-        ClusterMutation::RunMilestone { kind, phase } => {
-            assert_eq!(kind, RunMilestoneKind::OomRetryPassStart);
-            assert_eq!(phase, PhaseId::from("compile"));
-        }
-        _ => panic!("expected RunMilestone"),
-    }
-}
-
-/// Every `RunMilestoneKind` round-trips its discriminant verbatim — pins
-/// that the wire tag for each variant is stable (a renamed/reordered
-/// variant would change the serde tag and break cross-node convergence).
-#[test]
-fn roundtrip_run_milestone_all_kinds() {
-    for kind in [
-        RunMilestoneKind::PhaseTaskSpawning,
-        RunMilestoneKind::ErrorRetryPassStart,
-        RunMilestoneKind::OomRetryPassStart,
-    ] {
-        let mutation: ClusterMutation<TestId> = ClusterMutation::RunMilestone {
-            kind,
-            phase: PhaseId::from("p"),
-        };
-        let json = serde_json::to_string(&mutation).unwrap();
-        let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
-        match decoded {
-            ClusterMutation::RunMilestone {
-                kind: decoded_kind,
-                phase,
-            } => {
-                assert_eq!(decoded_kind, kind, "kind tag must round-trip verbatim");
-                assert_eq!(phase, PhaseId::from("p"));
-            }
-            _ => panic!("expected RunMilestone"),
-        }
-    }
-}
-
-/// Backward-compat: a `RunMilestone` frame from a sender that omits the
-/// `kind` and `phase` fields (the `#[serde(default)]` shape) decodes to
-/// the `PhaseTaskSpawning` default + empty `PhaseId`, keeping the wire safe
-/// under a coordinated/rolling restart.
-#[test]
-fn legacy_run_milestone_decodes_fields_as_default() {
-    let legacy = serde_json::json!({ "RunMilestone": {} });
-    let decoded: ClusterMutation<TestId> = serde_json::from_str(&legacy.to_string()).unwrap();
-
-    match decoded {
-        ClusterMutation::RunMilestone { kind, phase } => {
-            assert_eq!(kind, RunMilestoneKind::PhaseTaskSpawning);
-            assert_eq!(phase, PhaseId::default());
-        }
-        _ => panic!("expected RunMilestone"),
     }
 }
 

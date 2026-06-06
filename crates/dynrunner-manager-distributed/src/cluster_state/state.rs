@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
-use dynrunner_protocol_primary_secondary::{RoleTable, RunMilestoneKind, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
@@ -223,23 +223,6 @@ pub struct ClusterState<I> {
     /// reconstructs `alive_worker_count()` / `self.workers` from this
     /// replicated source rather than starting empty.
     pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
-    /// Replicated grow-only set of run-progress milestones the promoted
-    /// primary has reached (A7). Each element is a `(RunMilestoneKind,
-    /// PhaseId)` pair: a phase-task-spawning marker, or an error- /
-    /// OOM-retry-pass-start marker, per phase. Maintained by the
-    /// `RunMilestone` apply rule (`apply.rs`) as a MONOTONE grow-only set
-    /// — insert-once, never removed — so the apply is idempotent and
-    /// order-independent, the natural CRDT fit (no version stamp).
-    ///
-    /// Replicated CRDT data — clone preserves it (matches `tasks`,
-    /// `task_outputs`, `secondary_capacities` semantics). Included in
-    /// `snapshot` / `restore` (grow-only union merge) and folded into the
-    /// digest (`run_milestones_*`) so observers converge via anti-entropy:
-    /// the set IS snapshot-healable, so a flagged divergence is one a pull
-    /// actually heals (detect-WITH-heal). The narrator (Wave 3b) reads it
-    /// off [`Self::run_milestones`] and diffs it as a new edge-set to
-    /// project the promoted-primary phase milestones.
-    pub(super) run_milestones: std::collections::HashSet<(RunMilestoneKind, PhaseId)>,
     /// Node-local per-task monotone "next seq" counter — the originator's
     /// half of the `TaskVersion` stamp. The originating primary (or a
     /// promoted secondary holding a `ClusterState`) bumps this at the
@@ -292,8 +275,6 @@ where
             task_outputs: self.task_outputs.clone(),
             // Replicated CRDT data — clone preserves it.
             secondary_capacities: self.secondary_capacities.clone(),
-            // Replicated CRDT data — clone preserves it (grow-only set).
-            run_milestones: self.run_milestones.clone(),
             // Node-local originator counter — reset on clone (a cloned
             // replica originates nothing inherited from the source).
             task_seq: HashMap::new(),
@@ -324,7 +305,6 @@ where
             .field("peer_holdings", &self.peer_holdings)
             .field("task_outputs", &self.task_outputs.len())
             .field("secondary_capacities", &self.secondary_capacities)
-            .field("run_milestones", &self.run_milestones)
             .field("task_seq", &self.task_seq.len())
             .finish()
     }
@@ -351,7 +331,6 @@ impl<I> Default for ClusterState<I> {
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
             secondary_capacities: HashMap::new(),
-            run_milestones: std::collections::HashSet::new(),
             task_seq: HashMap::new(),
         }
     }
