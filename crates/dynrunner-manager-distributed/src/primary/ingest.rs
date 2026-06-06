@@ -73,6 +73,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         batch: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     ) -> Result<(), RunError> {
+        // The cold-start `phase_started_emitted` reset lives HERE (the
+        // `ColdStart` seed's concern), NOT unconditionally in `run_pipeline`:
+        // a fresh seed's CRDT is all-`Pending`, so no phase has legitimately
+        // started yet and the set must begin empty so `fire_initial_phase_starts`
+        // can fire each phase's first `on_phase_start`. The `PromotionSnapshot`
+        // path NEVER calls this, so the projection
+        // `seed_from_promotion_snapshot` seeded from the inherited ledger
+        // survives there — the call site IS the discriminator (no runtime
+        // `if seeded`). The clear must precede the `#3a` duplicate
+        // `debug_assert!(phase_started_emitted.is_empty())` below so a
+        // coordinator reused across runs still satisfies that invariant.
+        self.phase_started_emitted.clear();
+
         // Sort by size descending for better packing — same intent as
         // pre-Phase-4b. The pool preserves insertion order within a bucket,
         // so we pre-sort here and seed once.

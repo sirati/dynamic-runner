@@ -2558,15 +2558,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
-        self.phase_started_emitted.clear();
-        // The per-phase EVENT tallies (F4) and the per-(phase, bucket)
-        // retry-pass counter (P3) are NOT cleared here: they are now the
-        // replicated grow-only-MAX `ClusterState` fields. A `ColdStart` CRDT
-        // is empty (the accessor returns 0), a `PromotionSnapshot` CRDT
-        // carries the inherited counts via max-merge — and a stale clear
-        // could resurrect a re-granted budget on failover, which the
-        // grow-only-MAX merge is specifically designed to prevent. The
-        // `SeedSource` selects the CRDT origination, not a counter reset.
+        // `phase_started_emitted` is NOT cleared here. Its reset is the
+        // `ColdStart` seed's concern (`originate_cold_seed` clears it), so
+        // on the `PromotionSnapshot` path the projection
+        // `seed_from_promotion_snapshot` seeded from `phase_rollups().has_any`
+        // SURVIVES — without this a promoted primary would re-fire
+        // `on_phase_start` + re-emit the "starting job phase" line for every
+        // already-started phase. The `SeedSource` arm (via `originate_cold_seed`)
+        // is the sole discriminator, not a runtime `if seeded` fork.
+        //
+        // Same shape for the per-phase EVENT tallies (F4) and the
+        // per-(phase, bucket) retry-pass counter (P3): NOT cleared here
+        // because they are the replicated grow-only-MAX `ClusterState`
+        // fields. A `ColdStart` CRDT is empty (the accessor returns 0), a
+        // `PromotionSnapshot` CRDT carries the inherited counts via
+        // max-merge — and a stale clear could resurrect a re-granted budget
+        // on failover, which the grow-only-MAX merge is specifically
+        // designed to prevent. The `SeedSource` selects the CRDT
+        // origination, not a counter reset.
 
         // Spawn the peer-lifecycle + task-completion dispatchers BEFORE
         // any wire mutation can land. See `spawn_run_dispatchers`.
