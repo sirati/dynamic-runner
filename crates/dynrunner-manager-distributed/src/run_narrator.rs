@@ -4,11 +4,23 @@
 //!
 //! Single concern: turn the evolving [`ClusterState`] into the operator's
 //! "important" (LLM-wake-worthy) run narrative — phase-started,
-//! phase-complete, and the one-shot run-complete / run-aborted summary —
-//! by DIFFING the replicated ledger, not by hooking any one process's
-//! authority. Every line is emitted at the [`dynrunner_core::IMPORTANT_TARGET`]
-//! tracing target, exactly the marker the primary's
-//! [`crate::primary::important_events`] siblings use.
+//! phase-complete, the per-phase progress milestones (task-spawning,
+//! error- / OOM-retry-pass start), and the one-shot run-complete /
+//! run-aborted summary — by DIFFING the replicated ledger, not by hooking
+//! any one process's authority. Every line is emitted at the
+//! [`dynrunner_core::IMPORTANT_TARGET`] tracing target, exactly the marker
+//! the primary's [`crate::primary::important_events`] siblings use.
+//!
+//! # Milestones are DERIVED, not a fact
+//!
+//! There is no narrator-specific replicated milestone fact. The three
+//! per-phase progress milestones are derived from the COMPLETE converged
+//! CRDT, exactly as a promoted primary would derive them: task-spawning off
+//! the same `has_any && dispatchable` phase edge as the "starting job phase"
+//! line, and the two retry-pass-start milestones off upward steps of the
+//! replicated grow-only [`ClusterState::retry_passes_used`] map (a pass that
+//! opened on a remote promoted primary is surfaced here purely via
+//! replication).
 //!
 //! # Why narrate from the CRDT, not from the primary
 //!
@@ -40,11 +52,12 @@
 //! run-aborted summary is gated on a single `completion_emitted` latch so
 //! it fires exactly once across the whole observer tail.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{IMPORTANT_TARGET, Identifier, PhaseId};
 
 use crate::ClusterState;
+use crate::primary::retry_bucket::BucketKind;
 
 /// Stateful, pure projection that diffs the replicated [`ClusterState`]
 /// against its accumulated edge-sets and emits the operator's run
@@ -60,6 +73,17 @@ pub struct RunNarrator {
     started_phases: HashSet<PhaseId>,
     /// Phases for which the "phase complete" line has been emitted.
     done_phases: HashSet<PhaseId>,
+    /// Last-emitted retry-pass USED count per `(phase, bucket)`, diffed
+    /// against the replicated grow-only-MAX [`ClusterState::retry_passes_used`].
+    /// The retry-pass twin of the `started`/`done` edge-sets: instead of a
+    /// presence set it holds a per-key count, and a retry-pass-start
+    /// milestone is emitted on each UPWARD step (a key absent here is at the
+    /// implicit 0), since the retry-bucket bumps the count by one per pass
+    /// that actually opened. Re-observing an unchanged (or already-emitted)
+    /// count is silent, so a freshly-promoted/observing node fed a CRDT
+    /// already at N seeds its baseline to N on first sight and emits nothing
+    /// for the already-converged passes.
+    retry_passes_emitted: HashMap<(PhaseId, BucketKind), u32>,
     /// Whether the one-shot run-complete / run-aborted summary has fired.
     /// The two are mutually exclusive and share this single latch so at
     /// most one terminal line is ever emitted.
@@ -78,6 +102,7 @@ impl RunNarrator {
         Self {
             started_phases,
             done_phases: HashSet::new(),
+            retry_passes_emitted: HashMap::new(),
             completion_emitted: false,
         }
     }
@@ -116,6 +141,19 @@ impl RunNarrator {
                     phase = %phase,
                     "starting job phase",
                 );
+                // PhaseTaskSpawning milestone, derived on the SAME
+                // `has_any && dispatchable` edge the "starting job phase"
+                // line fires on — the CRDT-side twin of the milestone the
+                // removed projection emitted from `fire_initial_phase_starts`
+                // (which originated `PhaseTaskSpawning` on the same
+                // `phase_started_emitted.insert` edge as that line). Sharing
+                // the `started_phases` edge keeps the two lines on one
+                // once-per-phase guard, exactly as the authority did.
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    phase = %phase,
+                    "phase preparation / task spawning",
+                );
             }
             if rollup.has_any && !rollup.has_live && self.done_phases.insert(phase.clone()) {
                 tracing::info!(
@@ -123,6 +161,39 @@ impl RunNarrator {
                     phase = %phase,
                     "phase complete",
                 );
+            }
+        }
+
+        // Retry-pass-start milestones, derived off the replicated grow-only
+        // `retry_passes_used` map. The retry-bucket bumps a `(phase, bucket)`
+        // count by one per pass that actually opened (the SAME moment the
+        // removed projection originated its retry-pass milestone — the
+        // origination sat in the same `if !reinjected.is_empty()` block as
+        // the `record_retry_pass_used(used + 1)` bump), so an UPWARD step of
+        // the replicated count is the faithful edge for a pass start. Mirrors
+        // the started/done edge-sets, keyed by count rather than presence:
+        // emit once whenever the observed count exceeds the last-emitted one
+        // and store the new count, so a re-observe of an unchanged count is
+        // silent and a cold-join/promoted node fed a count already at N
+        // emits once for the 0→N step (it has no per-step history to
+        // replay). `BucketKind` selects the operator wording.
+        for (key, used) in state.retry_passes_used() {
+            let last = self.retry_passes_emitted.get(key).copied().unwrap_or(0);
+            if used > last {
+                self.retry_passes_emitted.insert(key.clone(), used);
+                let (phase, bucket) = key;
+                match bucket {
+                    BucketKind::Recoverable => tracing::info!(
+                        target: IMPORTANT_TARGET,
+                        phase = %phase,
+                        "error-retry-pass start",
+                    ),
+                    BucketKind::Oom => tracing::info!(
+                        target: IMPORTANT_TARGET,
+                        phase = %phase,
+                        "OOM-retry-pass start",
+                    ),
+                }
             }
         }
 
@@ -178,6 +249,7 @@ impl RunNarrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primary::retry_bucket::BucketKind;
     use crate::test_capture::{ImportantCapture, important_only};
     use dynrunner_core::{ErrorType, PhaseId, RunnerIdentifier, TaskDep, TaskInfo, TypeId};
     use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
@@ -225,6 +297,20 @@ mod tests {
             hash: hash.to_string(),
             result_data: None,
         });
+    }
+
+    /// Bump the replicated retry-pass USED count for `(phase, bucket)` to at
+    /// least `used` — the same grow-only-MAX originator the live retry-bucket
+    /// caller drives after a reinjecting pass. Modelling the pass-start this
+    /// way (rather than a `ClusterMutation`) mirrors the real path: the count
+    /// rides the snapshot + anti-entropy digest, there is no wire mutation.
+    fn bump_retry_pass(
+        state: &mut ClusterState<RunnerIdentifier>,
+        phase: &str,
+        bucket: BucketKind,
+        used: u32,
+    ) {
+        state.record_retry_pass_used((PhaseId::from(phase), bucket), used);
     }
 
     /// Run a closure with an `ImportantCapture` installed as the default
@@ -443,6 +529,175 @@ mod tests {
         assert!(
             events.iter().all(|e| !e.message.contains("phase complete")),
             "a phase whose only task is Blocked is not complete: {events:?}"
+        );
+    }
+
+    /// The phase-task-spawning milestone fires on the SAME `has_any &&
+    /// dispatchable` edge as the "starting job phase" line — once per phase,
+    /// not before the phase becomes dispatchable, not twice on a re-observe.
+    #[test]
+    fn phase_task_spawning_on_dispatchable_edge_once() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            add(&mut state, &task("compile", "a", &[]));
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            // Re-observe the unchanged ledger: idempotent.
+            narrator.observe(&state);
+        });
+
+        let spawn: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("phase preparation / task spawning"))
+            .collect();
+        assert_eq!(
+            spawn.len(),
+            1,
+            "exactly one task-spawning line on the dispatchable edge: {events:?}"
+        );
+        assert_eq!(
+            spawn[0].fields.get("phase").map(String::as_str),
+            Some("compile")
+        );
+    }
+
+    /// A gated phase emits NO task-spawning milestone until its upstream
+    /// fully terminates and it becomes dispatchable — pinning the milestone
+    /// to the dispatchable edge, not mere task presence.
+    #[test]
+    fn phase_task_spawning_waits_for_dispatchable() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            state.apply(ClusterMutation::PhaseDepsSet {
+                deps: std::collections::HashMap::from([(
+                    PhaseId::from("compile"),
+                    vec![PhaseId::from("build")],
+                )]),
+            });
+            add(&mut state, &task("build", "tc", &[]));
+            add(&mut state, &task("compile", "a", &[]));
+
+            let mut narrator = RunNarrator::new();
+            // build dispatchable, compile gated.
+            narrator.observe(&state);
+            complete(&mut state, "tc");
+            // compile now dispatchable.
+            narrator.observe(&state);
+        });
+
+        let spawned: Vec<&str> = events
+            .iter()
+            .filter(|e| e.message.contains("phase preparation / task spawning"))
+            .filter_map(|e| e.fields.get("phase").map(String::as_str))
+            .collect();
+        assert_eq!(
+            spawned,
+            vec!["build", "compile"],
+            "task-spawning fires per phase only once it is dispatchable: {events:?}"
+        );
+    }
+
+    /// An upward step of the replicated `retry_passes_used` count emits the
+    /// retry-pass-start milestone whose wording matches the bucket:
+    /// Recoverable → error-retry, Oom → OOM-retry. Once per increment; a
+    /// re-observe of the unchanged count is silent.
+    #[test]
+    fn retry_pass_milestone_per_bucket_on_increment() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+
+            // Error-retry pass opens (count 0 → 1).
+            bump_retry_pass(&mut state, "compile", BucketKind::Recoverable, 1);
+            narrator.observe(&state);
+            // OOM-retry pass opens (count 0 → 1).
+            bump_retry_pass(&mut state, "compile", BucketKind::Oom, 1);
+            narrator.observe(&state);
+            // Re-observe the unchanged counts: idempotent.
+            narrator.observe(&state);
+        });
+
+        let err: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("error-retry-pass start"))
+            .collect();
+        assert_eq!(err.len(), 1, "one error-retry-pass line: {events:?}");
+        assert_eq!(
+            err[0].fields.get("phase").map(String::as_str),
+            Some("compile")
+        );
+
+        let oom: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("OOM-retry-pass start"))
+            .collect();
+        assert_eq!(oom.len(), 1, "one OOM-retry-pass line: {events:?}");
+        assert_eq!(
+            oom[0].fields.get("phase").map(String::as_str),
+            Some("compile")
+        );
+    }
+
+    /// Each successive retry pass (the count stepping 1 → 2 → 3) emits its
+    /// own milestone — one line per increment, since each opened pass bumps
+    /// the replicated count by exactly one.
+    #[test]
+    fn retry_pass_milestone_once_per_increment() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+
+            for n in 1..=3 {
+                bump_retry_pass(&mut state, "compile", BucketKind::Recoverable, n);
+                narrator.observe(&state);
+            }
+        });
+
+        let err: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("error-retry-pass start"))
+            .collect();
+        assert_eq!(
+            err.len(),
+            3,
+            "one error-retry-pass line per opened pass (1→2→3): {events:?}"
+        );
+    }
+
+    /// Snapshot-driven: a freshly-promoted/observing node fed a converged
+    /// CRDT whose `retry_passes_used` is ALREADY at N (with no per-task work
+    /// for the phase in this replica's mirror) emits the retry-pass milestone
+    /// once for the 0→N step — and an idempotent re-observe of that same
+    /// state emits nothing further. Proves the derivation is purely
+    /// snapshot-driven (the milestone has no source but the converged count)
+    /// and dedups on re-observe.
+    #[test]
+    fn retry_pass_milestone_snapshot_driven_and_dedups() {
+        let events = capture(|| {
+            // A remote promoted primary ran 4 OOM-retry passes for this
+            // phase; only the converged count survives in this replica.
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            bump_retry_pass(&mut state, "remote-phase", BucketKind::Oom, 4);
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            // Idempotent re-observe of the converged state.
+            narrator.observe(&state);
+        });
+
+        let oom: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("OOM-retry-pass start"))
+            .collect();
+        assert_eq!(
+            oom.len(),
+            1,
+            "one OOM-retry-pass line for the converged 0→N step, dedup'd on re-observe: {events:?}"
+        );
+        assert_eq!(
+            oom[0].fields.get("phase").map(String::as_str),
+            Some("remote-phase")
         );
     }
 }

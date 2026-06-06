@@ -157,6 +157,23 @@ impl<I: Identifier> ClusterState<I> {
         read_grow_max(&self.retry_passes_used, key)
     }
 
+    /// Iterate every `((phase, bucket), used)` entry of the replicated
+    /// retry-pass USED map (P3). The read-seam the run-narrator diffs to
+    /// surface error- / OOM-retry-pass-start milestones from the converged
+    /// CRDT: each upward step of a key's `used` count is one retry pass that
+    /// opened (the retry-bucket core bumps it by exactly one per reinjecting
+    /// pass), so the narrator's last-seen-vs-current edge over THIS iterator
+    /// is the faithful derivation of the removed retry-pass milestones — a
+    /// pass opened on a promoted primary (a different node) is surfaced here
+    /// purely via replication, no per-node authority. Unlike
+    /// `retry_pass_used_for` (a single-key budget read) the narrator must
+    /// discover WHICH keys exist, so it borrows the whole map.
+    pub(crate) fn retry_passes_used(
+        &self,
+    ) -> impl Iterator<Item = (&(PhaseId, BucketKind), u32)> {
+        self.retry_passes_used.iter().map(|(k, v)| (k, *v))
+    }
+
     /// Originate a retry-pass USED count (P3): max-bump the local count for
     /// `key` to at least `used`. Called by the async retry-bucket caller
     /// with the new used count the pure core returned. Grow-only MAX —
