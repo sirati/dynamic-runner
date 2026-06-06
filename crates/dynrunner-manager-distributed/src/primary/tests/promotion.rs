@@ -589,7 +589,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         .await;
 }
 
-/// The deepest failover-completeness guard (F2): a retry reset
+/// The deepest failover-completeness guard: a retry reset
 /// (`Failed { attempt: n } → Pending { attempt: n+1 }`) MUST survive a
 /// `restore()` of a peer snapshot still holding the stale
 /// `Failed { attempt: n }`.
@@ -716,4 +716,274 @@ async fn retry_reset_survives_anti_entropy_heal() {
             }
         })
         .await;
+}
+
+/// A promotion that inherits an `InFlight` task whose type is capped must
+/// reserve the per-type concurrency slot on hydrate, so the eventual
+/// terminal release (`free_slot_on_terminal`'s `saturating_sub`) is
+/// symmetric. Pre-fix `seed_inflight` inserted the ledger entry without a
+/// `reserve_type_slot`, so the counter sat at 0; the inherited task's
+/// completion then fired `saturating_sub` against 0 (clamped, no underflow
+/// panic) and the cap desynced — every subsequent dispatch saw a phantom
+/// free slot and over-dispatched past `max_concurrent_per_type`. This test
+/// pins the reservation (counter == 1 after hydrate) AND the symmetric
+/// release (back to 0 after the broadcast completion, NOT a stuck-low
+/// counter).
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_inflight_reserves_per_type_slot_for_symmetric_release() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let cap_type = dynrunner_core::TypeId::from("default");
+
+            let (transport, _ends) = setup_test(1);
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                max_concurrent_per_type: HashMap::from([(cap_type.clone(), 4)]),
+                ..test_primary_config()
+            };
+            let (mut promoted, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let task = make_binary("inflight-cap", 100);
+            {
+                let cs = promoted.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "secondary-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "inflight-cap".into(),
+                    task: task.clone(),
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    hash: "inflight-cap".into(),
+                    secondary: "secondary-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                    attempt: 0,
+                });
+            }
+
+            promoted.hydrate_from_cluster_state();
+
+            // The inherited InFlight task reserved its type slot — symmetric
+            // with the live `commit_assignment` path.
+            assert_eq!(
+                promoted.in_flight_per_type_for_test(&cap_type),
+                1,
+                "inherited InFlight task must reserve its per-type slot on hydrate"
+            );
+
+            // The broadcast completion releases the slot through
+            // `free_slot_on_terminal`; the reserved counter drops back to 0.
+            let msg = DistributedMessage::TaskComplete {
+                target: None,
+                sender_id: "secondary-0".into(),
+                timestamp: 0.0,
+                secondary_id: "secondary-0".into(),
+                worker_id: 0,
+                task_hash: "inflight-cap".into(),
+                result_data: None,
+            };
+            promoted.handle_task_complete(msg, &mut None).await;
+
+            assert_eq!(
+                promoted.in_flight_per_type_for_test(&cap_type),
+                0,
+                "terminal release must return the per-type counter to 0 \
+                 (reservation + release are symmetric — no stuck-low cap desync)"
+            );
+        })
+        .await;
+}
+
+/// A promotion-hydrate must rebuild `all_binaries` (the OOM/retry candidate
+/// source `retry_bucket` filters against) from the inherited CRDT. Pre-fix
+/// the seeded path left it empty, so a promoted primary's retry bucket had
+/// NO candidate source. Every ledger entry carries its `TaskInfo` regardless
+/// of state, so the rebuilt universe spans Pending + InFlight + terminal.
+#[test]
+fn promoted_hydrate_rebuilds_all_binaries_candidate_source() {
+    let (transport, _ends) = setup_test(1);
+    let (mut promoted, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    {
+        let cs = promoted.cluster_state_mut_for_test();
+        // A spread of states: Pending, InFlight, and terminal Completed —
+        // all three must contribute to the candidate universe.
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "secondary-0".into(),
+            worker_count: 1,
+            resources: mem(8 * 1024 * 1024 * 1024),
+        });
+        for name in ["pend-1", "pend-2"] {
+            let t = make_binary(name, 100);
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: name.into(),
+                task: t,
+            });
+        }
+        let inflight = make_binary("inflight-1", 100);
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "inflight-1".into(),
+            task: inflight,
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            hash: "inflight-1".into(),
+            secondary: "secondary-0".into(),
+            worker: 0,
+            version: Default::default(),
+            attempt: 0,
+        });
+        let done = make_binary("done-1", 100);
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "done-1".into(),
+            task: done,
+        });
+        cs.apply(ClusterMutation::TaskCompleted {
+            hash: "done-1".into(),
+            result_data: None,
+            attempt: 0,
+        });
+    }
+
+    // Pre-condition: the freshly-built coordinator has an empty universe.
+    assert!(
+        promoted.all_binaries.is_empty(),
+        "all_binaries starts empty before hydrate"
+    );
+
+    promoted.hydrate_from_cluster_state();
+
+    // The candidate universe spans EVERY ledger entry (4 tasks across
+    // three state classes), so the retry bucket has a source to filter.
+    assert_eq!(
+        promoted.all_binaries.len(),
+        4,
+        "all_binaries must rebuild from every CRDT entry regardless of state"
+    );
+    let names: std::collections::HashSet<&str> = promoted
+        .all_binaries
+        .iter()
+        .map(|t| t.task_id.as_str())
+        .collect();
+    assert!(names.contains("pend-1"));
+    assert!(names.contains("inflight-1"));
+    assert!(names.contains("done-1"));
+}
+
+/// A promotion-hydrate must advance `next_secondary_id` past the highest id
+/// already in the inherited roster, so a respawn after promotion never mints
+/// an id that collides with one the pre-failover primary already minted.
+/// Pre-fix `next_secondary_id` reset to `config.num_secondaries` on
+/// promotion, colliding with any respawned id above that floor.
+#[test]
+fn promoted_hydrate_advances_next_secondary_id_past_roster_max() {
+    let (transport, _ends) = setup_test(1);
+    let config = PrimaryConfig {
+        num_secondaries: 2,
+        ..test_primary_config()
+    };
+    let (mut promoted, _mesh) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    {
+        let cs = promoted.cluster_state_mut_for_test();
+        // Roster from a run that had already respawned past the bootstrap
+        // range: ids secondary-0, secondary-1 (bootstrap) + secondary-5
+        // (a respawn the pre-failover primary minted).
+        for id in ["secondary-0", "secondary-1", "secondary-5"] {
+            cs.apply(ClusterMutation::SecondaryCapacity {
+                secondary: id.into(),
+                worker_count: 1,
+                resources: mem(8 * 1024 * 1024 * 1024),
+            });
+        }
+    }
+
+    promoted.hydrate_from_cluster_state();
+
+    // The next mint must exceed the highest known id (secondary-5 → 6),
+    // NOT reset to the `num_secondaries` floor (2) where it would collide
+    // with secondary-2..secondary-5.
+    assert_eq!(
+        promoted.next_secondary_id, 6,
+        "next_secondary_id must be max(known roster id) + 1, not the \
+         num_secondaries floor"
+    );
+    assert_eq!(
+        promoted.mint_secondary_id(),
+        "secondary-6",
+        "the first respawn after promotion mints a collision-free id"
+    );
+}
+
+/// A promotion-hydrate must seed `phase_started_emitted` from the inherited
+/// CRDT (a phase is "started" iff its rollup `has_any`), so a promoted
+/// primary does NOT re-fire `on_phase_start` for a phase that already started
+/// pre-failover. Seeded ONLY on the promote path
+/// (`seed_from_promotion_snapshot`); the cold path's freshly-`Pending` CRDT
+/// must NOT suppress the legitimate first fire.
+#[test]
+fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() {
+    let (transport, _ends) = setup_test(1);
+    let (mut live, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    {
+        let cs = live.cluster_state_mut_for_test();
+        // A started phase "build" (≥1 ledger entry) and a never-reached
+        // phase "ship" (no entries).
+        let mut t = make_binary("b-1", 100);
+        t.phase_id = dynrunner_core::PhaseId::from("build");
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "b-1".into(),
+            task: t,
+        });
+    }
+    let snapshot = live.cluster_state_for_test().snapshot();
+
+    let (transport2, _ends2) = setup_test(1);
+    let (mut promoted, _mesh2) = build_test_primary(
+        PrimaryConfig::default(),
+        transport2,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    promoted.seed_from_promotion_snapshot(snapshot);
+
+    // "build" is seeded as already-started (so `on_phase_start` won't
+    // re-fire); "ship" (no ledger entry) is NOT, so a later fire there is
+    // still legitimate.
+    assert!(
+        promoted
+            .phase_started_emitted
+            .contains(&dynrunner_core::PhaseId::from("build")),
+        "an already-started phase must be seeded so on_phase_start does not re-fire"
+    );
+    assert!(
+        !promoted
+            .phase_started_emitted
+            .contains(&dynrunner_core::PhaseId::from("ship")),
+        "a never-reached phase must NOT be marked started"
+    );
 }

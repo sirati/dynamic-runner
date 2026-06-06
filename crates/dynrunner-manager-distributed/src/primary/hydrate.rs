@@ -72,8 +72,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let mut items: Vec<TaskInfo<I>> = Vec::new();
         let mut in_flight_pairs: Vec<(String, PhaseId)> = Vec::new();
         let mut in_flight_seed: Vec<(String, PhaseId, String, u32, TaskInfo<I>)> = Vec::new();
+        // The run-start task universe — the OOM/retry candidate source
+        // (`retry_bucket` filters `all_binaries` × `failed_tasks`). EVERY
+        // ledger entry carries its `TaskInfo` regardless of state, so the
+        // universe is the `task()` of every entry: a pure derived cache of
+        // the CRDT, rebuilt on hydrate exactly like the pool.
+        let mut all_binaries: Vec<TaskInfo<I>> = Vec::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
+            all_binaries.push(state.task().clone());
             match state {
                 // Terminal-ish for hydration: contribute task_id to the
                 // dep-resolution seed and mark hash as completed in the
@@ -171,6 +178,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
 
         self.completed_tasks = primary_completed;
+        // Rebuild the OOM/retry candidate universe from the CRDT so a
+        // promoted primary's retry bucket has a candidate source (it was
+        // empty on the seeded path before this). Pure derived cache.
+        self.all_binaries = all_binaries;
+        // `single_worker_mode` is an ephemeral within-bucket dispatch-shape
+        // flag, NOT a failover decision input: a freshly-promoted primary
+        // starts unmasked and the next OOM-bucket entry re-arms it. Reset
+        // to the cold value so a stale `true` never carries across hydrate.
+        self.single_worker_mode = false;
         items.sort_by_key(|i| std::cmp::Reverse(i.size));
 
         let phase_deps = self.cluster_state.phase_deps().clone();
@@ -495,6 +511,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     .map(|cap| (id, cap.worker_count, cap.resources.clone(), can_be_primary))
             })
             .collect();
+
+        // The next minted id must exceed every id already in the roster so
+        // a respawn after promotion never collides with one the pre-failover
+        // primary already minted (it had advanced the counter past
+        // `config.num_secondaries`). `next_secondary_id` is a pure derived
+        // cache of the CRDT roster's id space; the `.max(self.next_secondary_id)`
+        // floor preserves the `config.num_secondaries` bootstrap reservation
+        // when the roster is smaller than that floor.
+        let max_known = self
+            .cluster_state
+            .known_secondaries()
+            .filter_map(super::secondary_id::parse_secondary_index)
+            .max();
+        if let Some(m) = max_known {
+            self.next_secondary_id = self.next_secondary_id.max(m + 1);
+        }
 
         self.secondaries.clear();
         self.secondary_keepalives.clear();
