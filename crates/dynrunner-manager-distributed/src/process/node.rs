@@ -18,8 +18,11 @@
 //! # Scope of THIS file (foundation only)
 //!
 //! This is the SKELETON: the struct shape, [`RoleEntry`], the typed
-//! [`PromotionSignal`], and the channel plumbing (`promotion`/`demote`
-//! senders handed out, receivers held). It deliberately does NOT define
+//! [`PromotionSignal`], and the promotion channel plumbing (the
+//! `promotion_tx` handed out, its receiver held). The demote channel is
+//! NOT a node-owned leg — the real BUG-6 demote pairs the role-change
+//! hook's sender with the primary coordinator's own `demote_rx` at the
+//! composition / promotion-build site. It deliberately does NOT define
 //! `Node::run`, does NOT compose or spawn the coordinators, and does NOT
 //! build a primary on a promotion signal — those are the later
 //! coordinator-rewire + node-wiring waves, which fill the `#[allow(
@@ -147,12 +150,6 @@ where
     // TODO(C-NODE): drained by `Node::run`'s promotion arm.
     #[allow(dead_code)]
     pub promotion_rx: mpsc::UnboundedReceiver<PromotionSignal<I>>,
-    /// Demote ingress: the BUG-6 role-change hook signals here on ANY
-    /// self→other primary-register flip (apply OR restore/merge heal); the
-    /// node-wiring wave's loop drains this and drops `self.primary` (§1.5).
-    // TODO(C-NODE): drained by `Node::run`'s demote arm.
-    #[allow(dead_code)]
-    pub demote_rx: mpsc::UnboundedReceiver<()>,
 }
 
 impl<I, Tr, P, S, O> Node<I, Tr, P, S, O>
@@ -162,34 +159,28 @@ where
 {
     /// Build a fresh node shell around a `mesh`, with no roles yet live.
     ///
-    /// Returns the node plus the two ingress SENDERS the node hands out:
+    /// Returns the node plus the promotion ingress SENDER it hands out:
     /// `promotion_tx` is installed on the secondary (mirror of
     /// `register_panik_signal_rx`) so a self-named promotion signals the
-    /// node; `demote_tx` is installed on the BUG-6 role-change hook so a
-    /// self→other primary flip signals teardown. Both are best-effort: a
-    /// dropped receiver means the node is winding down.
+    /// node. It is best-effort: a dropped receiver means the node is winding
+    /// down. The BUG-6 demote channel is NOT minted here — the real demote
+    /// pairs the role-change hook's sender (`NodeRunInputs::primary_demote_tx`
+    /// on the bootstrap path, a fresh pair on the promotion-build path) with
+    /// the primary coordinator's own `demote_rx`; the node never owns one.
     ///
     /// The roles start `None`; the node-wiring wave registers them on the
     /// mesh (minting each `(slot, client, inbox)` trio) and builds the
     /// coordinators with `client + inbox`.
-    pub fn new(
-        mesh: Mesh<I, Tr>,
-    ) -> (
-        Self,
-        mpsc::UnboundedSender<PromotionSignal<I>>,
-        mpsc::UnboundedSender<()>,
-    ) {
+    pub fn new(mesh: Mesh<I, Tr>) -> (Self, mpsc::UnboundedSender<PromotionSignal<I>>) {
         let (promotion_tx, promotion_rx) = mpsc::unbounded_channel();
-        let (demote_tx, demote_rx) = mpsc::unbounded_channel();
         let node = Self {
             mesh,
             primary: None,
             secondary: None,
             observer: None,
             promotion_rx,
-            demote_rx,
         };
-        (node, promotion_tx, demote_tx)
+        (node, promotion_tx)
     }
 
     /// Compose a primary role onto this node (builder form). The `slot` is the

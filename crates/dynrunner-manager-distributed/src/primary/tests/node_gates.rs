@@ -346,7 +346,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 FixedEstimator(100),
             );
             secondary.set_bootstrap_primary_id("primary".to_string());
-            let (sec_node, _sec_promo_tx, _sec_demote_tx) = Node::new(sec_mesh);
+            let (sec_node, _sec_promo_tx) = Node::new(sec_mesh);
             let sec_node = sec_node.with_secondary(secondary, sec_slot);
             let sec_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 secondary_factory: Some(FakeWorkerFactory),
@@ -373,7 +373,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            let (pri_node, _pri_promo_tx, _pri_demote_tx_unused) = Node::new(pri_mesh);
+            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
             let pri_node = pri_node.with_primary(primary, pri_slot);
             let binaries: Vec<TaskInfo<TestId>> = (0..3)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))

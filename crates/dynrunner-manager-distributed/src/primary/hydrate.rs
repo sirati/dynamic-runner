@@ -62,10 +62,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// the new pool's `completed_tasks` with those task_ids,
     /// `extend()`'s validation rejects every variant whose toolchain
     /// finished pre-composition as `UnknownTaskDep`.
-    /// Exercised directly by the hydrate tests; the production
-    /// snapshot-seeded construction caller lands in Phase C (see the R4
-    /// annotation).
-    #[allow(dead_code)] // TODO(R4): called from activate_local_primary (P4 composition)
+    /// Exercised directly by the hydrate tests and by the production
+    /// snapshot-seeded construction caller (`seed_from_promotion_snapshot`).
     pub(crate) fn hydrate_from_cluster_state(&mut self) {
         let mut completed_task_ids: HashSet<String> = HashSet::new();
         let mut primary_completed: HashSet<String> = HashSet::new();
