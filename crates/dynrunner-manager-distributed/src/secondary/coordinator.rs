@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
-use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
+use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator, SetupDiscovery};
 use crate::cluster_state::ClusterState;
 use crate::process::{MeshClient, PromotionSignal, RoleInbox};
 use crate::zip_extract::ExtractionCache;
@@ -112,6 +112,7 @@ where
             fatal_exit_signal_rx: None,
             on_phase_end: None,
             on_phase_start: None,
+            setup_discovery: None,
             command_rx: Some(command_rx),
             command_tx,
             // Lazily constructed in `run_until_setup_or_done_inner`
@@ -164,7 +165,7 @@ where
     /// concern.
     pub fn register_promotion_signal(
         &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<PromotionSignal>,
+        tx: tokio::sync::mpsc::UnboundedSender<PromotionSignal<I>>,
     ) {
         self.promotion_tx = Some(tx);
     }
@@ -383,6 +384,30 @@ where
     ) {
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
+    }
+
+    /// Register the consumer's setup-discovery policy — the mirror of
+    /// [`Self::register_phase_lifecycle_callbacks`] for the pre-staged
+    /// setup-promote path. Must be called BEFORE [`Self::run`].
+    ///
+    /// With a discovery registered, the [`Self::run`] convenience wrapper
+    /// DRIVES the `RunOutcome::SetupPending` yield loop itself (rather than
+    /// erroring on the yield): on each `SetupPending` it `.await`s the
+    /// policy's future, feeds the result through
+    /// [`Self::ingest_setup_discovery`], and re-enters the loop. The
+    /// framework (this coordinator) thus owns the setup-promote DRIVE while
+    /// the discovery POLICY stays the consumer's — the pyo3 wrapper supplies
+    /// a closure that runs Python's `task.discover_items` on a
+    /// non-runtime-blocking thread so the `Node`'s mesh-pump keeps the
+    /// keepalives flowing during discovery (see [`SetupDiscovery`] for the
+    /// non-block correctness contract).
+    ///
+    /// Single concern: own the registration surface for the setup-discovery
+    /// policy. Absent registration the secondary never observes
+    /// `SetupPending` (non-pre-staged modes) and `run` resolves on the first
+    /// `Terminal`.
+    pub fn register_setup_discovery(&mut self, discovery: SetupDiscovery<I>) {
+        self.setup_discovery = Some(discovery);
     }
 
     /// Tear down the task-completion dispatcher task. Mirrors
@@ -913,47 +938,89 @@ where
     /// 3. Wait for peer list, initial assignment, transfer complete
     /// 4. Process tasks: receive assignments, run on local workers, report back
     ///
-    /// Convenience wrapper around `run_until_setup_or_done` for callers
-    /// that don't participate in the setup-promote handshake (every
-    /// caller other than the PyO3 secondary wrapper, which has to
-    /// re-enter the loop after running Python `task.discover_items`).
-    /// The outcome can only be `Done` here, because `SetupPending`
-    /// requires an `InitialAssignment { pre_staged_mode: true }` wire
-    /// arrival (the discovery-yield carrier) and no test/non-pyo3 setup
-    /// ever sends one.
+    /// The single production secondary entry (the `Node::run` secondary arm
+    /// drives this). It wraps `run_until_setup_or_done` and OWNS the
+    /// setup-promote yield drive: when a setup-discovery policy is registered
+    /// (via [`Self::register_setup_discovery`], the pre-staged path), a
+    /// `RunOutcome::SetupPending` yield re-enters the policy's discovery
+    /// future and `ingest_setup_discovery`, then resumes the loop — the
+    /// framework owns the drive, the consumer owns the policy. The
+    /// discovery future is `.await`ed (never thread-blocked) so the
+    /// `Node`'s mesh-pump keeps the keepalives flowing during discovery
+    /// (the §14/§15 non-block contract on [`SetupDiscovery`]).
+    ///
+    /// Without a registered policy a `SetupPending` yield is a programmer
+    /// error (a non-pre-staged caller never receives the
+    /// `InitialAssignment { pre_staged_mode: true }` that triggers it), so
+    /// it surfaces as an `Err`. On a terminal, the per-secondary terminal is
+    /// read off the lifecycle (the single source of truth) and projected to
+    /// a `Result`: `Done`⇒`Ok`, `Aborted`/`Panik`/`Failed`⇒`Err`. (The
+    /// `Node::run` secondary arm surfaces this `Err`; the pyo3 boundary maps
+    /// the lifecycle terminal to the `std::process::exit` code via
+    /// [`Self::terminal`].)
     pub async fn run(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
-        match self.run_until_setup_or_done(factory).await? {
-            RunOutcome::SetupPending => Err(
-                "secondary yielded SetupPending but caller is the legacy run() \
-                 wrapper which cannot drive setup discovery — programming error \
-                 (only the PyO3 secondary wrapper should invoke a secondary that \
-                 may be promoted with required_setup=true)"
-                    .to_string(),
-            ),
-            // Reached a terminal — read the per-secondary terminal off the
-            // lifecycle (the single source of truth). The PyO3 wrapper
-            // takes the structured terminal and calls `std::process::exit`
-            // (137 panik / 1 abort); the legacy `run()` path has no such
-            // side-effect channel, so it surfaces `Aborted`/`Panik` as a
-            // normal String error and `Done` as `Ok`. (`Failed` never
-            // reaches here — `fatal_exit` propagates as the run loop's
-            // `Err` before this match. The watcher is not triggered by
-            // legacy `run()` callers, so the panik arm is structurally cold
-            // in production Rust-only usage.)
-            RunOutcome::Terminal => match self.lifecycle.terminal() {
-                Some(super::SecondaryTerminal::Done) | None => Ok(()),
-                Some(super::SecondaryTerminal::Panik {
-                    matched_path,
-                    reason,
-                }) => Err(format!(
-                    "secondary panik shutdown: {reason} (matched_path={})",
-                    matched_path.display()
-                )),
-                Some(super::SecondaryTerminal::Aborted { reason }) => {
-                    Err(format!("run aborted by primary: {reason}"))
+        loop {
+            match self.run_until_setup_or_done(factory).await? {
+                RunOutcome::SetupPending => {
+                    // Drive the setup-promote yield: run the consumer's
+                    // discovery policy (its future is `.await`ed, NOT
+                    // thread-blocked, so the mesh-pump keeps the keepalives
+                    // alive during discovery — §14/§15), feed the result onto
+                    // the mesh via `ingest_setup_discovery`, then re-enter the
+                    // loop. The fire-once latch in `ingest_setup_discovery`
+                    // prevents a re-yield, so this branch runs at most once.
+                    // Take the policy out so the discovery future (which we
+                    // `.await`) does not hold a borrow of `self` across the
+                    // await — `ingest_setup_discovery` needs `&mut self`, so
+                    // the two borrows must be disjoint in time.
+                    let Some(mut discovery) = self.setup_discovery.take() else {
+                        return Err(
+                            "secondary yielded SetupPending but no setup-discovery policy \
+                             was registered — programming error (only a pre-staged caller \
+                             that called register_setup_discovery may be promoted with \
+                             required_setup=true)"
+                                .to_string(),
+                        );
+                    };
+                    // Clone the phase-dep graph for the ingest BEFORE running
+                    // the discovery future (the future borrows `discovery`
+                    // mutably). Run discovery (`.await` yields to the pump),
+                    // then ingest.
+                    let phase_deps = discovery.phase_deps.clone();
+                    let discovered = (discovery.discover)().await?;
+                    // Put the policy back so a (latch-suppressed but defensive)
+                    // re-yield still finds it, mirroring the resumable-state
+                    // discipline of the panik/command receivers.
+                    self.setup_discovery = Some(discovery);
+                    self.ingest_setup_discovery(discovered, phase_deps).await?;
+                    // Loop: re-enter `run_until_setup_or_done`, which
+                    // short-circuits the setup handshake (the latch is set) and
+                    // re-enters `process_tasks` directly.
                 }
-                Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
-            },
+                // Reached a terminal — read the per-secondary terminal off the
+                // lifecycle (the single source of truth). The PyO3 wrapper
+                // takes the structured terminal (via `terminal()`) and calls
+                // `std::process::exit` (137 panik / 1 abort); this `run` path
+                // surfaces `Aborted`/`Panik` as a normal String error and
+                // `Done` as `Ok`. (`Failed` never reaches here — `fatal_exit`
+                // propagates as the run loop's `Err` before this match.)
+                RunOutcome::Terminal => {
+                    return match self.lifecycle.terminal() {
+                        Some(super::SecondaryTerminal::Done) | None => Ok(()),
+                        Some(super::SecondaryTerminal::Panik {
+                            matched_path,
+                            reason,
+                        }) => Err(format!(
+                            "secondary panik shutdown: {reason} (matched_path={})",
+                            matched_path.display()
+                        )),
+                        Some(super::SecondaryTerminal::Aborted { reason }) => {
+                            Err(format!("run aborted by primary: {reason}"))
+                        }
+                        Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
+                    };
+                }
+            }
         }
     }
 

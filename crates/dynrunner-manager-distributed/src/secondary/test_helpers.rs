@@ -94,7 +94,7 @@ pub(super) struct SecondaryHarness<P: PeerTransport<TestId>> {
     coord: TestSecondary,
     pub(super) test_mesh: Mesh<TestId, P>,
     _slot: Arc<RoleSlot<TestId>>,
-    pub(super) promotion_rx: mpsc::UnboundedReceiver<PromotionSignal>,
+    pub(super) promotion_rx: mpsc::UnboundedReceiver<PromotionSignal<TestId>>,
 }
 
 impl<P: PeerTransport<TestId>> Deref for SecondaryHarness<P> {

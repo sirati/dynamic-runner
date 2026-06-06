@@ -239,9 +239,14 @@ async fn observer_exits_on_dead_fleet() {
                     .run()
                     .await
                     .expect_err("dead fleet with no RunComplete must exit Err");
+                // The strand backstop is typed `ClusterCollapsed` (a STRUCTURED
+                // error that the PyO3 boundary RAISES on — the §14/§15 contract:
+                // a strand must surface non-zero, never the `Other` swallow).
+                // The "fleet-dead" detail rides the tracing log, not the
+                // Display; the structural assertion is the variant.
                 assert!(
-                    err.to_string().contains("fleet-dead"),
-                    "dead-fleet exit must surface a fleet-dead error: {err}"
+                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
+                    "dead-fleet exit must surface a structured ClusterCollapsed strand: {err}"
                 );
             })
             .await;
@@ -279,10 +284,18 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
                     .run()
                     .await
                     .expect_err("silent named primary must exit Err");
-                let msg = err.to_string();
+                // Typed `ClusterCollapsed` (a STRUCTURED strand the PyO3
+                // boundary RAISES on — §14/§15). The silent-primary id rides
+                // the tracing log (the `detail`), not the Display; the
+                // structural assertion is the variant + the "stranded"
+                // accounting the Display still renders.
                 assert!(
-                    msg.contains("stranded") && msg.contains("sec-0"),
-                    "the silence exit must name the silent primary and say stranded: {msg}"
+                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
+                    "the silence exit must surface a structured ClusterCollapsed strand: {err}"
+                );
+                assert!(
+                    err.to_string().contains("stranded"),
+                    "the strand Display still renders the stranded accounting: {err}"
                 );
             })
             .await;

@@ -448,6 +448,25 @@ where
         0
     }
 
+    /// Build the STRUCTURED strand-collapse error for a strand backstop
+    /// (fleet-dead / primary-silence): the run loop is exiting with tasks the
+    /// CRDT ledger left non-terminal. Typed as [`RunError::ClusterCollapsed`]
+    /// (NOT a generic `Other`) so the PyO3 boundary's uniform terminal
+    /// mapping RAISES on it — a strand must surface non-zero, never be
+    /// log-and-swallowed (the §14/§15 fleet-collapse contract). Carries the
+    /// CRDT-converged per-class breakdown + the stranded count (`task_count -
+    /// terminal`), the same shape the primary's `ClusterCollapsed` renders.
+    /// `detail` names which backstop fired for the operator log.
+    fn strand_collapsed(&self, detail: String) -> RunError {
+        let outcome = self.cluster_state.outcome_counts();
+        let stranded = self
+            .cluster_state
+            .task_count()
+            .saturating_sub(outcome.total_terminal());
+        tracing::error!(stranded, %detail, "observer strand — surfacing ClusterCollapsed");
+        RunError::ClusterCollapsed { stranded, outcome }
+    }
+
     /// LIVE `setup_pending` predicate (R2): `required_setup_on_promote &&
     /// task_count() == 0`. Recomputed at BOTH the deadline arm and fire so
     /// the moment discovery seeds the ledger (first `TaskAdded`) the arm
@@ -751,11 +770,14 @@ where
                         let _ = item.reply.send(outcome);
                     }
                     // Policy B fatal-exit (item 13): the invalid_task
-                    // monitor signalled; the OBSERVER exits non-zero.
+                    // monitor signalled; the OBSERVER exits non-zero. Typed as
+                    // a structured `FatalPolicyExit` (NOT a generic `Other`) so
+                    // the PyO3 boundary RAISES — a policy abort must surface
+                    // non-zero, never be log-and-swallowed.
                     Some(reason) = fatal_exit_rx.recv() => {
-                        return Err(RunError::Other(format!(
-                            "observer fatal-exit: invalid_task monitor — {reason}"
-                        )));
+                        return Err(RunError::FatalPolicyExit {
+                            reason: format!("invalid_task monitor — {reason}"),
+                        });
                     }
                 }
             }
@@ -840,8 +862,8 @@ where
         if peer_count == 0 {
             let since = *fleet_dead_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= self.config.fleet_dead_timeout {
-                return Err(RunError::Other(format!(
-                    "observer fleet-dead: every peer left the mesh and no RunComplete was \
+                return Err(self.strand_collapsed(format!(
+                    "fleet-dead: every peer left the mesh and no RunComplete was \
                      broadcast within {:.1}s",
                     self.config.fleet_dead_timeout.as_secs_f64()
                 )));
@@ -857,11 +879,12 @@ where
             && primary_last_seen.elapsed() > self.config.peer_timeout
             && !self.cluster_state.run_complete()
         {
-            return Err(RunError::Other(format!(
-                "observer: current primary {primary} silent for {:.0}s with no \
-                 RunComplete — run stranded",
+            let detail = format!(
+                "primary-silence: current primary {primary} silent for {:.0}s with no \
+                 RunComplete",
                 primary_last_seen.elapsed().as_secs_f64()
-            )));
+            );
+            return Err(self.strand_collapsed(detail));
         }
         Ok(None)
     }

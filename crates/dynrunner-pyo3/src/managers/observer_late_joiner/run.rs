@@ -7,11 +7,14 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 use dynrunner_manager_distributed::cluster_state::{ClusterState, ClusterStateSnapshot};
-use dynrunner_manager_distributed::observer::{
-    ObserverConfig, ObserverTerminal, build_cold_join_observer,
-};
+use dynrunner_manager_distributed::observer::{ObserverConfig, build_cold_join_observer};
 use dynrunner_manager_distributed::primary::RunError;
+use dynrunner_manager_distributed::process::{
+    LocalRole, Mesh, Node, NodeRunInputs, RunTerminal,
+};
+use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::{DEFAULT_JOIN_TIMEOUT, PeerTransport};
+use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_slurm::read_peer_info_dir_v2;
 
 use crate::identifier::RunnerIdentifier;
@@ -172,33 +175,63 @@ impl PyObserverLateJoiner {
                         panik_watcher_poll_interval,
                     };
 
-                    // 5. Cold-join: build the standalone ObserverCoordinator
-                    //    over the live mesh transport + the bootstrap
-                    //    snapshot(s). The factory installs the task-completed
-                    //    sender, attaches the resource-holdings announcer's
-                    //    role-change hook, then restores each snapshot (so the
-                    //    restore's role-change fire pushes the initial holdings
-                    //    announce into the registered channel), and spawns the
-                    //    panik watcher. The whole observation runtime —
-                    //    reporter, failure policies, announcer task, panik arm,
-                    //    teardown — lives inside `ObserverCoordinator::run`.
-                    let mut observer = build_cold_join_observer(
-                        peer_network,
+                    // 5. Wrap the live mesh transport (the bootstrap
+                    //    rendezvous above already ran on the bare
+                    //    `peer_network`, before it is consumed here) in the
+                    //    role-demux `Mesh` and register the Observer slot,
+                    //    minting the coordinator's `(client, inbox)` ends + the
+                    //    `Arc<RoleSlot>` the `Node` holds as the teardown lever.
+                    let mut mesh = Mesh::new(peer_network);
+                    let (obs_slot, obs_client, obs_inbox) =
+                        mesh.register_local_role(LocalRole::Observer, PeerId::from(observer_id.as_str()));
+
+                    // 6. Cold-join: build the standalone ObserverCoordinator
+                    //    over the mesh ends + the bootstrap snapshot(s). The
+                    //    factory installs the task-completed sender, attaches
+                    //    the resource-holdings announcer's role-change hook,
+                    //    then restores each snapshot (so the restore's
+                    //    role-change fire pushes the initial holdings announce
+                    //    into the registered channel), and spawns the panik
+                    //    watcher. The whole observation runtime — reporter,
+                    //    failure policies, announcer task, panik arm, teardown
+                    //    — lives inside `ObserverCoordinator::run`.
+                    let observer = build_cold_join_observer(
+                        obs_client,
+                        obs_inbox,
                         ClusterState::<RunnerIdentifier>::new(),
                         config,
                         snaps,
                         holdings,
                     );
 
-                    // 6. Drive the single observer run loop. It returns the
-                    //    run terminal (Done / Aborted / Panik); the strand
-                    //    backstops (fleet-dead, primary-silence) surface as
-                    //    `Err(RunError)`, which we route to a non-zero exit.
-                    match observer.run().await {
-                        Ok(ObserverTerminal::Done) => {
-                            Ok(ObserverRunOutcome::Done(observer.completed_count() as u32))
-                        }
-                        Ok(ObserverTerminal::Aborted { reason }) => {
+                    // 7. Compose a pure-observer `Node` (observer = Some;
+                    //    primary/secondary = None) and drive `Node::run`. A
+                    //    standalone observer IS a `Node` — one OS process
+                    //    owning its role composition — so it goes through the
+                    //    same `Node::run` as the submitter/compute peers; the
+                    //    promotion/demote/swap arms are simply inert (no
+                    //    secondary fires promotion, no primary to demote). The
+                    //    `Node` owns the mesh-pump (ingress demux + PeerInfo
+                    //    dialing) that the observer's ingress depends on.
+                    let (node, _node_promo_tx, _node_demote_tx) = Node::new(mesh);
+                    let node = node.with_observer(observer, obs_slot);
+                    let inputs: NodeRunInputs<
+                        crate::subprocess_factory::SubprocessWorkerFactory,
+                        ResourceStealingScheduler,
+                        crate::estimator::PyMemoryEstimatorBridge,
+                        RunnerIdentifier,
+                    > = NodeRunInputs::default();
+                    let node_outcome = node.run(inputs).await;
+
+                    // 8. The node ends as an observer; `Node::run` resolves to
+                    //    ONE role-agnostic `RunTerminal` (+ the observer's
+                    //    converged `completed` count). Map the terminal to the
+                    //    boundary's exit-code outcome (Done⇒0 / Aborted⇒1 /
+                    //    Panik⇒137 / Failed⇒non-zero PyErr).
+                    let completed = node_outcome.completed as u32;
+                    match node_outcome.terminal {
+                        RunTerminal::Done => Ok(ObserverRunOutcome::Done(completed)),
+                        RunTerminal::Aborted { reason } => {
                             // The primary broadcast `RunAborted` (#3a
                             // pre-phase duplicate). Propagate to the PyO3
                             // boundary for exit(1) — an observer exits
@@ -210,7 +243,7 @@ impl PyObserverLateJoiner {
                             );
                             Ok(ObserverRunOutcome::Aborted(reason))
                         }
-                        Ok(ObserverTerminal::Panik { matched_path }) => {
+                        RunTerminal::Panik { matched_path } => {
                             tracing::error!(
                                 matched_path = %matched_path.display(),
                                 "observer panik shutdown; propagating \
@@ -218,12 +251,12 @@ impl PyObserverLateJoiner {
                             );
                             Ok(ObserverRunOutcome::Panik(matched_path))
                         }
-                        Err(e) => {
+                        RunTerminal::Failed { error } => {
                             // Strand backstop (fleet-dead / primary-silence)
                             // or a fatal-exit policy. Surface as a typed
                             // Python exception (non-zero exit) — the run was
                             // stranded, not cleanly complete.
-                            Err(map_run_error(&e))
+                            Err(map_run_error(&error))
                         }
                     }
                 }))

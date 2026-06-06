@@ -392,7 +392,11 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
             // Drive the submitter Node::run to its outcome; the compute node
             // runs alongside on the same LocalSet.
             let outcome = pri_node.run(pri_inputs).await;
-            assert!(outcome.result.is_ok(), "Node::run primary outcome: {:?}", outcome.result);
+            assert!(
+                matches!(outcome.terminal, crate::process::RunTerminal::Done),
+                "Node::run primary outcome: {:?}",
+                outcome.terminal
+            );
             assert_eq!(outcome.completed, 3, "all 3 tasks complete through Node::run");
             assert_eq!(outcome.failed, 0);
 

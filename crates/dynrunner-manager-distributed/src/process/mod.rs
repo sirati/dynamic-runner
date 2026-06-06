@@ -87,5 +87,5 @@ pub use node::{Node, PromotionSignal, RoleEntry};
 pub use pump::{MeshControl, MeshControlHandle};
 pub use role::LocalRole;
 pub use role_slot::RoleSlot;
-pub use run::NodeRunOutcome;
+pub use run::{NodeRunOutcome, RunTerminal};
 pub use run_inputs::{NodeRunInputs, PrimaryRunArgs, PromotedPrimary, PromotedPrimaryBuilder};

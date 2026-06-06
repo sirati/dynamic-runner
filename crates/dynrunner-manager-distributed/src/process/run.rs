@@ -34,28 +34,83 @@ use super::node::{Node, PromotionSignal};
 use super::pump::{self, MeshControlHandle};
 use super::role::LocalRole;
 use super::run_inputs::{NodeRunInputs, PrimaryRunArgs};
-use crate::observer::{ObserverCoordinator, ObserverHandoff};
+use crate::observer::{ObserverCoordinator, ObserverHandoff, ObserverTerminal};
 use crate::primary::{PrimaryCoordinator, PrimaryRunOutcome, RunError};
-use crate::secondary::SecondaryCoordinator;
+use crate::secondary::{SecondaryCoordinator, SecondaryTerminal};
+
+/// The role-agnostic terminal disposition of one `Node::run`.
+///
+/// EVERY role's run resolves to one of these four — a primary, a secondary,
+/// and an observer all end in the same vocabulary, so the PyO3 boundary maps
+/// ONE terminal to the process exit code regardless of which role drove the
+/// run (no per-role `Option` fields). The mapping is uniform:
+///
+/// - [`Self::Done`] ⇒ exit 0 (a clean `RunComplete`).
+/// - [`Self::Aborted`] ⇒ exit 1 (the cluster broadcast `RunAborted` — a #3a
+///   pre-phase duplicate-task-id).
+/// - [`Self::Panik`] ⇒ exit 137 (operator emergency stop; the worker pgids
+///   were already killed by the role's own teardown).
+/// - [`Self::Failed`] ⇒ a non-zero exit the boundary derives from the
+///   carried [`RunError`] (a strand backstop — fleet-dead / primary-silence
+///   — a structured primary terminal like `ClusterCollapsed` /
+///   `SetupDeadlineExpired` / `DuplicateTaskIdPrePhase`, or a generic run
+///   failure). The boundary destructures the `RunError` for its
+///   per-variant exit handling.
+#[derive(Debug)]
+pub enum RunTerminal {
+    /// Clean completion — exit 0.
+    Done,
+    /// Cluster-wide `RunAborted` (#3a pre-phase duplicate) — exit 1.
+    Aborted { reason: String },
+    /// Operator panik — exit 137 (pgids already killed by the role teardown).
+    Panik { matched_path: std::path::PathBuf },
+    /// A strand backstop / structured-error / generic run failure — the
+    /// boundary maps the carried error to a non-zero exit.
+    Failed { error: RunError },
+}
 
 /// The single post-`run` accounting the PyO3 boundary reads.
 ///
 /// `Node::run` produces ONE outcome regardless of how the lifecycle
-/// resolved (local primary, promoted primary, relocated→observer, or a pure
-/// secondary). The counts come from whichever role held the converged ledger
-/// at the end; `result` is the structured exit contract the boundary maps to
-/// an exit code.
+/// resolved (local primary, promoted primary, relocated→observer, cold-join
+/// observer, or a pure secondary). [`Self::terminal`] is the role-agnostic
+/// exit disposition (every role ends in the same four-way vocabulary), and
+/// the counts come from whichever role held the converged ledger at the end.
 #[derive(Debug)]
 pub struct NodeRunOutcome {
-    /// Structured terminal: `Ok(())` ⇒ exit 0; an `Err` ⇒ a non-zero exit.
-    pub result: Result<(), RunError>,
-    /// Cluster-wide completed terminals.
+    /// The role-agnostic terminal — the boundary maps it to the process exit
+    /// code uniformly for a primary, secondary, or observer. See
+    /// [`RunTerminal`].
+    pub terminal: RunTerminal,
+    /// Cluster-wide completed terminals (the converged ledger count from
+    /// whichever role drove the run).
     pub completed: usize,
     /// Cluster-wide failed-residual terminals.
     pub failed: usize,
     /// Stranded (never-terminal) tasks at shutdown.
     pub stranded: usize,
 }
+
+/// What an observer's run task carries back: its run disposition (the
+/// three-way [`ObserverTerminal`] or a strand-backstop `Err`) PLUS its
+/// converged `completed_count`, both read off the coordinator at run end
+/// before the task drops it. Concrete (not generic over `I`) — every member
+/// is concrete — so it is a plain type alias usable for the observer arm's
+/// `JoinHandle` regardless of the node's identifier type.
+type ObserverRunResult = (Result<ObserverTerminal, RunError>, usize);
+
+/// The observer arm's join handle. See [`ObserverRunResult`].
+type ObserverJoinHandle = tokio::task::JoinHandle<ObserverRunResult>;
+
+/// What a secondary's run task carries back: its role-agnostic
+/// [`RunTerminal`] PLUS its converged `completed_count`, both read off the
+/// coordinator at run end before the task drops it (and after the factory's
+/// worker-teardown ladder ran). Concrete — usable for the secondary arm's
+/// `JoinHandle` regardless of `I`.
+type SecondaryRunResult = (RunTerminal, usize);
+
+/// The secondary arm's join handle. See [`SecondaryRunResult`].
+type SecondaryJoinHandle = tokio::task::JoinHandle<SecondaryRunResult>;
 
 impl<I, Tr, Mgr, Sched, Est>
     Node<I, Tr, PrimaryCoordinator<Sched, Est, I>, SecondaryCoordinator<Mgr, Sched, Est, I>, ObserverCoordinator<I>>
@@ -122,7 +177,12 @@ where
 
         // SECONDARY: run it with the supplied factory. Its `run` drains its
         // own inbox; the promotion signal it fires arrives on `promotion_rx`.
-        let mut secondary_done: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+        // The task carries the secondary's role-agnostic terminal + converged
+        // completion count back out (read off the coordinator at run end,
+        // before the task drops it) and runs the factory's worker-teardown
+        // ladder — gated on `terminal != Panik`, because a panik already
+        // killed every worker pgid inside the coordinator's own teardown.
+        let mut secondary_done: Option<SecondaryJoinHandle> = None;
         if let (Some(entry), Some(factory)) = (secondary, inputs.secondary_factory.take()) {
             {
                 // Hold the secondary's slot Arc for its run's lifetime so the
@@ -135,14 +195,30 @@ where
                     let _slot = slot;
                     let mut coordinator = entry.coordinator;
                     let mut factory = factory;
-                    coordinator.run(&mut factory).await
+                    let run_result = coordinator.run(&mut factory).await;
+                    let completed = coordinator.completed_count();
+                    let terminal = secondary_terminal(run_result, coordinator.terminal());
+                    // Worker teardown (SIGTERM→grace→SIGKILL) — the factory's
+                    // HOW; the node decides WHEN. Skip on panik: the
+                    // coordinator already killed every worker pgid, and the
+                    // `exit(137)` decision must fire promptly without a second
+                    // grace ladder.
+                    if !matches!(terminal, RunTerminal::Panik { .. }) {
+                        factory.cleanup().await;
+                    }
+                    (terminal, completed)
                 }));
             }
         }
 
         // OBSERVER (cold-join): run it standalone, holding its slot Arc for
         // the run's lifetime (same ingress-liveness reason as the secondary).
-        let mut observer_done: Option<tokio::task::JoinHandle<Result<(), RunError>>> = None;
+        // The task carries the observer's run disposition (`ObserverTerminal`
+        // + a strand-backstop `Err`) AND its converged `completed_count` back
+        // out — both are read off the coordinator at run end, before the task
+        // drops it, so the node outcome can surface the three distinct
+        // observer exit codes + the count instead of flattening them.
+        let mut observer_done: Option<ObserverJoinHandle> = None;
         if let Some(entry) = observer {
             observer_done = Some(spawn_observer(entry.coordinator, Some(entry.slot)));
         }
@@ -155,7 +231,7 @@ where
         // mid-run and folds its outcome into `primary_done`.
 
         let mut outcome = NodeRunOutcome {
-            result: Ok(()),
+            terminal: RunTerminal::Done,
             completed: 0,
             failed: 0,
             stranded: 0,
@@ -183,7 +259,21 @@ where
                 Some(po) = recv_primary(&mut primary_done) => {
                     match po {
                         PrimaryRunOutcome::Local { result, completed, failed, stranded } => {
-                            outcome = NodeRunOutcome { result, completed, failed, stranded };
+                            // A primary's structured exit maps onto the unified
+                            // terminal: `Ok` ⇒ Done, any `Err` ⇒ Failed (the
+                            // boundary destructures the RunError for its
+                            // per-variant exit code — ClusterCollapsed /
+                            // SetupDeadlineExpired / DuplicateTaskIdPrePhase /
+                            // generic).
+                            outcome = NodeRunOutcome {
+                                terminal: match result {
+                                    Ok(()) => RunTerminal::Done,
+                                    Err(error) => RunTerminal::Failed { error },
+                                },
+                                completed,
+                                failed,
+                                stranded,
+                            };
                             break;
                         }
                         PrimaryRunOutcome::Relocated { handoff } => {
@@ -200,9 +290,15 @@ where
                 }
 
                 // A pure-secondary node finished (no primary).
-                Some(sr) = join_opt_str(&mut secondary_done) => {
+                Some(sr) = join_secondary(&mut secondary_done) => {
                     if primary_done.is_none() && observer_done.is_none() {
-                        outcome.result = sr.map_err(RunError::Other);
+                        let (terminal, completed) = sr;
+                        outcome = NodeRunOutcome {
+                            terminal,
+                            completed,
+                            failed: 0,
+                            stranded: 0,
+                        };
                         break;
                     }
                 }
@@ -250,7 +346,7 @@ where
 fn swap_primary_to_observer<I>(
     control: &MeshControlHandle<I>,
     handoff: Box<ObserverHandoff<I>>,
-) -> tokio::task::JoinHandle<Result<(), RunError>>
+) -> ObserverJoinHandle
 where
     I: Identifier + 'static,
 {
@@ -274,7 +370,7 @@ where
 /// the latter as the teardown lever). `None` if the promotion cannot proceed
 /// (no builder, or the pump is gone).
 async fn self_build_promoted_primary<I, Sched, Est>(
-    _signal: PromotionSignal,
+    signal: PromotionSignal<I>,
     promote: &mut Option<super::run_inputs::PromotedPrimaryBuilder<Sched, Est, I>>,
     control: &MeshControlHandle<I>,
     own_peer_id: &PeerId,
@@ -293,8 +389,12 @@ where
     // relocates on it). Minted here so the hook and the receiver pair.
     let (demote_tx, demote_rx) = mpsc::unbounded_channel();
 
-    // The caller's recipe builds + snapshot-seeds the primary.
-    let mut built = builder(client, inbox, demote_rx);
+    // The caller's recipe builds + snapshot-seeds the primary from the
+    // converged `cluster_state` the secondary captured ON the signal at the
+    // promotion-fire instant. The node only threads the snapshot through —
+    // the builder owns `seed_from_promotion_snapshot` + coordinator
+    // construction (scheduler/estimator are the caller's concern).
+    let mut built = builder(client, inbox, demote_rx, signal.snapshot);
     built.coordinator.register_demote_on_displaced(demote_tx);
 
     let (tx, rx) = oneshot::channel();
@@ -358,16 +458,20 @@ fn spawn_primary_with<I, Sched, Est>(
 fn spawn_observer<I>(
     mut observer: ObserverCoordinator<I>,
     slot: Option<std::sync::Arc<crate::process::RoleSlot<I>>>,
-) -> tokio::task::JoinHandle<Result<(), RunError>>
+) -> ObserverJoinHandle
 where
     I: Identifier + 'static,
 {
     tokio::task::spawn_local(async move {
         let _slot = slot;
-        match observer.run().await {
-            Ok(_terminal) => Ok(()),
-            Err(e) => Err(e),
-        }
+        // Carry BOTH the run disposition AND the converged completion count
+        // out of the task. The count is read off the coordinator AFTER `run`
+        // returns (the converged ledger) but BEFORE the task drops the
+        // coordinator — once the task ends the coordinator is gone, so the
+        // count must travel back here, not be re-sourced by the caller.
+        let run_result = observer.run().await;
+        let completed = observer.completed_count();
+        (run_result, completed)
     })
 }
 
@@ -404,22 +508,83 @@ where
     PeerId::from("")
 }
 
-/// Map an observer run result into the node outcome (counts are not
-/// re-sourced here — the observer holds the converged ledger and `run`
-/// reports terminal via `Result`; the counts ride the observer's own
-/// accessors, read before the task ended — folded by the caller).
-fn finalize_observer(or: Result<Result<(), RunError>, tokio::task::JoinError>) -> NodeRunOutcome {
-    let result = match or {
-        Ok(inner) => inner,
-        Err(join) => Err(RunError::Other(format!(
-            "observer task panicked/aborted: {join}"
-        ))),
+/// Fold an observer's task result into the node outcome.
+///
+/// The observer task carried back BOTH its run disposition (the three-way
+/// [`ObserverTerminal`] or a strand-backstop `Err`) AND its converged
+/// completion count. This maps them onto the role-agnostic
+/// [`NodeRunOutcome::terminal`] (Done/Aborted/Panik/Failed) + `completed` so
+/// the PyO3 boundary maps the terminal uniformly with the primary/secondary.
+/// Used by BOTH observer-ending paths: the cold-join late-joiner and the
+/// submitter that relocated into the observer tail.
+fn finalize_observer(joined: Result<ObserverRunResult, tokio::task::JoinError>) -> NodeRunOutcome {
+    let (terminal, completed) = match joined {
+        Ok((run_result, completed)) => (observer_terminal(run_result), completed),
+        // A panicked/aborted observer task has no terminal and no count; map
+        // the join error to a STRUCTURED `Failed` (an unexpected non-clean
+        // exit, not the stay-local-primary swallow case) so the boundary
+        // raises — the observation never reached a clean terminal.
+        Err(join) => (
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit {
+                    reason: format!("observer task panicked/aborted: {join}"),
+                },
+            },
+            0,
+        ),
     };
     NodeRunOutcome {
-        result,
-        completed: 0,
+        terminal,
+        completed,
         failed: 0,
         stranded: 0,
+    }
+}
+
+/// Map an observer's run disposition onto the role-agnostic [`RunTerminal`].
+/// The observer's clean terminals map 1:1; a strand-backstop / fatal-exit
+/// `Err` becomes `Failed`.
+fn observer_terminal(run_result: Result<ObserverTerminal, RunError>) -> RunTerminal {
+    match run_result {
+        Ok(ObserverTerminal::Done) => RunTerminal::Done,
+        Ok(ObserverTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
+        Ok(ObserverTerminal::Panik { matched_path }) => RunTerminal::Panik { matched_path },
+        Err(error) => RunTerminal::Failed { error },
+    }
+}
+
+/// Map a secondary's `run` outcome onto the role-agnostic [`RunTerminal`].
+///
+/// The secondary's `run` returns `Ok(())` on a clean terminal and `Err` only
+/// on a `Failed` (a fatal-exit) — so the per-secondary [`SecondaryTerminal`]
+/// is the single source of truth for WHICH clean terminal (Done/Aborted/
+/// Panik) it reached, read back via `coordinator.terminal()`. An `Err` (or a
+/// `Failed`/absent terminal) becomes `Failed`.
+fn secondary_terminal(
+    run_result: Result<(), String>,
+    terminal: Option<SecondaryTerminal>,
+) -> RunTerminal {
+    match run_result {
+        Ok(()) => match terminal {
+            Some(SecondaryTerminal::Done) | None => RunTerminal::Done,
+            Some(SecondaryTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
+            Some(SecondaryTerminal::Panik { matched_path, .. }) => {
+                RunTerminal::Panik { matched_path }
+            }
+            // A `Failed` lifecycle is a deliberate fatal-exit (the secondary's
+            // `fatal_exit` latch). The OLD pyo3 secondary RAISED on it (it had
+            // no swallow path), so type it STRUCTURED (`FatalPolicyExit`) — the
+            // boundary raises, never swallows.
+            Some(SecondaryTerminal::Failed { reason }) => RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { reason },
+            },
+        },
+        // The secondary's `run` returns `Err` on a fatal-exit (the `fatal_exit`
+        // latch propagated). Same disposition as a `Failed` lifecycle: the OLD
+        // wrapper RAISED, so structure it so the boundary raises.
+        Err(reason) => RunTerminal::Failed {
+            error: RunError::FatalPolicyExit { reason },
+        },
     }
 }
 
@@ -449,22 +614,34 @@ async fn recv_primary<I: Identifier>(
     }
 }
 
-async fn join_opt_str(
-    h: &mut Option<tokio::task::JoinHandle<Result<(), String>>>,
-) -> Option<Result<(), String>> {
+async fn join_secondary(
+    h: &mut Option<SecondaryJoinHandle>,
+) -> Option<SecondaryRunResult> {
     match h.as_mut() {
         Some(handle) => {
             let r = handle.await;
             *h = None;
-            Some(r.unwrap_or_else(|e| Err(format!("secondary task aborted: {e}"))))
+            Some(r.unwrap_or_else(|e| {
+                (
+                    RunTerminal::Failed {
+                        // A panicked/aborted task is an UNEXPECTED non-clean
+                        // exit, not the stay-local-primary swallow case — type
+                        // it structured so the boundary raises.
+                        error: RunError::FatalPolicyExit {
+                            reason: format!("secondary task panicked/aborted: {e}"),
+                        },
+                    },
+                    0,
+                )
+            }))
         }
         None => std::future::pending().await,
     }
 }
 
 async fn join_opt_run(
-    h: &mut Option<tokio::task::JoinHandle<Result<(), RunError>>>,
-) -> Option<Result<Result<(), RunError>, tokio::task::JoinError>> {
+    h: &mut Option<ObserverJoinHandle>,
+) -> Option<Result<ObserverRunResult, tokio::task::JoinError>> {
     match h.as_mut() {
         Some(handle) => {
             let r = handle.await;

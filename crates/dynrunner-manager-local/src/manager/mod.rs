@@ -197,6 +197,31 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
     ) -> Result<(M, Option<u32>), String> {
         self.spawn_worker(worker_id, subcgroup)
     }
+
+    /// Tear down any OS-level worker resources the factory owns
+    /// (subprocesses, process groups) at end of run.
+    ///
+    /// Single concern: the factory provides the teardown mechanism (HOW); the
+    /// caller decides WHEN to invoke it. A factory whose `spawn_worker` minted
+    /// real OS subprocesses (the subprocess factory) implements this to run
+    /// its SIGTERM→grace→SIGKILL ladder over the children it tracked, so they
+    /// are not leaked when the factory is dropped (a bare
+    /// `std::process::Child` drop does NOT kill). In-process / channel-backed
+    /// test factories own no OS subprocesses and inherit the default no-op.
+    ///
+    /// The caller (`Node::run`'s secondary arm) invokes this AFTER the
+    /// secondary's run returns, GATED on the terminal NOT being a panik — a
+    /// panik already killed every worker pgid inside the coordinator's own
+    /// teardown, so a second grace ladder would only delay the `exit(137)`.
+    ///
+    /// `async fn` in a public trait: the returned future is deliberately NOT
+    /// `Send`-bounded — it is awaited on the `Node`'s single-threaded
+    /// `LocalSet` (a `!Send` task), so an auto-`Send` bound is neither
+    /// available nor needed. The only implementor that does real work
+    /// (`SubprocessWorkerFactory`) runs a brief blocking teardown at
+    /// end-of-run; the rest inherit this no-op.
+    #[allow(async_fn_in_trait)]
+    async fn cleanup(&mut self) {}
 }
 
 /// The local manager: owns workers, scheduler, and the 5-phase pipeline.

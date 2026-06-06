@@ -8,9 +8,13 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use dynrunner_manager_distributed::process::{
+    LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal,
+};
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
+use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
@@ -238,6 +242,11 @@ impl PyDistributedManager {
         // raises a `PyRuntimeError` so the wrapper does not return
         // exit 0.
         let mut duplicate_task_id_pre_phase: Option<RunError> = None;
+        // Policy-abort terminal — `Some(RunError::FatalPolicyExit)` iff the
+        // node's terminal was a deliberate policy abort (a panicked role task,
+        // or an invalid-task fatal-exit). RAISES at the GIL-side tail (never
+        // the `Other` swallow). Same shape as `PyPrimaryCoordinator::run`.
+        let mut fatal_policy_exit: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -250,7 +259,6 @@ impl PyDistributedManager {
                 use tokio::sync::mpsc as tokio_mpsc;
 
                 let mut sec_handles = Vec::new();
-                let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
                 // Build the in-process primary's single mesh transport
                 // through the backend-opaque factory. Post-collapse this
@@ -332,6 +340,10 @@ impl PyDistributedManager {
                             pri_to_sec_rx,
                             sec_to_pri_tx,
                         );
+                        // The local-slot peer-id for the secondary's `Node`
+                        // mesh registration (the same logical id the channel
+                        // mesh keys this secondary under).
+                        let sec_id_for_slot = secondary_id.clone();
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
@@ -421,7 +433,7 @@ impl PyDistributedManager {
 
                         let estimator = sec_estimator;
 
-                        let mut factory = SubprocessWorkerFactory {
+                        let factory = SubprocessWorkerFactory {
                             python_executable: sec_python,
                             source_dir: sec_source,
                             output_dir: sec_output,
@@ -435,14 +447,19 @@ impl PyDistributedManager {
                             child_processes: Vec::new(),
                         };
 
-                        // The secondary holds the channel-backed mesh
-                        // `PeerTransport` directly — the primary is a mesh
-                        // peer reached by id, exactly as the QUIC/WSS
-                        // bootstrap wire now folds into `PeerNetwork`.
-                        let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> =
+                        // Wrap the channel-backed mesh transport in the
+                        // role-demux `Mesh` and register the Secondary slot,
+                        // minting the coordinator's `(client, inbox)` ends + the
+                        // `Arc<RoleSlot>` the per-secondary `Node` holds.
+                        let mut sec_mesh = Mesh::new(transport);
+                        let (sec_slot, sec_client, sec_inbox) = sec_mesh
+                            .register_local_role(LocalRole::Secondary, PeerId::from(sec_id_for_slot.as_str()));
+
+                        let mut secondary: SecondaryCoordinator<_, _, _, RunnerIdentifier> =
                             SecondaryCoordinator::new(
                                 config,
-                                transport,
+                                sec_client,
+                                sec_inbox,
                                 sec_scheduler_config.build_memory_scheduler(),
                                 estimator,
                             );
@@ -506,41 +523,43 @@ impl PyDistributedManager {
                             secondary.register_panik_signal_rx(rx);
                         }
 
-                        // Install the per-secondary phase-lifecycle
-                        // callbacks BEFORE `run()` enters — same pre-run
-                        // registration contract as
-                        // `register_lifecycle_listener` /
-                        // `register_panik_signal_rx`. In the IN-PROCESS
-                        // distributed manager the authority is the
-                        // in-process `PrimaryCoordinator` (built below),
-                        // which fires `on_phase_*` directly; these
-                        // in-process secondaries hold a channel-backed mesh
-                        // with only the primary folded in (no peer-to-peer
-                        // mesh among the secondaries) and therefore register
-                        // NO on-demand primary-activator, so their registered
-                        // callbacks stay dormant (no transfer, no on-demand
-                        // build in-process) and never call into Python. They
-                        // are registered for shape-parity with the SLURM
-                        // secondary path (which DOES transfer them into the
-                        // on-demand primary-activator); the closures target
-                        // the SAME single process-wide Python
-                        // `TaskDefinition` instance the in-process primary's
-                        // callbacks already use.
-                        secondary.register_phase_lifecycle_callbacks(
-                            sec_on_phase_start,
-                            sec_on_phase_end,
-                        );
+                        // The in-process secondary cannot be PROMOTED
+                        // (`can_be_primary = false`: a channel mesh with only
+                        // the primary folded in, no peer-to-peer mesh among the
+                        // secondaries), so it registers NO setup-discovery /
+                        // promotion recipe and its phase-lifecycle callbacks
+                        // would never fire (the in-process `PrimaryCoordinator`
+                        // built below is the authority that owns the phase
+                        // machine + its own `on_phase_*`). The per-secondary
+                        // `sec_on_phase_*` closures are therefore dropped here
+                        // (they were only ever shape-parity for the promotable
+                        // SLURM path).
+                        let _ = (sec_on_phase_start, sec_on_phase_end);
 
-                        let result = secondary.run(&mut factory).await;
-                        if let Err(e) = &result {
-                            tracing::error!(error = %e, "secondary failed");
+                        // Compose the per-secondary `Node` (one OS-process role
+                        // composition per logical peer) and drive it. `Node::run`
+                        // owns the mesh-pump + the secondary's worker-teardown
+                        // ladder (gated off panik). A pure-secondary node with
+                        // no promotion recipe — the in-process secondary never
+                        // becomes primary.
+                        let (node, _promo_tx, _demote_tx) = Node::new(sec_mesh);
+                        let node = node.with_secondary(secondary, sec_slot);
+                        let inputs: NodeRunInputs<
+                            SubprocessWorkerFactory,
+                            dynrunner_scheduler::ResourceStealingScheduler,
+                            crate::estimator::PyMemoryEstimatorBridge,
+                            RunnerIdentifier,
+                        > = NodeRunInputs {
+                            secondary_factory: Some(factory),
+                            promote: None,
+                            primary_run_args: None,
+                            primary_demote_tx: None,
+                        };
+                        let outcome = node.run(inputs).await;
+                        if let RunTerminal::Failed { error } = &outcome.terminal {
+                            tracing::error!(error = %error, "in-process secondary node failed");
                         }
-
-                        // Collect child processes for cleanup
-                        let children: Vec<Option<std::process::Child>> =
-                            factory.child_processes.drain(..).collect();
-
-                        (secondary.completed_count(), children)
+                        outcome.completed
                     });
 
                     sec_handles.push(handle);
@@ -607,9 +626,24 @@ impl PyDistributedManager {
                     ..PrimaryConfig::default()
                 };
 
+                // Wrap the in-process primary's mesh transport in the
+                // role-demux `Mesh` and register the Primary slot. The
+                // in-process primary is the sole authority (every secondary
+                // joins `can_be_primary = false`), so its demote channel never
+                // fires — but `PrimaryCoordinator::new` requires the receiver,
+                // so we mint an inert pair (no `primary_demote_tx` is handed to
+                // the node, so no role-change hook feeds it).
+                let mut pri_mesh = Mesh::new(peer_transport);
+                let (pri_slot, pri_client, pri_inbox) =
+                    pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+                let (_pri_demote_tx, pri_demote_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<()>();
+
                 let mut primary = PrimaryCoordinator::new(
                     config,
-                    peer_transport,
+                    pri_client,
+                    pri_inbox,
+                    pri_demote_rx,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
@@ -685,57 +719,86 @@ impl PyDistributedManager {
                 // unique to it; the gate detects the non-empty
                 // queue and skips.
 
-                // phase_deps + lifecycle closures captured from the
-                // outer scope (5A built phase_deps; 5B built the
-                // GIL-reacquiring on_phase_* closures).
-                let result = primary
-                    .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
-                    .await;
-                if let Err(e) = &result {
-                    tracing::error!(error = %e, "primary failed");
-                }
-                match result {
-                    Err(RunError::ClusterCollapsed { .. }) => {
-                        cluster_collapsed = result.err();
+                // Compose the in-process primary `Node` (a pure-primary node —
+                // no co-located secondary, no promotion recipe: the in-process
+                // primary is the sole authority). `Node::run` owns the
+                // mesh-pump + the primary's lifecycle and resolves to ONE
+                // role-agnostic terminal (+ counts).
+                let (node, _node_promo_tx, _node_demote_tx) = Node::new(pri_mesh);
+                let node = node.with_primary(primary, pri_slot);
+                let inputs: NodeRunInputs<
+                    SubprocessWorkerFactory,
+                    dynrunner_scheduler::ResourceStealingScheduler,
+                    crate::estimator::PyMemoryEstimatorBridge,
+                    RunnerIdentifier,
+                > = NodeRunInputs {
+                    primary_run_args: Some(PrimaryRunArgs {
+                        binaries: rust_binaries,
+                        phase_deps,
+                        on_phase_start,
+                        on_phase_end,
+                    }),
+                    // No demote hook (the in-process primary is the sole
+                    // authority — it never relocates), no co-located secondary,
+                    // no promotion recipe.
+                    primary_demote_tx: None,
+                    secondary_factory: None,
+                    promote: None,
+                };
+                let outcome = node.run(inputs).await;
+                completed = outcome.completed as u32;
+                failed = outcome.failed as u32;
+                stranded = outcome.stranded as u32;
+
+                // Map the role-agnostic terminal to the GIL-side exit markers
+                // (uniform with `PyPrimaryCoordinator::run`).
+                match outcome.terminal {
+                    RunTerminal::Done => {}
+                    RunTerminal::Aborted { reason } => {
+                        // A cluster-wide `RunAborted` surfaced as the terminal
+                        // (the in-process primary broadcasts it on #3a). Carry
+                        // the reason as a structured duplicate marker so the
+                        // GIL-side tail raises.
+                        duplicate_task_id_pre_phase =
+                            Some(RunError::DuplicateTaskIdPrePhase { reason });
                     }
-                    Err(RunError::PanikShutdown {
-                        matched_path,
-                        reason: _,
-                    }) => {
+                    RunTerminal::Panik { matched_path } => {
                         panik_shutdown_path = Some(matched_path);
                     }
-                    Err(e @ RunError::SetupDeadlineExpired { .. }) => {
-                        setup_deadline_expired = Some(e);
-                    }
-                    Err(e @ RunError::DuplicateTaskIdPrePhase { .. }) => {
-                        duplicate_task_id_pre_phase = Some(e);
-                    }
-                    Err(RunError::Other(_)) | Ok(()) => {
-                        // Legacy log-and-swallow for non-structured
-                        // errors — see `PyPrimaryCoordinator::run`
-                        // for the rationale.
+                    RunTerminal::Failed { error } => {
+                        tracing::error!(error = %error, "in-process primary node failed");
+                        match error {
+                            RunError::ClusterCollapsed { .. } => {
+                                cluster_collapsed = Some(error);
+                            }
+                            RunError::PanikShutdown { matched_path, .. } => {
+                                panik_shutdown_path = Some(matched_path);
+                            }
+                            e @ RunError::SetupDeadlineExpired { .. } => {
+                                setup_deadline_expired = Some(e);
+                            }
+                            e @ RunError::DuplicateTaskIdPrePhase { .. } => {
+                                duplicate_task_id_pre_phase = Some(e);
+                            }
+                            e @ RunError::FatalPolicyExit { .. } => {
+                                fatal_policy_exit = Some(e);
+                            }
+                            RunError::Other(_) => {
+                                // The PRESERVED stay-local-primary swallow
+                                // (exit 0) — see `PyPrimaryCoordinator::run`.
+                            }
+                        }
                     }
                 }
 
-                completed = primary.completed_count() as u32;
-                failed = primary.failed_count() as u32;
-                stranded = primary.stranded_count() as u32;
-
-                // Drop primary to close channels, allowing secondaries to exit
-                drop(primary);
-
-                // Wait for secondaries and clean up child processes
+                // Wait for the per-secondary nodes to finish. Each `Node::run`
+                // already ran its own factory's worker-teardown ladder (gated
+                // off panik), so there is no aggregated child-process cleanup
+                // to do here — the OLD outer `terminate_children` aggregation
+                // is now per-node inside `Node::run`.
                 for handle in sec_handles {
-                    if let Ok((_, children)) = handle.await {
-                        all_child_processes.extend(children);
-                    }
+                    let _ = handle.await;
                 }
-
-                // Tear down all aggregated worker subprocesses via the
-                // shared SIGTERM → grace → SIGKILL primitive. See
-                // `subprocess_factory::terminate_children` for the
-                // rationale (podman SIGTERM handoff vs SIGKILL).
-                crate::subprocess_factory::terminate_children(&mut all_child_processes);
             }));
         });
 
@@ -774,6 +837,12 @@ impl PyDistributedManager {
             // shape as `PyPrimaryCoordinator::run`. The in-process
             // primary already broadcast `RunAborted`; raise here so the
             // Python wrapper sees a non-zero exit instead of exit 0.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = fatal_policy_exit {
+            // A deliberate policy abort (panicked role task / invalid-task
+            // fatal-exit) — RAISE, never the `Other` swallow.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
