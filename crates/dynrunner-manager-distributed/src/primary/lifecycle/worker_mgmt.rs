@@ -25,15 +25,12 @@
 //! `await_holding_lock` / `await_holding_refcell_ref` lints stay clean.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Worker management's reaction to one coalesced signal batch
     /// drained from the bus. Acts on every signal in arrival order —
     /// the batch preserves them all (unlike the matcher's latest-only

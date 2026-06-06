@@ -43,8 +43,9 @@ mod worker_lifecycle;
 // alternative is duplicated `use` lines in 11 sibling files.
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
-    FakeWorkerFactory, FixedEstimator, SlowFakeWorkerFactory, TestId, fake_secondary,
-    fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
+    FakeWorkerFactory, FixedEstimator, PrimaryMeshKeepalive, SlowFakeWorkerFactory, TestId,
+    build_test_primary, fake_secondary, fake_secondary_with_addrs, make_binary,
+    make_relative_binary, setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;

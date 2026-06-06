@@ -44,7 +44,6 @@
 use std::panic::AssertUnwindSafe;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
@@ -55,9 +54,8 @@ use crate::primary::command_channel::PrimaryCommand;
 #[cfg(test)]
 mod tests;
 
-impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
+impl<S, E, I> PrimaryCoordinator<S, E, I>
 where
-    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,

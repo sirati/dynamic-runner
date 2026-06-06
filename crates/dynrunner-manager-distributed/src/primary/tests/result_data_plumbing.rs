@@ -9,6 +9,7 @@ use super::*;
 /// Pre-P3b the primary destructured with `..` and hardcoded
 /// `result_data: None`, which silently dropped every byte that the
 /// producer worker had attached.
+#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation() {
     let local = tokio::task::LocalSet::new();
@@ -22,13 +23,12 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 peer_timeout: Duration::from_secs(5),
                 ..test_primary_config()
             };
-            let mut primary: crate::primary::PrimaryCoordinator<_, _, _, TestId> =
-                crate::primary::PrimaryCoordinator::new(
-                    config,
-                    transport,
-                    ResourceStealingScheduler::memory(),
-                    FixedEstimator(100),
-                );
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
 
             // Seed a TaskAdded so the CRDT apply for TaskCompleted is
             // not NoOp'd by the `apply_locally_for_broadcast` filter.

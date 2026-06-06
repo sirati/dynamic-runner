@@ -1,7 +1,6 @@
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerConnectionInfo, PeerTransport, PrimaryPeerSetupBootstrap,
-    SetupBootstrapBroadcast, SetupBootstrapMessage,
+    ClusterMutation, PeerConnectionInfo, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -10,9 +9,7 @@ use crate::state::SecondaryConnectionState;
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
         tracing::info!("sending peer lists");
 
@@ -77,40 +74,28 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             .collect();
 
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        // Step 10: route the PeerInfo fan-out through the narrow
-        // `SetupBootstrapBroadcast` surface. As on the secondary side,
-        // the underlying wire stays the same `transport`; the
-        // call-site type is what changed — `SetupBootstrapMessage`
-        // accepts only the three setup variants, so an accidental
-        // runtime broadcast fails to type-check here.
-        //
-        // The narrower broadcast result is `Result<(), String>`
-        // (partial-failure summary folded into one diagnostic). The
-        // pre-Step-10 wire path emitted the same warn-log per failing
-        // secondary; we preserve that detail by routing the structured
-        // form through the underlying transport ONLY for the partial-
-        // failure log loop below, while the actual delivery goes
-        // through the bootstrap. This keeps the per-secondary diagnostic
-        // breadcrumb that operators rely on without re-introducing the
-        // structured-error type on the bootstrap trait surface.
-        let msg = SetupBootstrapMessage::PeerInfo {
-            sender_id: self.config.node_id.clone(),
-            timestamp: timestamp_now(),
-            peers,
-        };
-        // Per-secondary structured warn lines for partial-failure
-        // cases are emitted by the bootstrap adapter (it walks the
-        // underlying transport's partial-failure list before folding
-        // it into the summary). The pre-Step-10 path emitted those
-        // lines from here directly; the post-Step-10 arrangement
-        // moves the emission into the adapter so every
-        // `SetupBootstrapBroadcast::broadcast` caller gets the same
-        // observability for free, without each call site
-        // re-implementing the walk. The `?` here propagates the
-        // summary string the adapter folds up — same exit semantics
-        // as the pre-refactor `return Err(format!(…))`.
-        let mut bootstrap = PrimaryPeerSetupBootstrap::new(&mut self.transport);
-        SetupBootstrapBroadcast::<I>::broadcast(&mut bootstrap, msg).await?;
+        // The PeerInfo fan-out rides the unified mesh egress: build the
+        // narrow setup-typed `SetupBootstrapMessage` (so an accidental
+        // operational variant fails to type-check here), then losslessly
+        // convert it to the wire `DistributedMessage` and broadcast it
+        // through `send_to(Destination::All, ..)` — the same egress every
+        // other primary broadcast uses. The wire bytes are identical to the
+        // pre-mesh `PrimaryPeerSetupBootstrap` path (the `From` conversion
+        // is the same one the adapter used internally); only the routing
+        // surface changed, from a transport-direct adapter to the queued
+        // mesh send. Per-secondary delivery failures are not folded into a
+        // synchronous result anymore (the queued send has none): a silent
+        // secondary surfaces through the heartbeat monitor, exactly as the
+        // adapter's own docs noted the per-secondary signal already did.
+        let msg: dynrunner_protocol_primary_secondary::DistributedMessage<I> =
+            SetupBootstrapMessage::PeerInfo {
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                peers,
+            }
+            .into();
+        self.send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
+            .await?;
 
         // Broadcast the observer-join CRDT batch immediately after
         // the PeerInfo fan-out. Secondaries' `wait_for_setup` accepts

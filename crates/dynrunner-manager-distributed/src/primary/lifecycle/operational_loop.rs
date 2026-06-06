@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier};
-use dynrunner_protocol_primary_secondary::{MessageType, PeerTransport};
+use dynrunner_protocol_primary_secondary::MessageType;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
@@ -30,9 +30,7 @@ fn format_drain_tally(by_type: &HashMap<MessageType, usize>) -> String {
     format!("[{body}]")
 }
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Run-completion exit decision for one operational-loop iteration.
     ///
     /// Returns `true` iff the loop should break this iteration on a
@@ -509,7 +507,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                         }
                     }
                 }
-                msg = self.transport.recv_peer(), if !transport_closed => {
+                msg = self.inbox.recv(), if !transport_closed => {
                     match msg {
                         Some(m) => {
                             // THE single inbound arm. Every wire shape —
@@ -896,7 +894,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                 break;
             }
             let poll_window = std::cmp::min(quiet_window, remaining);
-            match tokio::time::timeout(poll_window, self.transport.recv_peer()).await {
+            match tokio::time::timeout(poll_window, self.inbox.recv()).await {
                 Ok(Some(msg)) => {
                     // Post-loop drain: no operational loop is running to
                     // service callback-queued spawn_tasks, so passing

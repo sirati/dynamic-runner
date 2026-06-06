@@ -117,10 +117,11 @@ fn respawn_event_ringbuffer_drops_oldest_at_1024_cap() {
 // lands its outcome on the JoinSet; the test reads the
 // resolved entry to confirm the new id).
 use crate::peer_lifecycle::PeerLifecycleEvent;
-use crate::primary::test_helpers::{FixedEstimator, TestId, setup_test};
+use crate::primary::test_helpers::{
+    FixedEstimator, PrimaryMeshKeepalive, TestId, build_test_primary, setup_test,
+};
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelPeerTransport;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -168,12 +169,10 @@ impl SecondarySpawner for MockSpawner {
 /// Build a coordinator wired with 1 reserved initial-cohort id so
 /// the first minted respawn lands on `secondary-1`. The minted-id
 /// monotonic test pins this contract directly.
-fn make_coordinator() -> PrimaryCoordinator<
-    ChannelPeerTransport<TestId>,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
+fn make_coordinator() -> (
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    PrimaryMeshKeepalive,
+) {
     let (transport, _ends) = setup_test(0);
     let config = PrimaryConfig {
         num_secondaries: 1,
@@ -186,7 +185,7 @@ fn make_coordinator() -> PrimaryCoordinator<
         mesh_ready_timeout: Duration::from_secs(1),
         ..PrimaryConfig::default()
     };
-    PrimaryCoordinator::new(
+    build_test_primary(
         config,
         transport,
         ResourceStealingScheduler::memory(),
@@ -214,7 +213,7 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let spawner = Arc::new(MockSpawner::new());
             let calls = Arc::clone(&spawner.calls);
             let captured = Arc::clone(&spawner.captured_ids);
@@ -263,7 +262,7 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
 /// is `None`, so no listener can enqueue.
 #[tokio::test(flavor = "current_thread")]
 async fn respawn_dispatcher_skips_when_policy_disabled() {
-    let coordinator = make_coordinator();
+    let (coordinator, _mesh) = make_coordinator();
     // No `enable_respawn` call — the spawner / budget / channel /
     // listener registration are all absent by construction.
     assert!(coordinator.respawn_spawner.is_none());
@@ -302,7 +301,7 @@ async fn respawn_dispatcher_respects_per_secondary_budget() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let spawner = Arc::new(MockSpawner::new());
             let calls = Arc::clone(&spawner.calls);
             coordinator.enable_respawn(
@@ -363,7 +362,7 @@ async fn respawn_dispatcher_respects_total_budget() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let spawner = Arc::new(MockSpawner::new());
             let calls = Arc::clone(&spawner.calls);
             coordinator.enable_respawn(
@@ -421,7 +420,7 @@ async fn respawn_dispatcher_minted_id_is_monotonic() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let spawner = Arc::new(MockSpawner::new());
             let captured = Arc::clone(&spawner.captured_ids);
             coordinator.enable_respawn(
@@ -473,7 +472,7 @@ async fn unbounded_respawn_request_channel_accepts_burst() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut coordinator = make_coordinator();
+            let (mut coordinator, _mesh) = make_coordinator();
             let spawner = Arc::new(MockSpawner::new());
             let calls = Arc::clone(&spawner.calls);
             coordinator.enable_respawn(

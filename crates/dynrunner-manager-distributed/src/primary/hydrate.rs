@@ -29,7 +29,6 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
-use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
@@ -37,9 +36,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::secondary::origination::cascade_drain_done;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Build a fresh `PendingPool` for the authoritative primary view
     /// from the replicated `cluster_state` ledger.
     ///

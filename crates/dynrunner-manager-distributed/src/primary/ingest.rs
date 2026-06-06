@@ -21,16 +21,14 @@
 //! phase has started, so it is 3b.
 
 use dynrunner_core::{BoundedString, ErrorType, Identifier, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, PeerTransport};
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryCoordinator, RunError};
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Classify + commit the INITIAL task batch, the `extend`
     /// replacement on the bootstrap path.
     ///

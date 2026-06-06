@@ -10,9 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use dynrunner_core::{Identifier, TaskInfo, TypeId};
-use dynrunner_protocol_primary_secondary::{
-    Destination, DistributedMessage, PeerId, PeerTransport,
-};
+use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::PrimaryCoordinator;
@@ -163,9 +161,8 @@ pub fn compute_initial_staging_entries<I: Identifier>(
     Ok(entries)
 }
 
-impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
+impl<S, E, I> PrimaryCoordinator<S, E, I>
 where
-    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,

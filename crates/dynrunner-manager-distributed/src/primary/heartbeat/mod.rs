@@ -31,8 +31,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerId, PeerTransport,
-    RemovalCause,
+    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerId, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -109,9 +108,7 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<Tr, S, E, I>
-{
+impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Update the keepalive timestamp for a known secondary. No-op if the
     /// secondary id isn't registered (e.g. a stray message after death).
     ///
