@@ -56,6 +56,45 @@ pub enum PrimaryChangeReason {
     Transferred,
 }
 
+/// Which run-progress milestone a [`ClusterMutation::RunMilestone`] fact
+/// records (A7). These are the PROMOTED-primary phase transitions an
+/// observer cannot infer from per-task deltas alone — they are
+/// authority-side decisions (the primary chose to spawn a phase's tasks,
+/// or to open a retry pass), so the primary records them explicitly as
+/// replicated facts and the narrator (Wave 3b) projects them off the
+/// converged CRDT rather than reconstructing them from task-state churn.
+///
+/// The milestone fact is a MONOTONE grow-only set element keyed by
+/// `(RunMilestoneKind, PhaseId)`: once a `(kind, phase)` pair is reached
+/// it stays reached, so the apply is idempotent and order-independent (no
+/// version stamp needed — a grow-only set is the natural CRDT fit, see
+/// [`ClusterMutation::RunMilestone`]).
+///
+/// `#[serde(other)]`-free: the variant set is closed for this run (the
+/// wire protocol is version-locked per run), and the carrying mutation's
+/// fields are `#[serde(default)]` so a frame from a peer running an older
+/// crate that predates the field decodes safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum RunMilestoneKind {
+    /// The promoted primary began preparing / spawning a phase's tasks
+    /// (the phase became Active and `on_phase_start` fired). The
+    /// authority-side twin of the narrator's task-derived "starting job
+    /// phase" line, recorded so a promoted primary on a DIFFERENT node
+    /// surfaces the phase-start to the operator's observer. The `Default`
+    /// so a `#[serde(default)]` decode of a milestone frame with no `kind`
+    /// reads the phase-start shape.
+    #[default]
+    PhaseTaskSpawning,
+    /// The promoted primary opened a transient-error (Recoverable) retry
+    /// pass for a phase: at least one failed task was reinjected for one
+    /// more attempt.
+    ErrorRetryPassStart,
+    /// The promoted primary opened an OOM (memory-exhaustion) retry pass
+    /// for a phase: at least one OOM-failed task was reinjected under the
+    /// single-worker memory-pressure dispatch shape.
+    OomRetryPassStart,
+}
+
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
@@ -464,5 +503,37 @@ pub enum ClusterMutation<I> {
     /// from `apply_fail_permanent`.
     TasksSpawned {
         tasks: Vec<TaskInfo<I>>,
+    },
+    /// A7 observer-from-CRDT run-milestone fact: the promoted primary
+    /// reached a phase-progress milestone (`kind`) for a phase (`phase`).
+    /// Originated by the authoritative primary at the phase-task-spawning
+    /// and retry-pass-start points (see
+    /// `primary::lifecycle::originate_run_milestone`); broadcast over the
+    /// canonical `apply_and_broadcast_cluster_mutations` path so every
+    /// replica's CRDT mirror converges to the same reached-milestone set,
+    /// and the narrator (Wave 3b) projects it off the converged ledger.
+    ///
+    /// MONOTONE grow-only set-insert: the apply rule inserts
+    /// `(kind, phase)` into a replicated grow-only set on `ClusterState`
+    /// (see `cluster_state::apply`). Once a milestone is reached it stays
+    /// reached, so the apply is idempotent (re-emit / re-delivery is a
+    /// NoOp) and order-independent (the set union is the same regardless
+    /// of arrival order) — the natural CRDT fit, avoiding any version
+    /// stamp. Distinct from the run-LATCH facts (`RunComplete` /
+    /// `RunAborted`, which are single sticky booleans): a milestone set
+    /// carries one element per `(kind, phase)`, so a multi-phase run
+    /// surfaces a phase-start / retry-pass marker per phase.
+    ///
+    /// Both fields are `#[serde(default)]` so a frame from a peer running
+    /// an older crate that predates this variant's fields decodes to the
+    /// zero values (`PhaseTaskSpawning`, the empty `PhaseId`); the variant
+    /// itself is new, so a strictly-older peer never EMITS one, and a
+    /// receiver that predates the variant entirely simply has no arm for
+    /// it — the per-run version lock makes the variant set closed.
+    RunMilestone {
+        #[serde(default)]
+        kind: RunMilestoneKind,
+        #[serde(default)]
+        phase: PhaseId,
     },
 }

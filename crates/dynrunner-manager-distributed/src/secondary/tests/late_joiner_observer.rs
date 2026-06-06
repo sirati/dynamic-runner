@@ -79,6 +79,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
         secondary_capacities: HashMap::new(),
+        run_milestones: HashSet::new(),
         alive_members,
         run_complete: false,
         run_aborted: None,

@@ -148,6 +148,8 @@ fn roundtrip_all_message_types() {
                 current_primary_hash: 0x66,
                 capabilities_count: 3,
                 capabilities_hash: 0x77,
+                run_milestones_count: 4,
+                run_milestones_hash: 0x88,
                 primary_epoch: 3,
                 run_complete: true,
                 run_aborted: false,

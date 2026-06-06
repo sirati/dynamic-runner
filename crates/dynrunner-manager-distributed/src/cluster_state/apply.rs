@@ -420,6 +420,21 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
             }
+            // A7 run-milestone fact: MONOTONE grow-only set-insert. The
+            // first apply for a given `(kind, phase)` records the milestone
+            // and returns `Applied`; every subsequent apply (re-emit,
+            // at-least-once redelivery, snapshot replay) finds it already
+            // present and returns `NoOp`. `HashSet::insert` IS the
+            // idempotent + order-independent join — a grow-only set
+            // converges regardless of arrival order with no version stamp.
+            // The narrator (Wave 3b) diffs this set as a new edge-set.
+            ClusterMutation::RunMilestone { kind, phase } => {
+                if self.run_milestones.insert((kind, phase)) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
         }
     }
 
