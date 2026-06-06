@@ -307,6 +307,18 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
         }
     }
 
+    fn connected_ids(&self) -> Vec<PeerId> {
+        // Mirror the per-arm membership answers of `peer_count`/`has_peer`:
+        // the real mesh enumerates its connection table; the disabled arm
+        // is empty; the no-mesh-with-primary arm has the bootstrap primary
+        // as its sole member. Role-blind throughout.
+        match self {
+            Self::Real(p) => PeerTransport::<I>::connected_ids(&**p),
+            Self::Disabled(p) => PeerTransport::<I>::connected_ids(p),
+            Self::DisabledWithPrimary(link) => vec![PeerId::from(link.primary_id.as_str())],
+        }
+    }
+
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         match self {
             Self::Real(p) => {

@@ -153,6 +153,16 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         self.outgoing.contains_key(id.as_str())
     }
 
+    fn connected_ids(&self) -> Vec<PeerId> {
+        // Live enumeration off the same `outgoing` table that backs
+        // `peer_count`/`has_peer`. Role-blind: the folded primary is an
+        // ordinary id.
+        self.outgoing
+            .keys()
+            .map(|k| PeerId::from(k.as_str()))
+            .collect()
+    }
+
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {
         // No-op: peers are pre-wired via `peer_mesh` /
         // `peer_mesh_with_adjacency`. Test drivers simulate partition
