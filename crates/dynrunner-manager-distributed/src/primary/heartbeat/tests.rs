@@ -871,21 +871,34 @@ async fn oracle_true_when_only_silent_held_work_remains() {
 }
 
 /// Self-cut guard: the recognized primary's OWN same-peer secondary, when
-/// transiently silent past the first WARN stage, must NOT appear in
-/// `silent_secondary_ids` and must NOT flip `only_silent_held_work_remains`
-/// on. The early dispatch-altitude lazy requeue acts on first-stage silence;
-/// during a momentary self-keepalive gap (the host's own secondary is still
-/// processing but briefly silent) reporting self here would yank the self's
-/// LIVE in-flight task before the next keepalive refreshes the clock and
-/// before the hard backstop. The identity filter (`id != current_primary`,
-/// the same cut `alive_remote_secondary_count` uses) excludes that single
-/// co-located entry by IDENTITY. The hard backstop is deliberately left
-/// unfiltered — this guard is the EARLY path only.
+/// transiently silent past the first WARN stage but strictly BEFORE the hard
+/// backstop, must NOT appear in `silent_secondary_ids` and must NOT flip
+/// `only_silent_held_work_remains` on. The early dispatch-altitude lazy
+/// requeue acts on first-stage silence; during a momentary self-keepalive gap
+/// (the host's own secondary is still processing but briefly silent) reporting
+/// self here would yank the self's LIVE in-flight task before the next
+/// keepalive refreshes the clock and before the hard backstop. The identity
+/// filter (`id != current_primary`, the same cut `alive_remote_secondary_count`
+/// uses) excludes that single co-located entry by IDENTITY. The hard backstop
+/// is deliberately left unfiltered — this guard is the EARLY (WARN-only) path.
+///
+/// The schedule here puts the hard backstop far above the sleep (HARD at 10x =
+/// 500ms vs WARN at 1x = 50ms), so the ~120ms silence lands comfortably in the
+/// WARN-only window (70ms clear of WARN(0), 380ms clear of HARD); the assertion
+/// below pins the self entry to `Warn(0)` to prove it. A companion case past
+/// the hard backstop confirms the SAME filter (stage-agnostic `.is_some()`)
+/// also excludes the self at the HARD stage.
 #[tokio::test(flavor = "current_thread")]
 async fn self_secondary_excluded_from_silent_set_and_oracle() {
     let (transport, _sec_rx, _kept) = empty_transport();
+    // Widen the hard backstop to 10x (500ms) so the sleep below lands in the
+    // WARN-only window with a comfortable, non-flaky margin on both sides —
+    // the same robust config shape `warn_stages_fire_once_and_reset_on_recovery`
+    // uses. WARN stays at 1x (50ms).
+    let mut cfg = config(Duration::from_millis(50), 2);
+    cfg.silence_hard_multiple = 10;
     let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
-        config(Duration::from_millis(50), 2),
+        cfg,
         transport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
@@ -905,17 +918,30 @@ async fn self_secondary_excluded_from_silent_set_and_oracle() {
     register_operational_secondary(&mut primary, "primary", 0, "self-victim");
 
     // The self-secondary goes silent past the FIRST WARN stage (50ms) but
-    // well under the hard backstop — exactly the transient self-keepalive
-    // gap §15 describes.
+    // well under the hard backstop (500ms) — exactly the transient
+    // self-keepalive gap §15 describes (the WARN-only window).
     tokio::time::sleep(Duration::from_millis(120)).await;
 
     // Without the filter the staged classifier would flag the self entry;
-    // the identity cut excludes it.
+    // the identity cut excludes it. First pin the silence to the WARN-only
+    // window so the test genuinely demonstrates the early path: the self
+    // entry is at WARN(0), strictly before the hard backstop.
     let report = primary.collect_heartbeat_report();
     assert_eq!(
         report.silences.len(),
         1,
         "the self-secondary is tracked in the raw silence sweep"
+    );
+    assert_eq!(
+        silence_stage(
+            report.silences[0].last_keepalive,
+            Instant::now(),
+            Duration::from_millis(50),
+            &[1],
+            10,
+        ),
+        Some(Stage::Warn(0)),
+        "the silence sits in the WARN-only window (past WARN(0), before HARD)"
     );
     assert!(
         primary.silent_secondary_ids().is_empty(),
@@ -929,6 +955,58 @@ async fn self_secondary_excluded_from_silent_set_and_oracle() {
         !primary.only_silent_held_work_remains(),
         "self-held silent in-flight work must NOT make the lazy-requeue \
          oracle true — yanking the self's live task is the §15 self-cut"
+    );
+}
+
+/// Companion to the WARN-only self-cut guard: the identity filter is
+/// stage-agnostic (`silence_stage(..).is_some()`), so the recognized primary's
+/// own same-peer secondary is excluded from `silent_secondary_ids` and the
+/// early oracle even when the silence is PAST the hard backstop. (The hard
+/// backstop itself, `decide_dead_secondaries`, stays unfiltered and is what
+/// recovers the self entry — but the EARLY dispatch-altitude path never does.)
+#[tokio::test(flavor = "current_thread")]
+async fn self_secondary_excluded_from_early_path_past_hard_backstop() {
+    let (transport, _sec_rx, _kept) = empty_transport();
+    // Default schedule: WARN at 1x (50ms), HARD at 2x (100ms).
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::PrimaryChanged {
+            new: "primary".into(),
+            epoch: 1,
+            reason: Default::default(),
+        });
+    register_operational_secondary(&mut primary, "primary", 0, "self-victim");
+
+    // Silence past the hard backstop (100ms): the HARD stage, not WARN.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let report = primary.collect_heartbeat_report();
+    assert_eq!(
+        silence_stage(
+            report.silences[0].last_keepalive,
+            Instant::now(),
+            Duration::from_millis(50),
+            &[1],
+            2,
+        ),
+        Some(Stage::Hard),
+        "the silence sits at the HARD stage (past the backstop)"
+    );
+    assert!(
+        primary.silent_secondary_ids().is_empty(),
+        "the identity filter excludes the self at the HARD stage too"
+    );
+    assert!(
+        !primary.only_silent_held_work_remains(),
+        "the early dispatch-altitude oracle never fires on the self entry, \
+         regardless of stage"
     );
 }
 
