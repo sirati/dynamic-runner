@@ -282,6 +282,27 @@ pub struct ClusterState<I> {
     /// Merge: grow-only MAX (see `grow_max.rs`). Replicated via snapshot +
     /// AE digest.
     pub(super) unfulfillable_reinject_used: HashMap<String, u32>,
+    /// Replicated respawn ledger (F7) — grow-only SET keyed by `new_id`
+    /// (the minted replacement secondary id, globally unique per accepted
+    /// event), value `RespawnEventRecord { original_id, cause, at }`.
+    /// Replaces the node-local `VecDeque<RespawnEvent>` ring the
+    /// coordinator held. The respawn admission budget
+    /// (`max_per_secondary` / `max_total` / `cooldown`) is a failover
+    /// decision input, so the ledger `should_respawn` consults must be
+    /// replicated: a promoted primary inherits the full ledger via
+    /// union-merge on restore, so a just-respawned family is NOT re-granted
+    /// a fresh per-secondary budget and the cooldown timer does NOT restart.
+    ///
+    /// UNcapped (no ring eviction): the total budget bounds growth — once
+    /// `max_total` events land every further request is rejected, so the
+    /// set never exceeds `max_total + in-flight` entries.
+    ///
+    /// Merge: grow-only SET union-by-key (see `grow_max.rs`); converges
+    /// under union (a key's value is written exactly once, so shared keys
+    /// never diverge); never removes a key, never mutates a value.
+    /// Replicated via snapshot + AE digest, NOT a new `ClusterMutation`
+    /// variant.
+    pub(super) respawn_events: HashMap<String, super::types::RespawnEventRecord>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -325,6 +346,7 @@ where
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
+            respawn_events,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -363,6 +385,8 @@ where
             phase_event_tallies: phase_event_tallies.clone(),
             retry_passes_used: retry_passes_used.clone(),
             unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
+            // Replicated grow-only SET (F7) — clone preserves it.
+            respawn_events: respawn_events.clone(),
         }
     }
 }
@@ -399,6 +423,7 @@ where
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
+            respawn_events,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -425,6 +450,7 @@ where
                 "unfulfillable_reinject_used",
                 &unfulfillable_reinject_used.len(),
             )
+            .field("respawn_events", &respawn_events.len())
             .finish()
     }
 }
@@ -454,6 +480,7 @@ impl<I> Default for ClusterState<I> {
             phase_event_tallies: HashMap::new(),
             retry_passes_used: HashMap::new(),
             unfulfillable_reinject_used: HashMap::new(),
+            respawn_events: HashMap::new(),
         }
     }
 }

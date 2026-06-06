@@ -11,9 +11,11 @@
 //!
 //! The crossing-the-boundary surface is the [`SecondarySpawner`]
 //! trait plus the value types [`SecondarySpawnSpec`], [`SpawnError`],
-//! [`RespawnBudget`], [`RespawnOutcome`], and [`RespawnEvent`].
-//! Everything else (per-task tracking, primary-internal helpers,
-//! CLI flag plumbing) lands in sibling subtasks.
+//! [`RespawnBudget`], and [`RespawnOutcome`]. The respawn LEDGER itself
+//! is the replicated `cluster_state::RespawnEventRecord` grow-only SET
+//! (so the admission budget + cooldown survive a primary failover), not a
+//! node-local ring. Everything else (per-task tracking, primary-internal
+//! helpers, CLI flag plumbing) lands in sibling subtasks.
 
 mod budget;
 mod handler;
@@ -22,8 +24,8 @@ mod types;
 
 pub use listener::respawn_dispatcher_listener;
 pub use types::{
-    RESPAWN_EVENTS_CAP, RespawnBudget, RespawnDecision, RespawnEvent, RespawnOutcome,
-    RespawnRequest, SecondarySpawnSpec, SecondarySpawner, SpawnError,
+    RespawnBudget, RespawnDecision, RespawnOutcome, RespawnRequest, SecondarySpawnSpec,
+    SecondarySpawner, SpawnError,
 };
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use dynrunner_core::BoundedString;
 /// Authored by the primary at the point the corresponding
 /// `ClusterMutation::PeerRemoved` is built; receivers treat the cause
 /// as opaque metadata for logging / telemetry.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RemovalCause {
     /// Authoritative-detection paths: primary's keepalive watchdog
     /// observed N missed heartbeats from a secondary.

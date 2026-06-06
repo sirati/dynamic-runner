@@ -17,9 +17,9 @@ use crate::primary::retry_bucket::BucketKind;
 
 use super::ClusterState;
 use super::TaskState;
-use super::grow_max::merge_grow_max;
+use super::grow_max::{merge_grow_max, merge_grow_set};
 use super::merge::merge_capability;
-use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally};
+use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally, RespawnEventRecord};
 
 /// Serializable snapshot of an entire `ClusterState`. Used by the
 /// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
@@ -241,6 +241,15 @@ pub struct ClusterStateSnapshot<I> {
     /// keeps wire compat with a pre-field sender.
     #[serde(default)]
     pub unfulfillable_reinject_used: HashMap<String, u32>,
+    /// Replicated respawn ledger (F7) — grow-only SET keyed by `new_id`,
+    /// value `RespawnEventRecord`. Carried so a promoted primary inherits
+    /// the full respawn ledger and the admission budget + cooldown are NOT
+    /// re-granted on failover. Merge rule on `restore`: union-by-key (a
+    /// `new_id` is globally unique per event and its value is written once,
+    /// so shared keys never diverge). `#[serde(default)]` keeps wire compat
+    /// with a pre-field sender (missing field decodes as an empty map).
+    #[serde(default)]
+    pub respawn_events: HashMap<String, RespawnEventRecord>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -289,6 +298,8 @@ impl<I: Identifier> ClusterState<I> {
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
+            // Replicated grow-only SET (F7).
+            respawn_events,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -350,6 +361,10 @@ impl<I: Identifier> ClusterState<I> {
             phase_event_tallies: phase_event_tallies.clone(),
             retry_passes_used: retry_passes_used.clone(),
             unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
+            // Replicated grow-only SET (F7) — carried so a promoted primary
+            // inherits the respawn ledger via union-merge on restore (the
+            // admission budget + cooldown survive failover).
+            respawn_events: respawn_events.clone(),
         }
     }
 
@@ -433,6 +448,7 @@ impl<I: Identifier> ClusterState<I> {
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
+            respawn_events,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -625,5 +641,13 @@ impl<I: Identifier> ClusterState<I> {
             &mut self.unfulfillable_reinject_used,
             unfulfillable_reinject_used,
         );
+        // Grow-only SET (F7): union-by-key merge so a promoted primary
+        // inherits the full respawn ledger and a stale peer's snapshot can
+        // never remove an event (the budget + cooldown survive failover).
+        // A `new_id` is globally unique per event and its value is written
+        // exactly once, so shared keys never diverge — union-by-key is
+        // correct + idempotent. The merge rule is spelled once in
+        // `grow_max::merge_grow_set`.
+        merge_grow_set(&mut self.respawn_events, respawn_events);
     }
 }

@@ -70,32 +70,6 @@ pub struct RespawnOutcome {
     pub result: Result<(), String>,
 }
 
-/// Track family of respawned secondaries — `original_id` lets the
-/// budget look at the chain to apply per-secondary caps.
-#[derive(Clone, Debug)]
-pub struct RespawnEvent {
-    pub original_id: String,
-    pub new_id: String,
-    pub cause: RemovalCause,
-    pub at: std::time::SystemTime,
-}
-
-/// Maximum number of [`RespawnEvent`]s retained on the coordinator's
-/// `respawn_events` ring. Sized for operator forensics across the
-/// lifetime of a single run; the ring drops oldest on overflow.
-pub const RESPAWN_EVENTS_CAP: usize = 1024;
-
-/// Push `ev` onto a `respawn_events` ring, evicting the oldest entry
-/// when the ring is already at [`RESPAWN_EVENTS_CAP`]. The single
-/// concern of this helper is bounded FIFO semantics; the operational
-/// loop (the only legitimate caller) does not need to know the cap.
-pub(crate) fn push_event(ring: &mut std::collections::VecDeque<RespawnEvent>, ev: RespawnEvent) {
-    if ring.len() == RESPAWN_EVENTS_CAP {
-        ring.pop_front();
-    }
-    ring.push_back(ev);
-}
-
 /// Cross-boundary request issued by the peer-lifecycle listener side
 /// and consumed by the operational `select!` arm.
 ///

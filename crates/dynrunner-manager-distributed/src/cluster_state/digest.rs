@@ -86,6 +86,10 @@ impl<I: Identifier> ClusterState<I> {
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
+            // Replicated grow-only SET (F7) — summarised: count + KEY+VALUE
+            // XOR-fold (a missing event key is caught by the count; the
+            // VALUE is folded too, mirroring the grow-only-MAX shape).
+            respawn_events,
             // ── node-local: not replicated, carries no convergence signal ──
             // (see the field docs on `ClusterState`; same set `snapshot()`
             // classifies node-local).
@@ -177,6 +181,11 @@ impl<I: Identifier> ClusterState<I> {
         let unfulfillable_reinject_used_hash =
             super::grow_max::fold_grow_max(unfulfillable_reinject_used);
 
+        // Grow-only SET (F7): count + order-independent XOR-fold of the
+        // `(new_id, record)` PAIRS (same KEY+VALUE shape as the grow-only-MAX
+        // fold). The fold rule is spelled once in `grow_max::fold_grow_set`.
+        let respawn_events_hash = super::grow_max::fold_grow_set(respawn_events);
+
         StateDigest {
             tasks_count: tasks.len() as u64,
             tasks_hash,
@@ -209,6 +218,8 @@ impl<I: Identifier> ClusterState<I> {
             retry_passes_used_hash,
             unfulfillable_reinject_used_count: unfulfillable_reinject_used.len() as u64,
             unfulfillable_reinject_used_hash,
+            respawn_events_count: respawn_events.len() as u64,
+            respawn_events_hash,
         }
     }
 }

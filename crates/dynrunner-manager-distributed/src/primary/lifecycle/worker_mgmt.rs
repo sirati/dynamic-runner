@@ -203,7 +203,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return true;
         }
         match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref()) {
-            (Some(_), Some(budget)) => (self.respawn_events.len() as u32) < budget.max_total,
+            (Some(_), Some(budget)) => {
+                (self.cluster_state.respawn_events().len() as u32) < budget.max_total
+            }
             _ => false,
         }
     }

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,8 +16,7 @@ use super::config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 use super::error::RunError;
 use super::preferred_secondaries;
 use super::respawn::{
-    RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest, SecondarySpawner,
-    respawn_dispatcher_listener,
+    RespawnBudget, RespawnOutcome, RespawnRequest, SecondarySpawner, respawn_dispatcher_listener,
 };
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
@@ -613,12 +612,6 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// start with an empty `JoinSet`.
     pub(super) respawn_tasks: JoinSet<RespawnOutcome>,
 
-    /// FIFO ring of completed-or-attempted respawn events, capped at
-    /// [`respawn::RESPAWN_EVENTS_CAP`] entries (oldest dropped on
-    /// overflow). For operator forensics and per-secondary cap
-    /// consultation. Not cloned, snapshotted, or restored.
-    pub(super) respawn_events: VecDeque<RespawnEvent>,
-
     /// Per-provider respawn implementation, supplied by the
     /// deployment layer (multi-process / SLURM). `None` disables the
     /// respawn pipeline at construction; the operational `select!`
@@ -922,7 +915,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             next_secondary_id,
             slurm_job_manager: None,
             respawn_tasks: JoinSet::new(),
-            respawn_events: VecDeque::new(),
             respawn_spawner: None,
             respawn_budget: None,
             respawn_request_tx: None,
