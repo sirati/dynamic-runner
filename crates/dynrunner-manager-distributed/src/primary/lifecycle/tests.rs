@@ -193,7 +193,7 @@ fn count_keepalives(
 ) -> usize {
     log.borrow()
         .iter()
-        .filter(|m| matches!(m, DistributedMessage::Keepalive { target: None, .. }))
+        .filter(|m| matches!(m, DistributedMessage::Keepalive { target: _, .. }))
         .count()
 }
 
@@ -205,8 +205,8 @@ fn count_keepalives(
 /// first `heartbeat_tick` fires. Asserts the emission CALL was issued
 /// over the peer transport (delivery is not asserted — for the parked
 /// failover primary the transport is a no-op until A-M2 swaps it).
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn activate_local_primary_emits_a_keepalive() {
     let local = tokio::task::LocalSet::new();
     local
@@ -251,8 +251,8 @@ async fn activate_local_primary_emits_a_keepalive() {
 /// "primary", epoch: 1}` in the recorded log — `epoch: 1` is the
 /// non-default value that proves the originator ran, not a zeroed
 /// default) AND the single uniform "primary changed" important event.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn activate_local_primary_announces_primary_changed() {
     use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
 
@@ -333,8 +333,8 @@ async fn activate_local_primary_announces_primary_changed() {
 /// until the mesh-ready timeout. Holding the secondary-end senders keeps
 /// `transport.recv()` pending, so the heartbeat-tick arm is what fires.
 /// Asserts at least one keepalive was emitted before the timeout returns.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
+#[ignore = "C-NODE-TESTS: queued-egress drain-settle adaptation (needs per-drain settle or wire round-trip modeling)"]
 async fn wait_for_mesh_ready_ticks_keepalive() {
     let local = tokio::task::LocalSet::new();
     local
@@ -924,7 +924,6 @@ fn make_fleet_coordinator(
 /// `secondaries.is_empty()` condition could never trip here (the own
 /// secondary lives in the primary-local map), so the run hung; the
 /// count-based condition arms correctly.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn primary_strands_when_only_own_secondary_alive() {
     let local = tokio::task::LocalSet::new();
@@ -992,7 +991,6 @@ async fn primary_strands_when_only_own_secondary_alive() {
 /// holding a transport inbound sender so `recv_peer` parks; the
 /// operational loop must still be running (not have taken any exit) when
 /// the bound elapses.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn healthy_fleet_does_not_arm_fleet_dead() {
     let local = tokio::task::LocalSet::new();
@@ -1056,7 +1054,6 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
 /// `id != current_primary` filter is a no-op here: the count is simply
 /// "all alive worker-secondaries", which is zero once every remote
 /// secondary is dead.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn submitter_primary_strands_when_remote_fleet_gone() {
     let local = tokio::task::LocalSet::new();

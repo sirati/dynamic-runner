@@ -116,6 +116,17 @@ impl<I: Identifier> RoleSlot<I> {
 
     /// Hand a frame to this role's inbound stream.
     ///
+    /// STRIPS the routing `target` first: the `target` is the wire envelope's
+    /// routing header (the egress stamps it so the mesh-pump can demux to the
+    /// right local slot WITHOUT a content classifier). By the time a frame
+    /// reaches THIS local-delivery boundary the demux is done, so the
+    /// APPLICATION frame the role's handler receives is target-agnostic —
+    /// every handler pattern-matches `target: None`, never a routed value.
+    /// Clearing it here keeps the routing concern entirely inside the mesh
+    /// layer and the handlers oblivious to it (the single delivery choke
+    /// point every loopback + ingress frame flows through, so one clear
+    /// covers both).
+    ///
     /// `Err` iff the receive end ([`super::RoleInbox`]) was dropped — the
     /// "this role's coordinator loop is gone" signal the mesh treats the
     /// same as a failed `Weak`-upgrade (collect-then-prune). A live slot
@@ -123,7 +134,8 @@ impl<I: Identifier> RoleSlot<I> {
     /// `Arc` drop; the mesh prunes on either. The frame is unrecoverable
     /// on failure (its only consumer is gone), so the error is a small
     /// reason string — the mesh only inspects `is_err`.
-    pub fn deliver(&self, frame: DistributedMessage<I>) -> Result<(), String> {
+    pub fn deliver(&self, mut frame: DistributedMessage<I>) -> Result<(), String> {
+        frame.clear_target();
         self.inbound
             .send(frame)
             .map_err(|_| "role inbound receiver dropped".to_string())

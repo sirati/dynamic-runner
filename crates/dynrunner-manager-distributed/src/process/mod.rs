@@ -71,8 +71,11 @@ pub mod membership;
 pub mod mesh;
 pub mod mesh_client;
 pub mod node;
+pub mod pump;
 pub mod role;
 pub mod role_slot;
+pub mod run;
+pub mod run_inputs;
 
 #[cfg(test)]
 mod tests;
@@ -81,5 +84,8 @@ pub use membership::MembershipView;
 pub use mesh::Mesh;
 pub use mesh_client::{LocalDispatch, MeshClient, RoleInbox};
 pub use node::{Node, PromotionSignal, RoleEntry};
+pub use pump::{MeshControl, MeshControlHandle};
 pub use role::LocalRole;
 pub use role_slot::RoleSlot;
+pub use run::NodeRunOutcome;
+pub use run_inputs::{NodeRunInputs, PrimaryRunArgs, PromotedPrimary, PromotedPrimaryBuilder};

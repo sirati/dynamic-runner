@@ -8,6 +8,7 @@ use dynrunner_core::{
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_protocol_primary_secondary::address::Destination;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerId, PeerTransport,
 };
@@ -412,7 +413,7 @@ pub(super) async fn fake_secondary_with_addrs(
 ) {
     outgoing_to_primary
         .send(DistributedMessage::SecondaryWelcome {
-            target: None,
+            target: Some(Destination::Primary),
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -429,7 +430,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
     outgoing_to_primary
         .send(DistributedMessage::CertExchange {
-            target: None,
+            target: Some(Destination::Primary),
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -448,7 +449,7 @@ pub(super) async fn fake_secondary_with_addrs(
     // because the in-process fake doesn't model peer-dial latency.
     outgoing_to_primary
         .send(DistributedMessage::MeshReady {
-            target: None,
+            target: Some(Destination::Primary),
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -491,7 +492,7 @@ pub(super) async fn fake_secondary_with_addrs(
                             for task_hash in pending_hashes.drain() {
                                 outgoing_to_primary
                                     .send(DistributedMessage::TaskComplete {
-                                        target: None,
+                                        target: Some(Destination::Primary),
                                         sender_id: secondary_id.clone(),
                                         timestamp: 0.0,
                                         secondary_id: secondary_id.clone(),
@@ -525,7 +526,7 @@ pub(super) async fn fake_secondary_with_addrs(
                     pending_hashes.remove(&entry.hash);
                     outgoing_to_primary
                         .send(DistributedMessage::TaskComplete {
-                            target: None,
+                            target: Some(Destination::Primary),
                             sender_id: secondary_id.clone(),
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
@@ -537,7 +538,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
                     outgoing_to_primary
                         .send(DistributedMessage::TaskRequest {
-                            target: None,
+                            target: Some(Destination::Primary),
                             sender_id: secondary_id.clone(),
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
@@ -555,7 +556,7 @@ pub(super) async fn fake_secondary_with_addrs(
                 pending_hashes.remove(&file_hash);
                 outgoing_to_primary
                     .send(DistributedMessage::TaskComplete {
-                        target: None,
+                        target: Some(Destination::Primary),
                         sender_id: secondary_id.clone(),
                         timestamp: 0.0,
                         secondary_id: secondary_id.clone(),
@@ -567,7 +568,7 @@ pub(super) async fn fake_secondary_with_addrs(
 
                 outgoing_to_primary
                     .send(DistributedMessage::TaskRequest {
-                        target: None,
+                        target: Some(Destination::Primary),
                         sender_id: secondary_id.clone(),
                         timestamp: 0.0,
                         secondary_id: secondary_id.clone(),
@@ -584,38 +585,61 @@ pub(super) async fn fake_secondary_with_addrs(
     }
 }
 
-/// Keeps the test mesh + the primary role-slot `Arc` + the demote sender
-/// alive for as long as the [`PrimaryCoordinator`] built by
-/// [`build_test_primary`] lives.
+/// Keeps the primary role-slot `Arc` + the demote sender + the running
+/// production mesh-pump alive for as long as the [`PrimaryCoordinator`] built
+/// by [`build_test_primary`] lives.
 ///
 /// In production the [`crate::process::Node`] owns the `Mesh`, the
-/// `Arc<RoleSlot>`, and the demote channel; the mesh-pump drains the
-/// coordinator's queued egress and feeds its inbox. The unit tests have no
-/// pump (that is `Node::run`, owned by C-NODE), so a test that needs wire
-/// round-trips is `#[ignore]`d until C-NODE re-enables it against the real
-/// `Node::run`. This guard exists only so the LOCAL-only tests — which
-/// exercise the rewired coordinator's in-memory state without round-trips —
-/// can construct a coordinator: the slot `Arc` keeps the mesh `Weak`
-/// upgradeable and the `Mesh` keeps the egress queue's receiver alive so a
-/// queued `client.send` does not error as "pump dropped". Hold it for the
-/// coordinator's lifetime (bind to `_mesh` at the call site); dropping it
-/// early would tear the mesh out from under the coordinator.
+/// `Arc<RoleSlot>`, and the demote channel, and runs the mesh-pump that
+/// drains the coordinator's queued egress + feeds its inbox. This harness
+/// reproduces exactly that turn for the in-process primary tests: it spawns
+/// the PRODUCTION [`crate::process::pump::run_pump`] (the pump OWNS the
+/// `Mesh`), so a `primary.run(..)`'s queued sends reach the wire and inbound
+/// frames reach the primary slot — TRUE e2e against the production pump, not
+/// a test-double. Hold it for the coordinator's lifetime (bind to `_mesh` at
+/// the call site); dropping it closes the control channel + drops the slot,
+/// tearing the mesh out from under the coordinator.
 pub(super) struct PrimaryMeshKeepalive {
-    _mesh: Mesh<TestId, ChannelPeerTransport<TestId>>,
-    _slot: Arc<RoleSlot<TestId>>,
+    /// The primary's slot `Arc`, held ONLY on the no-pump (sync-test) path —
+    /// on the pump path the pump task owns it (so it drops on wire-close).
+    _slot: Option<Arc<RoleSlot<TestId>>>,
     _demote_tx: tokio_mpsc::UnboundedSender<()>,
+    /// Held so the pump's control arm stays open for the run's lifetime
+    /// (only present when a pump was spawned).
+    _control: Option<crate::process::MeshControlHandle<TestId>>,
+    /// The spawned pump task — aborted on drop so it does not outlive the run.
+    /// `None` for a SYNC unit test (no tokio runtime): there the mesh is held
+    /// idle below and no pump runs (the coordinator's queued egress simply
+    /// accumulates, harmlessly, because such tests never drive a wire round
+    /// trip — they inspect the coordinator's in-memory state directly).
+    pump: Option<tokio::task::JoinHandle<()>>,
+    /// When no pump was spawned (sync test), the mesh is parked here so its
+    /// egress-queue receiver stays alive (a queued `client.send` must not
+    /// error as "pump dropped"). `None` once the mesh was moved into a pump.
+    _mesh: Option<Mesh<TestId, ChannelPeerTransport<TestId>>>,
+}
+
+impl Drop for PrimaryMeshKeepalive {
+    fn drop(&mut self) {
+        if let Some(h) = self.pump.take() {
+            h.abort();
+        }
+    }
 }
 
 /// Mint the primary's mesh capability trio from a test `Mesh` (mirroring
-/// C0's `process/tests`) and build a [`PrimaryCoordinator`] over them.
+/// C0's `process/tests`), build a [`PrimaryCoordinator`] over them, and spawn
+/// the PRODUCTION mesh-pump over the mesh.
 ///
 /// Returns the coordinator plus the [`PrimaryMeshKeepalive`] guard the
 /// caller MUST keep alive alongside it (`let (mut primary, _mesh) = …`).
 /// This is the single construction choke point the tests share so the
-/// `register_local_role` → `new(client, inbox, demote_rx, …)` wiring lives
-/// in ONE place. It spawns no pump: a test that drives wire traffic through
-/// `primary.run(..)` needs the real `Node::run` pump and is `#[ignore]`d
-/// until C-NODE.
+/// `register_local_role` → `new(client, inbox, demote_rx, …)` wiring + the
+/// pump spawn live in ONE place. Because the pump is the real
+/// [`crate::process::pump::run_pump`], a test that drives wire traffic
+/// through `primary.run(..)` runs against the genuine production turn — these
+/// are the e2e tests C-NODE re-enabled. MUST be called inside a
+/// `tokio::task::LocalSet` (the pump is `spawn_local`'d).
 pub(super) fn build_test_primary<S, E>(
     config: PrimaryConfig,
     transport: ChannelPeerTransport<TestId>,
@@ -623,22 +647,60 @@ pub(super) fn build_test_primary<S, E>(
     estimator: E,
 ) -> (PrimaryCoordinator<S, E, TestId>, PrimaryMeshKeepalive)
 where
-    S: Scheduler<TestId>,
-    E: ResourceEstimator<TestId>,
+    S: Scheduler<TestId> + 'static,
+    E: ResourceEstimator<TestId> + 'static,
 {
     let mut mesh = Mesh::new(transport);
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
     let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
     let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
-    (
-        primary,
-        PrimaryMeshKeepalive {
-            _mesh: mesh,
-            _slot: slot,
-            _demote_tx: demote_tx,
-        },
-    )
+    // Publish live membership before the pump spawns so the primary's
+    // failover/strand reads see the connected secondaries from the first tick
+    // (the pump republishes every cycle thereafter).
+    mesh.publish_membership();
+    // Spawn the production pump (sole mesh owner) ONLY when there is a tokio
+    // runtime to spawn into — i.e. the e2e/wire-driving tests, which all run
+    // inside a `LocalSet::run_until`. SYNC unit tests (`#[test]`) that just
+    // build a coordinator and inspect its in-memory state have no runtime; for
+    // them we park the mesh idle in the keepalive (so the egress queue's
+    // receiver stays alive) and skip the pump — they never drive a wire round
+    // trip, so a queued `client.send` simply accumulates harmlessly.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let (control, control_rx) = crate::process::pump::control_channel::<TestId>();
+        // The pump task OWNS the primary's slot `Arc` for the pump's lifetime:
+        // while the pump runs the mesh `Weak` upgrades (inbound reaches the
+        // primary); when the pump EXITS on wire-close (`recv_peer → None`) it
+        // drops the `Arc`, so the slot's inbound sender drops and the primary's
+        // `inbox.recv()` returns `None` — the cluster-collapse signal the
+        // operational loop detects. (In production the `Node` owns this
+        // wire-close→teardown coupling; this harness reproduces it.)
+        let pump = tokio::task::spawn_local(async move {
+            let _slot = slot;
+            crate::process::pump::run_pump(mesh, control_rx).await;
+        });
+        (
+            primary,
+            PrimaryMeshKeepalive {
+                _slot: None,
+                _demote_tx: demote_tx,
+                _control: Some(control),
+                pump: Some(pump),
+                _mesh: None,
+            },
+        )
+    } else {
+        (
+            primary,
+            PrimaryMeshKeepalive {
+                _slot: Some(slot),
+                _demote_tx: demote_tx,
+                _control: None,
+                pump: None,
+                _mesh: Some(mesh),
+            },
+        )
+    }
 }
 
 /// Allocate the channel-pairs for `num_secondaries` and return the

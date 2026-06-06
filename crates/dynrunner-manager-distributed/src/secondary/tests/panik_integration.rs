@@ -281,7 +281,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
             let mut saw_departure = false;
             while let Ok(msg) = mesh_observer_rx.try_recv() {
                 if let DistributedMessage::ClusterMutation {
-    target: None, mutations, .. } = msg {
+    target: _, mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {
                             id,
@@ -524,7 +524,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
             let _ = primary_task.await;
             while let Ok(msg) = mesh_observer_rx.try_recv() {
                 if let DistributedMessage::ClusterMutation {
-    target: None, mutations, .. } = msg {
+    target: _, mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {
                             cause: RemovalCause::SelfDeparture(reason),

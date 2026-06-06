@@ -151,7 +151,6 @@ async fn on_phase_end_fires_after_every_in_flight_item_terminates() {
 /// (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
 /// where the next phase's items only enter the pool after
 /// `on_phase_end` fires.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn on_phase_end_fires_after_last_in_flight_completes_with_lazy_spawn() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -431,7 +430,6 @@ async fn run_phase_ordering_scenario(
 /// (on_phase_start(dependent) never precedes on_phase_end(dep)) is
 /// re-asserted to prove the cascade behaviour is identical with the
 /// call moved.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_spawn() {
     use crate::test_capture::{ImportantCapture, important_only};

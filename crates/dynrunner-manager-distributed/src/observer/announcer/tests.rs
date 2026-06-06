@@ -251,7 +251,7 @@ async fn production_announcer_sender_wraps_body_in_cluster_mutation() {
             sender_id,
             timestamp,
             mutations,
-            target: _,
+            target: None,
         } => {
             assert_eq!(sender_id, "observer-prod");
             assert!(

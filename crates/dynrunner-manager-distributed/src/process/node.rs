@@ -173,4 +173,28 @@ where
         };
         (node, promotion_tx, demote_tx)
     }
+
+    /// Compose a primary role onto this node (builder form). The `slot` is the
+    /// `Arc<RoleSlot>` minted alongside the coordinator's `MeshClient`/`RoleInbox`
+    /// by [`Mesh::register_local_role`]; the node holds it as the teardown
+    /// lever (H4). Used by the composition site (pyo3 / the test harness) that
+    /// builds the bootstrap submitter's primary.
+    pub fn with_primary(mut self, coordinator: P, slot: Arc<RoleSlot<I>>) -> Self {
+        self.primary = Some(RoleEntry { coordinator, slot });
+        self
+    }
+
+    /// Compose a secondary role onto this node (builder form). See
+    /// [`Self::with_primary`].
+    pub fn with_secondary(mut self, coordinator: S, slot: Arc<RoleSlot<I>>) -> Self {
+        self.secondary = Some(RoleEntry { coordinator, slot });
+        self
+    }
+
+    /// Compose an observer role onto this node (builder form, cold-join). See
+    /// [`Self::with_primary`].
+    pub fn with_observer(mut self, coordinator: O, slot: Arc<RoleSlot<I>>) -> Self {
+        self.observer = Some(RoleEntry { coordinator, slot });
+        self
+    }
 }

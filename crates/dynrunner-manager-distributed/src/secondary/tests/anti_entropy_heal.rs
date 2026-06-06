@@ -44,6 +44,7 @@ fn mk_task(name: &str) -> TaskInfo<TestId> {
 /// frames it emits (the anti-entropy snapshot pull lands in the log). The
 /// coordinator's `MeshClient` QUEUES sends, so a test calls
 /// [`SecondaryHarness::drain_egress`] before reading the log.
+#[allow(clippy::type_complexity)]
 fn make_recording_secondary(
     secondary_id: &str,
 ) -> (
@@ -62,7 +63,7 @@ fn count_snapshot_requests(
     log.borrow()
         .iter()
         .filter(|m| matches!(m, DistributedMessage::RequestClusterSnapshot {
-    target: None, .. }))
+    target: _, .. }))
         .count()
 }
 
@@ -230,7 +231,7 @@ async fn converged_secondary_emits_but_does_not_pull() {
                     .borrow()
                     .iter()
                     .any(|m| matches!(m, DistributedMessage::StateDigest {
-    target: None, .. })),
+    target: _, .. })),
                 "the cadence emit must put a StateDigest on the wire"
             );
 

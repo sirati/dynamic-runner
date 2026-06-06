@@ -185,7 +185,7 @@ async fn r1_promotion_on_no_route_count_axis() {
             .broadcast
             .iter()
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
-    target: None, .. })),
+    target: _, .. })),
         "Suspecting transition must broadcast TimeoutQuery"
     );
     assert!(sec.fatal_exit.is_none(), "healthy mesh must not fatal-exit");

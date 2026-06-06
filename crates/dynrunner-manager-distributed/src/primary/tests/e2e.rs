@@ -4,7 +4,6 @@
 use super::*;
 
 /// End-to-end: 1 real primary + 1 real secondary (2 workers), 5 tasks.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_and_secondary_single_node() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -75,7 +74,6 @@ async fn e2e_primary_and_secondary_single_node() {
 }
 
 /// End-to-end: 1 real primary + 2 real secondaries (2 workers each), 10 tasks.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_primary_and_two_secondaries() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -183,7 +181,6 @@ async fn e2e_primary_and_two_secondaries() {
 /// exact fields supplied. This is what the packaging pipeline
 /// depends on — without correct routing, the ExtractionCache on the
 /// receiving secondary never gets primed.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn notify_stage_file_emits_wire_message() {
     let local = tokio::task::LocalSet::new();
@@ -252,7 +249,6 @@ async fn notify_stage_file_emits_wire_message() {
 ///     applied to the secondary's mirror,
 ///   - the originator-side `apply_and_broadcast_cluster_mutations`
 ///     applied locally so the primary's own ledger converges.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn cluster_state_converges_on_primary_and_secondary() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -308,19 +304,16 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                         output_dir: None,
                         memuse_log_path: None,
                     };
-                    let mut secondary = SecondaryCoordinator::new(
-                        config,
-                        transport,
-                        ResourceStealingScheduler::memory(),
-                        FixedEstimator(100),
-                    );
-                    secondary.set_bootstrap_primary_id("primary".to_string());
-                    let mut factory = FakeWorkerFactory;
-                    secondary.run(&mut factory).await.unwrap();
-                    (
-                        secondary.local_tasks_run_for_test(),
-                        secondary.cluster_state_counts_for_test(),
-                    )
+                    // Drive the real secondary against the production
+                    // mesh-pump and collect BOTH the own-worker count and the
+                    // replicated cluster-state counts off the same coordinator.
+                    run_secondary_node_reading(config, transport, FakeWorkerFactory, |s| {
+                        (
+                            s.local_tasks_run_for_test(),
+                            s.cluster_state_counts_for_test(),
+                        )
+                    })
+                    .await
                 });
 
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
@@ -401,7 +394,6 @@ async fn cluster_state_converges_on_primary_and_secondary() {
 ///
 /// This test was the missing pre-stage end-to-end coverage that
 /// let bf1ce02 + a344b0e ship with a contract gap each.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_pre_staged_source_mode() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -521,7 +513,6 @@ async fn e2e_pre_staged_source_mode() {
 /// Without the flag, the same setup (no src_network, no
 /// queue_initial_staging) would hit the unresolvable-task guard
 /// and fail every item NonRecoverable.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_uses_file_based_items_false() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -607,7 +598,6 @@ async fn e2e_uses_file_based_items_false() {
 /// (no deadlock, all items dispatched). The real-world value of
 /// the cap shows up under slow workers; here we just pin the wire
 /// flow + bookkeeping.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn e2e_per_type_max_concurrent() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -696,7 +686,6 @@ async fn e2e_per_type_max_concurrent() {
 /// form the regression gate against re-introducing the gap that
 /// caused asm-tokenizer's `--multi-computer single-process` runs to
 /// 100%-fail at HEAD `2f30920`.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn run_without_stage_file_queue_fails_all_tasks() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -802,7 +791,6 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
 /// the per-secondary fan-out targets the supplied id).
 ///
 /// Pairs with T1 — together the two pin the regression at `2f30920`.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn run_with_initial_staging_succeeds() {
     let _ = tracing_subscriber::fmt::try_init();

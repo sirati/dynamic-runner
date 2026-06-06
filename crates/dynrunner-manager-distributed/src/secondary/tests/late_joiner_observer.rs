@@ -343,7 +343,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
-                        target: None,
+                        target: _,
                         error_type: dynrunner_core::ErrorType::Recoverable,
                         task_hash,
                         ..
@@ -554,7 +554,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
-                        target: None,
+                        target: _,
                         error_type: dynrunner_core::ErrorType::NonRecoverable,
                         task_hash,
                         worker_id,
@@ -653,7 +653,7 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
-                        target: None,
+                        target: _,
                         error_type: dynrunner_core::ErrorType::NonRecoverable,
                         task_hash,
                         worker_id,

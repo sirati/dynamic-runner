@@ -63,7 +63,7 @@ fn drain_first_cluster_mutation(
 ) -> Vec<ClusterMutation<TestId>> {
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::ClusterMutation {
-            target: None,
+            target: _,
             mutations,
             ..
         } = msg
@@ -127,6 +127,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             // drop the whole batch). Assert the wire batch carries BOTH
             // secondaries' records.
             complete.rebroadcast_full_roster().await;
+            settle_pump().await;
             let batch = drain_first_cluster_mutation(&mut sec0_inbox);
             let cap_ids: std::collections::HashSet<&str> = batch
                 .iter()
@@ -282,6 +283,7 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
             );
 
             primary.rebroadcast_full_roster().await;
+            settle_pump().await;
             let batch = drain_first_cluster_mutation(&mut sec_inbox);
 
             // The batch re-emits a `PeerRemoved { cause: RosterReemit }` for
@@ -327,7 +329,6 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
 /// originates the requester's `PeerJoined` (carrying its declared role +
 /// capability). Pre-fix only the secondary router answered; a request
 /// addressed at the primary fell through the catch-all and timed out.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn primary_answers_request_cluster_snapshot() {
     let local = tokio::task::LocalSet::new();
@@ -374,11 +375,12 @@ async fn primary_answers_request_cluster_snapshot() {
             // payload restores into the seeded ledger (the task survives).
             let mut got_snapshot = false;
             let mut got_peer_joined = false;
+            settle_pump().await;
             while let Ok(msg) = requester_inbox.try_recv() {
                 match msg.msg_type() {
                     MessageType::ClusterSnapshot => {
                         if let DistributedMessage::ClusterSnapshot {
-                            target: None,
+                            target: _,
                             snapshot_json,
                             ..
                         } = msg
@@ -398,7 +400,7 @@ async fn primary_answers_request_cluster_snapshot() {
                         // The originated PeerJoined for the requester rides
                         // a broadcast ClusterMutation batch.
                         if let DistributedMessage::ClusterMutation {
-                            target: None,
+                            target: _,
                             mutations,
                             ..
                         } = msg

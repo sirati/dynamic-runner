@@ -9,7 +9,6 @@ use super::*;
 /// Pre-P3b the primary destructured with `..` and hardcoded
 /// `result_data: None`, which silently dropped every byte that the
 /// producer worker had attached.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation() {
     let local = tokio::task::LocalSet::new();
@@ -43,9 +42,10 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                     task: bin,
                 }])
                 .await;
-            // Drain the TaskAdded broadcast from the secondary queue so
-            // the subsequent assertion only sees the TaskCompleted
-            // broadcast under test.
+            // Let the pump drain the queued TaskAdded broadcast onto the wire,
+            // then clear it from the secondary queue so the subsequent
+            // assertion only sees the TaskCompleted broadcast under test.
+            settle_pump().await;
             while let Ok(_msg) = to_sec_rx.try_recv() {}
 
             let payload: Vec<u8> = b"keyed-output-bytes".to_vec();
@@ -59,6 +59,9 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 result_data: Some(payload.clone()),
             };
             primary.handle_task_complete(msg, &mut None).await;
+            // Let the pump drain the queued ClusterMutation broadcast onto the
+            // wire before reading it (egress is QUEUED — M4).
+            settle_pump().await;
 
             // The broadcast lands on the per-secondary outgoing channel.
             let received = to_sec_rx

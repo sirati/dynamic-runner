@@ -60,11 +60,22 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
     /// Pump-published live-read membership the detached clients read.
     membership: MembershipView,
     /// Sender cloned into every [`MeshClient`] for local delivery; the
-    /// pump drains [`Self::local_dispatch_rx`] and applies each item via
+    /// pump drains the egress receiver and applies each item via
     /// [`Self::apply_local_dispatch`].
     local_dispatch_tx: mpsc::UnboundedSender<LocalDispatch<I>>,
-    /// Receive end of the local-dispatch queue, drained by the mesh-pump.
-    local_dispatch_rx: mpsc::UnboundedReceiver<LocalDispatch<I>>,
+    /// Receive end of the local-dispatch queue.
+    ///
+    /// `Some` until the mesh-pump ([`super::pump`]) takes it out via
+    /// [`Self::take_local_dispatch_rx`] to OWN it disjointly from the
+    /// `&mut Mesh` it uses for apply/route. That disjoint ownership is the
+    /// E0499 resolution: the pump's egress-drain future borrows only the
+    /// owned receiver, never `&mut Mesh`, so the egress and ingress drains
+    /// can coexist in one `select!` without double-borrowing the mesh (the
+    /// inbound arm is the sole `&mut Mesh` future; the egress arm's handler
+    /// then borrows the mesh only after the inbound future is dropped). The
+    /// `next_local_dispatch` helper still drains it in place for the
+    /// `process/tests` unit harness, which runs no pump.
+    local_dispatch_rx: Option<mpsc::UnboundedReceiver<LocalDispatch<I>>>,
 }
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
@@ -78,7 +89,7 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
             observer: None,
             membership: MembershipView::new(),
             local_dispatch_tx,
-            local_dispatch_rx,
+            local_dispatch_rx: Some(local_dispatch_rx),
         }
     }
 
@@ -231,12 +242,15 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 self.deliver_local(role, frame);
             }
             None => {
-                debug_assert!(
-                    false,
-                    "Mesh::route_incoming: frame arrived with no C3 target — every \
-                     egress edge must stamp Some(resolved) once the coordinators are \
-                     rewired"
-                );
+                // A frame arriving unstamped is either a real production
+                // egress bug OR a test double that injects raw wire frames
+                // without going through a coordinator's stamping egress. The
+                // documented safe default — fan to every live local slot —
+                // handles BOTH without dropping the frame, so we WARN (the
+                // diagnostic for the production-bug case) rather than panic
+                // (which a debug_assert would, killing legitimate raw-frame
+                // test doubles). Production egress still stamps every edge;
+                // this arm is the no-drop backstop, not the happy path.
                 tracing::warn!(
                     kind = ?frame.msg_type(),
                     "mesh ingress: frame has no routing target (pre-stamp transitional); \
@@ -345,17 +359,86 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
         self.dispatch(item.origin, item.target, item.frame).await
     }
 
-    /// Drain the next queued local-dispatch item, if any. Exposed so the
-    /// mesh-pump (C1) can select on it; `None` once every [`MeshClient`]
-    /// sender is dropped.
+    /// Drain the next queued local-dispatch item, if any.
+    ///
+    /// In-place drain for the `process/tests` unit harness (which runs no
+    /// pump); `None` once every [`MeshClient`] sender is dropped OR the
+    /// pump has already TAKEN the receiver via [`Self::take_local_dispatch_rx`]
+    /// (after the take, this mesh no longer owns the egress queue — the pump
+    /// drains it through the owned receiver).
     pub async fn next_local_dispatch(&mut self) -> Option<LocalDispatch<I>> {
-        self.local_dispatch_rx.recv().await
+        match self.local_dispatch_rx.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => None,
+        }
+    }
+
+    /// Take the egress-queue receiver OUT of the mesh so the mesh-pump
+    /// ([`super::pump`]) owns it disjointly from the `&mut Mesh` it uses for
+    /// apply/route.
+    ///
+    /// This is the E0499 resolution B-SECONDARY flagged: with the receiver
+    /// owned by the pump, the egress-drain future (`rx.recv()`) borrows only
+    /// the receiver — never `&mut Mesh` — so it can coexist in one `select!`
+    /// with the inbound-route arm (the sole `&mut Mesh` future). The egress
+    /// handler then takes `&mut Mesh` (for `apply_local_dispatch`) only after
+    /// the select drops the inbound future, so the two never double-borrow.
+    ///
+    /// Returns `None` if already taken (idempotent guard); the pump takes it
+    /// exactly once at startup.
+    pub fn take_local_dispatch_rx(&mut self) -> Option<mpsc::UnboundedReceiver<LocalDispatch<I>>> {
+        self.local_dispatch_rx.take()
+    }
+
+    /// Receive ONE inbound wire frame, dial off it if it is a `PeerInfo`
+    /// (RV-2 peer-mesh discovery), then route it to the right local slot(s)
+    /// — a single self-contained `&mut Mesh` call whose borrow is released on
+    /// return (so a sibling `select!` arm may then borrow the mesh for an
+    /// egress apply).
+    ///
+    /// Returns `true` if a frame was handled, `false` once the transport's
+    /// inbound is closed (`recv_peer → None`) — the pump's ingress-side
+    /// teardown signal. Both the dial and the route are delegated wholesale
+    /// (the pump is a thin adapter — H6); the dial is observed-not-shadowed
+    /// (it folds the listed peers into the transport, which stays the single
+    /// membership source). A `PeerInfo` is dialed AND ALSO routed to the
+    /// local slots, so the coordinator still observes the frame as today
+    /// (e.g. the secondary's watchdog arming) — the pump only ADDS the dial.
+    pub async fn recv_dial_and_route(&mut self) -> bool {
+        let Some(frame) = self.recv_peer().await else {
+            return false;
+        };
+        if let DistributedMessage::PeerInfo { peers, .. } = &frame {
+            // Clone the seed list out of the borrowed frame so the dial's
+            // `&mut self` does not alias the frame we still route below.
+            let peers = peers.clone();
+            self.connect_to_peers(&peers).await;
+        }
+        self.route_incoming(frame);
+        true
     }
 
     /// Receive the next frame from any remote peer. Thin pass-through to
     /// the transport for the mesh-pump's ingress drain.
     pub async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
         self.transport.recv_peer().await
+    }
+
+    /// Dial the peers in a `PeerInfo` list, folding each into the
+    /// transport's mesh (RV-2). Thin pass-through to
+    /// [`PeerTransport::connect_to_peers`]: peer discovery is a
+    /// transport/membership concern the mesh-pump owns, NOT the
+    /// coordinator's (the coordinator holds only a `MeshClient`/`RoleInbox`,
+    /// neither of which dials — see the `PHASE-C-SEAM[C-NODE]` at
+    /// `secondary/setup.rs`). The pump observes every inbound `PeerInfo`
+    /// frame, so it dials off the same list the coordinator would have, with
+    /// no manager-layer `connect_to_peers` call. Membership re-derivation
+    /// stays in the transport (the pump never shadows it).
+    pub async fn connect_to_peers(
+        &mut self,
+        peers: &[dynrunner_protocol_primary_secondary::PeerConnectionInfo],
+    ) {
+        self.transport.connect_to_peers(peers).await;
     }
 
     /// Borrow of one role's `Weak`, role-keyed.

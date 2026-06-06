@@ -32,7 +32,7 @@ fn drain_assigned_task_ids(
     let mut ids = Vec::new();
     while let Ok(msg) = rx.try_recv() {
         if let DistributedMessage::TaskAssignment {
-            target: None,
+            target: _,
             binary_info,
             ..
         } = msg
@@ -478,7 +478,6 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
 /// that still sees the (surviving) secondary's capacity; it hydrates the
 /// task as Pending and dispatches it once — never stranded, never double-
 /// executed.
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
     let local = tokio::task::LocalSet::new();
@@ -581,6 +580,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                 .dispatch_to_idle_workers(true)
                 .await
                 .expect("dispatch tick must succeed");
+            settle_pump().await;
             let assigned = drain_assigned_task_ids(&mut ends[0].1);
             assert_eq!(
                 assigned,
@@ -594,6 +594,7 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                 .dispatch_to_idle_workers(true)
                 .await
                 .expect("second dispatch tick must succeed");
+            settle_pump().await;
             assert!(
                 drain_assigned_task_ids(&mut ends[0].1).is_empty(),
                 "no second dispatch of the same task — exactly once"

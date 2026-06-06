@@ -184,7 +184,6 @@ fn mark_all_failed_oom(
 /// the wire to verify (a) each task went to its memory-DESC paired
 /// secondary and (b) every assignment landed on `worker_id == 0`
 /// of its secondary (single-worker mask).
-#[ignore = "C-NODE: re-enable under Node::run e2e"]
 #[tokio::test(flavor = "current_thread")]
 async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -295,6 +294,9 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 batch.signals
             );
             primary.react_to_worker_signal_batch(batch).await;
+            // Let the pump drain the queued TaskAssignments onto the wire
+            // before reading them (egress is QUEUED — M4).
+            settle_pump().await;
 
             // Drain each secondary's outgoing channel: every
             // `TaskAssignment` carries the worker id + task id, which
@@ -304,7 +306,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 let mut got: Vec<(String, u32)> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     if let DistributedMessage::TaskAssignment {
-                        target: None,
+                        target: _,
                         worker_id,
                         binary_info,
                         ..
