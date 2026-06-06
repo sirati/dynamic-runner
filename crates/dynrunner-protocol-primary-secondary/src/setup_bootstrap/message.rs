@@ -104,6 +104,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 is_observer,
                 can_be_primary,
             } => DistributedMessage::SecondaryWelcome {
+                target: None,
                 sender_id,
                 timestamp,
                 secondary_id,
@@ -122,6 +123,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 ipv6_address,
                 quic_port,
             } => DistributedMessage::CertExchange {
+                target: None,
                 sender_id,
                 timestamp,
                 secondary_id,
@@ -135,6 +137,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 timestamp,
                 peers,
             } => DistributedMessage::PeerInfo {
+                target: None,
                 sender_id,
                 timestamp,
                 peers,
@@ -169,6 +172,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 hostname,
                 is_observer,
                 can_be_primary,
+                target: _,
             } => Ok(SetupBootstrapMessage::SecondaryWelcome {
                 sender_id,
                 timestamp,
@@ -187,6 +191,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 ipv4_address,
                 ipv6_address,
                 quic_port,
+                target: _,
             } => Ok(SetupBootstrapMessage::CertExchange {
                 sender_id,
                 timestamp,
@@ -200,6 +205,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 sender_id,
                 timestamp,
                 peers,
+                target: _,
             } => Ok(SetupBootstrapMessage::PeerInfo {
                 sender_id,
                 timestamp,

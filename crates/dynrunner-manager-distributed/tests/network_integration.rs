@@ -407,6 +407,7 @@ async fn unified_inbound_surfaces_cluster_mutation_via_recv_peer() {
             // (the post-promotion new primary scenario) into the single
             // inbound sink.
             let mutation_frame = DistributedMessage::ClusterMutation {
+                target: None,
                 sender_id: "sec-0".into(),
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::RunComplete],
@@ -422,7 +423,8 @@ async fn unified_inbound_surfaces_cluster_mutation_via_recv_peer() {
                 .await
                 .expect("unified inbound must deliver");
             assert!(
-                matches!(via_peer, DistributedMessage::ClusterMutation { .. }),
+                matches!(via_peer, DistributedMessage::ClusterMutation {
+    target: None, .. }),
                 "recv_peer must surface the mutation: {via_peer:?}"
             );
 

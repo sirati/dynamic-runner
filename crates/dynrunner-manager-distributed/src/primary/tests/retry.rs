@@ -266,6 +266,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             tokio::task::spawn_local(async move {
                 let mut rx = rx;
                 tx.send(DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -280,6 +281,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -307,6 +309,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                     };
                     if let Some(h) = hash_opt {
                         tx.send(DistributedMessage::TaskFailed {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -317,6 +320,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -378,6 +382,7 @@ async fn retry_max_passes_zero_disables_retry() {
             tokio::task::spawn_local(async move {
                 let mut rx = rx;
                 tx.send(DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -392,6 +397,7 @@ async fn retry_max_passes_zero_disables_retry() {
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -414,6 +420,7 @@ async fn retry_max_passes_zero_disables_retry() {
                     };
                     if let Some(h) = hash_opt {
                         tx.send(DistributedMessage::TaskFailed {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -424,6 +431,7 @@ async fn retry_max_passes_zero_disables_retry() {
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -494,6 +502,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             tokio::task::spawn_local(async move {
                 let mut rx = rx;
                 tx.send(DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -508,6 +517,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -530,6 +540,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                     };
                     if let Some(h) = hash_opt {
                         tx.send(DistributedMessage::TaskFailed {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -542,6 +553,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),
@@ -748,6 +760,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
             tokio::task::spawn_local(async move {
                 let mut rx = rx;
                 tx.send(DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -762,6 +775,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                 })
                 .unwrap();
                 tx.send(DistributedMessage::CertExchange {
+                    target: None,
                     sender_id: id.clone(),
                     timestamp: 0.0,
                     secondary_id: id.clone(),
@@ -790,6 +804,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     if let Some((h, task_id)) = assignment {
                         if task_id == "a_task" {
                             tx.send(DistributedMessage::TaskFailed {
+                                target: None,
                                 sender_id: id.clone(),
                                 timestamp: 0.0,
                                 secondary_id: id.clone(),
@@ -803,6 +818,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                             .unwrap();
                         } else {
                             tx.send(DistributedMessage::TaskComplete {
+                                target: None,
                                 sender_id: id.clone(),
                                 timestamp: 0.0,
                                 secondary_id: id.clone(),
@@ -813,6 +829,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                             .unwrap();
                         }
                         tx.send(DistributedMessage::TaskRequest {
+                            target: None,
                             sender_id: id.clone(),
                             timestamp: 0.0,
                             secondary_id: id.clone(),

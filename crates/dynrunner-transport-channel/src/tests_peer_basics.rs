@@ -25,6 +25,7 @@ async fn peer_mesh_broadcasts_to_all_others() {
     assert_eq!(transports[2].peer_count(), 2);
 
     let msg = DistributedMessage::Keepalive {
+        target: None,
         sender_id: "a".into(),
         timestamp: 1.0,
         secondary_id: "a".into(),
@@ -52,6 +53,7 @@ async fn peer_mesh_send_to_specific_peer() {
     let mut transports = peer_mesh::<TestId>(&ids);
 
     let msg = DistributedMessage::Keepalive {
+        target: None,
         sender_id: "a".into(),
         timestamp: 1.0,
         secondary_id: "a".into(),
@@ -79,6 +81,7 @@ pub(crate) struct SendTestId(pub(crate) String);
 
 pub(crate) fn keepalive(sender: &str) -> DistributedMessage<SendTestId> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: sender.into(),
         timestamp: 1.0,
         secondary_id: sender.into(),

@@ -198,6 +198,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 }
                 to_secondary
                     .send(DistributedMessage::PeerInfo {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         peers: vec![],
@@ -205,6 +206,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                     .unwrap();
                 to_secondary
                     .send(DistributedMessage::InitialAssignment {
+                        target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
                         sender_id: "primary".into(),
@@ -217,6 +219,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                     .unwrap();
                 to_secondary
                     .send(DistributedMessage::TransferComplete {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         total_files: 0,
@@ -275,7 +278,8 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
             // load-bearing assertion that drove this test.
             let mut saw_departure = false;
             while let Ok(msg) = mesh_observer_rx.try_recv() {
-                if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {
                             id,
@@ -439,6 +443,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 }
                 to_secondary
                     .send(DistributedMessage::PeerInfo {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         peers: vec![],
@@ -446,6 +451,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                     .unwrap();
                 to_secondary
                     .send(DistributedMessage::InitialAssignment {
+                        target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
                         sender_id: "primary".into(),
@@ -458,6 +464,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                     .unwrap();
                 to_secondary
                     .send(DistributedMessage::TransferComplete {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         total_files: 0,
@@ -512,7 +519,8 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
             primary_task.abort();
             let _ = primary_task.await;
             while let Ok(msg) = mesh_observer_rx.try_recv() {
-                if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
                     for mutation in mutations {
                         if let ClusterMutation::PeerRemoved {
                             cause: RemovalCause::SelfDeparture(reason),

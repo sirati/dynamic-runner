@@ -127,6 +127,7 @@ mod tests {
         let port = listener.port();
 
         let outgoing: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+            target: None,
             sender_id: "wss-test".into(),
             timestamp: 99.0,
             secondary_id: "wss-test".into(),

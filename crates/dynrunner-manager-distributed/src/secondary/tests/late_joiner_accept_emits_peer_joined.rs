@@ -90,6 +90,7 @@ async fn observer_late_joiner_accept_emits_peer_joined_observer_true() {
 
             // The joiner DECLARES its role on the request frame.
             let req = DistributedMessage::RequestClusterSnapshot {
+                target: None,
                 sender_id: "late-observer-1".into(),
                 timestamp: 0.0,
                 is_observer: true,
@@ -144,6 +145,7 @@ async fn worker_late_joiner_accept_emits_peer_joined_observer_false() {
             sec.enter_operational_for_test();
 
             let req = DistributedMessage::RequestClusterSnapshot {
+                target: None,
                 sender_id: "late-worker-1".into(),
                 timestamp: 0.0,
                 is_observer: false,

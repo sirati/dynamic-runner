@@ -240,7 +240,8 @@ where
                     match msg.msg_type() {
                         MessageType::PeerInfo => {
                             got_peer_info = true;
-                            if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                            if let DistributedMessage::PeerInfo {
+    target: None, peers, .. } = &msg {
                                 let peer_count = peers
                                     .iter()
                                     .filter(|p| p.secondary_id != self.config.secondary_id)
@@ -288,6 +289,7 @@ where
                         MessageType::InitialAssignment => {
                             got_assignment = true;
                             if let DistributedMessage::InitialAssignment {
+                                target: None,
                                 zip_files,
                                 workers_ready,
                                 staged_files,
@@ -324,7 +326,8 @@ where
                             // post-setup view starts out incomplete. CRDT
                             // semantics make this idempotent against any
                             // re-applied mutation post-setup.
-                            if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                            if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
                                 self.apply_cluster_mutations(mutations);
                             }
                         }

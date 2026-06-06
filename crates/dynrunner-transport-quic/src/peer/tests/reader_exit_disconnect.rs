@@ -50,6 +50,7 @@ async fn reader_exit_prunes_connection() {
             // peer-b's accept handler reads it, forwards it, and emits the
             // AcceptedPeer registration.
             let first: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-x".into(),
                 timestamp: 1.0,
                 secondary_id: "peer-x".into(),

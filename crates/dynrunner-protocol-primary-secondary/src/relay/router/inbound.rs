@@ -88,6 +88,7 @@ impl<I: Identifier> Router<I> {
             RouteDecision::NoRoute => {
                 if let Some(predecessor) = path.last() {
                     let backoff = DistributedMessage::RelayBackoff {
+                        target: None,
                         sender_id: self.self_id.clone(),
                         timestamp: clocks.wire,
                         original_sender: sender_id.clone(),

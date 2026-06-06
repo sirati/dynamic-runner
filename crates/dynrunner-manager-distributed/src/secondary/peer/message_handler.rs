@@ -219,6 +219,7 @@ where
                     .get(&query_node_id)
                     .map(|t| t.elapsed().as_secs_f64());
                 let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
+                    target: None,
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
                     query_node_id,

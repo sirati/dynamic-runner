@@ -140,6 +140,7 @@ mod tests {
 
     fn frame(sender: &str) -> DistributedMessage<TestId> {
         DistributedMessage::Keepalive {
+            target: None,
             sender_id: sender.to_string(),
             timestamp: 1.0,
             secondary_id: sender.to_string(),

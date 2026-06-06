@@ -169,7 +169,8 @@ fn count_keepalives(
 ) -> usize {
     log.borrow()
         .iter()
-        .filter(|m| matches!(m, DistributedMessage::Keepalive { .. }))
+        .filter(|m| matches!(m, DistributedMessage::Keepalive {
+    target: None, .. }))
         .count()
 }
 

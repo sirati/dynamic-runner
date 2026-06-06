@@ -199,7 +199,8 @@ async fn observer_announcer_retries_on_send_failure() {
 
 /// `PeerMeshAnnouncerSender::send_holdings` rewraps the typed
 /// body into the canonical
-/// `DistributedMessage::ClusterMutation { mutations: vec![
+/// `DistributedMessage::ClusterMutation {
+/// mutations: vec![
 /// ClusterMutation::PeerResourceHoldingsUpdated { … } ] }`
 /// envelope and posts it onto the outbox. The reply oneshot
 /// resolves with the drain-side outcome; `send_holdings` returns
@@ -250,6 +251,7 @@ async fn production_announcer_sender_wraps_body_in_cluster_mutation() {
             sender_id,
             timestamp,
             mutations,
+            target: _,
         } => {
             assert_eq!(sender_id, "observer-prod");
             assert!(

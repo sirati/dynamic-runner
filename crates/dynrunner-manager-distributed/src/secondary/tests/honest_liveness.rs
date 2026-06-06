@@ -151,7 +151,8 @@ async fn busy_genuine_death_arms_fast_via_leg_a() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. })),
         "fast (leg A) election must broadcast TimeoutQuery",
     );
 }
@@ -200,7 +201,8 @@ async fn wedged_primary_elects_at_backstop() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. })),
         "backstop (leg B) election must broadcast TimeoutQuery",
     );
 }
@@ -239,6 +241,7 @@ async fn primary_recovery_cancels_in_flight_election() {
     // routes to `record_primary_message`.
     sec.handle_inbound(
         DistributedMessage::Keepalive {
+            target: None,
             sender_id: "primary-orig".into(),
             timestamp: timestamp_now(),
             secondary_id: "primary-orig".into(),

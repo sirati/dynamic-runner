@@ -75,6 +75,7 @@ fn primary_with_pool_and_idle_worker(
 
 fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId> {
     DistributedMessage::TaskRequest {
+        target: None,
         sender_id: secondary_id.into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
@@ -88,6 +89,7 @@ fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId
 
 fn task_complete(secondary_id: &str, worker_id: u32, hash: &str) -> DistributedMessage<TestId> {
     DistributedMessage::TaskComplete {
+        target: None,
         sender_id: secondary_id.into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),

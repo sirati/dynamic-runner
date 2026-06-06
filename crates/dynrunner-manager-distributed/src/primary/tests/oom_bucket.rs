@@ -314,6 +314,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 let mut got: Vec<(String, u32)> = Vec::new();
                 while let Ok(msg) = rx.try_recv() {
                     if let DistributedMessage::TaskAssignment {
+                        target: None,
                         worker_id,
                         binary_info,
                         ..

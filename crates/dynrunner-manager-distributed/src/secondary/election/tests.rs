@@ -60,7 +60,8 @@ async fn primary_dies_lowest_id_promotes() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. }))
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. }))
     );
 
     // Wait the gather window so the Suspecting tick is eligible to vote.
@@ -81,7 +82,8 @@ async fn primary_dies_lowest_id_promotes() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::PromotionVote { .. }))
+            .any(|m| matches!(m, DistributedMessage::PromotionVote {
+    target: None, .. }))
     );
 
     // One peer confirms — combined with the candidate's own vote that
@@ -185,6 +187,7 @@ async fn promote_primary_routing_survives_keepalive() {
     // Receive a `PrimaryChanged` naming a peer (sec-a) as the
     // SLURM-primary; sec-b is a regular peer.
     let promote = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -235,6 +238,7 @@ async fn self_named_primary_resets_election_to_normal() {
     // `current_primary()` now names this node) AND resets the election
     // to Normal (no lingering Promoted).
     let promote = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -293,6 +297,7 @@ async fn primary_changed_clears_per_worker_backoff() {
     assert!(!sec.op_mut().primary_link.should_request_now(1));
 
     let promote = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -322,6 +327,7 @@ async fn primary_changed_applies_with_epoch_lww() {
     sec.enter_operational_for_test();
 
     let high = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -339,6 +345,7 @@ async fn primary_changed_applies_with_epoch_lww() {
     // A late lower-epoch broadcast must not clobber the higher
     // epoch already installed.
     let stale = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -453,6 +460,7 @@ fn keepalive_from(
     role: KeepaliveRole,
 ) -> DistributedMessage<super::super::test_helpers::TestId> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: from.to_string(),
         timestamp: timestamp_now(),
         secondary_id: from.to_string(),
@@ -488,6 +496,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
 
     // A peer (sec-a) is promoted to primary via the real apply path.
     let promote = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -522,7 +531,8 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
             !actions
                 .broadcast
                 .iter()
-                .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+                .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. })),
             "no spurious TimeoutQuery against a healthy promoted primary",
         );
     }
@@ -544,7 +554,8 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
         actions
             .broadcast
             .iter()
-            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery {
+    target: None, .. })),
         "the election must broadcast a TimeoutQuery once the promoted primary is silent",
     );
 }
@@ -574,6 +585,7 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
     // sec-a is promoted to primary via the real apply path. Its
     // pre-promotion `peer_keepalives` entry is now stale-but-alive.
     let promote = DistributedMessage::ClusterMutation {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
@@ -633,6 +645,7 @@ async fn check_peer_timeouts_keys_on_receipt_not_wire_timestamp() {
     let ancient_wire = timestamp_now() - 100_000.0;
     sec.handle_inbound(
         DistributedMessage::Keepalive {
+            target: None,
             sender_id: "sec-b".into(),
             timestamp: ancient_wire,
             secondary_id: "sec-b".into(),

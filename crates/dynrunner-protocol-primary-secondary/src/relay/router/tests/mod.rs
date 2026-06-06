@@ -34,6 +34,7 @@ mod send;
 /// pulling in the real cluster types.
 fn keepalive(sender: &str) -> DistributedMessage<()> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: sender.into(),
         timestamp: 1.0,
         secondary_id: sender.into(),

@@ -150,7 +150,8 @@ async fn empty_discovery_latches_without_reyield() {
             assert!(
                 log.borrow().iter().any(|m| matches!(
                     m,
-                    DistributedMessage::ClusterMutation { mutations, .. }
+                    DistributedMessage::ClusterMutation {
+    target: None, mutations, .. }
                         if mutations.iter().any(|mu| matches!(mu, ClusterMutation::RunComplete))
                 )),
                 "empty discovery must broadcast RunComplete",

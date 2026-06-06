@@ -33,6 +33,7 @@ fn prune_evicts_stale_blacklist() {
         .unwrap();
     // Backoff inserts blacklist entry under (target=d, peer=b).
     let backoff = DistributedMessage::RelayBackoff {
+        target: None,
         sender_id: "b".into(),
         timestamp: 2.0,
         original_sender: "a".into(),

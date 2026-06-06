@@ -59,6 +59,7 @@ async fn two_peers_exchange_messages() {
 
             // Peer A broadcasts a message
             let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),
@@ -154,6 +155,7 @@ async fn higher_id_does_not_dial_lower_id() {
             // AcceptedPeer. recv_peer's internal drain then
             // populates peer-high's connections.
             let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),

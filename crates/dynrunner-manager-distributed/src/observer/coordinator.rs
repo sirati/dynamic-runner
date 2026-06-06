@@ -578,6 +578,7 @@ where
         // best-effort. The REPLY half is folded into the loop's recv arm.
         if self.cluster_state.current_primary().is_some() {
             let req = DistributedMessage::RequestClusterSnapshot {
+                target: None,
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
                 is_observer: true,
@@ -1058,6 +1059,7 @@ where
         };
         self.cluster_state.apply(mutation.clone());
         let msg = DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             mutations: vec![mutation],

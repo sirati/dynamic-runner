@@ -93,6 +93,7 @@ pub fn route_send<I: Identifier, V>(
         last_used_at: Instant::now(),
     };
     let wrapped = DistributedMessage::Relay {
+        target: None,
         sender_id: my_peer_id.to_string(),
         timestamp,
         target_id: target.to_string(),
@@ -169,6 +170,7 @@ pub fn forward_step<I: Identifier, V>(
         last_used_at: Instant::now(),
     };
     let wrapped = DistributedMessage::Relay {
+        target: None,
         sender_id: sender_id.to_string(),
         timestamp,
         target_id: target.to_string(),
@@ -219,6 +221,7 @@ pub fn handle_backoff<I: Identifier, V>(
         state.tried.insert(via.clone());
         state.last_used_at = Instant::now();
         let wrapped = DistributedMessage::Relay {
+            target: None,
             sender_id: state.original_sender.clone(),
             timestamp: state.original_timestamp,
             target_id: state.target.clone(),
@@ -231,6 +234,7 @@ pub fn handle_backoff<I: Identifier, V>(
     match &state.predecessor {
         Some(pred) => {
             let msg = DistributedMessage::RelayBackoff {
+                target: None,
                 sender_id: my_peer_id.to_string(),
                 timestamp: backoff_timestamp,
                 original_sender: state.original_sender.clone(),

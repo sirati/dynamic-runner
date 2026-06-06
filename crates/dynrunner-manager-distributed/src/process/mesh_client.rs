@@ -136,7 +136,8 @@ impl<I: Identifier> MeshClient<I> {
     /// Live mesh cardinality as of the last pump publish (see
     /// [`MembershipView`]'s staleness contract). Honest by type: a
     /// detached client reading a published live count can never report the
-    /// `MeshHandleTransport` fake-0.
+    /// old fake 0-peer count a same-peer detached send-handle used to
+    /// return.
     pub fn peer_count(&self) -> usize {
         self.membership.peer_count()
     }

@@ -134,6 +134,7 @@ where
                         // so it neither applies the completion locally
                         // nor drives a phase machine.
                         let msg = DistributedMessage::TaskComplete {
+                            target: None,
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
                             secondary_id: self.config.secondary_id.clone(),
@@ -174,6 +175,7 @@ where
                         // failure accounting, the retry-bucket cascade,
                         // and the terminal CRDT mutation.
                         let msg = DistributedMessage::TaskFailed {
+                            target: None,
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
                             secondary_id: self.config.secondary_id.clone(),
@@ -352,6 +354,7 @@ where
                     };
 
                     let msg = DistributedMessage::TaskFailed {
+                        target: None,
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),

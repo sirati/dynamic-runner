@@ -313,6 +313,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             let binary = super::processing::make_binary("orphan-task", 50);
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 secondary_id: "zero-worker-op".into(),
@@ -354,6 +355,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
+                        target: None,
                         error_type: dynrunner_core::ErrorType::Recoverable,
                         task_hash,
                         ..
@@ -423,6 +425,7 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             let binary = super::processing::make_binary("oob-task", 50);
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 secondary_id: "oob-worker".into(),
@@ -519,6 +522,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
             let binary = make_relative_path_binary("unresolvable-task");
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 0.0,
                 secondary_id: "zero-worker-unresolvable".into(),
@@ -556,6 +560,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
+                        target: None,
                         error_type: dynrunner_core::ErrorType::NonRecoverable,
                         task_hash,
                         worker_id,
@@ -652,6 +657,7 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
                 matches!(
                     m,
                     DistributedMessage::TaskFailed {
+                        target: None,
                         error_type: dynrunner_core::ErrorType::NonRecoverable,
                         task_hash,
                         worker_id,

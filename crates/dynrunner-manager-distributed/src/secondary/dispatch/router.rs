@@ -262,6 +262,7 @@ where
                         );
                         self.op_mut().pending_worker_restarts.insert(target_wid);
                         let task_failed = DistributedMessage::TaskFailed {
+                            target: None,
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
                             secondary_id: self.config.secondary_id.clone(),
@@ -343,6 +344,7 @@ where
                             // lost every subsequent task assigned
                             // to the dead slot.
                             let msg = DistributedMessage::TaskFailed {
+                                target: None,
                                 sender_id: self.config.secondary_id.clone(),
                                 timestamp: timestamp_now(),
                                 secondary_id: self.config.secondary_id.clone(),
@@ -363,6 +365,7 @@ where
                     // (there is no chosen slot).
                     tracing::warn!(worker_id, "no idle worker available for task assignment");
                     let msg = DistributedMessage::TaskFailed {
+                        target: None,
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
@@ -454,6 +457,7 @@ where
                 let snapshot_json = serde_json::to_string(&snapshot)
                     .map_err(|e| format!("snapshot serialization: {e}"))?;
                 let response = DistributedMessage::ClusterSnapshot {
+                    target: None,
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
                     snapshot_json,

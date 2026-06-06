@@ -304,6 +304,7 @@ where
             // backpressure path reports the same un-clamped wire id), so
             // drop the clamp and the pool touch entirely.
             let msg = DistributedMessage::TaskFailed {
+                target: None,
                 sender_id: self.config.secondary_id.clone(),
                 timestamp: timestamp_now(),
                 secondary_id: self.config.secondary_id.clone(),

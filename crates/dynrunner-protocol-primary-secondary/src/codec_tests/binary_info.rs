@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn wire_format_flattened_identifier() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "p".into(),
         timestamp: 0.0,
         secondary_id: "s".into(),
@@ -46,6 +47,7 @@ fn wire_format_flattened_identifier() {
 #[test]
 fn roundtrip_distributed_binary_info_phase_tags() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         secondary_id: "sec-0".into(),
@@ -309,6 +311,7 @@ fn distributed_binary_info_omits_empty_field_on_wire() {
 
     // Full round-trip preserves the hint.
     let bytes = serialize_message(&DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "p".into(),
         timestamp: 0.0,
         secondary_id: "s".into(),

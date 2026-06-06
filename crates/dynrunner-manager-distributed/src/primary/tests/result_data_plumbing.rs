@@ -50,6 +50,7 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
 
             let payload: Vec<u8> = b"keyed-output-bytes".to_vec();
             let msg = DistributedMessage::TaskComplete {
+                target: None,
                 sender_id: sec_id.clone(),
                 timestamp: 0.0,
                 secondary_id: sec_id.clone(),

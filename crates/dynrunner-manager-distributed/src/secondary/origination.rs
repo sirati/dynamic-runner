@@ -131,6 +131,7 @@ where
             return Ok(());
         }
         let msg = DistributedMessage::ClusterMutation {
+            target: None,
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             mutations: applied,

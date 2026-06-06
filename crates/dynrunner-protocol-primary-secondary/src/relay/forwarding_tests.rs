@@ -18,6 +18,7 @@ fn conns(ids: &[&str]) -> HashMap<String, ()> {
 
 fn keepalive(sender: &str) -> DistributedMessage<()> {
     DistributedMessage::Keepalive {
+        target: None,
         sender_id: sender.into(),
         timestamp: 1.0,
         secondary_id: sender.into(),
@@ -78,6 +79,7 @@ fn route_send_relays_via_lowest_when_target_unreachable() {
         } => {
             assert_eq!(via, "c");
             if let DistributedMessage::Relay {
+                target: None,
                 target_id,
                 relay_id,
                 path,
@@ -88,7 +90,8 @@ fn route_send_relays_via_lowest_when_target_unreachable() {
                 assert_eq!(target_id, "b");
                 assert_eq!(relay_id, 7);
                 assert_eq!(path, vec!["a".to_string()]);
-                assert!(matches!(*inner, DistributedMessage::Keepalive { .. }));
+                assert!(matches!(*inner, DistributedMessage::Keepalive {
+    target: None, .. }));
             } else {
                 panic!("not a relay");
             }
@@ -134,7 +137,8 @@ fn forward_step_unwraps_when_target_directly_reachable() {
     let d = forward_step::<(), _>(&c, "c", "b", 1, &path, 1.0, "a", inner, &empty_blacklist());
     match d {
         RouteDecision::Direct(m) => {
-            assert!(matches!(m, DistributedMessage::Keepalive { .. }));
+            assert!(matches!(m, DistributedMessage::Keepalive {
+    target: None, .. }));
         }
         other => panic!("expected Direct: {:?}", other),
     }
@@ -154,6 +158,7 @@ fn forward_step_picks_next_lowest_excluding_path() {
         } => {
             assert_eq!(via, "b");
             if let DistributedMessage::Relay {
+                target: None,
                 path: new_path,
                 relay_id,
                 ..
@@ -251,7 +256,8 @@ fn handle_backoff_retries_with_next_lowest() {
     match decision {
         BackoffDecision::Retry { via, wrapped } => {
             assert_eq!(via, "d");
-            if let DistributedMessage::Relay { relay_id, path, .. } = wrapped {
+            if let DistributedMessage::Relay {
+    target: None, relay_id, path, .. } = wrapped {
                 assert_eq!(relay_id, 1);
                 assert_eq!(path, vec!["a".to_string()]);
             } else {
@@ -283,6 +289,7 @@ fn handle_backoff_propagates_when_forwarder_exhausted() {
         BackoffDecision::PropagateBackoff { to, msg } => {
             assert_eq!(to, "a");
             if let DistributedMessage::RelayBackoff {
+                target: None,
                 sender_id,
                 relay_id,
                 original_sender,

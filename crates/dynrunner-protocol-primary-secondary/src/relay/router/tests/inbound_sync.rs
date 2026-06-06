@@ -14,6 +14,7 @@ fn process_inbound_sync_delivers_relay_for_self_and_emits_redial() {
     // only must NOT silently lose the redial safety net.
     let mut router = Router::<()>::new("a".into());
     let inbound = DistributedMessage::Relay {
+        target: None,
         sender_id: "d".into(),
         timestamp: 1.0,
         target_id: "a".into(),
@@ -25,7 +26,8 @@ fn process_inbound_sync_delivers_relay_for_self_and_emits_redial() {
     let outcome = router.process_inbound_sync(inbound, clocks_at(now, 1.0));
     match outcome {
         InboundOutcome::Deliver { msg, redial_target } => {
-            assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
+            assert!(matches!(&*msg, DistributedMessage::Keepalive {
+    target: None, .. }));
             assert_eq!(redial_target.as_deref(), Some("d"));
         }
         other => panic!("expected Deliver: {other:?}"),
@@ -43,6 +45,7 @@ fn process_inbound_sync_delivers_relay_for_self_and_emits_redial() {
 fn process_inbound_sync_drops_relay_for_others() {
     let mut router = Router::<()>::new("a".into());
     let inbound = DistributedMessage::Relay {
+        target: None,
         sender_id: "d".into(),
         timestamp: 1.0,
         target_id: "z".into(),
@@ -63,6 +66,7 @@ fn process_inbound_sync_drops_relay_for_others() {
 fn process_inbound_sync_drops_backoff() {
     let mut router = Router::<()>::new("a".into());
     let inbound = DistributedMessage::RelayBackoff {
+        target: None,
         sender_id: "b".into(),
         timestamp: 1.0,
         original_sender: "a".into(),

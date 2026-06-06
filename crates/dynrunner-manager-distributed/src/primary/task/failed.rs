@@ -22,6 +22,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         if let DistributedMessage::TaskFailed {
+            target: None,
             secondary_id,
             worker_id,
             task_hash,

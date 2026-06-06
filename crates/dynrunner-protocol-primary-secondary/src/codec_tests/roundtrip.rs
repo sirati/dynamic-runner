@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn roundtrip_keepalive() {
     let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+        target: None,
         sender_id: "sec-1".into(),
         timestamp: 1234.5,
         secondary_id: "sec-1".into(),
@@ -38,6 +39,7 @@ fn roundtrip_keepalive() {
 #[test]
 fn roundtrip_keepalive_primary_emitter_role() {
     let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 1234.5,
         secondary_id: "primary".into(),
@@ -80,6 +82,7 @@ fn roundtrip_state_digest_payload() {
         run_aborted: true,
     };
     let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
+        target: None,
         sender_id: "sec-7".into(),
         timestamp: 1234.5,
         digest,
@@ -106,6 +109,7 @@ fn roundtrip_state_digest_payload() {
 fn roundtrip_secondary_welcome() {
     use dynrunner_core::{ResourceAmount, ResourceKind};
     let msg: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+        target: None,
         sender_id: "sec-2".into(),
         timestamp: 9999.0,
         secondary_id: "sec-2".into(),
@@ -140,6 +144,7 @@ fn roundtrip_secondary_welcome() {
 #[test]
 fn roundtrip_task_assignment() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 100.0,
         secondary_id: "sec-1".into(),
@@ -190,6 +195,7 @@ fn roundtrip_task_assignment() {
 #[test]
 fn roundtrip_task_failed() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskFailed {
+        target: None,
         sender_id: "sec-1".into(),
         timestamp: 200.0,
         secondary_id: "sec-1".into(),
@@ -221,6 +227,7 @@ fn roundtrip_task_failed() {
 #[test]
 fn roundtrip_peer_info() {
     let msg: DistributedMessage<TestId> = DistributedMessage::PeerInfo {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 300.0,
         peers: vec![
@@ -275,6 +282,7 @@ fn roundtrip_task_assignment_predecessor_outputs_populated() {
     preds.insert("task_a".into(), TaskOutputs(producer_map));
 
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         secondary_id: "sec-1".into(),
@@ -361,6 +369,7 @@ fn legacy_task_assignment_without_predecessor_outputs_decodes_empty() {
 #[test]
 fn empty_predecessor_outputs_elided_on_wire() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        target: None,
         sender_id: "primary".into(),
         timestamp: 0.0,
         secondary_id: "sec-0".into(),

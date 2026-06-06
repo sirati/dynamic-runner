@@ -166,8 +166,10 @@ async fn responder_pump(
         match next {
             Err(_) => return, // timeout = inbox quiescent
             Ok(None) => return,
-            Ok(Some(DistributedMessage::RequestClusterSnapshot { sender_id, .. })) => {
+            Ok(Some(DistributedMessage::RequestClusterSnapshot {
+    target: None, sender_id, .. })) => {
                 let reply: DistributedMessage<TestId> = DistributedMessage::ClusterSnapshot {
+                    target: None,
                     sender_id: responder_id.to_string(),
                     timestamp: timestamp_now(),
                     snapshot_json: snapshot_json.to_string(),

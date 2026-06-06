@@ -41,6 +41,7 @@ async fn server_accepts_wss_bidirectional() {
                     .expect("WSS connect failed");
 
                 let welcome: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
@@ -68,6 +69,7 @@ async fn server_accepts_wss_bidirectional() {
             assert_eq!(msg.sender_id(), "sec-0");
 
             let reply: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 2.0,
                 secondary_id: "primary".into(),
@@ -115,6 +117,7 @@ async fn server_accepts_quic_bidirectional() {
                 assert!(matches!(client, NetworkClient::Quic(_)));
 
                 let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                    target: None,
                     sender_id: "sec-1".into(),
                     timestamp: 2.0,
                     secondary_id: "sec-1".into(),
@@ -133,6 +136,7 @@ async fn server_accepts_quic_bidirectional() {
             assert_eq!(msg.sender_id(), "sec-1");
 
             let reply: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "primary".into(),
                 timestamp: 3.0,
                 secondary_id: "primary".into(),
@@ -182,6 +186,7 @@ async fn client_falls_back_to_wss() {
             assert!(matches!(client, NetworkClient::Wss(_)));
 
             let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "fallback".into(),
                 timestamp: 1.0,
                 secondary_id: "fallback".into(),
@@ -228,6 +233,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                     .await
                     .expect("WSS connect failed");
                 let welcome: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
@@ -242,6 +248,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                 };
                 MessageSender::send(&mut client, welcome).await.unwrap();
                 let cert: DistributedMessage<TestId> = DistributedMessage::CertExchange {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 2.0,
                     secondary_id: "sec-0".into(),
@@ -258,7 +265,8 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
 
             let first = transport.recv_peer().await.expect("welcome");
             assert!(
-                matches!(first, DistributedMessage::SecondaryWelcome { .. }),
+                matches!(first, DistributedMessage::SecondaryWelcome {
+    target: None, .. }),
                 "first frame must be the welcome, got {first:?}"
             );
             // The writer must be registered by the time the welcome
@@ -268,6 +276,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                 .send_to_peer(
                     "sec-0",
                     DistributedMessage::Keepalive {
+                        target: None,
                         sender_id: "primary".into(),
                         timestamp: 3.0,
                         secondary_id: "primary".into(),
@@ -280,7 +289,8 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
 
             let second = transport.recv_peer().await.expect("cert");
             assert!(
-                matches!(second, DistributedMessage::CertExchange { .. }),
+                matches!(second, DistributedMessage::CertExchange {
+    target: None, .. }),
                 "second frame must be the cert exchange, got {second:?}"
             );
         })
@@ -315,6 +325,7 @@ async fn mesh_writer_fans_into_the_same_wire() {
                 // sender to the accept side (it reads `sender_id` from
                 // the first frame); send it via the client's own path.
                 let welcome: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
@@ -332,6 +343,7 @@ async fn mesh_writer_fans_into_the_same_wire() {
                 let mesh_writer = client.mesh_writer();
                 mesh_writer
                     .send(DistributedMessage::Keepalive {
+                        target: None,
                         sender_id: "sec-0".into(),
                         timestamp: 2.0,
                         secondary_id: "sec-0".into(),
@@ -345,7 +357,8 @@ async fn mesh_writer_fans_into_the_same_wire() {
             });
 
             let first = transport.recv_peer().await.expect("welcome");
-            assert!(matches!(first, DistributedMessage::SecondaryWelcome { .. }));
+            assert!(matches!(first, DistributedMessage::SecondaryWelcome {
+    target: None, .. }));
             let second = transport.recv_peer().await.expect("mesh_writer frame");
             match second {
                 DistributedMessage::Keepalive { active_workers, .. } => {
@@ -385,6 +398,7 @@ async fn recv_peer_drains_buffered_frames_accepted_before_first_poll() {
                     .expect("WSS connect failed");
                 for i in 0..3u32 {
                     let ka: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                        target: None,
                         sender_id: "sec-0".into(),
                         timestamp: i as f64,
                         secondary_id: "sec-0".into(),

@@ -260,7 +260,8 @@ fn collect_peer_removed(
 ) -> Vec<(String, RemovalCause)> {
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
-        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+        if let DistributedMessage::ClusterMutation {
+    target: None, mutations, .. } = msg {
             for m in mutations {
                 if let ClusterMutation::PeerRemoved { id, cause } = m {
                     out.push((id, cause));
@@ -295,6 +296,7 @@ async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
     // test).
     let huge = "x".repeat(4096);
     let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
+        target: None,
         sender_id: "sec-a".into(),
         timestamp: 0.0,
         secondary_id: "sec-a".into(),
@@ -377,7 +379,8 @@ fn first_task_assignment(
     rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
 ) -> Option<DistributedMessage<TestId>> {
     while let Ok(msg) = rx.try_recv() {
-        if matches!(msg, DistributedMessage::TaskAssignment { .. }) {
+        if matches!(msg, DistributedMessage::TaskAssignment {
+    target: None, .. }) {
             return Some(msg);
         }
     }
@@ -502,7 +505,8 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
          without the kickstart the recovered task hangs in the pool until \
          the next external event (which never came in the cohort run)"
     );
-    if let Some(DistributedMessage::TaskAssignment { secondary_id, .. }) = assignment {
+    if let Some(DistributedMessage::TaskAssignment {
+    target: None, secondary_id, .. }) = assignment {
         assert_eq!(secondary_id, "sec-b");
     }
     // Post-dispatch the survivor's worker is no longer idle and the
@@ -1213,7 +1217,8 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
         assignment.is_some(),
         "the recovered task must re-dispatch to the idle survivor"
     );
-    if let Some(DistributedMessage::TaskAssignment { secondary_id, .. }) = assignment {
+    if let Some(DistributedMessage::TaskAssignment {
+    target: None, secondary_id, .. }) = assignment {
         assert_eq!(secondary_id, "sec-b");
     }
 }

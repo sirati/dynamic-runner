@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 async fn no_peer_transport_never_receives() {
     let mut noop = NoPeerTransport;
     noop.broadcast(DistributedMessage::<TestId>::Keepalive {
+        target: None,
         sender_id: "x".into(),
         timestamp: 0.0,
         secondary_id: "x".into(),
@@ -49,6 +50,7 @@ async fn either_peer_transport_disabled_acts_like_no_peer() {
 
     either
         .broadcast(DistributedMessage::Keepalive {
+            target: None,
             sender_id: "x".into(),
             timestamp: 0.0,
             secondary_id: "x".into(),
@@ -119,6 +121,7 @@ async fn either_peer_transport_real_round_trips_a_message() {
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let msg: DistributedMessage<TestId> = DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "peer-a".into(),
                 timestamp: 1.0,
                 secondary_id: "peer-a".into(),
@@ -189,6 +192,7 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
         .send_to_peer(
             "primary",
             DistributedMessage::Keepalive {
+                target: None,
                 sender_id: "sec-0".into(),
                 timestamp: 1.0,
                 secondary_id: "sec-0".into(),
@@ -209,6 +213,7 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
             .send_to_peer(
                 "sec-1",
                 DistributedMessage::Keepalive {
+                    target: None,
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
@@ -229,6 +234,7 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
     // primary-death.
     either
         .broadcast(DistributedMessage::Keepalive {
+            target: None,
             sender_id: "sec-0".into(),
             timestamp: 1.0,
             secondary_id: "sec-0".into(),
@@ -254,6 +260,7 @@ async fn disabled_with_primary_routes_only_to_the_folded_primary() {
     // `recv_peer` like any other peer's.
     incoming_tx
         .send(DistributedMessage::Keepalive {
+            target: None,
             sender_id: "primary".into(),
             timestamp: 2.0,
             secondary_id: "primary".into(),
