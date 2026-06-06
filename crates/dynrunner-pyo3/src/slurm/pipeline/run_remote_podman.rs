@@ -256,11 +256,6 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             }
         })
         .and_then(|s| crate::system_resources::parse_memory(&s).ok());
-    let forwarded_argv: Vec<String> = args
-        .getattr("forwarded_argv")
-        .ok()
-        .and_then(|v| v.extract::<Vec<String>>().ok())
-        .unwrap_or_default();
     let skip_image_build: bool = attr_bool(args, "skip_image_build", false);
 
     // ---- try/finally guard. Owns gateway; no tunnel manager — the
@@ -340,7 +335,6 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
         wrapper_kwargs.set_item("gateway_port", primary_quic_port)?;
         wrapper_kwargs.set_item("cores_spec", &cores_spec)?;
         wrapper_kwargs.set_item("max_memory_spec", &max_memory_spec)?;
-        wrapper_kwargs.set_item("forwarded_argv", forwarded_argv.clone())?;
         wrapper_kwargs.set_item("reverse_connection", false)?;
         wrapper_kwargs.set_item("run_log_dir", &run_log_dir)?;
         // `None` for shutdown_manager_bin_path → no out-of-cgroup
@@ -411,10 +405,18 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
         }
         coord_kwargs.set_item("listen_port", primary_quic_port)?;
         // The operator's run-config: the same filtered tokens the spawned
-        // secondary fetches + re-serves. Threaded into the primary's
+        // secondary fetches + re-serves. Sourced from the operator's
+        // `args.forwarded_argv` (the launch-path cutover dropped the
+        // `--forwarded-arg`/wrapper-CLI plumbing, so the value now flows
+        // only through this config kwarg) and threaded into the primary's
         // node-local `forwarded_argv` so the `RequestRunConfig` responder
         // serves the real argv (same shape as `drive_rust_primary`).
-        coord_kwargs.set_item("forwarded_argv", forwarded_argv.clone())?;
+        let forwarded_argv: Vec<String> = args
+            .getattr("forwarded_argv")
+            .ok()
+            .and_then(|v| v.extract::<Vec<String>>().ok())
+            .unwrap_or_default();
+        coord_kwargs.set_item("forwarded_argv", forwarded_argv)?;
         if attr_truthy(args, "source_already_staged") {
             let root = slurm_config.call_method0("get_srcbins_mount_source")?;
             coord_kwargs.set_item("source_pre_staged_root", root)?;

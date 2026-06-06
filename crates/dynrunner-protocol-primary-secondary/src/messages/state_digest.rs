@@ -91,15 +91,6 @@ pub struct StateDigest {
     /// snapshot pull's `restore` actually heals (detect-WITH-heal).
     #[serde(default)]
     pub capabilities_hash: u64,
-    /// Number of entries in the A7 reached-milestone grow-only set.
-    #[serde(default)]
-    pub run_milestones_count: u64,
-    /// XOR-fold over the A7 reached-milestone set's `(kind, phase)`
-    /// elements. The set is a grow-only CRDT (union-merged on `restore`),
-    /// so it is snapshot-healable — a flagged divergence is one a pull's
-    /// union merge resolves (detect-WITH-heal).
-    #[serde(default)]
-    pub run_milestones_hash: u64,
     /// Replicated primary epoch (monotone scalar; higher wins).
     #[serde(default)]
     pub primary_epoch: u64,
@@ -139,10 +130,6 @@ impl StateDigest {
     ///   peer holds MORE entries OR the same count with a divergent fold.
     ///   A flagged divergence is one a snapshot pull's `restore` of the
     ///   2P-set actually resolves — no R2 no-op loop.
-    /// - `run_milestones` (A7): the reached-milestone grow-only set IS
-    ///   snapshot-healable (union-merged on `restore`), so it is COMPARED
-    ///   here (detect-WITH-heal). Ahead iff the peer holds MORE milestones
-    ///   OR the same count with a divergent fold.
     /// - `primary_epoch` + `current_primary_hash` (CRD-2/D-P): ahead iff
     ///   the peer's epoch is strictly higher, OR the epochs are EQUAL but
     ///   the `current_primary_hash` DIFFERS (a same-epoch identity split).
@@ -200,15 +187,6 @@ impl StateDigest {
                 self.capabilities_hash,
                 other.capabilities_count,
                 other.capabilities_hash,
-            )
-            // A7: the snapshot-healable reached-milestone grow-only set
-            // (detect-WITH-heal — a divergent set drives a pull whose union
-            // merge converges it).
-            || field_behind(
-                self.run_milestones_count,
-                self.run_milestones_hash,
-                other.run_milestones_count,
-                other.run_milestones_hash,
             )
             // CRD-2/D-P: higher epoch, OR equal epoch with a divergent
             // current-primary identity (the same-epoch split).

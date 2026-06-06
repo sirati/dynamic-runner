@@ -62,10 +62,11 @@ struct Cli {
     max_memory_spec: String,
     #[arg(long)]
     mem_manager_reserved_bytes: Option<u64>,
-    /// Repeated: one `--forwarded-arg` per token, order-preserving. Each
-    /// value is itself often a `--flag`, so hyphen-leading is allowed.
-    #[arg(long = "forwarded-arg", allow_hyphen_values = true)]
-    forwarded_arg: Vec<String>,
+    /// Consumer's real secondary entrypoint module, emitted by
+    /// `build_run_argv` onto the container argv as `--secondary-module
+    /// <module>` for the bootstrap shim to `runpy`.
+    #[arg(long)]
+    secondary_module: String,
     /// Repeated: one `--extra-run-arg` per token, order-preserving. Each
     /// value is itself often a `--flag`, so hyphen-leading is allowed.
     #[arg(long = "extra-run-arg", allow_hyphen_values = true)]
@@ -156,7 +157,7 @@ impl Cli {
             cores_spec: self.cores_spec,
             max_memory_spec: self.max_memory_spec,
             mem_manager_reserved_bytes: self.mem_manager_reserved_bytes,
-            forwarded_argv: self.forwarded_arg,
+            secondary_module: self.secondary_module,
             extra_run_args: self.extra_run_arg,
             srcbins_network: self.srcbins_network,
             output_network: self.output_network,
@@ -222,7 +223,6 @@ mod tests {
             gateway_port: 1,
         });
         cfg.mem_manager_reserved_bytes = None;
-        cfg.forwarded_argv.clear();
         cfg.extra_run_args.clear();
         cfg.dynrunner_network_dir = None;
         cfg.shutdown_manager_bin_path = None;
@@ -230,14 +230,14 @@ mod tests {
         assert_eq!(round_trip(&cfg), cfg);
     }
 
-    /// Repeated list flags preserve order and multiplicity.
+    /// The repeated `--extra-run-arg` list flag preserves order and
+    /// multiplicity (duplicate `a` entries survive the round trip).
     #[test]
     fn round_trip_preserves_list_order() {
         let mut cfg = sample(ConnectionMode::Reverse {
             connection_info_dir: "/c".to_string(),
         });
-        cfg.forwarded_argv = vec!["a".into(), "b".into(), "a".into(), "c".into()];
-        cfg.extra_run_args = vec!["--x".into(), "1".into()];
+        cfg.extra_run_args = vec!["a".into(), "b".into(), "a".into(), "c".into()];
         assert_eq!(round_trip(&cfg), cfg);
     }
 

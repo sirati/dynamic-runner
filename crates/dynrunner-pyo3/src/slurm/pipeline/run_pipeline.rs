@@ -317,20 +317,6 @@ pub(crate) fn run_slurm_pipeline<'py>(
         })
         .and_then(|s| crate::system_resources::parse_memory(&s).ok());
 
-    // `args.forwarded_argv` is the dispatcher's `sys.argv[1:]` minus
-    // the framework-regenerated flags (`--secondary`, `--cores`, …)
-    // that the wrapper emits afresh per job. Threaded opaquely through
-    // SlurmPreparation → SlurmJobManager → the Rust wrapper-script
-    // generator, which bash-quotes each entry into the secondary's
-    // container-command argv. Empty default keeps the field optional
-    // for legacy callers constructing SlurmPreparation directly
-    // (programmatic test fixtures); `run.py` always populates it.
-    let forwarded_argv: Vec<String> = args
-        .getattr("forwarded_argv")
-        .ok()
-        .and_then(|v| v.extract::<Vec<String>>().ok())
-        .unwrap_or_default();
-
     let skip_image_build: bool = args
         .getattr("skip_image_build")
         .ok()
@@ -362,7 +348,6 @@ pub(crate) fn run_slurm_pipeline<'py>(
             &cert_dir,
             &cores_spec,
             &max_memory_spec,
-            &forwarded_argv,
             num_secondaries,
             primary_quic_port,
             use_reverse_connection,
@@ -429,7 +414,6 @@ pub(crate) fn run_slurm_pipeline<'py>(
             respawn_tunnel_manager,
             &cores_spec,
             &max_memory_spec,
-            &forwarded_argv,
             use_reverse_connection,
             mem_manager_reserved_bytes,
             log,

@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, RunMilestoneKind};
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -2643,7 +2643,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         //     (`dispatch_message`'s TaskComplete/TaskFailed cascade) is a
         //     guaranteed no-op there. The on_phase_start-before-on_phase_end
         //     contract is therefore preserved.
-        self.fire_initial_phase_starts().await;
+        self.fire_initial_phase_starts();
 
         // Trivially-empty Active phases (no items at all) need to drain
         // and cascade Done before initial assignment, otherwise their
@@ -3152,7 +3152,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// re-running visits only newly-active phases. Called once at
     /// run start (for zero-deps phases) and again from
     /// `process_phase_lifecycle` after `mark_phase_done` cascades.
-    pub(super) async fn fire_initial_phase_starts(&mut self) {
+    pub(super) fn fire_initial_phase_starts(&mut self) {
         let active: Vec<PhaseId> = self.pool().active_phases();
         for p in active {
             if self.phase_started_emitted.insert(p.clone()) {
@@ -3169,17 +3169,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     phase = %p,
                     "starting job phase",
                 );
-                // A7: record the phase-task-spawning milestone as a
-                // replicated grow-only set fact, on the SAME once-per-phase
-                // edge as the local "starting job phase" line. This is the
-                // authority-side twin the observer cannot infer from
-                // per-task deltas — a promoted primary on a different node
-                // surfaces the phase-start to the operator's observer via
-                // the converged CRDT. Idempotent: the apply NoOps a
-                // re-reached `(PhaseTaskSpawning, phase)` (and the
-                // `insert` guard already gates this branch once per phase).
-                self.originate_run_milestone(RunMilestoneKind::PhaseTaskSpawning, p.clone())
-                    .await;
                 // Tell worker management a phase started and how many
                 // workers it minimally needs to make progress. This is a
                 // pure EMIT onto the decoupled worker-management bus — the
@@ -3466,7 +3455,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
             // mark_phase_done may have flipped Blocked → Active for
             // dependents; emit on_phase_start for them.
-            self.fire_initial_phase_starts().await;
+            self.fire_initial_phase_starts();
             // Newly-Active dependents may themselves be empty (a phase
             // chain like 0→1→2→3 with all items in phase 3 cascades
             // through this branch on every iteration). Re-drain so the

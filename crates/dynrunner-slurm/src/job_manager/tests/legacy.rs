@@ -130,12 +130,16 @@ impl SubmitRecordingGateway {
         self.created_dirs.lock().unwrap().clone()
     }
 
+    /// The single submit command: `printf '%s' '<body>' | sbatch …`.
+    /// The script is piped over STDIN, so there is no separate
+    /// script-write command and no trailing script-path argument —
+    /// the one recorded command carries the `| sbatch` pipe.
     fn sbatch_command(&self) -> String {
         self.commands
             .lock()
             .unwrap()
             .iter()
-            .find(|c| c.starts_with("sbatch "))
+            .find(|c| c.contains("| sbatch "))
             .expect("sbatch command must have been issued")
             .clone()
     }
@@ -154,10 +158,10 @@ impl Gateway for SubmitRecordingGateway {
         _cwd: Option<&str>,
     ) -> Result<CommandResult, GatewayError> {
         self.commands.lock().unwrap().push(cmd.to_string());
-        // Only `sbatch --parsable` is expected to produce stdout;
-        // anything else (e.g. the `printf … > path` script-write)
-        // is silent in the real shell.
-        let stdout = if cmd.starts_with("sbatch ") {
+        // The `printf … | sbatch --parsable` pipe is the only command
+        // that produces stdout (the sbatch job id on its last pipeline
+        // stage); anything else is silent in the real shell.
+        let stdout = if cmd.contains("| sbatch ") {
             "12345".to_string()
         } else {
             String::new()
@@ -196,9 +200,11 @@ impl Gateway for SubmitRecordingGateway {
 ///     matches Python, which never emits `--mem` at all.
 /// (c) `memory_per_node = Some("...")` → `--mem={val}` IS emitted
 ///     so opt-in operators still get a cap.
-/// (d) Wrapper script lands at `<root_folder>/job_<name>.sh`
-///     (Python placement; the negative assertion guards against
-///     regression to the historical `<log_path>/wrapper_<name>.sh`).
+/// (d) The wrapper body is piped to sbatch over STDIN
+///     (`printf '%s' '<body>' | sbatch …`): the submit issues a SINGLE
+///     command — no preceding script-write, no `chmod`, no
+///     `<root_folder>/job_<name>.sh` file, and no trailing script-path
+///     argument on the sbatch invocation.
 /// (e) `--ntasks=1` IS emitted (legacy Python had it; Rust
 ///     previously omitted it — a parity gap that this assertion
 ///     locks down so `sbatch` defaults can't drift the launched
@@ -235,21 +241,32 @@ async fn submit_job_matches_python_invocation_shape() {
 
     let cmds = mgr.gateway().commands();
 
-    // (d) Script path: `<root_folder>/job_<job_name>.sh`.
-    let write_cmd = cmds
-        .iter()
-        .find(|c| !c.starts_with("sbatch "))
-        .expect("script-write command must precede sbatch");
+    // (d) STDIN pipe: the submit issues a SINGLE shell command — the
+    // `printf '%s' '<body>' | sbatch …` pipe. No preceding script-write
+    // (`> …`) and no `chmod` command exist, and no
+    // `<root_folder>/job_<name>.sh` file is referenced.
     assert!(
-        write_cmd.contains("/srv/slurm/job_myjob.sh"),
-        "wrapper script must land under root_folder, got: {write_cmd}",
+        !cmds.iter().any(|c| c.contains("chmod")),
+        "STDIN pipe must not chmod a script file; got: {cmds:?}",
     );
     assert!(
-        !write_cmd.contains("/log/wrapper_"),
-        "wrapper must not land at <log_path>/wrapper_<name>.sh: {write_cmd}",
+        !cmds.iter().any(|c| c.contains("job_myjob.sh")),
+        "STDIN pipe must not write a per-secondary job script; got: {cmds:?}",
+    );
+    assert!(
+        cmds.iter()
+            .filter(|c| c.contains("sbatch "))
+            .count()
+            == 1,
+        "exactly one sbatch command (the STDIN pipe) is issued; got: {cmds:?}",
     );
 
     let sbatch = mgr.gateway().sbatch_command();
+    // The submit command pipes the body over stdin to sbatch.
+    assert!(
+        sbatch.starts_with("printf '%s' '") && sbatch.contains("' | sbatch --parsable "),
+        "submit must pipe the wrapper body to sbatch over STDIN; got: {sbatch}",
+    );
     // (a) mail=ALL only.
     assert!(
         sbatch.contains("--mail-type=ALL"),
@@ -279,10 +296,16 @@ async fn submit_job_matches_python_invocation_shape() {
         sbatch.contains(&format!("--signal=B:SIGTERM@{default_lead}")),
         "expected --signal=B:SIGTERM@{default_lead} (default lead) in sbatch; got: {sbatch}",
     );
-    // sbatch line ends with the script path argument.
+    // No trailing script-path argument: sbatch reads the script from
+    // STDIN, so the sbatch invocation (everything after the pipe) must
+    // NOT end with a `…/job_*.sh` path.
+    let sbatch_invocation = sbatch
+        .split_once("| sbatch ")
+        .map(|(_, rest)| rest.trim_end())
+        .expect("submit command must contain the `| sbatch ` pipe");
     assert!(
-        sbatch.ends_with("/srv/slurm/job_myjob.sh"),
-        "sbatch must terminate with the script path; got: {sbatch}",
+        !sbatch_invocation.ends_with(".sh"),
+        "sbatch must not carry a trailing script-path argument (STDIN pipe); got: {sbatch_invocation}",
     );
 
     // Case C: memory_per_node explicitly set → --mem={val} emitted.

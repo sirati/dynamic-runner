@@ -182,7 +182,7 @@ mod tests {
             cores_spec: "-2".to_string(),
             max_memory_spec: "-2G".to_string(),
             mem_manager_reserved_bytes: None,
-            forwarded_argv: vec![],
+            secondary_module: "pkg.secondary".to_string(),
             extra_run_args: vec![],
             srcbins_network: "/net/srcbins".to_string(),
             output_network: "/net/out".to_string(),

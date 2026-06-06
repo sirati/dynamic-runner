@@ -25,23 +25,24 @@ impl<G: Gateway> SlurmJobManager<G> {
 
     /// Submit a SLURM job using the given wrapper script content.
     ///
-    /// The script is written to `<root_folder>/job_<job_name>.sh` on
-    /// the gateway and then submitted via `sbatch --parsable`. Script
-    /// placement, sbatch argument order, `--ntasks=1`, `--mail-type=ALL`,
-    /// and `--mail-user=…` all mirror the legacy Python
-    /// `SlurmJobManager.submit_job` in `packaging/job_manager.py` so a
-    /// Rust-driven submission produces the same sbatch invocation a
-    /// Python-driven one would.
+    /// The script is piped to `sbatch` over STDIN
+    /// (`printf '%s' '<escaped>' | sbatch --parsable <flags…>`): sbatch
+    /// reads the batch script from stdin when no trailing path argument
+    /// is given, so NO per-secondary `job_<name>.sh` file is written to
+    /// the gateway and NO `chmod +x` is needed. sbatch argument order,
+    /// `--ntasks=1`, `--mail-type=ALL`, and `--mail-user=…` all mirror
+    /// the legacy Python `SlurmJobManager.submit_job` in
+    /// `packaging/job_manager.py` so a Rust-driven submission produces
+    /// the same sbatch invocation a Python-driven one would.
     ///
-    /// Two intentional divergences from the legacy Python:
+    /// The script body is single-quote escaped (`'` → `'\''`) for the
+    /// `printf '%s' '…'` literal, so `$VAR` and other shell
+    /// metacharacters reach sbatch verbatim. `--wrap` is deliberately
+    /// NOT used: it would re-shell the body and risk a double word-split
+    /// of the wrapper's `exec` line.
     ///
-    /// * **Script write/chmod is one shell command** (`printf … > path
-    ///   && chmod +x path`) rather than two (`cat << EOFSCRIPT …
-    ///   EOFSCRIPT` + `chmod +x`). Functionally equivalent but saves an
-    ///   ssh round-trip on `SshGateway` and avoids the heredoc-marker
-    ///   collision risk if a wrapper ever contains a literal
-    ///   `\nEOFSCRIPT\n`. Single-quote escaping (`'` → `'\''`) keeps
-    ///   `$VAR` and other shell metacharacters literal.
+    /// One intentional divergence from the legacy Python:
+    ///
     /// * **`--mem={memory_per_node}` is opt-in** rather than always-off.
     ///   Python never emits `--mem` (the field isn't in its sbatch
     ///   argument list); the Rust path keeps the same default
@@ -56,10 +57,8 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// root. The folder is `mkdir -p`'d on the gateway before sbatch runs
     /// because SLURM does NOT create the parent directory for an
     /// `--output=` path. Tilde expansion (`~/…` → `/home/u/…`) is the
-    /// caller's responsibility: the bash shell expands a leading `~` for
-    /// the trailing script-path argument and for redirected paths in the
-    /// write command, but it does NOT expand `~` after `=` in
-    /// `--output=~/…` style arguments, so callers that hand a
+    /// caller's responsibility: the bash shell does NOT expand `~` after
+    /// `=` in `--output=~/…` style arguments, so callers that hand a
     /// `~`-prefixed `run_log_dir` to `submit_job` will end up with sbatch
     /// literally writing to `~/…`. The PyO3 bridge (see
     /// `crates/dynrunner-pyo3/src/slurm/job_manager.rs`) expands tilde
@@ -79,22 +78,13 @@ impl<G: Gateway> SlurmJobManager<G> {
         nodes: u32,
         run_log_dir: &str,
     ) -> Result<String, SlurmError> {
-        // Write script to gateway. Python lays the wrapper directly in
-        // `root_folder` as `job_<name>.sh` (NOT under `log_subfolder`)
-        // — keeping that location so a side-by-side cluster has a
-        // single canonical path for the submitted script regardless of
-        // which binding launched the job.
-        let script_path = format!("{}/job_{job_name}.sh", self.config.root_folder);
+        // The wrapper body is piped to sbatch over STDIN below; escape it
+        // once for the `printf '%s' '<body>'` single-quoted literal so
+        // every `$VAR` / metacharacter reaches sbatch verbatim. No
+        // per-secondary `job_<name>.sh` is written and no `chmod +x` is
+        // needed — sbatch reads the batch script from stdin when no
+        // trailing path argument is given.
         let escaped = wrapper_script.replace('\'', "'\\''");
-        let write_cmd =
-            format!("printf '%s' '{escaped}' > {script_path} && chmod +x {script_path}");
-        let result = self.gateway.execute_command(&write_cmd, None).await?;
-        if !result.success() {
-            return Err(SlurmError::Command(format!(
-                "failed to write wrapper script: {}",
-                result.stderr
-            )));
-        }
 
         // Per-secondary log folder for sbatch's own stdout/stderr.
         // SLURM does NOT create the parent directory for an `--output=`
@@ -166,9 +156,10 @@ impl<G: Gateway> SlurmJobManager<G> {
             sbatch_args.push(format!("--mail-user={email}"));
         }
 
-        sbatch_args.push(script_path);
-
-        let cmd = sbatch_args.join(" ");
+        // No trailing script-path argument: sbatch reads the batch
+        // script from STDIN, which the `printf '%s' '<body>' |` prefix
+        // supplies. One shell command, no gateway-side script file.
+        let cmd = format!("printf '%s' '{escaped}' | {}", sbatch_args.join(" "));
         let result = self.gateway.execute_command(&cmd, None).await?;
 
         if !result.success() {

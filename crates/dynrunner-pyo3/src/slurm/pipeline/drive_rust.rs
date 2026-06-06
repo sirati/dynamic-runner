@@ -30,7 +30,6 @@ pub(super) fn drive_rust_primary<'py>(
     tunnel_manager: Option<Py<PyAny>>,
     cores_spec: &str,
     max_memory_spec: &str,
-    forwarded_argv: &[String],
     use_reverse_connection: bool,
     mem_manager_reserved_bytes: Option<u64>,
     log: &Bound<'py, PyAny>,
@@ -66,12 +65,19 @@ pub(super) fn drive_rust_primary<'py>(
     }
     coord_kwargs.set_item("listen_port", primary_quic_port)?;
     // The operator's run-config: the same filtered token sequence the
-    // mesh-launched secondaries fetch + re-serve. Threaded into the
-    // submitter primary's `PrimaryConfig.forwarded_argv` so the
-    // `RequestRunConfig` responder serves the real argv (not an empty
-    // default) — the single source every cold-start / promoted node
-    // reconstructs from.
-    coord_kwargs.set_item("forwarded_argv", forwarded_argv.to_vec())?;
+    // mesh-launched secondaries fetch + re-serve. Sourced from the
+    // operator's `args.forwarded_argv` (the launch-path cutover dropped
+    // the `--forwarded-arg` respawn-CLI plumbing, so the value now flows
+    // only through this config kwarg) and threaded into the submitter
+    // primary's `PrimaryConfig.forwarded_argv` so the `RequestRunConfig`
+    // responder serves the real argv (not an empty default) — the single
+    // source every cold-start / promoted node reconstructs from.
+    let forwarded_argv: Vec<String> = args
+        .getattr("forwarded_argv")
+        .ok()
+        .and_then(|v| v.extract::<Vec<String>>().ok())
+        .unwrap_or_default();
+    coord_kwargs.set_item("forwarded_argv", forwarded_argv)?;
     if attr_truthy(args, "source_already_staged") {
         let root = slurm_config.call_method0("get_srcbins_mount_source")?;
         coord_kwargs.set_item("source_pre_staged_root", root)?;
@@ -117,7 +123,6 @@ pub(super) fn drive_rust_primary<'py>(
             primary_quic_port,
             cores_spec,
             max_memory_spec,
-            forwarded_argv,
             use_reverse_connection,
             mem_manager_reserved_bytes,
             log,

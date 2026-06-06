@@ -95,7 +95,7 @@ fn generate_wrapper_stub(cfg: &WrapperScriptConfig<'_>, bin: &Path, rnd_suffix: 
         cores_spec: cfg.cores_spec.to_string(),
         max_memory_spec: cfg.max_memory_spec.to_string(),
         mem_manager_reserved_bytes: cfg.mem_manager_reserved_bytes,
-        forwarded_argv: cfg.forwarded_argv.to_vec(),
+        secondary_module: cfg.secondary_module.to_string(),
         extra_run_args: cfg.extra_run_args.to_vec(),
         srcbins_network,
         output_network,
