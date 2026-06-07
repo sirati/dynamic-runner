@@ -21,6 +21,7 @@ to keep the test runnable from any environment.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import pathlib
 import sys
@@ -376,6 +377,180 @@ class FrameworkFlagKnowledgeTests(unittest.TestCase):
         self.assertIn(
             "--mem-manager-reserved", self._ff.FRAMEWORK_REGENERATED_FLAGS
         )
+
+
+_run = _load_module_direct("run", "run.py")
+
+
+class _FakeTask:
+    """Minimal task exposing only `add_task_arguments` — the run-config
+    finalizer rebuilds the parser with `build_arg_parser + add_task_arguments`,
+    so the fake task registers the task-filter flags the worker command
+    depends on (mirroring asm-tokenizer's `--platform` / `--name-regex`).
+    """
+
+    def add_task_arguments(self, parser) -> None:
+        parser.add_argument("--platform", default=None)
+        parser.add_argument("--name-regex", dest="name_regex", default=None)
+
+
+class ReparseFinalizerTests(unittest.TestCase):
+    """Step-8 pins for the deferred run-config finalize closures
+    (`run.make_reparse_finalizer` / `run.make_identity_finalizer`).
+    """
+
+    def _boot_args(self, boot_argv: list[str]):
+        """Build a boot-time namespace the way a secondary's `run()` does:
+        parse `boot_argv` with `build_arg_parser + task.add_task_arguments`,
+        then stash the dispatch-time attributes the finalizer copies forward.
+        """
+        task = _FakeTask()
+        parser = _run.build_arg_parser("test")
+        task.add_task_arguments(parser)
+        args = parser.parse_args(boot_argv)
+        args._boot_argv = list(boot_argv)
+        args.forwarded_argv = []
+        args.resolved_output_root = "/tmp/out"
+        args._setup_deferred_to_secondary = False
+        return task, args
+
+    def test_reparse_splices_boot_and_delivered_into_complete_namespace(self) -> None:
+        # The cold-start secondary booted with only its framework-regenerated
+        # flags (no task filters); the push delivers the task filters. The
+        # reparse must splice `[*boot, *delivered]` into the complete namespace
+        # the worker-command build reads.
+        task, args = self._boot_args(["--secondary", "tcp://primary", "--cores", "4"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        delivered = ["--platform", "x64", "--name-regex", "foo.*"]
+        reparsed = finalize(delivered)
+        # The task filters from the delivered slice are now present...
+        self.assertEqual(reparsed.platform, "x64")
+        self.assertEqual(reparsed.name_regex, "foo.*")
+        # ...alongside the boot-CLI framework flags (re-parsed from boot_argv).
+        self.assertEqual(reparsed.cores, "4")
+        # The delivered argv becomes this node's authoritative forwarded set.
+        self.assertEqual(reparsed.forwarded_argv, delivered)
+
+    def test_reparse_copies_dispatch_time_attrs_forward(self) -> None:
+        # A fresh `parse_args` namespace lacks the framework's post-parse
+        # dispatch-time attributes; the finalizer must copy them forward.
+        task, args = self._boot_args(["--cores", "2"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        reparsed = finalize(["--platform", "arm"])
+        self.assertEqual(reparsed.resolved_output_root, "/tmp/out")
+        self.assertFalse(reparsed._setup_deferred_to_secondary)
+        self.assertEqual(reparsed._boot_argv, ["--cores", "2"])
+
+    def test_reparse_empty_delivered_is_byte_identical_to_boot_parse(self) -> None:
+        # An empty delivered slice (a run with no forwarded task filters)
+        # re-parses `[*boot]` — byte-identical to the boot-time parse, no flag
+        # loss.
+        task, args = self._boot_args(["--cores", "8", "--platform", "x64"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        reparsed = finalize([])
+        self.assertEqual(reparsed.cores, "8")
+        self.assertEqual(reparsed.platform, "x64")
+        self.assertEqual(reparsed.forwarded_argv, [])
+
+    def test_identity_finalizer_returns_args_unchanged(self) -> None:
+        # The `args=` (consumer-owned-parse) path: the finalizer must return
+        # the consumer's namespace verbatim — re-parsing with the framework
+        # parser would DROP the consumer's pre-parsed values.
+        consumer_args = argparse.Namespace(
+            consumer_only_flag="kept", forwarded_argv=[]
+        )
+        finalize = _run.make_identity_finalizer(consumer_args)
+        # Even a (hypothetically) non-empty delivered slice must not mutate it.
+        result = finalize(["--platform", "x64"])
+        self.assertIs(result, consumer_args)
+        self.assertEqual(result.consumer_only_flag, "kept")
+
+
+class _RequiredArgTask:
+    """A task with a `required=True` task arg — mirrors asm-tokenizer's
+    `build_memmap --unified-vocab`. A cold-start SLURM secondary's boot argv
+    carries only the framework-regenerated flags, so this required arg is
+    absent at boot; it rides the mesh post-connect in `forwarded_argv`.
+    """
+
+    def add_task_arguments(self, parser) -> None:
+        parser.add_argument("--unified-vocab", dest="unified_vocab", required=True)
+
+
+class SecondaryBootParseTests(unittest.TestCase):
+    """Regression pins for the lenient secondary boot parse (#238 item-3
+    BLOCKER): a `required=True` task arg must NOT abort the boot parse on a
+    SECONDARY argv — the strict parse + validation is deferred to the finalize.
+    """
+
+    def test_required_task_arg_boots_on_secondary_without_systemexit(self) -> None:
+        # The cold-start secondary booted with ONLY framework-regenerated flags
+        # (no `--unified-vocab`). A strict full parse would `parser.error()` →
+        # SystemExit(2) before dispatch; the lenient secondary boot parse must
+        # let it through and ROUTE to `_dispatch_secondary`.
+        task = _RequiredArgTask()
+        secondary_argv = [
+            "--secondary",
+            "tcp://primary",
+            "--secondary-id",
+            "sec-0",
+            "--cores",
+            "4",
+        ]
+        captured = {}
+
+        def fake_dispatch_secondary(t, args, logger):
+            captured["args"] = args
+
+        orig_setup_logging = _run.setup_logging
+        orig_dispatch_secondary = _run._dispatch_secondary
+        _run.setup_logging = lambda args: None
+        _run._dispatch_secondary = fake_dispatch_secondary
+        try:
+            # No SystemExit despite the missing required `--unified-vocab`.
+            _run.run(task, argv=secondary_argv)
+        finally:
+            _run.setup_logging = orig_setup_logging
+            _run._dispatch_secondary = orig_dispatch_secondary
+
+        self.assertIn("args", captured, "secondary boot must reach _dispatch_secondary")
+        args = captured["args"]
+        self.assertEqual(args.secondary, "tcp://primary")
+        # The relaxed parse yields the task-arg DEFAULT (None) rather than
+        # aborting — enough for the placeholder cmd_args build to read it.
+        self.assertIsNone(args.unified_vocab)
+        # The boot argv is stashed for the finalizer to splice with the
+        # delivered forwarded_argv.
+        self.assertEqual(args._boot_argv, secondary_argv)
+
+    def test_finalizer_recovers_required_arg_from_delivered_forwarded_argv(self) -> None:
+        # The deferred finalize re-parses `[*boot_argv, *forwarded_argv]` with a
+        # FRESH STRICT parser (required INTACT). When the delivered slice
+        # carries the required `--unified-vocab`, the strict parse succeeds and
+        # the value is present in the finalized namespace.
+        task = _RequiredArgTask()
+        boot_argv = ["--secondary", "tcp://primary", "--cores", "4"]
+        boot_args = _run._parse_secondary_boot_args(task, "test", boot_argv)
+        boot_args._boot_argv = list(boot_argv)
+        boot_args.forwarded_argv = []
+        finalize = _run.make_reparse_finalizer(task, "test", boot_args)
+        reparsed = finalize(["--unified-vocab", "/app/vocab.json"])
+        self.assertEqual(reparsed.unified_vocab, "/app/vocab.json")
+        self.assertEqual(reparsed.forwarded_argv, ["--unified-vocab", "/app/vocab.json"])
+
+    def test_finalizer_still_raises_when_required_arg_missing_everywhere(self) -> None:
+        # The finalize's strict parser keeps `required` INTACT, so a delivered
+        # config that omits the required arg from `[boot+forwarded]` is still
+        # caught (SystemExit from argparse's `parser.error`). The lenient boot
+        # parse relaxes ONLY the boot timing, never the genuine requirement.
+        task = _RequiredArgTask()
+        boot_argv = ["--secondary", "tcp://primary", "--cores", "4"]
+        boot_args = _run._parse_secondary_boot_args(task, "test", boot_argv)
+        boot_args._boot_argv = list(boot_argv)
+        boot_args.forwarded_argv = []
+        finalize = _run.make_reparse_finalizer(task, "test", boot_args)
+        with self.assertRaises(SystemExit):
+            finalize([])  # nothing supplies --unified-vocab
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ use crate::managers::primary_handle::{PyPrimaryHandle, ReinjectCapCell};
 use crate::network::gethostname;
 use crate::pytypes::{PyFailedTask, PyProcessingStats, PyTaskInfo, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
+use crate::task_def::{shared_registry, LoadedTaskDefinition, TypeRegistry};
 use crate::transport::EitherManagerEnd;
 
 /// The main Python-facing local manager class.
@@ -455,7 +455,9 @@ impl PyLocalManager {
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
             log_paths: self.log_paths.clone(),
-            types: self.types.clone(),
+            // Local manager parses args eagerly at construction — the registry
+            // is final, so seed the shared cell once and never swap.
+            types: shared_registry(self.types.clone()),
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,

@@ -70,17 +70,46 @@ def run(
 
     if args is None:
         parse_argv = argv if argv is not None else []
-        parser = build_arg_parser(description)
-        task.add_task_arguments(parser)
-        args = parser.parse_args(parse_argv)
-        validate_parsed_args(args, parser)
+        # Detect secondary-ness with a FRAMEWORK-ONLY parser first: on a SLURM
+        # secondary the boot argv carries only the framework-regenerated flags;
+        # the task-specific run-config (`forwarded_argv`) arrives over the mesh
+        # AFTER connect. Parsing the full task parser eagerly+strictly here would
+        # make a `required=True` task arg trip `parser.error()` → SystemExit(2)
+        # BEFORE dispatch could reach the deferred-finalize seam — so a required-
+        # arg task could never boot as a secondary. `parse_known_args` on a
+        # framework-only parser sees `--secondary` without enforcing task args.
+        boot_ns, _ = build_arg_parser(description).parse_known_args(parse_argv)
+        if boot_ns.secondary:
+            # SECONDARY boot: relaxed parse (task-arg `required` not enforced).
+            # The real task-arg values ride the mesh post-connect; the STRICT
+            # full parse + `validate_parsed_args` happens later in the finalize
+            # over `[*boot_argv, *forwarded_argv]` (see `make_reparse_finalizer`).
+            args = _parse_secondary_boot_args(task, description, parse_argv)
+        else:
+            # SUBMITTER / local boot: the submitter has ALL args, so a strict
+            # full parse + validation is correct (unchanged behaviour).
+            parser = build_arg_parser(description)
+            task.add_task_arguments(parser)
+            args = parser.parse_args(parse_argv)
+            validate_parsed_args(args, parser)
         forward_source = parse_argv
     else:
         # Pre-parsed namespace path: the consumer owns parse + validation
         # (it attached `add_framework_arguments` to its own parser). No
         # task-filter argv to forward — the secondary re-discovers from the
         # framework-regenerated invocation.
+        parse_argv = []
         forward_source = []
+
+    # Stash the boot argv (the tokens THIS process parsed, minus any
+    # forwarded run-config the boot CLI omits) as a dispatch-time-only
+    # attribute, consistent with the `args.forwarded_argv` /
+    # `args._setup_deferred_to_secondary` pattern. The secondary's deferred
+    # run-config finalize re-parses `[*boot_argv, *delivered_forwarded_argv]`
+    # once the primary's post-welcome push delivers the forwarded slice, so
+    # `dispatch`'s signature stays unchanged. On the `args=` path the boot
+    # argv is empty (the consumer's namespace is already complete).
+    args._boot_argv = list(parse_argv)
 
     # Stash the dispatcher's argv-minus-framework-regenerated-flags so
     # the SLURM wrapper can forward task-specific filter args
@@ -93,11 +122,139 @@ def run(
     # simply ignore the field.
     args.forwarded_argv = filter_framework_argv(forward_source)
 
+    # Build the run-config finalize closure the secondary's deferred
+    # cmd_args rebuild fires once the primary's post-welcome push delivers
+    # `forwarded_argv`. On the internal-parse branch the framework owns the
+    # parse, so it can faithfully re-parse `[*boot_argv, *delivered]`; on the
+    # `args=` branch the consumer owns the parse (and forwards nothing), so
+    # the finalizer is the identity. Stashed as a dispatch-time-only attr —
+    # `dispatch`'s signature stays unchanged.
+    if argv is not None or args is None:
+        args._finalize_run_config = make_reparse_finalizer(task, description, args)
+    else:
+        args._finalize_run_config = make_identity_finalizer(args)
+
     # Configure logging from the PARSED args — explicit params, after parse
     # (installs the native subscriber via `init_logging`, no env vars).
     setup_logging(args)
 
     dispatch(task, args, deployment)
+
+
+# Dispatch-time attributes the framework sets on `args` AFTER parse (not
+# argparse-owned). The reparse finalizer copies these forward onto its
+# freshly-parsed namespace so the secondary's deferred-finalize namespace
+# carries the same contract the boot-time `args` did. Listed once here so
+# the copy-forward set is a single source of truth.
+_DISPATCH_TIME_ATTRS = (
+    "forwarded_argv",
+    "resolved_output_root",
+    "_setup_deferred_to_secondary",
+    "_boot_argv",
+)
+
+
+def _parse_secondary_boot_args(
+    task: TaskDefinition,
+    description: str,
+    parse_argv: list[str],
+) -> argparse.Namespace:
+    """Lenient boot parse for the SECONDARY path — task-arg ``required`` relaxed.
+
+    Single concern: produce a COMPLETE boot-time namespace for a secondary
+    whose argv carries only the framework-regenerated flags. A SLURM secondary
+    boots BEFORE the primary's post-welcome push delivers the task-specific
+    ``forwarded_argv``, so its boot argv legitimately lacks every required task
+    arg (e.g. asm-tokenizer ``build_memmap --unified-vocab``). A strict full
+    parse would call ``parser.error()`` → ``SystemExit(2)`` and the deferred-
+    finalize seam (where the strict parse actually belongs, over
+    ``[*boot_argv, *forwarded_argv]``) would be unreachable.
+
+    The fix builds a DEDICATED boot parser (framework + task args), relaxes
+    every action's ``required`` so the missing task args don't abort, and parses
+    ``parse_argv``. The result is a complete namespace carrying task-arg
+    DEFAULTS — enough for the placeholder ``build_worker_command_args`` and any
+    ``discover_items`` to read their attributes without crashing on missing
+    fields; the real values land later in the finalize. ``validate_parsed_args``
+    is DEFERRED to the finalize (it runs the strict parser there) so genuinely
+    missing required args in the delivered config are still caught.
+    """
+    parser = build_arg_parser(description)
+    task.add_task_arguments(parser)
+    relax_required(parser)
+    return parser.parse_args(parse_argv)
+
+
+def relax_required(parser: argparse.ArgumentParser) -> None:
+    """Clear every action's ``required`` flag on a boot parser.
+
+    Single concern: the secondary boot-parse relaxation, factored out so both
+    framework entry points (``run`` and ``cli_main``) share ONE relaxation
+    rule rather than each spelling out the ``_actions`` walk. The strict parser
+    that ``make_reparse_finalizer`` rebuilds keeps ``required`` intact, so the
+    post-push parse over ``[*boot_argv, *forwarded_argv]`` still rejects a
+    delivered config that omits a required arg.
+    """
+    for action in parser._actions:
+        action.required = False
+
+
+def make_reparse_finalizer(task, description, args):
+    """Build the deferred run-config finalize closure for the framework-owned
+    parse path (``run(argv=...)`` and the internal default-parse).
+
+    The returned callable takes the DELIVERED ``forwarded_argv`` (the
+    post-welcome push payload) and re-parses
+    ``[*boot_argv, *delivered_forwarded_argv]`` with the SAME parser ``run``
+    built (``build_arg_parser(description)`` + ``task.add_task_arguments``),
+    validates it, copies the framework's dispatch-time attributes forward, and
+    returns the complete namespace. Rust then re-runs
+    ``build_worker_command_args`` against it.
+
+    Parse LOGIC is unchanged — only the TIMING moves to post-push: the boot
+    CLI omits the run-config-bearing task-filter flags on a cold-start
+    secondary, so the per-type worker ``cmd_args`` cannot be derived until the
+    push delivers them.
+    """
+    boot_argv = list(getattr(args, "_boot_argv", []))
+
+    def finalize_run_config(delivered_forwarded_argv: list[str]) -> argparse.Namespace:
+        parser = build_arg_parser(description)
+        task.add_task_arguments(parser)
+        reparsed = parser.parse_args([*boot_argv, *delivered_forwarded_argv])
+        validate_parsed_args(reparsed, parser)
+        # Copy the framework's dispatch-time attributes forward — they were
+        # set on the boot-time `args` after parse and are not argparse-owned,
+        # so a fresh `parse_args` namespace lacks them.
+        for attr in _DISPATCH_TIME_ATTRS:
+            if hasattr(args, attr):
+                setattr(reparsed, attr, getattr(args, attr))
+        # The reparsed namespace is the run-config the worker command is built
+        # from; the delivered argv it incorporated is now the authoritative
+        # forwarded set for this node.
+        reparsed.forwarded_argv = list(delivered_forwarded_argv)
+        return reparsed
+
+    return finalize_run_config
+
+
+def make_identity_finalizer(args):
+    """Build the no-op finalize closure for the consumer-owned-parse
+    (``args=``) path.
+
+    The consumer parsed + validated its own namespace and forwards no
+    task-filter argv (the delivered slice is empty), so re-parsing with the
+    framework parser would DROP the consumer's pre-parsed values. The
+    finalizer therefore returns the consumer's ``args`` unchanged — no flag
+    loss. The Rust side still rebuilds ``cmd_args`` from this namespace, which
+    for the ``args=`` consumer (compiler_suit) is byte-identical to the boot
+    build (its worker command ignores the forwarded run-config).
+    """
+
+    def finalize_run_config(_delivered_forwarded_argv: list[str]) -> argparse.Namespace:
+        return args
+
+    return finalize_run_config
 
 
 def dispatch(
@@ -608,6 +765,13 @@ def _dispatch_secondary(task, args, logger) -> None:
         skip_existing=args.skip_existing,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),
+        # The deferred run-config finalize closure (built at the entry point
+        # where parse-ownership is known). Fired by the coordinator after the
+        # primary's post-welcome push delivers `forwarded_argv`, BEFORE workers
+        # spawn, to re-derive the per-type worker `cmd_args`. Absent (an
+        # out-of-tree caller driving `_dispatch_secondary` directly) → None →
+        # the Rust side keeps the boot-CLI cmd_args.
+        finalize_run_config=getattr(args, "_finalize_run_config", None),
         **_panik_kwargs(args),
     )
 

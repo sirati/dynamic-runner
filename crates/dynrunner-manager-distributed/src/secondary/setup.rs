@@ -4,7 +4,7 @@ use dynrunner_core::Identifier;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    DistributedBinaryInfo, DistributedMessage, MessageType, SetupBootstrapMessage,
+    Destination, DistributedBinaryInfo, DistributedMessage, MessageType, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -180,6 +180,132 @@ where
         .await
     }
 
+    /// Receive the next setup frame, draining the run-config backstop's
+    /// backlog first. The backstop (see
+    /// [`Self::finalize_run_config_before_workers`]) may have pulled
+    /// PeerInfo / InitialAssignment / TransferComplete frames off the inbox
+    /// while bounded-waiting for the `RunConfig` answer; those belong to
+    /// `wait_for_setup`'s progress loop, so it must consume them before any
+    /// fresh `inbox.recv()`. Empty backlog (the common path — the push lands
+    /// before the first setup frame) falls straight through to `recv`.
+    pub(in crate::secondary) async fn recv_setup_frame(&mut self) -> Option<DistributedMessage<I>> {
+        if let Some(buffered) = self.setup_frame_backlog.pop_front() {
+            return Some(buffered);
+        }
+        self.inbox.recv().await
+    }
+
+    /// Ensure the post-welcome `RunConfig` push has landed, then fire the
+    /// consumer's run-config finalize policy — BEFORE the worker pool spawns.
+    ///
+    /// Fired ONCE at the `AwaitingPrimary → Configuring` transition (the top
+    /// of [`Self::enter_configuring_on_first_primary_frame`], before
+    /// [`Self::initialize_workers`]) so the per-type `cmd_args` the finalize
+    /// re-derives from the DELIVERED `forwarded_argv` are live for the initial
+    /// workers (and, via the shared worker-command source the closure swaps,
+    /// every respawn).
+    ///
+    /// Backstop: if the push has not landed yet
+    /// (`!self.forwarded_argv_was_pushed` — an empty argv is a valid landing,
+    /// so the dedicated latch, not emptiness, is the test), actively unicast
+    /// ONE `RequestRunConfig` to the primary IN-BAND over the existing mesh
+    /// connection (NOT a new dial) and bounded-wait for the answer. Frames
+    /// that are not the answer are buffered into `setup_frame_backlog` so the
+    /// outer setup loop still sees them. On timeout, proceed with whatever the
+    /// shared handle holds (last-writer-wins) — a missing run-config is not
+    /// fatal (e.g. a non-pushing legacy primary). Normally the push lands
+    /// first and this is a no-op short-circuit.
+    pub(in crate::secondary) async fn finalize_run_config_before_workers(
+        &mut self,
+    ) -> Result<(), String> {
+        // Nothing to do unless a finalize policy was registered. The `args=`
+        // path (compiler_suit) registers an IDENTITY finalizer (Some), so the
+        // seam DOES run for it — harmlessly: the identity ignores the delivered
+        // argv and the rebuild is byte-identical (compiler_suit's
+        // `build_worker_command_args` does `del args`). Only Rust-only test
+        // fixtures register `None`, which skips the seam here.
+        let Some(mut finalize) = self.finalize_run_config.take() else {
+            return Ok(());
+        };
+
+        if !self.forwarded_argv_was_pushed {
+            self.request_and_await_run_config().await;
+        }
+
+        // Read the delivered argv off the shared handle (single source of
+        // truth) and hand it to the consumer's reparse closure. The closure
+        // does the cmd_args rebuild + swap internally (under the GIL, in the
+        // pyo3 wrapper); the coordinator stays Python-free.
+        let delivered = self
+            .forwarded_argv
+            .lock()
+            .expect("forwarded_argv mutex poisoned")
+            .clone();
+        let result = finalize(delivered).await;
+        // Put the closure back defensively (mirrors the setup-discovery
+        // re-arm discipline) even though it fires at most once per run.
+        self.finalize_run_config = Some(finalize);
+        result
+    }
+
+    /// Send ONE in-band `RequestRunConfig` to the primary and bounded-wait
+    /// for the `RunConfig` answer (stored via `store_pushed_run_config`).
+    /// Non-answer frames are buffered for `wait_for_setup` to drain. Best
+    /// effort: a send failure or a timeout simply returns — the caller
+    /// proceeds with whatever the shared handle holds.
+    async fn request_and_await_run_config(&mut self) {
+        let request = DistributedMessage::RequestRunConfig {
+            target: None,
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+        };
+        // In-band over the EXISTING mesh connection (the bootstrap primary
+        // link is routable this early via `bootstrap_primary_id`); NOT a new
+        // dial. A no-route error is non-fatal — fall through to the wait,
+        // which will time out and proceed.
+        if let Err(e) = self.send_to(Destination::Primary, request).await {
+            tracing::debug!(
+                error = %e,
+                "run-config backstop: RequestRunConfig send failed; \
+                 proceeding to bounded-wait (will fall back on timeout)"
+            );
+        }
+        // Bounded-wait, reusing the setup recv discipline. The deadline is the
+        // keepalive-derived setup budget; on expiry the caller proceeds with
+        // the current handle value (last-writer-wins).
+        let deadline = self
+            .config
+            .keepalive_interval
+            .saturating_mul(self.config.keepalive_miss_threshold.max(1))
+            .max(std::time::Duration::from_secs(2));
+        let wait = async {
+            while !self.forwarded_argv_was_pushed {
+                match self.inbox.recv().await {
+                    Some(msg) => {
+                        if let MessageType::RunConfig = msg.msg_type() {
+                            if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                                self.store_pushed_run_config(forwarded_argv);
+                            }
+                        } else {
+                            // A setup/operational frame the outer loop still
+                            // needs — buffer it (no frame loss, no duplicated
+                            // handling).
+                            self.setup_frame_backlog.push_back(msg);
+                        }
+                    }
+                    None => break, // primary link closed; let the caller proceed
+                }
+            }
+        };
+        if tokio::time::timeout(deadline, wait).await.is_err() {
+            tracing::warn!(
+                secondary = %self.config.secondary_id,
+                "run-config backstop: timed out waiting for RunConfig answer; \
+                 proceeding with the current (possibly empty) forwarded_argv"
+            );
+        }
+    }
+
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
     /// Dispatches any initial task assignments to local workers.
     ///
@@ -217,8 +343,25 @@ where
             // setup frames onto this secondary's slot inbox as the primary
             // host dials/accepts; the manager addresses peers by id and
             // never sees a transport role split.
-            match self.inbox.recv().await {
+            match self.recv_setup_frame().await {
                 Some(msg) => {
+                    // Run-config PUSH is PRE-ANNOUNCE config delivery: it
+                    // fires from the primary's welcome handler, BEFORE the
+                    // PeerInfo/InitialAssignment/TransferComplete announce
+                    // batch, so on the ordered primary link it normally
+                    // arrives first. Store it and `continue` WITHOUT triggering
+                    // the `AwaitingPrimary → Configuring` transition — the
+                    // announce (PeerInfo) is the real first frame that spawns
+                    // workers, and by then the latch is set so the finalize
+                    // backstop short-circuits (the push already landed). Doing
+                    // the store before `enter_configuring` also means a
+                    // RunConfig-first frame never spuriously arms the backstop.
+                    if let MessageType::RunConfig = msg.msg_type() {
+                        if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                            self.store_pushed_run_config(forwarded_argv);
+                        }
+                        continue;
+                    }
                     // FIRST primary-originated frame = the announce. This
                     // is the `AwaitingPrimary → Configuring` boundary: the
                     // primary has made contact, so spawn the worker pool
@@ -352,6 +495,10 @@ where
                                 self.apply_cluster_mutations(mutations);
                             }
                         }
+                        // `MessageType::RunConfig` is handled BEFORE the
+                        // `enter_configuring` trigger above (pre-announce
+                        // config delivery, store-and-`continue`), so it never
+                        // reaches this match.
                         other => {
                             tracing::debug!(?other, "unexpected message during setup");
                         }
@@ -379,7 +526,7 @@ where
     /// `uses_file_based_items`) start at their historical defaults
     /// (`false` / `true`) and are updated by the `InitialAssignment`
     /// handler via `set_pre_staged_mode` / `set_uses_file_based_items`.
-    async fn enter_configuring_on_first_primary_frame(
+    pub(in crate::secondary) async fn enter_configuring_on_first_primary_frame(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
@@ -389,6 +536,14 @@ where
         ) {
             return Ok(());
         }
+        // Finalize the consumer's run-config BEFORE spawning workers: the
+        // worker pool reads the per-type `cmd_args` at spawn, and those are
+        // re-derived from the post-welcome-pushed `forwarded_argv` (with an
+        // in-band `RequestRunConfig` backstop if the push has not landed yet).
+        // Must precede `initialize_workers` so the initial pool's argv is the
+        // finalized command, not the empty boot-CLI placeholder. No-op when no
+        // finalize policy was registered.
+        self.finalize_run_config_before_workers().await?;
         tracing::info!(
             secondary = %self.config.secondary_id,
             workers = self.config.num_workers,

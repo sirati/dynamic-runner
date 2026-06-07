@@ -264,6 +264,72 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
         .await;
 }
 
+/// Drain the welcomed secondary's inbox and return every `RunConfig`
+/// frame's `forwarded_argv` in arrival order. Mirrors the capacity /
+/// peer-joined drainers for the run-config PUSH originated at the
+/// `handle_welcome` site.
+fn drain_pushed_run_config(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+            out.push(forwarded_argv);
+        }
+    }
+    out
+}
+
+/// `handle_welcome` PUSHES the primary's node-local `forwarded_argv` to
+/// the freshly-welcomed secondary over its existing connection, carrying
+/// the consumer's run-config the boot CLI omitted. Asserts the welcomed
+/// secondary receives exactly ONE `RunConfig` carrying the seeded argv
+/// token-for-token — so the deferred-parse path has the value the moment
+/// it is connected, without the secondary having to ask.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_welcome_pushes_run_config_to_welcomed_secondary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut secondary_ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                make_test_primary_config(1),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Seed the node-local run-config the push reads (production
+            // seeding is the pyo3 kwarg; this test seeds the field).
+            let seeded = vec![
+                "--task".to_string(),
+                "tokenize".to_string(),
+                "--platform".to_string(),
+                "x86".to_string(),
+            ];
+            primary.forwarded_argv = seeded.clone();
+
+            let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+
+            primary.handle_welcome(welcome_msg(&id, false)).await;
+            settle_pump().await;
+
+            let pushed = drain_pushed_run_config(&mut to_sec_rx);
+            assert_eq!(
+                pushed.len(),
+                1,
+                "handle_welcome must push exactly one RunConfig to the \
+                 welcomed secondary; got {pushed:?}"
+            );
+            assert_eq!(
+                pushed[0], seeded,
+                "the pushed RunConfig must carry the seeded forwarded_argv \
+                 token-for-token"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
     let local = tokio::task::LocalSet::new();

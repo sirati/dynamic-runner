@@ -638,6 +638,15 @@ where
                 // compatibility but is not consumed here.
                 Ok(())
             }
+            DistributedMessage::RunConfig { forwarded_argv, .. } => {
+                // Inbound run-config PUSH from the primary (see
+                // `store_pushed_run_config` for the full rationale). Reached
+                // when the push lands after this secondary is already
+                // operational; the usual landing window is mid-setup
+                // (`wait_for_setup`), which shares the same helper.
+                self.store_pushed_run_config(forwarded_argv);
+                Ok(())
+            }
             DistributedMessage::RequestRunConfig { sender_id, .. } => {
                 // PURE read-only run-config responder. Answer a joining /
                 // respawned / cold-start-fetching peer from this node's
@@ -659,7 +668,11 @@ where
                     target: None,
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
-                    forwarded_argv: self.forwarded_argv.clone(),
+                    forwarded_argv: self
+                        .forwarded_argv
+                        .lock()
+                        .expect("forwarded_argv mutex poisoned")
+                        .clone(),
                 };
                 if let Err(e) = self
                     .send_to(

@@ -460,7 +460,11 @@ impl PyDistributedManager {
                             output_dir: sec_output,
                             log_dir: sec_log,
                             log_paths: sec_log_paths,
-                            types: sec_types,
+                            // In-process distributed mode shares the submitter's
+                            // eagerly-parsed namespace (no cold-start run-config
+                            // fetch / deferral): seed each per-secondary cell
+                            // once and never swap.
+                            types: crate::task_def::shared_registry(sec_types),
                             skip_existing,
                             connection_mode: ConnectionMode::Socketpair,
                             manual_start_worker: false,

@@ -43,6 +43,30 @@ use dynrunner_core::{Identifier, TaskInfo};
 pub type SetupDiscoveryFn<I> =
     Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<I>>, String>>>>>;
 
+/// The consumer's run-config finalize policy — fired ONCE after the
+/// post-welcome `RunConfig` push has delivered the consumer's
+/// `forwarded_argv`, BEFORE the worker pool spawns.
+///
+/// Given the delivered `forwarded_argv`, the closure re-parses the
+/// consumer's full argparse namespace (`[*boot_argv, *forwarded_argv]`),
+/// rebuilds the per-type worker `cmd_args`, and swaps them into the live
+/// worker-command source the factory reads at every spawn (initial +
+/// respawn). The secondary booted with only its boot-critical CLI args, so
+/// the run-config-bearing flags (task filters that drive the worker argv)
+/// are not known until the push lands; this closure is the seam that
+/// re-derives the worker command after delivery.
+///
+/// Mirrors [`SetupDiscoveryFn`]'s ownership + non-block contract: the
+/// returned future is awaited on the secondary's own `!Send` task, so the
+/// pyo3 wrapper runs its GIL excursion on a `spawn_blocking` thread and the
+/// future merely `.await`s that handle (the `Node`'s mesh-pump keeps the
+/// keepalives flowing). `Err` aborts the run (same discipline as
+/// `initialize_workers`). `FnMut` because the secondary takes it on the one
+/// fire; the coordinator itself stays PyO3-agnostic / Python-free — the
+/// closure does the cmd_args swap under the GIL internally.
+pub type FinalizeRunConfigFn =
+    Box<dyn FnMut(Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), String>>>>>;
+
 /// The consumer's setup-discovery policy plus the phase-dependency graph
 /// the secondary feeds alongside the discovered binaries into
 /// `ingest_setup_discovery`. Registered together (via

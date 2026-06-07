@@ -327,12 +327,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     cap_version: Default::default(),
                 },
                 ClusterMutation::SecondaryCapacity {
-                    secondary: secondary_id,
+                    secondary: secondary_id.clone(),
                     worker_count,
                     resources: advertised_resources,
                 },
             ])
             .await;
+
+            // Post-welcome run-config delivery. The secondary booted with
+            // only its boot-critical CLI args and parses the consumer's
+            // run-config (`--task`, task filters) AFTER it connects, so the
+            // primary proactively unicasts the EXISTING `RunConfig` frame
+            // over the connection it just welcomed — the secondary need not
+            // ask first. Pure SEND of the existing message; the welcome /
+            // cert handshake above is unchanged.
+            self.push_run_config_to(secondary_id).await;
         }
     }
 

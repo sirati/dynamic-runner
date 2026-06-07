@@ -10,7 +10,7 @@ use dynrunner_transport_socket::socketpair::create_socketpair;
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::worker_spec::{RenderedCommand, WorkerSpec, WorkerVars};
-use crate::task_def::{TypeRegistry, TypeRuntime};
+use crate::task_def::{SharedTypeRegistry, TypeRuntime};
 use crate::transport::EitherManagerEnd;
 
 /// Grace period between SIGTERM and SIGKILL during teardown. Matches
@@ -172,10 +172,15 @@ pub(crate) struct SubprocessWorkerFactory {
     pub(crate) log_paths: LogPathConfig,
     /// All `TaskTypeSpec` runtimes extracted from
     /// `TaskDefinition.get_phases()`. The single source of truth the
-    /// factory consults for per-spawn argv. Cloned in once at
-    /// construction so the factory does not borrow `TaskDefinition`
-    /// state for the run lifetime.
-    pub(crate) types: TypeRegistry,
+    /// factory consults for per-spawn argv.
+    ///
+    /// A SHARED cell ([`SharedTypeRegistry`]) so the secondary's run-config
+    /// finalize closure can swap in a registry rebuilt from the delivered
+    /// `forwarded_argv` (the boot-CLI placeholder cmd_args → the finalized
+    /// command) and have EVERY subsequent spawn — initial pool + per-type
+    /// respawn — read the swapped value. The non-secondary dispatch paths
+    /// seed it once and never swap.
+    pub(crate) types: SharedTypeRegistry,
     pub(crate) skip_existing: bool,
     pub(crate) connection_mode: ConnectionMode,
     pub(crate) manual_start_worker: bool,
@@ -193,13 +198,18 @@ impl SubprocessWorkerFactory {
     /// mismatch — every `type_id` the manager dispatches must have
     /// come from the same `get_phases()` call that populated the
     /// registry.
-    fn type_runtime_for(&self, type_id: &TypeId) -> Result<&TypeRuntime, String> {
-        self.types.get(type_id).ok_or_else(|| {
-            format!(
-                "no TypeRuntime registered for TypeId '{type_id}'; \
-                 TaskDefinition.get_phases() did not declare it"
-            )
-        })
+    fn type_runtime_for(&self, type_id: &TypeId) -> Result<TypeRuntime, String> {
+        self.types
+            .lock()
+            .expect("worker TypeRegistry mutex poisoned")
+            .get(type_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "no TypeRuntime registered for TypeId '{type_id}'; \
+                     TaskDefinition.get_phases() did not declare it"
+                )
+            })
     }
 
     /// Resolve a fallback `TypeRuntime` for initial-spawn paths that
@@ -211,9 +221,12 @@ impl SubprocessWorkerFactory {
     /// type was already validated at `LoadedTaskDefinition::from_python`
     /// time; an empty registry can only happen in the observer
     /// placeholder path where this fallback is unreachable anyway).
-    fn first_type_runtime(&self) -> Result<&TypeRuntime, String> {
+    fn first_type_runtime(&self) -> Result<TypeRuntime, String> {
         self.types
+            .lock()
+            .expect("worker TypeRegistry mutex poisoned")
             .first()
+            .cloned()
             .ok_or_else(|| "TypeRegistry is empty; cannot spawn worker".to_string())
     }
 
@@ -553,13 +566,14 @@ impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
         worker_id: WorkerId,
         subcgroup: Option<&SubcgroupHandle>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
-        // Clone the first-type runtime so the immutable borrow against
-        // `self.types` is released before `spawn_with_runtime` takes
-        // `&mut self`. The clone is cheap — `TypeRuntime` holds Arc-
-        // backed strings + a `Vec<String>` of cmd_args; only the
-        // cmd_args vec actually copies, and at the once-per-restart
-        // cadence this is dominated by the cost of forking Python.
-        let runtime = self.first_type_runtime()?.clone();
+        // Read (clone out) the first-type runtime so the `SharedTypeRegistry`
+        // lock is released before `spawn_with_runtime` takes `&mut self`. The
+        // clone is cheap — `TypeRuntime` holds Arc-backed strings + a
+        // `Vec<String>` of cmd_args; only the cmd_args vec actually copies,
+        // and at the once-per-restart cadence this is dominated by the cost
+        // of forking Python. Reads the SHARED cell, so a finalize-time swap
+        // (the run-config deferral) is honoured by every spawn.
+        let runtime = self.first_type_runtime()?;
         let subcgroup_procs = subcgroup.map(|h| h.procs_path());
         self.spawn_with_runtime(worker_id, &runtime, subcgroup_procs)
     }
@@ -570,7 +584,7 @@ impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
         type_id: &TypeId,
         subcgroup: Option<&SubcgroupHandle>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
-        let runtime = self.type_runtime_for(type_id)?.clone();
+        let runtime = self.type_runtime_for(type_id)?;
         let subcgroup_procs = subcgroup.map(|h| h.procs_path());
         self.spawn_with_runtime(worker_id, &runtime, subcgroup_procs)
     }
@@ -591,6 +605,7 @@ impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_def::TypeRegistry;
 
     /// `terminate_children` should be a no-op on an empty slice and on
     /// slots that contain `None`. Idempotence is essential because the
@@ -681,7 +696,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp/out"),
             log_dir: PathBuf::from("/tmp/log"),
             log_paths: Default::default(),
-            types: make_two_type_registry(),
+            types: std::sync::Arc::new(std::sync::Mutex::new(make_two_type_registry())),
             skip_existing: false,
             connection_mode: ConnectionMode::Named {
                 socket_dir: PathBuf::from("/tmp/sockets"),
@@ -746,7 +761,7 @@ mod tests {
             output_dir: PathBuf::new(),
             log_dir: PathBuf::new(),
             log_paths: Default::default(),
-            types: TypeRegistry::default(),
+            types: std::sync::Arc::new(std::sync::Mutex::new(TypeRegistry::default())),
             skip_existing: false,
             connection_mode: ConnectionMode::Named {
                 socket_dir: PathBuf::new(),

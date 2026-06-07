@@ -24,10 +24,9 @@
 
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-// Re-exported into the module namespace for the `#[cfg(test)]` child
-// modules that reach it via `use super::super::*` (the production code in
-// this module no longer names `DistributedMessage` directly).
-#[cfg(test)]
+// Named directly by the `setup_frame_backlog` field (the run-config
+// backstop's frame buffer) and re-exported into the module namespace for
+// the `#[cfg(test)]` child modules that reach it via `use super::super::*`.
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -64,7 +63,8 @@ mod tests;
 
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{
-    PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal, SetupDiscovery, SetupDiscoveryFn,
+    FinalizeRunConfigFn, PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal,
+    SetupDiscovery, SetupDiscoveryFn,
 };
 
 /// A task DEFERRED on this secondary because the target worker's
@@ -424,6 +424,43 @@ where
     /// `Terminal`.
     pub(super) setup_discovery: Option<super::SetupDiscovery<I>>,
 
+    /// The consumer's run-config finalize policy — re-derives the per-type
+    /// worker `cmd_args` from the delivered `forwarded_argv` and swaps them
+    /// into the worker-command source the factory reads. Installed via
+    /// [`Self::register_finalize_run_config`] BEFORE `run`; `Some` on the
+    /// run-config-bearing consumer path (the pyo3 wrapper supplies a closure
+    /// that re-parses Python's argparse + rebuilds the cmd_args under the
+    /// GIL). Fired ONCE at the `AwaitingPrimary → Configuring` transition,
+    /// BEFORE [`Self::initialize_workers`] reads the cmd_args at worker
+    /// spawn, so the swapped command is live for the initial pool. `None` only
+    /// for callers that register no closure at all (legacy Rust-only fixtures /
+    /// out-of-tree direct drivers), which skips the seam. The `args=` consumer
+    /// path (compiler_suit) registers an IDENTITY finalizer (Some) — the seam
+    /// fires but is a faithful no-op (byte-identical rebuild).
+    pub(super) finalize_run_config: Option<super::FinalizeRunConfigFn>,
+
+    /// Latch set true by [`Self::store_pushed_run_config`] the first time an
+    /// inbound `RunConfig` lands (a primary PUSH or a `RequestRunConfig`
+    /// answer). Drives the finalize backstop: at the
+    /// `AwaitingPrimary → Configuring` transition, if the push has NOT yet
+    /// landed, the secondary actively requests the run-config in-band before
+    /// firing the finalize, so the per-type `cmd_args` are derived from the
+    /// delivered argv rather than the empty boot CLI. An EMPTY pushed argv is
+    /// a valid landing (compiler_suit-shape), so emptiness cannot be the
+    /// discriminator — this dedicated bool is.
+    pub(super) forwarded_argv_was_pushed: bool,
+
+    /// Setup frames the run-config backstop pulled off the inbox while
+    /// bounded-waiting for the `RunConfig` answer. The backstop must drain the
+    /// inbox to find the answer, but the SETUP frames it encounters
+    /// (PeerInfo / InitialAssignment / TransferComplete) belong to
+    /// `wait_for_setup`'s own progress loop; buffering them here and draining
+    /// this backlog before each fresh `inbox.recv()` keeps the backstop from
+    /// stealing frames the setup loop needs (no frame loss, no duplicated
+    /// setup-handling logic). Empty in the common path (the push lands before
+    /// the first setup frame, so the backstop never recvs).
+    pub(super) setup_frame_backlog: std::collections::VecDeque<DistributedMessage<I>>,
+
     /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
     /// PyO3 surface (when the handle was minted from a
     /// `PySecondaryCoordinator`).
@@ -468,11 +505,26 @@ where
     /// promoted node's command line. A NODE-LOCAL launch constant
     /// seeded from `config.forwarded_argv` at construction; NOT
     /// replicated lattice data, so it never touches `cluster_state`.
-    /// The `RequestRunConfig` responder (the router's
-    /// `DistributedMessage::RequestRunConfig` arm) reads it READ-ONLY
-    /// and unicasts it back to a requesting peer — available on this
-    /// secondary role so a cold-start fetch is answerable before any
-    /// primary exists / promotes. Empty for a run with no forwarded
-    /// args.
-    pub(super) forwarded_argv: Vec<String>,
+    ///
+    /// A SHARED handle (single source of truth) so the three readers
+    /// observe the SAME delivered value with exactly one writer
+    /// ([`Self::store_pushed_run_config`]):
+    ///   * the `RequestRunConfig` responder (the router's
+    ///     `DistributedMessage::RequestRunConfig` arm) reads it READ-ONLY
+    ///     and unicasts it back to a requesting peer — available on this
+    ///     secondary role so a cold-start fetch is answerable before any
+    ///     primary exists / promotes;
+    ///   * the finalize-run-config fire feeds the delivered argv to the
+    ///     consumer's reparse closure;
+    ///   * the promotion recipe (built in the pyo3 wrapper) reads it at
+    ///     promotion time so a node promoted to primary threads the
+    ///     DELIVERED argv (post-push) into its `PrimaryConfig.forwarded_argv`,
+    ///     not the stale boot copy.
+    ///
+    /// `Arc<Mutex<_>>` rather than the plain `Vec` it replaces because the
+    /// promotion recipe is a standalone closure that cannot borrow the
+    /// coordinator: it captures a clone of THIS handle and reads it at the
+    /// promotion instant (which is always after the push has landed). Empty
+    /// for a run with no forwarded args.
+    pub(super) forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }

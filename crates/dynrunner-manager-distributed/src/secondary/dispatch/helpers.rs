@@ -359,4 +359,41 @@ where
         }
         Ok(false)
     }
+
+    /// Store an inbound run-config PUSH from the primary.
+    ///
+    /// The primary unicasts a `RunConfig` the moment it welcomes this
+    /// secondary (`PrimaryCoordinator::push_run_config_to`), carrying the
+    /// consumer's `forwarded_argv` the boot CLI omits. Shared by the
+    /// operational dispatch router AND `wait_for_setup`'s receive loop —
+    /// the push can land in EITHER window (it fires right after welcome, so
+    /// it usually arrives mid-setup), and both sites must store it with
+    /// identical semantics, so the write lives here with exactly one
+    /// writer.
+    ///
+    /// Pure node-local launch constant, NOT lattice data: it overwrites
+    /// `self.forwarded_argv` (last-writer-wins; a duplicate push or a later
+    /// `RequestRunConfig` answer carries the same value) and never touches
+    /// `cluster_state`. The stored copy is what the run path reads and what
+    /// THIS node re-serves on a peer's `RequestRunConfig` / threads into a
+    /// promoted `PrimaryConfig`.
+    pub(in crate::secondary) fn store_pushed_run_config(&mut self, forwarded_argv: Vec<String>) {
+        let argv_len = forwarded_argv.len();
+        // SINGLE writer to the shared handle. Last-writer-wins: a duplicate
+        // push or a later `RequestRunConfig` answer carries the same value.
+        *self
+            .forwarded_argv
+            .lock()
+            .expect("forwarded_argv mutex poisoned") = forwarded_argv;
+        // Latch the delivery so the finalize backstop can tell "the push
+        // landed (possibly empty)" from "no run-config has arrived yet" —
+        // an empty argv is a valid landing (compiler_suit-shape), so the
+        // latch, not emptiness, is the discriminator.
+        self.forwarded_argv_was_pushed = true;
+        tracing::debug!(
+            secondary = %self.config.secondary_id,
+            argv_len,
+            "received pushed run-config from primary"
+        );
+    }
 }

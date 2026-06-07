@@ -172,6 +172,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Push this primary's node-local `forwarded_argv` to a freshly-
+    /// welcomed secondary over its EXISTING mesh connection.
+    ///
+    /// Single concern: the run-config DELIVERY edge on the welcome-accept
+    /// path. The welcomed secondary booted with only its boot-critical CLI
+    /// args; it parses the consumer's run-config (`--task`, task filters)
+    /// only AFTER it is connected, so the primary unicasts the same
+    /// `RunConfig` frame the `RequestRunConfig` responder serves — but
+    /// proactively, the moment the secondary is recorded as connected,
+    /// rather than waiting for the secondary to ask. This reuses the
+    /// already-established connection (the welcome/cert handshake that
+    /// precedes it is untouched); it is purely a new SEND site for the
+    /// existing message.
+    ///
+    /// Like the responder, this is read-only peer gossip: it reads
+    /// `self.forwarded_argv` and never touches roster / capacity / CRDT.
+    /// A send failure is logged best-effort — the secondary's own
+    /// `RequestRunConfig` fallback (and bounded recv waits) still cover the
+    /// rare drop.
+    pub(crate) async fn push_run_config_to(&mut self, secondary_id: String) {
+        let response = DistributedMessage::RunConfig {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            forwarded_argv: self.forwarded_argv.clone(),
+        };
+        if let Err(e) = self
+            .send_to(
+                Destination::Secondary(PeerId::from(secondary_id.clone())),
+                response,
+            )
+            .await
+        {
+            tracing::warn!(
+                target = %secondary_id,
+                error = %e,
+                "failed to push RunConfig to welcomed secondary"
+            );
+        }
+    }
+
     /// Anti-entropy receive: compare a peer's `StateDigest` against the
     /// primary's own and pull a snapshot iff the primary is somehow behind.
     ///
