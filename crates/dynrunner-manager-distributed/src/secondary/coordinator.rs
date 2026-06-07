@@ -433,8 +433,10 @@ where
     /// are live for the initial workers (and every respawn). The framework
     /// (this coordinator) owns the DRIVE / timing; the reparse + cmd_args
     /// rebuild is the consumer's POLICY (the pyo3 wrapper supplies the
-    /// closure). Absent registration the finalize is a faithful no-op
-    /// (compiler_suit-shape, Rust-only fixtures).
+    /// closure). The `args=` path (compiler_suit) registers an IDENTITY
+    /// finalizer (Some) — the seam fires but is a faithful no-op (identity
+    /// ignores the argv; the rebuild is byte-identical). Only Rust-only test
+    /// fixtures register `None`, which skips the seam entirely.
     ///
     /// Single concern: own the registration surface for the finalize policy;
     /// the cmd_args swap itself is the closure's (consumer's) concern.

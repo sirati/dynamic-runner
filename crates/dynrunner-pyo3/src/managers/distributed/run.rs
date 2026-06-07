@@ -464,7 +464,7 @@ impl PyDistributedManager {
                             // eagerly-parsed namespace (no cold-start run-config
                             // fetch / deferral): seed each per-secondary cell
                             // once and never swap.
-                            types: std::sync::Arc::new(std::sync::Mutex::new(sec_types)),
+                            types: crate::task_def::shared_registry(sec_types),
                             skip_existing,
                             connection_mode: ConnectionMode::Socketpair,
                             manual_start_worker: false,

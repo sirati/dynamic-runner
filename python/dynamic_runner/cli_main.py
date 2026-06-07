@@ -26,6 +26,7 @@ from .logging_setup import setup_logging
 from ._forwarded_argv import filter_framework_argv
 from .run import dispatch as _dispatch
 from .run import make_reparse_finalizer as _make_reparse_finalizer
+from .run import relax_required as _relax_required
 from .task_protocol import TaskDefinition
 
 TaskOrFactory = Union[
@@ -92,8 +93,18 @@ def cli_main(
     task.add_task_arguments(parser)
     if add_consumer_args is not None:
         add_consumer_args(parser)
+    if selector_ns.secondary:
+        # SECONDARY boot: the regenerated secondary argv carries only the
+        # framework-regenerated flags; the task-specific run-config arrives over
+        # the mesh AFTER connect. Relax task-arg `required` so a required-arg
+        # task (e.g. asm-tokenizer `build_memmap --unified-vocab`) boots without
+        # `SystemExit(2)`; the STRICT parse + `validate_parsed_args` is deferred
+        # to the finalize over `[*boot_argv, *forwarded_argv]` (the SUBMITTER
+        # path keeps the strict full parse + validation — it has all args).
+        _relax_required(parser)
     args = parser.parse_args(raw)
-    validate_parsed_args(args, parser)
+    if not selector_ns.secondary:
+        validate_parsed_args(args, parser)
 
     # The forward-set is the framework+task argv with consumer flags
     # removed. A framework+task-only parser recognises exactly that subset;

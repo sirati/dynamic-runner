@@ -337,9 +337,12 @@ async fn finalize_fires_before_initialize_workers() {
         .await;
 }
 
-/// (step-8c) compiler_suit-shape: no finalize registered (empty forwarded
-/// argv, `args=` path) → `enter_configuring` still spawns workers, and the
-/// shared run-config handle is untouched (the finalize is a faithful no-op).
+/// (step-8c) No finalize registered (the legacy Rust-only fixture / out-of-tree
+/// direct-driver path) → `enter_configuring` still spawns workers, and the
+/// shared run-config handle is untouched (the seam is skipped). Note the
+/// `args=` consumer path (compiler_suit) registers an IDENTITY finalizer
+/// instead, exercising the Some-but-no-op seam; this fixture pins the genuine
+/// `None`-skips-the-seam path.
 #[tokio::test(flavor = "current_thread")]
 async fn no_finalize_registered_is_faithful_no_op() {
     let local = tokio::task::LocalSet::new();

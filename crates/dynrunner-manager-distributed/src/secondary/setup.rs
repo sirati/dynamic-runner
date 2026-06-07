@@ -218,9 +218,12 @@ where
     pub(in crate::secondary) async fn finalize_run_config_before_workers(
         &mut self,
     ) -> Result<(), String> {
-        // Nothing to do unless a finalize policy was registered (the
-        // run-config-bearing consumer path). compiler_suit-shape / Rust-only
-        // fixtures register none and skip the whole seam.
+        // Nothing to do unless a finalize policy was registered. The `args=`
+        // path (compiler_suit) registers an IDENTITY finalizer (Some), so the
+        // seam DOES run for it — harmlessly: the identity ignores the delivered
+        // argv and the rebuild is byte-identical (compiler_suit's
+        // `build_worker_command_args` does `del args`). Only Rust-only test
+        // fixtures register `None`, which skips the seam here.
         let Some(mut finalize) = self.finalize_run_config.take() else {
             return Ok(());
         };

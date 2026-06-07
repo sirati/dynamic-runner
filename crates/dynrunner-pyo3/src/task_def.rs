@@ -74,6 +74,16 @@ pub(crate) struct TypeRegistry {
 /// simply seed the cell once and the lock is uncontended.
 pub(crate) type SharedTypeRegistry = std::sync::Arc<std::sync::Mutex<TypeRegistry>>;
 
+/// Wrap a `TypeRegistry` into the [`SharedTypeRegistry`] cell.
+///
+/// Single concern: own the `Arc<Mutex<_>>` construction so the every
+/// factory-seeding call site (local / distributed / secondary managers) does
+/// not re-spell the wrapper internals — the cell's representation stays a
+/// private detail of this alias.
+pub(crate) fn shared_registry(reg: TypeRegistry) -> SharedTypeRegistry {
+    std::sync::Arc::new(std::sync::Mutex::new(reg))
+}
+
 impl TypeRegistry {
     /// Look up a `TypeRuntime` by its `TypeId`. Returns `None` if the
     /// caller asks about a type that wasn't declared in `get_phases()`.

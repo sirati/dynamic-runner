@@ -70,10 +70,28 @@ def run(
 
     if args is None:
         parse_argv = argv if argv is not None else []
-        parser = build_arg_parser(description)
-        task.add_task_arguments(parser)
-        args = parser.parse_args(parse_argv)
-        validate_parsed_args(args, parser)
+        # Detect secondary-ness with a FRAMEWORK-ONLY parser first: on a SLURM
+        # secondary the boot argv carries only the framework-regenerated flags;
+        # the task-specific run-config (`forwarded_argv`) arrives over the mesh
+        # AFTER connect. Parsing the full task parser eagerly+strictly here would
+        # make a `required=True` task arg trip `parser.error()` → SystemExit(2)
+        # BEFORE dispatch could reach the deferred-finalize seam — so a required-
+        # arg task could never boot as a secondary. `parse_known_args` on a
+        # framework-only parser sees `--secondary` without enforcing task args.
+        boot_ns, _ = build_arg_parser(description).parse_known_args(parse_argv)
+        if boot_ns.secondary:
+            # SECONDARY boot: relaxed parse (task-arg `required` not enforced).
+            # The real task-arg values ride the mesh post-connect; the STRICT
+            # full parse + `validate_parsed_args` happens later in the finalize
+            # over `[*boot_argv, *forwarded_argv]` (see `make_reparse_finalizer`).
+            args = _parse_secondary_boot_args(task, description, parse_argv)
+        else:
+            # SUBMITTER / local boot: the submitter has ALL args, so a strict
+            # full parse + validation is correct (unchanged behaviour).
+            parser = build_arg_parser(description)
+            task.add_task_arguments(parser)
+            args = parser.parse_args(parse_argv)
+            validate_parsed_args(args, parser)
         forward_source = parse_argv
     else:
         # Pre-parsed namespace path: the consumer owns parse + validation
@@ -134,6 +152,51 @@ _DISPATCH_TIME_ATTRS = (
     "_setup_deferred_to_secondary",
     "_boot_argv",
 )
+
+
+def _parse_secondary_boot_args(
+    task: TaskDefinition,
+    description: str,
+    parse_argv: list[str],
+) -> argparse.Namespace:
+    """Lenient boot parse for the SECONDARY path — task-arg ``required`` relaxed.
+
+    Single concern: produce a COMPLETE boot-time namespace for a secondary
+    whose argv carries only the framework-regenerated flags. A SLURM secondary
+    boots BEFORE the primary's post-welcome push delivers the task-specific
+    ``forwarded_argv``, so its boot argv legitimately lacks every required task
+    arg (e.g. asm-tokenizer ``build_memmap --unified-vocab``). A strict full
+    parse would call ``parser.error()`` → ``SystemExit(2)`` and the deferred-
+    finalize seam (where the strict parse actually belongs, over
+    ``[*boot_argv, *forwarded_argv]``) would be unreachable.
+
+    The fix builds a DEDICATED boot parser (framework + task args), relaxes
+    every action's ``required`` so the missing task args don't abort, and parses
+    ``parse_argv``. The result is a complete namespace carrying task-arg
+    DEFAULTS — enough for the placeholder ``build_worker_command_args`` and any
+    ``discover_items`` to read their attributes without crashing on missing
+    fields; the real values land later in the finalize. ``validate_parsed_args``
+    is DEFERRED to the finalize (it runs the strict parser there) so genuinely
+    missing required args in the delivered config are still caught.
+    """
+    parser = build_arg_parser(description)
+    task.add_task_arguments(parser)
+    relax_required(parser)
+    return parser.parse_args(parse_argv)
+
+
+def relax_required(parser: argparse.ArgumentParser) -> None:
+    """Clear every action's ``required`` flag on a boot parser.
+
+    Single concern: the secondary boot-parse relaxation, factored out so both
+    framework entry points (``run`` and ``cli_main``) share ONE relaxation
+    rule rather than each spelling out the ``_actions`` walk. The strict parser
+    that ``make_reparse_finalizer`` rebuilds keeps ``required`` intact, so the
+    post-push parse over ``[*boot_argv, *forwarded_argv]`` still rejects a
+    delivered config that omits a required arg.
+    """
+    for action in parser._actions:
+        action.required = False
 
 
 def make_reparse_finalizer(task, description, args):

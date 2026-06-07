@@ -432,10 +432,11 @@ where
     /// that re-parses Python's argparse + rebuilds the cmd_args under the
     /// GIL). Fired ONCE at the `AwaitingPrimary → Configuring` transition,
     /// BEFORE [`Self::initialize_workers`] reads the cmd_args at worker
-    /// spawn, so the swapped command is live for the initial pool. `None`
-    /// for callers whose worker argv does not depend on the forwarded
-    /// run-config (compiler_suit-shape; legacy Rust-only fixtures), where the
-    /// finalize is a faithful no-op.
+    /// spawn, so the swapped command is live for the initial pool. `None` only
+    /// for callers that register no closure at all (legacy Rust-only fixtures /
+    /// out-of-tree direct drivers), which skips the seam. The `args=` consumer
+    /// path (compiler_suit) registers an IDENTITY finalizer (Some) — the seam
+    /// fires but is a faithful no-op (byte-identical rebuild).
     pub(super) finalize_run_config: Option<super::FinalizeRunConfigFn>,
 
     /// Latch set true by [`Self::store_pushed_run_config`] the first time an

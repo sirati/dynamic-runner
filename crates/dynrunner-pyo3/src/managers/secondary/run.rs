@@ -119,7 +119,7 @@ impl PySecondaryCoordinator {
         // (post-push). Seeded from the boot-CLI registry (placeholder
         // cmd_args). One Arc, two readers — the factory and the finalize.
         let shared_types: crate::task_def::SharedTypeRegistry =
-            std::sync::Arc::new(std::sync::Mutex::new(self.types.clone()));
+            crate::task_def::shared_registry(self.types.clone());
         let finalize_shared_types = shared_types.clone();
         let skip_existing = self.skip_existing;
         // The declared `TypeId`s (for the finalize's per-type
@@ -897,9 +897,12 @@ struct FinalizeCaptures {
 /// resulting per-type `cmd_args` into the SHARED [`SharedTypeRegistry`] the
 /// factory reads at every spawn.
 ///
-/// `None` finalize callable → no-op (the cmd_args stay the boot-CLI build;
-/// compiler_suit-shape, where the worker argv does not depend on the
-/// forwarded run-config).
+/// `None` finalize callable → no-op (the cmd_args stay the boot-CLI build).
+/// This is the out-of-tree path (a caller driving the secondary directly with
+/// no Python dispatcher closure). The `args=` consumer path (compiler_suit)
+/// supplies an IDENTITY callable instead (Some) — its worker argv does not
+/// depend on the forwarded run-config, so the seam fires but rebuilds a
+/// byte-identical cmd_args.
 ///
 /// # Non-block correctness (§14/§15)
 ///
