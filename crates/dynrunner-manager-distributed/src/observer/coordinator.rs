@@ -61,6 +61,7 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
+use tracing::Instrument;
 
 use crate::anti_entropy::{self, RequesterIdentity};
 use crate::cluster_state::ClusterState;
@@ -569,6 +570,29 @@ where
     /// arms. Returns the run terminal; the strand backstops surface as
     /// `Err`.
     pub async fn run(&mut self) -> Result<ObserverTerminal, RunError>
+    where
+        Self: 'static,
+    {
+        // Role-tag the whole observer run future so every event this task
+        // emits is attributed to the observer role and routed to the
+        // per-role full log (`observer.log`). A relocated submitter steps
+        // down into this standalone observer on the SAME host as the
+        // compute peer it handed the primary role to; this span keeps the
+        // relocated submitter's events in `observer.log`, distinct from the
+        // promoted peer's `primary.log` and any host `secondary.log`. See
+        // `dynrunner_core::role_span`.
+        let span = tracing::info_span!(
+            dynrunner_core::OBSERVER_ROLE_SPAN,
+            kind = "observer",
+            node = %self.config.node_id
+        );
+        async move { self.run_inner().await }.instrument(span).await
+    }
+
+    /// Original `run` body, factored out so the public `run` wrapper can
+    /// role-tag the whole future (see [`Self::run`]). Behaviour-identical
+    /// to the pre-span body; the wrapper adds only the role span.
+    async fn run_inner(&mut self) -> Result<ObserverTerminal, RunError>
     where
         Self: 'static,
     {

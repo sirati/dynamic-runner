@@ -26,3 +26,13 @@ pub const PRIMARY_ROLE_SPAN: &str = "dynrunner_role_primary";
 /// Span name marking a coordinator's run future as the SECONDARY role.
 /// Read by the `dynrunner-pyo3` per-role full-log routing layer.
 pub const SECONDARY_ROLE_SPAN: &str = "dynrunner_role_secondary";
+
+/// Span name marking a coordinator's run future as the OBSERVER role.
+/// Read by the `dynrunner-pyo3` per-role full-log routing layer.
+///
+/// A relocated submitter steps down from primary to a standalone observer
+/// on the SAME host (the bootstrap-relocation observer tail); its observer
+/// run future carries this span so its events route to a dedicated
+/// `observer.log`, keeping the relocated submitter's actions debuggable
+/// after it hands the primary role to a compute peer.
+pub const OBSERVER_ROLE_SPAN: &str = "dynrunner_role_observer";

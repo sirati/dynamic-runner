@@ -14,7 +14,7 @@ pub use importance::IMPORTANT_TARGET;
 pub use node_id::SETUP_NODE_ID;
 pub use output_gather::gather_predecessor_outputs;
 pub use path_resolve::{ResolvedPath, resolve_against_root};
-pub use role_span::{PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
+pub use role_span::{OBSERVER_ROLE_SPAN, PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
 pub use spawn_tasks_validator::{
     COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };

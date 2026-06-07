@@ -44,6 +44,14 @@ IMPORTANT_STDIO_ONLY_FLAG = "--important-stdio-only"
 #: shell-redirection capture point.
 DEFAULT_FULL_LOG_FILE = "dynrunner-full.log"
 
+#: Per-node subdirectory the SUBMITTER's full role-split logs land under,
+#: anchored on ``--log-dir`` — the gateway-shared mount compute nodes use
+#: for ``--full-log-dir=<log-dir>/{secondary_id}``. "setup" mirrors the
+#: submitter's ``SETUP_NODE_ID`` so its bootstrap-primary log
+#: (``<log-dir>/setup/primary.log``) and post-relocation observer log
+#: (``<log-dir>/setup/observer.log``) sit beside the compute nodes' dirs.
+SETUP_FULL_LOG_SUBDIR = "setup"
+
 
 def resolve_full_log_file(
     important_stdio_only: bool, full_log_file: str | None
@@ -65,6 +73,41 @@ def resolve_full_log_file(
     if full_log_file and full_log_file.strip():
         return Path(full_log_file)
     return Path(DEFAULT_FULL_LOG_FILE)
+
+
+def resolve_full_log_dir(
+    args: argparse.Namespace, full_log_dir: str | None
+) -> str | None:
+    """The per-node role-split full-log directory, or ``None``.
+
+    Single concern: pick the directory the native PerNodeDir sink splits
+    ``primary.log`` / ``secondary.log`` / ``observer.log`` under.
+
+    An explicit ``--full-log-dir`` always wins (compute nodes are launched
+    with ``--full-log-dir=<log-dir>/{secondary_id}`` by the SLURM spawn
+    paths). When unset, the SUBMITTER (a distributed / SLURM primary — NOT a
+    ``--secondary``) defaults to ``<log-dir>/setup`` so its bootstrap-primary
+    actions land in ``setup/primary.log`` and, after it relocates its primary
+    role to a compute peer, its observer actions land in
+    ``setup/observer.log`` — keeping the relocated submitter debuggable. This
+    full per-node record is INDEPENDENT of ``--important-stdio-only`` (that
+    flag only gates the operator-facing stdio view). A plain local run and a
+    ``--secondary`` leave this ``None`` (the secondary's dir is always
+    forwarded explicitly; a local run keeps the single stdout stream).
+    """
+    if full_log_dir and full_log_dir.strip():
+        return full_log_dir
+    if getattr(args, "secondary", None):
+        return None
+    is_submitter = bool(
+        getattr(args, "multi_computer", None) or getattr(args, "slurm", False)
+    )
+    if not is_submitter:
+        return None
+    log_dir = getattr(args, "log_dir", None)
+    if not (log_dir and str(log_dir).strip()):
+        return None
+    return str(Path(log_dir) / SETUP_FULL_LOG_SUBDIR)
 
 
 def _redirect_python_logs_to_full_log(full_log_file: Path) -> None:
@@ -111,7 +154,11 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     """
     important_stdio_only = bool(getattr(args, "important_stdio_only", False))
     full_log_file = getattr(args, "full_log_file", None)
-    full_log_dir = getattr(args, "full_log_dir", None)
+    # The submitter defaults to a per-setup `<log-dir>/setup` role-split dir
+    # when no explicit `--full-log-dir` was passed, so its bootstrap-primary
+    # (`primary.log`) and post-relocation observer (`observer.log`) actions
+    # are captured for debugging — independent of `--important-stdio-only`.
+    full_log_dir = resolve_full_log_dir(args, getattr(args, "full_log_dir", None))
     debug = bool(getattr(args, "debug", False))
 
     # Deferred native subscriber install — explicit params, after argparse.

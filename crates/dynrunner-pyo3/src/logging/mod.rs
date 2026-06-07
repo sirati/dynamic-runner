@@ -28,8 +28,14 @@
 //!     gateway-shared `--log-dir` mount. When set, the framework's own
 //!     runner log is persisted under it, SPLIT BY ROLE: primary-role
 //!     events to `<dir>/primary.log`, secondary-role events to
-//!     `<dir>/secondary.log`. So the log of a relocated same-host primary
-//!     is isolated from its host secondary's, and both land host-readably.
+//!     `<dir>/secondary.log`, observer-role events to `<dir>/observer.log`.
+//!     So the log of a relocated same-host primary (and the observer it
+//!     becomes after handing its role to a compute peer) is isolated from
+//!     its host secondary's, and all land host-readably. The submitter
+//!     passes a per-setup `full_log_dir` too, so its bootstrap-primary
+//!     events (`primary.log`) and post-relocation observer events
+//!     (`observer.log`) are captured independently of the operator-facing
+//!     `--important-stdio-only` view.
 //!     The role is read off the run future's role span (see
 //!     [`role_full_layer`] and `dynrunner_core::role_span`), never a
 //!     per-call-site branch. Takes precedence over `full_log_file`: the
@@ -96,11 +102,20 @@ const PRIMARY_LOG_FILENAME: &str = "primary.log";
 /// [`SECONDARY_ROLE_SPAN`]).
 const SECONDARY_LOG_FILENAME: &str = "secondary.log";
 
-/// Cross-crate role-span names, the routing keys for the two per-role
+/// Filename for observer-role events under the per-node full-log dir:
+/// every event an observer coordinator's run future emits (it carries the
+/// [`OBSERVER_ROLE_SPAN`]). Separate so a relocated submitter — which
+/// steps down from primary to a standalone observer on the SAME host as
+/// the compute peer it promoted — keeps its post-relocation log isolated
+/// from that peer's `primary.log` (and from any host `secondary.log`),
+/// keeping the relocated submitter debuggable.
+const OBSERVER_LOG_FILENAME: &str = "observer.log";
+
+/// Cross-crate role-span names, the routing keys for the per-role
 /// full-log layers. Defined once in `dynrunner-core`; the coordinators
 /// enter spans of these names at their run entry, this layer reads the
 /// names off the event scope. See [`role_full_layer`].
-use dynrunner_core::{PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
+use dynrunner_core::{OBSERVER_ROLE_SPAN, PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
 
 /// Where the full (everything) sink writes.
 #[derive(Debug)]
@@ -372,10 +387,13 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
 /// The full sink composes per `FullSink`: `Stdout` adds no file layer (the
 /// stdio layer alone is the full stream); `File` adds one unfiltered
 /// verbose file layer (the submitter's explicit path); `PerNodeDir` adds
-/// TWO role-routed verbose file layers (`primary.log` / `secondary.log`),
-/// each gated on the run future's role span. The stdio layer is always
-/// present (mode off → ungated stdout; mode on → only the important target
-/// to stdout). This is one rule per sink shape, not a per-event branch.
+/// THREE role-routed verbose file layers (`primary.log` / `secondary.log` /
+/// `observer.log`), each gated on the run future's role span — so a
+/// relocated submitter's post-relocation observer events land in
+/// `observer.log`, isolated from the promoted peer's `primary.log`. The
+/// stdio layer is always present (mode off → ungated stdout; mode on →
+/// only the important target to stdout). This is one rule per sink shape,
+/// not a per-event branch.
 ///
 /// None of these layers carry a verbosity filter: the `--debug`-resolved
 /// ceiling is applied ONCE as a global subscriber-level filter on the
@@ -399,6 +417,10 @@ where
             layers.push(role_full_layer(
                 open_append_create(&dir.join(SECONDARY_LOG_FILENAME)),
                 SECONDARY_ROLE_SPAN,
+            ));
+            layers.push(role_full_layer(
+                open_append_create(&dir.join(OBSERVER_LOG_FILENAME)),
+                OBSERVER_ROLE_SPAN,
             ));
         }
     }
@@ -800,11 +822,11 @@ mod tests {
     }
 
     #[test]
-    fn per_node_dir_adds_two_role_layers_and_creates_missing_dir() {
+    fn per_node_dir_adds_three_role_layers_and_creates_missing_dir() {
         // The per-node mount subdir is composed lazily, so the dir may not
         // exist when logging installs. Building the per-node-dir layers must
-        // materialise it and open BOTH role files (append-create), plus the
-        // stdio layer — three layers total.
+        // materialise it and open ALL THREE role files (append-create), plus
+        // the stdio layer — four layers total.
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
@@ -812,8 +834,8 @@ mod tests {
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
-            3,
-            "expected primary.log + secondary.log + stdio layers"
+            4,
+            "expected primary.log + secondary.log + observer.log + stdio layers"
         );
         assert!(
             node_dir.join(PRIMARY_LOG_FILENAME).exists(),
@@ -822,6 +844,48 @@ mod tests {
         assert!(
             node_dir.join(SECONDARY_LOG_FILENAME).exists(),
             "secondary.log not created under fresh per-node dir"
+        );
+        assert!(
+            node_dir.join(OBSERVER_LOG_FILENAME).exists(),
+            "observer.log not created under fresh per-node dir"
+        );
+    }
+
+    #[test]
+    fn observer_span_routes_events_to_observer_log() {
+        // The observer role layer is scope-gated on OBSERVER_ROLE_SPAN: an
+        // observer-span event lands ONLY in observer.log, isolated from
+        // primary.log / secondary.log. This is the relocated-submitter
+        // debuggability fix — a setup that handed its primary role to a
+        // compute peer keeps logging under its own observer role span.
+        let primary_buf = BufWriter::default();
+        let secondary_buf = BufWriter::default();
+        let observer_buf = BufWriter::default();
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            role_full_layer::<Registry, _>(primary_buf.clone(), PRIMARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(secondary_buf.clone(), SECONDARY_ROLE_SPAN),
+            role_full_layer::<Registry, _>(observer_buf.clone(), OBSERVER_ROLE_SPAN),
+        ];
+        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        with_default(subscriber, || {
+            tracing::info_span!(OBSERVER_ROLE_SPAN, kind = "observer")
+                .in_scope(|| tracing::info!("observer-event"));
+        });
+
+        assert!(
+            observer_buf.contents().contains("observer-event"),
+            "observer.log missing the observer-span event: {}",
+            observer_buf.contents()
+        );
+        assert!(
+            !primary_buf.contents().contains("observer-event"),
+            "primary.log leaked an observer-span event: {}",
+            primary_buf.contents()
+        );
+        assert!(
+            !secondary_buf.contents().contains("observer-event"),
+            "secondary.log leaked an observer-span event: {}",
+            secondary_buf.contents()
         );
     }
 

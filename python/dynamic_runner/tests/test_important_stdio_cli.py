@@ -135,6 +135,69 @@ class ResolveFullLogFileTests(unittest.TestCase):
         )
 
 
+class ResolveFullLogDirTests(unittest.TestCase):
+    """The submitter's per-setup role-split dir default — independent of
+    `--important-stdio-only`, so the bootstrap-primary / post-relocation
+    observer logs are always captured for debugging."""
+
+    @staticmethod
+    def _ns(**kw: object) -> argparse.Namespace:
+        base: dict[str, object] = {
+            "secondary": None,
+            "multi_computer": None,
+            "slurm": False,
+            "log_dir": None,
+        }
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_explicit_dir_always_wins(self) -> None:
+        # A compute node is launched with an explicit per-node dir; honour it
+        # verbatim regardless of role flags.
+        ns = self._ns(secondary=True, log_dir="/app/log-network")
+        self.assertEqual(
+            logging_setup.resolve_full_log_dir(ns, "/app/log-network/sec-0"),
+            "/app/log-network/sec-0",
+        )
+
+    def test_slurm_submitter_defaults_to_log_dir_setup(self) -> None:
+        ns = self._ns(slurm=True, log_dir="/app/log-network")
+        self.assertEqual(
+            logging_setup.resolve_full_log_dir(ns, None),
+            str(pathlib.Path("/app/log-network") / logging_setup.SETUP_FULL_LOG_SUBDIR),
+        )
+
+    def test_multi_computer_submitter_defaults_to_log_dir_setup(self) -> None:
+        ns = self._ns(multi_computer="local", log_dir="/var/log/run")
+        self.assertEqual(
+            logging_setup.resolve_full_log_dir(ns, None),
+            str(pathlib.Path("/var/log/run") / "setup"),
+        )
+
+    def test_secondary_returns_none(self) -> None:
+        # A secondary's dir is always forwarded explicitly; never defaulted.
+        ns = self._ns(secondary=True, slurm=True, log_dir="/app/log-network")
+        self.assertIsNone(logging_setup.resolve_full_log_dir(ns, None))
+
+    def test_plain_local_run_returns_none(self) -> None:
+        # Not a submitter (no multi_computer/slurm) → keep the single stdout
+        # stream, no role-split dir.
+        ns = self._ns(log_dir="/var/log/run")
+        self.assertIsNone(logging_setup.resolve_full_log_dir(ns, None))
+
+    def test_submitter_without_log_dir_returns_none(self) -> None:
+        # No anchor to hang the per-setup dir on → None (stdout single stream).
+        ns = self._ns(slurm=True, log_dir=None)
+        self.assertIsNone(logging_setup.resolve_full_log_dir(ns, None))
+
+    def test_blank_explicit_dir_falls_through_to_default(self) -> None:
+        ns = self._ns(slurm=True, log_dir="/app/log-network")
+        self.assertEqual(
+            logging_setup.resolve_full_log_dir(ns, "  "),
+            str(pathlib.Path("/app/log-network") / "setup"),
+        )
+
+
 class _RootLoggerSandbox(unittest.TestCase):
     """Save/restore the root logger's handlers + level so logging-setup
     tests do not corrupt the shared root logger for the rest of the suite.
