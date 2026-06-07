@@ -35,7 +35,7 @@ async fn e2e_primary_and_secondary_single_node() {
             });
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
@@ -120,7 +120,7 @@ async fn e2e_primary_and_two_secondaries() {
             drop(incoming_tx); // Only forwarding tasks hold senders now
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 num_secondaries: 2,
                 connect_timeout: Duration::from_secs(10),
@@ -297,7 +297,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                         HashMap::new(),
                         pri_to_sec_rx,
                     );
-                    transport.register_primary_link("primary".into(), sec_to_pri_tx);
+                    transport.register_primary_link("setup".into(), sec_to_pri_tx);
 
                     let config = SecondaryConfig {
                         secondary_id: sec_secondary_id,
@@ -351,7 +351,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
             });
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
@@ -497,7 +497,7 @@ async fn e2e_pre_staged_source_mode() {
             });
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
@@ -583,7 +583,7 @@ async fn e2e_uses_file_based_items_false() {
             });
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
@@ -681,7 +681,7 @@ async fn e2e_per_type_max_concurrent() {
             caps.insert(dynrunner_core::TypeId::from("compile"), 2);
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
@@ -774,7 +774,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
                 }
             });
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
@@ -917,7 +917,7 @@ async fn run_with_initial_staging_succeeds() {
                 }
             });
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),

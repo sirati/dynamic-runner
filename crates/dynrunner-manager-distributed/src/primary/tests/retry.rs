@@ -74,7 +74,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
                 }
             });
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
@@ -191,7 +191,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
                 }
             });
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),
@@ -711,7 +711,7 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
                 }
             });
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),

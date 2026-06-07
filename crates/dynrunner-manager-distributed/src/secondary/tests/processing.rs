@@ -42,7 +42,7 @@ pub(super) async fn fake_primary(
     to_secondary
         .send(DistributedMessage::PeerInfo {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             peers: vec![],
         })
@@ -54,7 +54,7 @@ pub(super) async fn fake_primary(
             target: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
             zip_files: vec![],
@@ -67,7 +67,7 @@ pub(super) async fn fake_primary(
     to_secondary
         .send(DistributedMessage::TransferComplete {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             total_files: 0,
             total_bytes: 0,
@@ -107,7 +107,7 @@ pub(super) async fn fake_primary(
     to_secondary
         .send(DistributedMessage::ClusterMutation {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete],
         })
@@ -133,7 +133,7 @@ pub(super) fn send_task_assignment(
     let hash = format!("hash_{}", binary.identifier.0);
     tx.send(DistributedMessage::TaskAssignment {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         secondary_id: secondary_id.into(),
         worker_id,
@@ -236,7 +236,7 @@ async fn secondary_with_real_workers_processes_tasks() {
             let mut secondary = make_secondary_channel(config, unified);
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
@@ -315,7 +315,7 @@ async fn secondary_multi_worker_processes_tasks() {
             let mut secondary = make_secondary_channel(config, unified);
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
@@ -395,7 +395,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
             let mut secondary = make_secondary_channel(config, unified);
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
@@ -502,7 +502,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::PeerInfo {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         peers: vec![],
                     })
@@ -512,7 +512,7 @@ async fn stage_file_then_assign_task_succeeds() {
                         target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
                         zip_files: vec![],
@@ -523,7 +523,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::TransferComplete {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         total_files: 0,
                         total_bytes: 0,
@@ -533,7 +533,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::StageFile {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
                         file_hash: real_hash_clone.clone(),
@@ -553,7 +553,7 @@ async fn stage_file_then_assign_task_succeeds() {
                                 pri_to_sec_tx
                                     .send(DistributedMessage::TaskAssignment {
                                         target: None,
-                                        sender_id: "primary".into(),
+                                        sender_id: "setup".into(),
                                         timestamp: 0.0,
                                         secondary_id: secondary_id_clone.clone(),
                                         worker_id,
@@ -593,7 +593,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 // `cluster_state.run_complete()`.
                 let _ = pri_to_sec_tx.send(DistributedMessage::ClusterMutation {
                     target: None,
-                    sender_id: "primary".into(),
+                    sender_id: "setup".into(),
                     timestamp: 0.0,
                     mutations: vec![
                         dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
@@ -609,7 +609,7 @@ async fn stage_file_then_assign_task_succeeds() {
             let mut secondary = make_secondary_channel(config, unified);
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let (secondary, result) = run_secondary_node(secondary, &mut factory).await;
@@ -652,7 +652,7 @@ async fn fake_primary_abort(
     to_secondary
         .send(DistributedMessage::PeerInfo {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             peers: vec![],
         })
@@ -662,7 +662,7 @@ async fn fake_primary_abort(
             target: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             secondary_id,
             zip_files: vec![],
@@ -673,7 +673,7 @@ async fn fake_primary_abort(
     to_secondary
         .send(DistributedMessage::TransferComplete {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             total_files: 0,
             total_bytes: 0,
@@ -690,7 +690,7 @@ async fn fake_primary_abort(
     to_secondary
         .send(DistributedMessage::ClusterMutation {
             target: None,
-            sender_id: "primary".into(),
+            sender_id: "setup".into(),
             timestamp: 0.0,
             mutations: vec![
                 dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
@@ -765,7 +765,7 @@ async fn run_aborted_yields_terminal_aborted() {
             let mut secondary = make_secondary_channel(config, unified);
             // Cold-cache resolution of `Destination::Primary` to the folded
             // primary mesh-link's id.
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             // Spawn the production pump so the secondary's egress drains and
             // the primary's RunAborted is routed back while we drive the

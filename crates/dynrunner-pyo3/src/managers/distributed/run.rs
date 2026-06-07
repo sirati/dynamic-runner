@@ -343,14 +343,14 @@ impl PyDistributedManager {
                     let handle = tokio::task::spawn_local(async move {
                         // Channel-backed mesh built through the
                         // backend-opaque factory: the in-process primary is
-                        // folded in as an ordinary mesh peer keyed by
-                        // `"primary"` (no per-role uplink leg). Inbound is
+                        // folded in as an ordinary mesh peer keyed by the
+                        // submitter id (no per-role uplink leg). Inbound is
                         // the primary→secondary channel; the outbound
                         // primary link is the secondary→primary channel.
                         let transport =
                             transport_factory::inprocess_secondary_mesh::<RunnerIdentifier>(
                                 secondary_id.clone(),
-                                "primary".to_string(),
+                                dynrunner_core::SETUP_NODE_ID.to_string(),
                                 pri_to_sec_rx,
                                 sec_to_pri_tx,
                             );
@@ -491,10 +491,9 @@ impl PyDistributedManager {
                                 estimator,
                             );
                         // The egress edge resolves `Destination::Primary` to
-                        // the in-process primary's id (`"primary"`) while the
-                        // role table is cold — matching the folded primary
-                        // mesh-link's key.
-                        secondary.set_bootstrap_primary_id("primary".to_string());
+                        // the in-process submitter id while the role table is
+                        // cold — matching the folded primary mesh-link's key.
+                        secondary.set_bootstrap_primary_id(dynrunner_core::SETUP_NODE_ID.to_string());
 
                         // Per-secondary panik watcher. One watcher per
                         // coordinator is the simplest correct shape: a
@@ -600,7 +599,7 @@ impl PyDistributedManager {
                 drop(inbound);
 
                 let config = PrimaryConfig {
-                    node_id: "primary".into(),
+                    node_id: dynrunner_core::SETUP_NODE_ID.into(),
                     num_secondaries,
                     connect_timeout: dist_connect_timeout,
                     peer_timeout: dist_peer_timeout,
@@ -666,8 +665,10 @@ impl PyDistributedManager {
                 // so we mint an inert pair (no `primary_demote_tx` is handed to
                 // the node, so no role-change hook feeds it).
                 let mut pri_mesh = Mesh::new(peer_transport);
-                let (pri_slot, pri_client, pri_inbox) =
-                    pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+                let (pri_slot, pri_client, pri_inbox) = pri_mesh.register_local_role(
+                    LocalRole::Primary,
+                    PeerId::from(dynrunner_core::SETUP_NODE_ID),
+                );
                 let (_pri_demote_tx, pri_demote_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
                 let mut primary = PrimaryCoordinator::new(

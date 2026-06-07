@@ -33,7 +33,7 @@
 //! the seams (bind, dial, fold, mesh-send) the composition wires, never
 //! naming a backend type at any caller.
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{Identifier, SETUP_NODE_ID};
 use dynrunner_manager_distributed::PeerCertInfo;
 use dynrunner_transport_quic::{
     EitherPeerTransport, MeshSendHandle, NetworkClient, NetworkServer, NoPeerTransport, PeerNetwork,
@@ -87,12 +87,17 @@ pub(crate) async fn bind_primary_mesh<I: Identifier>(
     // path (the accept loops register each secondary's writer via the
     // registration sink, not a direct insert).
     let (transport, _shared_outgoing, inbound, registration) =
-        TunneledPeerTransport::<I>::new("primary".into());
+        TunneledPeerTransport::<I>::new(SETUP_NODE_ID.into());
 
     let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port)
         .parse()
         .map_err(|e| format!("invalid bind addr: {e}"))?;
-    let server = NetworkServer::bind::<I>(bind_addr, inbound, registration).await?;
+    // The submitter mesh's QUIC cert names the submitter host (the same
+    // id its TunneledPeerTransport registered above + secondaries dial it
+    // by), so a QUIC-dialing secondary's `connect(addr, SETUP_NODE_ID)`
+    // certificate-name check passes.
+    let server =
+        NetworkServer::bind::<I>(bind_addr, SETUP_NODE_ID, inbound, registration).await?;
 
     // The primary's listen endpoint + cert PEM are the trust anchors
     // threaded through `enable_respawn`. Endpoint format mirrors the
@@ -314,7 +319,7 @@ pub(crate) struct InProcessPrimaryBundle<I: Identifier> {
 /// `shared_outgoing` and feeds `sec_to_pri` frames into `inbound`.
 pub(crate) fn inprocess_primary_mesh<I: Identifier>() -> InProcessPrimaryBundle<I> {
     let (transport, shared_outgoing, inbound, _registration) =
-        TunneledPeerTransport::<I>::new("primary".into());
+        TunneledPeerTransport::<I>::new(SETUP_NODE_ID.into());
     InProcessPrimaryBundle {
         transport,
         shared_outgoing,

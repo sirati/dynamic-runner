@@ -4,7 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{
-    Identifier, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
+    Identifier, MessageReceiver, MessageSender, PhaseId, SETUP_NODE_ID, SoftPreferredSecondaries,
+    TaskInfo, TypeId,
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -744,7 +745,7 @@ pub(super) fn setup_test(
     }
 
     (
-        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
+        ChannelPeerTransport::from_raw_channels(SETUP_NODE_ID.into(), outgoing, incoming_rx),
         secondary_ends,
     )
 }

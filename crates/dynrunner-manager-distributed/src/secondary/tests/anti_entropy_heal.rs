@@ -89,7 +89,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             // the wire data it would broadcast / answer with.
             let mut donor = ClusterState::<TestId>::new();
             donor.apply(ClusterMutation::PrimaryChanged {
-                new: "primary".into(),
+                new: "setup".into(),
                 epoch: 1,
                 reason: PrimaryChangeReason::Election,
             });
@@ -107,7 +107,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             // task ADDED, but DROPPED the `TaskCompleted` broadcast during a
             // transient mesh blip — so its entry is stuck `Pending`.
             sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
-                new: "primary".into(),
+                new: "setup".into(),
                 epoch: 1,
                 reason: PrimaryChangeReason::Election,
             });
@@ -131,7 +131,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             // ── Round 1: the peer's periodic digest arrives. ──
             let digest_frame = DistributedMessage::StateDigest {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
             };
@@ -154,7 +154,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
                 serde_json::to_string(&donor.snapshot()).expect("donor snapshot serializes");
             let reply = DistributedMessage::ClusterSnapshot {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 snapshot_json,
             };
@@ -181,7 +181,7 @@ async fn transient_disconnect_heals_on_next_digest_cycle() {
             peer_log.borrow_mut().clear();
             let digest_frame_2 = DistributedMessage::StateDigest {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 digest: donor.digest(),
             };

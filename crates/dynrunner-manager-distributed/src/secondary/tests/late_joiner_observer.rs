@@ -287,7 +287,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             // captured `"primary"` peer so the backpressure report is
             // recorded (the secondary's own id differs, so it resolves to
             // a `Peer` send, not loopback).
-            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.set_bootstrap_primary_id("setup".to_string());
             sec.enter_operational_for_test();
             assert_eq!(
                 sec.op_mut().pool.workers.len(),
@@ -304,7 +304,7 @@ async fn task_assignment_to_zero_worker_operational_node_reports_backpressure_no
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 secondary_id: "zero-worker-op".into(),
                 worker_id: 0,
@@ -388,7 +388,7 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             let mut config = election_config("oob-worker");
             config.num_workers = 2;
             let (mut sec, _log) = super::super::test_helpers::make_secondary_recording(config, 1);
-            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.set_bootstrap_primary_id("setup".to_string());
             sec.enter_operational_for_test();
 
             let max = sec.max_resources();
@@ -419,7 +419,7 @@ async fn out_of_range_worker_id_falls_back_to_idle_worker_not_clamped_to_last() 
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 secondary_id: "oob-worker".into(),
                 worker_id: 999,
@@ -505,7 +505,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
                 election_config("zero-worker-unresolvable"),
                 1,
             );
-            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.set_bootstrap_primary_id("setup".to_string());
             sec.enter_operational_for_test();
             assert_eq!(
                 sec.op_mut().pool.workers.len(),
@@ -519,7 +519,7 @@ async fn unresolvable_task_to_zero_worker_node_reports_failure_not_underflow() {
             let file_hash = format!("hash_{}", binary.identifier.0);
             let assignment = DistributedMessage::TaskAssignment {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 secondary_id: "zero-worker-unresolvable".into(),
                 // A non-zero wire id to ALSO prove the reported id is the
@@ -605,7 +605,7 @@ async fn initial_assignment_to_zero_worker_pool_does_not_underflow() {
                 election_config("zero-worker-initial"),
                 1,
             );
-            sec.set_bootstrap_primary_id("primary".to_string());
+            sec.set_bootstrap_primary_id("setup".to_string());
             sec.enter_operational_for_test();
             assert_eq!(
                 sec.op_mut().pool.workers.len(),

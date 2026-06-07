@@ -383,7 +383,7 @@ async fn run_producer_zero_dispatch_scenario(
     drop(incoming_tx);
 
     let transport =
-        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         num_secondaries: 2,
         connect_timeout: Duration::from_secs(10),
@@ -508,7 +508,7 @@ async fn run_phase_ordering_scenario(
     drop(incoming_tx);
 
     let transport =
-        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
     let config = PrimaryConfig {
         num_secondaries: 2,
         connect_timeout: Duration::from_secs(10),
@@ -767,7 +767,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             drop(incoming_tx);
 
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 num_secondaries: 2,
                 connect_timeout: Duration::from_secs(10),

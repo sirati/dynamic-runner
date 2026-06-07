@@ -127,7 +127,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
             };
 
             let mut secondary = make_secondary_channel(config, unified);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             // Register the panik signal receiver BEFORE entering
             // run_until_setup_or_done — the field is taken into the
@@ -202,7 +202,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 to_secondary
                     .send(DistributedMessage::PeerInfo {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         peers: vec![],
                     })
@@ -212,7 +212,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                         target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         secondary_id: sec_id.clone(),
                         zip_files: vec![],
@@ -223,7 +223,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                 to_secondary
                     .send(DistributedMessage::TransferComplete {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         total_files: 0,
                         total_bytes: 0,
@@ -402,7 +402,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
             };
 
             let mut secondary = make_secondary_channel(config, unified);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let (panik_tx, panik_rx) = tokio::sync::oneshot::channel();
             secondary.register_panik_signal_rx(panik_rx);
@@ -459,7 +459,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 to_secondary
                     .send(DistributedMessage::PeerInfo {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         peers: vec![],
                     })
@@ -469,7 +469,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                         target: None,
                         pre_staged_mode: false,
                         uses_file_based_items: true,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         secondary_id: sec_id.clone(),
                         zip_files: vec![],
@@ -480,7 +480,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                 to_secondary
                     .send(DistributedMessage::TransferComplete {
                         target: None,
-                        sender_id: "primary".into(),
+                        sender_id: "setup".into(),
                         timestamp: 0.0,
                         total_files: 0,
                         total_bytes: 0,

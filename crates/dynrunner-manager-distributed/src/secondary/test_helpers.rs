@@ -199,7 +199,7 @@ pub(super) fn channel_mesh_to_primary(
 ) -> ChannelPeerTransport<TestId> {
     let mut transport =
         ChannelPeerTransport::from_raw_channels(secondary_id.into(), HashMap::new(), from_primary);
-    transport.register_primary_link("primary".into(), to_primary);
+    transport.register_primary_link("setup".into(), to_primary);
     transport
 }
 
@@ -228,7 +228,7 @@ pub(super) fn channel_mesh_with_observed_peer(
     outgoing.insert("peer-observer".to_string(), observer_tx);
     let mut transport =
         ChannelPeerTransport::from_raw_channels(secondary_id.into(), outgoing, from_primary);
-    transport.register_primary_link("primary".into(), to_primary);
+    transport.register_primary_link("setup".into(), to_primary);
     (transport, observer_rx)
 }
 
@@ -386,7 +386,7 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
         // is filled with `peer-{i}` ids. This backs the published view the
         // coordinator's egress gate reads — `has_peer("primary")` is true so
         // the recorded primary-bound sends route, and `peer_count()` agrees.
-        std::iter::once(PeerId::from("primary"))
+        std::iter::once(PeerId::from("setup"))
             .chain((0..self.peer_count).map(|i| PeerId::from(format!("peer-{i}").as_str())))
             .collect()
     }

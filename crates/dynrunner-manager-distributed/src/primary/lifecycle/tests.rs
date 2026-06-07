@@ -52,7 +52,7 @@ fn make_coordinator(
 ) {
     let (transport, _secondary_ends) = setup_test(0);
     let config = PrimaryConfig {
-        node_id: "primary".into(),
+        node_id: "setup".into(),
         num_secondaries: 0,
         connect_timeout: Duration::from_secs(1),
         peer_timeout: Duration::from_secs(1),
@@ -127,7 +127,7 @@ fn make_recording_coordinator(
 ) {
     let (_transport, secondary_ends) = setup_test(num_secondaries);
     let config = PrimaryConfig {
-        node_id: "primary".into(),
+        node_id: "setup".into(),
         num_secondaries,
         connect_timeout: Duration::from_secs(1),
         peer_timeout: Duration::from_secs(1),
@@ -326,7 +326,7 @@ async fn activate_local_primary_announces_primary_changed() {
                 .collect();
             assert_eq!(
                 primary_changes,
-                vec![("primary".to_string(), 1)],
+                vec![("setup".to_string(), 1)],
                 "activate_local_primary must broadcast exactly one \
                  PrimaryChanged naming self at epoch 1"
             );
@@ -932,7 +932,7 @@ fn make_fleet_coordinator(
     let (transport, _ends) = setup_test(0);
     build_test_primary(
         PrimaryConfig {
-            node_id: "primary".into(),
+            node_id: "setup".into(),
             num_secondaries: 0,
             fleet_dead_timeout: timeout,
             ..Default::default()
@@ -963,8 +963,8 @@ async fn primary_strands_when_only_own_secondary_alive() {
 
             // The host advertises BOTH a worker-secondary under its own id
             // ("primary") AND is the recognized primary.
-            seed_cluster_secondary(&mut primary, "primary", 4);
-            set_current_primary(&mut primary, "primary");
+            seed_cluster_secondary(&mut primary, "setup", 4);
+            set_current_primary(&mut primary, "setup");
             // A remote secondary that has since died (partition).
             seed_cluster_secondary(&mut primary, "sec-0", 4);
             kill_cluster_secondary(&mut primary, "sec-0");
@@ -974,7 +974,7 @@ async fn primary_strands_when_only_own_secondary_alive() {
             // entry is excluded by the `id != current_primary` filter).
             let state = primary.cluster_state_for_test();
             assert!(
-                state.alive_secondary_members().any(|id| id == "primary"),
+                state.alive_secondary_members().any(|id| id == "setup"),
                 "the own secondary must be an alive worker-secondary"
             );
             assert_eq!(
@@ -1031,7 +1031,7 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
             let _inbound_keepalive = secondary_ends; // hold the incoming_tx clone
             let (mut primary, _mesh) = build_test_primary(
                 PrimaryConfig {
-                    node_id: "primary".into(),
+                    node_id: "setup".into(),
                     num_secondaries: 2,
                     // Long enough that, were the arm reachable, it would
                     // fire well after the bounded wait below — but it must
@@ -1047,7 +1047,7 @@ async fn healthy_fleet_does_not_arm_fleet_dead() {
 
             // Two alive REMOTE worker-secondaries; the submitter "primary"
             // is the recognized primary (and is NOT itself a secondary).
-            set_current_primary(&mut primary, "primary");
+            set_current_primary(&mut primary, "setup");
             seed_cluster_secondary(&mut primary, "sec-0", 4);
             seed_cluster_secondary(&mut primary, "sec-1", 4);
             assert_eq!(
@@ -1091,7 +1091,7 @@ async fn submitter_primary_strands_when_remote_fleet_gone() {
 
             // Submitter primary: recognized primary, NO own secondary
             // capacity. Two remote secondaries that have both died.
-            set_current_primary(&mut primary, "primary");
+            set_current_primary(&mut primary, "setup");
             for id in ["sec-0", "sec-1"] {
                 seed_cluster_secondary(&mut primary, id, 4);
                 kill_cluster_secondary(&mut primary, id);

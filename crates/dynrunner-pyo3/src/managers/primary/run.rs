@@ -359,7 +359,7 @@ impl PyPrimaryCoordinator {
 
                 // Run the primary coordinator with the network server transport.
                 let config = PrimaryConfig {
-                    node_id: "primary".into(),
+                    node_id: dynrunner_core::SETUP_NODE_ID.into(),
                     num_secondaries,
                     connect_timeout: dist_connect_timeout,
                     peer_timeout: dist_peer_timeout,
@@ -404,8 +404,10 @@ impl PyPrimaryCoordinator {
                 // (held in `_mesh_server_guard` above) stays bound to the
                 // LocalSet so its accept loops keep feeding the transport.
                 let mut mesh = Mesh::new(peer_transport);
-                let (pri_slot, pri_client, pri_inbox) =
-                    mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+                let (pri_slot, pri_client, pri_inbox) = mesh.register_local_role(
+                    LocalRole::Primary,
+                    PeerId::from(dynrunner_core::SETUP_NODE_ID),
+                );
 
                 // BUG-6 demote channel: the bootstrap primary relocates into
                 // a standalone observer on any self→other primary-register

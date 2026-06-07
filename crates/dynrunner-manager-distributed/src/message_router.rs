@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn route_to_registered_channel() {
-        let mut router: MessageRouter<TestId> = MessageRouter::new("primary".into());
+        let mut router: MessageRouter<TestId> = MessageRouter::new("setup".into());
         let mut rx = router.register(MessageType::Keepalive);
 
         let msg = DistributedMessage::Keepalive {
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn unregistered_type_returns_false() {
-        let router: MessageRouter<TestId> = MessageRouter::new("primary".into());
+        let router: MessageRouter<TestId> = MessageRouter::new("setup".into());
         let msg = DistributedMessage::Keepalive {
             target: None,
             sender_id: "sec-0".into(),

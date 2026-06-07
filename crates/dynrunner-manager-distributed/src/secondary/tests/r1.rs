@@ -58,7 +58,7 @@ mod r1_helpers {
             election_config(secondary_id),
             channel_mesh_no_primary(secondary_id, peers),
         );
-        sec.set_bootstrap_primary_id("primary".to_string());
+        sec.set_bootstrap_primary_id("setup".to_string());
         sec
     }
 
@@ -452,7 +452,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
             };
 
             let mut secondary = make_secondary_channel(config, unified);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             let mut factory = FakeWorkerFactory;
             let start = std::time::Instant::now();
@@ -558,7 +558,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
             };
 
             let mut secondary = make_secondary_channel(config, unified);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
 
             // Two peer-secondaries are alive members in the replicated
             // ledger — the global-state the cold-start branch reads. Each

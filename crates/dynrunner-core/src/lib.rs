@@ -1,5 +1,6 @@
 pub mod bounded_string;
 pub mod importance;
+pub mod node_id;
 pub mod output_gather;
 pub mod path_resolve;
 pub mod role_span;
@@ -10,6 +11,7 @@ pub mod types;
 
 pub use bounded_string::BoundedString;
 pub use importance::IMPORTANT_TARGET;
+pub use node_id::SETUP_NODE_ID;
 pub use output_gather::gather_predecessor_outputs;
 pub use path_resolve::{ResolvedPath, resolve_against_root};
 pub use role_span::{PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};

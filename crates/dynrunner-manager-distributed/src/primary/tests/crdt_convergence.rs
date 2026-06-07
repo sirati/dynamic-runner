@@ -194,7 +194,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             promoted
                 .handle_cluster_mutation(DistributedMessage::ClusterMutation {
                     target: None,
-                    sender_id: "primary".into(),
+                    sender_id: "setup".into(),
                     timestamp: 0.0,
                     mutations: batch,
                 })

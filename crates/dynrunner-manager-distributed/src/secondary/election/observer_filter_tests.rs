@@ -95,7 +95,7 @@ async fn primary_changed_naming_observer_is_rejected() {
 
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "obs-a".into(),
@@ -195,7 +195,7 @@ async fn role_table_observers_drives_filter_and_promote_rejection() {
     // (logged at error level) without flipping role.
     let promote = DistributedMessage::ClusterMutation::<super::super::test_helpers::TestId> {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "obs-a".into(),

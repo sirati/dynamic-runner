@@ -188,7 +188,7 @@ async fn promote_primary_routing_survives_keepalive() {
     // SLURM-primary; sec-b is a regular peer.
     let promote = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
@@ -239,7 +239,7 @@ async fn self_named_primary_resets_election_to_normal() {
     // to Normal (no lingering Promoted).
     let promote = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
@@ -384,7 +384,7 @@ async fn primary_changed_clears_per_worker_backoff() {
 
     let promote = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
@@ -414,7 +414,7 @@ async fn primary_changed_applies_with_epoch_lww() {
 
     let high = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-c".into(),
@@ -432,7 +432,7 @@ async fn primary_changed_applies_with_epoch_lww() {
     // epoch already installed.
     let stale = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
@@ -583,7 +583,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     // A peer (sec-a) is promoted to primary via the real apply path.
     let promote = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),
@@ -670,7 +670,7 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
     // pre-promotion `peer_keepalives` entry is now stale-but-alive.
     let promote = DistributedMessage::ClusterMutation {
         target: None,
-        sender_id: "primary".into(),
+        sender_id: "setup".into(),
         timestamp: 0.0,
         mutations: vec![ClusterMutation::PrimaryChanged {
             new: "sec-a".into(),

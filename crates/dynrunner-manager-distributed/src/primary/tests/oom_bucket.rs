@@ -211,7 +211,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 sec_receivers.insert(sec_id.into(), rx);
             }
             let transport =
-                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
 
             let tasks = vec![
                 phased_task("t_small", "default", 40),

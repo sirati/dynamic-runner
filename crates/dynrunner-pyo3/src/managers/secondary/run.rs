@@ -300,14 +300,13 @@ impl PySecondaryCoordinator {
                 // must match the logical id, not the SLURM hostname or
                 // any worker count.
                 //
-                // The bootstrap primary's peer-id is the conventional
-                // `"primary"` — the same id baked into the primary's
-                // `PrimaryConfig::node_id`, the cert CN the QUIC dialer
-                // validates against, and the host-id `Destination::Primary`
-                // resolves to. The matching `set_bootstrap_primary_id`
-                // below tells the egress edge to resolve
-                // `Destination::Primary` to it while the role table is
-                // still cold (pre-`PrimaryChanged`).
+                // The bootstrap/submitter host's peer-id is
+                // `SETUP_NODE_ID` — the same id baked into the submitter's
+                // `PrimaryConfig::node_id` and the host-id
+                // `Destination::Primary` resolves to while the role table is
+                // cold. The matching `set_bootstrap_primary_id` below tells
+                // the egress edge to resolve `Destination::Primary` to it
+                // (pre-`PrimaryChanged`).
                 let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
                     transport_factory::SecondaryDialParams {
                         addr,
@@ -315,7 +314,7 @@ impl PySecondaryCoordinator {
                         retry_delay: dist_connect_retry_delay,
                         disable_peer_overlay: dist_disable_peer_overlay,
                         secondary_id: &secondary_id,
-                        bootstrap_primary_id: "primary".to_string(),
+                        bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
                         ipv4_address: Some(detect_ipv4(None)),
                         ipv6_address: detect_ipv6(None),
                     },
@@ -418,13 +417,12 @@ impl PySecondaryCoordinator {
                     );
 
                 // Tell the egress edge which peer-id the bootstrap wire
-                // reaches (the conventional `"primary"`, the same id the
-                // mesh-link registration keyed the dialed connection
-                // under). The edge resolves `Destination::Primary` to it
-                // while the role table is cold (pre-`PrimaryChanged`), so
-                // setup frames route to the dialled primary before the
-                // self-announcement lands.
-                secondary.set_bootstrap_primary_id("primary".to_string());
+                // reaches (`SETUP_NODE_ID`, the same id the mesh-link
+                // registration keyed the dialed connection under). The edge
+                // resolves `Destination::Primary` to it while the role table
+                // is cold (pre-`PrimaryChanged`), so setup frames route to
+                // the dialled submitter before the self-announcement lands.
+                secondary.set_bootstrap_primary_id(dynrunner_core::SETUP_NODE_ID.to_string());
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE `run` enters — the coordinator's

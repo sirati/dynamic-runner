@@ -398,7 +398,7 @@ async fn originate_primary_membership_self_joins_the_primary_host() {
             // Sanity: before origination the primary is NOT yet a member —
             // proves the assertion below is load-bearing, not a default.
             assert!(
-                !primary.cluster_state_for_test().is_peer_alive("primary"),
+                !primary.cluster_state_for_test().is_peer_alive("setup"),
                 "primary must not be a member before originate_primary_membership"
             );
 
@@ -411,7 +411,7 @@ async fn originate_primary_membership_self_joins_the_primary_host() {
             let observed = drain_peer_joined(&mut to_sec_rx);
             assert_eq!(
                 observed,
-                vec![("primary".to_string(), false)],
+                vec![("setup".to_string(), false)],
                 "originate_primary_membership must broadcast exactly one \
                  PeerJoined for the primary's own node_id with is_observer=false; \
                  got {:?}",
@@ -422,12 +422,12 @@ async fn originate_primary_membership_self_joins_the_primary_host() {
             // non-observer self-join did NOT touch the observer projection.
             let cs = primary.cluster_state_for_test();
             assert!(
-                cs.is_peer_alive("primary"),
+                cs.is_peer_alive("setup"),
                 "the primary must be a live member of its own cluster ledger \
                  after originate_primary_membership"
             );
             assert!(
-                !cs.role_table().observers.contains("primary"),
+                !cs.role_table().observers.contains("setup"),
                 "the primary's non-observer self-join must NOT enter \
                  role_table.observers; got {:?}",
                 cs.role_table().observers

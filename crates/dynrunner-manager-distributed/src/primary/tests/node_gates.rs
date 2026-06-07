@@ -299,10 +299,10 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
     local
         .run_until(async {
             // A 2-node fully-connected channel mesh: "primary" + "sec-0".
-            let ids = vec!["primary".to_string(), "sec-0".to_string()];
+            let ids = vec!["setup".to_string(), "sec-0".to_string()];
             let mut transports = peer_mesh::<TestId>(&ids);
             let sec_transport = transports.pop().unwrap(); // "sec-0"
-            let pri_transport = transports.pop().unwrap(); // "primary"
+            let pri_transport = transports.pop().unwrap(); // "setup"
 
             // ── Compute node: secondary, driven by Node::run ───────────────
             let mut sec_mesh = Mesh::new(sec_transport);
@@ -346,7 +346,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
             let (sec_node, _sec_promo_tx) = Node::new(sec_mesh);
             let sec_node = sec_node.with_secondary(secondary, sec_slot);
             let sec_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
@@ -358,7 +358,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
             // ── Submitter node: bootstrap primary, driven by Node::run ─────
             let mut pri_mesh = Mesh::new(pri_transport);
             let (pri_slot, pri_client, pri_inbox) =
-                pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+                pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
             pri_mesh.publish_membership();
             let pri_config = PrimaryConfig {
                 connect_timeout: Duration::from_secs(10),

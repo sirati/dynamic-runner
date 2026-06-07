@@ -24,7 +24,7 @@ async fn keepalive_is_emitted_exactly_once() {
     // peer_count = 1: a healthy (non-degraded) mesh.
     let (mut sec, log) = make_secondary_recording(election_config("sec-0"), 1);
     sec.enter_operational_for_test();
-    sec.set_bootstrap_primary_id("primary".to_string());
+    sec.set_bootstrap_primary_id("setup".to_string());
 
     sec.send_keepalive().await;
     // Flush the queued keepalive fan-out onto the RecordingPeer log
@@ -53,7 +53,7 @@ async fn keepalive_is_emitted_exactly_once() {
 async fn keepalive_still_emitted_when_mesh_degraded() {
     let (mut sec, log) = make_secondary_recording(election_config("sec-0"), 0);
     sec.enter_operational_for_test();
-    sec.set_bootstrap_primary_id("primary".to_string());
+    sec.set_bootstrap_primary_id("setup".to_string());
     sec.mesh.degraded = true;
 
     sec.send_keepalive().await;

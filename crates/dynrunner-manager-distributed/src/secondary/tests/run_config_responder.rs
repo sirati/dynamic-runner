@@ -207,7 +207,7 @@ async fn inbound_run_config_push_stores_forwarded_argv() {
             ];
             let push = DistributedMessage::RunConfig {
                 target: None,
-                sender_id: "primary".into(),
+                sender_id: "setup".into(),
                 timestamp: 0.0,
                 forwarded_argv: pushed.clone(),
             };

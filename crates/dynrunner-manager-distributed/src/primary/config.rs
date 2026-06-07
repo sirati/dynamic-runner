@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use std::collections::BTreeMap;
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs, resolve_against_root};
+use dynrunner_core::{
+    Identifier, PhaseId, SETUP_NODE_ID, TaskInfo, TaskOutputs, resolve_against_root,
+};
 
 /// Per-phase lifecycle hook invoked by the coordinator when a phase
 /// flips Blocked → Active. The pyo3 layer (Phase 5B) wires this to the
@@ -309,7 +311,7 @@ pub struct PrimaryConfig {
 impl Default for PrimaryConfig {
     fn default() -> Self {
         Self {
-            node_id: "primary".into(),
+            node_id: SETUP_NODE_ID.into(),
             num_secondaries: 1,
             connect_timeout: Duration::from_secs(600),
             peer_timeout: Duration::from_secs(300),

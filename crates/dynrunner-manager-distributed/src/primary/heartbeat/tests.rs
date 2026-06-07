@@ -224,7 +224,7 @@ fn empty_transport() -> (
     let mut outgoing = HashMap::new();
     outgoing.insert("dead-sec".into(), sec_tx);
     (
-        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx),
         sec_rx,
         incoming_tx,
     )
@@ -322,7 +322,7 @@ fn two_secondary_transport() -> (
     outgoing.insert("sec-a".into(), a_tx);
     outgoing.insert("sec-b".into(), b_tx);
     (
-        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx),
         vec![a_rx, b_rx],
         incoming_tx,
     )
@@ -1065,11 +1065,11 @@ async fn self_secondary_excluded_from_silent_set_and_oracle() {
     primary
         .cluster_state_mut_for_test()
         .apply(ClusterMutation::PrimaryChanged {
-            new: "primary".into(),
+            new: "setup".into(),
             epoch: 1,
             reason: Default::default(),
         });
-    register_operational_secondary(&mut primary, "primary", 0, "self-victim");
+    register_operational_secondary(&mut primary, "setup", 0, "self-victim");
 
     // The self-secondary goes silent past the FIRST WARN stage (50ms) but
     // well under the hard backstop (500ms) — exactly the transient
@@ -1132,11 +1132,11 @@ async fn self_secondary_excluded_from_early_path_past_hard_backstop() {
     primary
         .cluster_state_mut_for_test()
         .apply(ClusterMutation::PrimaryChanged {
-            new: "primary".into(),
+            new: "setup".into(),
             epoch: 1,
             reason: Default::default(),
         });
-    register_operational_secondary(&mut primary, "primary", 0, "self-victim");
+    register_operational_secondary(&mut primary, "setup", 0, "self-victim");
 
     // Silence past the hard backstop (100ms): the HARD stage, not WARN.
     tokio::time::sleep(Duration::from_millis(150)).await;

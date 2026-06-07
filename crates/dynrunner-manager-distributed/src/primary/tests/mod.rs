@@ -143,7 +143,7 @@ fn channel_mesh_secondary_ends(
 
     let mut transport =
         ChannelPeerTransport::from_raw_channels(secondary_id.into(), HashMap::new(), pri_to_sec_rx);
-    transport.register_primary_link("primary".into(), sec_to_pri_tx);
+    transport.register_primary_link("setup".into(), sec_to_pri_tx);
 
     (pri_to_sec_tx, sec_to_pri_rx, transport)
 }
@@ -208,7 +208,7 @@ async fn run_secondary_node_reading<R>(
     // The egress edge resolves `Destination::Primary` to the in-process
     // primary's id (`"primary"`) while the role table is cold — matching the
     // folded primary mesh-link's key.
-    secondary.set_bootstrap_primary_id("primary".to_string());
+    secondary.set_bootstrap_primary_id("setup".to_string());
 
     // Publish the live membership BEFORE the secondary's first send so its
     // no-route failover probe (`client.has_peer("primary")`) reads the folded

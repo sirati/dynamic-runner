@@ -442,7 +442,7 @@ fn consumer_invariants_survive_snapshot_restore() {
     // A same-peer primary+secondary host + a remote worker-secondary,
     // exactly the bootstrap-promotion roster.
     s.apply(ClusterMutation::PeerJoined {
-        peer_id: "primary".into(),
+        peer_id: "setup".into(),
         is_observer: false,
         can_be_primary: true,
         cap_version: Default::default(),
@@ -462,7 +462,7 @@ fn consumer_invariants_survive_snapshot_restore() {
     // `id != current_primary` cut in `alive_remote_secondary_count`
     // is genuinely exercised.
     s.apply(ClusterMutation::PrimaryChanged {
-        new: "primary".into(),
+        new: "setup".into(),
         epoch: 1,
         reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
     });

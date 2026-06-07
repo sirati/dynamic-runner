@@ -70,7 +70,7 @@ fn arm_watchdog_no_peers(
         forwarded_argv: Vec::new(),
     };
     let mut secondary = make_secondary_channel(config, unified);
-    secondary.set_bootstrap_primary_id("primary".to_string());
+    secondary.set_bootstrap_primary_id("setup".to_string());
     secondary.mesh.peer_dial_count = dial_count;
     secondary.mesh.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
     (secondary, sec_to_pri_rx)
@@ -347,7 +347,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 pri_to_sec_tx,
             ));
             let mut secondary = make_secondary_channel(config, unified);
-            secondary.set_bootstrap_primary_id("primary".to_string());
+            secondary.set_bootstrap_primary_id("setup".to_string());
             // Pre-latch degraded mode so the run starts in the
             // post-watchdog-fire state. The watchdog's actual fire
             // path is covered by `peer_mesh_watchdog_enters_degraded_mode_when_no_peers`.
@@ -470,7 +470,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         forwarded_argv: Vec::new(),
     };
     let mut secondary = make_secondary_channel(config, unified);
-    secondary.set_bootstrap_primary_id("primary".to_string());
+    secondary.set_bootstrap_primary_id("setup".to_string());
     // Drive the coordinator Operational (the regime in which the watchdog
     // ticks in production, where `peer_keepalives` is the alive-secondary
     // signal) and record 3 alive peer-secondaries — a fully-formed healthy

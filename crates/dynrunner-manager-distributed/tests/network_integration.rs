@@ -107,7 +107,7 @@ where
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
-    secondary.set_bootstrap_primary_id("primary".to_string());
+    secondary.set_bootstrap_primary_id("setup".to_string());
 
     // Publish the live membership BEFORE the coordinator's first egress —
     // mirroring production `Node::run`, where the pump's entry
@@ -216,8 +216,8 @@ async fn e2e_primary_secondary_over_wss() {
             // demux; the server shrinks to bind + accept-loops. The primary
             // holds this transport as its single `Tr`.
             let (peer_transport, _shared_outgoing, inbound, registration) =
-                TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+                TunneledPeerTransport::<TestId>::new("setup".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "setup", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -272,7 +272,7 @@ async fn e2e_primary_secondary_over_wss() {
                 let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
                     .await
                     .expect("peer network start");
-                peer_network.register_primary_link("primary".to_string(), client);
+                peer_network.register_primary_link("setup".to_string(), client);
                 // Drive the real secondary over the real network transport
                 // against the production mesh-pump (the cold-primary
                 // resolution + bootstrap-link fold these tests pin happen
@@ -323,8 +323,8 @@ async fn e2e_primary_secondary_over_quic() {
             // Same Shape-A construction as the WSS sibling: transport first,
             // then bind the server with its inbound + registration sinks.
             let (peer_transport, _shared_outgoing, inbound, registration) =
-                TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+                TunneledPeerTransport::<TestId>::new("setup".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "setup", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -340,7 +340,7 @@ async fn e2e_primary_secondary_over_quic() {
             let sec_handle = tokio::task::spawn_local(async move {
                 let client = NetworkClient::connect(
                     server_addr,
-                    "primary",
+                    "setup",
                     &cert_der,
                     Duration::from_secs(5),
                 )
@@ -388,7 +388,7 @@ async fn e2e_primary_secondary_over_quic() {
                 let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
                     .await
                     .expect("peer network start");
-                peer_network.register_primary_link("primary".to_string(), client);
+                peer_network.register_primary_link("setup".to_string(), client);
                 // Drive the real secondary over the real network transport
                 // against the production mesh-pump (the cold-primary
                 // resolution + bootstrap-link fold these tests pin happen
@@ -447,7 +447,7 @@ async fn unified_inbound_surfaces_cluster_mutation_via_recv_peer() {
             // one writer directly into the shared `outgoing` table (the
             // in-process / test path).
             let (mut peer_transport, shared_outgoing, inbound, _registration) =
-                TunneledPeerTransport::<TestId>::new("primary".into());
+                TunneledPeerTransport::<TestId>::new("setup".into());
 
             let (pri_to_sec_tx, _pri_to_sec_rx) =
                 mpsc::unbounded_channel::<DistributedMessage<TestId>>();

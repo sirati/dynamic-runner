@@ -27,7 +27,7 @@ async fn server_accepts_wss_bidirectional() {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let (mut transport, _outgoing, inbound, registration) =
                 TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "primary", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -95,7 +95,7 @@ async fn server_accepts_quic_bidirectional() {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let (mut transport, _outgoing, inbound, registration) =
                 TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "primary", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -222,7 +222,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let (mut transport, _outgoing, inbound, registration) =
                 TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "primary", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -315,7 +315,7 @@ async fn mesh_writer_fans_into_the_same_wire() {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let (mut transport, _outgoing, inbound, registration) =
                 TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "primary", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();
@@ -392,7 +392,7 @@ async fn recv_peer_drains_buffered_frames_accepted_before_first_poll() {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let (mut transport, _outgoing, inbound, registration) =
                 TunneledPeerTransport::<TestId>::new("primary".into());
-            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, inbound, registration)
+            let server: NetworkServer = NetworkServer::bind::<TestId>(addr, "primary", inbound, registration)
                 .await
                 .unwrap();
             let port = server.port();

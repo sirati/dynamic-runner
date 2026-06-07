@@ -27,7 +27,7 @@ impl PyPrimaryConfig {
     #[new]
     #[pyo3(signature = (
         num_secondaries,
-        node_id = "primary".to_string(),
+        node_id = dynrunner_core::SETUP_NODE_ID.to_string(),
         distributed_config = None,
     ))]
     fn new(

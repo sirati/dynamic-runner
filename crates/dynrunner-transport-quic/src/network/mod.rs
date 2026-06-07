@@ -67,12 +67,20 @@ impl NetworkServer {
     /// through it). Construct the transport first, then pass its two
     /// sinks here — the accept loops then feed the transport directly,
     /// with no separate legacy inbound consumer.
+    ///
+    /// `server_name` is this server's own node-id: it becomes the QUIC
+    /// certificate's subject CN, which a QUIC-dialing peer validates the
+    /// connection against (`connect(addr, server_name)`). It MUST equal the
+    /// id the dialer addresses this server by — for the submitter mesh that
+    /// is the bootstrap/submitter node-id (`SETUP_NODE_ID`), the same id
+    /// secondaries register the bootstrap link under.
     pub async fn bind<I: Identifier>(
         addr: SocketAddr,
+        server_name: &str,
         inbound: InboundTap<I>,
         registration: RegistrationSink<I>,
     ) -> Result<Self, String> {
-        let cert = CertPair::generate("primary")?;
+        let cert = CertPair::generate(server_name)?;
 
         // Bind QUIC (UDP) on the requested address. If the caller
         // passed port 0 the OS picks; if they passed a fixed port we
