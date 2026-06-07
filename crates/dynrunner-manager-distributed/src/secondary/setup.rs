@@ -352,6 +352,19 @@ where
                                 self.apply_cluster_mutations(mutations);
                             }
                         }
+                        MessageType::RunConfig => {
+                            // Run-config PUSH from the primary. It fires the
+                            // moment the primary welcomes this secondary
+                            // (`PrimaryCoordinator::push_run_config_to`), so
+                            // it usually lands in THIS setup window rather
+                            // than the operational router. Store it with the
+                            // same shared writer the router uses so the run
+                            // path sees the consumer's `forwarded_argv` the
+                            // boot CLI omitted.
+                            if let DistributedMessage::RunConfig { forwarded_argv, .. } = msg {
+                                self.store_pushed_run_config(forwarded_argv);
+                            }
+                        }
                         other => {
                             tracing::debug!(?other, "unexpected message during setup");
                         }

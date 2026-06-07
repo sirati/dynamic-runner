@@ -638,6 +638,15 @@ where
                 // compatibility but is not consumed here.
                 Ok(())
             }
+            DistributedMessage::RunConfig { forwarded_argv, .. } => {
+                // Inbound run-config PUSH from the primary (see
+                // `store_pushed_run_config` for the full rationale). Reached
+                // when the push lands after this secondary is already
+                // operational; the usual landing window is mid-setup
+                // (`wait_for_setup`), which shares the same helper.
+                self.store_pushed_run_config(forwarded_argv);
+                Ok(())
+            }
             DistributedMessage::RequestRunConfig { sender_id, .. } => {
                 // PURE read-only run-config responder. Answer a joining /
                 // respawned / cold-start-fetching peer from this node's

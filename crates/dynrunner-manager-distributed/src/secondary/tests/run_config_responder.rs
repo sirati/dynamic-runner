@@ -142,6 +142,75 @@ async fn run_config_responder_is_pure_and_round_trips_argv() {
         .await;
 }
 
+/// An inbound `RunConfig` PUSH from the primary STORES its `forwarded_argv`
+/// into the secondary's node-local copy, overwriting the (empty boot-CLI)
+/// pre-seed. This is the deferred-delivery half of the primary push: the
+/// secondary booted with only its boot-critical args, and the primary
+/// unicasts the consumer's run-config the moment it welcomes this node.
+/// After the push the stored copy is what the run path reads AND what THIS
+/// node re-serves on a peer's `RequestRunConfig`.
+#[tokio::test(flavor = "current_thread")]
+async fn inbound_run_config_push_stores_forwarded_argv() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Boot with an EMPTY pre-seed (the cold-start boot CLI omits the
+            // run-config) so the assertion pins that the push REPLACES it.
+            let (mut sec, _log) = operational_secondary_with_argv("sec-0", Vec::new());
+            assert!(
+                sec.forwarded_argv.is_empty(),
+                "precondition: cold-start secondary boots with empty forwarded_argv"
+            );
+
+            let pushed = vec![
+                "--task".to_string(),
+                "tokenize".to_string(),
+                "--platform".to_string(),
+                "x86".to_string(),
+            ];
+            let push = DistributedMessage::RunConfig {
+                target: None,
+                sender_id: "primary".into(),
+                timestamp: 0.0,
+                forwarded_argv: pushed.clone(),
+            };
+            sec.dispatch_message(push, &mut FakeWorkerFactory)
+                .await
+                .expect("inbound RunConfig handler succeeds");
+
+            assert_eq!(
+                sec.forwarded_argv, pushed,
+                "the pushed RunConfig must be stored token-for-token as the \
+                 secondary's node-local forwarded_argv"
+            );
+
+            // The stored value now round-trips through the responder: a peer's
+            // RequestRunConfig is answered with the PUSHED argv (proves the
+            // push and the re-serve share the one node-local copy).
+            let req = DistributedMessage::RequestRunConfig {
+                target: None,
+                sender_id: "peer-0".into(),
+                timestamp: 0.0,
+            };
+            sec.dispatch_message(req, &mut FakeWorkerFactory)
+                .await
+                .expect("RequestRunConfig handler succeeds");
+            sec.drain_egress().await;
+            let argvs = run_config_argvs(&_log);
+            assert_eq!(
+                argvs.len(),
+                1,
+                "responder must emit exactly one RunConfig after the push; got {argvs:?}"
+            );
+            assert_eq!(
+                argvs[0], pushed,
+                "the re-served RunConfig must carry the PUSHED forwarded_argv"
+            );
+        })
+        .await;
+}
+
 /// Empty pre-seed → empty argv (graceful): a node that never received a
 /// run-config still answers, with an empty `forwarded_argv`.
 #[tokio::test(flavor = "current_thread")]
