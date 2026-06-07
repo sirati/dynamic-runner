@@ -21,6 +21,7 @@ to keep the test runnable from any environment.
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import pathlib
 import sys
@@ -376,6 +377,93 @@ class FrameworkFlagKnowledgeTests(unittest.TestCase):
         self.assertIn(
             "--mem-manager-reserved", self._ff.FRAMEWORK_REGENERATED_FLAGS
         )
+
+
+_run = _load_module_direct("run", "run.py")
+
+
+class _FakeTask:
+    """Minimal task exposing only `add_task_arguments` — the run-config
+    finalizer rebuilds the parser with `build_arg_parser + add_task_arguments`,
+    so the fake task registers the task-filter flags the worker command
+    depends on (mirroring asm-tokenizer's `--platform` / `--name-regex`).
+    """
+
+    def add_task_arguments(self, parser) -> None:
+        parser.add_argument("--platform", default=None)
+        parser.add_argument("--name-regex", dest="name_regex", default=None)
+
+
+class ReparseFinalizerTests(unittest.TestCase):
+    """Step-8 pins for the deferred run-config finalize closures
+    (`run.make_reparse_finalizer` / `run.make_identity_finalizer`).
+    """
+
+    def _boot_args(self, boot_argv: list[str]):
+        """Build a boot-time namespace the way a secondary's `run()` does:
+        parse `boot_argv` with `build_arg_parser + task.add_task_arguments`,
+        then stash the dispatch-time attributes the finalizer copies forward.
+        """
+        task = _FakeTask()
+        parser = _run.build_arg_parser("test")
+        task.add_task_arguments(parser)
+        args = parser.parse_args(boot_argv)
+        args._boot_argv = list(boot_argv)
+        args.forwarded_argv = []
+        args.resolved_output_root = "/tmp/out"
+        args._setup_deferred_to_secondary = False
+        return task, args
+
+    def test_reparse_splices_boot_and_delivered_into_complete_namespace(self) -> None:
+        # The cold-start secondary booted with only its framework-regenerated
+        # flags (no task filters); the push delivers the task filters. The
+        # reparse must splice `[*boot, *delivered]` into the complete namespace
+        # the worker-command build reads.
+        task, args = self._boot_args(["--secondary", "tcp://primary", "--cores", "4"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        delivered = ["--platform", "x64", "--name-regex", "foo.*"]
+        reparsed = finalize(delivered)
+        # The task filters from the delivered slice are now present...
+        self.assertEqual(reparsed.platform, "x64")
+        self.assertEqual(reparsed.name_regex, "foo.*")
+        # ...alongside the boot-CLI framework flags (re-parsed from boot_argv).
+        self.assertEqual(reparsed.cores, "4")
+        # The delivered argv becomes this node's authoritative forwarded set.
+        self.assertEqual(reparsed.forwarded_argv, delivered)
+
+    def test_reparse_copies_dispatch_time_attrs_forward(self) -> None:
+        # A fresh `parse_args` namespace lacks the framework's post-parse
+        # dispatch-time attributes; the finalizer must copy them forward.
+        task, args = self._boot_args(["--cores", "2"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        reparsed = finalize(["--platform", "arm"])
+        self.assertEqual(reparsed.resolved_output_root, "/tmp/out")
+        self.assertFalse(reparsed._setup_deferred_to_secondary)
+        self.assertEqual(reparsed._boot_argv, ["--cores", "2"])
+
+    def test_reparse_empty_delivered_is_byte_identical_to_boot_parse(self) -> None:
+        # An empty delivered slice (a run with no forwarded task filters)
+        # re-parses `[*boot]` — byte-identical to the boot-time parse, no flag
+        # loss.
+        task, args = self._boot_args(["--cores", "8", "--platform", "x64"])
+        finalize = _run.make_reparse_finalizer(task, "test", args)
+        reparsed = finalize([])
+        self.assertEqual(reparsed.cores, "8")
+        self.assertEqual(reparsed.platform, "x64")
+        self.assertEqual(reparsed.forwarded_argv, [])
+
+    def test_identity_finalizer_returns_args_unchanged(self) -> None:
+        # The `args=` (consumer-owned-parse) path: the finalizer must return
+        # the consumer's namespace verbatim — re-parsing with the framework
+        # parser would DROP the consumer's pre-parsed values.
+        consumer_args = argparse.Namespace(
+            consumer_only_flag="kept", forwarded_argv=[]
+        )
+        finalize = _run.make_identity_finalizer(consumer_args)
+        # Even a (hypothetically) non-empty delivered slice must not mutate it.
+        result = finalize(["--platform", "x64"])
+        self.assertIs(result, consumer_args)
+        self.assertEqual(result.consumer_only_flag, "kept")
 
 
 if __name__ == "__main__":

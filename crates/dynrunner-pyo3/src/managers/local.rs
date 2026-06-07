@@ -455,7 +455,9 @@ impl PyLocalManager {
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
             log_paths: self.log_paths.clone(),
-            types: self.types.clone(),
+            // Local manager parses args eagerly at construction — the registry
+            // is final, so seed the shared cell once and never swap.
+            types: std::sync::Arc::new(std::sync::Mutex::new(self.types.clone())),
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,

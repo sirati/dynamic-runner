@@ -27,6 +27,7 @@ use super::module;
     scheduler_config = None,
     panik_watcher_paths = None,
     panik_watcher_poll_interval_secs = 10.0,
+    finalize_run_config = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_secondary<'py>(
@@ -44,6 +45,7 @@ pub(crate) fn run_secondary<'py>(
     scheduler_config: Option<SchedulerConfig>,
     panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
     panik_watcher_poll_interval_secs: f64,
+    finalize_run_config: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_bytes` retained for back-compat; the typed
     // path passes the full multi-resource map via the `max_resources`
@@ -108,6 +110,14 @@ pub(crate) fn run_secondary<'py>(
         && let Ok(fwd) = fwd.extract::<Vec<String>>()
     {
         kwargs.set_item("forwarded_argv", fwd)?;
+    }
+    // The consumer's run-config finalize closure (deferred reparse). When the
+    // dispatcher supplies it, the coordinator fires it after the post-welcome
+    // `RunConfig` push delivers the consumer's `forwarded_argv`, BEFORE
+    // workers spawn — re-deriving the per-type worker `cmd_args`. Absent
+    // (out-of-tree callers) the finalize is a no-op.
+    if let Some(finalize) = finalize_run_config {
+        kwargs.set_item("finalize_run_config", finalize)?;
     }
 
     let cls = module(py)?.getattr("RustSecondaryCoordinator")?;

@@ -60,6 +60,20 @@ pub(crate) struct TypeRegistry {
     pub(crate) index_by_id: HashMap<TypeId, usize>,
 }
 
+/// A `TypeRegistry` shared between the worker factory (which reads the
+/// per-type `cmd_args` at every spawn) and the run-config finalize closure
+/// (which swaps in a freshly-rebuilt registry once the post-welcome
+/// `RunConfig` push has delivered the consumer's forwarded argv).
+///
+/// `Arc<Mutex<_>>` so the swap is observed by every subsequent spawn —
+/// initial pool init AND per-type respawn — through the one cell. The lock
+/// is taken per spawn only to clone the matching `TypeRuntime` out; at the
+/// once-per-(re)spawn cadence (dominated by the cost of forking Python) the
+/// lock is free. The non-secondary dispatch paths (local / distributed
+/// managers) parse args eagerly at construction and never swap, so they
+/// simply seed the cell once and the lock is uncontended.
+pub(crate) type SharedTypeRegistry = std::sync::Arc<std::sync::Mutex<TypeRegistry>>;
+
 impl TypeRegistry {
     /// Look up a `TypeRuntime` by its `TypeId`. Returns `None` if the
     /// caller asks about a type that wasn't declared in `get_phases()`.

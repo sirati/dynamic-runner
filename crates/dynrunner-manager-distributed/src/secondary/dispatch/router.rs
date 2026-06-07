@@ -668,7 +668,11 @@ where
                     target: None,
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
-                    forwarded_argv: self.forwarded_argv.clone(),
+                    forwarded_argv: self
+                        .forwarded_argv
+                        .lock()
+                        .expect("forwarded_argv mutex poisoned")
+                        .clone(),
                 };
                 if let Err(e) = self
                     .send_to(

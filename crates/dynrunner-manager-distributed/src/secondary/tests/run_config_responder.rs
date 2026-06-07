@@ -13,13 +13,49 @@
 //! graceful empty-pre-seed case.
 
 use super::super::SecondaryConfig;
+use super::super::lifecycle::SecondaryLifecycle;
 use super::super::test_helpers::{
     FakeWorkerFactory, RecordingPeer, SecondaryHarness, TestId, election_config,
     make_secondary_recording,
 };
 use dynrunner_protocol_primary_secondary::{DistributedMessage, MessageType};
+use dynrunner_transport_channel::{ChannelManagerEnd, channel_pair};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// A `WorkerFactory` that records each `spawn_worker` into a shared ordering
+/// log, then behaves like `FakeWorkerFactory` (Ready → Done echo). Paired
+/// with a recording finalize closure to prove the finalize fires BEFORE the
+/// first worker spawn reads `cmd_args`.
+struct OrderingFactory {
+    order: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl dynrunner_manager_local::WorkerFactory<ChannelManagerEnd> for OrderingFactory {
+    fn spawn_worker(
+        &mut self,
+        _worker_id: dynrunner_core::WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        self.order.borrow_mut().push("spawn");
+        let (manager_end, runner_end) = channel_pair();
+        tokio::task::spawn_local(async move {
+            use dynrunner_core::{MessageReceiver, MessageSender};
+            use dynrunner_protocol_manager_worker::{Command, Response};
+            let mut runner = runner_end;
+            let _ = runner.send(Response::Ready).await;
+            loop {
+                match MessageReceiver::<Command>::recv(&mut runner).await {
+                    Some(Command::Stop) | None => break,
+                    Some(Command::ProcessTask { .. }) => {
+                        let _ = runner.send(Response::Done { result_data: None }).await;
+                    }
+                }
+            }
+        });
+        Ok((manager_end, None))
+    }
+}
 
 /// Build an operational secondary over a `RecordingPeer` mesh stub, seeded
 /// with `forwarded_argv`. Returns the harness + the shared peer-bus log so
@@ -159,7 +195,7 @@ async fn inbound_run_config_push_stores_forwarded_argv() {
             // run-config) so the assertion pins that the push REPLACES it.
             let (mut sec, _log) = operational_secondary_with_argv("sec-0", Vec::new());
             assert!(
-                sec.forwarded_argv.is_empty(),
+                sec.forwarded_argv.lock().unwrap().is_empty(),
                 "precondition: cold-start secondary boots with empty forwarded_argv"
             );
 
@@ -180,7 +216,8 @@ async fn inbound_run_config_push_stores_forwarded_argv() {
                 .expect("inbound RunConfig handler succeeds");
 
             assert_eq!(
-                sec.forwarded_argv, pushed,
+                *sec.forwarded_argv.lock().unwrap(),
+                pushed,
                 "the pushed RunConfig must be stored token-for-token as the \
                  secondary's node-local forwarded_argv"
             );
@@ -241,6 +278,138 @@ async fn run_config_responder_empty_preseed_answers_empty() {
                 argvs[0].is_empty(),
                 "empty pre-seed must answer with an empty forwarded_argv; got {:?}",
                 argvs[0]
+            );
+        })
+        .await;
+}
+
+/// Move a `Connecting` coordinator into `AwaitingPrimary` (the state
+/// `enter_configuring_on_first_primary_frame` requires), mirroring the
+/// `Connecting → AwaitingPrimary` transition the run loop drives on the dial.
+fn arm_awaiting_primary(sec: &mut SecondaryHarness<RecordingPeer<TestId>>) {
+    let lifecycle = std::mem::replace(&mut sec.lifecycle, SecondaryLifecycle::connecting());
+    sec.lifecycle = lifecycle.enter_awaiting_primary();
+}
+
+/// (step-8a) The run-config finalize fires BEFORE `initialize_workers` reads
+/// `cmd_args`: driving `enter_configuring_on_first_primary_frame` records the
+/// finalize event strictly before the first worker spawn.
+#[tokio::test(flavor = "current_thread")]
+async fn finalize_fires_before_initialize_workers() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(election_config("sec-0"), 0);
+            arm_awaiting_primary(&mut sec);
+
+            // The push delivered (so the backstop short-circuits), carrying a
+            // value the finalize will observe.
+            sec.store_pushed_run_config(vec!["--platform".into(), "x64".into()]);
+
+            let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+            let order_for_finalize = order.clone();
+            let seen_argv: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+            let seen_for_finalize = seen_argv.clone();
+            sec.register_finalize_run_config(Box::new(move |delivered: Vec<String>| {
+                order_for_finalize.borrow_mut().push("finalize");
+                *seen_for_finalize.borrow_mut() = delivered;
+                Box::pin(async { Ok(()) })
+            }));
+
+            let mut factory = OrderingFactory {
+                order: order.clone(),
+            };
+            sec.enter_configuring_on_first_primary_frame(&mut factory)
+                .await
+                .expect("enter_configuring must succeed");
+
+            assert_eq!(
+                *order.borrow(),
+                vec!["finalize", "spawn"],
+                "the finalize must fire BEFORE the worker pool's first spawn reads cmd_args"
+            );
+            assert_eq!(
+                *seen_argv.borrow(),
+                vec!["--platform".to_string(), "x64".to_string()],
+                "the finalize must receive the DELIVERED forwarded_argv off the shared handle"
+            );
+        })
+        .await;
+}
+
+/// (step-8c) compiler_suit-shape: no finalize registered (empty forwarded
+/// argv, `args=` path) → `enter_configuring` still spawns workers, and the
+/// shared run-config handle is untouched (the finalize is a faithful no-op).
+#[tokio::test(flavor = "current_thread")]
+async fn no_finalize_registered_is_faithful_no_op() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sec, _log) = make_secondary_recording(election_config("sec-0"), 0);
+            arm_awaiting_primary(&mut sec);
+
+            let argv_before = sec.forwarded_argv.lock().unwrap().clone();
+
+            // No `register_finalize_run_config` call: the inert path.
+            let order: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+            let mut factory = OrderingFactory {
+                order: order.clone(),
+            };
+            sec.enter_configuring_on_first_primary_frame(&mut factory)
+                .await
+                .expect("enter_configuring must succeed with no finalize registered");
+
+            // Workers still spawn; the run-config handle is byte-identical.
+            assert_eq!(
+                *order.borrow(),
+                vec!["spawn"],
+                "with no finalize the pool still spawns (the seam is inert, not blocking)"
+            );
+            assert_eq!(
+                *sec.forwarded_argv.lock().unwrap(),
+                argv_before,
+                "a no-finalize run must leave the run-config handle byte-identical"
+            );
+        })
+        .await;
+}
+
+/// (step-8b) The shared run-config handle the PROMOTION RECIPE reads reflects
+/// the DELIVERED argv (post-push), not the stale boot seed. The recipe
+/// (built in the pyo3 wrapper) captures a clone of THIS handle and reads it at
+/// promotion, threading the value into the promoted `PrimaryConfig.forwarded_argv`
+/// — so this pins the staleness fix at the layer the handle lives in.
+#[tokio::test(flavor = "current_thread")]
+async fn run_config_handle_reflects_delivered_argv_for_promotion() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Boot with an EMPTY seed (the cold-start case the bug bit: the
+            // pre-push recipe capture would have frozen this empty value).
+            let (sec, _log) = make_secondary_recording(election_config("sec-0"), 0);
+            let recipe_handle = sec.run_config_handle();
+            assert!(
+                recipe_handle.lock().unwrap().is_empty(),
+                "precondition: the recipe handle starts at the empty boot seed"
+            );
+
+            let mut sec = sec;
+            let delivered = vec![
+                "--jobs".to_string(),
+                "8".to_string(),
+                "--name-regex".to_string(),
+                "foo.*".to_string(),
+            ];
+            sec.store_pushed_run_config(delivered.clone());
+
+            // The handle the recipe holds now reflects the DELIVERED argv —
+            // the promoted PrimaryConfig.forwarded_argv would carry this, NOT
+            // the stale empty seed.
+            assert_eq!(
+                *recipe_handle.lock().unwrap(),
+                delivered,
+                "the promotion recipe's shared handle must reflect the delivered \
+                 (post-push) argv, not the stale boot seed"
             );
         })
         .await;

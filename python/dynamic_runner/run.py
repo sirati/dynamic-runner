@@ -80,7 +80,18 @@ def run(
         # (it attached `add_framework_arguments` to its own parser). No
         # task-filter argv to forward — the secondary re-discovers from the
         # framework-regenerated invocation.
+        parse_argv = []
         forward_source = []
+
+    # Stash the boot argv (the tokens THIS process parsed, minus any
+    # forwarded run-config the boot CLI omits) as a dispatch-time-only
+    # attribute, consistent with the `args.forwarded_argv` /
+    # `args._setup_deferred_to_secondary` pattern. The secondary's deferred
+    # run-config finalize re-parses `[*boot_argv, *delivered_forwarded_argv]`
+    # once the primary's post-welcome push delivers the forwarded slice, so
+    # `dispatch`'s signature stays unchanged. On the `args=` path the boot
+    # argv is empty (the consumer's namespace is already complete).
+    args._boot_argv = list(parse_argv)
 
     # Stash the dispatcher's argv-minus-framework-regenerated-flags so
     # the SLURM wrapper can forward task-specific filter args
@@ -93,11 +104,94 @@ def run(
     # simply ignore the field.
     args.forwarded_argv = filter_framework_argv(forward_source)
 
+    # Build the run-config finalize closure the secondary's deferred
+    # cmd_args rebuild fires once the primary's post-welcome push delivers
+    # `forwarded_argv`. On the internal-parse branch the framework owns the
+    # parse, so it can faithfully re-parse `[*boot_argv, *delivered]`; on the
+    # `args=` branch the consumer owns the parse (and forwards nothing), so
+    # the finalizer is the identity. Stashed as a dispatch-time-only attr —
+    # `dispatch`'s signature stays unchanged.
+    if argv is not None or args is None:
+        args._finalize_run_config = make_reparse_finalizer(task, description, args)
+    else:
+        args._finalize_run_config = make_identity_finalizer(args)
+
     # Configure logging from the PARSED args — explicit params, after parse
     # (installs the native subscriber via `init_logging`, no env vars).
     setup_logging(args)
 
     dispatch(task, args, deployment)
+
+
+# Dispatch-time attributes the framework sets on `args` AFTER parse (not
+# argparse-owned). The reparse finalizer copies these forward onto its
+# freshly-parsed namespace so the secondary's deferred-finalize namespace
+# carries the same contract the boot-time `args` did. Listed once here so
+# the copy-forward set is a single source of truth.
+_DISPATCH_TIME_ATTRS = (
+    "forwarded_argv",
+    "resolved_output_root",
+    "_setup_deferred_to_secondary",
+    "_boot_argv",
+)
+
+
+def make_reparse_finalizer(task, description, args):
+    """Build the deferred run-config finalize closure for the framework-owned
+    parse path (``run(argv=...)`` and the internal default-parse).
+
+    The returned callable takes the DELIVERED ``forwarded_argv`` (the
+    post-welcome push payload) and re-parses
+    ``[*boot_argv, *delivered_forwarded_argv]`` with the SAME parser ``run``
+    built (``build_arg_parser(description)`` + ``task.add_task_arguments``),
+    validates it, copies the framework's dispatch-time attributes forward, and
+    returns the complete namespace. Rust then re-runs
+    ``build_worker_command_args`` against it.
+
+    Parse LOGIC is unchanged — only the TIMING moves to post-push: the boot
+    CLI omits the run-config-bearing task-filter flags on a cold-start
+    secondary, so the per-type worker ``cmd_args`` cannot be derived until the
+    push delivers them.
+    """
+    boot_argv = list(getattr(args, "_boot_argv", []))
+
+    def finalize_run_config(delivered_forwarded_argv: list[str]) -> argparse.Namespace:
+        parser = build_arg_parser(description)
+        task.add_task_arguments(parser)
+        reparsed = parser.parse_args([*boot_argv, *delivered_forwarded_argv])
+        validate_parsed_args(reparsed, parser)
+        # Copy the framework's dispatch-time attributes forward — they were
+        # set on the boot-time `args` after parse and are not argparse-owned,
+        # so a fresh `parse_args` namespace lacks them.
+        for attr in _DISPATCH_TIME_ATTRS:
+            if hasattr(args, attr):
+                setattr(reparsed, attr, getattr(args, attr))
+        # The reparsed namespace is the run-config the worker command is built
+        # from; the delivered argv it incorporated is now the authoritative
+        # forwarded set for this node.
+        reparsed.forwarded_argv = list(delivered_forwarded_argv)
+        return reparsed
+
+    return finalize_run_config
+
+
+def make_identity_finalizer(args):
+    """Build the no-op finalize closure for the consumer-owned-parse
+    (``args=``) path.
+
+    The consumer parsed + validated its own namespace and forwards no
+    task-filter argv (the delivered slice is empty), so re-parsing with the
+    framework parser would DROP the consumer's pre-parsed values. The
+    finalizer therefore returns the consumer's ``args`` unchanged — no flag
+    loss. The Rust side still rebuilds ``cmd_args`` from this namespace, which
+    for the ``args=`` consumer (compiler_suit) is byte-identical to the boot
+    build (its worker command ignores the forwarded run-config).
+    """
+
+    def finalize_run_config(_delivered_forwarded_argv: list[str]) -> argparse.Namespace:
+        return args
+
+    return finalize_run_config
 
 
 def dispatch(
@@ -608,6 +702,13 @@ def _dispatch_secondary(task, args, logger) -> None:
         skip_existing=args.skip_existing,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),
+        # The deferred run-config finalize closure (built at the entry point
+        # where parse-ownership is known). Fired by the coordinator after the
+        # primary's post-welcome push delivers `forwarded_argv`, BEFORE workers
+        # spawn, to re-derive the per-type worker `cmd_args`. Absent (an
+        # out-of-tree caller driving `_dispatch_secondary` directly) → None →
+        # the Rust side keeps the boot-CLI cmd_args.
+        finalize_run_config=getattr(args, "_finalize_run_config", None),
         **_panik_kwargs(args),
     )
 

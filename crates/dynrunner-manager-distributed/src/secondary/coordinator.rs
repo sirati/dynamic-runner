@@ -67,9 +67,13 @@ where
         // `SetupPending` re-entries keep the channel.
         let (command_tx, command_rx) =
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
-        // Snapshot the node-local run-config off the config before it moves
-        // into `this.config`. The responder reads this verbatim.
-        let forwarded_argv = config.forwarded_argv.clone();
+        // Seed the SHARED node-local run-config handle off the config before
+        // it moves into `this.config`. The responder, the finalize fire, and
+        // the promotion recipe all read this one handle; `store_pushed_run_config`
+        // is the single writer. Seeded from the boot CLI's `forwarded_argv`
+        // (usually empty — the post-welcome push delivers the real value).
+        let forwarded_argv =
+            std::sync::Arc::new(std::sync::Mutex::new(config.forwarded_argv.clone()));
         let mut this = Self {
             config,
             client,
@@ -116,6 +120,9 @@ where
             on_phase_end: None,
             on_phase_start: None,
             setup_discovery: None,
+            finalize_run_config: None,
+            forwarded_argv_was_pushed: false,
+            setup_frame_backlog: std::collections::VecDeque::new(),
             command_rx: Some(command_rx),
             command_tx,
             // Lazily constructed in `run_until_setup_or_done_inner`
@@ -412,6 +419,37 @@ where
     /// `Terminal`.
     pub fn register_setup_discovery(&mut self, discovery: SetupDiscovery<I>) {
         self.setup_discovery = Some(discovery);
+    }
+
+    /// Register the consumer's run-config finalize policy. Must be called
+    /// BEFORE [`Self::run`]; same pre-run, single-shot family as
+    /// [`Self::register_setup_discovery`].
+    ///
+    /// With a finalize registered, the `AwaitingPrimary → Configuring`
+    /// transition fires it ONCE — after ensuring the post-welcome `RunConfig`
+    /// push has landed (sending an in-band `RequestRunConfig` backstop if it
+    /// has not) and BEFORE [`Self::initialize_workers`] spawns the pool — so
+    /// the per-type `cmd_args` the closure re-derives from the delivered argv
+    /// are live for the initial workers (and every respawn). The framework
+    /// (this coordinator) owns the DRIVE / timing; the reparse + cmd_args
+    /// rebuild is the consumer's POLICY (the pyo3 wrapper supplies the
+    /// closure). Absent registration the finalize is a faithful no-op
+    /// (compiler_suit-shape, Rust-only fixtures).
+    ///
+    /// Single concern: own the registration surface for the finalize policy;
+    /// the cmd_args swap itself is the closure's (consumer's) concern.
+    pub fn register_finalize_run_config(&mut self, finalize: super::FinalizeRunConfigFn) {
+        self.finalize_run_config = Some(finalize);
+    }
+
+    /// Clone of the SHARED node-local run-config handle (single source of
+    /// truth). The pyo3 promotion recipe captures this clone so it reads the
+    /// DELIVERED `forwarded_argv` (post-push) at the promotion instant, rather
+    /// than a stale boot-time copy — without the recipe ever borrowing the
+    /// coordinator. The responder and the finalize fire read the same handle;
+    /// [`Self::store_pushed_run_config`] is the single writer.
+    pub fn run_config_handle(&self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        self.forwarded_argv.clone()
     }
 
     /// Tear down the task-completion dispatcher task. Mirrors

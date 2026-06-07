@@ -378,10 +378,21 @@ where
     /// THIS node re-serves on a peer's `RequestRunConfig` / threads into a
     /// promoted `PrimaryConfig`.
     pub(in crate::secondary) fn store_pushed_run_config(&mut self, forwarded_argv: Vec<String>) {
-        self.forwarded_argv = forwarded_argv;
+        let argv_len = forwarded_argv.len();
+        // SINGLE writer to the shared handle. Last-writer-wins: a duplicate
+        // push or a later `RequestRunConfig` answer carries the same value.
+        *self
+            .forwarded_argv
+            .lock()
+            .expect("forwarded_argv mutex poisoned") = forwarded_argv;
+        // Latch the delivery so the finalize backstop can tell "the push
+        // landed (possibly empty)" from "no run-config has arrived yet" —
+        // an empty argv is a valid landing (compiler_suit-shape), so the
+        // latch, not emptiness, is the discriminator.
+        self.forwarded_argv_was_pushed = true;
         tracing::debug!(
             secondary = %self.config.secondary_id,
-            argv_len = self.forwarded_argv.len(),
+            argv_len,
             "received pushed run-config from primary"
         );
     }

@@ -25,6 +25,7 @@ from .deployment_spec import TaskDeploymentSpec
 from .logging_setup import setup_logging
 from ._forwarded_argv import filter_framework_argv
 from .run import dispatch as _dispatch
+from .run import make_reparse_finalizer as _make_reparse_finalizer
 from .task_protocol import TaskDefinition
 
 TaskOrFactory = Union[
@@ -100,6 +101,15 @@ def cli_main(
     # framework flags. Consumer flags never reach the secondary.
     framework_task_argv = _framework_task_argv(task, raw, description)
     args.forwarded_argv = filter_framework_argv(framework_task_argv)
+
+    # The secondary's deferred run-config finalize re-parses
+    # `[*boot_argv, *delivered_forwarded_argv]`. The boot argv is the
+    # framework+task subset (consumer flags excluded — the secondary's parser
+    # carries only framework+task flags), so the re-parse splice matches the
+    # secondary's argparse exactly. The framework owns this parse, so the
+    # reparse finalizer (not the identity) is correct.
+    args._boot_argv = list(framework_task_argv)
+    args._finalize_run_config = _make_reparse_finalizer(task, description, args)
 
     setup_logging(args)
     _dispatch(task, args, deployment)

@@ -151,4 +151,14 @@ pub(crate) struct PySecondaryCoordinator {
     /// `RequestRunConfig`) AND the PROMOTED `PrimaryConfig.forwarded_argv`
     /// (so a node promoted to primary answers identically — no split-brain).
     pub(super) forwarded_argv: Vec<String>,
+    /// The consumer's run-config finalize closure (the `args=`/`argv=` path's
+    /// deferred reparse). `Some` when the Python dispatcher supplied
+    /// `finalize_run_config=`: a callable taking the delivered
+    /// `forwarded_argv` and returning the re-parsed argparse namespace, from
+    /// which Rust re-runs `build_worker_command_args` per type and swaps the
+    /// result into the shared worker-command source the factory reads. `None`
+    /// (out-of-tree callers / no deferral needed) makes the finalize a no-op.
+    /// Held as a `Py<PyAny>` (re-bound under a fresh GIL scope at fire time)
+    /// for the same lifetime reason as `task_definition_py`.
+    pub(super) finalize_run_config: Option<Py<PyAny>>,
 }

@@ -64,12 +64,17 @@ impl PySecondaryCoordinator {
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
-        // The node-local run-config (the consumer's `args.forwarded_argv`).
-        // Captured on the GIL thread so both the detached-runtime
-        // `SecondaryConfig` (so THIS secondary re-serves `RequestRunConfig`)
-        // and the promoted-primary recipe (so a node promoted to primary
-        // answers identically) receive the SAME byte-identical copy.
+        // The node-local run-config SEED (the consumer's boot-CLI
+        // `args.forwarded_argv`, usually empty — the post-welcome push delivers
+        // the real value). Feeds `SecondaryConfig.forwarded_argv`, which the
+        // coordinator wraps into its SHARED handle. The promoted-primary recipe
+        // reads that SAME shared handle (via `run_config_handle()`, below) so a
+        // node promoted to primary threads the DELIVERED argv (post-push) — not
+        // this stale seed — into its `PrimaryConfig` (step 7 staleness fix).
         let forwarded_argv = self.forwarded_argv.clone();
+        // The consumer's run-config finalize closure (deferred reparse), taken
+        // off `self` so it can move into the detached runtime's registration.
+        let finalize_run_config = self.finalize_run_config.take();
         // Resolve the memprofile output directory at run-start.
         // The three-input shape (`memprofile_enabled` + the
         // operator-supplied `output_dir` + the implicit
@@ -109,8 +114,25 @@ impl PySecondaryCoordinator {
                 "task_definition.get_phases() yielded zero TaskTypeSpec entries",
             ));
         }
-        let types = self.types.clone();
+        // SHARED worker-command source (single representation): the factory
+        // reads it at every spawn; the run-config finalize closure swaps it
+        // (post-push). Seeded from the boot-CLI registry (placeholder
+        // cmd_args). One Arc, two readers — the factory and the finalize.
+        let shared_types: crate::task_def::SharedTypeRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(self.types.clone()));
+        let finalize_shared_types = shared_types.clone();
         let skip_existing = self.skip_existing;
+        // The declared `TypeId`s (for the finalize's per-type
+        // `build_worker_command_args` loop) + the run paths the rebuild needs,
+        // captured on the GIL thread as plain owned values.
+        let finalize_type_ids: Vec<String> = self
+            .types
+            .types
+            .iter()
+            .map(|t| t.type_id.as_str().to_string())
+            .collect();
+        let finalize_source_str = self.source_dir.to_string_lossy().into_owned();
+        let finalize_output_str = self.output_dir.to_string_lossy().into_owned();
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
 
@@ -141,6 +163,10 @@ impl PySecondaryCoordinator {
         // pretending to walk a non-existent root.
         let task_definition_py = self.task_definition_py.clone_ref(py);
         let task_args_py = self.task_args_py.clone_ref(py);
+        // A second `task_definition_py` reference bump for the finalize
+        // closure's per-type `build_worker_command_args` rebuild — the
+        // setup-discovery closure consumes the first one.
+        let finalize_task_definition_py = self.task_definition_py.clone_ref(py);
         let phase_deps_for_ingest = self.phase_deps.clone();
         let setup_discover_root = self.src_network.clone();
         // Capture the submitter's `--source-already-staged` signal on the
@@ -342,15 +368,13 @@ impl PySecondaryCoordinator {
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
                     output_dir: memprofile_output_dir.clone(),
                     memuse_log_path: cfg_memuse_log_path.clone(),
-                    // The node-local run-config. On a cold-start secondary
-                    // this is the argv the `_secondary_bootstrap` shim
-                    // fetched over the mesh and spliced onto `sys.argv`; the
-                    // consumer re-parsed it into `args.forwarded_argv`, which
-                    // reached this coordinator's constructor. Stored here so
-                    // THIS secondary re-serves `RequestRunConfig` from its own
-                    // copy. Cloned because the promoted-primary recipe (built
-                    // below) needs the same value.
-                    forwarded_argv: forwarded_argv.clone(),
+                    // The node-local run-config SEED (boot CLI; usually empty —
+                    // the post-welcome push delivers the real value). The
+                    // coordinator wraps this into its shared handle; the
+                    // promoted-primary recipe reads that handle (post-push), so
+                    // the seed is only the starting value, not the recipe's
+                    // source — no second copy to keep in sync.
+                    forwarded_argv,
                 };
 
                 let factory = SubprocessWorkerFactory {
@@ -359,7 +383,10 @@ impl PySecondaryCoordinator {
                     output_dir,
                     log_dir,
                     log_paths,
-                    types,
+                    // The SHARED worker-command source: the finalize closure
+                    // swaps the per-type `cmd_args` here (post-push, before the
+                    // pool spawns) and every spawn reads the swapped value.
+                    types: shared_types,
                     skip_existing,
                     connection_mode: ConnectionMode::Socketpair,
                     manual_start_worker: false,
@@ -473,6 +500,33 @@ impl PySecondaryCoordinator {
                     phase_deps: phase_deps_for_ingest,
                 });
 
+                // Register the consumer's run-config finalize policy. The Rust
+                // `SecondaryCoordinator` OWNS the WHEN (it fires this at the
+                // `AwaitingPrimary → Configuring` transition, after the
+                // post-welcome `RunConfig` push delivers `forwarded_argv`, with
+                // an in-band `RequestRunConfig` backstop if it has not landed,
+                // and BEFORE the worker pool spawns). This closure is the
+                // consumer's POLICY: it re-parses the argparse namespace +
+                // rebuilds the per-type `cmd_args` OFF the runtime thread (GIL
+                // excursion on a `spawn_blocking` thread, §14/§15) and swaps
+                // them into the SHARED worker-command source the factory reads.
+                // `None` (no Python finalize supplied) makes it inert.
+                secondary.register_finalize_run_config(build_finalize_run_config_fn(
+                    finalize_run_config,
+                    finalize_task_definition_py,
+                    finalize_type_ids,
+                    finalize_source_str,
+                    finalize_output_str,
+                    skip_existing,
+                    finalize_shared_types,
+                ));
+
+                // The promoted-primary recipe reads the SAME shared run-config
+                // handle the coordinator's `store_pushed_run_config` writes, so
+                // on promotion it threads the DELIVERED argv (post-push) into
+                // its `PrimaryConfig` — not the stale boot seed (step 7).
+                let promote_run_config_handle = secondary.run_config_handle();
+
                 // Compose the compute-peer `Node`: a secondary that may be
                 // PROMOTED to primary. `Node::new` hands out the
                 // `promotion_tx` the secondary signals on a self-named
@@ -503,7 +557,7 @@ impl PySecondaryCoordinator {
                     command_rx,
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
-                    forwarded_argv,
+                    forwarded_argv: promote_run_config_handle,
                 });
 
                 let node = node.with_secondary(secondary, sec_slot);
@@ -629,12 +683,13 @@ struct PromotedPrimaryRecipeInputs {
     /// phase machine; the secondary does not — R4 seam).
     on_phase_start: crate::managers::lifecycle::OnPhaseStart,
     on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
-    /// The node-local run-config this secondary holds (the consumer's
-    /// `args.forwarded_argv`, mesh-fetched on cold start). Carried into the
-    /// promoted `PrimaryConfig.forwarded_argv` so a node promoted to primary
-    /// re-serves `RequestRunConfig` with the SAME argv it fetched — byte-
-    /// identical to the original submitter (no split-brain).
-    forwarded_argv: Vec<String>,
+    /// The SHARED node-local run-config handle (single source of truth —
+    /// `store_pushed_run_config` is the one writer). Read `.lock().clone()` at
+    /// the promotion instant (always AFTER the post-welcome push landed), so
+    /// the promoted `PrimaryConfig.forwarded_argv` carries the DELIVERED argv
+    /// — byte-identical to the original submitter (no split-brain) — rather
+    /// than the stale boot copy a pre-push capture would have frozen (step 7).
+    forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
@@ -679,9 +734,9 @@ fn build_promoted_primary_recipe(
     // one invocation (a node promotes at most once per lifetime).
     let mut command_channel = Some((command_tx, command_rx));
     let mut phase_callbacks = Some((on_phase_start, on_phase_end));
-    // Same single-use shape: the run-config Vec is moved into the one
-    // promoted `PrimaryConfig` it builds.
-    let mut forwarded_argv = Some(forwarded_argv);
+    // The run-config handle is shared (not single-use): the recipe READS it at
+    // promotion, leaving the secondary's copy intact. No `Option`/`take` — the
+    // handle is cloned-in and read by value at the promotion instant.
     Box::new(move |client, inbox, demote_rx, snapshot| {
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
@@ -695,11 +750,15 @@ fn build_promoted_primary_recipe(
             // must wait for its own discovery batch. Sourced from the run's
             // OWN `--source-already-staged` arg, NOT a derived band-aid.
             required_setup_on_promote,
-            // The node-local run-config this secondary fetched on cold start
-            // (or empty for a submitter-spawned secondary). Threaded verbatim
-            // so the promoted primary re-serves `RequestRunConfig` with the
-            // SAME argv — byte-identical to the original submitter.
-            forwarded_argv: forwarded_argv.take().unwrap_or_default(),
+            // The DELIVERED node-local run-config, read off the shared handle
+            // at the promotion instant (post-push, so it reflects the value the
+            // primary unicast — not the empty boot seed). Threaded so the
+            // promoted primary re-serves `RequestRunConfig` with the SAME argv
+            // — byte-identical to the original submitter.
+            forwarded_argv: forwarded_argv
+                .lock()
+                .expect("forwarded_argv mutex poisoned")
+                .clone(),
             ..PrimaryConfig::default()
         };
         let mut primary = PrimaryCoordinator::new(
@@ -804,6 +863,194 @@ fn build_setup_discovery_fn(
         Box::pin(fut)
             as Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<RunnerIdentifier>>, String>>>>
     })
+}
+
+/// Captured inputs for the run-config finalize closure's per-type
+/// `build_worker_command_args` rebuild — bundled so the `spawn_blocking`
+/// closure moves one value and the GIL body takes refs into it.
+struct FinalizeCaptures {
+    /// The Python finalize callable: `finalize_run_config(delivered_argv) ->
+    /// argparse.Namespace`.
+    finalize_run_config: Py<PyAny>,
+    /// The Python `task_definition` (for `build_worker_command_args`).
+    task_definition_py: Py<PyAny>,
+    /// The declared `TypeId` strings to rebuild cmd_args for.
+    type_ids: Vec<String>,
+    source_str: String,
+    output_str: String,
+    skip_existing: bool,
+    /// The shared worker-command source the rebuilt cmd_args swap into.
+    shared_types: crate::task_def::SharedTypeRegistry,
+}
+
+/// Build the consumer's run-config finalize policy closure.
+///
+/// The returned [`dynrunner_manager_distributed::FinalizeRunConfigFn`] is
+/// invoked ONCE by the `SecondaryCoordinator` at the
+/// `AwaitingPrimary → Configuring` transition — after the post-welcome
+/// `RunConfig` push delivers the consumer's `forwarded_argv`, BEFORE the
+/// worker pool spawns. Given the delivered argv, it calls the Python
+/// `finalize_run_config(delivered_argv)` to re-parse the full argparse
+/// namespace, re-runs `task_definition.build_worker_command_args(type_id,
+/// new_args, source, output, skip_existing)` per declared type (the EXACT
+/// path `LoadedTaskDefinition::from_python` uses at boot), and swaps the
+/// resulting per-type `cmd_args` into the SHARED [`SharedTypeRegistry`] the
+/// factory reads at every spawn.
+///
+/// `None` finalize callable → no-op (the cmd_args stay the boot-CLI build;
+/// compiler_suit-shape, where the worker argv does not depend on the
+/// forwarded run-config).
+///
+/// # Non-block correctness (§14/§15)
+///
+/// Mirrors [`build_setup_discovery_fn`] exactly: the GIL excursion runs on a
+/// `tokio::task::spawn_blocking` thread and the returned future merely
+/// `.await`s the handle, yielding the secondary's single-threaded runtime to
+/// the `Node`'s mesh-pump so keepalives keep flowing while Python re-parses /
+/// rebuilds. The captured handles are taken on the first (only) invocation
+/// (fire-once upstream); a defensive second invocation surfaces a clear
+/// error.
+fn build_finalize_run_config_fn(
+    finalize_run_config: Option<Py<PyAny>>,
+    task_definition_py: Py<PyAny>,
+    type_ids: Vec<String>,
+    source_str: String,
+    output_str: String,
+    skip_existing: bool,
+    shared_types: crate::task_def::SharedTypeRegistry,
+) -> dynrunner_manager_distributed::FinalizeRunConfigFn {
+    // No finalize callable supplied → an inert closure (no-op). The factory
+    // keeps reading the boot-CLI cmd_args the shared cell was seeded with.
+    let Some(finalize_run_config) = finalize_run_config else {
+        return Box::new(move |_delivered: Vec<String>| {
+            Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+        });
+    };
+    // Captured once; taken on the single fire (the coordinator fires the
+    // finalize at most once per run).
+    let mut captures = Some(FinalizeCaptures {
+        finalize_run_config,
+        task_definition_py,
+        type_ids,
+        source_str,
+        output_str,
+        skip_existing,
+        shared_types,
+    });
+    Box::new(move |delivered: Vec<String>| {
+        let taken = captures.take();
+        let fut = async move {
+            let Some(captures) = taken else {
+                return Err("run-config finalize policy invoked more than once — the \
+                     coordinator fires it at most once per run; a second fire is a \
+                     programmer error"
+                    .to_string());
+            };
+            // Run the GIL excursion OFF the runtime thread so the mesh-pump
+            // keeps the keepalives flowing during the reparse + rebuild
+            // (§14/§15).
+            tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> Result<(), String> {
+                    finalize_cmd_args_under_gil(py, &captures, delivered)
+                })
+            })
+            .await
+            .map_err(|e| format!("run-config finalize blocking task panicked/aborted: {e}"))?
+        };
+        Box::pin(fut) as Pin<Box<dyn Future<Output = Result<(), String>>>>
+    })
+}
+
+/// The GIL-held body of the run-config finalize: call the Python
+/// `finalize_run_config(delivered)` to get the re-parsed namespace, re-run
+/// `build_worker_command_args` per declared type, and swap the rebuilt
+/// per-type `cmd_args` into the shared worker-command source. Pure under-GIL
+/// logic, factored out so the `spawn_blocking` closure stays a thin off-thread
+/// wrapper. Returns a `String` error (the secondary aborts the run on it) so
+/// no `PyErr` crosses the `Send` boundary.
+///
+/// The worker_module / timeout / reserved-memory of each `TypeRuntime` are
+/// preserved from the boot registry (only the `cmd_args` depend on the
+/// run-config); the rebuild reads them off the current shared registry under
+/// the same lock it then swaps, so the swap is atomic from the factory's view.
+fn finalize_cmd_args_under_gil(
+    py: Python<'_>,
+    captures: &FinalizeCaptures,
+    delivered: Vec<String>,
+) -> Result<(), String> {
+    // Re-parse the consumer's full argparse namespace from the delivered argv.
+    let new_args = captures
+        .finalize_run_config
+        .bind(py)
+        .call1((delivered,))
+        .map_err(|e| format!("finalize_run_config(delivered_argv) raised: {e}"))?;
+
+    // Rebuild the per-type cmd_args via the EXACT boot-time path
+    // (`build_worker_command_args`), then assemble a fresh registry that keeps
+    // every non-cmd_args field of the existing runtimes.
+    let task_def = captures.task_definition_py.bind(py);
+    // Snapshot the current runtimes (worker_module / timeout / reserved) under
+    // the lock so the rebuilt registry preserves them; the swap re-locks below.
+    let existing: Vec<crate::task_def::TypeRuntime> = captures
+        .shared_types
+        .lock()
+        .map_err(|_| "worker TypeRegistry mutex poisoned".to_string())?
+        .types
+        .clone();
+
+    let mut rebuilt: Vec<crate::task_def::TypeRuntime> =
+        Vec::with_capacity(captures.type_ids.len());
+    let mut index_by_id: std::collections::HashMap<dynrunner_core::TypeId, usize> =
+        std::collections::HashMap::with_capacity(captures.type_ids.len());
+    for type_id_str in &captures.type_ids {
+        let cmd_args: Vec<String> = task_def
+            .call_method1(
+                "build_worker_command_args",
+                (
+                    type_id_str.as_str(),
+                    &new_args,
+                    captures.source_str.as_str(),
+                    captures.output_str.as_str(),
+                    captures.skip_existing,
+                ),
+            )
+            .map_err(|e| format!("build_worker_command_args({type_id_str}) raised: {e}"))?
+            .extract()
+            .map_err(|e| {
+                format!("build_worker_command_args({type_id_str}) returned non-list: {e}")
+            })?;
+        let type_id = dynrunner_core::TypeId::from(type_id_str.as_str());
+        // Preserve the boot runtime's non-cmd_args fields for this type.
+        let base = existing
+            .iter()
+            .find(|t| t.type_id == type_id)
+            .ok_or_else(|| {
+                format!(
+                    "finalize: TypeId '{type_id_str}' not present in the boot registry; \
+                     the declared type set must not change across the run-config reparse"
+                )
+            })?;
+        index_by_id.insert(type_id.clone(), rebuilt.len());
+        rebuilt.push(crate::task_def::TypeRuntime {
+            type_id,
+            worker_module: base.worker_module.clone(),
+            cmd_args,
+            timeout: base.timeout,
+            reserved_memory_per_worker: base.reserved_memory_per_worker,
+        });
+    }
+
+    // Atomically swap the rebuilt registry into the shared cell. Every
+    // subsequent factory spawn (initial pool + respawn) reads the new cmd_args.
+    *captures
+        .shared_types
+        .lock()
+        .map_err(|_| "worker TypeRegistry mutex poisoned".to_string())? =
+        crate::task_def::TypeRegistry {
+            types: rebuilt,
+            index_by_id,
+        };
+    Ok(())
 }
 
 /// The GIL-held body of one setup-discovery excursion: resolve the output
