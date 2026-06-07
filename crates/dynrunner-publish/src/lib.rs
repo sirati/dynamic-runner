@@ -27,16 +27,24 @@
 //! the slow part never exposes a partial *final* tree:
 //!
 //! * **Phase 1 (stage):** `copy_with_fsync` every cross-FS src to its
-//!   `.publish-tmp` sibling. Same-FS items need no staging and are
-//!   collected for the rename phase as-is. A phase-1 failure unwinds
-//!   only the temps staged *this batch* and returns the error — no
-//!   final path is touched, so the destination tree is unchanged.
+//!   `.publish-tmp` sibling. Same-FS items (by `st_dev`) need no
+//!   staging and are collected for the rename phase as-is. A phase-1
+//!   failure unwinds only the temps staged *this batch* and returns the
+//!   error — no final path is touched, so the destination tree is
+//!   unchanged.
 //! * **Phase 2 (commit):** `rename(2)` every item back-to-back (each
 //!   an intra-FS metadata commit, sub-ms on one NFS dir), fsync the
 //!   touched parents, then unlink the staged srcs. This phase runs
 //!   under a [`SignalMaskGuard`] that holds {SIGTERM,SIGINT,SIGHUP}
 //!   pending so a catchable signal cannot tear the process apart
 //!   mid-rename-loop; the signals are delivered normally on drop.
+//! * **EXDEV fallback:** `st_dev` equality is only a hint — two bind
+//!   mounts of one filesystem share it yet `rename` across them returns
+//!   `EXDEV`. A "same-FS" rename that hits `EXDEV` is therefore not a
+//!   failure: the item is deferred, copied to a `.publish-tmp` sibling
+//!   *outside* the signal mask (the copy is slow; the mask must only
+//!   cover sub-ms renames), then committed by an intra-dst rename. This
+//!   restores the cross-FS fallback the original `publish_one` had.
 //!
 //! [`publish_one`] is the single-item case, re-expressed as a
 //! one-element [`publish_all`] so there is exactly one transaction
@@ -177,6 +185,25 @@ pub fn publish_one(src: &Path, dst: &Path, src_root: &Path) -> Result<(), Publis
 /// src, file-vs-dir collision) fails the whole batch with no finals
 /// touched.
 pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), PublishError> {
+    // Production path: the real `rename(2)` is the cross-device oracle.
+    // Wrapped in a closure (not passed as `fs::rename` directly) so the
+    // higher-ranked `Fn(&Path, &Path)` bound unifies both arg lifetimes.
+    publish_all_with(items, src_root, |from, to| fs::rename(from, to))
+}
+
+/// [`publish_all`] with the final-commit `rename` injected. The
+/// production entry point passes [`fs::rename`]; tests pass a fake that
+/// returns `EXDEV` for a chosen `(src, dst)` pair to exercise the
+/// bind-mount fallback (two mounts of the same underlying FS share an
+/// `st_dev` yet `rename` across them yields `EXDEV`) without the
+/// privileges a real bind mount needs. The single concern stays inside
+/// this crate; the seam is the one `Fn(&Path, &Path) -> io::Result<()>`
+/// the commit step would otherwise call directly.
+fn publish_all_with(
+    items: &[(PathBuf, PathBuf)],
+    src_root: &Path,
+    rename: impl Fn(&Path, &Path) -> io::Result<()>,
+) -> Result<(), PublishError> {
     let canon_root = fs::canonicalize(src_root).map_err(|e| PublishError::SourceMissing {
         path: src_root.to_path_buf(),
         source: e,
@@ -187,6 +214,14 @@ pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), 
     // Cross-FS items are copied to a `.publish-tmp` sibling now (the
     // slow, signal-unmasked part). Each staged temp is registered so a
     // later failure unwinds exactly the temps this batch created.
+    //
+    // `st_dev` here is a fast-path HINT, not the source of truth:
+    // distinct mounts of one underlying FS (bind mounts) share an
+    // `st_dev`, so a "SameFs" classification can still `EXDEV` at
+    // rename time. Phase 2 treats that as the cross-FS case via the
+    // EXDEV fallback rather than crashing — the kernel's `rename`
+    // result, not `classify`, is the cross-device oracle (restoring
+    // the original `publish_one` semantics that #254 dropped).
     let mut commits: Vec<Commit> = Vec::with_capacity(items.len());
     for (src, dst) in items {
         let canon_src = validate_under_root(src, &canon_root)?;
@@ -222,22 +257,88 @@ pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), 
     // of parents and unlink of srcs happen after the renames are
     // committed; they are not part of the uninterruptible window
     // (a rename already made the final visible).
+    //
+    // A SameFs item whose rename returns `EXDEV` (the bind-mount
+    // false-positive) is NOT a failure: it is deferred to the cross-FS
+    // fallback below. Crucially the deferral collects the item and
+    // leaves the masked loop, so its slow copy runs OUTSIDE the mask —
+    // the mask must only ever cover sub-ms renames, never a multi-second
+    // copy (that would blow the SIGKILL grace, which is the whole reason
+    // phase 1 stages first).
+    let mut committed: Vec<Commit> = Vec::with_capacity(commits.len());
+    let mut exdev_fallback: Vec<Commit> = Vec::new();
     {
         let _mask = SignalMaskGuard::block()?;
-        for c in &commits {
-            fs::rename(&c.rename_from, &c.dst).map_err(|e| {
-                // Best-effort cleanup of a staged temp on rename
-                // failure (mirrors publish_one's prior behaviour);
-                // same-FS items have no temp to clean.
-                if c.unlink.is_some() {
-                    let _ = fs::remove_file(&c.rename_from);
+        for c in commits.drain(..) {
+            match rename(&c.rename_from, &c.dst) {
+                Ok(()) => committed.push(c),
+                Err(e) if c.unlink.is_none() && is_cross_device(&e) => {
+                    // SameFs hint was wrong (bind mount): no temp staged
+                    // for this item yet, so the final dst is untouched.
+                    // Defer to the unmasked cross-FS fallback.
+                    exdev_fallback.push(c);
                 }
-                PublishError::Rename {
-                    from: c.rename_from.clone(),
-                    to: c.dst.clone(),
-                    source: e,
+                Err(e) => {
+                    // Real rename failure. Best-effort cleanup of a
+                    // staged temp (cross-FS items only; SameFs items
+                    // have none). Mirrors publish_one's prior behaviour.
+                    if c.unlink.is_some() {
+                        let _ = fs::remove_file(&c.rename_from);
+                    }
+                    return Err(PublishError::Rename {
+                        from: c.rename_from.clone(),
+                        to: c.dst.clone(),
+                        source: e,
+                    });
                 }
-            })?;
+            }
+        }
+    }
+
+    // CROSS-FS FALLBACK — for SameFs items the kernel rejected with
+    // `EXDEV`. The copy is the slow part, so it runs here, OUTSIDE the
+    // signal mask. Each item is then committed by an intra-dst rename
+    // (the temp is a sibling of dst, so this rename cannot `EXDEV`)
+    // under a fresh short mask, exactly as a phase-1-staged cross-FS
+    // item would have been.
+    if !exdev_fallback.is_empty() {
+        let mut staged: Vec<Commit> = Vec::with_capacity(exdev_fallback.len());
+        for c in exdev_fallback {
+            // c.rename_from is the canonical src (SameFs items never
+            // had a temp); c.unlink is None.
+            let canon_src = c.rename_from;
+            let tmp = sibling_tmp_path(&c.dst);
+            if let Err(e) = copy_with_fsync(&canon_src, &tmp) {
+                // The copy failed. Unwind only the temps staged in THIS
+                // fallback pass; the finals already committed above are
+                // genuine successes and are left in place (an EXDEV item
+                // whose copy fails is uncommittable — same exposure as
+                // the original per-item cross-FS path).
+                unwind_staged(&staged);
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+            staged.push(Commit {
+                rename_from: tmp,
+                dst: c.dst,
+                unlink: Some(canon_src),
+            });
+        }
+        {
+            let _mask = SignalMaskGuard::block()?;
+            for c in staged.drain(..) {
+                match rename(&c.rename_from, &c.dst) {
+                    Ok(()) => committed.push(c),
+                    Err(e) => {
+                        let _ = fs::remove_file(&c.rename_from);
+                        return Err(PublishError::Rename {
+                            from: c.rename_from.clone(),
+                            to: c.dst.clone(),
+                            source: e,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -245,10 +346,10 @@ pub fn publish_all(items: &[(PathBuf, PathBuf)], src_root: &Path) -> Result<(), 
     // parent directory so the renames survive power loss, then unlink
     // the staged srcs (cross-FS only — same-FS items were moved by
     // the rename itself).
-    for c in &commits {
+    for c in &committed {
         fsync_parent(&c.dst)?;
     }
-    for c in &commits {
+    for c in &committed {
         if let Some(src) = &c.unlink {
             fs::remove_file(src).map_err(|e| PublishError::Unlink {
                 path: src.clone(),
@@ -278,13 +379,19 @@ enum Classification {
 /// phase-2 rename always targets `dst.parent()`, so this is the exact
 /// device the commit rename runs within.
 ///
-/// `st_dev` mismatch is the canonical cross-FS signal (the same
-/// condition the kernel raises `EXDEV` on). A false "cross-FS"
-/// (different `st_dev` but rename would have worked, e.g. some bind
-/// mounts) only costs a needless copy — never a wrong result. A false
-/// "same-FS" (matching `st_dev` but rename yields `EXDEV`) does not
-/// occur on Linux, and if it ever did the phase-2 rename surfaces it
-/// as a `Rename` error rather than silently corrupting the tree.
+/// `st_dev` is a fast-path HINT, not the cross-device oracle. A
+/// matching `st_dev` usually means `rename(2)` will succeed in one
+/// syscall, so we skip the copy. But it is NOT sufficient: two mounts
+/// of the same underlying filesystem (bind mounts — common when a
+/// container binds one host FS to both `/app/out-tmp` and
+/// `/app/out-network`) share an `st_dev` yet `rename` across them
+/// returns `EXDEV`. So `classify` may answer "SameFs" for a pair the
+/// kernel will reject; phase 2 catches that `EXDEV` and routes the item
+/// through the cross-FS copy fallback. The kernel's `rename` result,
+/// not this `st_dev` test, is the authority — which is why the false
+/// "same-FS" case is handled rather than asserted impossible. A false
+/// "cross-FS" (different `st_dev` but rename would have worked) only
+/// costs a needless copy, never a wrong result.
 fn classify(canon_src: &Path, dst: &Path) -> Classification {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     match (fs::metadata(canon_src), fs::metadata(parent)) {
@@ -294,6 +401,16 @@ fn classify(canon_src: &Path, dst: &Path) -> Classification {
         // path, which is correct in both cases.
         _ => Classification::CrossFs,
     }
+}
+
+/// Whether a `rename(2)` error is the cross-device rejection (`EXDEV`).
+/// This is the kernel's authoritative cross-FS signal — the original
+/// `publish_one` keyed its copy fallback off exactly this, and phase 2
+/// restores that behaviour for `st_dev`-false-positive (bind-mount)
+/// items. `io::ErrorKind::CrossesDevices` is still unstable, so match
+/// the raw errno (re-exported via `nix::libc`) for toolchain stability.
+fn is_cross_device(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(nix::libc::EXDEV)
 }
 
 /// Resolve symlinks on `src` and verify it sits under the
@@ -947,6 +1064,104 @@ mod tests {
         assert_eq!(read_file(&dst), b"single");
         assert!(!src.exists());
         assert!(!any_tmp_in(&dst_root.join("out")));
+    }
+
+    // ---- bind-mount EXDEV fallback (cross-mount, same `st_dev`) ----
+
+    /// A `rename` seam that returns `EXDEV` for a chosen `(from, to)`
+    /// pair and delegates to the real `fs::rename` for everything else.
+    /// This simulates the bind-mount case the test can't create without
+    /// privileges: two mounts of one filesystem share an `st_dev` (so
+    /// `classify` answers "SameFs") yet the kernel rejects the
+    /// cross-mount rename with `EXDEV`. The pair is matched on the
+    /// staging→final direct move; the later intra-dst temp→final rename
+    /// (a true sibling rename) is allowed through.
+    fn exdev_for(from: PathBuf, to: PathBuf) -> impl Fn(&Path, &Path) -> io::Result<()> {
+        move |f: &Path, t: &Path| {
+            if f == from && t == to {
+                Err(io::Error::from_raw_os_error(nix::libc::EXDEV))
+            } else {
+                fs::rename(f, t)
+            }
+        }
+    }
+
+    /// REGRESSION (#254 → cross-device crash): a publish whose `st_dev`
+    /// says "SameFs" but whose direct `rename` returns `EXDEV` (the
+    /// bind-mount false positive) MUST succeed via the copy fallback —
+    /// file lands, src removed, no leftover temp, no error. Pre-fix
+    /// (#254) there was no `publish_all_with` seam and no fallback: the
+    /// direct rename's `EXDEV` propagated as a `PublishError::Rename`,
+    /// crashing the publish. This test pins the restored fallback.
+    #[test]
+    fn same_dev_rename_exdev_falls_back_to_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = root.path().join("staging");
+        let dst_root = root.path().join("network");
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+
+        let src = src_root.join("ncat_function_ranges.txt");
+        let dst = dst_root.join("out/x64-clang_ncat_function_ranges.txt");
+        write_file(&src, b"function ranges payload");
+
+        // `classify` will see one tempdir filesystem → SameFs, so the
+        // commit attempts a DIRECT canon_src→dst rename. The seam makes
+        // exactly that rename EXDEV, forcing the fallback.
+        let canon_src = fs::canonicalize(&src).unwrap();
+        let rename = exdev_for(canon_src.clone(), dst.clone());
+
+        publish_all_with(
+            std::slice::from_ref(&(src.clone(), dst.clone())),
+            &src_root,
+            rename,
+        )
+        .expect("EXDEV on a same-st_dev rename must fall back, not fail");
+
+        assert!(dst.exists(), "dst missing after EXDEV fallback");
+        assert_eq!(read_file(&dst), b"function ranges payload");
+        assert!(!src.exists(), "src not removed after fallback");
+        assert!(
+            !any_tmp_in(&dst_root.join("out")),
+            "fallback temp left behind"
+        );
+    }
+
+    /// The fallback is per-item: in a mixed batch, the non-EXDEV item
+    /// still commits via the single fast-path rename (no copy, no temp)
+    /// while only the EXDEV item is copied. Asserts both land, both srcs
+    /// gone, no temps left.
+    #[test]
+    fn mixed_batch_only_exdev_item_uses_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = root.path().join("staging");
+        let dst_root = root.path().join("network");
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+
+        let fast_src = src_root.join("fast.bin");
+        let fast_dst = dst_root.join("out/fast.bin");
+        write_file(&fast_src, b"fast-path");
+
+        let slow_src = src_root.join("slow.bin");
+        let slow_dst = dst_root.join("out/slow.bin");
+        write_file(&slow_src, b"fallback-path");
+
+        // Only the slow item's direct rename is forced to EXDEV.
+        let slow_canon = fs::canonicalize(&slow_src).unwrap();
+        let rename = exdev_for(slow_canon, slow_dst.clone());
+
+        let items = vec![
+            (fast_src.clone(), fast_dst.clone()),
+            (slow_src.clone(), slow_dst.clone()),
+        ];
+        publish_all_with(&items, &src_root, rename).expect("mixed batch must succeed");
+
+        assert_eq!(read_file(&fast_dst), b"fast-path");
+        assert_eq!(read_file(&slow_dst), b"fallback-path");
+        assert!(!fast_src.exists(), "fast src not removed");
+        assert!(!slow_src.exists(), "slow src not removed");
+        assert!(!any_tmp_in(&dst_root.join("out")), "temp left behind");
     }
 
     // ---- C.2: signal-mask RAII guard ----
