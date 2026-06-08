@@ -222,9 +222,8 @@ pub(crate) struct AppliedBatch<I: Identifier> {
 ///   - `primary::lifecycle::apply_and_broadcast_cluster_mutations`
 ///     (the authority primary's originator path).
 ///   - `secondary::origination::apply_and_broadcast_mutations` (the
-///     secondary-side originator path, used by `ingest_setup_discovery`
-///     to seed the ledger with the discovery-time `TaskAdded` batch +
-///     `PhaseDepsSet`, and by the panik self-departure announcement).
+///     secondary-side originator path, used by the panik self-departure
+///     announcement).
 pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     state: &mut ClusterState<I>,
     mut mutations: Vec<ClusterMutation<I>>,

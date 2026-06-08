@@ -112,10 +112,9 @@ use super::primary_link::PrimaryLink;
 /// configuration latches (`setup_phase_completed`, `transfer_complete`,
 /// `pre_staged_mode`, the `Option<Receiver>` take-once gates, `fatal_exit`,
 /// …). The forward span is `Connecting → AwaitingPrimary → Configuring →
-/// Operational`; `Operational` is resumable across a `SetupPending`
-/// excursion (the caller re-enters and finds the lifecycle already
-/// `Operational`, preserving the fire-once consumption of the take-once
-/// channels). The four terminal variants
+/// Operational`; the `Configuring → Operational` transition consumes the
+/// take-once channels exactly once per node (a late-joiner observer is
+/// constructed directly in `Operational`). The four terminal variants
 /// (`Done`/`Aborted`/`Panik`/`Failed`) are absorbing and carry the
 /// per-secondary terminal payload (see the module docs).
 ///
@@ -173,9 +172,8 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
     /// of its life as.
     Configuring(Box<ConfiguringState<M, I>>),
 
-    /// Fully configured and running tasks. Resumable across a
-    /// `SetupPending` yield/resume. Carries the worker pool, the nested
-    /// [`ElectionState`] sub-machine, primary-liveness tracking, peer
+    /// Fully configured and running tasks. Carries the worker pool, the
+    /// nested [`ElectionState`] sub-machine, primary-liveness tracking, peer
     /// keepalives, the primary link, and the pending/active task
     /// collections. The short election deadline is computed from inside
     /// this state's data and so cannot fire earlier.
@@ -223,10 +221,9 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
 /// State data for [`SecondaryLifecycle::Configuring`].
 ///
 /// Carries the worker pool (spawned on entry to this state) plus the
-/// setup-discovery flags the configuration phase reads. The pre-staged /
-/// file-based / discovery-done flags are *carried forward* into
-/// [`OperationalState`] when configuration completes, so the resolver and
-/// the `SetupPending` discriminator keep their values across the
+/// configuration flags the setup phase reads. The pre-staged /
+/// file-based flags are *carried forward* into [`OperationalState`] when
+/// configuration completes, so the resolver keeps its values across the
 /// `enter_operational()` boundary.
 pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifier> {
     /// The local worker pool, built by `initialize_workers` on entry to
@@ -237,18 +234,13 @@ pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifi
 
     /// Pre-staged source mode, from `InitialAssignment.pre_staged_mode`.
     /// Carried forward into [`OperationalState`] (it feeds the
-    /// `SetupPending` discriminator and the dispatch-resolver hash choice).
+    /// dispatch-resolver hash choice).
     pub(in crate::secondary) pre_staged_mode: bool,
 
     /// Whether dispatched items are real files, from
     /// `InitialAssignment.uses_file_based_items`. Carried forward into
     /// [`OperationalState`].
     pub(in crate::secondary) uses_file_based_items: bool,
-
-    /// One-shot latch for the setup-discovery `SetupPending` yield.
-    /// Carried forward into [`OperationalState`] so the yield fires at most
-    /// once per node across re-entry.
-    pub(in crate::secondary) setup_discovery_done: bool,
 
     /// This node's OWN in-flight worker assignments: `file_hash ->
     /// worker_id`. Populated during the `InitialAssignment` dispatch,
@@ -322,10 +314,6 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
 
     /// File-based-items flag, carried forward from [`ConfiguringState`].
     pub(in crate::secondary) uses_file_based_items: bool,
-
-    /// Setup-discovery fire-once latch, carried forward from
-    /// [`ConfiguringState`].
-    pub(in crate::secondary) setup_discovery_done: bool,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -408,20 +396,17 @@ impl Default for MeshFormation {
 /// carrier only ferries the receivers it owns — the ones the operational
 /// `select!` actually polls and that have no other take-site.
 ///
-/// **Fire-once by construction.** A `SetupPending` excursion re-enters
-/// `run_until_setup_or_done` and finds the lifecycle already `Operational`,
-/// so `enter_operational` is never called twice; and even if it were, the
-/// coordinator's `Option::take()` yields `None` on the second pass. For the
-/// two members carried here that `None` is benign — NOT because the
-/// capability is "optional", but because both are OBSERVER-ONLY
-/// registrations (`attach_observer_announcer` / the observer's invalid-task
-/// `register_fatal_exit_signal_rx`),
-/// and an observer / late-joiner lands directly in `Operational` via
-/// `restore_from_snapshot_and_skip_setup` — it NEVER takes the
-/// `SetupPending` excursion, so its arms are never re-parked on re-entry.
+/// **Fire-once by construction.** `enter_operational` is called once per
+/// node (the single `Configuring → Operational` boundary), so the
+/// coordinator's `Option::take()` runs once. For the two members carried
+/// here a `None` is benign — NOT because the capability is "optional", but
+/// because both are OBSERVER-ONLY registrations
+/// (`attach_observer_announcer` / the observer's invalid-task
+/// `register_fatal_exit_signal_rx`), and an observer / late-joiner lands
+/// directly in `Operational` via `restore_from_snapshot_and_skip_setup`.
 /// Modelling these two as a move-in / move-out carrier (NOT fields of
 /// [`OperationalState`]) keeps them where they belong — local to the
-/// operational loop, not part of the resumable state data.
+/// operational loop, not part of the state data.
 pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// Observer-announcer outbox receiver. `None` outside an attached
     /// observer wiring.
@@ -501,11 +486,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     ///
     /// `pre_staged_mode` / `uses_file_based_items` are seeded from the
     /// primary's `InitialAssignment` and carried forward into
-    /// [`OperationalState`] at the next boundary. `setup_discovery_done`
-    /// starts `false`. The real `Configuring → Operational` gate is the
-    /// local `got_peer_info / got_assignment / got_transfer` trio tracked
-    /// in `wait_for_setup` — the single source of truth, not a field on
-    /// this state.
+    /// [`OperationalState`] at the next boundary. The real `Configuring →
+    /// Operational` gate is the local `got_peer_info / got_assignment /
+    /// got_transfer` trio tracked in `wait_for_setup` — the single source of
+    /// truth, not a field on this state.
     pub(in crate::secondary) fn enter_configuring(
         self,
         pool: WorkerPool<M, I>,
@@ -518,7 +502,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pool,
                     pre_staged_mode,
                     uses_file_based_items,
-                    setup_discovery_done: false,
                     active_tasks: HashMap::new(),
                 }))
             }
@@ -533,13 +516,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// latches ([`OperationalLatches`]) are consumed — the coordinator
     /// surrenders its `Option<Receiver>` slots here and gets the unwrapped
     /// handles back (`(Self, OperationalLatches)`) to drive the operational
-    /// `select!` loop. A `SetupPending` excursion re-enters and finds the
-    /// lifecycle already `Operational`, so this transition (and thus the
-    /// consumption) happens at most once per node.
+    /// `select!` loop. This transition (and thus the consumption) happens at
+    /// most once per node.
     ///
-    /// The [`ConfiguringState`]'s `pool` and the three carried-forward
-    /// config flags (`pre_staged_mode` / `uses_file_based_items` /
-    /// `setup_discovery_done`) move **into** [`OperationalState`]; the
+    /// The [`ConfiguringState`]'s `pool` and the two carried-forward config
+    /// flags (`pre_staged_mode` / `uses_file_based_items`) move **into**
+    /// [`OperationalState`]; the
     /// operational runtime values the caller supplies — the
     /// [`ElectionState`] sub-machine, `primary_last_seen`,
     /// `peer_keepalives`, the [`PrimaryLink`], `active_tasks`, and the
@@ -577,7 +559,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pool,
                     pre_staged_mode,
                     uses_file_based_items,
-                    setup_discovery_done,
                     // The initial-assignment dispatch (run in `Configuring`)
                     // already populated `active_tasks`; carry it forward
                     // rather than overwrite it with an empty map.
@@ -595,13 +576,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pending_first_bind,
                     pre_staged_mode,
                     uses_file_based_items,
-                    setup_discovery_done,
                 }));
                 (next, latches)
             }
-            // Already `Operational` (a `SetupPending` re-entry): a no-op on the
-            // state — the receivers already living in `OperationalState`
-            // (restored before the yield) are preserved.
+            // Already `Operational`: a no-op on the state — the receivers
+            // already living in `OperationalState` are preserved.
             other => (other, latches),
         }
     }
@@ -639,7 +618,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             // contract until an `InitialAssignment` says otherwise.
             pre_staged_mode: false,
             uses_file_based_items: true,
-            setup_discovery_done: false,
         }));
         (state, latches)
     }
@@ -680,8 +658,9 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
 
     /// Whether the lifecycle has reached `Operational` or a terminal
     /// variant — i.e. the old `setup_phase_completed` latch, recovered as a
-    /// projection of the typed state rather than a separate bool. Used by
-    /// the re-entry guard so a `SetupPending` re-entry skips the handshake.
+    /// projection of the typed state rather than a separate bool. Used as
+    /// the guard that lets an already-`Operational` entry (the late-joiner
+    /// observer) skip the setup handshake.
     pub(in crate::secondary) fn setup_phase_completed(&self) -> bool {
         !matches!(
             self,
@@ -820,16 +799,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             SecondaryLifecycle::Configuring(cfg) => cfg.uses_file_based_items,
             SecondaryLifecycle::Operational(op) => op.uses_file_based_items,
             _ => true,
-        }
-    }
-
-    /// Read the setup-discovery fire-once latch from whichever state
-    /// carries it. `false` before `Configuring`.
-    pub(in crate::secondary) fn setup_discovery_done(&self) -> bool {
-        match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.setup_discovery_done,
-            SecondaryLifecycle::Operational(op) => op.setup_discovery_done,
-            _ => false,
         }
     }
 

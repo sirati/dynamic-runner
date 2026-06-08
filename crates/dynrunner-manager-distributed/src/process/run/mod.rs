@@ -221,8 +221,7 @@ where
                             // terminal: `Ok` ⇒ Done, any `Err` ⇒ Failed (the
                             // boundary destructures the RunError for its
                             // per-variant exit code — ClusterCollapsed /
-                            // SetupDeadlineExpired / DuplicateTaskIdPrePhase /
-                            // generic).
+                            // DuplicateTaskIdPrePhase / generic).
                             outcome = NodeRunOutcome {
                                 terminal: match result {
                                     Ok(()) => RunTerminal::Done,

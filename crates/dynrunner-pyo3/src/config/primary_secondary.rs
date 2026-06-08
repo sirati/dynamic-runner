@@ -65,7 +65,6 @@ impl PyPrimaryConfig {
             // that opt out do so via PyPrimaryCoordinator (which
             // reads `TaskDefinition.uses_file_based_items`).
             uses_file_based_items: true,
-            required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: self.distributed_config.retry_max_passes(),
             oom_retry_max_passes: self.distributed_config.oom_retry_max_passes(),
@@ -85,7 +84,6 @@ impl PyPrimaryConfig {
             // unbounded; consumers that need a cap go via
             // `PyPrimaryCoordinator`.
             unfulfillable_reinject_max_per_task: None,
-            setup_promote_deadline: self.distributed_config.setup_promote_deadline(),
             // Staged silence schedule: not surfaced on the PyO3 config
             // shim; the keepalive-interval-relative defaults apply.
             ..RustPrimaryConfig::default()

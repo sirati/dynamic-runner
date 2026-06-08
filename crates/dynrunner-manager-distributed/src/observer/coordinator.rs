@@ -98,15 +98,6 @@ pub struct ObserverConfig {
     /// silent (no `Primary` keepalive, no `PrimaryChanged` re-point)
     /// before the observer exits a stranded run.
     pub peer_timeout: Duration,
-    /// Setup-promote deadline (§3). The window a setup-defer observer
-    /// waits for the promoted secondary to seed the ledger before
-    /// exiting via [`RunError::SetupDeadlineExpired`].
-    pub setup_promote_deadline: Duration,
-    /// Whether this observer is in setup-defer mode. Combined with a
-    /// live `cluster_state.task_count() == 0`, this defines
-    /// `setup_pending` LIVE (R2): the setup-promote deadline arm is inert
-    /// the moment the ledger is seeded.
-    pub required_setup_on_promote: bool,
     /// Panik trigger paths (sentinel files). Empty disables the file
     /// trigger.
     pub panik_watcher_paths: Vec<std::path::PathBuf>,
@@ -135,16 +126,12 @@ where
     pub cluster_state: ClusterState<I>,
     /// This observer's peer-id.
     pub node_id: String,
-    /// The strand-backstop + setup deadline thresholds.
+    /// The strand-backstop thresholds.
     pub deadlines: ObserverConfig,
     /// The phases the pre-relocation emitter already announced as started
     /// — the `RunNarrator::with_started_phases` seed so the observer does
     /// not re-announce them but still narrates post-relocation starts.
     pub started_phases: HashSet<dynrunner_core::PhaseId>,
-    /// Whether the relocated node was in setup-defer mode. `setup_pending`
-    /// is recomputed LIVE (= `required_setup_on_promote && task_count==0`)
-    /// at both arm and fire — this is NOT a frozen `setup_pending` bool.
-    pub required_setup_on_promote: bool,
     /// The panik watcher's signal receiver, already taken from the
     /// inherited watcher. `None` when the relocated node ran no watcher.
     pub panik_signal_rx: Option<oneshot::Receiver<PanikSignal>>,
@@ -212,9 +199,6 @@ where
     /// the initial `AnnounceTrigger` into the registered channel rather than
     /// dropping it. [`Self::run`] takes it to spawn the announcer task.
     announcer_handle: Option<AnnouncerHandle>,
-    /// The setup-deadline elapsed, recorded for the GIL-side tail when the
-    /// deadline genuinely expired (mirrors the primary's outcome slot).
-    setup_deadline_elapsed: Option<Duration>,
     /// Receiver end of the task-completion dispatcher channel. Captured at
     /// construction (the sender is installed into `cluster_state` at the
     /// SAME point, BEFORE any restore on the cold-join factory path) so any
@@ -259,7 +243,6 @@ where
         config: ObserverConfig,
     ) -> Self {
         let node_id = config.node_id.clone();
-        let required_setup = config.required_setup_on_promote;
         Self::with_pieces(
             client,
             inbox,
@@ -267,7 +250,6 @@ where
             node_id,
             config,
             HashSet::new(),
-            required_setup,
             None,
             HashSet::new(),
         )
@@ -307,7 +289,6 @@ where
             node_id,
             deadlines,
             started_phases,
-            required_setup_on_promote,
             panik_signal_rx,
             task_completed_dispatcher_handle,
             lifecycle_dispatcher_handle,
@@ -334,7 +315,6 @@ where
             cluster_state,
             config: ObserverConfig {
                 node_id,
-                required_setup_on_promote,
                 ..deadlines
             },
             started_phases,
@@ -346,7 +326,6 @@ where
             lifecycle_dispatcher_handle: Some(lifecycle_dispatcher_handle),
             panik_signal_rx,
             announcer_handle: Some(announcer_handle),
-            setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
@@ -366,7 +345,6 @@ where
         node_id: String,
         config: ObserverConfig,
         started_phases: HashSet<dynrunner_core::PhaseId>,
-        required_setup_on_promote: bool,
         panik_signal_rx: Option<oneshot::Receiver<PanikSignal>>,
         holdings: HashSet<String>,
     ) -> Self {
@@ -394,27 +372,16 @@ where
             client,
             inbox,
             cluster_state,
-            config: ObserverConfig {
-                node_id,
-                required_setup_on_promote,
-                ..config
-            },
+            config: ObserverConfig { node_id, ..config },
             started_phases,
             inherited_task_completed_dispatcher: None,
             lifecycle_dispatcher_handle: None,
             panik_signal_rx,
             announcer_handle: Some(announcer_handle),
-            setup_deadline_elapsed: None,
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
         }
-    }
-
-    /// The setup-deadline elapsed, if the deadline genuinely expired. Read
-    /// by the GIL-side tail to surface [`RunError::SetupDeadlineExpired`].
-    pub fn setup_deadline_elapsed(&self) -> Option<Duration> {
-        self.setup_deadline_elapsed
     }
 
     /// Read-only access to the replicated ledger (tests / result getters).
@@ -490,14 +457,6 @@ where
             target: IMPORTANT_TARGET,
             "run terminated — {reason}",
         );
-    }
-
-    /// LIVE `setup_pending` predicate (R2): `required_setup_on_promote &&
-    /// task_count() == 0`. Recomputed at BOTH the deadline arm and fire so
-    /// the moment discovery seeds the ledger (first `TaskAdded`) the arm
-    /// goes inert. NEVER a frozen bool.
-    fn setup_pending(&self) -> bool {
-        self.config.required_setup_on_promote && self.cluster_state.task_count() == 0
     }
 
     /// The observer's OWN egress edge: resolve `Destination::Primary`
@@ -737,14 +696,6 @@ where
             recovery_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let _ = recovery_tick.tick().await;
 
-            // Setup-promote deadline (§3): anchored at loop entry. A
-            // one-shot consumed latch ensures the fire path runs at most
-            // once. The arm is LIVE-gated on `setup_pending()` so it goes
-            // inert the moment the ledger is seeded.
-            let setup_loop_start = Instant::now();
-            let setup_deadline_at = setup_loop_start + self.config.setup_promote_deadline;
-            let mut setup_deadline_consumed = false;
-
             // Panik receiver (BUG-4): consumed by a live arm. `None` →
             // a never-firing arm.
             let mut panik_rx = self.panik_signal_rx.take();
@@ -794,21 +745,6 @@ where
                     // known peer iff still behind its last-seen digest.
                     _ = recovery_tick.tick() => {
                         self.on_recovery_tick().await;
-                    }
-                    // Setup-promote deadline (§3): LIVE-recompute at fire.
-                    _ = tokio::time::sleep_until(setup_deadline_at.into()),
-                        if self.setup_pending() && !setup_deadline_consumed =>
-                    {
-                        setup_deadline_consumed = true;
-                        if self.setup_pending() {
-                            let elapsed = setup_loop_start.elapsed();
-                            self.setup_deadline_elapsed = Some(elapsed);
-                            let err = RunError::SetupDeadlineExpired { elapsed };
-                            self.emit_terminal_reason_important(&err.to_string());
-                            return Err(err);
-                        }
-                        // A TaskAdded landed in the same tick — the gate is
-                        // now inert; fall back into the loop.
                     }
                     // Panik arm (BUG-4): consumed. On fire, announce
                     // self-departure + return the Panik terminal.
@@ -1233,7 +1169,6 @@ where
         std::future::pending::<()>().await;
     });
 
-    let required_setup = config.required_setup_on_promote;
     let node_id = config.node_id.clone();
     // `with_pieces` installs the task_completed sender AND attaches the
     // resource-holdings announcer's role-change hook. Construct FIRST, then
@@ -1254,7 +1189,6 @@ where
         node_id,
         config,
         HashSet::new(),
-        required_setup,
         panik_signal_rx,
         holdings,
     );

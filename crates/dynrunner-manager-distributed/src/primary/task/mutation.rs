@@ -289,10 +289,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             });
             // Discovery-seed surface, distinct from the runtime-spawn
             // surface above. `TaskAdded` is originated ONLY as the
-            // initial ledger seed — `seed_cluster_state` (run start) and
-            // `ingest_setup_discovery` (the `--source-already-staged`
-            // discovery feed) — always paired with a `PhaseDepsSet`,
-            // never as an incremental mid-run add (that is `TasksSpawned`,
+            // initial ledger seed — `seed_cluster_state` (run start) —
+            // always paired with a `PhaseDepsSet`, never as an
+            // incremental mid-run add (that is `TasksSpawned`,
             // which auto-resumes through the pool's dep machine via
             // `newly_pending`). A `TaskAdded` therefore marks the FIRST
             // ledger growth this node's pool sees. Snapshot pre-apply,
@@ -350,10 +349,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             //     `TaskAdded` Applied AND the pool currently holds no
             //     queued dispatchable work — the pool was built before
             //     discovery seeded the ledger and is drained/empty (the
-            //     setup-defer `--source-already-staged` path: phases sit
+            //     pre-staged `--source-already-staged` path: phases sit
             //     `Active`-empty or `Drained`, every declared phase with
-            //     zero items; see `coordinator.rs`'s setup-pending cascade
-            //     gate). `TaskAdded` does NOT feed `newly_pending` (only
+            //     zero items). `TaskAdded` does NOT feed `newly_pending` (only
             //     `TasksSpawned` does, in `apply_tasks.rs`), so a plain
             //     reinject never runs for it and the discovered tasks
             //     would stay in the CRDT ledger un-dispatchable. REBUILD
@@ -406,8 +404,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // phases here for dependent visibility — the same silent
                     // cascade the secondary-hydration port performed in-line
                     // before. Callback narration is owned by the operational
-                    // loop's `process_phase_lifecycle` and is suppressed while
-                    // `setup_pending()` holds (this rebuild's only caller).
+                    // loop's `process_phase_lifecycle`.
                     crate::secondary::origination::cascade_drain_done(self.pool_mut());
                     self.cluster_state
                         .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);

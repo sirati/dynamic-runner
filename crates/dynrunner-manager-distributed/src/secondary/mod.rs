@@ -208,8 +208,8 @@ where
 
     /// The typed secondary lifecycle. Replaces the scattered
     /// configuration latches (`setup_phase_completed`,
-    /// `transfer_complete`, `pre_staged_mode`, `uses_file_based_items`,
-    /// `setup_discovery_done`) and the operational-only state (`pool`,
+    /// `transfer_complete`, `pre_staged_mode`, `uses_file_based_items`)
+    /// and the operational-only state (`pool`,
     /// `active_tasks`, `peer_keepalives`, `primary_last_seen`,
     /// `election`, `pending_peer_messages`, `primary_link`,
     /// `pending_worker_restarts`, `pending_first_bind`) with one state
@@ -267,10 +267,9 @@ where
     /// Read-only authority-wise on this node — the secondary never
     /// originates a terminal mutation. The authority (the live primary,
     /// or this node's same-node primary once promoted) owns
-    /// origination. The secondary DOES originate the two non-authority
-    /// mutations the unified model keeps on this side: the
-    /// `ingest_setup_discovery` `PhaseDepsSet + TaskAdded` batch and the
-    /// panik self-departure `PeerRemoved` (both via
+    /// origination. The secondary DOES originate the one non-authority
+    /// mutation the unified model keeps on this side: the panik
+    /// self-departure `PeerRemoved` (via
     /// `origination::apply_and_broadcast_mutations`).
     pub(super) cluster_state: ClusterState<I>,
 
@@ -293,11 +292,7 @@ where
     /// and the `cleanup_lifecycle_dispatcher` abort+await at run
     /// exit; `None` outside an active run. Mirrors the same field on
     /// `PrimaryCoordinator` — see that doc for the leaked-dispatcher
-    /// failure mode this guards against. The re-entrant
-    /// `RunOutcome::SetupPending` yield path deliberately does NOT
-    /// clean up: the caller will re-enter and the dispatcher is
-    /// still useful (and the receiver has already been moved into
-    /// the task, so it can't be re-spawned).
+    /// failure mode this guards against.
     pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Task-completion dispatcher channel receiver, paired with the
@@ -315,8 +310,7 @@ where
 
     /// Handle to the task-completion dispatcher task. Mirrors
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
-    /// rationale, same re-entrant SetupPending non-cleanup
-    /// discipline.
+    /// rationale.
     pub(super) task_completed_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Announcer-outbox sender. Cloned out via
@@ -359,15 +353,11 @@ where
     /// `take`-n ONCE at the first `process_tasks` entry (normal OR observer)
     /// into the loop-local panik arm and moved into
     /// [`super::lifecycle::OperationalState::panik_signal_rx`], its RESUMABLE
-    /// home: a `SetupPending` re-entry is a real second consumption, and on a
-    /// regular (non-observer) pre-staged secondary this is the SOLE in-loop
-    /// path by which a SIGTERM (or sentinel file) delivered after the
-    /// discovery yield reaches the graceful-shutdown cascade, so it must
-    /// survive the yield. This coordinator slot is therefore `None` from the
-    /// first entry onward; the live receiver lives on `OperationalState`
-    /// thereafter. Re-attaching the `Option` from this struct field on every
-    /// iteration would race the take/put with the arm's cancel-on-fire
-    /// semantics, hence the loop owns it across `select!` iterations.
+    /// home. This coordinator slot is therefore `None` from the first entry
+    /// onward; the live receiver lives on `OperationalState` thereafter.
+    /// Re-attaching the `Option` from this struct field on every iteration
+    /// would race the take/put with the arm's cancel-on-fire semantics,
+    /// hence the loop owns it across `select!` iterations.
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
@@ -410,19 +400,6 @@ where
     /// `on_phase_end`; same R4-seam disposition.
     #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_start: Option<crate::primary::OnPhaseStart>,
-
-    /// The consumer's setup-discovery policy + the phase-dep graph it
-    /// broadcasts alongside the discovered tasks. Installed via
-    /// [`Self::register_setup_discovery`] BEFORE `run`; `Some` only on the
-    /// pre-staged path where a promoted/discovering node owes setup work.
-    /// When `Some`, the `run` convenience wrapper drives the
-    /// `RunOutcome::SetupPending` yield loop itself — calling the closure,
-    /// `await`ing its (non-thread-blocking) future, and feeding the result
-    /// into [`Self::ingest_setup_discovery`] — instead of erroring on the
-    /// yield. `None` for every non-pre-staged caller, where the secondary
-    /// never observes `SetupPending` and `run` resolves on the first
-    /// `Terminal`.
-    pub(super) setup_discovery: Option<super::SetupDiscovery<I>>,
 
     /// The consumer's run-config finalize policy — re-derives the per-type
     /// worker `cmd_args` from the delivered `forwarded_argv` and swaps them

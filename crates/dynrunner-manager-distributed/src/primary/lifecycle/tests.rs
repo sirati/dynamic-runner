@@ -60,7 +60,6 @@ fn make_coordinator(
         keepalive_miss_threshold: 3,
         source_pre_staged_root: None,
         uses_file_based_items: false,
-        required_setup_on_promote: false,
         max_concurrent_per_type: HashMap::new(),
         retry_max_passes,
         oom_retry_max_passes: retry_max_passes,
@@ -68,7 +67,6 @@ fn make_coordinator(
         mesh_ready_timeout: Duration::from_secs(1),
         source_dir: None,
         unfulfillable_reinject_max_per_task: None,
-        setup_promote_deadline: std::time::Duration::from_secs(600),
         ..PrimaryConfig::default()
     };
     build_test_primary(
@@ -135,7 +133,6 @@ fn make_recording_coordinator(
         keepalive_miss_threshold: 3,
         source_pre_staged_root: None,
         uses_file_based_items: false,
-        required_setup_on_promote: false,
         max_concurrent_per_type: HashMap::new(),
         retry_max_passes: 0,
         oom_retry_max_passes: 0,
@@ -143,7 +140,6 @@ fn make_recording_coordinator(
         mesh_ready_timeout,
         source_dir: None,
         unfulfillable_reinject_max_per_task: None,
-        setup_promote_deadline: Duration::from_secs(600),
         ..PrimaryConfig::default()
     };
     let recorder = RecordingPeer::<TestId>::new();

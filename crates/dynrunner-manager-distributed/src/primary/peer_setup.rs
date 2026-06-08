@@ -55,9 +55,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // membership is Batch D's `PeerRemoved`/`PeerJoined { is_observer
         // = false }` semantics). `send_peer_lists` is the earliest
         // call site where the primary's view of observers is being
-        // shared with secondaries; gathering the originator here
-        // means the setup-defer path (`emit_setup_defer_handshake`)
-        // inherits observer replication without a parallel call site.
+        // shared with secondaries; gathering the originator here keeps
+        // observer replication on a single call site.
         let observer_mutations: Vec<ClusterMutation<I>> = self
             .secondaries
             .values()

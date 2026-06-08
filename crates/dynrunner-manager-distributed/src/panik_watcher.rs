@@ -113,9 +113,9 @@ static LAST_SIGTERM_SENDER_PID: AtomicI32 = AtomicI32::new(NO_SENDER_PID);
 /// wakeup and reads the captured PID afterwards. The action body does
 /// nothing but a relaxed atomic store (async-signal-safe).
 ///
-/// Idempotent via a `Once`: re-running the watcher (e.g. the secondary
-/// `SetupPending` caller-loop re-entry, or multiple in-process managers)
-/// must not stack duplicate actions. A failed install is logged and
+/// Idempotent via a `Once`: re-running the watcher (e.g. multiple
+/// in-process managers) must not stack duplicate actions. A failed
+/// install is logged and
 /// tolerated — the SIGTERM trigger still fires (tokio's stream is
 /// independent); only the sender-PID enrichment is lost, leaving the log
 /// to report `None`.

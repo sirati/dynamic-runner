@@ -274,11 +274,10 @@ where
             }
             // Post-promotion TaskAssignment: when the new primary IS a
             // Peer-mesh CRDT replication: any node may originate a
-            // `ClusterMutation` batch on the mesh (the promoted
-            // secondary's `apply_and_broadcast_mutations` does this
-            // for `TaskAdded` during `ingest_setup_discovery` and for
-            // `RunComplete` in the natural-quiesce branch). Applied via
-            // the single-concern `apply_cluster_mutations` helper; CRDT
+            // `ClusterMutation` batch on the mesh (a secondary's
+            // `apply_and_broadcast_mutations` does this for the panik
+            // self-departure `PeerRemoved`). Applied via the
+            // single-concern `apply_cluster_mutations` helper; CRDT
             // idempotency makes any duplicate apply a no-op.
             DistributedMessage::ClusterMutation { mutations, .. } => {
                 // Same revive-on-primary-change contract as the operational

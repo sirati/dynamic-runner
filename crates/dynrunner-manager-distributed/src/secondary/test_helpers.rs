@@ -313,8 +313,9 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
 
 /// PeerTransport that captures every `broadcast` and `send_to_peer`
 /// call into a shared `Rc<RefCell<Vec<_>>>` so a test that drives the
-/// secondary's promoted-primary side (e.g. `ingest_setup_discovery`)
-/// can assert on the messages that would have gone over the peer mesh.
+/// secondary's mesh-originating side (e.g. the panik self-departure
+/// broadcast) can assert on the messages that would have gone over the
+/// peer mesh.
 ///
 /// `recv_peer` blocks forever — these tests synthesize their own
 /// inbound messages via `dispatch_message` / `handle_peer_message`
@@ -355,10 +356,9 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         // Unicast goes into the same log as broadcasts for these tests;
-        // none of the four setup-promote scenarios distinguish the two
-        // (ingest_setup_discovery only uses broadcast). Recording both
-        // means a future variant that switches to unicast still gets
-        // captured rather than being silently dropped.
+        // the scenarios that read this log do not distinguish the two.
+        // Recording both means a future variant that switches to unicast
+        // still gets captured rather than being silently dropped.
         self.broadcasts.borrow_mut().push(msg);
         Ok(())
     }
@@ -497,65 +497,6 @@ pub(super) fn make_secondary(config: SecondaryConfig) -> SecondaryHarness<NoPeer
     )
 }
 
-/// Seed a secondary's replicated `cluster_state` mirror with one
-/// worker-secondary member through the REAL CRDT apply path the primary's
-/// fleet-connect originates (`PeerJoined` + `SecondaryCapacity`, see
-/// `primary/connect.rs`). The seeded member is alive, carries the given
-/// `can_be_primary` / `is_observer` projection, and advertises one
-/// worker (so it appears in `alive_secondary_members`).
-///
-/// Used by the setup-discovery designation tests to build the same
-/// membership view a node's mirror holds after the primary broadcasts the
-/// fleet roster — the input `is_designated_discoverer` reads.
-pub(super) fn seed_member<P: PeerTransport<TestId>>(
-    sec: &mut SecondaryHarness<P>,
-    id: &str,
-    can_be_primary: bool,
-    is_observer: bool,
-) {
-    use dynrunner_protocol_primary_secondary::ClusterMutation;
-    sec.cluster_state.apply(ClusterMutation::PeerJoined {
-        peer_id: id.into(),
-        is_observer,
-        can_be_primary,
-        cap_version: Default::default(),
-    });
-    sec.cluster_state.apply(ClusterMutation::SecondaryCapacity {
-        secondary: id.into(),
-        worker_count: 1,
-        resources: vec![],
-    });
-}
-
-/// Set the recognized post-promotion authority on a secondary's mirror
-/// through the REAL `PrimaryChanged` apply path (epoch 1, advisory
-/// `Transferred` reason — the bootstrap-relocate shape). `is_designated_
-/// discoverer`'s sibling axis (5) reads `current_primary()`.
-pub(super) fn set_current_primary<P: PeerTransport<TestId>>(
-    sec: &mut SecondaryHarness<P>,
-    id: &str,
-) {
-    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
-    sec.cluster_state
-        .apply(ClusterMutation::<TestId>::PrimaryChanged {
-            new: id.into(),
-            epoch: 1,
-            reason: PrimaryChangeReason::Transferred,
-        });
-}
-
-/// Arm a pre-staged secondary as the SINGLE designated discoverer AND the
-/// recognized authority: seed it as the sole alive, `can_be_primary`,
-/// non-observer worker-secondary member and set `current_primary` to
-/// itself. After this the node satisfies axes (4) + (5) of
-/// `setup_discovery_pending`, so the legacy single-node yield tests (which
-/// predate the designation gate) hold their original intent.
-pub(super) fn arm_designated_discoverer<P: PeerTransport<TestId>>(sec: &mut SecondaryHarness<P>) {
-    let self_id = sec.config.secondary_id.clone();
-    seed_member(sec, &self_id, true, false);
-    set_current_primary(sec, &self_id);
-}
-
 /// Construct a secondary over a [`RecordingPeer`] mesh stub, returning the
 /// harness + the shared broadcast log so a test can assert on the messages
 /// the failover terminal action (e.g. the `PrimaryChanged { new = self }`
@@ -580,33 +521,6 @@ pub(super) fn make_secondary_recording(
         FixedEstimator(100),
     );
     (harness, log)
-}
-
-/// Build a pre-staged, operational secondary whose replicated mirror holds
-/// the given fleet `roster` (each `(id, can_be_primary, is_observer)`
-/// seeded through the real `PeerJoined` + `SecondaryCapacity` apply path)
-/// and the given recognized `current_primary`. This is the membership view
-/// a node's mirror holds after the primary broadcasts the fleet roster —
-/// the exact input `setup_discovery_pending`'s designation axes read.
-#[allow(clippy::type_complexity)]
-pub(super) fn node_with_roster(
-    self_id: &str,
-    roster: &[(&str, bool, bool)],
-    current_primary: Option<&str>,
-) -> (
-    SecondaryHarness<RecordingPeer<TestId>>,
-    Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
-) {
-    let (mut sec, log) = make_secondary_recording(election_config(self_id), roster.len());
-    sec.enter_operational_for_test();
-    sec.set_pre_staged_mode(true);
-    for (id, can_be_primary, is_observer) in roster {
-        seed_member(&mut sec, id, *can_be_primary, *is_observer);
-    }
-    if let Some(p) = current_primary {
-        set_current_primary(&mut sec, p);
-    }
-    (sec, log)
 }
 
 /// Build a secondary over a `ChannelPeerTransport` mesh stub, returning the

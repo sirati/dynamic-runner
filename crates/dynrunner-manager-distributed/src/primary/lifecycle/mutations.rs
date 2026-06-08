@@ -36,7 +36,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `cluster_state::apply_locally_for_broadcast` so this
         // originator path and the secondary-side originator
         // (`secondary::origination::apply_and_broadcast_mutations`, used
-        // by `ingest_setup_discovery` + panik self-departure) share one
+        // by the panik self-departure) share one
         // canonical filter; the broadcast step stays at each call site
         // because the two transports have different error shapes.
         //

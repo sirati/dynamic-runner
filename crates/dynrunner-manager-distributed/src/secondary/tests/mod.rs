@@ -11,13 +11,6 @@
 //! result_data_plumbing, promoted_primary_quiesce_gate) was retired
 //! with the authority mirror it tested.
 //!
-//! Setup-discovery is NOT an authority-mirror concern and is restored
-//! in its correct shape: the secondary is the PRODUCER of the discovery
-//! result (it mounts the corpus), broadcasting `PhaseDepsSet + TaskAdded`
-//! onto the mesh for the same-peer authoritative primary to pick up. It
-//! holds no dispatch authority over the discovered tasks — see
-//! [`setup_discovery_yield`].
-//!
 //! Split per-concern:
 //!
 //! - [`processing`] — basic worker-processing integration tests
@@ -45,10 +38,6 @@
 //!   wiring contract (the separate resource-provider capability).
 //! - [`panik_integration`] — panik self-departure + worker teardown.
 //! - [`memprofile_hook`] — sampler lifecycle hooks.
-//! - [`setup_discovery_yield`] — the pre-staged-mode `SetupPending`
-//!   yield discriminator + the fire-once latch (`ingest_setup_discovery`
-//!   broadcasts `PhaseDepsSet + TaskAdded`, seeds the local ledger, and
-//!   suppresses re-yield even on an empty discovery).
 
 #![cfg(test)]
 
@@ -65,4 +54,3 @@ mod peer_mesh_watchdog;
 mod processing;
 mod r1;
 mod run_config_responder;
-mod setup_discovery_yield;

@@ -17,7 +17,7 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator, SetupDiscovery,
+    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -146,45 +146,10 @@ impl PySecondaryCoordinator {
         let command_tx = wiring.command_tx;
         let command_rx = wiring.command_rx;
 
-        // Setup-promote yield captures: cloned here so the `py.detach`
-        // closure (which runs without the GIL) owns its own handles
-        // without borrowing `self`. `task_definition_py` /
-        // `task_args_py` are `Send`-safe `Py<PyAny>` reference bumps;
-        // `phase_deps_for_ingest` / `setup_discover_root` are plain
-        // owned values.
-        //
-        // `setup_discover_root` mirrors `cfg_src_network`: in pre-staged
-        // mode the Python pipeline guarantees it's `Some` (the bind-
-        // mount root the staged corpus lives under). In legacy /
-        // failover modes the secondary never observes
-        // `RunOutcome::SetupPending`, so the `None` arm of the yield
-        // handler can surface a programmer-error rather than
-        // pretending to walk a non-existent root.
-        let task_definition_py = self.task_definition_py.clone_ref(py);
-        let task_args_py = self.task_args_py.clone_ref(py);
-        // A second `task_definition_py` reference bump for the finalize
-        // closure's per-type `build_worker_command_args` rebuild — the
-        // setup-discovery closure consumes the first one.
+        // The finalize closure's per-type `build_worker_command_args`
+        // rebuild captures a `Py<PyAny>` reference bump of the task
+        // definition.
         let finalize_task_definition_py = self.task_definition_py.clone_ref(py);
-        let phase_deps_for_ingest = self.phase_deps.clone();
-        let setup_discover_root = self.src_network.clone();
-        // Capture the submitter's `--source-already-staged` signal on the
-        // GIL thread for the PROMOTED primary's `required_setup_on_promote`.
-        // This is the SAME signal the submitter's own `PrimaryConfig` uses
-        // (`args.source_already_staged is not None`): the node that owns
-        // setup-discovery is exactly the node whose promoted primary must
-        // engage the `setup_pending()` suppressor so it does not declare
-        // `0+0 >= 0` run-complete before its discovery-broadcast `TaskAdded`
-        // batch lands. Sourced from the run's OWN arg (D6/D7 — values
-        // originate on the run's config), NOT a derived band-aid chain
-        // (`derive_setup_defer_on_promote` was deleted as poison).
-        let required_setup_on_promote = self
-            .task_args_py
-            .bind(py)
-            .getattr("source_already_staged")
-            .ok()
-            .filter(|v| !v.is_none())
-            .is_some();
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -471,23 +436,6 @@ impl PySecondaryCoordinator {
                     secondary.register_panik_signal_rx(rx);
                 }
 
-                // Register the consumer's setup-discovery policy. The Rust
-                // `SecondaryCoordinator` now OWNS the setup-promote yield loop
-                // (the framework drives WHEN); this closure is the consumer's
-                // POLICY (it runs Python `task.discover_items` OFF the runtime
-                // thread, so the `Node`'s mesh-pump keeps the keepalives
-                // flowing during discovery — §14/§15). On a non-pre-staged run
-                // the secondary never yields `SetupPending`, so the policy is
-                // inert.
-                secondary.register_setup_discovery(SetupDiscovery {
-                    discover: build_setup_discovery_fn(
-                        task_definition_py,
-                        task_args_py,
-                        setup_discover_root,
-                    ),
-                    phase_deps: phase_deps_for_ingest,
-                });
-
                 // Register the consumer's run-config finalize policy. The Rust
                 // `SecondaryCoordinator` OWNS the WHEN (it fires this at the
                 // `AwaitingPrimary → Configuring` transition, after the
@@ -538,7 +486,6 @@ impl PySecondaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     retry_max_passes: dist_retry_max_passes,
                     oom_retry_max_passes: dist_oom_retry_max_passes,
-                    required_setup_on_promote,
                     scheduler_config,
                     estimator,
                     command_tx,
@@ -649,11 +596,6 @@ struct PromotedPrimaryRecipeInputs {
     keepalive_miss_threshold: u32,
     retry_max_passes: u32,
     oom_retry_max_passes: u32,
-    /// The submitter's `--source-already-staged` signal (captured on the GIL
-    /// thread). When true the promoted primary engages the `setup_pending()`
-    /// suppressor so it does not declare `0+0 >= 0` run-complete before its
-    /// discovery-broadcast `TaskAdded` batch lands.
-    required_setup_on_promote: bool,
     scheduler_config: SchedulerConfig,
     estimator: PyMemoryEstimatorBridge,
     /// The Python `PrimaryHandle`'s command channel ends. The PROMOTED PRIMARY
@@ -709,7 +651,6 @@ fn build_promoted_primary_recipe(
         keepalive_miss_threshold,
         retry_max_passes,
         oom_retry_max_passes,
-        required_setup_on_promote,
         scheduler_config,
         estimator,
         command_tx,
@@ -733,11 +674,6 @@ fn build_promoted_primary_recipe(
             keepalive_miss_threshold,
             retry_max_passes,
             oom_retry_max_passes,
-            // The promoted-primary's setup-defer suppressor (D6/D7): the node
-            // that owns discovery is exactly the node whose promoted primary
-            // must wait for its own discovery batch. Sourced from the run's
-            // OWN `--source-already-staged` arg, NOT a derived band-aid.
-            required_setup_on_promote,
             // The DELIVERED node-local run-config, read off the shared handle
             // at the promotion instant (post-push, so it reflects the value the
             // primary unicast — not the empty boot seed). Threaded so the
@@ -792,44 +728,44 @@ fn build_promoted_primary_recipe(
 
 /// Build the consumer's setup-discovery policy closure.
 ///
-/// The returned [`dynrunner_manager_distributed::SetupDiscoveryFn`] is
-/// invoked by the Rust `SecondaryCoordinator`'s run loop on each
-/// `SetupPending` yield (pre-staged mode, empty ledger). It runs Python's
-/// `task.discover_items(<root>, args)` and converts the result through the
-/// workspace-shared `extract_binaries`.
+/// The returned [`dynrunner_manager_distributed::SetupDiscoveryFn`] runs
+/// Python's `task.discover_items(<root>, args)` and converts the result
+/// through the workspace-shared `extract_binaries`. Pre-staged
+/// (`--source-already-staged`) discovery runs on the corpus-mounting node.
 ///
 /// # Non-block correctness (§14/§15)
 ///
-/// The secondary's run loop shares ONE single-threaded runtime with the
-/// `Node`'s mesh-pump. Running the GIL excursion ON that thread would stall
-/// the pump → the secondary's keepalives stop → the primary declares it dead
-/// → STRAND. So each invocation runs the GIL excursion on a
-/// `tokio::task::spawn_blocking` thread and the returned future merely
-/// `.await`s that handle — yielding the runtime thread to the pump, which
-/// keeps the mesh alive (keepalives flowing) for the whole discovery
-/// duration, however slow the `--source-already-staged` scan is.
+/// The run loop shares ONE single-threaded runtime with the `Node`'s
+/// mesh-pump. Running the GIL excursion ON that thread would stall the pump
+/// → keepalives stop → a peer declares the node dead → STRAND. So each
+/// invocation runs the GIL excursion on a `tokio::task::spawn_blocking`
+/// thread and the returned future merely `.await`s that handle — yielding
+/// the runtime thread to the pump, which keeps the mesh alive (keepalives
+/// flowing) for the whole discovery duration, however slow the
+/// `--source-already-staged` scan is.
 ///
 /// The `Send` Python handles are captured in an `Option` and MOVED into the
-/// blocking task on the first (only) invocation — the secondary yields
-/// `SetupPending` at most once (the `ingest_setup_discovery` fire-once latch),
-/// so an `FnMut` that consumes its handles via `take()` is sufficient and
-/// avoids any off-GIL `Py` clone (which would need a `Python` token). A
-/// defensive second invocation surfaces a clear error rather than panicking.
+/// blocking task on the first (only) invocation, so an `FnMut` that consumes
+/// its handles via `take()` is sufficient and avoids any off-GIL `Py` clone
+/// (which would need a `Python` token). A defensive second invocation
+/// surfaces a clear error rather than panicking.
+// Phase 5 wires this onto the relocated primary's discovery path; uncalled
+// in the interim.
+#[allow(dead_code)]
 fn build_setup_discovery_fn(
     task_definition_py: Py<PyAny>,
     task_args_py: Py<PyAny>,
     setup_discover_root: Option<std::path::PathBuf>,
 ) -> dynrunner_manager_distributed::SetupDiscoveryFn<RunnerIdentifier> {
-    // Captured once; taken on the single invocation (fire-once latch upstream).
+    // Captured once; taken on the single invocation.
     let mut handles = Some((task_definition_py, task_args_py, setup_discover_root));
     Box::new(move || {
         let taken = handles.take();
         let fut = async move {
             let Some((task_definition_py, task_args_py, setup_discover_root)) = taken else {
                 return Err(
-                    "setup-discovery policy invoked more than once — the secondary \
-                     yields SetupPending at most once (ingest fire-once latch); a \
-                     second yield is a programmer error"
+                    "setup-discovery policy invoked more than once — a second \
+                     invocation is a programmer error"
                         .to_string(),
                 );
             };
@@ -1057,10 +993,10 @@ fn discover_items_under_gil(
     setup_discover_root: Option<&std::path::PathBuf>,
 ) -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
     let root = setup_discover_root.ok_or_else(|| {
-        "RunOutcome::SetupPending observed but src_network is None — the wrapper \
-         has no root to pass to task.discover_items; this is a programmer error \
-         (only pre-staged mode emits the SetupPending yield, and that mode always \
-         supplies src_network)"
+        "setup discovery invoked but src_network is None — the wrapper has no \
+         root to pass to task.discover_items; this is a programmer error \
+         (only pre-staged mode runs discovery, and that mode always supplies \
+         src_network)"
             .to_string()
     })?;
     let task_def = task_definition_py.bind(py);

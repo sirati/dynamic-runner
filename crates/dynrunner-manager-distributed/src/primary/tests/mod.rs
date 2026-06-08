@@ -4,7 +4,7 @@
 //! Sub-modules:
 //! - [`basic`] — happy-path single/multi-secondary dispatch.
 //! - [`retry`] — recoverable-failure retry passes.
-//! - [`setup_promote`] — setup-promote / pre-seeded-counter pathways.
+//! - [`setup_promote`] — pre-seeded-counter exit pathway.
 //! - [`e2e`] — end-to-end primary + real secondary scenarios.
 //! - [`promotion`] — primary-promotion + mesh-ready gates.
 //! - [`stranded`] — stranded-task / cluster-collapse accounting.

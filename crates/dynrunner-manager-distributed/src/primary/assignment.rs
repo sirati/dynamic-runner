@@ -318,98 +318,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // prose (mirrors `retry_bucket`'s `count`-bearing emit). One emit
         // with the TOTAL, after the per-secondary fan-out — never inside
         // the per-recipient loop.
-        //
-        // Defer-mode asymmetry (scope boundary): this event fires ONLY on
-        // the non-defer, submitter-side initial-assignment path. In
-        // setup-defer mode (`--source-already-staged` /
-        // `required_setup_on_promote`) `perform_initial_assignment` is not
-        // called at all — `emit_setup_defer_handshake` runs instead, and the
-        // real task discovery + assignment happens post-relocation on the
-        // promoted primary. That promoted-side spawning is NOT surfaced
-        // here, by design: this is a submitter-local important-stdio site,
-        // and the promoted primary is constructed by `Process` on the
-        // promotion event (a separate coordinator) whose own assignment is
-        // out of this emitter's reach. So under setup-defer the operator sees no
-        // "initial assignment complete" from the submitter — the boundary
-        // is honest, not a gap to paper over here.
         tracing::info!(
             target: super::important_events::IMPORTANT_TARGET,
             assigned,
             remaining = self.pool().len(),
             "initial assignment complete"
         );
-
-        Ok(())
-    }
-
-    /// Setup-defer mode handshake (replaces `perform_initial_assignment`
-    /// when the submitter has chosen to delegate task discovery + ledger
-    /// seed to the chosen secondary). Emits one degenerate
-    /// `InitialAssignment` per connected secondary — empty `zip_files`,
-    /// empty `workers_ready`, empty `staged_files`, `pre_staged_mode =
-    /// true`, `uses_file_based_items` carried through — so each
-    /// secondary's `wait_for_setup` loop sees the expected
-    /// PeerInfo + InitialAssignment + TransferComplete triple and falls
-    /// through to operational mode. The `pre_staged_mode: true` field on
-    /// that `InitialAssignment` is the discriminator (the secondary's
-    /// `setup_discovery_pending` latch) that flips the post-handshake
-    /// secondary into setup-pending mode instead of the usual
-    /// hydrate-from-cluster-state path.
-    ///
-    /// Also performs the InitialAssigning → Operational typestate
-    /// transition and seeds the per-secondary keepalive clock — the
-    /// same bookkeeping `perform_initial_assignment` does on the legacy
-    /// path. Without those, the local primary's heartbeat monitor
-    /// would never observe its secondaries as `Operational` (it gates
-    /// dead-detection on that variant) and post-demote keepalive
-    /// timestamps would start unset.
-    ///
-    /// No pool / worker allocation: in setup-defer mode the local
-    /// primary's `all_binaries` is empty, no `self.workers` are built,
-    /// and assignment decisions are deferred to the promoted secondary
-    /// after it broadcasts its `TaskAdded` mutations.
-    pub(super) async fn emit_setup_defer_handshake(&mut self) -> Result<(), String> {
-        tracing::info!("emitting setup-defer handshake (empty InitialAssignment per secondary)");
-
-        let mut secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        secondary_ids.sort();
-
-        for secondary_id in &secondary_ids {
-            let msg = DistributedMessage::InitialAssignment {
-                target: None,
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                secondary_id: secondary_id.clone(),
-                zip_files: Vec::new(),
-                workers_ready: Vec::new(),
-                staged_files: Vec::new(),
-                pre_staged_mode: true,
-                uses_file_based_items: self.config.uses_file_based_items,
-            };
-            self.send_to(
-                Destination::Secondary(PeerId::from(secondary_id.clone())),
-                msg,
-            )
-            .await?;
-        }
-
-        // InitialAssigning → Operational + seed keepalive, identical to
-        // the legacy `perform_initial_assignment` tail. The connection
-        // states must reach Operational so the heartbeat monitor (which
-        // gates dead-detection on this variant) can observe per-secondary
-        // liveness from this point onward.
-        for secondary_id in &secondary_ids {
-            if let Some(state) = self.secondaries.remove(secondary_id) {
-                let new_state = match state {
-                    SecondaryConnectionState::InitialAssigning(conn) => {
-                        SecondaryConnectionState::Operational(conn.assignments_sent())
-                    }
-                    other => other,
-                };
-                self.secondaries.insert(secondary_id.clone(), new_state);
-            }
-            self.seed_keepalive(secondary_id);
-        }
 
         Ok(())
     }

@@ -17,7 +17,7 @@ use tracing::Instrument;
 
 use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
-use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator, SetupDiscovery};
+use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
 use crate::process::{MeshClient, PromotionSignal, RoleInbox};
 use crate::zip_extract::ExtractionCache;
@@ -63,8 +63,7 @@ where
         // sized so a noisy caller can't OOM the secondary, but with
         // enough slack to absorb a batch of commands before
         // backpressure surfaces. The receiver is taken out for the
-        // duration of `process_tasks` and put back at loop exit so
-        // `SetupPending` re-entries keep the channel.
+        // duration of `process_tasks` and put back at loop exit.
         let (command_tx, command_rx) =
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         // Seed the SHARED node-local run-config handle off the config before
@@ -119,7 +118,6 @@ where
             fatal_exit_signal_rx: None,
             on_phase_end: None,
             on_phase_start: None,
-            setup_discovery: None,
             finalize_run_config: None,
             forwarded_argv_was_pushed: false,
             setup_frame_backlog: std::collections::VecDeque::new(),
@@ -305,11 +303,9 @@ where
     /// Tear down the peer-lifecycle dispatcher task spawned at
     /// `run_until_setup_or_done`'s first entry. No-op when the
     /// dispatcher was never spawned (e.g. the coordinator's
-    /// `run_until_setup_or_done` was never called, or only the
-    /// SetupPending-yielding first entry ran and no second entry
-    /// reached the terminal cleanup). Mirrors the same helper on
-    /// `PrimaryCoordinator` — see that doc for the Drop-vs-explicit
-    /// design rationale.
+    /// `run_until_setup_or_done` was never called). Mirrors the same
+    /// helper on `PrimaryCoordinator` — see that doc for the
+    /// Drop-vs-explicit design rationale.
     pub(in crate::secondary) async fn cleanup_lifecycle_dispatcher(&mut self) {
         if let Some(handle) = self.lifecycle_dispatcher_handle.take() {
             handle.abort();
@@ -321,11 +317,8 @@ where
     /// BEFORE `run_until_setup_or_done` enters; calls afterwards have
     /// no effect on the active loop (the field is `Option::take`-n
     /// into the loop's local state on first entry, then moved into its
-    /// resumable home on
-    /// [`super::lifecycle::OperationalState::panik_signal_rx`] where it
-    /// survives a `SetupPending` re-entry — on a regular pre-staged
-    /// secondary this is the sole in-loop path for a post-discovery SIGTERM
-    /// to reach the graceful-shutdown cascade).
+    /// home on
+    /// [`super::lifecycle::OperationalState::panik_signal_rx`]).
     ///
     /// Single concern: the coordinator owns the panik-react logic
     /// (announce a self-authored `ClusterMutation::PeerRemoved
@@ -397,33 +390,9 @@ where
         self.on_phase_end = Some(on_phase_end);
     }
 
-    /// Register the consumer's setup-discovery policy — the mirror of
-    /// [`Self::register_phase_lifecycle_callbacks`] for the pre-staged
-    /// setup-promote path. Must be called BEFORE [`Self::run`].
-    ///
-    /// With a discovery registered, the [`Self::run`] convenience wrapper
-    /// DRIVES the `RunOutcome::SetupPending` yield loop itself (rather than
-    /// erroring on the yield): on each `SetupPending` it `.await`s the
-    /// policy's future, feeds the result through
-    /// [`Self::ingest_setup_discovery`], and re-enters the loop. The
-    /// framework (this coordinator) thus owns the setup-promote DRIVE while
-    /// the discovery POLICY stays the consumer's — the pyo3 wrapper supplies
-    /// a closure that runs Python's `task.discover_items` on a
-    /// non-runtime-blocking thread so the `Node`'s mesh-pump keeps the
-    /// keepalives flowing during discovery (see [`SetupDiscovery`] for the
-    /// non-block correctness contract).
-    ///
-    /// Single concern: own the registration surface for the setup-discovery
-    /// policy. Absent registration the secondary never observes
-    /// `SetupPending` (non-pre-staged modes) and `run` resolves on the first
-    /// `Terminal`.
-    pub fn register_setup_discovery(&mut self, discovery: SetupDiscovery<I>) {
-        self.setup_discovery = Some(discovery);
-    }
-
     /// Register the consumer's run-config finalize policy. Must be called
-    /// BEFORE [`Self::run`]; same pre-run, single-shot family as
-    /// [`Self::register_setup_discovery`].
+    /// BEFORE [`Self::run`]; same pre-run, single-shot family as the other
+    /// `register_*` policy hooks.
     ///
     /// With a finalize registered, the `AwaitingPrimary → Configuring`
     /// transition fires it ONCE — after ensuring the post-welcome `RunConfig`
@@ -456,8 +425,7 @@ where
 
     /// Tear down the task-completion dispatcher task. Mirrors
     /// [`Self::cleanup_lifecycle_dispatcher`] — same Drop-vs-explicit
-    /// design rationale, same re-entrant SetupPending non-cleanup
-    /// discipline.
+    /// design rationale.
     pub(in crate::secondary) async fn cleanup_task_completed_dispatcher(&mut self) {
         if let Some(handle) = self.task_completed_dispatcher_handle.take() {
             handle.abort();
@@ -538,87 +506,6 @@ where
         // which runs in `Configuring`; the flag is carried forward into
         // `Operational` at `enter_operational`.
         self.lifecycle.set_pre_staged_mode(on);
-    }
-
-    /// `true` iff this node is the single deterministically-designated
-    /// setup-discovery node — the lowest-id alive, non-observer,
-    /// `can_be_primary` worker-secondary in the replicated membership
-    /// mirror.
-    ///
-    /// This is the SAME candidate set + `.min()` rule the deterministic
-    /// bootstrap-promotion selection applies to pick the bootstrap target,
-    /// computed here against the secondary's own replicated
-    /// `cluster_state`:
-    ///   - [`ClusterState::alive_secondary_members`] — advertised
-    ///     worker-secondary capacity (`worker_count > 0`) AND alive; the
-    ///     faithful liveness signal in the SETUP window where no
-    ///     operational keepalive map exists yet (exactly the substitution
-    ///     the secondary election makes in its cold-start branch,
-    ///     `alive_secondary_ids`).
-    ///   - `role_table().observers` excluded — an observer hosts no
-    ///     workers and can never become primary, mirroring the election's
-    ///     observer self-exclusion and the bootstrap selection's defensive
-    ///     cut.
-    ///   - [`ClusterState::can_be_primary`] — the explicit replicated
-    ///     capability marker; only a peer that declared it can host the
-    ///     primary role is eligible.
-    ///
-    /// The bootstrap selection ALSO filters `mesh_ready_secondaries` /
-    /// `transport.has_peer`, which a secondary cannot read for its peers;
-    /// its membership/liveness mirror is the faithful analogue (the same
-    /// substitution `alive_secondary_ids` makes). The designated
-    /// discoverer is therefore the SAME node the bootstrap selection
-    /// promotes — discovery and promotion re-coupled through one
-    /// deterministic rule, with no cross-call between the two concerns.
-    ///
-    /// Self-healing: if the designated node dies before discovering, the
-    /// `.min()` re-resolves to the next eligible node on the next tick
-    /// (the predicate is re-evaluated every loop iteration), and that
-    /// node's empty-ledger axis is still true, so it picks up discovery —
-    /// the same liveness-driven re-resolution the election has.
-    fn is_designated_discoverer(&self) -> bool {
-        let observers = &self.cluster_state.role_table().observers;
-        let designated = self
-            .cluster_state
-            .alive_secondary_members()
-            .filter(|id| !observers.contains(*id))
-            .filter(|id| self.cluster_state.can_be_primary(id))
-            .min();
-        designated == Some(self.config.secondary_id.as_str())
-    }
-
-    /// Single source of truth for the setup-discovery `SetupPending`
-    /// yield discriminator.
-    ///
-    /// `true` iff (a) the authority deferred discovery
-    /// (`pre_staged_mode`, set from the empty `InitialAssignment` the
-    /// submitter sends when it has no local corpus view), (b) this node
-    /// hasn't already run its own discovery pass
-    /// ([`Self::setup_discovery_done`]), (c) the replicated ledger is
-    /// still empty (`cluster_state.task_count() == 0` — no node has
-    /// seeded it yet), and (d) this node is the single deterministically-
-    /// designated discoverer ([`Self::is_designated_discoverer`]).
-    ///
-    /// Axis (d) makes discovery run on EXACTLY ONE node: the designated
-    /// discoverer is the same lowest-id-eligible node the bootstrap
-    /// selection promotes, so discovery and promotion are re-coupled
-    /// through one deterministic rule.
-    ///
-    /// `process_tasks` consults this once per tick and yields
-    /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
-    /// Python's `task.discover_items` against the locally bind-mounted
-    /// corpus and feed the result back via
-    /// [`Self::ingest_setup_discovery`]. The predicate is self-clearing
-    /// on every axis: a non-empty ledger (this node's own ingest or a
-    /// peer's broadcast) flips (c) false, and `ingest_setup_discovery`
-    /// flips (b) true — so the yield FIRES AT MOST ONCE per node and an
-    /// empty discovery never re-yields. Legacy / failover runs leave
-    /// `pre_staged_mode` false, so the predicate is always false there.
-    pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
-        self.lifecycle.pre_staged_mode()
-            && !self.lifecycle.setup_discovery_done()
-            && self.cluster_state.task_count() == 0
-            && self.is_designated_discoverer()
     }
 
     pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
@@ -724,11 +611,9 @@ where
     /// owns its cluster view (it called `join_running_cluster` before
     /// constructing this coordinator), so the existing run loop should
     /// pick up from the live-processing phase rather than re-run the
-    /// primary-handshake setup". Mirrors what
-    /// `run_until_setup_or_done`'s second-iteration branch does on the
-    /// `SetupPending` re-entry path — that branch's `if !self
-    /// .setup_phase_completed { … }` guard is the single source of
-    /// truth for "skip setup". We just set the latch.
+    /// primary-handshake setup". The `run_until_setup_or_done` entry's
+    /// `if !self.setup_phase_completed { … }` guard is the single source of
+    /// truth for "skip setup"; we just set the latch.
     ///
     /// # Why a dedicated entry-point (not an inline `cluster_state` +
     /// `setup_phase_completed` writer on the caller)
@@ -983,137 +868,61 @@ where
     /// 4. Process tasks: receive assignments, run on local workers, report back
     ///
     /// The single production secondary entry (the `Node::run` secondary arm
-    /// drives this). It wraps `run_until_setup_or_done` and OWNS the
-    /// setup-promote yield drive: when a setup-discovery policy is registered
-    /// (via [`Self::register_setup_discovery`], the pre-staged path), a
-    /// `RunOutcome::SetupPending` yield re-enters the policy's discovery
-    /// future and `ingest_setup_discovery`, then resumes the loop — the
-    /// framework owns the drive, the consumer owns the policy. The
-    /// discovery future is `.await`ed (never thread-blocked) so the
-    /// `Node`'s mesh-pump keeps the keepalives flowing during discovery
-    /// (the §14/§15 non-block contract on [`SetupDiscovery`]).
-    ///
-    /// Without a registered policy a `SetupPending` yield is a programmer
-    /// error (a non-pre-staged caller never receives the
-    /// `InitialAssignment { pre_staged_mode: true }` that triggers it), so
-    /// it surfaces as an `Err`. On a terminal, the per-secondary terminal is
-    /// read off the lifecycle (the single source of truth) and projected to
-    /// a `Result`: `Done`⇒`Ok`, `Aborted`/`Panik`/`Failed`⇒`Err`. (The
-    /// `Node::run` secondary arm surfaces this `Err`; the pyo3 boundary maps
-    /// the lifecycle terminal to the `std::process::exit` code via
-    /// [`Self::terminal`].)
+    /// drives this). It wraps `run_until_setup_or_done` and, on a terminal,
+    /// reads the per-secondary terminal off the lifecycle (the single source
+    /// of truth) and projects it to a `Result`: `Done`⇒`Ok`,
+    /// `Aborted`/`Panik`/`Failed`⇒`Err`. (The `Node::run` secondary arm
+    /// surfaces this `Err`; the pyo3 boundary maps the lifecycle terminal to
+    /// the `std::process::exit` code via [`Self::terminal`].)
     pub async fn run(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
-        loop {
-            match self.run_until_setup_or_done(factory).await? {
-                RunOutcome::SetupPending => {
-                    // Drive the setup-promote yield: run the consumer's
-                    // discovery policy (its future is `.await`ed, NOT
-                    // thread-blocked, so the mesh-pump keeps the keepalives
-                    // alive during discovery — §14/§15), feed the result onto
-                    // the mesh via `ingest_setup_discovery`, then re-enter the
-                    // loop. The fire-once latch in `ingest_setup_discovery`
-                    // prevents a re-yield, so this branch runs at most once.
-                    // Take the policy out so the discovery future (which we
-                    // `.await`) does not hold a borrow of `self` across the
-                    // await — `ingest_setup_discovery` needs `&mut self`, so
-                    // the two borrows must be disjoint in time.
-                    let Some(mut discovery) = self.setup_discovery.take() else {
-                        return Err(
-                            "secondary yielded SetupPending but no setup-discovery policy \
-                             was registered — programming error (only a pre-staged caller \
-                             that called register_setup_discovery may be promoted with \
-                             required_setup=true)"
-                                .to_string(),
-                        );
-                    };
-                    // Clone the phase-dep graph for the ingest BEFORE running
-                    // the discovery future (the future borrows `discovery`
-                    // mutably). Run discovery (`.await` yields to the pump),
-                    // then ingest.
-                    let phase_deps = discovery.phase_deps.clone();
-                    let discovered = (discovery.discover)().await?;
-                    // Put the policy back so a (latch-suppressed but defensive)
-                    // re-yield still finds it, mirroring the resumable-state
-                    // discipline of the panik/command receivers.
-                    self.setup_discovery = Some(discovery);
-                    self.ingest_setup_discovery(discovered, phase_deps).await?;
-                    // Loop: re-enter `run_until_setup_or_done`, which
-                    // short-circuits the setup handshake (the latch is set) and
-                    // re-enters `process_tasks` directly.
-                }
-                // Reached a terminal — read the per-secondary terminal off the
-                // lifecycle (the single source of truth). The PyO3 wrapper
-                // takes the structured terminal (via `terminal()`) and calls
-                // `std::process::exit` (137 panik / 1 abort); this `run` path
-                // surfaces `Aborted`/`Panik` as a normal String error and
-                // `Done` as `Ok`. (`Failed` never reaches here — `fatal_exit`
-                // propagates as the run loop's `Err` before this match.)
-                RunOutcome::Terminal => {
-                    return match self.lifecycle.terminal() {
-                        Some(super::SecondaryTerminal::Done) | None => Ok(()),
-                        Some(super::SecondaryTerminal::Panik {
-                            matched_path,
-                            reason,
-                        }) => Err(format!(
-                            "secondary panik shutdown: {reason} (matched_path={})",
-                            matched_path.display()
-                        )),
-                        Some(super::SecondaryTerminal::Aborted { reason }) => {
-                            Err(format!("run aborted by primary: {reason}"))
-                        }
-                        Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
-                    };
-                }
+        // Reached a terminal — read the per-secondary terminal off the
+        // lifecycle (the single source of truth). The PyO3 wrapper takes the
+        // structured terminal (via `terminal()`) and calls
+        // `std::process::exit` (137 panik / 1 abort); this `run` path
+        // surfaces `Aborted`/`Panik` as a normal String error and `Done` as
+        // `Ok`. (`Failed` never reaches here — `fatal_exit` propagates as the
+        // run loop's `Err` before this match.)
+        let RunOutcome::Terminal = self.run_until_setup_or_done(factory).await?;
+        match self.lifecycle.terminal() {
+            Some(super::SecondaryTerminal::Done) | None => Ok(()),
+            Some(super::SecondaryTerminal::Panik {
+                matched_path,
+                reason,
+            }) => Err(format!(
+                "secondary panik shutdown: {reason} (matched_path={})",
+                matched_path.display()
+            )),
+            Some(super::SecondaryTerminal::Aborted { reason }) => {
+                Err(format!("run aborted by primary: {reason}"))
             }
+            Some(super::SecondaryTerminal::Failed { reason }) => Err(reason),
         }
     }
 
     /// Drive the secondary coordination loop until it either yields
-    /// for setup discovery (`RunOutcome::SetupPending`) or reaches a
-    /// terminal (`RunOutcome::Terminal`, with the specific per-secondary
-    /// terminal recorded on the lifecycle and readable via
+    /// reaches a terminal (`RunOutcome::Terminal`, with the specific
+    /// per-secondary terminal recorded on the lifecycle and readable via
     /// [`Self::terminal`]).
     ///
-    /// First invocation: enters `AwaitingPrimary`, runs the setup
-    /// handshake (welcome / cert exchange / wait_for_setup) under
-    /// `config.unconfigured_deadline` — `wait_for_setup` spawns the worker
-    /// pool and enters `Configuring` on the first primary frame — then
-    /// `process_tasks` drives the `Configuring → Operational` transition
-    /// and runs the loop.
-    ///
-    /// Subsequent invocations (only reached on the `SetupPending`
-    /// caller-loop re-entry): skip the setup phase — workers are still
-    /// alive and the handshake messages have already been consumed —
-    /// and re-enter `process_tasks` directly. The re-entry guard is the
-    /// `self.lifecycle.setup_phase_completed()` projection (true once the
-    /// lifecycle reaches `Operational`), which `process_tasks` flips on
-    /// the first invocation.
-    ///
-    /// Cleanup (`stop_all_workers` + the "secondary finished" log)
-    /// fires only on the `Done` branch. On `SetupPending` the worker
-    /// pool is intentionally left running so the caller's re-entry
-    /// finds it in the same state `process_tasks` yielded from.
+    /// Enters `AwaitingPrimary`, runs the setup handshake (welcome / cert
+    /// exchange / wait_for_setup) under `config.unconfigured_deadline` —
+    /// `wait_for_setup` spawns the worker pool and enters `Configuring` on
+    /// the first primary frame — then `process_tasks` drives the
+    /// `Configuring → Operational` transition and runs the loop.
     ///
     /// Cancel-safety: `process_tasks` already documents that every
     /// arm of its `select!` is cancel-safe (mpsc recv + tokio
-    /// interval ticks); the early break on `setup_pending` simply
-    /// abandons the in-flight future of whichever arm was awaiting,
-    /// and the next entry rebuilds a fresh `select!`. No state is
-    /// dropped except those in-flight recv futures, which are
-    /// cancel-safe by construction.
+    /// interval ticks). No state is dropped except in-flight recv
+    /// futures, which are cancel-safe by construction.
     ///
     /// # Cleanup discipline
     ///
     /// Thin wrapper around [`Self::run_until_setup_or_done_inner`]
     /// whose secondary concern is to drive the peer-lifecycle
-    /// dispatcher's abort-on-exit contract. `Done` and any `Err`
-    /// path flow through `cleanup_lifecycle_dispatcher` before
-    /// returning, so the spawned dispatcher task is always aborted
-    /// and joined before the caller observes the result. The
-    /// `SetupPending` yield path deliberately bypasses cleanup —
-    /// the caller will re-enter, the dispatcher is still useful
-    /// across that boundary, and the receiver has been moved into
-    /// the task so a fresh spawn would be impossible anyway.
+    /// dispatcher's abort-on-exit contract. Every exit path flows
+    /// through `cleanup_lifecycle_dispatcher` before returning, so the
+    /// spawned dispatcher task is always aborted and joined before the
+    /// caller observes the result.
     pub async fn run_until_setup_or_done(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
@@ -1122,8 +931,7 @@ where
         // emits is attributed to the secondary role and routed to the
         // per-role full log. This is the single entry all production
         // secondary paths flow through (the legacy `run` wrapper delegates
-        // here), so one span here covers them all — including the events
-        // emitted on a `SetupPending` re-entry. A secondary that never
+        // here), so one span here covers them all. A secondary that never
         // promotes only ever carries this span → `secondary.log`; a peer
         // that activates a same-peer primary spawns a SEPARATE task whose
         // own primary span keeps that authority's events in `primary.log`.
@@ -1135,17 +943,9 @@ where
         );
         async {
             let result = self.run_until_setup_or_done_inner(factory).await;
-            // SetupPending is a re-entrant yield, not a terminal exit;
-            // the dispatcher must stay alive across the boundary so the
-            // next `run_until_setup_or_done` re-entry inherits it.
-            // Match on the borrow to keep the result move-back intact.
-            let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
-            if cleanup {
-                self.cleanup_lifecycle_dispatcher().await;
-                // Independent of `cleanup_lifecycle_dispatcher`; same
-                // Done/Err vs. SetupPending discipline as documented above.
-                self.cleanup_task_completed_dispatcher().await;
-            }
+            self.cleanup_lifecycle_dispatcher().await;
+            // Independent of `cleanup_lifecycle_dispatcher`.
+            self.cleanup_task_completed_dispatcher().await;
             result
         }
         .instrument(span)
@@ -1160,9 +960,8 @@ where
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
-        // Spawn the peer-lifecycle dispatcher on first entry (idempotent
-        // on `SetupPending` re-entry: the receiver was already taken,
-        // so this branch is a no-op the second time around). The
+        // Spawn the peer-lifecycle dispatcher on first entry (idempotent:
+        // once the receiver has been taken this branch is a no-op). The
         // sender end was installed on `cluster_state` in `new()` so
         // any apply that lands before the dispatcher polls queues on
         // the unbounded channel and drains here. `spawn_local`
@@ -1171,8 +970,7 @@ where
         //
         // The returned `JoinHandle` is stored on `self` so
         // `cleanup_lifecycle_dispatcher` (called from the outer
-        // wrapper on Done / Err exits — NOT on the re-entrant
-        // SetupPending yield) can abort the task and await its
+        // wrapper on exit) can abort the task and await its
         // termination. Without this, an error-return from inside the
         // run loop would leave the dispatcher blocked on its input
         // channel forever (the sender on `cluster_state` is still
@@ -1191,9 +989,8 @@ where
             self.lifecycle_dispatcher_handle = Some(handle);
         }
         // Same shape for the task-completion dispatcher: spawn on
-        // first entry only (the receiver was moved on first entry,
-        // so the take() returns None on SetupPending re-entry and the
-        // branch is a no-op).
+        // first entry only (once the receiver has been moved the
+        // take() returns None and the branch is a no-op).
         if let Some(rx) = self.task_completed_rx.take() {
             let listeners = std::mem::take(&mut self.task_completed_listeners);
             let handle = tokio::task::spawn_local(
@@ -1208,18 +1005,17 @@ where
         // `MeshFormation` sub-concern is untouched by this transition).
         // No worker pool, no task acceptance, no election, no keepalive in
         // this state — only the setup handshake below. Idempotent: a no-op
-        // from any state other than `Connecting` (a `SetupPending`
-        // re-entry is already `Operational`, so this leaves it unchanged).
+        // from any state other than `Connecting` (a late-joiner observer is
+        // already `Operational`, so this leaves it unchanged).
         self.lifecycle = std::mem::replace(&mut self.lifecycle, SecondaryLifecycle::connecting())
             .enter_awaiting_primary();
 
         // Skip the per-secondary setup phase once the lifecycle has
         // reached `Operational` (or terminal) — the `setup_phase_completed`
-        // projection replaces the old flat bool latch. This gates a
-        // `SetupPending` re-entry (already `Operational`, so workers are
-        // alive and the handshake frames are already consumed) and the
+        // projection replaces the old flat bool latch. This gates the
         // late-joiner observer (which `restore_from_snapshot_and_skip_setup`
-        // landed directly in `Operational`).
+        // landed directly in `Operational`, so workers are alive and the
+        // handshake frames are already consumed).
         if !self.lifecycle.setup_phase_completed() {
             tracing::info!(
                 secondary = %self.config.secondary_id,
@@ -1336,100 +1132,87 @@ where
             // `Configuring → Operational` transition at the top of
             // `process_tasks` (next) flips the lifecycle to `Operational`,
             // and the `setup_phase_completed()` projection reads true from
-            // there on. A `SetupPending` re-entry therefore observes
+            // there on. A late-joiner observer therefore observes
             // `Operational` and skips this whole block — the same
-            // fire-once re-entry guard the flat bool gave, now derived
-            // from the typed state.
+            // fire-once guard the flat bool gave, now derived from the
+            // typed state.
         }
 
         // Phase 5: Process tasks. The first thing it does is drive the
         // `Configuring → Operational` transition (consuming the take-once
-        // latches). May yield with SetupPending or run to completion.
-        let outcome = self.process_tasks(factory).await?;
+        // latches), then runs to a terminal.
+        let RunOutcome::Terminal = self.process_tasks(factory).await?;
 
-        match outcome {
-            RunOutcome::SetupPending => {
-                // Workers stay alive; the caller's re-entry resumes
-                // the loop in `process_tasks`. No final log line yet —
-                // the run isn't actually finished.
+        // `process_tasks` already recorded the per-secondary terminal on the
+        // lifecycle (the single source of truth); read it back to choose the
+        // matching teardown.
+        match self.lifecycle.terminal() {
+            Some(super::SecondaryTerminal::Done) | None => {
+                // Normal termination — drain the sampler BEFORE
+                // `stop_all_workers` so its last tick still sees
+                // the per-worker cgroup leaves the pool's teardown
+                // is about to Drop-rmdir. Mirrors
+                // `LocalManager::process_binaries`'s teardown order.
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
                 tracing::info!(
                     secondary = %self.config.secondary_id,
-                    "secondary yielding for setup discovery"
+                    completed = self.completed_count(),
+                    "secondary finished"
                 );
             }
-            RunOutcome::Terminal => {
-                // `process_tasks` already recorded the per-secondary
-                // terminal on the lifecycle (the single source of truth);
-                // read it back to choose the matching teardown.
-                match self.lifecycle.terminal() {
-                    Some(super::SecondaryTerminal::Done) | None => {
-                        // Normal termination — drain the sampler BEFORE
-                        // `stop_all_workers` so its last tick still sees
-                        // the per-worker cgroup leaves the pool's teardown
-                        // is about to Drop-rmdir. Mirrors
-                        // `LocalManager::process_binaries`'s teardown order.
-                        self.shutdown_sampler_if_present().await;
-                        self.stop_all_workers().await;
-                        tracing::info!(
-                            secondary = %self.config.secondary_id,
-                            completed = self.completed_count(),
-                            "secondary finished"
-                        );
-                    }
-                    Some(super::SecondaryTerminal::Panik {
-                        matched_path,
-                        reason,
-                    }) => {
-                        // Workers have already been taken down via the
-                        // panik-react path's `kill_all_workers_with_grace`;
-                        // skip the clean `stop_all_workers` ladder (it would
-                        // try to send a protocol Stop on a dead transport
-                        // and waste teardown time). The PyO3 wrapper reads
-                        // the `Panik` terminal and calls
-                        // `std::process::exit(137)`.
-                        tracing::error!(
-                            secondary = %self.config.secondary_id,
-                            matched_path = %matched_path.display(),
-                            reason = %reason,
-                            "secondary panik shutdown"
-                        );
-                    }
-                    Some(super::SecondaryTerminal::Aborted { reason }) => {
-                        // Run aborted cluster-wide. The run is over, so tear
-                        // down workers the same way as `Done` (drain the
-                        // sampler before `stop_all_workers`); the PyO3
-                        // wrapper reads the `Aborted` terminal and calls
-                        // `std::process::exit(1)`. Logged at error level —
-                        // an abort is a failure outcome, not a clean finish.
-                        self.shutdown_sampler_if_present().await;
-                        self.stop_all_workers().await;
-                        tracing::error!(
-                            secondary = %self.config.secondary_id,
-                            reason = %reason,
-                            "secondary exiting: run aborted by primary"
-                        );
-                    }
-                    Some(super::SecondaryTerminal::Failed { reason }) => {
-                        // A `Failed` terminal is reached only via the
-                        // `fatal_exit` read, which propagates an `Err` from
-                        // `process_tasks` (short-circuiting the `?` above) —
-                        // so this arm is unreachable on a `RunOutcome::
-                        // Terminal`. Guard defensively rather than weaken
-                        // the match.
-                        tracing::error!(
-                            secondary = %self.config.secondary_id,
-                            reason = %reason,
-                            "secondary reported Terminal with a Failed lifecycle \
-                             (unexpected — fatal_exit should propagate Err)"
-                        );
-                        self.shutdown_sampler_if_present().await;
-                        self.stop_all_workers().await;
-                    }
-                }
+            Some(super::SecondaryTerminal::Panik {
+                matched_path,
+                reason,
+            }) => {
+                // Workers have already been taken down via the
+                // panik-react path's `kill_all_workers_with_grace`;
+                // skip the clean `stop_all_workers` ladder (it would
+                // try to send a protocol Stop on a dead transport
+                // and waste teardown time). The PyO3 wrapper reads
+                // the `Panik` terminal and calls
+                // `std::process::exit(137)`.
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    matched_path = %matched_path.display(),
+                    reason = %reason,
+                    "secondary panik shutdown"
+                );
+            }
+            Some(super::SecondaryTerminal::Aborted { reason }) => {
+                // Run aborted cluster-wide. The run is over, so tear
+                // down workers the same way as `Done` (drain the
+                // sampler before `stop_all_workers`); the PyO3
+                // wrapper reads the `Aborted` terminal and calls
+                // `std::process::exit(1)`. Logged at error level —
+                // an abort is a failure outcome, not a clean finish.
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    reason = %reason,
+                    "secondary exiting: run aborted by primary"
+                );
+            }
+            Some(super::SecondaryTerminal::Failed { reason }) => {
+                // A `Failed` terminal is reached only via the
+                // `fatal_exit` read, which propagates an `Err` from
+                // `process_tasks` (short-circuiting the `?` above) —
+                // so this arm is unreachable on a `RunOutcome::
+                // Terminal`. Guard defensively rather than weaken
+                // the match.
+                tracing::error!(
+                    secondary = %self.config.secondary_id,
+                    reason = %reason,
+                    "secondary reported Terminal with a Failed lifecycle \
+                     (unexpected — fatal_exit should propagate Err)"
+                );
+                self.shutdown_sampler_if_present().await;
+                self.stop_all_workers().await;
             }
         }
 
-        Ok(outcome)
+        Ok(RunOutcome::Terminal)
     }
 
     pub(in crate::secondary) fn max_resources(&self) -> dynrunner_core::ResourceMap {

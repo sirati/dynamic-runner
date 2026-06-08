@@ -345,14 +345,10 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     Pre-staged-source mode (`--source-already-staged <path>`) defers
     discovery to the cluster secondary that has the staged path
     bind-mounted as `src_network`. The submitter has no local view
-    of those files, so we return an empty list and let the
-    coordinator's setup-promote handshake drive `discover_items` on
-    the chosen secondary. `args._setup_deferred_to_secondary` is set
-    so dispatch helpers can distinguish "intentionally empty" from
-    "task discovered nothing" — only the latter is a useful no-op.
-    The empty-list signal is also what the Step 6 PyO3 wrapper reads
-    (together with `source_pre_staged_root.is_some()`) to flip
-    `PrimaryConfig.required_setup_on_promote` to true.
+    of those files, so we return an empty list.
+    `args._setup_deferred_to_secondary` is set so dispatch helpers can
+    distinguish "intentionally empty" from "task discovered nothing" —
+    only the latter is a useful no-op.
     """
     logger = logging.getLogger()
 
@@ -873,10 +869,9 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     # `[]` and set `args._setup_deferred_to_secondary` when
     # `args.source_already_staged` is set. The string path goes
     # through to the Rust pyfunction's `Option<PathBuf>` kwarg
-    # uniformly with the SLURM and local-multi-computer paths so the
-    # in-process manager's `PrimaryConfig.required_setup_on_promote`
-    # flips to `True` and the chosen secondary owns discovery +
-    # ledger-seed.
+    # uniformly with the SLURM and local-multi-computer paths; it drives
+    # the secondary's pre-staged binary resolution (the bind-mount IS
+    # the contract).
     # `unfulfillable_reinject_max_per_task` is the CLI knob plumbed
     # uniformly through every primary path; the in-process distributed
     # manager mints its `PrimaryHandle` from a shared
@@ -940,11 +935,9 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     )
     # Pre-staged-source plumbing — see `_dispatch_single_process` for
     # the rationale; `run_primary` forwards the kwarg into the inner
-    # `RustPrimaryCoordinator(source_pre_staged_root=...)` whose
-    # `run()` derives `required_setup_on_promote` from
-    # `source_pre_staged_root.is_some() && binaries.is_empty()` (the
-    # `_collect_binaries` helper guarantees the empty list in pre-
-    # staged mode, so both halves of the gate agree).
+    # `RustPrimaryCoordinator(source_pre_staged_root=...)`, which drives
+    # the secondary's pre-staged binary resolution (the bind-mount IS
+    # the contract).
     unfulfillable_cap = getattr(args, "unfulfillable_reinject_max_per_task", None)
     # Build the respawn-pipeline wiring from the CLI knobs. The
     # `_build_respawn_args` helper centralises the policy +

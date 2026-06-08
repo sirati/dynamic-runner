@@ -28,9 +28,8 @@ use crate::secondary::SecondaryTerminal;
 /// - [`Self::Failed`] ⇒ a non-zero exit the boundary derives from the
 ///   carried [`RunError`] (a strand backstop — fleet-dead / primary-silence
 ///   — a structured primary terminal like `ClusterCollapsed` /
-///   `SetupDeadlineExpired` / `DuplicateTaskIdPrePhase`, or a generic run
-///   failure). The boundary destructures the `RunError` for its
-///   per-variant exit handling.
+///   `DuplicateTaskIdPrePhase`, or a generic run failure). The boundary
+///   destructures the `RunError` for its per-variant exit handling.
 #[derive(Debug)]
 pub enum RunTerminal {
     /// Clean completion — exit 0.

@@ -50,13 +50,12 @@ where
         // `OperationalLatches` from the coordinator's `Option` slots and
         // get the unwrapped handles back to drive the `select!` below.
         //
-        // A `SetupPending` re-entry (and the late-joiner observer, which
-        // `restore_from_snapshot_and_skip_setup` landed directly in
-        // `Operational`) finds the lifecycle already `Operational`, so the
-        // transition is a no-op on the state — and the three fire-once
-        // latches' `Option::take()`s yield `None` the second time, so the
-        // loop's latch locals re-park exactly as the pre-typed flat-field
-        // flow did across the yield. The carrier ferries only the receivers
+        // The late-joiner observer (which `restore_from_snapshot_and_skip_setup`
+        // landed directly in `Operational`) finds the lifecycle already
+        // `Operational`, so the transition is a no-op on the state — and the
+        // three fire-once latches' `Option::take()`s yield `None`, so the
+        // loop's latch locals park exactly as the pre-typed flat-field flow
+        // did. The carrier ferries only the receivers
         // the operational `select!` actually polls. `lifecycle_rx` /
         // `task_completed_rx` were already taken in
         // `run_until_setup_or_done_inner` to spawn their dispatchers, and the
@@ -503,42 +502,6 @@ where
                 return Err(reason);
             }
 
-            // Setup-discovery yield: in pre-staged mode the authority
-            // deferred task discovery to the corpus-mounting secondaries
-            // (it sent an empty `InitialAssignment { pre_staged_mode: true }`
-            // rather than seeding the ledger). With the ledger still
-            // empty and no discovery run on this node yet, yield back to
-            // the caller (the PyO3 secondary wrapper) so it can
-            // re-acquire the GIL, run Python's `task.discover_items`
-            // against the locally bind-mounted corpus, and feed the
-            // result back via `ingest_setup_discovery` — which broadcasts
-            // `PhaseDepsSet + TaskAdded` onto the mesh (the same-peer
-            // primary picks them up as a mesh member, refreshes
-            // `total_tasks`, and its CRDT-derived `setup_pending()` gate
-            // flips false) and latches the fire-once guard. On re-entry
-            // `setup_discovery_pending()` is false (ledger seeded OR the
-            // latch is set), so the loop proceeds normally.
-            //
-            // The discriminator lives entirely in
-            // `setup_discovery_pending()` (`coordinator.rs`) — this site
-            // only reads the predicate. Placed AFTER `fatal_exit`
-            // (genuine errors take priority) but BEFORE the run-complete
-            // / drain checks, which would all be no-ops here anyway (the
-            // ledger is empty, the mesh is alive, nothing to drain).
-            //
-            // Cancel-safety: every awaiting arm in the `select!` above is
-            // cancel-safe (mpsc recv + tokio interval ticks), so breaking
-            // out here just abandons whichever in-flight future was being
-            // awaited; re-entry rebuilds a fresh `select!`.
-            if self.setup_discovery_pending() {
-                tracing::info!(
-                    "setup-discovery pending (pre-staged mode, empty ledger); \
-                     yielding from process_tasks so caller can run \
-                     task.discover_items and call ingest_setup_discovery"
-                );
-                return Ok(RunOutcome::SetupPending);
-            }
-
             // Run-aborted exit: the primary broadcast
             // `ClusterMutation::RunAborted { reason }` — the failure
             // twin of RunComplete. Checked BEFORE the `run_complete`
@@ -640,11 +603,10 @@ where
 
         // All `break` statements above represent terminal exits
         // (RunComplete observed, drain-down complete after primary
-        // disconnect, single-secondary clean shutdown). The
-        // SetupPending yield uses `return Ok(RunOutcome::SetupPending)`
-        // directly, so reaching here means we're done. Record the `Done`
-        // terminal on the lifecycle (single source of truth) and report
-        // the `Terminal` control signal.
+        // disconnect, single-secondary clean shutdown), so reaching here
+        // means we're done. Record the `Done` terminal on the lifecycle
+        // (single source of truth) and report the `Terminal` control
+        // signal.
         self.enter_terminal_done();
         Ok(RunOutcome::Terminal)
     }

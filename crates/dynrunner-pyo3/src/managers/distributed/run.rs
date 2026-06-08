@@ -114,7 +114,6 @@ impl PyDistributedManager {
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
-        let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let worker_spec = self.worker_spec.clone();
@@ -141,20 +140,6 @@ impl PyDistributedManager {
         // identically.
         let forwarded_argv = self.forwarded_argv.clone();
         let source_pre_staged_root = self.source_pre_staged_root.clone();
-        // Pre-staged mode: the submitter has no local view of the
-        // staged corpus, so `_dispatch_single_process` handed us an
-        // empty binaries list and the bootstrap setup-defer handshake
-        // must tell the chosen secondary to run discovery + ledger-seed on
-        // its bind-mounted `src_network`. The Python dispatch layer is
-        // the single source of truth for "binaries empty" here — when
-        // `source_pre_staged_root.is_some()` the helper has already
-        // ensured the empty-list invariant, so we mirror the
-        // submitter-side pipeline gate without re-checking on the
-        // binaries (the `PyPrimaryCoordinator::run` gate that pairs
-        // `is_some()` with `binaries.is_empty()` defends against the
-        // SLURM pipeline path where binaries may legitimately be non-
-        // empty; that case does not exist for the in-process manager).
-        let required_setup_on_promote = source_pre_staged_root.is_some();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -236,11 +221,6 @@ impl PyDistributedManager {
         // same shape as `PyPrimaryCoordinator::run`. `Some` iff the
         // in-process primary's `run` returned `RunError::PanikShutdown`.
         let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
-        // Setup-promote deadline carried out of the detached tokio
-        // runtime — same shape as `PyPrimaryCoordinator::run`. `Some`
-        // iff the in-process primary's `run` returned
-        // `RunError::SetupDeadlineExpired`.
-        let mut setup_deadline_expired: Option<RunError> = None;
         // Pre-phase duplicate-task-id carried out of the detached tokio
         // runtime — same shape as `PyPrimaryCoordinator::run`. `Some`
         // iff the in-process primary's `run` aborted on a #3a duplicate
@@ -606,20 +586,12 @@ impl PyDistributedManager {
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     // `--source-already-staged` is a dispatch-layer
-                    // discriminator, not a SLURM-only signal: the
-                    // Python `_dispatch_single_process` helper threads
-                    // `args.source_already_staged` into the
-                    // constructor's `source_pre_staged_root` kwarg, we
-                    // hoist it onto the PrimaryConfig, and derive
-                    // `required_setup_on_promote` from
-                    // `source_pre_staged_root.is_some()`. The dispatch
-                    // helper has already returned an empty
-                    // `binaries` list in pre-staged mode, so the
-                    // chosen secondary owns the discovery + ledger-
-                    // seed via the bootstrap setup-defer handshake.
+                    // discriminator threaded through the constructor's
+                    // `source_pre_staged_root` kwarg and hoisted onto the
+                    // PrimaryConfig; it drives the secondary's pre-staged
+                    // binary resolution (the bind-mount IS the contract).
                     source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
-                    required_setup_on_promote,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     oom_retry_max_passes: dist_oom_retry_max_passes,
@@ -646,7 +618,6 @@ impl PyDistributedManager {
                     // handle side, so the value frozen here is the
                     // single source of truth for the inner loop.
                     unfulfillable_reinject_max_per_task,
-                    setup_promote_deadline: dist_setup_promote_deadline,
                     // The shared node-local run-config (the operator's
                     // `args.forwarded_argv`), seeded identically on the
                     // in-process primary and every in-process secondary so
@@ -808,9 +779,6 @@ impl PyDistributedManager {
                             RunError::PanikShutdown { matched_path, .. } => {
                                 panik_shutdown_path = Some(matched_path);
                             }
-                            e @ RunError::SetupDeadlineExpired { .. } => {
-                                setup_deadline_expired = Some(e);
-                            }
                             e @ RunError::DuplicateTaskIdPrePhase { .. } => {
                                 duplicate_task_id_pre_phase = Some(e);
                             }
@@ -858,15 +826,6 @@ impl PyDistributedManager {
                 "panik shutdown: distributed manager exiting with code 137"
             );
             std::process::exit(137);
-        }
-
-        if let Some(err) = setup_deadline_expired {
-            // Surface setup-promote deadline expiry — same shape as
-            // `PyPrimaryCoordinator::run`. Sequenced after panik
-            // (strictly stronger) and before cluster-collapsed
-            // (deadline expiry means zero tasks dispatched, so
-            // stranded accounting carries no useful operator pointer).
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
         if let Some(err) = duplicate_task_id_pre_phase {
