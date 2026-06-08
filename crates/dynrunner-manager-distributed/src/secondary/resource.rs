@@ -194,6 +194,32 @@ where
                      (threshold not yet breached)"
                 );
             }
+            // FAILOVER-B: a no-route is NOT a run-fatal error — it is a
+            // failover SIGNAL, fully recorded above into the primary-link
+            // health window. Returning the no-route `Err` here would
+            // `?`-propagate up every operational caller
+            // (`request_task_for_worker`, the TaskComplete/TaskFailed
+            // reports in `worker_event`/`dispatch`) and ABORT the run loop
+            // — deliberately killing a VOTER on primary-loss instead of
+            // letting `run_election_tick` enter `Suspecting`. A primary
+            // death MUST recover via election, never abort. So we ABSORB
+            // the no-route into `Ok(())`: the undelivered report is
+            // re-driven by the post-failover authority's retry cascade
+            // (the secondary holds no authority and owns no requeue), and
+            // the loop continues so the election (already armed) runs.
+            //
+            // This is the NO-ROUTE abort — DISTINCT from the
+            // `mesh_degraded` split-brain guard in `run_election_tick`,
+            // which is preserved: a genuinely-lone (zero-peer) secondary
+            // still bails there rather than self-promoting on `quorum=1`.
+            //
+            // `send_to(Destination::Primary, …)` errors ONLY on no-route
+            // (the two branches in `send_to`'s no-route gate; the queued
+            // `MeshClient::send` never surfaces a wire-level error here),
+            // so absorbing the `Err` discards no other error class. The
+            // `Result` return is retained for a future genuinely-fatal
+            // primary-bound send class, should one ever exist.
+            return Ok(());
         }
         result
     }

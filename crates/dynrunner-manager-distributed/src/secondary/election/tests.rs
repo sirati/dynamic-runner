@@ -25,6 +25,268 @@ const PAST_DEATH: Duration = Duration::from_millis(110);
 /// progress to a vote.
 const ONE_INTERVAL: Duration = Duration::from_millis(60);
 
+// ── Phase 6a: failover-B (no-route → ALWAYS elect) + adaptive quorum ──
+
+/// Failover-B: a "no route to primary" must ALWAYS enter the election and
+/// NEVER deliberately abort a VOTER. The no-route is recorded into the
+/// failover-health probe and ABSORBED into `Ok(())` (it is a failover
+/// signal, not a run-fatal error). Pre-fix, `send_to_primary` returned the
+/// no-route `Err`, which `?`-propagated up every operational caller
+/// (`request_task_for_worker`, the worker-event TaskComplete/TaskFailed
+/// reports) and aborted `process_tasks` — killing a voter on primary-loss
+/// instead of letting the election run. This pins: (1) `send_to_primary`
+/// returns `Ok(())` on no-route (no voter-abort), (2) the probe still arms,
+/// (3) the next `run_election_tick` enters Suspecting (the recovery path),
+/// (4) `fatal_exit` is NOT set (the no-route abort is gone; only the
+/// `mesh_degraded` guard — a SEPARATE concern, not exercised here since a
+/// peer is present — would set it).
+#[tokio::test(flavor = "current_thread")]
+async fn no_route_enters_election_and_never_aborts_a_voter() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+    // A surviving peer so the election is non-degraded (can elect) — the
+    // no-route concerns the PRIMARY link, distinct from peer-mesh liveness.
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    // A recognized primary so `Destination::Primary` resolves to a concrete
+    // peer id; `make_secondary`'s NoPeers transport has no member for it, so
+    // every primary-bound send no-routes at the egress `has_peer` gate.
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    // Drive the no-route past the count threshold (3 in election_config).
+    // EACH send must return Ok — the no-route is absorbed, never aborting
+    // the voter — while arming the failover-health probe as a side effect.
+    let probe = || DistributedMessage::<super::super::test_helpers::TestId>::Keepalive {
+        target: None,
+        sender_id: "sec-a".into(),
+        timestamp: timestamp_now(),
+        secondary_id: "sec-a".into(),
+        active_workers: 0,
+        emitter_role: KeepaliveRole::Secondary,
+    };
+    for _ in 0..3 {
+        assert!(
+            sec.send_to_primary(probe()).await.is_ok(),
+            "a no-route to primary must NOT abort the voter — it is a \
+             failover signal absorbed into Ok(())",
+        );
+    }
+    assert!(
+        sec.op_mut().primary_link.should_arm_failover(),
+        "three no-route sends must arm the failover-health probe",
+    );
+
+    // The recovery path: the election ENTERS Suspecting (it does not abort).
+    let actions = sec.run_election_tick();
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Suspecting { .. }),
+        "a no-route must enter the election (Suspecting), never abort; got {:?}",
+        std::mem::discriminant(&sec.op_mut().election),
+    );
+    assert!(
+        actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { target: _, .. })),
+        "entering Suspecting must broadcast a TimeoutQuery",
+    );
+    assert!(
+        sec.fatal_exit.is_none(),
+        "no-route with a live peer must NOT fatal-exit the voter (the \
+         mesh_degraded split-brain guard is a SEPARATE, un-exercised path)",
+    );
+}
+
+/// Adaptive quorum — the 2-node-trap fix. A 3-node fleet (1 primary + 2
+/// secondaries) loses its primary. From a survivor's view the live-peer
+/// set is the ONE other survivor (`live_peer_ids` excludes the dead
+/// primary), so `failover_quorum(1) == 2`, reachable by self + the one
+/// surviving peer. This is the substance of pillar 5(a): the quorum
+/// denominator is the CURRENT live set (which shrank symmetrically on the
+/// partition), never a fixed `config.num_secondaries`. The survivor
+/// reaches quorum, self-promotes, and a single peer confirm completes the
+/// promotion.
+#[tokio::test(flavor = "current_thread")]
+async fn two_survivor_fleet_reaches_quorum_and_promotes() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+    // Exactly ONE surviving peer → live-fleet of two (self + sec-b).
+    sec.op_mut()
+        .peer_keepalives
+        .insert("sec-b".into(), std::time::Instant::now());
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    // Sanity-pin the adaptive rule on this fleet size BEFORE driving it: a
+    // 2-survivor fleet (live_peer_count == 1) needs quorum 2, met by self +
+    // one peer.
+    assert_eq!(
+        failover_quorum(1),
+        2,
+        "a 2-survivor fleet (1 live peer) must reach quorum with self + 1 peer",
+    );
+
+    tokio::time::sleep(PAST_DEATH).await;
+    let actions = sec.run_election_tick();
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
+    assert!(
+        actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { target: _, .. }))
+    );
+
+    tokio::time::sleep(ONE_INTERVAL).await;
+    // The one surviving peer agrees the primary is silent.
+    sec.record_timeout_response("sec-b".into(), None);
+
+    // Tally: agreeing = self(1) + sec-b(1) = 2 == quorum → Candidate (sec-a
+    // is the lowest live id).
+    sec.run_election_tick();
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Candidate { .. }),
+        "a 2-survivor fleet reaches quorum on the adaptive (live-fleet) rule",
+    );
+
+    // One peer confirm + the candidate's own vote = quorum 2 → promote.
+    let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+    assert!(
+        promoted,
+        "self + one peer confirm meets the adaptive quorum (2) → promote",
+    );
+    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
+}
+
+/// The split-brain guard HOLDS: a genuinely-lone (zero-peer) secondary must
+/// NOT self-promote on `quorum == 1`. `failover_quorum(0) == 1` is the
+/// majority arithmetic for a lone node, which WOULD let it elect itself
+/// solo — a split-brain. That self-promotion is blocked UPSTREAM by the
+/// `mesh_degraded` guard in `run_election_tick`: with the mesh degraded and
+/// the primary suspected dead, the tick FATAL-EXITS (no peer to coordinate
+/// with → unsalvageable) rather than transitioning the election. This is
+/// the guard the failover-B "always elect" change deliberately PRESERVES —
+/// the no-route → elect path applies to a fleet WITH peers, never to a lone
+/// secondary.
+#[tokio::test(flavor = "current_thread")]
+async fn lone_secondary_does_not_self_promote_on_quorum_one() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+    // ZERO peers, and the mesh is degraded (the watchdog latched it: no
+    // peer-secondary ever formed a mesh).
+    sec.mesh.degraded = true;
+    sec.mesh.peer_dial_count = 2;
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    // Document the arithmetic the guard intercepts: a lone node would
+    // compute quorum 1 and self-promote — exactly the split-brain the
+    // mesh_degraded guard exists to stop.
+    assert_eq!(
+        failover_quorum(0),
+        1,
+        "a lone secondary's bare majority arithmetic is quorum 1 (self only) \
+         — the split-brain the mesh_degraded guard blocks UPSTREAM",
+    );
+
+    // Primary suspected dead (backdate past the patient backstop).
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+
+    // The tick hits the mesh_degraded guard BEFORE any tally: it must
+    // fatal-exit, NOT transition toward Candidate/Promoted.
+    let _actions = sec.run_election_tick();
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "the mesh_degraded guard must NOT transition the election (no \
+         Suspecting/Candidate/Promoted); a lone secondary never tallies",
+    );
+    let reason = sec
+        .fatal_exit
+        .as_ref()
+        .expect("a lone (zero-peer) secondary suspecting primary death must \
+                 fatal-exit the split-brain guard, never self-promote");
+    assert!(
+        reason.contains("peer mesh required for failover"),
+        "the guard's reason must name the degraded-failover bail; got: {reason}",
+    );
+}
+
+/// Single-source quorum rule (pillar 5(a)): `failover_quorum` is the ONE
+/// home for the `live_peer_count.div_ceil(2) + 1` formula, so the
+/// Suspecting tally and the PromotionConfirm tally cannot desync (a desync
+/// only manifests on a LIVE failover — not locally reproducible). Pin the
+/// values across fleet sizes (each `live_peer_count` is the count EXCLUDING
+/// the voter itself, which the callers add via `+1`):
+///   - 0 live peers (lone): quorum 1 (self) — gated by mesh_degraded.
+///   - 1 live peer (2-survivor): quorum 2 (self + 1) — the 2-node-trap fix.
+///   - 2 live peers (3-survivor): quorum 2 (self + 1 of 2).
+///   - 3 live peers (4-survivor): quorum 3 (self + 2 of 3).
+#[test]
+fn failover_quorum_single_source_values() {
+    assert_eq!(failover_quorum(0), 1);
+    assert_eq!(failover_quorum(1), 2);
+    assert_eq!(failover_quorum(2), 2);
+    assert_eq!(failover_quorum(3), 3);
+    assert_eq!(failover_quorum(4), 3);
+    assert_eq!(failover_quorum(5), 4);
+}
+
+/// Single-source guard (no duplicated logic, CLAUDE.md): the quorum formula
+/// `div_ceil(2) + 1` must appear EXACTLY ONCE in the secondary source — in
+/// `failover_quorum`'s body in `election/mod.rs` — and NOWHERE in
+/// `election/coordinator.rs` (both the Suspecting tally and the
+/// PromotionConfirm tally must read the function, not re-spell the formula).
+/// A re-introduced copy would desync only on a live failover (not locally
+/// reproducible), so this test catches the regression at compile-test time.
+/// Matches the code token `.div_ceil(2)` — robust to comments mentioning
+/// the formula because those write `peer_count.div_ceil(2)` / a literal
+/// digit, not the bare method-call token on its own.
+#[test]
+fn failover_quorum_formula_is_single_source() {
+    let coordinator = include_str!("coordinator.rs");
+    let coord_hits = coordinator.matches(".div_ceil(2)").count();
+    assert_eq!(
+        coord_hits, 0,
+        "election/coordinator.rs must NOT spell the quorum formula — both \
+         tally sites read `failover_quorum`; found {coord_hits} occurrence(s)",
+    );
+
+    let election_mod = include_str!("mod.rs");
+    // Count the formula as a CODE token (`div_ceil(2) + 1`), not the prose
+    // mentions of it in the function's doc comment.
+    let mod_hits = election_mod.matches("div_ceil(2) + 1").count();
+    // The body has it once; the doc comment mentions `div_ceil(2) + 1` in
+    // prose, so the total is the body + the prose mentions — the load-bearing
+    // assertion is the ZERO in coordinator.rs above. Here we only pin that
+    // the rule still LIVES in mod.rs (≥1), so a future move that empties
+    // mod.rs without updating this test fails loud.
+    assert!(
+        mod_hits >= 1,
+        "the quorum rule must live in election/mod.rs (failover_quorum); \
+         found {mod_hits} occurrence(s)",
+    );
+}
+
 /// Scenario (b): primary stops sending keepalives. The lowest-id
 /// secondary observes the death, runs the election, collects quorum,
 /// and promotes itself.
