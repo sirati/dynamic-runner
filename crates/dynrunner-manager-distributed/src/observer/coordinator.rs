@@ -5,11 +5,14 @@
 //! Own the lifecycle of a ZERO-AUTHORITY observer node: hold the
 //! replicated [`ClusterState`] mirror, apply (never originate) every
 //! mutation that flows through the mesh, narrate the run for the operator,
-//! and exit on the run's terminal — or, when the run is stranded, on one
-//! of the strand backstops. The observer is its OWN role/component: it has
-//! no scheduler, no worker pool, no dispatch authority, and originates no
-//! `PrimaryChanged`. It is NOT a [`crate::SecondaryCoordinator`] in a
-//! mode — there is no `is_observer` flag anywhere on this type.
+//! and exit ONLY on a run terminal it OBSERVED (the primary's RunComplete /
+//! RunAborted verdict, or its own local panik). A loss of the observer's
+//! OWN transport visibility is NEVER a terminal — it is reported + retried
+//! (BUG-B; see [`crate::observer::lost_visibility`]). The observer is its
+//! OWN role/component: it has no scheduler, no worker pool, no dispatch
+//! authority, and originates no `PrimaryChanged`. It is NOT a
+//! [`crate::SecondaryCoordinator`] in a mode — there is no `is_observer`
+//! flag anywhere on this type.
 //!
 //! # Module boundary
 //!
@@ -17,8 +20,9 @@
 //! an [`ObserverHandoff`]) construct via [`ObserverCoordinator::new`]
 //! (cold-join) or [`ObserverCoordinator::from_handoff`] (relocation) and
 //! drive the single [`ObserverCoordinator::run`] loop. Everything else —
-//! the backstop clocks, the apply-only mirror, the send wrapper, the
-//! teardown discipline — is private. The observer COMPOSES the
+//! the visibility-recheck clock, the lost-visibility reporter, the
+//! apply-only mirror, the send wrapper, the teardown discipline — is
+//! private. The observer COMPOSES the
 //! role-agnostic primitives (`anti_entropy`, `run_narrator`,
 //! `panik_watcher`, `observer::{announcer, reporting, failure_response,
 //! lifecycle}`, `task_completed`) rather than re-implementing any of them.
@@ -33,21 +37,27 @@
 //! snapshot request, the anti-entropy digest, the resource-holdings
 //! announce, and (on panik) a self-departure `PeerRemoved`.
 //!
-//! # Top-of-loop ordering invariant (load-bearing — see the spec §9)
+//! # Top-of-loop ordering invariant (load-bearing)
 //!
 //! Each iteration, BEFORE awaiting events:
 //!   1. narrate (emit any pending phase / summary line),
-//!   2. `run_aborted()` ⇒ exit 1 (checked FIRST),
-//!   3. `run_complete()` ⇒ exit 0,
-//!   4. transport-closed with peers present ⇒ exit 0,
-//!   5. zero peers ⇒ accumulate fleet-dead grace ⇒ `Err` on expiry,
-//!   6. named primary silent past `peer_timeout` ⇒ `Err`.
+//!   2. `run_aborted()` ⇒ exit 1 (checked FIRST) — the PRIMARY's verdict,
+//!   3. `run_complete()` ⇒ exit 0 — the PRIMARY's verdict,
+//!   4. otherwise compute the observer's own VISIBILITY (any peer
+//!      reachable + the named primary not silent) and feed the
+//!      [`LostVisibilityReporter`] — which REPORTS lost / retrying and
+//!      NEVER exits.
 //!
-//! This guarantees `run_complete`/`run_aborted` always win over any
-//! strand; a closed-transport-with-peers is clean; only
-//! zero-peers-no-RunComplete becomes the fleet-dead strand; the
-//! primary-silence backstop catches the half-open-peer case the
-//! fleet-dead grace cannot see.
+//! The observer terminates ONLY on an OBSERVED run-terminal: `run_complete`
+//! (Done), `run_aborted` (Aborted — the primary's broadcast verdict), or
+//! its OWN local panik (137). It carries ZERO authority over the run, so
+//! its loss of transport visibility — zero peers, a silent named primary,
+//! a by-design `-R` setup-tunnel drop after relocation — is NEVER a run
+//! verdict: it is reported as "connection lost, retrying" while the
+//! transport's role-blind reconnect ticker redials underneath, and the
+//! observer keeps observing until the primary's terminal converges into
+//! the CRDT (or the run truly ends, observed). See
+//! [`crate::observer::lost_visibility`].
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -68,6 +78,7 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
+use crate::observer::lost_visibility::{LostVisibilityReporter, Visibility};
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
@@ -80,23 +91,27 @@ use crate::task_completed::{
 };
 
 /// Configuration for a standalone observer. Carries only the values the
-/// observer's own concerns read: the node identity, the strand-backstop
-/// thresholds, the setup-promote deadline + its gate, and the panik
-/// trigger inputs. It carries NO scheduler / worker / dispatch fields —
-/// an observer has none of those concerns.
+/// observer's own concerns read: the node identity, the lost-visibility
+/// report thresholds, and the panik trigger inputs. It carries NO scheduler
+/// / worker / dispatch fields — an observer has none of those concerns.
 #[derive(Debug, Clone)]
 pub struct ObserverConfig {
     /// This observer's own peer-id — the bootstrap-RPC return address and
     /// the `local_id` the send edge resolves loopback against (the
     /// observer never loops back, but the resolver still needs it).
     pub node_id: String,
-    /// Fleet-dead grace (§1). The window after the LAST peer leaves the
-    /// mesh before the observer exits a stranded run. Doubles as the
-    /// poll-tick cadence so a fully-silent observer still re-checks.
+    /// Visibility re-check cadence. The interval at which the run loop
+    /// re-evaluates its visibility (and the [`LostVisibilityReporter`]
+    /// emits its recurrence report) even with zero inbound traffic. This is
+    /// NO LONGER a death timer (BUG-B): an observer that sees no peer
+    /// reports lost-connection and keeps observing, it never strands the
+    /// run on this window.
     pub fleet_dead_timeout: Duration,
-    /// Primary-silence threshold (§2). The window a NAMED primary may be
-    /// silent (no `Primary` keepalive, no `PrimaryChanged` re-point)
-    /// before the observer exits a stranded run.
+    /// Named-primary silence threshold. The window a NAMED primary may be
+    /// silent (no `Primary` keepalive, no `PrimaryChanged` re-point reaching
+    /// THIS observer) before the observer REPORTS lost-visibility to the
+    /// primary. NOT a strand: the observer keeps observing and retrying;
+    /// the run verdict is the primary's, never the observer's view (BUG-B).
     pub peer_timeout: Duration,
     /// Panik trigger paths (sentinel files). Empty disables the file
     /// trigger.
@@ -126,7 +141,7 @@ where
     pub cluster_state: ClusterState<I>,
     /// This observer's peer-id.
     pub node_id: String,
-    /// The strand-backstop thresholds.
+    /// The lost-visibility report thresholds + panik inputs.
     pub deadlines: ObserverConfig,
     /// The phases the pre-relocation emitter already announced as started
     /// — the `RunNarrator::with_started_phases` seed so the observer does
@@ -416,42 +431,17 @@ where
         0
     }
 
-    /// Build the STRUCTURED strand-collapse error for a strand backstop
-    /// (fleet-dead / primary-silence): the run loop is exiting with tasks the
-    /// CRDT ledger left non-terminal. Typed as [`RunError::ClusterCollapsed`]
-    /// (NOT a generic `Other`) so the PyO3 boundary's uniform terminal
-    /// mapping RAISES on it — a strand must surface non-zero, never be
-    /// log-and-swallowed (the §14/§15 fleet-collapse contract). Carries the
-    /// CRDT-converged per-class breakdown + the stranded count (`task_count -
-    /// terminal`), the same shape the primary's `ClusterCollapsed` renders.
-    /// `detail` names which backstop fired for the operator log.
-    fn strand_collapsed(&self, detail: String) -> RunError {
-        let outcome = self.cluster_state.outcome_counts();
-        let stranded = self
-            .cluster_state
-            .task_count()
-            .saturating_sub(outcome.total_terminal());
-        tracing::error!(stranded, %detail, "observer strand — surfacing ClusterCollapsed");
-        let err = RunError::ClusterCollapsed { stranded, outcome };
-        // Backstop the fully-partitioned case (the observer can't receive
-        // the primary's `RunAborted` broadcast, so the narrator never
-        // projects the abort onto the important channel): emit the terminal
-        // reason on `IMPORTANT_TARGET` directly so the strand is never
-        // silent there.
-        self.emit_terminal_reason_important(&err.to_string());
-        err
-    }
-
     /// Emit a run-terminal reason on the [`IMPORTANT_TARGET`] channel.
     ///
-    /// The observer's own exit arms (strand backstop, setup-deadline,
-    /// fatal-policy, panik) reach this when the run ends WITHOUT a CRDT
-    /// terminal the narrator could project — the connected case is already
-    /// covered (the primary broadcasts `RunComplete` / `RunAborted` and the
-    /// narrator emits the summary on `IMPORTANT_TARGET`), but a partitioned
-    /// observer never sees that broadcast. One emit site, one line per arm,
-    /// so "every run-terminal reason reaches the important channel" holds on
-    /// both the connected and the partitioned path.
+    /// The observer's own LOCAL exit arms (fatal-policy, panik) reach this
+    /// when the run ends WITHOUT a CRDT terminal the narrator could project
+    /// — the connected case is already covered (the primary broadcasts
+    /// `RunComplete` / `RunAborted` and the narrator emits the summary on
+    /// `IMPORTANT_TARGET`). Visibility loss does NOT reach this (it is not a
+    /// terminal — see [`crate::observer::lost_visibility`]). One emit site,
+    /// one line per local terminal arm, so "every run-terminal reason
+    /// reaches the important channel" holds on both the connected and the
+    /// partitioned path.
     fn emit_terminal_reason_important(&self, reason: &str) {
         tracing::error!(
             target: IMPORTANT_TARGET,
@@ -523,11 +513,13 @@ where
         self.client.send(send_target, msg.with_target(dst))
     }
 
-    /// Drive the observer until the run terminates or a strand backstop
-    /// fires. THIN DRIVER: a `select!` loop whose arms delegate to named
-    /// per-concern methods + the inline reporter / failure-policy / panik
-    /// arms. Returns the run terminal; the strand backstops surface as
-    /// `Err`.
+    /// Drive the observer until it OBSERVES a run terminal (the primary's
+    /// RunComplete/RunAborted, or its own local panik). THIN DRIVER: a
+    /// `select!` loop whose arms delegate to named per-concern methods + the
+    /// inline reporter / failure-policy / panik arms. Returns the observed
+    /// run terminal; a local policy abort (the invalid-task monitor)
+    /// surfaces as `Err`. A loss of the observer's own visibility is NEVER a
+    /// terminal — it is reported + retried (BUG-B).
     pub async fn run(&mut self) -> Result<ObserverTerminal, RunError>
     where
         Self: 'static,
@@ -647,8 +639,8 @@ where
             if let Err(e) = self.send_to(Destination::Primary, req).await {
                 tracing::warn!(
                     error = %e,
-                    "observer bootstrap snapshot request failed; relying on backstops + \
-                     anti-entropy / late snapshot heal"
+                    "observer bootstrap snapshot request failed; relying on \
+                     anti-entropy / late snapshot heal + reconnect"
                 );
             }
         }
@@ -658,21 +650,26 @@ where
         // (cp the late-joiner inner-async-block idiom — NO
         // cleanup-before-each-return).
         let loop_result: Result<ObserverTerminal, RunError> = async {
-            // ── Backstop clocks ──
+            // ── Loop-local state ──
             let mut narrator =
                 RunNarrator::with_started_phases(std::mem::take(&mut self.started_phases));
-            let mut fleet_dead_since: Option<Instant> = None;
+            // The report-lost-and-keep-observing state machine (BUG-B): the
+            // observer's loss of its OWN transport view is reported + retried,
+            // NEVER a run verdict — see [`crate::observer::lost_visibility`].
+            let mut visibility_reporter = LostVisibilityReporter::new();
             let mut primary_last_seen = Instant::now();
             let mut transport_closed = false;
 
-            // Fleet-dead poll tick (§1): same cadence as the grace; the
-            // immediate tick (fires at t=0) is consumed so the cadence
-            // starts one full interval out and the tick carries no work —
-            // it only re-drives the loop so the top-of-loop check
-            // re-evaluates.
-            let mut fleet_dead_tick = tokio::time::interval(self.config.fleet_dead_timeout);
-            fleet_dead_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let _ = fleet_dead_tick.tick().await;
+            // Visibility re-check poll tick: the same cadence as before, but
+            // it is NO LONGER a death timer — it only re-drives the loop so
+            // the top-of-loop visibility check re-evaluates (and the
+            // lost-visibility recurrence report fires) even when no inbound
+            // frame arrives. The immediate tick (fires at t=0) is consumed so
+            // the cadence starts one full interval out; the tick carries no
+            // work.
+            let mut visibility_recheck_tick = tokio::time::interval(self.config.fleet_dead_timeout);
+            visibility_recheck_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let _ = visibility_recheck_tick.tick().await;
 
             // Anti-entropy tick (item 3): per-node-jittered cadence; Skip +
             // immediate-tick-consume so a converged mesh's digest traffic
@@ -684,8 +681,9 @@ where
 
             // AE-3 snapshot-recovery tick (D-C / C9): an INDEPENDENT timer,
             // distinct from the digest broadcast above, on the SAME proven
-            // per-node-jittered period (bounded by `peer_timeout` so a
-            // configured period never exceeds the strand window). Each tick
+            // per-node-jittered period (bounded by `peer_timeout` so the
+            // recovery probe re-pulls at least as often as the named-primary
+            // silence-report threshold). Each tick
             // re-pulls a snapshot from a rotating known peer iff still behind
             // its last-seen digest — this is what re-converges a WARN-dropped
             // steady-state decode. Skip + immediate-tick-consume mirrors the
@@ -708,13 +706,16 @@ where
                 // Keep the reporter's cell fresh with the live projection.
                 snapshot_publisher.publish(StatsSnapshot::from_cluster_state(&self.cluster_state));
 
-                // 2. Terminal backstop block (top-of-loop). Ordering is
-                //    load-bearing — see the module + spec §9.
-                if let Some(terminal) =
-                    self.evaluate_exit(transport_closed, &mut fleet_dead_since, primary_last_seen)?
-                {
+                // 2. Observed-terminal block (top-of-loop). The observer
+                //    terminates ONLY on an OBSERVED run-terminal (the
+                //    primary's RunComplete/RunAborted, or its own panik); a
+                //    loss of the observer's OWN transport visibility is fed to
+                //    the lost-visibility reporter (report-and-retry, NEVER an
+                //    exit). Ordering is load-bearing — see the module header.
+                if let Some(terminal) = self.evaluate_exit(transport_closed) {
                     return Ok(terminal);
                 }
+                visibility_reporter.observe(&self.current_visibility(primary_last_seen));
 
                 // 3. Await events.
                 tokio::select! {
@@ -727,16 +728,20 @@ where
                                 self.on_inbound(msg, &mut primary_last_seen).await;
                             }
                             None => {
-                                // Latch + disable this arm; the exit
-                                // decision is made at top-of-loop (§4). A
-                                // `None` is the role's teardown signal (every
-                                // write end of the slot's inbound dropped).
+                                // Latch + disable this arm; the
+                                // closed-transport-with-peers clean-exit
+                                // decision is made at top-of-loop. A `None` is
+                                // the role's teardown signal (every write end
+                                // of the slot's inbound dropped).
                                 transport_closed = true;
                             }
                         }
                     }
-                    // Fleet-dead poll tick (§1): no work — just re-drives.
-                    _ = fleet_dead_tick.tick() => {}
+                    // Visibility re-check poll tick: no work — it only
+                    // re-drives the loop so the top-of-loop visibility check
+                    // re-evaluates + the lost-visibility recurrence report
+                    // fires even with zero inbound traffic.
+                    _ = visibility_recheck_tick.tick() => {}
                     // Anti-entropy tick (item 3): broadcast our digest.
                     _ = ae_tick.tick() => {
                         self.on_anti_entropy_tick().await;
@@ -811,72 +816,81 @@ where
         loop_result
     }
 
-    /// Top-of-loop terminal backstop block (the single exit decision
-    /// point). Ordering is load-bearing (spec §9). Returns `Some(terminal)`
-    /// for a clean exit, `Err` for a strand, `None` to keep looping.
-    fn evaluate_exit(
-        &self,
-        transport_closed: bool,
-        fleet_dead_since: &mut Option<Instant>,
-        primary_last_seen: Instant,
-    ) -> Result<Option<ObserverTerminal>, RunError> {
-        // 2. Aborted FIRST (§5 / BUG-1): never narrate/exit as completed.
+    /// Top-of-loop OBSERVED-terminal block (the single exit decision
+    /// point). The observer terminates ONLY on a terminal it OBSERVED — the
+    /// primary's `RunAborted` / `RunComplete` verdict, or the
+    /// closed-transport-with-peers clean tail. It carries ZERO authority
+    /// over the run, so it NEVER returns an `Err`: a loss of the observer's
+    /// own transport visibility is handled separately by the
+    /// [`LostVisibilityReporter`] (report-and-retry, NEVER an exit — BUG-B).
+    /// Returns `Some(terminal)` for a clean observed exit, `None` to keep
+    /// observing.
+    fn evaluate_exit(&self, transport_closed: bool) -> Option<ObserverTerminal> {
+        // 1. Aborted FIRST (BUG-1): never narrate/exit as completed. This is
+        //    the PRIMARY's verdict, broadcast cluster-wide and converged into
+        //    the observer's CRDT — the run's authority, faithfully relayed.
         if let Some(reason) = self.cluster_state.run_aborted() {
-            return Ok(Some(ObserverTerminal::Aborted {
+            return Some(ObserverTerminal::Aborted {
                 reason: reason.to_string(),
-            }));
+            });
         }
-        // 3. Complete → clean exit 0.
+        // 2. Complete → clean exit 0. Also the PRIMARY's verdict.
         if self.cluster_state.run_complete() {
-            return Ok(Some(ObserverTerminal::Done));
+            return Some(ObserverTerminal::Done);
         }
-        // 4. Closed transport with peers present → clean exit 0 (§4-int).
-        //    Read off the mesh client's pump-published `MembershipView`
-        //    (≤1-cycle stale, monotone-toward-truth — it republishes the
-        //    whole live set each pump cycle, so it can never MISS a remove).
-        //    This is a clean-EXIT permit, NEVER a death trigger: a
-        //    stale-HIGH count only delays a clean exit by one cycle, and a
-        //    stale-LOW count falls through to the timeout-gated grace at
-        //    step 5 (which a ≤1-cycle blip cannot drive to fire — the count
-        //    corrects within one cycle and clears the grace at line below).
-        //    So no strand decision keys on a live-vs-stale distinction.
-        let peer_count = self.client.peer_count();
-        if transport_closed && peer_count > 0 {
-            return Ok(Some(ObserverTerminal::Done));
+        // 3. Closed transport with peers present → clean exit 0. Read off
+        //    the mesh client's pump-published `MembershipView` (≤1-cycle
+        //    stale, monotone-toward-truth — it republishes the whole live set
+        //    each pump cycle, so it can never MISS a remove). This is the
+        //    role's teardown tail: the inbound closed but the wire still has
+        //    peers (a clean shutdown), so the observer rides out cleanly. A
+        //    stale-HIGH count only delays this by one cycle; a closed
+        //    transport with ZERO peers is NOT an exit — it falls through to
+        //    the lost-visibility reporter (report-and-retry), never a strand.
+        if transport_closed && self.client.peer_count() > 0 {
+            return Some(ObserverTerminal::Done);
         }
-        // 5. Fleet-dead grace (§1). Capture-once on first emptiness; clear
-        //    on any non-empty observation (a partial recovery resets the
-        //    grace). Fires `Err` when the grace elapses. This also OWNS the
-        //    closed-transport-with-zero-peers strand (§4-int): a closed
-        //    transport does not short-circuit to Ok here — it falls through.
-        if peer_count == 0 {
-            let since = *fleet_dead_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= self.config.fleet_dead_timeout {
-                return Err(self.strand_collapsed(format!(
-                    "fleet-dead: every peer left the mesh and no RunComplete was \
-                     broadcast within {:.1}s",
+        None
+    }
+
+    /// Compute the observer's CURRENT visibility into the run for the
+    /// [`LostVisibilityReporter`]. Visibility is LOST when the observer can
+    /// see NO peer (fleet empty — its `-R` setup tunnel dropped, or the
+    /// gateway link blipped) OR a NAMED primary has been silent past the
+    /// configured threshold with no terminal. Neither is the cluster dying:
+    /// the compute mesh runs autonomously over its direct links. This is a
+    /// PURE classification (no exit, no `Err`); the reporter owns the
+    /// report-and-retry cadence.
+    fn current_visibility(&self, primary_last_seen: Instant) -> Visibility {
+        // Fleet empty: the observer has no reachable peer (its own transport
+        // view collapsed). The transport's role-blind reconnect ticker is
+        // already redialling underneath; the observer just reports + waits.
+        if self.client.peer_count() == 0 {
+            return Visibility::Lost {
+                reason: format!(
+                    "no reachable peer (the observer's transport view is empty for \
+                     ≥{:.1}s); the compute mesh continues over its direct links",
                     self.config.fleet_dead_timeout.as_secs_f64()
-                )));
-            }
-        } else {
-            *fleet_dead_since = None;
+                ),
+            };
         }
-        // 6. Primary-silence backstop (§2): only when a primary is NAMED
-        //    and it has been silent past `peer_timeout` with no RunComplete.
-        //    Independent of `peer_count()` (un-pruned for an apply-only
-        //    observer that never sends).
+        // Named-primary silence: a primary is NAMED but its keepalives /
+        // re-points stopped reaching this observer past `peer_timeout`. The
+        // half-open-link case the empty-fleet check cannot see. Still not a
+        // death — the primary is reachable from its own mesh; the observer
+        // lost ITS path to the primary's signals.
         if let Some(primary) = self.cluster_state.current_primary()
             && primary_last_seen.elapsed() > self.config.peer_timeout
-            && !self.cluster_state.run_complete()
         {
-            let detail = format!(
-                "primary-silence: current primary {primary} silent for {:.0}s with no \
-                 RunComplete",
-                primary_last_seen.elapsed().as_secs_f64()
-            );
-            return Err(self.strand_collapsed(detail));
+            return Visibility::Lost {
+                reason: format!(
+                    "named primary {primary} silent for {:.0}s (no keepalive / re-point \
+                     reaching this observer)",
+                    primary_last_seen.elapsed().as_secs_f64()
+                ),
+            };
         }
-        Ok(None)
+        Visibility::Visible
     }
 
     /// Dispatch one inbound mesh frame. Apply-only: the observer mirrors

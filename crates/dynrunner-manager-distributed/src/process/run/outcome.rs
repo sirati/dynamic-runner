@@ -122,13 +122,50 @@ pub(super) fn finalize_observer(
 }
 
 /// Map an observer's run disposition onto the role-agnostic [`RunTerminal`].
-/// The observer's clean terminals map 1:1; a strand-backstop / fatal-exit
-/// `Err` becomes `Failed`.
+///
+/// # The verdict-authority sever (BUG-B — there are never two authorities)
+///
+/// The observer carries ZERO authority over the run. Its terminals are
+/// either the PRIMARY's verdict it OBSERVED (`Done` from `RunComplete`,
+/// `Aborted` from the broadcast `RunAborted`) or a LOCAL operator/policy
+/// terminal on its own host (`Panik`, or a `FatalPolicyExit` `Err` from its
+/// invalid-task monitor). The observer's loss of its OWN transport
+/// visibility — zero peers, a silent named primary, the by-design `-R`
+/// setup-tunnel drop after relocation — is NEVER a terminal at all (the
+/// observer reports-and-retries instead of exiting; see
+/// [`crate::observer::lost_visibility`]), so it can never reach this mapping.
+///
+/// LOAD-BEARING INVARIANT: a [`RunError::ClusterCollapsed`] must NEVER be
+/// the run's verdict via the observer. The compute primary is the SOLE
+/// authority that can declare the cluster collapsed; the observer's own
+/// view collapsing is not the cluster collapsing. The observer never
+/// CONSTRUCTS a `ClusterCollapsed` (the strand backstops were removed), so
+/// this arm is unreachable in practice — but the boundary RE-TYPES any
+/// stray `ClusterCollapsed` into a non-cluster `FatalPolicyExit` rather
+/// than letting an observer reap the run as collapsed, keeping the sever
+/// total even against a future regression.
 fn observer_terminal(run_result: Result<ObserverTerminal, RunError>) -> RunTerminal {
     match run_result {
         Ok(ObserverTerminal::Done) => RunTerminal::Done,
         Ok(ObserverTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
         Ok(ObserverTerminal::Panik { matched_path }) => RunTerminal::Panik { matched_path },
+        // A genuine LOCAL policy abort (the invalid-task monitor) surfaces
+        // non-zero as itself.
+        Err(error @ RunError::FatalPolicyExit { .. }) => RunTerminal::Failed { error },
+        // The verdict-authority sever: an observer must NEVER produce the
+        // run's `ClusterCollapsed` verdict (it has no authority to declare
+        // the cluster dead). The source never builds one; if a future change
+        // reintroduces it, re-type it so the observer cannot reap the run as
+        // collapsed.
+        Err(RunError::ClusterCollapsed { stranded, .. }) => RunTerminal::Failed {
+            error: RunError::FatalPolicyExit {
+                reason: format!(
+                    "observer surfaced a ClusterCollapsed ({stranded} stranded) — re-typed: \
+                     an observer has zero authority to declare the cluster collapsed; the run \
+                     verdict belongs to the primary"
+                ),
+            },
+        },
         Err(error) => RunTerminal::Failed { error },
     }
 }
@@ -165,5 +202,74 @@ pub(super) fn secondary_terminal(
         Err(reason) => RunTerminal::Failed {
             error: RunError::FatalPolicyExit { reason },
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster_state::OutcomeSummary;
+
+    /// BUG-B verdict-authority sever: an observer's run result must NEVER
+    /// map to a run-failing `ClusterCollapsed` verdict. The observer never
+    /// constructs one (its strand backstops were removed — see
+    /// `crate::observer::lost_visibility`), but the boundary itself must be
+    /// the second line of defence: even if a `ClusterCollapsed` somehow
+    /// reaches the observer mapping, it is RE-TYPED so the observer cannot
+    /// reap the run as collapsed. This pins the severed edge at the type
+    /// boundary the PyO3 verdict reads.
+    #[test]
+    fn observer_cluster_collapsed_is_never_the_run_verdict() {
+        let terminal = observer_terminal(Err(RunError::ClusterCollapsed {
+            stranded: 7,
+            outcome: OutcomeSummary::default(),
+        }));
+        // It MUST NOT carry a `ClusterCollapsed` into the run verdict.
+        match terminal {
+            RunTerminal::Failed {
+                error: RunError::ClusterCollapsed { .. },
+            } => panic!(
+                "an observer's ClusterCollapsed must NEVER be the run verdict — the \
+                 verdict-authority edge is severed (BUG-B)"
+            ),
+            // Re-typed to a non-cluster policy exit: the run still surfaces
+            // non-zero (not swallowed), but NOT as a cluster collapse the
+            // observer has no authority to declare.
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { .. },
+            } => {}
+            other => panic!("unexpected re-typed terminal: {other:?}"),
+        }
+    }
+
+    /// A genuine LOCAL policy abort (the invalid-task monitor) still
+    /// surfaces as itself — only the cluster-collapse verdict is severed.
+    #[test]
+    fn observer_fatal_policy_exit_surfaces_as_itself() {
+        let terminal = observer_terminal(Err(RunError::FatalPolicyExit {
+            reason: "invalid_task monitor".into(),
+        }));
+        assert!(matches!(
+            terminal,
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { .. }
+            }
+        ));
+    }
+
+    /// The observer's OBSERVED terminals (the primary's verdict it relayed)
+    /// map 1:1: RunComplete→Done, RunAborted→Aborted.
+    #[test]
+    fn observed_primary_verdicts_map_one_to_one() {
+        assert!(matches!(
+            observer_terminal(Ok(ObserverTerminal::Done)),
+            RunTerminal::Done
+        ));
+        assert!(matches!(
+            observer_terminal(Ok(ObserverTerminal::Aborted {
+                reason: "dup".into()
+            })),
+            RunTerminal::Aborted { .. }
+        ));
     }
 }
