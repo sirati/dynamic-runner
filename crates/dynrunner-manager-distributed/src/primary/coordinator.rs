@@ -2707,9 +2707,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // and the worker / secondary rosters from whatever the CRDT now holds.
         self.hydrate_from_cluster_state();
 
-        let total = self.total_tasks;
+        // Point-in-time "primary starting" observation. Read inline — NOT
+        // captured into a local that flows downstream: on the mode-2
+        // `RelocatedSeed`/`Owed` path the ledger is still empty here (its
+        // corpus is seeded later by `discover_on_promotion`), so this logs the
+        // pre-discovery count for THIS line only. The finalize entries read
+        // their own LIVE `self.total_tasks`, after discovery's re-hydrate, so
+        // no stale snapshot can ever reach the stranded denominator.
         tracing::info!(
-            total,
+            total = self.total_tasks,
             num_secondaries = self.config.num_secondaries,
             "primary starting"
         );
@@ -2994,7 +3000,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if let InitialAssignmentOutcome::ClusterCollapsed =
                     self.perform_initial_assignment().await?
                 {
-                    return self.bail_to_finalize(command_rx, total).await;
+                    return self.bail_to_finalize(command_rx).await;
                 }
 
                 // Phase 6: Send transfer complete.
@@ -3012,7 +3018,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // operational loop's break-then-finalize, observed from the
                 // send side.
                 if self.mesh_pump_gone {
-                    return self.bail_to_finalize(command_rx, total).await;
+                    return self.bail_to_finalize(command_rx).await;
                 }
 
                 // Put the command-channel receiver back on `self` so
@@ -3038,7 +3044,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `wait_for_mesh_ready` above held until the peer mesh settled,
                 // so the self-announce warms each replica's role cache to a
                 // real connection.
-                self.bootstrap_tail_dispatch(total).await
+                self.bootstrap_tail_dispatch().await
             }
         }
     }
@@ -3058,9 +3064,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Activates the local primary (originates its self-announce at
     /// `primary_epoch()+1`, warms the role cache, emits a keepalive), then runs
     /// the shared operational-loop-and-finalize tail to completion in place.
-    pub(crate) async fn bootstrap_tail_dispatch(&mut self, total: usize) -> Result<(), RunError> {
+    pub(crate) async fn bootstrap_tail_dispatch(&mut self) -> Result<(), RunError> {
         self.activate_local_primary().await?;
-        self.run_operational_and_finalize(total).await
+        self.run_operational_and_finalize().await
     }
 
     /// Shared operational-loop-and-finalize tail. The single mechanism
@@ -3071,10 +3077,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// setup-deadline), the retry passes, final accounting, and the
     /// `RunComplete` broadcast + settle window.
     ///
-    /// `total` is the run's task count, captured by the caller from
-    /// `self.total_tasks` after seeding so the stranded accounting is
-    /// identical on both paths.
-    async fn run_operational_and_finalize(&mut self, total: usize) -> Result<(), RunError> {
+    /// The task count is read LIVE from `self.total_tasks` (refreshed by
+    /// `hydrate_from_cluster_state` on every seed, including discovery's
+    /// re-hydrate) at each use — never a caller-captured snapshot that could
+    /// predate `discover_on_promotion`.
+    async fn run_operational_and_finalize(&mut self) -> Result<(), RunError> {
         // Operational loop (main pass).
         self.operational_loop().await?;
 
@@ -3156,7 +3163,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // classified identically to one dying mid-operational-loop. On a
         // clean run (`stranded == 0`) the helper returns `Ok(())` and we fall
         // through to the spawn-rejection backstop + clean-finish tail below.
-        self.finalize_terminal_accounting(total).await?;
+        self.finalize_terminal_accounting().await?;
 
         // Loud-fail backstop for the silent zero-dispatch path. A runtime
         // `spawn_tasks` batch (typically `on_phase_end` spawning the next
@@ -3192,7 +3199,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             fail_retry = outcome.fail_retry,
             fail_oom = outcome.fail_oom,
             fail_final = outcome.fail_final,
-            total,
+            total = self.total_tasks,
             "primary finished"
         );
 
@@ -3212,10 +3219,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     async fn bail_to_finalize(
         &mut self,
         command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
-        total: usize,
     ) -> Result<(), RunError> {
         self.command_rx = command_rx;
-        self.finalize_terminal_accounting(total).await
+        self.finalize_terminal_accounting().await
     }
 
     /// The SOLE strand-classification + terminal-broadcast site.
@@ -3242,10 +3248,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   peer-list / cold-seed / roster-rebroadcast / initial-assignment /
     ///   transfer-complete chain is classified identically.
     ///
-    /// `total` is the run's task count, captured by the caller from
-    /// `self.total_tasks` after seeding so the accounting matches on both
-    /// paths.
-    async fn finalize_terminal_accounting(&mut self, total: usize) -> Result<(), RunError> {
+    /// The run's task count is read LIVE from `self.total_tasks` — the
+    /// single-source-of-truth that `hydrate_from_cluster_state` refreshes on
+    /// every (re)seed, including `discover_on_promotion`'s mode-2 re-hydrate.
+    /// It is NOT a caller-captured snapshot: a value snapshotted in
+    /// `run_pipeline` before `discover_on_promotion` ran would be the stale
+    /// pre-discovery `0` on the `Owed`/`RelocatedSeed` path and falsely
+    /// classify a post-discovery collapse as a clean run.
+    async fn finalize_terminal_accounting(&mut self) -> Result<(), RunError> {
+        // Live denominator (see doc comment): the count as of NOW, after any
+        // discovery-driven re-hydrate, never a pre-discovery snapshot.
+        let total = self.total_tasks;
         // Drain any TaskComplete / TaskFailed messages that crossed the
         // wire while the operational loop was winding down but hadn't
         // been pulled by `transport.recv` yet. Without this, the

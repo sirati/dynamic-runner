@@ -203,10 +203,23 @@ where
             // — deliberately killing a VOTER on primary-loss instead of
             // letting `run_election_tick` enter `Suspecting`. A primary
             // death MUST recover via election, never abort. So we ABSORB
-            // the no-route into `Ok(())`: the undelivered report is
-            // re-driven by the post-failover authority's retry cascade
-            // (the secondary holds no authority and owns no requeue), and
-            // the loop continues so the election (already armed) runs.
+            // the no-route into `Ok(())` and let the loop continue so the
+            // election (already armed) runs; the secondary holds no
+            // authority and owns no requeue.
+            //
+            // ACCOUNTING HONESTY: the absorbed terminal is genuinely LOST,
+            // NOT recovered. The post-failover authority's recovery paths
+            // (`recover_inflight_for_dead_secondary`,
+            // `maybe_requeue_silent_held_work`) fire ONLY for DEAD / SILENT
+            // holders — a holder the new primary believes is gone. This
+            // secondary SURVIVES the failover gap, so the new primary keeps
+            // its in-flight slot live and waits for a `TaskComplete` that was
+            // dropped here and will never come; the completed task is then
+            // STRANDED by the primary's final accounting. That is an
+            // honest-PESSIMISTIC over-strand (the work really did finish, but
+            // the run reports it as un-terminal), NOT a false-green — the
+            // buffered-terminal-replay that would let a surviving holder re-
+            // deliver across the gap is the proper fix (owner-deferred).
             //
             // This is the NO-ROUTE abort — DISTINCT from the
             // `mesh_degraded` split-brain guard in `run_election_tick`,
