@@ -26,7 +26,7 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DiscoveryDebt};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::wire::compute_task_hash;
-use crate::primary::{PrimaryCoordinator, RelocationPolicy, RunError};
+use crate::primary::{PrimaryCoordinator, RunError};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Mode-2 discover-on-promotion. Fires at most once, ONLY when the CRDT
@@ -49,16 +49,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// Inert on every non-debt primary: a cold mode-1 / legacy run never
     /// declares debt (`discovery_debt() == Undeclared`), so the gate
-    /// short-circuits and no policy is consulted. It is ALSO inert on a
-    /// [`RelocationPolicy::RelocateToComputePeer`] primary even when it owes
-    /// debt: that primary is the mode-2 bootstrap submitter, which seeded the
-    /// `Owed` marker only to HAND it to the compute peer it relocates to (the
-    /// submitter has no corpus + no discovery policy). Discovery is owed by the
-    /// primary that STAYS — the relocate TARGET (built `StayLocal` by the
-    /// promotion recipe, which inherits the `Owed` marker via its snapshot and
-    /// carries the registered discovery policy), or the in-process `StayLocal`
-    /// local primary. So the driver fires only on a `StayLocal` primary that
-    /// owes debt; a relocating submitter hands the marker on untouched.
+    /// short-circuits and no policy is consulted.
+    ///
+    /// Reached ONLY by the OPERATIONAL primary (the
+    /// `BootstrapRole::PromotedDestination` arm — a
+    /// [`crate::process::SeedSource::PromotionSnapshot`]): the relocate TARGET,
+    /// which inherits the `Owed` marker via its snapshot AND carries the
+    /// registered discovery policy (via the promote recipe / the in-process
+    /// `--source-already-staged` registration). The SETUP PEER never reaches
+    /// this function — it relocates in `run_pipeline`'s `SetupPeer` arm BEFORE
+    /// discover, so a setup peer that owes debt without a corpus or policy
+    /// hands the `Owed` marker on untouched (the relocate happens before this
+    /// point). The structural relocate-before-discover ordering — NOT a policy
+    /// gate — is what keeps a policyless setup peer off the hard-error branch
+    /// below.
     ///
     /// The driver ends with [`Self::hydrate_from_cluster_state`] — the SOLE
     /// pool builder — so THIS primary's pool holds the discovered tasks
@@ -71,19 +75,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // settled (re-promotion after a prior origination). NO-OP.
             return Ok(());
         }
-        if self.relocation_policy == RelocationPolicy::RelocateToComputePeer {
-            // The mode-2 bootstrap submitter: it seeded `Owed` only to relocate
-            // the role (and the marker) to a compute peer that owns the corpus
-            // and the discovery policy. The submitter never discovers — the
-            // `StayLocal` relocate target does, on the same `Owed` marker it
-            // inherits. NO-OP here (the relocate fires at the bootstrap tail).
-            return Ok(());
-        }
         let Some(mut sd) = self.setup_discovery.take() else {
             // `Owed` but no policy registered = a programmer error: a primary
-            // that owes discovery MUST carry the discovery policy. Hard-fail
-            // rather than silently strand (which run_complete_check would
-            // never exit — the counter arm is gated on `Owed`).
+            // that owes discovery MUST carry the discovery policy. Reachable
+            // ONLY by a `PromotionSnapshot` primary (the setup peer relocated
+            // before this point), and a `PromotionSnapshot` that owes debt MUST
+            // carry the policy via its recipe — so this fires only on a genuine
+            // recipe-construction bug. Hard-fail rather than silently strand
+            // (which run_complete_check would never exit — the counter arm is
+            // gated on `Owed`).
             return Err(RunError::Other(
                 "discovery_debt is Owed but no discovery policy was registered \
                  on this primary (the relocated / pre-staged recipe must \

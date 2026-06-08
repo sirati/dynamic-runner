@@ -306,120 +306,15 @@ async fn discover_on_promotion_owed_without_policy_is_hard_error() {
         .await;
 }
 
-/// `discover_on_promotion` is a NO-OP on a `RelocateToComputePeer` primary
-/// even when it owes debt: the mode-2 bootstrap submitter seeds `Owed` only to
-/// HAND the marker to the compute peer it relocates to (the submitter has no
-/// corpus + no policy). The driver must NOT consult the policy and must NOT
-/// hard-error — the relocate target (StayLocal) discovers on the same marker.
-#[tokio::test(flavor = "current_thread")]
-async fn discover_on_promotion_noop_on_relocating_submitter() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (transport, _ends) = setup_test(1);
-            let (mut primary, _mesh) = build_test_primary_with_policy(
-                test_primary_config(),
-                transport,
-                crate::primary::RelocationPolicy::RelocateToComputePeer,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-            // The submitter seeds `Owed` (relocated seed) and registers NO
-            // discovery policy — it relocates, never discovers.
-            primary
-                .cluster_state_mut_for_test()
-                .apply(ClusterMutation::DiscoveryDebtDeclared);
-
-            primary
-                .discover_on_promotion()
-                .await
-                .expect("a relocating submitter must NO-OP (not hard-error) on Owed");
-
-            assert_eq!(
-                primary.cluster_state_for_test().task_count(),
-                0,
-                "a relocating submitter seeds no tasks (the peer discovers)"
-            );
-            assert_eq!(
-                primary.cluster_state_for_test().discovery_debt(),
-                DiscoveryDebt::Owed,
-                "the submitter leaves the Owed marker intact for the relocate target"
-            );
-        })
-        .await;
-}
-
-/// 5c seam (end-to-end): `run` with `SeedSource::RelocatedSeed` originates the
-/// phase graph + `DiscoveryDebt=Owed` (NO tasks), then — after
-/// `wait_for_connections` — `discover_on_promotion` runs the registered policy,
-/// seeds the discovered tasks + `DiscoverySettled`, and the run drives them to
-/// completion. This is the production path the pyo3 layer wires: the mode-2
-/// SLURM submitter and the in-process `--source-already-staged` local primary
-/// both construct `RelocatedSeed` and register the discovery policy. (Cold
-/// mode-1 — `ColdStart` — is exercised by every other `run`/`run_consuming`
-/// test and is unaffected: it never declares debt.)
-#[tokio::test(flavor = "current_thread")]
-async fn run_with_relocated_seed_discovers_and_completes() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (transport, secondary_ends) = setup_test(1);
-            let config = PrimaryConfig {
-                connect_timeout: Duration::from_secs(5),
-                peer_timeout: Duration::from_secs(5),
-                ..test_primary_config()
-            };
-            let (mut primary, _mesh) = build_test_primary(
-                config,
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-
-            // The discovery policy yields the corpus the relocated primary
-            // owes (the submitter passed no binaries — the RelocatedSeed seeds
-            // only the phase graph + the Owed marker).
-            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
-            primary.register_setup_discovery(fixed_discovery(
-                vec![make_binary("disc-a", 50), make_binary("disc-b", 50)],
-                HashMap::new(),
-                fires.clone(),
-            ));
-
-            // A fake secondary answers TaskRequests + completes every
-            // dispatched task, so the run drives the discovered corpus to
-            // completion.
-            for (id, rx, tx) in secondary_ends {
-                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
-            }
-
-            let (deps, ops, ope) = noop_phase_args();
-            primary
-                .run(SeedSource::RelocatedSeed { phase_deps: deps }, ops, ope)
-                .await
-                .expect("relocated-seed run must complete cleanly");
-
-            // The policy ran exactly once (post-connect, on the Owed marker)
-            // and the debt settled — the seam routed RelocatedSeed →
-            // originate_relocated_seed → discover_on_promotion.
-            assert_eq!(
-                fires.get(),
-                1,
-                "the discovery policy must run exactly once on the Owed marker"
-            );
-            assert_eq!(
-                primary.cluster_state_for_test().discovery_debt(),
-                DiscoveryDebt::Settled,
-                "discovery must settle after the relocated primary seeds its corpus"
-            );
-            assert_eq!(
-                primary.cluster_state_for_test().task_count(),
-                2,
-                "the discovered corpus must be seeded into the ledger"
-            );
-        })
-        .await;
-}
+// `discover_on_promotion_noop_on_relocating_submitter` is DELETED: its premise
+// — a setup peer that REACHES `discover_on_promotion` while owing debt — no
+// longer exists. Under mesh-always the setup peer relocates in
+// `run_pipeline`'s `BootstrapRole::SetupPeer` arm BEFORE `discover_on_promotion`,
+// so a policyless owing setup peer never reaches the driver (the relocate
+// TARGET, a `PromotionSnapshot`, does the discovery). The real end-to-end
+// pre-staged-relocate behaviour is covered by
+// `relocated_seed_setup_peer_relocates_and_target_discovers_and_completes`
+// below (a TRUE `Node::run` relocate: the target discovers + completes).
 
 /// `run_complete_check` gated on `discovery_debt() == Owed` (V6): a zero-task
 /// CRDT that declares debt must NOT trip the counter exit (`0+0 >= 0`) — the
@@ -630,9 +525,10 @@ async fn pre_seeded_counter_exit_unchanged() {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Bootstrap-relocation: RelocationPolicy + select_relocation_target +
-// relocate_primary_to (mesh-always pillar 2 — the primary relocates off the
-// submitter onto a compute peer).
+// Bootstrap-relocation: select_relocation_target + relocate_primary_to +
+// the SeedSource-keyed bootstrap role (mesh-always — the setup peer ALWAYS
+// relocates the primary onto a compute peer; the promoted destination runs
+// the operational loop in place).
 // ────────────────────────────────────────────────────────────────────────
 
 /// One advertised-memory `ResourceAmount` vec (the live welcome shape).
@@ -711,9 +607,9 @@ async fn select_relocation_target_picks_lowest_eligible_compute_peer() {
         .await;
 }
 
-/// No eligible compute peer → `None` (the caller maps this to a hard
-/// `NoRelocationTarget` error under `RelocateToComputePeer`). Seed only an
-/// observer and a non-can_be_primary worker — neither is promotable.
+/// No eligible compute peer → `None` (the `SetupPeer` bootstrap arm maps this
+/// to a hard `NoRelocationTarget` error). Seed only an observer and a
+/// non-can_be_primary worker — neither is promotable.
 #[tokio::test(flavor = "current_thread")]
 async fn select_relocation_target_none_when_no_eligible_peer() {
     let local = tokio::task::LocalSet::new();
@@ -925,33 +821,35 @@ async fn relocate_primary_to_tolerates_concurrent_lex_lower_winner() {
         .await;
 }
 
-/// `RelocationPolicy::StayLocal` runs the stay-local bootstrap tail
-/// (`activate_local_primary` → `run_operational_and_finalize`): a stay-local
-/// primary, seeded pre-complete with zero tasks, drives
-/// `bootstrap_tail_dispatch` to a clean `Ok(())` and asserts itself the local
-/// primary (`primary_id == self`, `current_primary == self`). It must NEVER
-/// take the relocate arm even with an eligible compute peer present.
+/// The OPERATIONAL bootstrap tail (`bootstrap_tail_dispatch`) activates THIS
+/// node as the local primary (`activate_local_primary` →
+/// `run_operational_and_finalize`): a primary seeded pre-complete with zero
+/// tasks drives the tail to a clean `Ok(())` and asserts itself the local
+/// primary (`primary_id == self`, `current_primary == self`). Reached ONLY on
+/// the `BootstrapRole::PromotedDestination` arm (a `PromotionSnapshot`); the
+/// relocate is NOT here (it fired in `run_pipeline`'s `SetupPeer` arm), so the
+/// tail never relocates even with an eligible compute peer present.
 #[tokio::test(flavor = "current_thread")]
-async fn relocation_policy_stay_local_activates_local_primary() {
+async fn bootstrap_tail_activates_local_primary() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
             let config = test_primary_config();
             let own_id = config.node_id.clone();
-            let (mut primary, _mesh) = build_test_primary_with_policy(
+            let (mut primary, _mesh) = build_test_primary(
                 config,
                 transport,
-                crate::primary::RelocationPolicy::StayLocal,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            // An eligible compute peer IS present — a StayLocal policy must
-            // still NOT relocate to it.
+            // An eligible compute peer IS present — the operational tail must
+            // still NOT relocate to it (relocation is the SetupPeer arm's job,
+            // which this tail is not).
             seed_member(&mut primary, "sec-0", 2, false, true);
 
-            // Drive only the bootstrap tail directly (no full run): total=0 so
-            // the operational loop's counter exit fires immediately.
+            // Drive only the operational bootstrap tail directly (no full run):
+            // total=0 so the operational loop's counter exit fires immediately.
             let exit = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 primary.bootstrap_tail_dispatch(0),
@@ -959,53 +857,82 @@ async fn relocation_policy_stay_local_activates_local_primary() {
             .await;
             assert!(
                 matches!(exit, Ok(Ok(()))),
-                "StayLocal bootstrap_tail_dispatch must run the in-place tail to \
-                 a clean Ok(()); got {exit:?}"
+                "the operational bootstrap tail must run the in-place tail to a \
+                 clean Ok(()); got {exit:?}"
             );
             assert_eq!(
                 primary.primary_id.as_deref(),
                 Some(own_id.as_str()),
-                "StayLocal must activate THIS node as the local primary \
-                 (primary_id == self)"
+                "the operational tail must activate THIS node as the local \
+                 primary (primary_id == self)"
             );
             assert_eq!(
                 primary.cluster_state_for_test().current_primary(),
                 Some(own_id.as_str()),
-                "StayLocal's activate_local_primary must name self the primary"
+                "activate_local_primary must name self the primary"
             );
         })
         .await;
 }
 
-/// `RelocationPolicy::RelocateToComputePeer` with an EMPTY candidate set is a
-/// hard `RunError::NoRelocationTarget` (pillar 2: the submitter must never
-/// stay primary). Seed no eligible compute peer and drive the bootstrap tail.
+/// A SETUP PEER (a `ColdStart` seed ⇒ `BootstrapRole::SetupPeer`) with an EMPTY
+/// candidate set is a hard `RunError::NoRelocationTarget` (mesh-always: the
+/// setup peer must never stay primary). Drive the FULL `run_consuming` against
+/// a CONNECTED secondary that is NOT promotion-eligible (`fake_secondary`
+/// advertises `can_be_primary:false`): `wait_for_connections` + mesh formation
+/// succeed (so the pipeline reaches the `SetupPeer` arm), but
+/// `select_relocation_target()` finds no eligible compute peer ⇒ the run errors
+/// rather than silently staying local.
 #[tokio::test(flavor = "current_thread")]
-async fn relocation_policy_relocate_empty_candidate_set_is_no_relocation_target() {
+async fn setup_peer_empty_candidate_set_is_no_relocation_target() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (transport, _ends) = setup_test(1);
-            let (mut primary, _mesh) = build_test_primary_with_policy(
-                test_primary_config(),
+            // One CONNECTED but non-eligible secondary (fake_secondary welcomes
+            // with can_be_primary:false), so mesh formation completes and the
+            // pipeline reaches the SetupPeer relocate branch — but the
+            // candidate set is empty (the only peer cannot be primary).
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+            let (primary, _mesh) = build_test_primary(
+                config,
                 transport,
-                crate::primary::RelocationPolicy::RelocateToComputePeer,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-            // Only an observer + a non-promotable worker → no eligible peer.
-            seed_member(&mut primary, "obs-0", 0, true, false);
-            seed_member(&mut primary, "sec-0", 2, false, false);
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
+            }
 
+            let (deps, ops, ope) = noop_phase_args();
             let exit = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                primary.bootstrap_tail_dispatch(0),
+                std::time::Duration::from_secs(10),
+                primary.run_consuming(
+                    SeedSource::ColdStart { binaries: vec![], phase_deps: deps },
+                    ops,
+                    ope,
+                ),
             )
             .await
-            .expect("bootstrap_tail_dispatch must return promptly on the empty-candidate path");
+            .expect("the SetupPeer run must return promptly on the empty-candidate path");
+            // The SetupPeer branch returns `Err(NoRelocationTarget)` from the
+            // pipeline; `run_consuming`'s non-demoted arm wraps it as
+            // `PrimaryRunOutcome::Local { result: Err(..) }` (the pipeline
+            // COMPLETED with an error — it never demoted, because the relocate
+            // never fired).
             assert!(
-                matches!(exit, Err(crate::primary::RunError::NoRelocationTarget)),
-                "RelocateToComputePeer with no eligible compute peer must surface \
+                matches!(
+                    exit,
+                    Ok(crate::primary::PrimaryRunOutcome::Local {
+                        result: Err(crate::primary::RunError::NoRelocationTarget),
+                        ..
+                    })
+                ),
+                "a setup peer with no eligible compute peer must surface \
                  RunError::NoRelocationTarget, never silently stay local; got {exit:?}"
             );
         })

@@ -323,15 +323,12 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             // in sequence and observe the gate.
             let primary_handle = tokio::task::spawn_local(async move {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap();
                 primary.completed_count()
@@ -685,15 +682,12 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 

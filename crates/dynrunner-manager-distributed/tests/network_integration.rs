@@ -7,9 +7,11 @@ use std::time::Duration;
 use dynrunner_core::{
     MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
 };
+use dynrunner_manager_distributed::cluster_state::ClusterState;
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, SecondaryConfig, SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator, compute_task_hash,
 };
+use dynrunner_protocol_primary_secondary::ClusterMutation;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
@@ -84,12 +86,26 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     }
 }
 
-/// Run a real `SecondaryCoordinator` over ANY `Tr: PeerTransport` against the
-/// PRODUCTION mesh-pump, returning its `completed_count` when it exits. The
-/// real-`Node` e2e harness for the network tests: the coordinator holds only
-/// a `MeshClient`/`RoleInbox`; the pump owns the `Mesh` over the real network
-/// transport and concurrently drains egress + routes inbound.
-async fn run_secondary_over<Tr>(config: SecondaryConfig, transport: Tr) -> usize
+/// Drive a real `SecondaryCoordinator` over ANY `Tr: PeerTransport` against the
+/// PRODUCTION mesh-pump to its clean exit.
+///
+/// Returns nothing: under the operational `PromotionSnapshot` primary (the
+/// transport-flow shape these tests now use — a `ColdStart` primary would
+/// relocate away, never running the dispatch loop), the fresh-connect secondary
+/// never receives the cold-seed `TaskAdded` broadcast (it rides the snapshot /
+/// anti-entropy in production), so its CRDT-mirror `completed_count` is
+/// legitimately 0 and is NOT a meaningful signal here. The transport-flow proof
+/// is the PRIMARY-side `completed == 5`: the primary can only observe 5
+/// completions if the secondary's workers processed the dispatched tasks AND
+/// the `TaskComplete` reports traversed the real QUIC/WSS transport back — a
+/// dropped-message / transport bug fails it. The secondary mirror's
+/// CRDT-convergence-via-broadcast is a transport-AGNOSTIC property covered by
+/// the mpsc relocate convergence test + the consumer live SLURM gate.
+///
+/// The real-`Node` e2e harness for the network tests: the coordinator holds
+/// only a `MeshClient`/`RoleInbox`; the pump owns the `Mesh` over the real
+/// network transport and concurrently drains egress + routes inbound.
+async fn run_secondary_over<Tr>(config: SecondaryConfig, transport: Tr)
 where
     Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId> + 'static,
 {
@@ -133,12 +149,25 @@ where
             _ = &mut pump_fut => {}
         }
     }
-    secondary.completed_count()
 }
 
-/// Run a real `PrimaryCoordinator` over ANY `Tr: PeerTransport` against the
-/// PRODUCTION mesh-pump, returning `(completed, failed)`. Mirrors
+/// Run a real OPERATIONAL `PrimaryCoordinator` over ANY `Tr: PeerTransport`
+/// against the PRODUCTION mesh-pump, returning `(completed, failed)`. Mirrors
 /// `run_secondary_over` for the primary side of the network e2e.
+///
+/// Under mesh-always a `ColdStart` primary is a SETUP PEER that RELOCATES (it
+/// would never run the dispatch loop itself — the whole point of these tests).
+/// These are TRANSPORT-FLOW proofs: their value is that the real QUIC/WSS
+/// transport carries the dispatch/assign/complete/keepalive wire-flow. The
+/// honest seed for "an operational primary dispatching over real transport" is
+/// `PromotionSnapshot` (≡ the relocated target / failover-promoted primary —
+/// `BootstrapRole::PromotedDestination`, runs the operational loop in place,
+/// `.run()` works since it never relocates). So we pre-seed a populated
+/// `ClusterState` snapshot from `binaries` (the corpus the target would have
+/// inherited) and seed the coordinator from it before the run. Real-transport
+/// RELOCATION is validated by the consumer live SLURM gate, not here; the
+/// relocate→demote→promote machinery itself is proven over the mpsc peer_mesh
+/// (`node_gates`), since relocation speaks `Mesh`/`PeerTransport`, never QUIC.
 async fn run_primary_over<Tr>(
     config: PrimaryConfig,
     transport: Tr,
@@ -147,8 +176,25 @@ async fn run_primary_over<Tr>(
 where
     Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId> + 'static,
 {
-    use dynrunner_manager_distributed::process::{LocalRole, Mesh, pump};
+    use dynrunner_manager_distributed::process::{LocalRole, Mesh, SeedSource, pump};
     use dynrunner_protocol_primary_secondary::address::PeerId;
+
+    // Build the inherited-ledger snapshot the operational (promotion-snapshot)
+    // primary resumes from: the phase graph + one Pending `TaskAdded` per
+    // binary, exactly what a relocate target would have inherited.
+    let snapshot = {
+        let mut cs: ClusterState<TestId> = ClusterState::new();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: std::collections::HashMap::new(),
+        });
+        for task in &binaries {
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: compute_task_hash(task),
+                task: task.clone(),
+            });
+        }
+        cs.snapshot()
+    };
 
     let mut mesh = Mesh::new(transport);
     let (_slot, client, inbox) =
@@ -159,10 +205,12 @@ where
         client,
         inbox,
         demote_rx,
-        RelocationPolicy::StayLocal,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
+    // Seed from the inherited snapshot so the `PromotionSnapshot` run resumes
+    // on the populated ledger (hydrate rebuilds the pool + total_tasks).
+    primary.seed_from_promotion_snapshot(snapshot);
 
     // Publish the live membership BEFORE the coordinator's first egress —
     // mirroring production `Node::run`, where the pump's entry
@@ -178,10 +226,7 @@ where
 
     {
         let run = primary.run(
-            dynrunner_manager_distributed::process::SeedSource::ColdStart {
-                binaries,
-                phase_deps: std::collections::HashMap::new(),
-            },
+            SeedSource::PromotionSnapshot,
             Box::new(|_| {}),
             Box::new(|_, _, _, _| {}),
         );
@@ -297,11 +342,20 @@ async fn e2e_primary_secondary_over_wss() {
             // teardown) lets the secondary exit.
             let (completed, failed) = run_primary_over(config, peer_transport, binaries).await;
 
-            let sec_completed = sec_handle.await.unwrap();
+            // Drive the secondary to its clean exit.
+            sec_handle.await.unwrap();
 
-            assert_eq!(completed, 5, "primary should see 5 completed");
+            // Transport-flow proof: the primary observed all 5 completions over
+            // the real QUIC/WSS transport. This REQUIRES the full round-trip —
+            // the primary dispatched TaskAssignments, the secondary's workers
+            // processed them, and the `TaskComplete` reports traversed the real
+            // transport back — so a dropped-message / transport regression fails
+            // it. The secondary's CRDT-mirror count is legitimately 0 under the
+            // operational `PromotionSnapshot` primary (no cold-seed re-broadcast
+            // to a fresh secondary); mirror-convergence-via-broadcast is the
+            // mpsc relocate convergence test's job + the consumer live gate.
+            assert_eq!(completed, 5, "primary should see 5 completed over the real transport");
             assert_eq!(failed, 0, "no failures expected");
-            assert_eq!(sec_completed, 5, "secondary should see 5 completed");
         })
         .await;
 }
@@ -413,11 +467,20 @@ async fn e2e_primary_secondary_over_quic() {
             // teardown) lets the secondary exit.
             let (completed, failed) = run_primary_over(config, peer_transport, binaries).await;
 
-            let sec_completed = sec_handle.await.unwrap();
+            // Drive the secondary to its clean exit.
+            sec_handle.await.unwrap();
 
-            assert_eq!(completed, 5, "primary should see 5 completed");
+            // Transport-flow proof: the primary observed all 5 completions over
+            // the real QUIC/WSS transport. This REQUIRES the full round-trip —
+            // the primary dispatched TaskAssignments, the secondary's workers
+            // processed them, and the `TaskComplete` reports traversed the real
+            // transport back — so a dropped-message / transport regression fails
+            // it. The secondary's CRDT-mirror count is legitimately 0 under the
+            // operational `PromotionSnapshot` primary (no cold-seed re-broadcast
+            // to a fresh secondary); mirror-convergence-via-broadcast is the
+            // mpsc relocate convergence test's job + the consumer live gate.
+            assert_eq!(completed, 5, "primary should see 5 completed over the real transport");
             assert_eq!(failed, 0, "no failures expected");
-            assert_eq!(sec_completed, 5, "secondary should see 5 completed");
         })
         .await;
 }

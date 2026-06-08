@@ -38,7 +38,7 @@ use dynrunner_manager_distributed::PeerCertInfo;
 use dynrunner_transport_quic::{
     MeshSendHandle, NetworkClient, NetworkServer, PeerNetwork,
 };
-use dynrunner_transport_tunnel::{InboundTap, SharedOutgoing, TunneledPeerTransport};
+use dynrunner_transport_tunnel::TunneledPeerTransport;
 
 /// Opaque guard holding the bound mesh listener alive.
 ///
@@ -274,59 +274,11 @@ pub(crate) async fn observer_mesh<I: Identifier>(
         .await
         .map_err(|e| format!("failed to start peer network: {e}"))
 }
-
-/// The in-process distributed manager's primary mesh transport plus the
-/// channel sinks the per-secondary forwarders wire into.
-pub(crate) struct InProcessPrimaryBundle<I: Identifier> {
-    /// The opaque mesh transport the in-process `PrimaryCoordinator`
-    /// holds by value.
-    pub transport: TunneledPeerTransport<I>,
-    /// Writer table: the per-secondary `pri_to_sec_tx` is inserted here
-    /// so `send_to_peer(sec_id, ..)` reaches each secondary (no accept
-    /// loops in-process — the direct insert IS the registration).
-    pub shared_outgoing: SharedOutgoing<I>,
-    /// The transport's single inbound sink: each per-secondary forwarder
-    /// task feeds `sec_to_pri` frames into it (the in-process analogue of
-    /// a QUIC/WSS accept loop's reader task).
-    pub inbound: InboundTap<I>,
-}
-
-/// Build the in-process distributed manager's primary mesh transport.
-///
-/// Post-collapse this is the ONE transport the in-process primary holds;
-/// the manager wires the per-secondary channel writers into
-/// `shared_outgoing` and feeds `sec_to_pri` frames into `inbound`.
-pub(crate) fn inprocess_primary_mesh<I: Identifier>() -> InProcessPrimaryBundle<I> {
-    let (transport, shared_outgoing, inbound, _registration) =
-        TunneledPeerTransport::<I>::new(SETUP_NODE_ID.into());
-    InProcessPrimaryBundle {
-        transport,
-        shared_outgoing,
-        inbound,
-    }
-}
-
-/// Build an in-process distributed-manager secondary's channel-backed
-/// mesh transport with the primary folded in as an ordinary mesh peer.
-///
-/// Inbound is the primary→secondary channel; the outbound primary link
-/// is the secondary→primary channel folded under `bootstrap_primary_id`
-/// (`register_primary_link`) — no per-role uplink leg.
-pub(crate) fn inprocess_secondary_mesh<I: Identifier>(
-    secondary_id: String,
-    bootstrap_primary_id: String,
-    pri_to_sec_rx: tokio::sync::mpsc::UnboundedReceiver<
-        dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-    >,
-    sec_to_pri_tx: tokio::sync::mpsc::UnboundedSender<
-        dynrunner_protocol_primary_secondary::DistributedMessage<I>,
-    >,
-) -> dynrunner_transport_channel::ChannelPeerTransport<I> {
-    let mut transport = dynrunner_transport_channel::ChannelPeerTransport::<I>::from_raw_channels(
-        secondary_id,
-        std::collections::HashMap::new(),
-        pri_to_sec_rx,
-    );
-    transport.register_primary_link(bootstrap_primary_id, sec_to_pri_tx);
-    transport
-}
+// The in-process `--multi-computer local` manager no longer constructs its
+// mesh here: it builds the full N+1-node all-to-all mpsc mesh directly via the
+// EXISTING `dynrunner_transport_channel::peer_mesh` primitive (every node — the
+// setup peer + each secondary — is a first-class `ChannelPeerTransport`
+// member). The old STAR builders (a `TunneledPeerTransport` primary + per-
+// secondary `from_raw_channels` legs folded only the primary in) are gone:
+// under mesh-always the setup peer relocates onto a secondary, so every node
+// needs all-to-all reach, which the STAR could not provide.

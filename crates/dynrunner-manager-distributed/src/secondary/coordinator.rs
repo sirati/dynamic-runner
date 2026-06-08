@@ -787,6 +787,7 @@ where
         self.local_tasks_run
     }
 
+
     /// Test accessor: snapshot of `self.sampler.is_some()`. Mirrors
     /// `LocalManager::sampler_is_some` — used by the secondary's
     /// memprofile lifecycle test to pin "constructed iff

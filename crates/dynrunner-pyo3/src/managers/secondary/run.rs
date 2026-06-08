@@ -17,7 +17,7 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, SecondaryConfig, SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -532,8 +532,10 @@ impl PySecondaryCoordinator {
                     oom_retry_max_passes: dist_oom_retry_max_passes,
                     scheduler_config,
                     estimator,
-                    command_tx,
-                    command_rx,
+                    // SLURM secondary: each process owns its own Python
+                    // `PrimaryHandle` command channel, so the promoted primary
+                    // drains it.
+                    command_channel: Some((command_tx, command_rx)),
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
                     forwarded_argv: promote_run_config_handle,
@@ -632,47 +634,64 @@ impl PySecondaryCoordinator {
     }
 }
 
+/// The Python `PrimaryHandle`'s command-channel ends (sender + receiver) for a
+/// promoted primary's `replace_command_channel`. `pub(crate)` alias so the
+/// recipe-input field stays a single named type rather than an inline nested
+/// tuple-of-channels.
+pub(crate) type PromotedCommandChannel = (
+    tokio::sync::mpsc::Sender<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
+    tokio::sync::mpsc::Receiver<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
+);
+
 /// Inputs to [`build_promoted_primary_recipe`] — everything the promoted
 /// primary's build needs that is captured on the GIL thread / from config.
-struct PromotedPrimaryRecipeInputs {
-    secondary_id: String,
-    keepalive_interval: std::time::Duration,
-    peer_timeout: std::time::Duration,
-    keepalive_miss_threshold: u32,
-    retry_max_passes: u32,
-    oom_retry_max_passes: u32,
-    scheduler_config: SchedulerConfig,
-    estimator: PyMemoryEstimatorBridge,
-    /// The Python `PrimaryHandle`'s command channel ends. The PROMOTED PRIMARY
-    /// drains the receiver (post-promotion, externally-issued
-    /// `spawn_tasks`/`reinject` land on its `primary_pending` pool); the
-    /// secondary does not (R4 seam). Moved into the promoted primary via
-    /// `replace_command_channel`.
-    command_tx: tokio::sync::mpsc::Sender<
-        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
-    >,
-    command_rx: tokio::sync::mpsc::Receiver<
-        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
-    >,
+///
+/// `pub(crate)` so the in-process `--multi-computer local` manager
+/// (`managers/distributed/run.rs`) can build the SAME transport-agnostic
+/// recipe for its promotable in-process secondaries (it relocates the setup
+/// peer onto one of them), reusing the SLURM submitter's recipe builder rather
+/// than duplicating the promoted-primary construction.
+pub(crate) struct PromotedPrimaryRecipeInputs {
+    pub secondary_id: String,
+    pub keepalive_interval: std::time::Duration,
+    pub peer_timeout: std::time::Duration,
+    pub keepalive_miss_threshold: u32,
+    pub retry_max_passes: u32,
+    pub oom_retry_max_passes: u32,
+    pub scheduler_config: SchedulerConfig,
+    pub estimator: PyMemoryEstimatorBridge,
+    /// The Python `PrimaryHandle`'s command channel ends, iff this node's
+    /// promoted primary should drain externally-issued `spawn_tasks`/`reinject`
+    /// from a Python handle (the SLURM secondary path: each secondary process
+    /// owns its own handle). Moved into the promoted primary via
+    /// `replace_command_channel` on the single recipe fire. `None` on the
+    /// in-process `--multi-computer local` path: the ONE Python handle is held
+    /// by the setup peer (the bootstrap primary), so the promoted in-process
+    /// primary keeps the internal command channel `PrimaryCoordinator::new`
+    /// minted — the run loop is fully driven; only runtime `spawn_tasks` via
+    /// that one Python handle does not re-route to the relocated primary.
+    pub command_channel: Option<PromotedCommandChannel>,
     /// The phase-lifecycle callbacks the PROMOTED primary fires (it owns the
     /// phase machine; the secondary does not — R4 seam).
-    on_phase_start: crate::managers::lifecycle::OnPhaseStart,
-    on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
+    pub on_phase_start: crate::managers::lifecycle::OnPhaseStart,
+    pub on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
     /// The SHARED node-local run-config handle (single source of truth —
     /// `store_pushed_run_config` is the one writer). Read `.lock().clone()` at
     /// the promotion instant (always AFTER the post-welcome push landed), so
     /// the promoted `PrimaryConfig.forwarded_argv` carries the DELIVERED argv
     /// — byte-identical to the original submitter (no split-brain) — rather
     /// than the stale boot copy a pre-push capture would have frozen (step 7).
-    forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    pub forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     /// The consumer's discovery policy + phase graph for the PROMOTED primary's
-    /// `discover_on_promotion` driver (mode-2 SLURM relocate). Single-use (the
-    /// `discover` closure is a `FnMut` that consumes its `Py` handles on the
-    /// one fire, not `Clone`), so it is `take`-n on the recipe's single
-    /// invocation. `None` only for an out-of-tree caller that does not supply a
-    /// discovery policy; under the live SLURM dispatch it is always `Some` and
-    /// inert on a non-relocated promotion (the driver gates on `Owed`).
-    setup_discovery:
+    /// `discover_on_promotion` driver (mode-2 relocate — SLURM submitter OR the
+    /// in-process `--source-already-staged` setup peer that relocates onto this
+    /// secondary). Single-use (the `discover` closure is a `FnMut` that consumes
+    /// its `Py` handles on the one fire, not `Clone`), so it is `take`-n on the
+    /// recipe's single invocation. `None` only for a caller that does not supply
+    /// a discovery policy (the in-process COLD path, where the corpus was
+    /// cold-seeded and the marker is `Settled`); inert on a non-relocated
+    /// promotion (the driver gates on `Owed`).
+    pub setup_discovery:
         Option<dynrunner_manager_distributed::SetupDiscovery<RunnerIdentifier>>,
 }
 
@@ -691,7 +710,11 @@ struct PromotedPrimaryRecipeInputs {
 /// `FnMut`-but-single-use: a node promotes at most once, so the command
 /// channel + phase callbacks (single-use, not `Clone`) are captured in
 /// `Option`s and taken on the first (only) invocation.
-fn build_promoted_primary_recipe(
+///
+/// `pub(crate)` so the in-process `--multi-computer local` manager reuses this
+/// transport-agnostic builder for its promotable in-process secondaries (it
+/// takes `client, inbox, demote_rx, snapshot` — all mesh-backend-opaque).
+pub(crate) fn build_promoted_primary_recipe(
     inputs: PromotedPrimaryRecipeInputs,
 ) -> dynrunner_manager_distributed::process::PromotedPrimaryBuilder<
     dynrunner_scheduler::ResourceStealingScheduler,
@@ -707,16 +730,17 @@ fn build_promoted_primary_recipe(
         oom_retry_max_passes,
         scheduler_config,
         estimator,
-        command_tx,
-        command_rx,
+        command_channel,
         on_phase_start,
         on_phase_end,
         forwarded_argv,
         setup_discovery,
     } = inputs;
     // Single-use pieces captured in Options so the FnMut can take them on its
-    // one invocation (a node promotes at most once per lifetime).
-    let mut command_channel = Some((command_tx, command_rx));
+    // one invocation (a node promotes at most once per lifetime). The command
+    // channel is already an `Option` (it is `None` on the in-process path,
+    // where the promoted primary keeps the internal channel `new` minted).
+    let mut command_channel = command_channel;
     let mut phase_callbacks = Some((on_phase_start, on_phase_end));
     // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
     // `discover` closure that is not `Clone`); take it on the single fire.
@@ -748,10 +772,12 @@ fn build_promoted_primary_recipe(
             client,
             inbox,
             demote_rx,
-            // A promotion-built primary: this host won the role on failover
-            // and IS a compute peer — it must STAY local, never relocate
-            // again (relocation is the BOOTSTRAP submitter's tail only).
-            RelocationPolicy::StayLocal,
+            // A promotion-built primary: this host won the role on failover /
+            // relocation and IS a compute peer. Its seed is
+            // `SeedSource::PromotionSnapshot` (below) ⇒
+            // `BootstrapRole::PromotedDestination`, so `run_pipeline` runs the
+            // operational loop in place and never relocates again — no
+            // construction-time policy needed; the seed is the discriminator.
             scheduler_config.build_memory_scheduler(),
             estimator.clone(),
         );

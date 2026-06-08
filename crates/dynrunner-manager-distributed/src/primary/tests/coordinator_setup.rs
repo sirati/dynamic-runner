@@ -561,15 +561,12 @@ async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
             }
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
