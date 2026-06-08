@@ -146,6 +146,17 @@ impl PySecondaryCoordinator {
         let command_tx = wiring.command_tx;
         let command_rx = wiring.command_rx;
 
+        // The relocated primary's OWN live `PrimaryHandle` for its
+        // `on_run_start` fire. Minted here (post-`take_for_run`, which left the
+        // sender behind so `to_handle` still works) so its sender shares the
+        // SAME command channel the recipe threads via `replace_command_channel`
+        // — a `spawn_tasks` issued from `on_run_start`/`on_phase_end` against
+        // this handle reaches THIS primary's command loop. The `source_dir` +
+        // task-definition clone complete the modern `on_run_start` signature.
+        let on_run_start_handle = self.control_plane.to_handle()?;
+        let on_run_start_source_dir = self.source_dir.to_string_lossy().into_owned();
+        let on_run_start_task_definition_py = self.task_definition_py.clone_ref(py);
+
         // The finalize closure's per-type `build_worker_command_args`
         // rebuild captures a `Py<PyAny>` reference bump of the task
         // definition.
@@ -211,20 +222,29 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
-        // Phase-lifecycle callbacks. Built here under the GIL (the
-        // `make_on_phase_*` constructors capture a `Py<PyAny>` clone of
-        // `task_definition_py` that the closure body re-binds via
-        // `Python::attach` at each fire). Registered on the
-        // `SecondaryCoordinator` BEFORE `run_until_setup_or_done` enters.
-        // The closures fire only when this node is the authority that owns
-        // the phase machine; a node that never calls into Python pays no
-        // GIL-reacquiring cost.
+        // Phase-lifecycle callbacks the PROMOTED primary fires. Built here
+        // under the GIL (the `make_on_phase_*` constructors capture a
+        // `Py<PyAny>` clone of `task_definition_py` that the closure body
+        // re-binds via `Python::attach` at each fire). Routed through the
+        // promote recipe's `PrimaryRunArgs` (the channel `run_pipeline` reads)
+        // so they fire on the relocated primary. The closures fire only when
+        // this node is the authority that owns the phase machine; a node that
+        // never calls into Python pays no GIL-reacquiring cost.
         let sec_on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(self.task_definition_py.clone_ref(py)),
         );
-        let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(self.task_definition_py.clone_ref(py)),
-        );
+        // Honest `on_phase_end`: the closure records a consumer-hook raise into
+        // this latch; the SAME latch is installed on the promoted coordinator
+        // (`set_phase_hook_raise_latch` in the recipe) so the phase cascade
+        // surfaces the raise as a non-zero `FatalPolicyExit` on the relocated
+        // primary (mirrors the submitter `primary/run.rs`).
+        let sec_phase_hook_raise_latch =
+            dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+        let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+            Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                self.task_definition_py.clone_ref(py),
+                sec_phase_hook_raise_latch.clone(),
+            ));
 
         // Errors produced inside the async block — including
         // `task.discover_items` raising in setup-promote — must surface
@@ -492,19 +512,46 @@ impl PySecondaryCoordinator {
                     secondary.register_panik_signal_rx(rx);
                 }
 
+                // The SHARED run-config handle the coordinator's
+                // `store_pushed_run_config` writes (the delivered `forwarded_argv`,
+                // post-push). Read up-front because it backs THREE consumers
+                // below: the promoted-primary recipe's `PrimaryConfig` (step 7),
+                // and — via the `SharedRunConfig` complete-namespace cell built
+                // from it — the run-config finalize (worker `cmd_args`) AND the
+                // promotion-time discovery driver.
+                let promote_run_config_handle = secondary.run_config_handle();
+
+                // The node-local COMPLETE run-config namespace (single source of
+                // truth) — `Some` iff a Python finalize callable was supplied
+                // (the deferred SLURM reparse path). The finalize and the
+                // discovery driver share this ONE handle, so the namespace is
+                // reparsed at most once and both read it identically (worker
+                // `cmd_args` selection flags == discovery selection flags). On a
+                // relocate-target the finalize never fires before promotion (no
+                // primary PeerInfo arrives), so DISCOVERY resolves it first; on a
+                // plain secondary the finalize resolves it first. `None`
+                // (out-of-tree, no finalize) makes both inert.
+                let run_config = finalize_run_config.map(|reparse| {
+                    crate::managers::run_config::SharedRunConfig::deferred(
+                        reparse,
+                        promote_run_config_handle.clone(),
+                    )
+                });
+
                 // Register the consumer's run-config finalize policy. The Rust
                 // `SecondaryCoordinator` OWNS the WHEN (it fires this at the
                 // `AwaitingPrimary → Configuring` transition, after the
                 // post-welcome `RunConfig` push delivers `forwarded_argv`, with
                 // an in-band `RequestRunConfig` backstop if it has not landed,
                 // and BEFORE the worker pool spawns). This closure is the
-                // consumer's POLICY: it re-parses the argparse namespace +
-                // rebuilds the per-type `cmd_args` OFF the runtime thread (GIL
-                // excursion on a `spawn_blocking` thread, §14/§15) and swaps
-                // them into the SHARED worker-command source the factory reads.
-                // `None` (no Python finalize supplied) makes it inert.
+                // consumer's POLICY: it resolves the COMPLETE namespace through
+                // the SHARED `run_config` cell + rebuilds the per-type `cmd_args`
+                // OFF the runtime thread (GIL excursion on a `spawn_blocking`
+                // thread, §14/§15) and swaps them into the SHARED worker-command
+                // source the factory reads. `None` (no Python finalize supplied)
+                // makes it inert.
                 secondary.register_finalize_run_config(build_finalize_run_config_fn(
-                    finalize_run_config,
+                    run_config.clone(),
                     finalize_task_definition_py,
                     finalize_type_ids,
                     finalize_source_str,
@@ -512,12 +559,6 @@ impl PySecondaryCoordinator {
                     skip_existing,
                     finalize_shared_types,
                 ));
-
-                // The promoted-primary recipe reads the SAME shared run-config
-                // handle the coordinator's `store_pushed_run_config` writes, so
-                // on promotion it threads the DELIVERED argv (post-push) into
-                // its `PrimaryConfig` — not the stale boot seed (step 7).
-                let promote_run_config_handle = secondary.run_config_handle();
 
                 // Compose the compute-peer `Node`: a secondary that may be
                 // PROMOTED to primary. `Node::new` hands out the
@@ -543,10 +584,25 @@ impl PySecondaryCoordinator {
                 // (§14/§15); paired with the run's phase graph (the consumer
                 // declares it independent of discovery). Inert on a non-mode-2
                 // promotion (the driver short-circuits when debt != Owed).
+                // Discovery resolves the COMPLETE namespace through the SAME
+                // `run_config` cell the finalize uses (single source of truth).
+                // When no finalize callable was supplied (out-of-tree / no
+                // deferred reparse), fall back to the boot `task_args` as the
+                // pre-resolved namespace — the historical discovery contract.
+                let discovery_run_config = run_config.clone().unwrap_or_else(|| {
+                    crate::managers::run_config::SharedRunConfig::pre_resolved(
+                        discovery_task_args_py,
+                    )
+                });
+                // The on_run_start fire reads the SAME complete-namespace cell
+                // (single source of truth) — a clone shares the resolved-value
+                // cell, so on_run_start, discovery, and the finalize all see ONE
+                // namespace.
+                let on_run_start_run_config = discovery_run_config.clone();
                 let setup_discovery = dynrunner_manager_distributed::SetupDiscovery {
                     discover: build_setup_discovery_fn(
                         discovery_task_definition_py,
-                        discovery_task_args_py,
+                        discovery_run_config,
                         discovery_root,
                     ),
                     phase_deps: discovery_phase_deps,
@@ -566,6 +622,16 @@ impl PySecondaryCoordinator {
                     command_channel: Some((command_tx, command_rx)),
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
+                    phase_hook_raise_latch: sec_phase_hook_raise_latch,
+                    // SLURM path: the relocated primary must fire `on_run_start`
+                    // with its OWN live handle (the submitter's fired in a
+                    // DIFFERENT process and is dead post-relocation).
+                    on_run_start: Some(OnRunStartContext {
+                        task_definition_py: on_run_start_task_definition_py,
+                        source_dir: on_run_start_source_dir,
+                        run_config: on_run_start_run_config,
+                        primary_handle: on_run_start_handle,
+                    }),
                     forwarded_argv: promote_run_config_handle,
                     uses_file_based_items: promote_uses_file_based_items,
                     pre_staged_mode: promote_pre_staged_mode,
@@ -675,6 +741,37 @@ pub(crate) type PromotedCommandChannel = (
     tokio::sync::mpsc::Receiver<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
 );
 
+/// Node-local context for firing `on_run_start` on the PROMOTED primary.
+///
+/// Single concern: "what does the relocated primary hand the consumer's
+/// `on_run_start(source_dir, output_dir, args, primary_handle)` hook?". Built
+/// on the GIL thread (Py-handle ref-bumps) and consumed once, inside the
+/// recipe, under `Python::attach`.
+///
+/// `Some` ONLY on the SLURM secondary path: the consumer's `on_run_start`
+/// fired on the SUBMITTER process with the SUBMITTER's `PrimaryHandle`, which
+/// is dead once the submitter relocates into an observer — so the compute-node
+/// relocated primary must fire `on_run_start` AGAIN with its OWN live handle so
+/// the lazy-injection pattern (`on_phase_end → primary_handle.spawn_tasks`)
+/// reaches THIS primary. `None` on the in-process `--multi-computer local`
+/// path: that submitter's `on_run_start` already fired in the SAME process with
+/// the one live handle (re-firing would double-invoke the hook).
+pub(crate) struct OnRunStartContext {
+    /// The consumer `TaskDefinition` whose `on_run_start` is fired.
+    pub task_definition_py: Py<PyAny>,
+    /// The local source-tree root — the `source_dir` positional arg.
+    pub source_dir: String,
+    /// The COMPLETE run-config namespace cell (single source of truth, shared
+    /// with discovery): supplies the `args` Namespace AND resolves the
+    /// node-local `output_dir` ([`resolve_node_local_output_root`] — the D↔G
+    /// converged resolver).
+    pub run_config: crate::managers::run_config::SharedRunConfig,
+    /// The relocated primary's OWN live `PrimaryHandle` (its command channel is
+    /// the SAME the recipe threads via `replace_command_channel`), handed to
+    /// the consumer so `spawn_tasks` reaches THIS primary's command loop.
+    pub primary_handle: crate::managers::primary_handle::PyPrimaryHandle,
+}
+
 /// Inputs to [`build_promoted_primary_recipe`] — everything the promoted
 /// primary's build needs that is captured on the GIL thread / from config.
 ///
@@ -704,9 +801,27 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// that one Python handle does not re-route to the relocated primary.
     pub command_channel: Option<PromotedCommandChannel>,
     /// The phase-lifecycle callbacks the PROMOTED primary fires (it owns the
-    /// phase machine; the secondary does not — R4 seam).
+    /// phase machine; the secondary does not — R4 seam). Routed through
+    /// `PrimaryRunArgs` (the channel `run_pipeline` actually reads) so they
+    /// REPLACE the no-op closures — the bug-D one-line clobber.
     pub on_phase_start: crate::managers::lifecycle::OnPhaseStart,
     pub on_phase_end: crate::managers::lifecycle::OnPhaseEnd,
+    /// The raise-latch the honest `on_phase_end` (built via
+    /// `make_on_phase_end_with_raise_latch`) records a consumer-hook raise
+    /// into. Installed on the promoted coordinator via
+    /// `set_phase_hook_raise_latch` BEFORE `run` enters, so a relocated
+    /// primary's `on_phase_end` raise surfaces a non-zero `FatalPolicyExit`
+    /// (mirrors the submitter `primary/run.rs`). A `detached()` latch (nobody
+    /// reads it) keeps the warn-and-continue contract for callers that do not
+    /// wire an honest exit.
+    pub phase_hook_raise_latch: dynrunner_manager_distributed::PhaseHookRaiseLatch,
+    /// Node-local context for firing `on_run_start` on the promoted primary.
+    /// `Some` on the SLURM path (the relocated primary must hand the consumer
+    /// its OWN live handle + node-local `output_dir` so lazy injection reaches
+    /// THIS primary); `None` on the in-process path (the submitter's
+    /// `on_run_start` already fired in-process). Fired ONCE inside the recipe,
+    /// before the run loop spawns.
+    pub on_run_start: Option<OnRunStartContext>,
     /// The SHARED node-local run-config handle (single source of truth —
     /// `store_pushed_run_config` is the one writer). Read `.lock().clone()` at
     /// the promotion instant (always AFTER the post-welcome push landed), so
@@ -843,6 +958,8 @@ pub(crate) fn build_promoted_primary_recipe(
         command_channel,
         on_phase_start,
         on_phase_end,
+        phase_hook_raise_latch,
+        on_run_start,
         forwarded_argv,
         uses_file_based_items,
         pre_staged_mode,
@@ -855,7 +972,15 @@ pub(crate) fn build_promoted_primary_recipe(
     // channel is already an `Option` (it is `None` on the in-process path,
     // where the promoted primary keeps the internal channel `new` minted).
     let mut command_channel = command_channel;
+    // The phase callbacks are routed through `PrimaryRunArgs` (the channel
+    // `run_pipeline` reads — the bug-D clobber fix) rather than the dead
+    // `register_phase_lifecycle_callbacks`. Captured in an `Option` so the
+    // `FnMut` recipe takes the move-only `OnPhaseStart`/`OnPhaseEnd` on its one
+    // fire.
     let mut phase_callbacks = Some((on_phase_start, on_phase_end));
+    // The on_run_start context (Some on SLURM, None in-process) is single-use
+    // (the move-only Py handles + the PrimaryHandle); take it on the one fire.
+    let mut on_run_start = on_run_start;
     // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
     // `discover` closure that is not `Clone`); take it on the single fire.
     let mut setup_discovery = setup_discovery;
@@ -923,12 +1048,13 @@ pub(crate) fn build_promoted_primary_recipe(
         if let Some((tx, rx)) = command_channel.take() {
             primary.replace_command_channel(tx, rx);
         }
-        // The promoted primary owns the phase machine, so it fires the
-        // `on_phase_*` callbacks (R4: the secondary held them only as the
-        // wiring anchor; they belong on the authority).
-        if let Some((on_start, on_end)) = phase_callbacks.take() {
-            primary.register_phase_lifecycle_callbacks(on_start, on_end);
-        }
+        // Install the phase-hook raise-latch BEFORE `run` enters (pre-run
+        // setter contract, mirroring the submitter `primary/run.rs:444`) so a
+        // relocated primary's `on_phase_end` raise surfaces a non-zero
+        // `FatalPolicyExit` rather than warn-and-continue. The honest
+        // `on_phase_end` (built via `make_on_phase_end_with_raise_latch`)
+        // records into THIS latch.
+        primary.set_phase_hook_raise_latch(phase_hook_raise_latch.clone());
         // Register the consumer's discovery policy so a mode-2 SLURM-relocated
         // primary (which inherits `DiscoveryDebt=Owed` from the submitter's
         // relocated seed) can run `discover_on_promotion` and seed the staged
@@ -944,6 +1070,29 @@ pub(crate) fn build_promoted_primary_recipe(
         // the primary enters the ordinary `run` path and originates
         // `PrimaryChanged` itself.
         primary.seed_from_promotion_snapshot(snapshot);
+
+        // Fire `on_run_start` on the relocated primary (SLURM path only — the
+        // in-process submitter already fired it in-process). The consumer
+        // receives this primary's OWN live `PrimaryHandle` + the node-local
+        // `output_dir` so its lazy-injection pattern (`on_phase_end →
+        // primary_handle.spawn_tasks`) reaches THIS primary's command loop. A
+        // raise aborts the run (the consumer's setup failed) — surfaced as a
+        // `Failed` terminal at the node boundary. Runs synchronously on the
+        // node runtime thread; this is a one-time PRE-RUN hook (this primary's
+        // operational loop / keepalives have not started yet), so it does not
+        // stall an in-flight pump.
+        if let Some(ctx) = on_run_start.take() {
+            fire_on_run_start_on_promoted_primary(&ctx);
+        }
+
+        // Take the real phase callbacks into `PrimaryRunArgs` — the channel
+        // `run_pipeline` reads (`coordinator.rs:2640-2641`). This REPLACES the
+        // dead `register_phase_lifecycle_callbacks` path whose registration the
+        // run-args no-ops used to clobber (bug D). The promoted primary owns
+        // the phase machine; the secondary does not (R4 seam).
+        let (on_phase_start, on_phase_end) = phase_callbacks.take().expect(
+            "promoted-primary recipe fires at most once; phase callbacks must be present",
+        );
         PromotedPrimary {
             coordinator: primary,
             // The snapshot already carries the tasks + phase-deps and was
@@ -952,11 +1101,63 @@ pub(crate) fn build_promoted_primary_recipe(
             // run-init originates nothing and just re-hydrates.
             run_args: PrimaryRunArgs {
                 seed: SeedSource::PromotionSnapshot,
-                on_phase_start: Box::new(|_| {}),
-                on_phase_end: Box::new(|_, _, _, _| {}),
+                on_phase_start,
+                on_phase_end,
             },
         }
     })
+}
+
+/// Fire the consumer's `on_run_start` on the relocated primary under the GIL.
+///
+/// Single concern: hand the consumer `(source_dir, node-local output_dir,
+/// complete-namespace args, this primary's live handle)`. The node-local
+/// `output_dir` is the D↔G converged value [`resolve_node_local_output_root`]
+/// computes from the COMPLETE namespace; the `args` Namespace is that same
+/// complete namespace (the single source of truth shared with discovery). A
+/// resolve/hook failure logs at error and is swallowed at this seam — the run
+/// loop's own honesty signals (the phase-hook raise-latch, discovery's
+/// `Err`-abort) carry genuine terminal failures; a `Python::attach`-side panic
+/// here would unwind across the node runtime thread.
+fn fire_on_run_start_on_promoted_primary(ctx: &OnRunStartContext) {
+    Python::attach(|py| {
+        let result = (|| -> Result<(), String> {
+            let args_owned = ctx.run_config.resolve_under_gil(py)?;
+            let args = args_owned.bind(py);
+            // `on_run_start` REQUIRES an output_dir (its signature is
+            // positional). The complete namespace always carries `--output`
+            // (a required CLI flag), so the lenient `None` branch is a genuine
+            // misconfiguration here — surface it rather than passing an empty
+            // dir.
+            let output_dir = resolve_node_local_output_root(py, args)?.ok_or_else(|| {
+                "on_run_start: the run-config namespace has no `output` attribute \
+                 to resolve a node-local output_dir from"
+                    .to_string()
+            })?;
+            let handle = ctx
+                .primary_handle
+                .clone()
+                .into_pyobject(py)
+                .map_err(|e| format!("failed to convert PrimaryHandle to a Python object: {e}"))?
+                .into_any()
+                .unbind();
+            crate::managers::lifecycle::fire_on_run_start(
+                ctx.task_definition_py.bind(py),
+                &ctx.source_dir,
+                &output_dir,
+                args,
+                Some(handle),
+            )
+            .map_err(|e| format!("TaskDefinition.on_run_start raised: {e}"))
+        })();
+        if let Err(e) = result {
+            tracing::error!(
+                error = %e,
+                "on_run_start on the relocated primary failed; the consumer's \
+                 lazy-injection setup did not complete"
+            );
+        }
+    });
 }
 
 /// Build the consumer's setup-discovery policy closure.
@@ -990,17 +1191,23 @@ pub(crate) fn build_promoted_primary_recipe(
 /// (`managers/distributed/run.rs`), which seeds `DiscoveryDebt=Owed` and runs
 /// the same driver on the host fs (it does not relocate — the driver gates on
 /// the marker, not on relocation).
+///
+/// `run_config` is the COMPLETE-namespace single source of truth
+/// ([`crate::managers::run_config::SharedRunConfig`]) the discovery body
+/// resolves under the GIL — NOT the stale boot Namespace. Shared with the
+/// run-config finalize (worker `cmd_args`) on the SLURM path so both read ONE
+/// namespace.
 pub(crate) fn build_setup_discovery_fn(
     task_definition_py: Py<PyAny>,
-    task_args_py: Py<PyAny>,
+    run_config: crate::managers::run_config::SharedRunConfig,
     setup_discover_root: Option<std::path::PathBuf>,
 ) -> dynrunner_manager_distributed::SetupDiscoveryFn<RunnerIdentifier> {
     // Captured once; taken on the single invocation.
-    let mut handles = Some((task_definition_py, task_args_py, setup_discover_root));
+    let mut handles = Some((task_definition_py, run_config, setup_discover_root));
     Box::new(move || {
         let taken = handles.take();
         let fut = async move {
-            let Some((task_definition_py, task_args_py, setup_discover_root)) = taken else {
+            let Some((task_definition_py, run_config, setup_discover_root)) = taken else {
                 return Err(
                     "setup-discovery policy invoked more than once — a second \
                      invocation is a programmer error"
@@ -1014,7 +1221,7 @@ pub(crate) fn build_setup_discovery_fn(
                     discover_items_under_gil(
                         py,
                         &task_definition_py,
-                        &task_args_py,
+                        &run_config,
                         setup_discover_root.as_ref(),
                     )
                 })
@@ -1031,9 +1238,10 @@ pub(crate) fn build_setup_discovery_fn(
 /// `build_worker_command_args` rebuild — bundled so the `spawn_blocking`
 /// closure moves one value and the GIL body takes refs into it.
 struct FinalizeCaptures {
-    /// The Python finalize callable: `finalize_run_config(delivered_argv) ->
-    /// argparse.Namespace`.
-    finalize_run_config: Py<PyAny>,
+    /// The COMPLETE run-config namespace (single source of truth) the finalize
+    /// resolves and the discovery driver shares. Resolving it here caches the
+    /// reparse so a later promotion-time discovery reads the SAME namespace.
+    run_config: crate::managers::run_config::SharedRunConfig,
     /// The Python `task_definition` (for `build_worker_command_args`).
     task_definition_py: Py<PyAny>,
     /// The declared `TypeId` strings to rebuild cmd_args for.
@@ -1059,12 +1267,16 @@ struct FinalizeCaptures {
 /// resulting per-type `cmd_args` into the SHARED [`SharedTypeRegistry`] the
 /// factory reads at every spawn.
 ///
-/// `None` finalize callable → no-op (the cmd_args stay the boot-CLI build).
-/// This is the out-of-tree path (a caller driving the secondary directly with
-/// no Python dispatcher closure). The `args=` consumer path (compiler_suit)
-/// supplies an IDENTITY callable instead (Some) — its worker argv does not
-/// depend on the forwarded run-config, so the seam fires but rebuilds a
-/// byte-identical cmd_args.
+/// `None` `run_config` → no-op (the cmd_args stay the boot-CLI build). This is
+/// the out-of-tree path (a caller driving the secondary directly with no
+/// Python dispatcher closure). The `args=` consumer path (compiler_suit)
+/// supplies an IDENTITY-callable-backed [`SharedRunConfig`] instead (Some) —
+/// its worker argv does not depend on the forwarded run-config, so the seam
+/// fires but rebuilds a byte-identical cmd_args.
+///
+/// The `run_config` is the SAME [`SharedRunConfig`] handle the discovery driver
+/// reads, so the namespace the finalize resolves is cached for a later
+/// promotion-time discovery (single source of truth — one reparse).
 ///
 /// # Non-block correctness (§14/§15)
 ///
@@ -1076,7 +1288,7 @@ struct FinalizeCaptures {
 /// (fire-once upstream); a defensive second invocation surfaces a clear
 /// error.
 fn build_finalize_run_config_fn(
-    finalize_run_config: Option<Py<PyAny>>,
+    run_config: Option<crate::managers::run_config::SharedRunConfig>,
     task_definition_py: Py<PyAny>,
     type_ids: Vec<String>,
     source_str: String,
@@ -1084,9 +1296,9 @@ fn build_finalize_run_config_fn(
     skip_existing: bool,
     shared_types: crate::task_def::SharedTypeRegistry,
 ) -> dynrunner_manager_distributed::FinalizeRunConfigFn {
-    // No finalize callable supplied → an inert closure (no-op). The factory
+    // No run-config handle supplied → an inert closure (no-op). The factory
     // keeps reading the boot-CLI cmd_args the shared cell was seeded with.
-    let Some(finalize_run_config) = finalize_run_config else {
+    let Some(run_config) = run_config else {
         return Box::new(move |_delivered: Vec<String>| {
             Box::pin(async { Ok(()) }) as Pin<Box<dyn Future<Output = Result<(), String>>>>
         });
@@ -1094,7 +1306,7 @@ fn build_finalize_run_config_fn(
     // Captured once; taken on the single fire (the coordinator fires the
     // finalize at most once per run).
     let mut captures = Some(FinalizeCaptures {
-        finalize_run_config,
+        run_config,
         task_definition_py,
         type_ids,
         source_str,
@@ -1102,7 +1314,10 @@ fn build_finalize_run_config_fn(
         skip_existing,
         shared_types,
     });
-    Box::new(move |delivered: Vec<String>| {
+    // The coordinator passes the delivered argv, but resolution reads it off
+    // the shared `run_config` handle (the SAME `run_config_handle()`), so the
+    // closure arg is redundant here — single source of truth.
+    Box::new(move |_delivered: Vec<String>| {
         let taken = captures.take();
         let fut = async move {
             let Some(captures) = taken else {
@@ -1116,7 +1331,7 @@ fn build_finalize_run_config_fn(
             // (§14/§15).
             tokio::task::spawn_blocking(move || {
                 Python::attach(|py| -> Result<(), String> {
-                    finalize_cmd_args_under_gil(py, &captures, delivered)
+                    finalize_cmd_args_under_gil(py, &captures)
                 })
             })
             .await
@@ -1141,14 +1356,14 @@ fn build_finalize_run_config_fn(
 fn finalize_cmd_args_under_gil(
     py: Python<'_>,
     captures: &FinalizeCaptures,
-    delivered: Vec<String>,
 ) -> Result<(), String> {
-    // Re-parse the consumer's full argparse namespace from the delivered argv.
-    let new_args = captures
-        .finalize_run_config
-        .bind(py)
-        .call1((delivered,))
-        .map_err(|e| format!("finalize_run_config(delivered_argv) raised: {e}"))?;
+    // Resolve the consumer's COMPLETE argparse namespace through the SHARED
+    // run-config (single source of truth — it reads the delivered argv off its
+    // own `run_config_handle()` and caches the reparse). A later
+    // promotion-time discovery reads the SAME cached namespace, so the worker
+    // `cmd_args` and the discovery selection flags never diverge.
+    let new_args_owned = captures.run_config.resolve_under_gil(py)?;
+    let new_args = new_args_owned.bind(py);
 
     // Rebuild the per-type cmd_args via the EXACT boot-time path
     // (`build_worker_command_args`), then assemble a fresh registry that keeps
@@ -1218,16 +1433,78 @@ fn finalize_cmd_args_under_gil(
     Ok(())
 }
 
-/// The GIL-held body of one setup-discovery excursion: resolve the output
-/// root attribute, call `task.discover_items(<root>, args)`, and convert the
-/// result into typed binaries. Pure under-GIL logic, factored out so the
-/// `spawn_blocking` closure stays a thin off-thread wrapper. Returns a
-/// `String` error (the secondary aborts the run on it) so no `PyErr` crosses
-/// the `Send` boundary.
+/// Resolve the NODE-LOCAL output root the relocated/pre-staged primary writes
+/// under — the bind-mount-aware value, NOT the submitter-side `--output`.
+///
+/// Single concern: "where does THIS node's filesystem expose the run's output
+/// directory?". The D↔G convergence point: the SAME value is BOTH the
+/// discovery driver's `args.resolved_output_root` (G) AND the relocated
+/// primary's `on_run_start` `output_dir` (D), so it is computed ONCE here and
+/// fed to both — no duplicated bind-mount logic.
+///
+///   * Pre-staged mode (`args.source_already_staged` non-`None`): the
+///     secondary's filesystem-view of the gateway-side output dir lives at the
+///     wrapper-script's static bind-mount path `/app/out-network` → `Some`.
+///   * Non-pre-staged WITH `args.output`: `Path(args.output).resolve()` →
+///     `Some`.
+///   * Non-pre-staged WITHOUT `args.output`: `Ok(None)` — preserves the
+///     original discovery body's lenient "skip setting `resolved_output_root`"
+///     behaviour (the boot Namespace need not carry `--output`, which is NOT a
+///     framework-regenerated flag). A genuine resolve failure (pathlib raising)
+///     is still an `Err`.
+///
+/// Returns a `String` error (the secondary aborts the run on it) so no `PyErr`
+/// crosses the `Send` boundary in the calling closures.
+fn resolve_node_local_output_root(
+    py: Python<'_>,
+    args: &Bound<'_, PyAny>,
+) -> Result<Option<String>, String> {
+    let pre_staged = args
+        .getattr("source_already_staged")
+        .ok()
+        .filter(|v| !v.is_none())
+        .is_some();
+    if pre_staged {
+        return Ok(Some("/app/out-network".to_string()));
+    }
+    let Ok(output_attr) = args.getattr("output") else {
+        // No `output` attribute: lenient skip (original discovery behaviour).
+        return Ok(None);
+    };
+    let resolved = (|| -> PyResult<Bound<'_, PyAny>> {
+        let pathlib = py.import("pathlib")?;
+        pathlib
+            .getattr("Path")?
+            .call1((output_attr,))?
+            .call_method0("resolve")
+    })()
+    .map_err(|e| format!("failed to resolve output root: {e}"))?;
+    resolved
+        .str()
+        .map_err(|e| format!("failed to stringify resolved output root: {e}"))?
+        .extract::<String>()
+        .map(Some)
+        .map_err(|e| format!("failed to extract resolved output root: {e}"))
+}
+
+/// The GIL-held body of one setup-discovery excursion: resolve the COMPLETE
+/// run-config namespace, surface the node-local output root, call
+/// `task.discover_items(<root>, args)`, and convert the result into typed
+/// binaries. Pure under-GIL logic, factored out so the `spawn_blocking`
+/// closure stays a thin off-thread wrapper. Returns a `String` error (the
+/// secondary aborts the run on it) so no `PyErr` crosses the `Send` boundary.
+///
+/// The discovery namespace is the COMPLETE one [`SharedRunConfig`] resolves —
+/// NOT the stale boot Namespace. On a SLURM relocate-target this is the
+/// reparse of the delivered `forwarded_argv` (so the consumer selection flags
+/// `--platform` / `--compiler` / `--name-regex` / `--exclude-subfolder` +
+/// `--skip-existing` are present); on the in-process path it is the submitter's
+/// eagerly-parsed namespace. Either way `args.resolved_output_root` is the
+/// node-local value [`resolve_node_local_output_root`] computes.
 fn discover_items_under_gil(
     py: Python<'_>,
     task_definition_py: &Py<PyAny>,
-    task_args_py: &Py<PyAny>,
+    run_config: &crate::managers::run_config::SharedRunConfig,
     setup_discover_root: Option<&std::path::PathBuf>,
 ) -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
     let root = setup_discover_root.ok_or_else(|| {
@@ -1238,38 +1515,21 @@ fn discover_items_under_gil(
             .to_string()
     })?;
     let task_def = task_definition_py.bind(py);
-    let args = task_args_py.bind(py);
+    // The COMPLETE run-config namespace (single source of truth) — carries the
+    // consumer selection flags + `--skip-existing` the stale boot Namespace
+    // lacked.
+    let args_owned = run_config.resolve_under_gil(py)?;
+    let args = args_owned.bind(py);
     let root_py = root
         .clone()
         .into_pyobject(py)
         .map_err(|e| format!("failed to convert discovery root to a Python path: {e}"))?;
-    // Surface `args.resolved_output_root` on the secondary so the task's
-    // `discover_items` sees the same attribute contract the submitter sets.
-    // - Pre-staged mode (`args.source_already_staged` non-None): the
-    //   secondary's filesystem-view of the gateway-side output dir lives at
-    //   the wrapper-script's static bind-mount path `/app/out-network`.
-    // - Non-pre-staged: fall back to `Path(args.output).resolve()`.
-    let pre_staged = args
-        .getattr("source_already_staged")
-        .ok()
-        .filter(|v| !v.is_none())
-        .is_some();
-    if pre_staged {
-        args.setattr("resolved_output_root", "/app/out-network")
-            .map_err(|e| format!("failed to set resolved_output_root: {e}"))?;
-    } else if let Ok(output_attr) = args.getattr("output") {
-        let resolved = (|| -> PyResult<Bound<'_, PyAny>> {
-            let pathlib = py.import("pathlib")?;
-            pathlib
-                .getattr("Path")?
-                .call1((output_attr,))?
-                .call_method0("resolve")
-        })()
-        .map_err(|e| format!("failed to resolve output root: {e}"))?;
-        let resolved_str = resolved
-            .str()
-            .map_err(|e| format!("failed to stringify resolved output root: {e}"))?;
-        args.setattr("resolved_output_root", resolved_str)
+    // Surface `args.resolved_output_root` (the node-local, bind-mount-aware
+    // value) so the task's `discover_items` sees the same attribute contract
+    // the submitter sets — the D↔G converged resolver. Lenient skip when the
+    // namespace carries no `output` (original discovery behaviour).
+    if let Some(resolved_output_root) = resolve_node_local_output_root(py, args)? {
+        args.setattr("resolved_output_root", resolved_output_root)
             .map_err(|e| format!("failed to set resolved_output_root: {e}"))?;
     }
     // Buffer the discover_items iterable into a `PyList` so the shared
@@ -1558,6 +1818,372 @@ mod staging_dispatch_flags_tests {
             let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
             assert!(uses_files, "missing uses_file_based_items defaults to file-based");
             assert!(!pre_staged, "missing source_already_staged defaults to not-pre-staged");
+        });
+    }
+}
+
+/// Relocated-primary run-lifecycle tests (bugs D + G).
+///
+/// Exercise the REAL pyo3 source the relocated primary runs:
+///   * G — [`discover_items_under_gil`] resolves the COMPLETE namespace
+///     ([`SharedRunConfig::deferred`] reparse of the delivered argv) so the
+///     consumer's `discover_items` sees the selection flags + `--skip-existing`
+///     + the node-local `resolved_output_root` the stale boot Namespace lacked.
+///   * D — [`build_promoted_primary_recipe`] routes the REAL `on_phase_end`
+///     through `PrimaryRunArgs` (NOT the no-op closure `run_pipeline` used to
+///     read) AND fires `on_run_start` on the relocated primary with a live
+///     handle + node-local `output_dir`.
+///
+/// No false-greens: each test drives the production builder / GIL body, never a
+/// pre-built config. Revert the fix (no-op closures in `PrimaryRunArgs`; the
+/// stale `task_args_py` into discovery) and these regress.
+///
+///   `cargo test -p dynrunner-pyo3 --no-default-features \
+///        --features test-with-python relocated_primary`
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod relocated_primary_tests {
+    use super::*;
+    use crate::managers::run_config::SharedRunConfig;
+    use pyo3::types::PyModule;
+    use std::sync::{Arc, Mutex};
+
+    /// A consumer `TaskDefinition` whose `discover_items`, `on_phase_end`, and
+    /// `on_run_start` RECORD what the framework handed them onto module-level
+    /// lists, so a test reads back the real call arguments. Built from a small
+    /// pure-Python module (no wheel). `finalize_run_config` is a real reparse
+    /// closure that builds a `Namespace` from the delivered argv tokens.
+    fn task_module(py: Python<'_>) -> Bound<'_, PyAny> {
+        let source = r#"
+import argparse
+from types import SimpleNamespace
+
+# Recorded call arguments, read back by the Rust test.
+discover_calls = []      # list[(root_str, namespace)]
+on_phase_end_calls = []  # list[(phase, completed, failed)]
+on_run_start_calls = []  # list[(source_dir, output_dir, has_handle, namespace)]
+
+class _Item:
+    """Minimal duck-typed TaskInfo the shared `extract_binaries` accepts."""
+    def __init__(self, task_id):
+        self.task_id = task_id
+        self.path = "/staged/corpus/" + task_id
+        self.size = 1
+        self.identifier = SimpleNamespace(
+            binary_name=task_id,
+            platform="x64",
+            compiler="gcc",
+            version="1",
+            opt_level="O0",
+        )
+        self.type_id = "t"
+        self.task_depends_on = []
+
+class Task:
+    def discover_items(self, root, args):
+        discover_calls.append((str(root), args))
+        # Emit ONE item iff the selection flag the boot Namespace lacked is
+        # present — proves the COMPLETE namespace reached discovery.
+        if getattr(args, "platform", None) == "x64":
+            yield _Item("disc-1")
+
+    def on_phase_end(self, phase_id, completed, failed, phase_outputs=None):
+        on_phase_end_calls.append((phase_id, completed, failed))
+        if getattr(self, "_raise_on_phase_end", False):
+            raise RuntimeError("consumer policy abort from on_phase_end")
+
+    def on_run_start(self, source_dir, output_dir, args, primary_handle=None):
+        on_run_start_calls.append(
+            (source_dir, output_dir, primary_handle is not None, args)
+        )
+
+def finalize_run_config(delivered):
+    # The deferred reparse: build the COMPLETE Namespace from the delivered
+    # forwarded argv (the boot Namespace would lack these).
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--platform")
+    parser.add_argument("--output")
+    ns = parser.parse_args(delivered)
+    return ns
+
+task = Task()
+"#;
+        let module = PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new("relocated_stub.py").unwrap().as_c_str(),
+            std::ffi::CString::new("relocated_stub").unwrap().as_c_str(),
+        )
+        .expect("compile relocated-primary stub module");
+        module.into_any()
+    }
+
+    /// G: discovery resolves the COMPLETE namespace (the deferred reparse of
+    /// the delivered argv), so `discover_items` sees `--platform`/`--output`
+    /// AND the node-local `resolved_output_root` — none of which are on the
+    /// stale boot line. The emitted item proves the selection flag arrived.
+    #[test]
+    fn discovery_receives_complete_namespace_and_node_local_output_root() {
+        Python::attach(|py| {
+            let module = task_module(py);
+            let task = module.getattr("task").unwrap().unbind();
+            // The DELIVERED forwarded argv (post-push) — the complete run-config
+            // the boot Namespace lacked.
+            let delivered = Arc::new(Mutex::new(vec![
+                "--platform".to_string(),
+                "x64".to_string(),
+                "--output".to_string(),
+                "/run/out".to_string(),
+            ]));
+            let finalize = module.getattr("finalize_run_config").unwrap().unbind();
+            let run_config = SharedRunConfig::deferred(finalize, delivered);
+
+            let root = std::path::PathBuf::from("/staged/corpus");
+            let items = discover_items_under_gil(py, &task, &run_config, Some(&root))
+                .expect("discovery must succeed on the complete namespace");
+
+            // The selection flag reached discovery → one item emitted.
+            assert_eq!(items.len(), 1, "selection flag must reach discover_items");
+
+            // Read back the recorded call arguments.
+            let discover_calls = module.getattr("discover_calls").unwrap();
+            assert_eq!(discover_calls.len().unwrap(), 1);
+            let (root_str, ns): (String, Bound<'_, PyAny>) =
+                discover_calls.get_item(0).unwrap().extract().unwrap();
+            assert_eq!(root_str, "/staged/corpus");
+            // The COMPLETE namespace: the boot Namespace would not carry
+            // `platform`.
+            let platform: String = ns.getattr("platform").unwrap().extract().unwrap();
+            assert_eq!(platform, "x64");
+            // Non-pre-staged node-local output root = resolve(args.output).
+            let resolved: String =
+                ns.getattr("resolved_output_root").unwrap().extract().unwrap();
+            assert_eq!(resolved, "/run/out");
+        });
+    }
+
+    /// G: a PRE-staged discovery namespace gets the bind-mount output root
+    /// (`/app/out-network`), the D↔G converged resolver's pre-staged branch.
+    #[test]
+    fn discovery_pre_staged_output_root_is_bind_mount() {
+        Python::attach(|py| {
+            let source = "from types import SimpleNamespace\n\
+                 ns = SimpleNamespace(source_already_staged='/staged', output='/ignored')\n";
+            let m = PyModule::from_code(
+                py,
+                std::ffi::CString::new(source).unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_ns.py").unwrap().as_c_str(),
+                std::ffi::CString::new("prestaged_ns").unwrap().as_c_str(),
+            )
+            .unwrap();
+            let ns = m.getattr("ns").unwrap();
+            let resolved = resolve_node_local_output_root(py, &ns).unwrap();
+            assert_eq!(resolved.as_deref(), Some("/app/out-network"));
+        });
+    }
+
+    /// Build the four mesh/snapshot inputs the promote recipe consumes, plus a
+    /// `(tx, rx)` command channel and a live handle minted from the SAME `tx`.
+    /// All produced from production constructors (no test-only shims).
+    #[allow(clippy::type_complexity)]
+    fn recipe_inputs() -> (
+        PromotedCommandChannel,
+        crate::managers::primary_handle::PyPrimaryHandle,
+        dynrunner_manager_distributed::process::Mesh<
+            RunnerIdentifier,
+            dynrunner_transport_channel::ChannelPeerTransport<RunnerIdentifier>,
+        >,
+    ) {
+        use dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY;
+        let (tx, rx) = tokio::sync::mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let handle = crate::managers::primary_handle::PyPrimaryHandle::from_sender(
+            tx.clone(),
+            crate::managers::primary_handle::ReinjectCapCell::default(),
+        )
+        .expect("handle init");
+        let mut transports =
+            dynrunner_transport_channel::peer_mesh::<RunnerIdentifier>(&["primary".to_string()]);
+        let transport = transports.remove(0);
+        let mesh = Mesh::new(transport);
+        ((tx, rx), handle, mesh)
+    }
+
+    /// D: the promote recipe routes the REAL `on_phase_end` through
+    /// `PrimaryRunArgs` (NOT the no-op closure). Invoking the returned
+    /// `run_args.on_phase_end` fires the consumer hook (recorded) AND — because
+    /// it is the raise-latch variant sharing the latch the recipe installed — a
+    /// raising hook records into THAT latch. Reverting the fix (no-op closures
+    /// in `PrimaryRunArgs`) leaves the consumer hook uncalled and the latch
+    /// empty.
+    #[test]
+    fn recipe_routes_real_on_phase_end_with_raise_latch_through_run_args() {
+        Python::attach(|py| {
+            let module = task_module(py);
+            let task = module.getattr("task").unwrap();
+            // Arm the consumer hook to raise so the latch path is exercised.
+            task.setattr("_raise_on_phase_end", true).unwrap();
+            let task_def = task.clone().unbind();
+
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+                crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)),
+            );
+            let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                    task_def.clone_ref(py),
+                    raise_latch.clone(),
+                ));
+
+            let ((tx, rx), _handle, mut mesh) = recipe_inputs();
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+            let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
+            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
+                .snapshot();
+            let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
+
+            let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                secondary_id: "primary".to_string(),
+                keepalive_interval: std::time::Duration::from_secs(5),
+                peer_timeout: std::time::Duration::from_secs(30),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 0,
+                oom_retry_max_passes: 0,
+                scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
+                estimator,
+                command_channel: Some((tx, rx)),
+                on_phase_start,
+                on_phase_end,
+                phase_hook_raise_latch: raise_latch.clone(),
+                // No on_run_start here — exercised in its own test.
+                on_run_start: None,
+                forwarded_argv: Arc::new(Mutex::new(Vec::new())),
+                uses_file_based_items: true,
+                pre_staged_mode: false,
+                source_pre_staged_root: None,
+                source_dir: None,
+                setup_discovery: None,
+            });
+
+            let mut built = recipe(client, inbox, demote_rx, snapshot);
+            // Keep the slot alive for the coordinator's lifetime.
+            let _slot = slot;
+
+            // Invoke the REAL `run_args.on_phase_end` — the channel
+            // `run_pipeline` reads. A no-op (reverted bug) would record nothing.
+            let outputs = std::collections::BTreeMap::new();
+            (built.run_args.on_phase_end)(
+                &dynrunner_core::PhaseId::from("phase-1"),
+                3,
+                0,
+                &outputs,
+            );
+
+            // The consumer hook fired (NOT a no-op).
+            let calls = module.getattr("on_phase_end_calls").unwrap();
+            assert_eq!(
+                calls.len().unwrap(),
+                1,
+                "run_args.on_phase_end must invoke the consumer hook, not a no-op"
+            );
+            // The raise was recorded into the SAME latch the recipe installed —
+            // the honest-exit path is live on the relocated primary.
+            assert!(
+                raise_latch.take().is_some(),
+                "a raising on_phase_end must record into the recipe's raise-latch"
+            );
+            drop(built.coordinator);
+        });
+    }
+
+    /// D: the recipe fires `on_run_start` on the relocated primary, handing the
+    /// consumer (source_dir, node-local output_dir, complete-namespace args,
+    /// a LIVE handle). Reverting the fix (no on_run_start fire) leaves
+    /// `on_run_start_calls` empty.
+    #[test]
+    fn recipe_fires_on_run_start_with_live_handle_and_node_local_output() {
+        Python::attach(|py| {
+            let module = task_module(py);
+            let task = module.getattr("task").unwrap();
+            let task_def = task.clone().unbind();
+
+            let on_phase_start: crate::managers::lifecycle::OnPhaseStart =
+                Box::new(crate::managers::lifecycle::make_on_phase_start(task_def.clone_ref(py)));
+            let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+            let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                    task_def.clone_ref(py),
+                    raise_latch.clone(),
+                ));
+
+            // The complete namespace, resolved from the delivered argv.
+            let delivered = Arc::new(Mutex::new(vec![
+                "--platform".to_string(),
+                "x64".to_string(),
+                "--output".to_string(),
+                "/run/out".to_string(),
+            ]));
+            let finalize = module.getattr("finalize_run_config").unwrap().unbind();
+            let run_config = SharedRunConfig::deferred(finalize, delivered);
+
+            let ((tx, rx), handle, mut mesh) = recipe_inputs();
+            let (slot, client, inbox) =
+                mesh.register_local_role(LocalRole::Primary, PeerId::from("primary"));
+            let (_demote_tx, demote_rx) = tokio::sync::mpsc::unbounded_channel();
+            let snapshot = dynrunner_manager_distributed::ClusterState::<RunnerIdentifier>::new()
+                .snapshot();
+            let estimator = PyMemoryEstimatorBridge::from_python(&task, &[]).unwrap();
+
+            let mut recipe = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                secondary_id: "primary".to_string(),
+                keepalive_interval: std::time::Duration::from_secs(5),
+                peer_timeout: std::time::Duration::from_secs(30),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 0,
+                oom_retry_max_passes: 0,
+                scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
+                estimator,
+                command_channel: Some((tx, rx)),
+                on_phase_start,
+                on_phase_end,
+                phase_hook_raise_latch: raise_latch,
+                on_run_start: Some(OnRunStartContext {
+                    task_definition_py: task_def,
+                    source_dir: "/local/src".to_string(),
+                    run_config,
+                    primary_handle: handle,
+                }),
+                forwarded_argv: Arc::new(Mutex::new(Vec::new())),
+                uses_file_based_items: true,
+                pre_staged_mode: false,
+                source_pre_staged_root: None,
+                source_dir: None,
+                setup_discovery: None,
+            });
+
+            let built = recipe(client, inbox, demote_rx, snapshot);
+            let _slot = slot;
+
+            let calls = module.getattr("on_run_start_calls").unwrap();
+            assert_eq!(
+                calls.len().unwrap(),
+                1,
+                "the relocated primary must fire on_run_start once"
+            );
+            let (source_dir, output_dir, has_handle, ns): (
+                String,
+                String,
+                bool,
+                Bound<'_, PyAny>,
+            ) = calls.get_item(0).unwrap().extract().unwrap();
+            assert_eq!(source_dir, "/local/src");
+            // The node-local output root (non-pre-staged → resolve(args.output)).
+            assert_eq!(output_dir, "/run/out");
+            assert!(has_handle, "on_run_start must receive a live primary_handle");
+            // The args are the COMPLETE namespace (selection flag present).
+            let platform: String = ns.getattr("platform").unwrap().extract().unwrap();
+            assert_eq!(platform, "x64");
+            drop(built.coordinator);
         });
     }
 }
