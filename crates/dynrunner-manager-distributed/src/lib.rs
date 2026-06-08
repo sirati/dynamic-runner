@@ -26,7 +26,7 @@ pub use primary::{
 pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 pub use secondary::{
     DEFAULT_PRIMARY_SILENCE_BACKSTOP, FinalizeRunConfigFn, PeerCertInfo, RunOutcome,
-    SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
+    SecondaryConfig, SecondaryCoordinator, SecondaryTerminal, StagingDispatchContext,
 };
 pub use zip_extract::compute_file_hash;
 // Re-export transport traits from the comm API crate for convenience.

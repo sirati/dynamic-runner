@@ -220,27 +220,19 @@ pub(in crate::secondary) enum SecondaryLifecycle<M: ManagerEndpoint, I: Identifi
 
 /// State data for [`SecondaryLifecycle::Configuring`].
 ///
-/// Carries the worker pool (spawned on entry to this state) plus the
-/// configuration flags the setup phase reads. The pre-staged /
-/// file-based flags are *carried forward* into [`OperationalState`] when
-/// configuration completes, so the resolver keeps its values across the
-/// `enter_operational()` boundary.
+/// Carries the worker pool (spawned on entry to this state) and this node's
+/// own in-flight assignments. The pre-staged / file-based dispatch flags are
+/// NOT lifecycle state — they are a node-local run constant the
+/// [`SecondaryCoordinator`] holds in its shared
+/// [`crate::secondary::StagingDispatchContext`] handle (single source of
+/// truth, read by both the dispatch resolver and the promotion recipe), so
+/// they no longer ride this state across the `enter_operational()` boundary.
 pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifier> {
     /// The local worker pool, built by `initialize_workers` on entry to
     /// this state. Real [`WorkerPool<M, I>`] — there is no pool in any
     /// earlier state, which is what makes a pre-`Configuring` worker-spawn
     /// unrepresentable.
     pub(in crate::secondary) pool: WorkerPool<M, I>,
-
-    /// Pre-staged source mode, from `InitialAssignment.pre_staged_mode`.
-    /// Carried forward into [`OperationalState`] (it feeds the
-    /// dispatch-resolver hash choice).
-    pub(in crate::secondary) pre_staged_mode: bool,
-
-    /// Whether dispatched items are real files, from
-    /// `InitialAssignment.uses_file_based_items`. Carried forward into
-    /// [`OperationalState`].
-    pub(in crate::secondary) uses_file_based_items: bool,
 
     /// This node's OWN in-flight worker assignments: `file_hash ->
     /// worker_id`. Populated during the `InitialAssignment` dispatch,
@@ -308,12 +300,6 @@ pub(in crate::secondary) struct OperationalState<M: ManagerEndpoint, I: Identifi
     /// Tasks deferred because the target worker's per-type subprocess is
     /// mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`.
     pub(in crate::secondary) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-
-    /// Pre-staged source mode, carried forward from [`ConfiguringState`].
-    pub(in crate::secondary) pre_staged_mode: bool,
-
-    /// File-based-items flag, carried forward from [`ConfiguringState`].
-    pub(in crate::secondary) uses_file_based_items: bool,
 }
 
 /// Peer-mesh formation progress — the orthogonal sub-concern.
@@ -484,24 +470,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// unrepresentable, and if the primary never announces the lifecycle
     /// never leaves `AwaitingPrimary` and no pool is ever built.
     ///
-    /// `pre_staged_mode` / `uses_file_based_items` are seeded from the
-    /// primary's `InitialAssignment` and carried forward into
-    /// [`OperationalState`] at the next boundary. The real `Configuring →
+    /// The pre-staged / file-based dispatch flags are seeded from the
+    /// primary's `InitialAssignment` into the coordinator's shared
+    /// [`crate::secondary::StagingDispatchContext`] handle (not this state),
+    /// so the transition no longer threads them. The real `Configuring →
     /// Operational` gate is the local `got_peer_info / got_assignment /
     /// got_transfer` trio tracked in `wait_for_setup` — the single source of
     /// truth, not a field on this state.
-    pub(in crate::secondary) fn enter_configuring(
-        self,
-        pool: WorkerPool<M, I>,
-        pre_staged_mode: bool,
-        uses_file_based_items: bool,
-    ) -> Self {
+    pub(in crate::secondary) fn enter_configuring(self, pool: WorkerPool<M, I>) -> Self {
         match self {
             SecondaryLifecycle::AwaitingPrimary { .. } => {
                 SecondaryLifecycle::Configuring(Box::new(ConfiguringState {
                     pool,
-                    pre_staged_mode,
-                    uses_file_based_items,
                     active_tasks: HashMap::new(),
                 }))
             }
@@ -519,8 +499,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
     /// `select!` loop. This transition (and thus the consumption) happens at
     /// most once per node.
     ///
-    /// The [`ConfiguringState`]'s `pool` and the two carried-forward config
-    /// flags (`pre_staged_mode` / `uses_file_based_items`) move **into**
+    /// The [`ConfiguringState`]'s `pool` moves **into**
     /// [`OperationalState`]; the
     /// operational runtime values the caller supplies — the
     /// [`ElectionState`] sub-machine, `primary_last_seen`,
@@ -557,8 +536,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             SecondaryLifecycle::Configuring(cfg) => {
                 let ConfiguringState {
                     pool,
-                    pre_staged_mode,
-                    uses_file_based_items,
                     // The initial-assignment dispatch (run in `Configuring`)
                     // already populated `active_tasks`; carry it forward
                     // rather than overwrite it with an empty map.
@@ -574,8 +551,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pending_peer_messages,
                     pending_worker_restarts,
                     pending_first_bind,
-                    pre_staged_mode,
-                    uses_file_based_items,
                 }));
                 (next, latches)
             }
@@ -613,11 +588,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
             pending_peer_messages: Vec::new(),
             pending_worker_restarts: HashSet::new(),
             pending_first_bind: HashMap::new(),
-            // A late-joiner is never the pre-stage discovery node and
-            // its dispatched items follow the historical file-based
-            // contract until an `InitialAssignment` says otherwise.
-            pre_staged_mode: false,
-            uses_file_based_items: true,
         }));
         (state, latches)
     }
@@ -777,53 +747,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         }
     }
 
-    /// Read the pre-staged-source-mode flag from whichever state carries
-    /// it (`Configuring` or `Operational` — it is seeded in `Configuring`
-    /// and carried forward into `Operational`). `false` before
-    /// `Configuring` (no `InitialAssignment` seen yet), which matches the
-    /// historical pre-InitialAssignment default.
-    pub(in crate::secondary) fn pre_staged_mode(&self) -> bool {
-        match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.pre_staged_mode,
-            SecondaryLifecycle::Operational(op) => op.pre_staged_mode,
-            _ => false,
-        }
-    }
-
-    /// Read the file-based-items flag from whichever state carries it.
-    /// Defaults to `true` before `Configuring` (the historical
-    /// pre-`InitialAssignment` contract: items are real files until an
-    /// `InitialAssignment` says otherwise).
-    pub(in crate::secondary) fn uses_file_based_items(&self) -> bool {
-        match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.uses_file_based_items,
-            SecondaryLifecycle::Operational(op) => op.uses_file_based_items,
-            _ => true,
-        }
-    }
-
-    /// Set the pre-staged-source-mode flag on the carrying state. Written
-    /// from `wait_for_setup`'s `InitialAssignment` handler, which runs in
-    /// `Configuring`. A no-op pre-`Configuring` / terminal (no state to
-    /// carry it) — defensive; the only caller runs in `Configuring`.
-    pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
-        match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.pre_staged_mode = on,
-            SecondaryLifecycle::Operational(op) => op.pre_staged_mode = on,
-            _ => {}
-        }
-    }
-
-    /// Set the file-based-items flag on the carrying state. Same
-    /// `Configuring`-phase write site / no-op-otherwise disposition as
-    /// [`Self::set_pre_staged_mode`].
-    pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
-        match self {
-            SecondaryLifecycle::Configuring(cfg) => cfg.uses_file_based_items = on,
-            SecondaryLifecycle::Operational(op) => op.uses_file_based_items = on,
-            _ => {}
-        }
-    }
 }
 
 /// Capability invariants that exist ONLY in `AwaitingPrimary`.

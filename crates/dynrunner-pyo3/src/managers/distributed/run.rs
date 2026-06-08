@@ -374,6 +374,26 @@ impl PyDistributedManager {
                     // policy (pre-staged path) — the relocate target pairs it
                     // with the discovered corpus in `discover_on_promotion`.
                     let sec_phase_deps = phase_deps.clone();
+                    // Staging/discovery config the PROMOTE recipe threads into
+                    // the relocated primary's `PrimaryConfig` so its dispatch
+                    // matches the submitter's (the relocate-staging fix). The
+                    // in-process setup peer shares one fs, so the pre-staged
+                    // root IS `source_pre_staged_root` and the source root IS
+                    // `source_dir`. Per-secondary clones because each spawned
+                    // `move` task owns its own copy.
+                    let promote_pre_staged_root = source_pre_staged_root.clone();
+                    let promote_source_dir = Some(source_dir.clone());
+                    // The two staging-dispatch flags the PROMOTE recipe stamps,
+                    // sourced from the LOCAL PRODUCER (NOT the
+                    // `InitialAssignment`-fed cell — a relocate-target's cell is
+                    // at `Default` at promotion). Both are already extracted on
+                    // this in-process manager: `uses_file_based_items` off the
+                    // `task_definition`, `source_pre_staged` =
+                    // `source_pre_staged_root.is_some()` (mirroring the
+                    // submitter's discriminant). `Copy` bools, captured by the
+                    // per-secondary `move` task below.
+                    let promote_uses_file_based_items = uses_file_based_items;
+                    let promote_pre_staged_mode = source_pre_staged;
 
                     let handle = tokio::task::spawn_local(async move {
                         // This secondary's all-to-all mpsc mesh transport
@@ -638,6 +658,10 @@ impl PyDistributedManager {
                             on_phase_start: sec_on_phase_start,
                             on_phase_end: sec_on_phase_end,
                             forwarded_argv: promote_run_config_handle,
+                            uses_file_based_items: promote_uses_file_based_items,
+                            pre_staged_mode: promote_pre_staged_mode,
+                            source_pre_staged_root: promote_pre_staged_root,
+                            source_dir: promote_source_dir,
                             setup_discovery: sec_setup_discovery,
                         });
 

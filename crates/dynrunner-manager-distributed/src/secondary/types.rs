@@ -33,6 +33,56 @@ use std::time::Duration;
 pub type FinalizeRunConfigFn =
     Box<dyn FnMut(Vec<String>) -> Pin<Box<dyn Future<Output = Result<(), String>>>>>;
 
+/// The two run-config dispatch flags the original submitter primary stamped
+/// into every `InitialAssignment` (`pre_staged_mode` /
+/// `uses_file_based_items`). A NODE-LOCAL run constant — NOT replicated
+/// lattice data — that a PLAIN secondary learns from the primary's
+/// `InitialAssignment` so the local dispatch resolver agrees with the primary
+/// on what a worker can open.
+///
+/// The `InitialAssignment` handler is the SOLE writer
+/// (`SecondaryCoordinator::set_staging_dispatch_context`); the dispatch
+/// resolver (`resolve_for_dispatch`) is the SOLE reader. This is the
+/// DISPATCH-time source, fed by the wire.
+///
+/// It is deliberately NOT the source the promotion recipe reads: a
+/// relocate-TARGET never receives an `InitialAssignment` before it is promoted
+/// (the setup peer relocates, then the target promotes, then the PROMOTED
+/// primary runs `perform_initial_assignment`), so its cell is still at
+/// `Default` at the promotion instant. The recipe instead sources the same two
+/// flags from the node's OWN local producer (the run-uniform consumer
+/// `task_definition`/`task_args` it booted with — see
+/// `managers/secondary/run.rs::extract_staging_dispatch_flags`), which carries
+/// the value the submitter primary stamped. The two sources answer the same
+/// question at two different lifecycle points (wire-at-dispatch vs.
+/// producer-at-promotion); they are not redundant copies of one computation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagingDispatchContext {
+    /// Pre-staged source mode (`--source-already-staged`): the data is
+    /// bind-mounted into the secondary, so the resolver accepts a file by
+    /// existence (no content-hash verify). Mirror of
+    /// `PrimaryConfig::source_pre_staged_root.is_some()`.
+    pub pre_staged_mode: bool,
+    /// Whether dispatched items are real files. `false` makes the wire
+    /// `local_path` an opaque worker identifier the framework does no IO on.
+    /// Mirror of `PrimaryConfig::uses_file_based_items`.
+    pub uses_file_based_items: bool,
+}
+
+impl Default for StagingDispatchContext {
+    /// The historical pre-`InitialAssignment` contract: items are real
+    /// files (`uses_file_based_items = true`) and not pre-staged
+    /// (`pre_staged_mode = false`) until the primary's `InitialAssignment`
+    /// says otherwise. Matches the per-state defaults the lifecycle
+    /// previously seeded.
+    fn default() -> Self {
+        Self {
+            pre_staged_mode: false,
+            uses_file_based_items: true,
+        }
+    }
+}
+
 /// Per-run control signal reported by
 /// `SecondaryCoordinator::run_until_setup_or_done`.
 ///
