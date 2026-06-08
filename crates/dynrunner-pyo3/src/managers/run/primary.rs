@@ -38,11 +38,15 @@ use super::module;
 ///
 /// `source_pre_staged_root` (optional) carries the
 /// `--source-already-staged` signal for the `--multi-computer local`
-/// path: threaded into `RustPrimaryCoordinator`, it drives the
-/// secondary's pre-staged binary resolution (the bind-mount IS the
-/// contract). Mirrors the SLURM pipeline's direct construction of
-/// `RustPrimaryCoordinator(source_pre_staged_root=...)` so all three
-/// multi-computer modes share one signal.
+/// path: threaded into `RustPrimaryCoordinator`, where it makes the
+/// submitter originate `SeedSource::RelocatedSeed` (phase graph +
+/// `DiscoveryDebt=Owed`, no tasks) and relocate the primary role onto a
+/// compute peer. The promoted compute-peer primary — built by the
+/// secondary's promotion recipe, which registers the consumer's discovery
+/// policy — runs `discover_on_promotion` on the inherited `Owed` marker and
+/// seeds the staged corpus itself. Mirrors the SLURM pipeline's direct
+/// construction of `RustPrimaryCoordinator(source_pre_staged_root=...)` so
+/// all three multi-computer modes share one signal.
 #[pyfunction]
 #[pyo3(signature = (
     config,

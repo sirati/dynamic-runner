@@ -150,6 +150,22 @@ impl PySecondaryCoordinator {
         // rebuild captures a `Py<PyAny>` reference bump of the task
         // definition.
         let finalize_task_definition_py = self.task_definition_py.clone_ref(py);
+        // Discovery-policy captures for the PROMOTED primary's
+        // `discover_on_promotion` driver: a SLURM-relocated mode-2 primary
+        // inherits the `DiscoveryDebt=Owed` marker (seeded by the submitter's
+        // relocated seed) and must run the consumer's `discover_items` policy
+        // itself to seed the tasks. Mirror the `make_on_phase_*` GIL-thread
+        // capture: a `Py<PyAny>` reference bump of the task definition + the
+        // task args, plus the staged-corpus root (`src_network` — the
+        // bind-mount the pre-staged corpus lives under, matching the old
+        // secondary-discovery `setup_discover_root`) and the phase graph. The
+        // policy is registered on the promoted primary unconditionally; the
+        // driver gates on `discovery_debt() == Owed`, so it is inert on every
+        // non-relocated promotion (a failover snapshot is already `Settled`).
+        let discovery_task_definition_py = self.task_definition_py.clone_ref(py);
+        let discovery_task_args_py = self.task_args_py.clone_ref(py);
+        let discovery_root = self.src_network.clone();
+        let discovery_phase_deps = self.phase_deps.clone();
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -491,6 +507,22 @@ impl PySecondaryCoordinator {
                 // secondary holds no phase machine). Invoked at most once, on
                 // promotion, with the converged snapshot the secondary
                 // captured on the signal.
+                // The consumer's discovery policy for the promoted primary: a
+                // mode-2 SLURM-relocated primary inherits `DiscoveryDebt=Owed`
+                // and runs `discover_on_promotion`, which consults this policy
+                // to seed the staged corpus. `build_setup_discovery_fn` runs
+                // `task.discover_items(<root>, args)` OFF the runtime thread
+                // (§14/§15); paired with the run's phase graph (the consumer
+                // declares it independent of discovery). Inert on a non-mode-2
+                // promotion (the driver short-circuits when debt != Owed).
+                let setup_discovery = dynrunner_manager_distributed::SetupDiscovery {
+                    discover: build_setup_discovery_fn(
+                        discovery_task_definition_py,
+                        discovery_task_args_py,
+                        discovery_root,
+                    ),
+                    phase_deps: discovery_phase_deps,
+                };
                 let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                     secondary_id: secondary_id.clone(),
                     keepalive_interval: dist_keepalive,
@@ -505,6 +537,7 @@ impl PySecondaryCoordinator {
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
                     forwarded_argv: promote_run_config_handle,
+                    setup_discovery: Some(setup_discovery),
                 });
 
                 let node = node.with_secondary(secondary, sec_slot);
@@ -632,6 +665,15 @@ struct PromotedPrimaryRecipeInputs {
     /// — byte-identical to the original submitter (no split-brain) — rather
     /// than the stale boot copy a pre-push capture would have frozen (step 7).
     forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The consumer's discovery policy + phase graph for the PROMOTED primary's
+    /// `discover_on_promotion` driver (mode-2 SLURM relocate). Single-use (the
+    /// `discover` closure is a `FnMut` that consumes its `Py` handles on the
+    /// one fire, not `Clone`), so it is `take`-n on the recipe's single
+    /// invocation. `None` only for an out-of-tree caller that does not supply a
+    /// discovery policy; under the live SLURM dispatch it is always `Some` and
+    /// inert on a non-relocated promotion (the driver gates on `Owed`).
+    setup_discovery:
+        Option<dynrunner_manager_distributed::SetupDiscovery<RunnerIdentifier>>,
 }
 
 /// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
@@ -670,11 +712,15 @@ fn build_promoted_primary_recipe(
         on_phase_start,
         on_phase_end,
         forwarded_argv,
+        setup_discovery,
     } = inputs;
     // Single-use pieces captured in Options so the FnMut can take them on its
     // one invocation (a node promotes at most once per lifetime).
     let mut command_channel = Some((command_tx, command_rx));
     let mut phase_callbacks = Some((on_phase_start, on_phase_end));
+    // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
+    // `discover` closure that is not `Clone`); take it on the single fire.
+    let mut setup_discovery = setup_discovery;
     // The run-config handle is shared (not single-use): the recipe READS it at
     // promotion, leaving the secondary's copy intact. No `Option`/`take` — the
     // handle is cloned-in and read by value at the promotion instant.
@@ -721,6 +767,15 @@ fn build_promoted_primary_recipe(
         if let Some((on_start, on_end)) = phase_callbacks.take() {
             primary.register_phase_lifecycle_callbacks(on_start, on_end);
         }
+        // Register the consumer's discovery policy so a mode-2 SLURM-relocated
+        // primary (which inherits `DiscoveryDebt=Owed` from the submitter's
+        // relocated seed) can run `discover_on_promotion` and seed the staged
+        // corpus itself. Inert on a non-relocated promotion: the driver gates
+        // on `discovery_debt() == Owed`, and a failover-promotion snapshot is
+        // already `Settled`, so the policy is never consulted there.
+        if let Some(sd) = setup_discovery.take() {
+            primary.register_setup_discovery(sd);
+        }
         // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
         // construction input — not a `run_activated` resume, which is gone):
         // restore the ledger + rebuild the derived pool/roster caches, then
@@ -765,10 +820,15 @@ fn build_promoted_primary_recipe(
 /// its handles via `take()` is sufficient and avoids any off-GIL `Py` clone
 /// (which would need a `Python` token). A defensive second invocation
 /// surfaces a clear error rather than panicking.
-// Phase 5 wires this onto the relocated primary's discovery path; uncalled
-// in the interim.
-#[allow(dead_code)]
-fn build_setup_discovery_fn(
+///
+/// Wired onto the PROMOTED primary's `discover_on_promotion` driver via
+/// [`build_promoted_primary_recipe`]: a mode-2 SLURM-relocated primary runs
+/// this policy when its CRDT declares `DiscoveryDebt=Owed`. Also consumed by
+/// the in-process `--source-already-staged` local primary
+/// (`managers/distributed/run.rs`), which seeds `DiscoveryDebt=Owed` and runs
+/// the same driver on the host fs (it does not relocate — the driver gates on
+/// the marker, not on relocation).
+pub(crate) fn build_setup_discovery_fn(
     task_definition_py: Py<PyAny>,
     task_args_py: Py<PyAny>,
     setup_discover_root: Option<std::path::PathBuf>,

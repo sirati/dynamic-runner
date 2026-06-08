@@ -306,6 +306,121 @@ async fn discover_on_promotion_owed_without_policy_is_hard_error() {
         .await;
 }
 
+/// `discover_on_promotion` is a NO-OP on a `RelocateToComputePeer` primary
+/// even when it owes debt: the mode-2 bootstrap submitter seeds `Owed` only to
+/// HAND the marker to the compute peer it relocates to (the submitter has no
+/// corpus + no policy). The driver must NOT consult the policy and must NOT
+/// hard-error — the relocate target (StayLocal) discovers on the same marker.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_noop_on_relocating_submitter() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary_with_policy(
+                test_primary_config(),
+                transport,
+                crate::primary::RelocationPolicy::RelocateToComputePeer,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // The submitter seeds `Owed` (relocated seed) and registers NO
+            // discovery policy — it relocates, never discovers.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("a relocating submitter must NO-OP (not hard-error) on Owed");
+
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                0,
+                "a relocating submitter seeds no tasks (the peer discovers)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Owed,
+                "the submitter leaves the Owed marker intact for the relocate target"
+            );
+        })
+        .await;
+}
+
+/// 5c seam (end-to-end): `run` with `SeedSource::RelocatedSeed` originates the
+/// phase graph + `DiscoveryDebt=Owed` (NO tasks), then — after
+/// `wait_for_connections` — `discover_on_promotion` runs the registered policy,
+/// seeds the discovered tasks + `DiscoverySettled`, and the run drives them to
+/// completion. This is the production path the pyo3 layer wires: the mode-2
+/// SLURM submitter and the in-process `--source-already-staged` local primary
+/// both construct `RelocatedSeed` and register the discovery policy. (Cold
+/// mode-1 — `ColdStart` — is exercised by every other `run`/`run_consuming`
+/// test and is unaffected: it never declares debt.)
+#[tokio::test(flavor = "current_thread")]
+async fn run_with_relocated_seed_discovers_and_completes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // The discovery policy yields the corpus the relocated primary
+            // owes (the submitter passed no binaries — the RelocatedSeed seeds
+            // only the phase graph + the Owed marker).
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                vec![make_binary("disc-a", 50), make_binary("disc-b", 50)],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            // A fake secondary answers TaskRequests + completes every
+            // dispatched task, so the run drives the discovered corpus to
+            // completion.
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(id, 2, 1024 * 1024 * 1024, rx, tx));
+            }
+
+            let (deps, ops, ope) = noop_phase_args();
+            primary
+                .run(SeedSource::RelocatedSeed { phase_deps: deps }, ops, ope)
+                .await
+                .expect("relocated-seed run must complete cleanly");
+
+            // The policy ran exactly once (post-connect, on the Owed marker)
+            // and the debt settled — the seam routed RelocatedSeed →
+            // originate_relocated_seed → discover_on_promotion.
+            assert_eq!(
+                fires.get(),
+                1,
+                "the discovery policy must run exactly once on the Owed marker"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "discovery must settle after the relocated primary seeds its corpus"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                2,
+                "the discovered corpus must be seeded into the ledger"
+            );
+        })
+        .await;
+}
+
 /// `run_complete_check` gated on `discovery_debt() == Owed` (V6): a zero-task
 /// CRDT that declares debt must NOT trip the counter exit (`0+0 >= 0`) — the
 /// driver hasn't seeded yet. After `DiscoverySettled` lands, the same

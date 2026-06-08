@@ -2591,6 +2591,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 binaries,
                 phase_deps,
             } => self.originate_cold_seed(binaries, phase_deps)?,
+            // Mode-2 relocate / pre-staged: originate ONLY the phase graph +
+            // the `DiscoveryDebtDeclared` marker (`discovery_debt = Owed`), NO
+            // tasks. `discover_on_promotion` (fired post-connect below) reads
+            // the `Owed` marker, runs the registered discovery policy, and
+            // seeds the discovered tasks itself — so the seed step here only
+            // stages the phase graph + the marker, not the corpus.
+            crate::process::SeedSource::RelocatedSeed { phase_deps } => {
+                self.originate_relocated_seed(phase_deps)
+            }
             // The CRDT was already restored by `seed_from_promotion_snapshot`;
             // hydrate (re-)derives the pool + caches from the inherited ledger.
             crate::process::SeedSource::PromotionSnapshot => {}

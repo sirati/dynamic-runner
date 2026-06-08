@@ -62,9 +62,11 @@ pub(crate) struct PySecondaryCoordinator {
     /// `task.discover_items` call resolves the per-task list but not
     /// the graph metadata, and the Rust core seeds both as a single
     /// mutation batch.
-    // Phase 5 wires this into the relocated-primary discovery recipe;
-    // write-only in the interim.
-    #[allow(dead_code)]
+    ///
+    /// Captured into the promoted-primary discovery recipe
+    /// (`build_promoted_primary_recipe`): a mode-2 SLURM-relocated primary's
+    /// `discover_on_promotion` seeds this phase graph alongside the discovered
+    /// tasks.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) skip_existing: bool,
     pub(super) estimator: PyMemoryEstimatorBridge,
@@ -78,9 +80,10 @@ pub(crate) struct PySecondaryCoordinator {
     /// Held for the same reason as `task_definition_py`: the second
     /// positional argument to `discover_items`. Originates from the
     /// `task_args` Python object passed into the constructor.
-    // Phase 5 wires this into the relocated-primary discovery recipe;
-    // write-only in the interim.
-    #[allow(dead_code)]
+    ///
+    /// Captured into the promoted-primary discovery recipe
+    /// (`build_promoted_primary_recipe`) as the args the relocated primary's
+    /// `discover_items` call receives.
     pub(super) task_args_py: Py<PyAny>,
     /// Optional Python peer-lifecycle listener supplied at `__init__`.
     /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;

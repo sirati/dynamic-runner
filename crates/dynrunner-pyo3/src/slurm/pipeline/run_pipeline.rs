@@ -210,10 +210,11 @@ pub(crate) fn run_slurm_pipeline<'py>(
     //
     // Pre-staged-source mode (`--source-already-staged <path>`): the
     // submitter has no local view of the staged corpus — those files
-    // live on the cluster filesystem the secondaries see, not on the
-    // dispatcher. Skip the discovery walk here and hand the
-    // coordinator an empty list; the corpus is resolved against the
-    // secondaries' bind-mounted `src_network` at dispatch time.
+    // live on the cluster filesystem. Skip the discovery walk here and
+    // hand the coordinator an empty list; the submitter originates
+    // `SeedSource::RelocatedSeed` (DiscoveryDebt=Owed) and relocates the
+    // primary onto a compute peer, whose `discover_on_promotion` walks the
+    // staged corpus on its filesystem and seeds the tasks.
     let binaries = PyList::empty(py);
     if !attr_truthy(args, "source_already_staged") {
         for item in task
@@ -231,7 +232,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
     } else {
         log.call_method1(
             "info",
-            ("Pre-staged source mode: deferring task discovery to the setup-promoted secondary.",),
+            ("Pre-staged source mode: deferring task discovery to the relocated compute-peer primary.",),
         )?;
     }
 

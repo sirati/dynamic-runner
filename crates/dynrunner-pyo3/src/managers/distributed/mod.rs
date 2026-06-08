@@ -69,18 +69,30 @@ pub(crate) struct PyDistributedManager {
     pub(super) stranded: u32,
     /// Pre-staged-source mode (`--source-already-staged`) signal.
     /// Mirrors `PyPrimaryCoordinator.source_pre_staged_root`: when
-    /// `Some`, the corpus is bind-mounted on the secondaries and the
-    /// secondary's pre-staged binary resolution (the bind-mount IS the
-    /// contract) drives dispatch. Threaded through to `PrimaryConfig`
-    /// uniformly with the SLURM / network-primary paths so
-    /// `--source-already-staged` works in every multi-computer mode
-    /// without per-caller special casing.
+    /// `Some`, the corpus is already staged on the host fs and the
+    /// submitter passed no locally-discovered binaries. The in-process
+    /// run then constructs `SeedSource::RelocatedSeed` (phase graph +
+    /// `DiscoveryDebt=Owed`, no tasks) and registers the consumer's
+    /// discovery policy on the LOCAL primary: it does NOT relocate
+    /// (`RelocationPolicy::StayLocal`) but it OWES discovery, so its
+    /// `discover_on_promotion` driver runs `task.discover_items` on the host
+    /// fs and seeds the tasks itself (the driver gates on the `Owed` marker,
+    /// not on relocation). Also threaded into `PrimaryConfig` as the staging
+    /// root. The cold path (`None`) discovers the corpus upfront in Python
+    /// and cold-seeds it (`DiscoveryDebt` stays `Undeclared`).
     pub(super) source_pre_staged_root: Option<PathBuf>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B). The
     /// distributed in-process pipeline drives a primary; secondaries
     /// don't fire user-visible phase hooks.
     pub(super) task_definition: Py<PyAny>,
+    /// The Python `task_args` namespace, held for the in-process
+    /// `--source-already-staged` discovery policy: the local primary owes
+    /// discovery (`DiscoveryDebt=Owed`) and runs `task.discover_items(<root>,
+    /// task_args)` itself via `discover_on_promotion`. Second positional arg
+    /// to `discover_items`. Unused on the cold in-process path (the corpus is
+    /// discovered upfront in Python and cold-seeded).
+    pub(super) task_args: Py<PyAny>,
     /// Optional Python peer-lifecycle listener supplied at `__init__`.
     /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
     /// bridged through

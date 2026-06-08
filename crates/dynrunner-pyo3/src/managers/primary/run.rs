@@ -37,6 +37,17 @@ impl PyPrimaryCoordinator {
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
+        // Mode-2 pre-staged signal: when the operator passed
+        // `--source-already-staged`, the corpus is already on the cluster and
+        // the submitter has NO local view of it, so it cannot cold-seed tasks.
+        // It instead originates the relocated seed (phase graph +
+        // `DiscoveryDebt=Owed`, no tasks) and relocates; the promoted
+        // compute-peer primary (built by the secondary's promotion recipe,
+        // which registers the discovery policy) runs `discover_on_promotion`
+        // on the `Owed` marker and seeds the tasks itself. Captured as a bool
+        // here because `source_pre_staged_root` moves into `PrimaryConfig`
+        // inside the detached-runtime closure before the seed is built.
+        let source_pre_staged = source_pre_staged_root.is_some();
         let source_dir = self.source_dir.clone();
         // The node-local run-config (the operator's `args.forwarded_argv`),
         // captured on the GIL thread for the detached-runtime `PrimaryConfig`
@@ -511,6 +522,22 @@ impl PyPrimaryCoordinator {
                 // composes the inputs and drives it to a single outcome.
                 let (node, _node_promo_tx) = Node::new(mesh);
                 let node = node.with_primary(primary, pri_slot);
+                // Construct the typed seed at the boundary from the pre-staged
+                // signal (the construction-site decision pillar 2 mandates —
+                // NOT a runtime flag-if inside the coordinator). Pre-staged
+                // (mode-2): the corpus is already on the cluster, so originate
+                // ONLY the phase graph + `DiscoveryDebt=Owed` and let the
+                // promoted compute-peer primary discover the tasks. Cold
+                // (mode-1): the submitter discovered the corpus locally and
+                // seeds it directly.
+                let seed = if source_pre_staged {
+                    SeedSource::RelocatedSeed { phase_deps }
+                } else {
+                    SeedSource::ColdStart {
+                        binaries: rust_binaries,
+                        phase_deps,
+                    }
+                };
                 let inputs: NodeRunInputs<
                     crate::subprocess_factory::SubprocessWorkerFactory,
                     _,
@@ -518,10 +545,7 @@ impl PyPrimaryCoordinator {
                     RunnerIdentifier,
                 > = NodeRunInputs {
                     primary_run_args: Some(PrimaryRunArgs {
-                        seed: SeedSource::ColdStart {
-                            binaries: rust_binaries,
-                            phase_deps,
-                        },
+                        seed,
                         on_phase_start,
                         on_phase_end,
                     }),

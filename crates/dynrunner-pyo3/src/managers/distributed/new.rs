@@ -118,6 +118,7 @@ impl PyDistributedManager {
             stranded: 0,
             source_pre_staged_root,
             task_definition: task_definition.clone().unbind(),
+            task_args: task_args.clone().unbind(),
             peer_lifecycle_listener,
             task_completed_listener,
             control_plane,

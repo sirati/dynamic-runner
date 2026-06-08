@@ -704,23 +704,26 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
 
     Today's rules — all centred on the load-bearing
     ``--source-already-staged`` flag, which moves discovery + ledger
-    seed from the submitter to a chosen secondary:
+    seed from the submitter to the run's PRIMARY (a SLURM-relocated
+    compute-peer primary, or the in-process local primary), which has
+    the staged corpus on its filesystem:
 
     * ``--list-files`` is a submitter-side introspection knob that
       runs ``task.discover_items`` and prints what it found.
       ``--source-already-staged`` deliberately defers that walk to
-      the setup-promoted secondary — the submitter has no local view
-      of the staged corpus, so it cannot list what it never
-      discovers. The two flags cannot meaningfully combine.
-    * ``--source-already-staged`` only makes sense when a secondary
-      exists to take the setup hand-off. Plain local mode
-      (``--multi-computer`` absent) runs everything in-process with
-      no peer to delegate to, so the combination is rejected here.
-      The four ``--multi-computer`` modes (``slurm``, ``local``,
-      ``single-process``, ``remote-podman``) all participate in the
-      setup-promote handshake; the deprecated ``--slurm`` shorthand
-      is treated as equivalent to ``--multi-computer slurm`` for this
-      check.
+      the run's primary — the submitter has no local view of the
+      staged corpus, so it cannot list what it never discovers. The
+      two flags cannot meaningfully combine.
+    * ``--source-already-staged`` only makes sense in a distributed
+      run that stands up a primary owning a CRDT (which seeds
+      ``DiscoveryDebt=Owed`` and runs ``discover_on_promotion``).
+      Plain local mode (``--multi-computer`` absent) runs the simple
+      in-process ``LocalManager`` with no CRDT/discovery-debt path, so
+      the combination is rejected here. The four ``--multi-computer``
+      modes (``slurm``, ``local``, ``single-process``,
+      ``remote-podman``) all stand up that primary; the deprecated
+      ``--slurm`` shorthand is treated as equivalent to
+      ``--multi-computer slurm`` for this check.
 
     Called from ``dynamic_runner.run.run`` immediately after
     ``parser.parse_args``. Failures route through ``parser.error``,
@@ -734,7 +737,7 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
             parser.error(
                 "--list-files is incompatible with --source-already-staged: "
                 "the submitter does not discover items in pre-staged mode "
-                "(discovery runs on the setup-promoted secondary)."
+                "(discovery runs on the run's primary)."
             )
         # `--slurm` is the deprecated alias for `--multi-computer slurm`
         # (see `dynamic_runner.run.run` which performs the equivalence

@@ -35,13 +35,19 @@ use crate::process::{MeshClient, RoleInbox};
 /// discriminator the builder threads in, never a shape `run_pipeline`
 /// infers from `task_count()` / `binaries.is_empty()`.
 ///
-/// Both arms converge on ONE init path: land the seed into the CRDT, then
+/// All arms converge on ONE init path: land the seed into the CRDT, then
 /// always `hydrate_from_cluster_state` (the sole builder of the pool +
 /// progress caches + `total_tasks`). The arm selects ONLY who originates the
 /// CRDT first:
 ///   * [`SeedSource::ColdStart`] ORIGINATES the CRDT (the `originate_cold_seed`
 ///     work — `PhaseDepsSet` + `TaskAdded` fan-out, the `#3a`/`#2` ingest
 ///     directives), then hydrate builds the pool from the freshly-seeded CRDT.
+///   * [`SeedSource::RelocatedSeed`] originates ONLY the phase graph + the
+///     `DiscoveryDebtDeclared` marker (NO tasks): a mode-2 submitter (SLURM
+///     relocate-then-discover) or an in-process `--source-already-staged`
+///     local primary that has no local corpus to seed. The empty ledger + the
+///     `Owed` marker IS the "awaiting seed" state; the relocated / local
+///     primary runs `discover_on_promotion` post-connect to seed the tasks.
 ///   * [`SeedSource::PromotionSnapshot`] TRUSTS a CRDT that
 ///     `seed_from_promotion_snapshot` already restored + hydrated; the seed
 ///     step is a no-op and hydrate (re-)derives the pool from the inherited
@@ -52,6 +58,19 @@ pub enum SeedSource<I: Identifier> {
         /// The task binaries to seed.
         binaries: Vec<TaskInfo<I>>,
         /// The phase dependency graph.
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    },
+    /// Mode-2 relocated / pre-staged seed: originate ONLY the phase graph +
+    /// the `DiscoveryDebtDeclared` marker (`discovery_debt = Owed`), NO tasks.
+    /// The replicated `Owed` marker is the CRDT-pure "discovery owed" signal
+    /// `discover_on_promotion` gates on — the relocated compute-peer primary
+    /// (or the in-process `--source-already-staged` local primary) runs
+    /// discovery itself post-connect and seeds the tasks. The pyo3 layer
+    /// CONSTRUCTS this variant from the pre-staged signal
+    /// (`source_pre_staged_root.is_some()`); a cold mode-1 run never uses it.
+    RelocatedSeed {
+        /// The phase dependency graph (the consumer declares it independent of
+        /// discovery; the per-task list resolves from the later discovery walk).
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     },
     /// Promotion: the coordinator was ALREADY
