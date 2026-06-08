@@ -188,6 +188,7 @@ impl PyDistributedManager {
         let mut sec_phase_lifecycle_callbacks: Vec<(
             crate::managers::lifecycle::OnPhaseStart,
             crate::managers::lifecycle::OnPhaseEnd,
+            dynrunner_manager_distributed::PhaseHookRaiseLatch,
         )> = Vec::with_capacity(num_secondaries as usize);
         // Per-secondary RAW discovery handles for the pre-staged path: the
         // `task_definition` + `task_args` Py refs + the staged-corpus root.
@@ -206,10 +207,17 @@ impl PyDistributedManager {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
                 crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
             );
-            let on_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-                crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
-            );
-            sec_phase_lifecycle_callbacks.push((on_start, on_end));
+            // Honest `on_phase_end`: record a consumer-hook raise into a
+            // per-secondary latch the recipe installs on the promoted primary
+            // (`set_phase_hook_raise_latch`), so an in-process relocate-target's
+            // `on_phase_end` raise surfaces a non-zero `FatalPolicyExit`.
+            let raise_latch = dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+            let on_end: crate::managers::lifecycle::OnPhaseEnd =
+                Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                    self.task_definition.clone_ref(py),
+                    raise_latch.clone(),
+                ));
+            sec_phase_lifecycle_callbacks.push((on_start, on_end, raise_latch));
             // Pre-staged: capture this secondary's own discovery Py-handle
             // clones (the corpus root IS `source_pre_staged_root` — in-process
             // shares one fs). The relocate target inherits `DiscoveryDebt=Owed`
@@ -333,7 +341,10 @@ impl PyDistributedManager {
                 let mut sec_transports = mesh_transports.into_iter();
 
                 for (
-                    ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)),
+                    (
+                        (secondary_id, sec_log),
+                        (sec_on_phase_start, sec_on_phase_end, sec_phase_hook_raise_latch),
+                    ),
                     sec_discovery_handle,
                 ) in sec_log_dirs
                     .into_iter()
@@ -626,9 +637,19 @@ impl PyDistributedManager {
                         // only the raw `Py` handles did). `Some` on the
                         // pre-staged path; `None` on cold (the marker is
                         // `Settled`, so the driver never consults it).
+                        // In-process discovery reads the submitter's
+                        // EAGERLY-parsed namespace directly (every node shares
+                        // it — no deferred reparse), so it is the
+                        // PRE-RESOLVED `SharedRunConfig` (complete from the
+                        // start). The `discover_items` driver resolves the same
+                        // node-local `resolved_output_root` the SLURM path does.
                         let sec_setup_discovery = sec_discovery_handle.map(|(td, ta, root)| {
                             dynrunner_manager_distributed::SetupDiscovery {
-                                discover: build_setup_discovery_fn(td, ta, Some(root)),
+                                discover: build_setup_discovery_fn(
+                                    td,
+                                    crate::managers::run_config::SharedRunConfig::pre_resolved(ta),
+                                    Some(root),
+                                ),
                                 phase_deps: sec_phase_deps,
                             }
                         });
@@ -657,6 +678,11 @@ impl PyDistributedManager {
                             command_channel: None,
                             on_phase_start: sec_on_phase_start,
                             on_phase_end: sec_on_phase_end,
+                            phase_hook_raise_latch: sec_phase_hook_raise_latch,
+                            // In-process: the submitter's `on_run_start` already
+                            // fired in THIS process with the one live handle, so
+                            // the relocated primary must NOT re-fire it.
+                            on_run_start: None,
                             forwarded_argv: promote_run_config_handle,
                             uses_file_based_items: promote_uses_file_based_items,
                             pre_staged_mode: promote_pre_staged_mode,
