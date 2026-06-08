@@ -16,6 +16,9 @@
 //!     aggregation + the invalid_task fatal-exit monitor).
 //!   * [`lost_visibility`]  — the report-lost-and-keep-observing state
 //!     machine (visibility loss is reported + retried, NEVER a run verdict).
+//!   * [`reconnect`]        — the transport-recovery port the observer
+//!     triggers on lost visibility (the `-R` tunnel rebuild seam; the
+//!     observer triggers, the provider layer owns ssh).
 //!
 //! See each submodule's header for its concern.
 
@@ -24,6 +27,7 @@ pub mod coordinator;
 pub mod failure_response;
 pub mod lifecycle;
 pub mod lost_visibility;
+pub mod reconnect;
 pub mod reporting;
 
 pub use announcer::{
@@ -36,5 +40,6 @@ pub use coordinator::{
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
-pub use lost_visibility::{LostVisibilityReporter, Visibility};
+pub use lost_visibility::{LostVisibilityReporter, RetryDirective, Visibility};
+pub use reconnect::{ReconnectorHandle, TunnelReconnector};
 pub use reporting::{Reporter, SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};

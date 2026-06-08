@@ -884,6 +884,7 @@ fn build_test_handoff(
         task_completed_dispatcher_handle: inherited_task_completed_dispatcher,
         lifecycle_dispatcher_handle,
         holdings: std::collections::HashSet::new(),
+        reconnector: None,
     };
     HandoffTestRig {
         handoff,
@@ -1568,4 +1569,137 @@ fn lost_visibility_report_is_retry_notice_not_a_run_terminal() {
         "visibility loss is NOT a run terminal — no 'run terminated' reason must be \
          emitted for it: {events:?}"
     );
+}
+
+/// Recording [`TunnelReconnector`] stub: captures every set of peer ids the
+/// observer asked to reconnect, so a test can assert the observer DROVE the
+/// reconnect (the `-R` tunnel rebuild) on lost visibility — the BUG-B2
+/// contract. The `reconnect` is otherwise a no-op (a real impl rebuilds the
+/// ssh tunnel; the unit boundary is "the observer triggered it with the
+/// right roster"). Recording state is behind a `std::sync::Mutex` so the
+/// stub is genuinely `Send + Sync` (the trait-object bound), with no unsafe.
+#[derive(Default)]
+struct RecordingReconnector {
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl crate::observer::TunnelReconnector for RecordingReconnector {
+    async fn reconnect(&self, peer_ids: &[String]) {
+        self.calls
+            .lock()
+            .expect("recording mutex not poisoned")
+            .push(peer_ids.to_vec());
+    }
+}
+
+/// BUG-B2 (the reconnect the prior agent omitted): a relocated observer
+/// that loses ALL visibility (its `-R` reverse tunnels dropped, peer_count
+/// == 0) must ACTIVELY trigger a tunnel rebuild for its CRDT roster — not
+/// merely report lost. Proof: with a recording [`TunnelReconnector`] wired
+/// on the handoff and a named primary in the ledger, the observer's first
+/// lost loop calls `reconnect(["sec-0"])`; the observer does NOT hang or
+/// strand, and exits `Done` once the primary's `RunComplete` converges over
+/// the (later-arriving) inbound.
+///
+/// Revert check: dropping the `trigger_reconnect()` call (or the
+/// `RetryDirective::ReconnectDue` wiring) makes `reconnect_calls` stay empty
+/// — the observer would report lost but never rebuild the tunnel, the exact
+/// gap this fix closes. The end-to-end "does not collapse + exits on
+/// RunComplete" is shared with the dead-fleet test; this one adds the
+/// reconnect-was-DRIVEN assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Zero peers ⇒ the observer's transport view is empty for the
+                // whole run (the dropped `-R` tunnels). A named primary so
+                // the roster the observer asks to reconnect is non-empty.
+                let (transport, inbound, _peers) = transport_with_peers("obs", 0);
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+                let mut config = observer_config("obs");
+                // Tiny re-check cadence so the first lost loop (which fires
+                // the reconnect) runs well before the RunComplete lands.
+                config.fleet_dead_timeout = Duration::from_millis(10);
+
+                let (client, inbox, pump) = observer_mesh(transport, "obs");
+                tokio::task::spawn_local(pump);
+
+                // Build the handoff WITH a recording reconnector wired on it
+                // (mirrors `into_observer_handoff` carrying the submitter's
+                // `tunnel_reconnector`). A minimal inherited-fabric stand-in
+                // so `from_handoff` is exercised end-to-end.
+                let reconnector = std::sync::Arc::new(RecordingReconnector::default());
+                let (inherited_tx, mut inherited_rx) =
+                    mpsc::unbounded_channel::<crate::task_completed::TaskCompletedEvent>();
+                cs.install_task_completed_sender(inherited_tx);
+                let inherited_dispatcher = tokio::task::spawn_local(async move {
+                    while inherited_rx.recv().await.is_some() {}
+                });
+                let lifecycle_dispatcher =
+                    tokio::task::spawn_local(async { std::future::pending::<()>().await });
+                let handoff = super::ObserverHandoff {
+                    client,
+                    inbox,
+                    cluster_state: cs,
+                    node_id: "obs".to_string(),
+                    deadlines: config,
+                    started_phases: std::collections::HashSet::new(),
+                    panik_signal_rx: None,
+                    task_completed_dispatcher_handle: inherited_dispatcher,
+                    lifecycle_dispatcher_handle: lifecycle_dispatcher,
+                    holdings: std::collections::HashSet::new(),
+                    reconnector: Some(reconnector.clone()),
+                };
+                let mut observer = ObserverCoordinator::from_handoff(handoff);
+
+                // Land RunComplete after the observer has had several
+                // lost-visibility ticks — long enough to have fired ≥1
+                // reconnect, short enough to keep the test snappy.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::RunComplete],
+                    });
+                });
+
+                let terminal = observer.run().await.expect(
+                    "a lost-visibility observer must keep observing + exit on the primary's \
+                     RunComplete, never strand",
+                );
+                assert!(
+                    matches!(terminal, ObserverTerminal::Done),
+                    "got {terminal:?}"
+                );
+
+                // The observer DROVE the reconnect: at least one call, each
+                // carrying the named primary id (the roster it expects to
+                // reach over the rebuilt tunnel).
+                let calls = reconnector.calls.lock().expect("mutex");
+                assert!(
+                    !calls.is_empty(),
+                    "a lost-visibility observer must TRIGGER the tunnel reconnect, not just \
+                     report lost — got zero reconnect calls"
+                );
+                assert!(
+                    calls.iter().all(|ids| ids.contains(&"sec-0".to_string())),
+                    "each reconnect must target the observer's roster (the named primary \
+                     sec-0): {calls:?}"
+                );
+            })
+            .await;
+    })
+    .await
+    .expect("the reconnecting observer must terminate, not hang");
 }

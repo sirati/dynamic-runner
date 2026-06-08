@@ -91,6 +91,7 @@ impl PyPrimaryCoordinator {
             peer_lifecycle_listener,
             fulfillability_matcher,
             slurm_job_manager: None,
+            tunnel_reconnector: None,
             respawn_policy: respawn_policy
                 .unwrap_or_else(crate::config::respawn::PyRespawnPolicy::rust_disabled),
             respawn_spawner,

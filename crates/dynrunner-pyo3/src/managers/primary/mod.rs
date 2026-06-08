@@ -157,6 +157,16 @@ pub(crate) struct PyPrimaryCoordinator {
     /// submit-loop.
     pub(super) slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
 
+    /// Transport-recovery port handed to the observer at relocation
+    /// (BUG-B reconnect). Parked here by the SLURM pipeline's
+    /// `drive_rust_primary` (reverse-connection mode only); threaded into
+    /// the inner `PrimaryCoordinator` via `set_tunnel_reconnector` at
+    /// `run()` start, which carries it onto the observer tail. `None` for
+    /// in-process / non-reverse callers whose transport self-heals. Held
+    /// Rust-to-Rust (same rationale as `slurm_job_manager`).
+    pub(super) tunnel_reconnector:
+        Option<Arc<dyn dynrunner_manager_distributed::observer::TunnelReconnector>>,
+
     /// Scheduler tuning forwarded into every `ResourceStealingScheduler`
     /// the coordinator constructs at `run()` start. Sourced from the
     /// caller's `scheduler_config` kwarg (defaulting via
@@ -220,5 +230,19 @@ impl PyPrimaryCoordinator {
     /// it's built inside the detached tokio runtime.
     pub(crate) fn set_slurm_job_manager_from_rust(&mut self, jm: Arc<dyn Any + Send + Sync>) {
         self.slurm_job_manager = Some(jm);
+    }
+
+    /// Park the observer's transport-recovery port (BUG-B reconnect) so
+    /// the inner `PrimaryCoordinator` carries it onto its observer tail at
+    /// relocation. Called by `slurm::pipeline::drive_rust_primary` in
+    /// reverse-connection mode (where the `-R` tunnels exist to rebuild),
+    /// after `run_preparation` and BEFORE `run()` enters. Same Rust-to-Rust
+    /// hand-off as [`Self::set_slurm_job_manager_from_rust`] — the inner
+    /// coordinator does not exist yet at the call site.
+    pub(crate) fn set_tunnel_reconnector_from_rust(
+        &mut self,
+        reconnector: Arc<dyn dynrunner_manager_distributed::observer::TunnelReconnector>,
+    ) {
+        self.tunnel_reconnector = Some(reconnector);
     }
 }

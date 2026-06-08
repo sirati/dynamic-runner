@@ -10,6 +10,7 @@ pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
 pub mod config;
 pub mod job_manager;
+pub mod observer_reconnect;
 pub mod packaging;
 pub mod peer_info;
 pub mod pipeline;
@@ -19,6 +20,7 @@ pub mod wrapper_script;
 
 pub use config::SlurmConfig;
 pub use job_manager::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use observer_reconnect::SlurmPreparationTunnelReconnector;
 pub use packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 pub use peer_info::{
     Builder as PeerInfoBuilder, LegacyUri, PeerInfoError, PeerInfoRecord, PeerInfoVersion,
