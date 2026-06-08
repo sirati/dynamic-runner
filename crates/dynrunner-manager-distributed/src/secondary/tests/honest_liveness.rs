@@ -28,8 +28,9 @@
 use std::time::{Duration, Instant};
 
 use super::super::election::ElectionState;
-use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
+use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary_membership};
 use super::super::wire::timestamp_now;
+use dynrunner_protocol_primary_secondary::address::PeerId;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, KeepaliveRole, PrimaryChangeReason,
 };
@@ -50,7 +51,18 @@ const BACKSTOP: Duration = Duration::from_millis(100);
 /// have fired here.
 #[tokio::test(flavor = "current_thread")]
 async fn transient_blip_no_election() {
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Membership-backed harness with the primary (`primary-orig`) AND the
+    // live peer (`sec-b`) seeded as transport members: leg (C)
+    // (primary-left-membership) reads `MeshClient::has_peer`, so a faithful
+    // "healthy remote primary" fixture must report the primary as a member —
+    // otherwise leg (C) would (correctly) arm against an absent primary and
+    // mask the leg-(A)/(B) behaviour these tests isolate. The `_members`
+    // handle is unused here (none of these tests removes the primary; the
+    // dedicated leg-(C) coverage lives in `failover_membership`).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("primary-orig"), PeerId::from("sec-b")],
+    );
     sec.enter_operational_for_test();
     // A live mesh peer so a (wrongly) firing election would have a
     // non-degraded path to Suspecting — isolating "we stayed Normal"
@@ -105,7 +117,18 @@ async fn transient_blip_no_election() {
 /// backstop: a genuinely dead link must still fail over quickly.
 #[tokio::test(flavor = "current_thread")]
 async fn busy_genuine_death_arms_fast_via_leg_a() {
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Membership-backed harness with the primary (`primary-orig`) AND the
+    // live peer (`sec-b`) seeded as transport members: leg (C)
+    // (primary-left-membership) reads `MeshClient::has_peer`, so a faithful
+    // "healthy remote primary" fixture must report the primary as a member —
+    // otherwise leg (C) would (correctly) arm against an absent primary and
+    // mask the leg-(A)/(B) behaviour these tests isolate. The `_members`
+    // handle is unused here (none of these tests removes the primary; the
+    // dedicated leg-(C) coverage lives in `failover_membership`).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("primary-orig"), PeerId::from("sec-b")],
+    );
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
@@ -164,7 +187,18 @@ async fn busy_genuine_death_arms_fast_via_leg_a() {
 /// cannot catch.
 #[tokio::test(flavor = "current_thread")]
 async fn wedged_primary_elects_at_backstop() {
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Membership-backed harness with the primary (`primary-orig`) AND the
+    // live peer (`sec-b`) seeded as transport members: leg (C)
+    // (primary-left-membership) reads `MeshClient::has_peer`, so a faithful
+    // "healthy remote primary" fixture must report the primary as a member —
+    // otherwise leg (C) would (correctly) arm against an absent primary and
+    // mask the leg-(A)/(B) behaviour these tests isolate. The `_members`
+    // handle is unused here (none of these tests removes the primary; the
+    // dedicated leg-(C) coverage lives in `failover_membership`).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("primary-orig"), PeerId::from("sec-b")],
+    );
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
@@ -212,7 +246,18 @@ async fn wedged_primary_elects_at_backstop() {
 /// message must abort it cleanly, NOT leave the node mid-failover.
 #[tokio::test(flavor = "current_thread")]
 async fn primary_recovery_cancels_in_flight_election() {
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Membership-backed harness with the primary (`primary-orig`) AND the
+    // live peer (`sec-b`) seeded as transport members: leg (C)
+    // (primary-left-membership) reads `MeshClient::has_peer`, so a faithful
+    // "healthy remote primary" fixture must report the primary as a member —
+    // otherwise leg (C) would (correctly) arm against an absent primary and
+    // mask the leg-(A)/(B) behaviour these tests isolate. The `_members`
+    // handle is unused here (none of these tests removes the primary; the
+    // dedicated leg-(C) coverage lives in `failover_membership`).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("primary-orig"), PeerId::from("sec-b")],
+    );
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives

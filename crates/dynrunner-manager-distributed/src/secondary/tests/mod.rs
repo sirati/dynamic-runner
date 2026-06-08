@@ -24,6 +24,13 @@
 //!   does NOT elect, a dead link arms fast via leg (A), a wedged-but-
 //!   routable primary elects via the patient backstop (leg B), and a
 //!   resumed primary message cancels an in-flight election.
+//! - [`failover_membership`] — BUG H: `run_election_tick`'s leg (C) arms the
+//!   failover election when the current primary LEAVES the transport
+//!   `MembershipView`, so an IDLE survivor (no `send_to_primary`, leg (A)
+//!   silent) elects on primary-death without waiting the leg-(B) backstop;
+//!   gated on `primary_last_seen.is_some()` (no relocation-window false-arm),
+//!   self-cancelling on a flicker, and a gap-closure control proving the
+//!   election is membership-armed.
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
@@ -42,6 +49,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod failover_membership;
 mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;

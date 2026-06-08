@@ -149,12 +149,24 @@ where
                  still flow)"
             );
         } else {
+            // The "failover-capable" claim is now BACKED by a real,
+            // idle-independent trigger: `run_election_tick`'s leg (C) arms
+            // the election when the primary LEAVES the transport
+            // `MembershipView` (pump `handle_peer_disconnect`), so a survivor
+            // with ≥1 peer genuinely DOES detect primary-death and elect
+            // without needing a pending primary-bound send. (Pre-leg-(C) this
+            // message overpromised: an IDLE survivor never opened leg (A)'s
+            // send-driven window and would silently reconnect-loop a dead
+            // primary instead of electing — the message named a capability the
+            // arming path could not deliver. Reconciled to match the wired
+            // trigger.)
             tracing::warn!(
                 attempted = self.mesh.peer_dial_count,
                 connected,
                 "peer mesh formed only partially before the deadline — \
-                 proceeding degraded-but-capable (≥1 peer can still gather \
-                 failover quorum); further peers may still arrive"
+                 proceeding degraded-but-capable (≥1 peer can gather \
+                 failover quorum, and primary-departure arms the election \
+                 idle-independently); further peers may still arrive"
             );
         }
 
