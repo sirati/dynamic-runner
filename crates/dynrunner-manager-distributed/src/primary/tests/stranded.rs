@@ -131,6 +131,83 @@ async fn fake_secondary_dies_post_mesh_ready(
     drop(outgoing_to_primary);
 }
 
+/// Transfer-complete-window disconnect helper: the fake completes the full
+/// handshake (Welcome + Cert + MeshReady) and stays alive THROUGH the
+/// primary's `perform_initial_assignment` — it drains inbound until it sees
+/// its `InitialAssignment` (so that send SUCCEEDS, i.e. the assignment-time
+/// collapse path does NOT fire) — then drops its outbound channel. Dropping
+/// it tears the channel transport's peer down, so the production pump's
+/// `recv_peer()` returns `None` and the pump exits, dropping the primary's
+/// egress-queue receiver. The NEXT pre-loop send — `send_transfer_complete`,
+/// which runs immediately after assignment — then observes the gone mesh-pump
+/// (`client.send` `Err`), latching `mesh_pump_gone` and tripping
+/// `run_pipeline`'s post-transfer collapse gate.
+///
+/// Kept next to the test that uses it for the same reason as
+/// [`fake_secondary_dies_post_mesh_ready`]: the shape ("survive assignment,
+/// die at the transfer-complete window") is specific to this collapse-window
+/// regression, not general enough to promote to `test_helpers.rs`.
+async fn fake_secondary_dies_at_transfer_complete(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    outgoing_to_primary
+        .send(DistributedMessage::SecondaryWelcome {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: ram_bytes,
+            }],
+            worker_count: num_workers,
+            hostname: "test-host".into(),
+            is_observer: false,
+            can_be_primary: false,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::CertExchange {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            public_cert_pem: "FAKE_CERT".into(),
+            ipv4_address: Some("127.0.0.1".into()),
+            ipv6_address: None,
+            quic_port: 5000,
+        })
+        .unwrap();
+    outgoing_to_primary
+        .send(DistributedMessage::MeshReady {
+            target: None,
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            peer_count: 0,
+        })
+        .unwrap();
+
+    // Drain inbound until the InitialAssignment lands. Everything earlier
+    // (PeerInfo, the cold-seed ClusterMutation batch) is consumed silently so
+    // its `send_to` succeeds — the assignment-time collapse path must NOT be
+    // what fires here. The moment the InitialAssignment is in hand the
+    // assignment send has already succeeded; dropping the outbound channel now
+    // closes this peer so the pump exits BEFORE the primary's immediately-
+    // following `send_transfer_complete` queues — surfacing the gone mesh-pump
+    // on that send.
+    while let Some(msg) = incoming_from_primary.recv().await {
+        if matches!(msg, DistributedMessage::InitialAssignment { .. }) {
+            break;
+        }
+    }
+    drop(outgoing_to_primary);
+}
+
 /// Thread-local tracing buffer: captures every ERROR event emitted on the
 /// current thread for the lifetime of the returned guard.
 ///
@@ -417,6 +494,129 @@ async fn strand_broadcasts_run_aborted_not_run_complete() {
             assert!(
                 reason.contains("cluster routing collapsed"),
                 "abort reason must carry the ClusterCollapsed render, got: {reason}"
+            );
+        })
+        .await;
+}
+
+/// T-stranded-at-transfer-complete: the SIBLING-send collapse window.
+///
+/// A secondary survives the primary's `perform_initial_assignment` (its
+/// `InitialAssignment` send succeeds) but dies immediately after, so the
+/// next pre-loop send — `send_transfer_complete` — hits the now-gone local
+/// mesh-pump. Pre-fix that `send_to` `?`-escaped `run_pipeline` as a raw
+/// `Err(RunError::Other("…mesh-pump…dropped"))`, bypassing the
+/// strand-classification entirely: the assigned-but-unconfirmed work was an
+/// UNCLASSIFIED `Other` instead of a clean `ClusterCollapsed`. The fix makes
+/// `send_to` latch the local-pump-gone condition on `mesh_pump_gone` (the SOLE
+/// detection point, shared with every pre-loop send) and `run_pipeline`'s
+/// post-transfer gate route it into `finalize_terminal_accounting` — the SAME
+/// SOLE strand-classification site the assignment-time path and the
+/// operational loop converge on. So a death in the transfer-complete window
+/// is classified identically: `ClusterCollapsed` with per-category counts, the
+/// diagnostic log line, and the honest `RunAborted` terminal broadcast.
+///
+/// This pins the newly-covered sibling-send site (the assignment-time path is
+/// pinned by [`stranded_on_cluster_collapse_returns_err_with_counts`] /
+/// [`strand_broadcasts_run_aborted_not_run_complete`]); together they cover the
+/// whole pre-loop send chain uniformly.
+#[tokio::test(flavor = "current_thread")]
+async fn stranded_at_transfer_complete_window_returns_err_with_counts() {
+    let (log_buf, _log_guard) = capture_logs_thread_local();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Single secondary: its drop (after it has the InitialAssignment in
+            // hand) deterministically tears the pump down in the window between
+            // the assignment send and `send_transfer_complete`.
+            let (transport, secondary_ends) = setup_test(1);
+
+            let config = PrimaryConfig {
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                fleet_dead_timeout: std::time::Duration::from_secs(600),
+                ..test_primary_config()
+            };
+
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+            let total = binaries.len();
+
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_dies_at_transfer_complete(
+                    id,
+                    /* num_workers = */ 2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
+
+            let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot`. The secondary dies in the
+            // transfer-complete window → the sibling-send collapse gate fires.
+            seed_operational_ledger(&mut primary, binaries, deps);
+            let outcome = primary
+                .run(SeedSource::PromotionSnapshot, ops, ope)
+                .await;
+
+            match outcome {
+                Err(RunError::ClusterCollapsed { stranded, outcome }) => {
+                    assert!(
+                        stranded > 0,
+                        "stranded must be positive on transfer-complete-window collapse"
+                    );
+                    assert_eq!(
+                        outcome.total_terminal() + stranded,
+                        total,
+                        "succeeded + fail_retry + fail_oom + fail_final + stranded must equal total"
+                    );
+                    assert_eq!(stranded, primary.stranded_count());
+                }
+                other => panic!(
+                    "expected RunError::ClusterCollapsed, got {other:?} (counters: \
+                     succeeded={} failed={} stranded={} total={})",
+                    primary.completed_count(),
+                    primary.failed_count(),
+                    primary.stranded_count(),
+                    total,
+                ),
+            }
+
+            // The shared collapse-arm diagnostic must fire (same SOLE finalize
+            // site as the assignment-time path), so ops scripts grepping the
+            // log detect this window's collapse too.
+            let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
+            assert!(
+                captured.contains("tasks left unassigned because cluster routing collapsed"),
+                "the collapse diagnostic must fire on the transfer-complete-window arm; \
+                 captured error-level logs:\n{captured}"
+            );
+
+            // The peer-facing broadcast is the honest RunAborted, NOT
+            // RunComplete (the sibling-send window reaches the SAME terminal
+            // broadcast as the assignment-time path).
+            let state = primary.cluster_state_for_test();
+            assert!(
+                state.run_aborted().is_some(),
+                "transfer-complete-window collapse must broadcast RunAborted; \
+                 run_complete()={}",
+                state.run_complete()
+            );
+            assert!(
+                !state.run_complete(),
+                "transfer-complete-window collapse must NOT latch RunComplete"
             );
         })
         .await;
