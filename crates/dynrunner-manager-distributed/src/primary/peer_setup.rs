@@ -93,8 +93,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 peers,
             }
             .into();
-        self.send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
-            .await?;
+        // `Destination::All` always resolves, so the only way this `send_to`
+        // errors is the local mesh-pump being gone (the node winding down) —
+        // a cluster collapse, which `send_to` latches on `self.mesh_pump_gone`
+        // for `run_pipeline`'s pre-loop gate to route into the
+        // strand-classification finalize tail. Warn-and-continue here (uniform
+        // with the sibling `Destination::All` broadcasts
+        // `broadcast_cold_seed` / `rebroadcast_full_roster` /
+        // `apply_and_broadcast_cluster_mutations`) instead of `?`-escaping as a
+        // raw `RunError::Other` that would bypass the classification.
+        if let Err(error) = self
+            .send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
+            .await
+        {
+            tracing::warn!(error = %error, "PeerInfo broadcast delivery failed");
+        }
 
         // Broadcast the observer-join CRDT batch immediately after
         // the PeerInfo fan-out. Secondaries' `wait_for_setup` accepts

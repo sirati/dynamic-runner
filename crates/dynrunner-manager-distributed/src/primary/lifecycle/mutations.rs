@@ -393,13 +393,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             total_bytes: 0,
         };
         // Uniform `Destination::All` mesh broadcast, same as the primary
-        // keepalive + CRDT-mutation fan-out.
+        // keepalive + CRDT-mutation fan-out. `Destination::All` always
+        // resolves, so the only way this errors is the local mesh-pump being
+        // gone (the node winding down) — a cluster collapse, which `send_to`
+        // latches on `self.mesh_pump_gone` for `run_pipeline`'s post-transfer
+        // gate to route into the strand-classification finalize tail.
+        // Warn-and-continue (uniform with the sibling `Destination::All`
+        // broadcasts) instead of `?`-escaping as a raw `RunError::Other`: a
+        // secondary dying in the window between a successful initial
+        // assignment and transfer-complete must surface as a clean
+        // `ClusterCollapsed` + `RunAborted`, not an unclassified `Other`.
         if let Err(error) = self.send_to(Destination::All, msg).await {
             tracing::warn!(
                 error = %error,
                 "TransferComplete delivery failed"
             );
-            return Err(format!("TransferComplete broadcast failed: {error}"));
         }
         tracing::info!("transfer complete sent to all secondaries");
         Ok(())

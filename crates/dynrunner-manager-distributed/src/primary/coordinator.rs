@@ -374,6 +374,20 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// clean run; `>0` on the cluster-collapse path the tokenizer hit
     /// on 2026-05-10. Reset to 0 at the start of every `run()`.
     pub(super) stranded_count: usize,
+    /// Sticky per-run latch: a pre-loop [`Self::send_to`] observed the local
+    /// egress receiver (the mesh-pump) dropped — i.e. THIS node is winding
+    /// down and the mesh is gone. The egress-side TWIN of the operational
+    /// loop's `inbox.recv() -> None` collapse criterion, set in exactly ONE
+    /// place (the `client.send` `Err` arm of `send_to`) so no individual send
+    /// site is special-cased. `run_pipeline`'s `PromotedDestination` arm reads
+    /// it at its pre-loop gates and short-circuits into the SOLE
+    /// strand-classification site (`finalize_terminal_accounting`) — the
+    /// uniform pre-loop analogue of the operational loop's `break`-then-
+    /// finalize — instead of letting a `send_to` `?`-escape as a raw
+    /// `RunError::Other`. Set ONLY on the local-pump-gone arm; a
+    /// `resolve_destination` miss (a routing-state error, NOT a collapse)
+    /// never sets it. Reset to `false` at the start of every run.
+    pub(super) mesh_pump_gone: bool,
     /// Per-task identities a runtime `spawn_tasks` batch could not apply
     /// because the validator rejected them (`UnknownDependency` —
     /// an `on_phase_end`-spawned task naming a `(phase_id, task_id)`
@@ -953,6 +967,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             workers: Vec::new(),
             total_tasks: 0,
             stranded_count: 0,
+            mesh_pump_gone: false,
             spawn_rejected_task_ids: Vec::new(),
             all_binaries: Vec::new(),
             pending: None,
@@ -1095,7 +1110,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Stamp the role-bearing target so the receiving pump demuxes it
         // (C3), then queue. The mesh decides loopback-vs-remote; nothing is
         // silently dropped here.
-        self.client.send(dst.clone(), msg.with_target(dst))
+        //
+        // A `client.send` `Err` means the egress queue's receiver — the local
+        // mesh-pump — has been dropped: THIS node is winding down and the mesh
+        // is gone. That is the egress-side TWIN of the operational loop's
+        // `inbox.recv() -> None` collapse criterion (the SAME mesh-pump,
+        // observed from the send side). Latch it here — the SOLE detection
+        // point — so the pre-loop chain in `run_pipeline` can short-circuit
+        // into the strand-classification finalize tail uniformly, regardless
+        // of which pre-loop send hit the dead pump. The `resolve_destination`
+        // miss above is a routing-state error, NOT a local-pump-gone collapse,
+        // so it deliberately does NOT set the latch. The `Err` is still
+        // returned unchanged for callers that consult it directly (e.g.
+        // `perform_initial_assignment`'s typed-outcome short-circuit) or
+        // log-and-swallow it.
+        let result = self.client.send(dst.clone(), msg.with_target(dst));
+        if result.is_err() {
+            self.mesh_pump_gone = true;
+        }
+        result
     }
 
     /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
@@ -2583,6 +2616,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
         self.stranded_count = 0;
+        // Same per-run reset for the pre-loop mesh-pump-gone latch: only set
+        // by `send_to` when the local egress receiver has dropped during a
+        // pre-loop send; a coordinator re-used across runs must not inherit a
+        // previous run's collapse signal.
+        self.mesh_pump_gone = false;
         // Same per-run reset for the spawn-rejection ledger: only written
         // by `apply_spawn_tasks` when the validator rejects a runtime
         // `spawn_tasks` task; a coordinator re-used across runs must not
@@ -2956,12 +2994,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if let InitialAssignmentOutcome::ClusterCollapsed =
                     self.perform_initial_assignment().await?
                 {
-                    self.command_rx = command_rx;
-                    return self.finalize_terminal_accounting(total).await;
+                    return self.bail_to_finalize(command_rx, total).await;
                 }
 
                 // Phase 6: Send transfer complete.
                 self.send_transfer_complete().await?;
+
+                // Pre-loop collapse gate (transfer-complete window): a
+                // secondary dying AFTER its initial assignment send succeeded
+                // but before/at `send_transfer_complete` makes that broadcast's
+                // `send_to` hit the now-gone local mesh-pump — latched on
+                // `mesh_pump_gone`. Route it through the SAME finalize tail as
+                // the assignment-time collapse (rather than the warn-swallow
+                // letting the doomed run proceed into the operational loop over
+                // a dead mesh): the assigned-but-unconfirmed pool surfaces as
+                // stranded with the honest `RunAborted` terminal. Mirror of the
+                // operational loop's break-then-finalize, observed from the
+                // send side.
+                if self.mesh_pump_gone {
+                    return self.bail_to_finalize(command_rx, total).await;
+                }
 
                 // Put the command-channel receiver back on `self` so
                 // `operational_loop`'s own `self.command_rx.take()` picks it up
@@ -3147,6 +3199,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         Ok(())
     }
 
+    /// Pre-loop collapse bail-out: put the borrowed command-channel receiver
+    /// back on `self` (symmetric with the take at the top of the pre-loop
+    /// chain) and route into the SOLE strand-classification site.
+    ///
+    /// One concern: the shared tail every pre-loop cluster-collapse gate in
+    /// `run_pipeline`'s `PromotedDestination` arm converges on, so the
+    /// `command_rx` put-back + `finalize_terminal_accounting` call is written
+    /// ONCE rather than duplicated per gate. The gates differ only in WHICH
+    /// collapse signal they observe (the per-send `mesh_pump_gone` latch);
+    /// the bail-out itself is uniform.
+    async fn bail_to_finalize(
+        &mut self,
+        command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        total: usize,
+    ) -> Result<(), RunError> {
+        self.command_rx = command_rx;
+        self.finalize_terminal_accounting(total).await
+    }
+
     /// The SOLE strand-classification + terminal-broadcast site.
     ///
     /// One concern: turn the run's final per-task ledger state into the
@@ -3162,11 +3233,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// - `run_operational_and_finalize` — the operational loop exited
     ///   (clean completion, fleet-dead, or a mid-loop transport collapse the
     ///   loop tolerates by breaking); and
-    /// - `run_pipeline`'s `PromotedDestination` arm — the initial
-    ///   per-secondary assignment hit a cluster-collapse send failure (the
-    ///   mesh-pump is gone, the egress-side twin of the operational loop's
-    ///   `recv() -> None` collapse criterion), so the loop is never entered
-    ///   and the full pool is stranded.
+    /// - `run_pipeline`'s `PromotedDestination` arm — ANY pre-loop send hit a
+    ///   cluster-collapse send failure (the local mesh-pump is gone, the
+    ///   egress-side twin of the operational loop's `recv() -> None` collapse
+    ///   criterion), so the loop is never entered and the un-dispatched pool
+    ///   is stranded. The pre-loop gate is driven uniformly by the
+    ///   `mesh_pump_gone` latch (set in `send_to`), so a collapse during the
+    ///   peer-list / cold-seed / roster-rebroadcast / initial-assignment /
+    ///   transfer-complete chain is classified identically.
     ///
     /// `total` is the run's task count, captured by the caller from
     /// `self.total_tasks` after seeding so the accounting matches on both
