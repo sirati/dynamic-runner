@@ -297,3 +297,65 @@ fn divergence_detected_then_quiescent_after_restore() {
     assert_eq!(incomplete.digest(), complete.digest());
     assert!(!incomplete.digest().is_behind(&complete.digest()));
 }
+
+/// The discovery-debt lattice height threads through `digest()` and drives
+/// the AE detector by STRICT lattice-height compare across all three states
+/// `Undeclared < Owed < Settled`. Pins the case the single-bool projection
+/// could NOT carry: an `Undeclared` local (missed the live `Declared`) is
+/// BEHIND an `Owed` peer and pulls it via the snapshot `max`-join, then the
+/// pair quiesces. Also pins the `Owed`-behind-`Settled` heal and the
+/// one-directional reverse (a higher local is never behind a lower peer).
+#[test]
+fn discovery_debt_divergence_detected_and_heals() {
+    // A replica that declared discovery and settled it.
+    let mut settled = ClusterState::<RunnerIdentifier>::new();
+    settled.apply(ClusterMutation::DiscoveryDebtDeclared);
+    settled.apply(ClusterMutation::DiscoverySettled);
+
+    // A replica still owing discovery (declared, not yet settled).
+    let mut owed = ClusterState::<RunnerIdentifier>::new();
+    owed.apply(ClusterMutation::DiscoveryDebtDeclared);
+
+    // A replica that missed the `Declared` broadcast entirely (BOTTOM).
+    let undeclared = ClusterState::<RunnerIdentifier>::new();
+
+    // Strict lattice-height: a lower local is behind a higher peer, in both
+    // adjacent steps. THE bool-missed case is Undeclared-behind-Owed.
+    assert!(
+        undeclared.digest().is_behind(&owed.digest()),
+        "an Undeclared local must be behind an Owed peer (the bool-missed case)"
+    );
+    assert!(
+        owed.digest().is_behind(&settled.digest()),
+        "an Owed local must be behind a Settled peer"
+    );
+    // Reverse: a higher local is never behind a lower peer.
+    assert!(
+        !owed.digest().is_behind(&undeclared.digest()),
+        "an Owed local must NOT be behind an Undeclared peer"
+    );
+    assert!(
+        !settled.digest().is_behind(&owed.digest()),
+        "a Settled local must NOT be behind an Owed peer (top-wins)"
+    );
+
+    // Pull: restoring the Owed snapshot ratchets the Undeclared local up to
+    // Owed (the convergence the bool could not detect), then it quiesces vs
+    // that peer.
+    let mut healing = ClusterState::<RunnerIdentifier>::new();
+    healing.restore(owed.snapshot());
+    assert_eq!(
+        healing.digest().discovery_debt,
+        owed.digest().discovery_debt,
+        "the Undeclared local must now match the Owed peer"
+    );
+    assert!(
+        !healing.digest().is_behind(&owed.digest()),
+        "converged → no further pull (self-quiescing)"
+    );
+
+    // And the Owed → Settled heal likewise quiesces.
+    owed.restore(settled.snapshot());
+    assert_eq!(owed.digest().discovery_debt, settled.digest().discovery_debt);
+    assert!(!owed.digest().is_behind(&settled.digest()));
+}

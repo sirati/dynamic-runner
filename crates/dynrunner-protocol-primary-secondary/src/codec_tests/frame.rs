@@ -162,6 +162,7 @@ fn roundtrip_all_message_types() {
                 primary_epoch: 3,
                 run_complete: true,
                 run_aborted: false,
+                discovery_debt: crate::DiscoveryDebt::Owed,
                 phase_event_tallies_count: 6,
                 phase_event_tallies_hash: 0x88,
                 retry_passes_used_count: 2,

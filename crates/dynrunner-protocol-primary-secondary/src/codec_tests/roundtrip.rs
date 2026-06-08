@@ -80,6 +80,7 @@ fn roundtrip_state_digest_payload() {
         primary_epoch: 42,
         run_complete: true,
         run_aborted: true,
+        discovery_debt: crate::DiscoveryDebt::Owed,
         phase_event_tallies_count: 9,
         phase_event_tallies_hash: 0x1357_2468,
         retry_passes_used_count: 5,

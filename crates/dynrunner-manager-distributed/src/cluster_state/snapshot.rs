@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, TaskOutputs};
-use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
+use dynrunner_protocol_primary_secondary::{DiscoveryDebt, SecondaryCapacityRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::primary::retry_bucket::BucketKind;
@@ -101,6 +101,14 @@ use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally, RespawnEve
 ///   first `Some(reason)` and never overwrites an already-`Some` local
 ///   value. Carried so a node seeded from a snapshot learns the run is
 ///   already over / aborted without waiting for a re-broadcast.
+/// - `discovery_debt`: sticky-monotonic merge, join = `max` over the
+///   three-state lattice `Undeclared ⊑ Owed ⊑ Settled`. A replica only
+///   moves UP: a `Settled` snapshot ratchets any lower local to `Settled`;
+///   an `Owed` snapshot ratchets a local `Undeclared → Owed` but never
+///   overwrites a local `Settled`; an `Undeclared` snapshot loses to both.
+///   Carried so a promoted primary inherits "discovery already done" (and
+///   does NOT re-run discovery on failover) AND so a replica that missed
+///   the live `Declared` broadcast still learns `Owed` via the pull.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -216,6 +224,17 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-field shape).
     #[serde(default)]
     pub run_aborted: Option<String>,
+    /// Sticky-monotonic discovery-debt latch (the replicated discovery
+    /// lattice). Merge rule on `restore`: join = `max` over
+    /// `Undeclared ⊑ Owed ⊑ Settled` (a replica only moves UP; a `Settled`
+    /// snapshot wins, an `Owed` snapshot ratchets a local `Undeclared` but
+    /// never overwrites a local `Settled`). `#[serde(default)]` keeps wire
+    /// compat with pre-field senders (missing field decodes as `Undeclared`
+    /// = the never-declared BOTTOM = the conservative never-owed shape,
+    /// which loses to any peer's higher state, so a legacy snapshot never
+    /// drags a declared run down).
+    #[serde(default)]
+    pub discovery_debt: DiscoveryDebt,
     /// Replicated per-phase EVENT tallies (F4) — grow-only MAX of a monotone
     /// event count keyed by `(PhaseId, PhaseTally)`. Carried so a promoted
     /// primary inherits the per-phase completed/failed EVENT counts (a fail
@@ -288,6 +307,7 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
+            discovery_debt,
             role_table: _role_table,
             peer_state,
             capabilities,
@@ -355,6 +375,10 @@ impl<I: Identifier> ClusterState<I> {
             // from a snapshot learns the run is already over / aborted.
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Sticky-monotonic discovery-debt latch — carried so a promoted
+            // primary inherits "discovery already settled" and does NOT
+            // re-run discovery on failover.
+            discovery_debt: *discovery_debt,
             // Replicated grow-only-MAX maps (F4 + P3) — carried so a
             // promoted primary inherits the per-phase event tallies and the
             // retry / reinject used-budgets via max-merge on restore.
@@ -445,6 +469,7 @@ impl<I: Identifier> ClusterState<I> {
             alive_members,
             run_complete,
             run_aborted,
+            discovery_debt,
             phase_event_tallies,
             retry_passes_used,
             unfulfillable_reinject_used,
@@ -628,6 +653,17 @@ impl<I: Identifier> ClusterState<I> {
         {
             self.run_aborted = Some(reason);
         }
+        // Discovery-debt latch: sticky-monotonic join = `max` over the
+        // total order `Undeclared ⊑ Owed ⊑ Settled` (the derived `Ord`).
+        // A replica only moves UP: an incoming `Settled` ratchets a local
+        // `Owed`/`Undeclared → Settled`; an incoming `Owed` ratchets a local
+        // `Undeclared → Owed` but NEVER overwrites a local `Settled`; an
+        // incoming `Undeclared` loses to both. So a promoted primary that
+        // restored a `Settled` snapshot inherits "discovery done" and does
+        // not re-run it, while a replica that missed the live `Declared`
+        // broadcast still learns `Owed` via the snapshot pull (the case the
+        // single-bool digest could not carry — see `digest()` / `is_behind`).
+        self.discovery_debt = self.discovery_debt.max(discovery_debt);
         // Grow-only-MAX maps (F4 + P3): per-key MAX merge so a promoted
         // primary inherits the per-phase event tallies and the retry /
         // reinject used-budgets, and a stale peer's snapshot can never

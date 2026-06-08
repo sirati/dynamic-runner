@@ -59,6 +59,12 @@ pub use types::{
     ApplyOutcome, CapabilityEntry, OutcomeSummary, PhaseRollup, PhaseTally, RespawnEventRecord,
     RoleChangeHook, StateCounts, TaskState,
 };
+// `DiscoveryDebt` is the wire-format value type for the discovery-debt
+// field; it lives in the protocol crate (it crosses the wire inside
+// `StateDigest`, sibling to `SecondaryCapacityRecord`). Re-exported here so
+// `cluster_state::DiscoveryDebt` resolves at the original path for callers
+// that read it off `ClusterState`.
+pub use dynrunner_protocol_primary_secondary::DiscoveryDebt;
 
 #[cfg(test)]
 mod tests;

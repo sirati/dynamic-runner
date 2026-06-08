@@ -31,6 +31,57 @@ pub struct SecondaryCapacityRecord {
     pub resources: Vec<ResourceAmount>,
 }
 
+/// Replicated per-RUN "discovery owed" fact (V6) — a THREE-state
+/// sticky-monotone scalar lattice. The value half of the discovery-debt
+/// CRDT field: set by [`ClusterMutation::DiscoveryDebtDeclared`] /
+/// [`ClusterMutation::DiscoverySettled`], summarised verbatim into
+/// [`crate::StateDigest`], and carried through the cluster-state snapshot.
+///
+/// The join is `max` over the total order `Undeclared ⊑ Owed ⊑ Settled`;
+/// once a replica reaches a higher state it never reverts. Three states
+/// (not two) because the cold/never-declared BOTTOM and the post-settle TOP
+/// must be DISTINCT — collapsing them makes the apply rule self-contradict
+/// (a cold replica's first `Declared` must set `Owed`, while a stale
+/// `Declared` redelivered after `Settled` must be a NoOp; with one shared
+/// value the apply rule cannot tell them apart). A distinct `Undeclared`
+/// bottom resolves it: `Declared` is Applied ONLY from `Undeclared`.
+///
+/// Consumer contract: every reader (run_complete_check, the cascade gate,
+/// the discover-on-promotion driver) checks `== Owed`. `Undeclared` and
+/// `Settled` are both `!= Owed`, so a run that never declares debt (cold
+/// mode-1 / legacy) is `Undeclared` from t0 and unaffected.
+///
+/// Lives in the protocol crate (not `cluster_state`) because it crosses the
+/// wire inside [`crate::StateDigest`] (the anti-entropy digest carries the
+/// full lattice height so the detector can compare it in both directions —
+/// a bool would conflate `Undeclared` and `Settled` and silently break
+/// convergence). Sibling to [`SecondaryCapacityRecord`].
+///
+/// The variants are declared in lattice order so the DERIVED `Ord` IS the
+/// lattice order (`Undeclared < Owed < Settled`): the snapshot/restore join
+/// is `max`, and the AE detector is "behind iff the peer is STRICTLY
+/// higher" (`self < other`). Do NOT reorder the variants — the derived
+/// `Ord` is load-bearing.
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize, Hash,
+)]
+pub enum DiscoveryDebt {
+    /// Lattice BOTTOM (the default): no discovery has been declared. The
+    /// cold-seeded (mode-1 / legacy) shape and the wire-compat decode of a
+    /// pre-field frame. `!= Owed`, so every completion check proceeds.
+    #[default]
+    Undeclared,
+    /// Discovery is owed: the run was relocated to a compute peer that must
+    /// run `discover_items` and seed the ledger before any completion
+    /// check. The lattice MIDDLE. The discover-on-promotion driver (Phase
+    /// 5b) gates on this state.
+    Owed,
+    /// Lattice TOP: discovery has completed (or the empty-corpus terminal
+    /// was originated). Sticky — once `Settled` a replica never reverts,
+    /// and an `Owed`/`Undeclared` observation never overwrites it.
+    Settled,
+}
+
 /// Why a `PrimaryChanged` was originated. Advisory routing metadata
 /// only — the CRDT apply rule and snapshot merge are `reason`-BLIND
 /// ("highest epoch wins, one primary" never reads it). It distinguishes
@@ -183,6 +234,39 @@ pub enum ClusterMutation<I> {
     RunAborted {
         reason: String,
     },
+    /// "This run still OWES discovery." Sets the replicated
+    /// `discovery_debt` lattice to `Owed`.
+    ///
+    /// Originated by the mode-2 (relocated) submitter in the SAME
+    /// origination pass as the phase graph, BEFORE relocating: the
+    /// submitter has no local corpus to discover (the files are already on
+    /// the cluster), so instead of seeding `TaskAdded`s it declares the
+    /// debt + the `PhaseDepsSet`, and the empty CRDT + this marker IS the
+    /// "awaiting seed" state the compute-peer primary later settles.
+    ///
+    /// Payload-free latch-SET, NOT a `Set(bool)` toggle — the monotonicity
+    /// lives in the apply rule, not the wire payload: a `Declared` that
+    /// arrives AFTER [`Self::DiscoverySettled`] is a NoOp (`Settled` is the
+    /// sticky lattice TOP), so reordered delivery can never un-settle a run.
+    /// This is the same payload-free-latch reason [`Self::RunComplete`] is
+    /// not a `SetRunComplete(bool)`.
+    DiscoveryDebtDeclared,
+    /// "Discovery is now DONE." Ratchets the replicated `discovery_debt`
+    /// lattice to `Settled` (the TOP). The failover-safe twin of
+    /// [`Self::DiscoveryDebtDeclared`].
+    ///
+    /// Originated by the compute-peer primary's discover-on-promotion
+    /// driver as the FINAL mutation of the same batch that carries the
+    /// discovered `PhaseDepsSet` + `TaskAdded` set (or, on the empty-corpus
+    /// path, alongside the `RunComplete`), so "the tasks are in the CRDT"
+    /// and "the debt is cleared" land atomically on the wire — no window
+    /// where a peer sees `Settled` without the tasks.
+    ///
+    /// Sticky-monotone apply: ratchets `Owed → Settled` and is `Applied`
+    /// iff it changed the local value, else a NoOp; once `Settled` it never
+    /// reverts (mirrors [`Self::RunComplete`]'s `false → true` ratchet,
+    /// with `Settled` as the latched TOP).
+    DiscoverySettled,
     /// External-control reinjection: the primary's
     /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
     /// state is the discrete `TaskState::Unfulfillable { .. }` variant

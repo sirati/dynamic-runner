@@ -21,6 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::cluster_mutation::DiscoveryDebt;
+
 /// Compact fingerprint of a replicated `ClusterState`, exchanged on the
 /// anti-entropy cadence. Every field pairs a COUNT (how many entries the
 /// replica holds for that part of the ledger) with a `u64` content HASH
@@ -101,6 +103,20 @@ pub struct StateDigest {
     /// reason string is not needed to detect divergence).
     #[serde(default)]
     pub run_aborted: bool,
+    /// Sticky-monotone discovery-debt lattice height, carried VERBATIM (the
+    /// full three-state [`DiscoveryDebt`], NOT a bool). A bool is provably
+    /// insufficient for a 3-state lattice: it would map both `Undeclared`
+    /// (BOTTOM) and `Settled` (TOP) to the same value, so a replica that
+    /// missed the `Declared` broadcast (`Undeclared`) could never detect it
+    /// is behind an `Owed` peer and would never pull — silent
+    /// non-convergence (the mode-2 stall). `is_behind` compares lattice
+    /// height directly (`self.discovery_debt < other.discovery_debt`).
+    /// `#[serde(default)]` decodes a pre-field peer as `Undeclared` = the
+    /// never-declared BOTTOM = the conservative never-claims-ahead shape
+    /// (it loses to any peer's higher state, so a legacy peer never drags a
+    /// declared run down).
+    #[serde(default)]
+    pub discovery_debt: DiscoveryDebt,
     /// Number of per-phase EVENT-tally entries (F4 grow-only-MAX map).
     #[serde(default)]
     pub phase_event_tallies_count: u64,
@@ -173,6 +189,16 @@ impl StateDigest {
     /// - `run_complete` / `run_aborted`: ahead iff the peer's latch is set
     ///   while ours is not (`false → true` ratchet; the reason string is
     ///   irrelevant to the detector).
+    /// - `discovery_debt`: the peer is ahead iff it is STRICTLY HIGHER in the
+    ///   three-state lattice `Undeclared < Owed < Settled` —
+    ///   `self.discovery_debt < other.discovery_debt`. This is a direct
+    ///   lattice-height compare (NOT a bool mirror): a bool projection would
+    ///   conflate `Undeclared` and `Settled`, so an `Undeclared` replica
+    ///   (missed the `Declared` broadcast) could never detect it is behind an
+    ///   `Owed` peer → never pulls → on promotion reads `!= Owed` → skips
+    ///   discovery → the run stalls / false-completes. The restore `max`-join
+    ///   then heals the lower side. One-directional by construction: a higher
+    ///   local is never behind a lower peer.
     ///
     /// The detector compares the monotone, snapshot-healable ledger
     /// fields INCLUDING the capability 2P-set (C6 — it heals via snapshot).
@@ -229,6 +255,13 @@ impl StateDigest {
                 && other.current_primary_hash != self.current_primary_hash)
             || (other.run_complete && !self.run_complete)
             || (other.run_aborted && !self.run_aborted)
+            // discovery_debt: behind iff the peer is STRICTLY HIGHER in the
+            // lattice `Undeclared < Owed < Settled` (a direct lattice-height
+            // compare on the full enum). Covers ALL three states: an
+            // Undeclared local is behind an Owed-or-Settled peer; an Owed
+            // local is behind a Settled peer; a Settled local is behind
+            // nothing. The restore `max`-join heals the lower side.
+            || self.discovery_debt < other.discovery_debt
             // F4 + P3 grow-only-MAX maps: count-OR-hash compare, same shape
             // as the other count-bearing fields. A promoted primary that
             // bumped a count past a stale peer's snapshot makes the peer
@@ -334,6 +367,45 @@ mod tests {
         // Latch ratchet is one-directional: a set-local vs unset-peer is
         // NOT behind.
         assert!(!peer.is_behind(&local));
+    }
+
+    /// discovery_debt lattice-height direction across ALL THREE states
+    /// `Undeclared < Owed < Settled`: a replica is behind iff the peer is
+    /// STRICTLY higher. Pins every adjacent transition in BOTH directions —
+    /// the case the single-bool projection could not carry (it would
+    /// conflate `Undeclared` and `Settled`, so an `Undeclared` replica would
+    /// never detect it is behind an `Owed` peer → the mode-2 stall).
+    #[test]
+    fn discovery_debt_behind_iff_peer_strictly_higher() {
+        let undeclared = StateDigest {
+            discovery_debt: DiscoveryDebt::Undeclared,
+            ..Default::default()
+        };
+        let owed = StateDigest {
+            discovery_debt: DiscoveryDebt::Owed,
+            ..Default::default()
+        };
+        let settled = StateDigest {
+            discovery_debt: DiscoveryDebt::Settled,
+            ..Default::default()
+        };
+
+        // Undeclared is behind Owed and Settled (pull up the lattice).
+        // THIS is the case a bool would miss: Undeclared-behind-Owed.
+        assert!(undeclared.is_behind(&owed));
+        assert!(undeclared.is_behind(&settled));
+        // Owed is behind Settled.
+        assert!(owed.is_behind(&settled));
+
+        // Reverse direction: a higher local is NEVER behind a lower peer.
+        assert!(!owed.is_behind(&undeclared));
+        assert!(!settled.is_behind(&undeclared));
+        assert!(!settled.is_behind(&owed));
+
+        // Equal states → neither behind (no divergence on this field).
+        assert!(!undeclared.is_behind(&undeclared));
+        assert!(!owed.is_behind(&owed));
+        assert!(!settled.is_behind(&settled));
     }
 
     /// CRD-2/D-P: at EQUAL epoch a DIFFERENT `current_primary_hash` makes
