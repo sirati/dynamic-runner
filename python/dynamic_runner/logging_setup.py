@@ -13,10 +13,16 @@ feature are "configure logging for importance mode", so they live together:
     at `_native` import, so config is chosen by flags, not read from the
     env. Anything that logs in the (do-nothing) window before this call has
     no global subscriber and is dropped.
-  * The Python side suppresses the root console handler and routes Python's
-    own logs to the same full-log file, so stdio carries only the
-    Rust-emitted important events while the full log keeps everything. This
-    half runs inside :func:`setup_logging`.
+  * The Python side BRIDGES every consumer/framework Python log record into
+    Rust tracing (the :class:`_TracingBridgeHandler` installed for ALL roles),
+    so a consumer hook's logging (``on_phase_end``, ``discover_items``) lands
+    in the SAME per-role full-log file (``primary.log`` / ``secondary.log`` /
+    ``observer.log``) as the Rust framework events — routed by the run
+    future's role span, NOT by anything the Python side knows. This gives the
+    relocated primary / observer a durable per-role Python sink it previously
+    lacked on SLURM (a non-submitter role had no Python file sink at all).
+    In importance mode the Python console handler is additionally dropped so
+    stdio carries only the Rust-emitted important events.
 
 ``--important-stdio-only`` is SUBMITTER-LOCAL: it steers the submitter's own
 stdout/log split and is deliberately NOT forwarded to secondaries (see
@@ -38,12 +44,6 @@ from ._shared.logging_utils import remove_stream_handlers
 #: reference share one literal.
 IMPORTANT_STDIO_ONLY_FLAG = "--important-stdio-only"
 
-#: Default destination for the full (unfiltered) log when importance mode is
-#: on and the operator did not pass ``--full-log-file``. Relative on
-#: purpose: it lands wherever the run was launched, matching the historical
-#: shell-redirection capture point.
-DEFAULT_FULL_LOG_FILE = "dynrunner-full.log"
-
 #: Per-node subdirectory the SUBMITTER's full role-split logs land under,
 #: anchored on ``--log-dir`` — the gateway-shared mount compute nodes use
 #: for ``--full-log-dir=<log-dir>/{secondary_id}``. "setup" mirrors the
@@ -51,28 +51,6 @@ DEFAULT_FULL_LOG_FILE = "dynrunner-full.log"
 #: (``<log-dir>/setup/primary.log``) and post-relocation observer log
 #: (``<log-dir>/setup/observer.log``) sit beside the compute nodes' dirs.
 SETUP_FULL_LOG_SUBDIR = "setup"
-
-
-def resolve_full_log_file(
-    important_stdio_only: bool, full_log_file: str | None
-) -> Path | None:
-    """The full-log file the importance mode writes to, or ``None``.
-
-    Single concern: turn the two parsed knobs into the concrete path both
-    the Rust full sink and the Python redirect must agree on. When
-    importance mode is off, there is no submitter full-log file (``None``).
-    When on, honour an explicit ``--full-log-file`` else the cwd default.
-
-    The per-node ``--full-log-dir`` split is a separate sink (it takes
-    precedence on the Rust side and needs no Python-side redirect, since a
-    container's stdout is captured wholesale by the wrapper), so it is not
-    considered here — this is purely the submitter's single-file path.
-    """
-    if not important_stdio_only:
-        return None
-    if full_log_file and full_log_file.strip():
-        return Path(full_log_file)
-    return Path(DEFAULT_FULL_LOG_FILE)
 
 
 def resolve_full_log_dir(
@@ -110,28 +88,52 @@ def resolve_full_log_dir(
     return str(Path(log_dir) / SETUP_FULL_LOG_SUBDIR)
 
 
-def _redirect_python_logs_to_full_log(full_log_file: Path) -> None:
-    """Importance-mode Python-side handler reconfiguration: drop the root
-    console StreamHandler(s) so Python chatter does not reach stdio, and
-    append a FileHandler to ``full_log_file`` so Python's full record is
-    preserved alongside the Rust full sink.
+class _TracingBridgeHandler(logging.Handler):
+    """Forward every Python log record into Rust tracing via ``py_log``.
 
-    Reuses the shared `remove_stream_handlers` helper (no bespoke handler
-    walk) and the same level/format `setup_logging` just installed on the
-    root logger.
+    Single concern: be the Python end of the Python→tracing bridge. ``emit``
+    hands the record's level name, logger name, and rendered message to the
+    native ``py_log`` pyfunction, which emits a ``tracing::event!`` that
+    inherits the run future's role span and so routes to the matching per-role
+    full-log file (``primary.log`` / ``secondary.log`` / ``observer.log``).
+
+    The handler knows NOTHING about roles, per-role files, or the importance
+    gate: role attribution lives entirely in the Rust run loop's span, and the
+    routing/exclusion lives in the Rust subscriber. This is the GENERAL
+    per-role mechanism that replaces the submitter-only full-log FileHandler
+    redirect — installed for every role, it gives a relocated primary /
+    observer the durable per-role Python sink it lacked on SLURM.
+    """
+
+    def __init__(self, py_log) -> None:
+        super().__init__()
+        self._py_log = py_log
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._py_log(record.levelname, record.name, self.format(record))
+        except Exception:
+            self.handleError(record)
+
+
+def _install_tracing_bridge() -> None:
+    """Install the Python→tracing bridge handler on the root logger.
+
+    Single concern: route Python's full record into the Rust per-role sinks
+    for ALL roles (not just the submitter). The native ``py_log`` is imported
+    lazily here (same reason as ``init_logging`` — keep ``_native`` out of
+    modules that import this one in isolation). Idempotent: a re-entrant
+    ``setup_logging`` (respawn / consumer calling ``cli_main`` then ``run``)
+    must not stack duplicate bridges, so a pre-existing bridge is left alone.
     """
     root = logging.getLogger()
-    file_handler = logging.FileHandler(full_log_file, mode="a")
-    file_handler.setLevel(root.level)
-    # Inherit the formatter the just-completed basicConfig installed on a
-    # root stream handler so the file record reads identically to what
-    # stdout would have shown.
-    for handler in root.handlers:
-        if isinstance(handler, logging.StreamHandler) and handler.formatter:
-            file_handler.setFormatter(handler.formatter)
-            break
-    remove_stream_handlers(root)
-    root.addHandler(file_handler)
+    if any(isinstance(h, _TracingBridgeHandler) for h in root.handlers):
+        return
+    from . import py_log
+
+    bridge = _TracingBridgeHandler(py_log)
+    bridge.setLevel(root.level)
+    root.addHandler(bridge)
 
 
 def setup_logging(args: argparse.Namespace) -> logging.Logger:
@@ -145,9 +147,14 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
       * Configures the Python root logger's level / prefix from
         ``--debug`` / ``--raw-logs`` and the role flags (``--secondary``,
         ``--multi-computer``, ``--slurm``).
-      * When importance mode is on, drops the Python console handler and
-        routes Python's logs to the full-log file so stdio carries only the
-        Rust-emitted important events.
+      * Installs the Python→tracing bridge for ALL roles so consumer/framework
+        Python records land in the matching per-role full-log file (routed by
+        the run future's role span). The Rust stdio sink drops this bridged
+        copy, so stdout is unchanged — Python chatter still reaches it via the
+        console handler.
+      * When importance mode is on, ADDITIONALLY drops the Python console
+        handler so stdio carries only the Rust-emitted important events; the
+        bridge keeps Python's full record in the per-role/full file sink.
 
     The role flags choose a prefix: ``S|`` for a secondary, ``P|`` for a
     distributed primary, none for plain local mode.
@@ -201,8 +208,17 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
             log_format = "%(levelname)s | %(asctime)s | %(message)s"
         logging.basicConfig(level=log_level, format=log_format, datefmt="%H:%M:%S")
 
-    resolved = resolve_full_log_file(important_stdio_only, full_log_file)
-    if resolved is not None:
-        _redirect_python_logs_to_full_log(resolved)
+    # Bridge Python's records into Rust tracing for EVERY role: the general
+    # per-role mechanism that replaces the submitter-only full-log redirect, so
+    # a relocated primary / observer's `on_phase_end` / `discover_items` Python
+    # logging lands in `primary.log` / `observer.log` / `secondary.log`.
+    _install_tracing_bridge()
+
+    # Importance mode is operator-stdout-only: drop the Python console handler
+    # so Python chatter does not reach the gated stdio. The bridge (installed
+    # above) keeps Python's full record in the per-role/full file sink, so
+    # nothing is lost — the Rust full sink and the per-role files carry it.
+    if important_stdio_only:
+        remove_stream_handlers(logger)
 
     return logger

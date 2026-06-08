@@ -1214,9 +1214,22 @@ pub(crate) fn build_setup_discovery_fn(
                         .to_string(),
                 );
             };
+            // Capture the role span CURRENT on the runtime thread (this future
+            // is awaited inside the primary coordinator's role-instrumented
+            // `discover_on_promotion`, so `Span::current()` is the primary role
+            // span). `spawn_blocking` otherwise DETACHES the span context, so
+            // the consumer's `discover_items` Python logging — forwarded into
+            // tracing by the Python→tracing bridge — would carry no role span
+            // and route to NO per-role file. Re-entering the captured span on
+            // the blocking thread restores the attribution, so those bridged
+            // records land in the relocated primary's `primary.log`. This is
+            // the "run the emit on the role-tagged thread" half of the bridge;
+            // `py_log` itself stays role-agnostic.
+            let role_span = tracing::Span::current();
             // Run the GIL excursion OFF the runtime thread so the mesh-pump
             // keeps the keepalives flowing during discovery (§14/§15).
             tokio::task::spawn_blocking(move || {
+                let _role_guard = role_span.enter();
                 Python::attach(|py| -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
                     discover_items_under_gil(
                         py,

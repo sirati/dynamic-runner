@@ -111,28 +111,19 @@ class ImportantStdioFlagShapeTests(unittest.TestCase):
                 f"retired env-mechanism symbol still present: {retired}",
             )
 
-
-class ResolveFullLogFileTests(unittest.TestCase):
-    def test_off_returns_none(self) -> None:
-        self.assertIsNone(logging_setup.resolve_full_log_file(False, "/tmp/x.log"))
-
-    def test_on_uses_explicit_path(self) -> None:
-        self.assertEqual(
-            logging_setup.resolve_full_log_file(True, "/tmp/x.log"),
-            pathlib.Path("/tmp/x.log"),
-        )
-
-    def test_on_falls_back_to_default(self) -> None:
-        self.assertEqual(
-            logging_setup.resolve_full_log_file(True, None),
-            pathlib.Path(logging_setup.DEFAULT_FULL_LOG_FILE),
-        )
-
-    def test_on_blank_path_falls_back_to_default(self) -> None:
-        self.assertEqual(
-            logging_setup.resolve_full_log_file(True, "  "),
-            pathlib.Path(logging_setup.DEFAULT_FULL_LOG_FILE),
-        )
+    def test_submitter_only_filehandler_redirect_retired(self) -> None:
+        # The submitter-only Python full-log FileHandler redirect is replaced
+        # by the general per-role Python->tracing bridge; its symbols must be
+        # gone so no caller resurrects the special-case.
+        for retired in (
+            "resolve_full_log_file",
+            "_redirect_python_logs_to_full_log",
+            "DEFAULT_FULL_LOG_FILE",
+        ):
+            self.assertFalse(
+                hasattr(logging_setup, retired),
+                f"retired submitter-only redirect symbol still present: {retired}",
+            )
 
 
 class ResolveFullLogDirTests(unittest.TestCase):
@@ -216,6 +207,12 @@ class _RootLoggerSandbox(unittest.TestCase):
         pkg = sys.modules["dynamic_runner"]
         self._saved_init = getattr(pkg, "init_logging", None)
         pkg.init_logging = lambda **kw: self.init_calls.append(kw)
+        # Stub the native py_log the bridge handler forwards to
+        # (`_install_tracing_bridge` does `from . import py_log`). Record
+        # forwarded records so tests can assert the Python->tracing bridge.
+        self.py_log_calls: list[tuple] = []
+        self._saved_py_log = getattr(pkg, "py_log", None)
+        pkg.py_log = lambda *a: self.py_log_calls.append(a)
 
     def tearDown(self) -> None:
         root = logging.getLogger()
@@ -234,6 +231,11 @@ class _RootLoggerSandbox(unittest.TestCase):
                 del pkg.init_logging
         else:
             pkg.init_logging = self._saved_init
+        if self._saved_py_log is None:
+            if hasattr(pkg, "py_log"):
+                del pkg.py_log
+        else:
+            pkg.py_log = self._saved_py_log
 
 
 class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
@@ -267,22 +269,15 @@ class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
         # effect (the mechanism is purely parametric now).
         snapshot = dict(os.environ)
         logging_setup.setup_logging(_parse(["--important-stdio-only"]))
-        try:
-            self.assertEqual(len(self.init_calls), 1)
-            self.assertTrue(self.init_calls[0]["important_stdio_only"])
-            # No DYNRUNNER_* logging env var appeared.
-            new_dynrunner = {
-                k for k in os.environ if k.startswith("DYNRUNNER_") and k not in snapshot
-            }
-            self.assertEqual(
-                new_dynrunner, set(), f"setup_logging leaked env vars: {new_dynrunner}"
-            )
-        finally:
-            for h in self._file_handlers():
-                h.close()
-            stray = pathlib.Path(logging_setup.DEFAULT_FULL_LOG_FILE)
-            if stray.exists():
-                stray.unlink()
+        self.assertEqual(len(self.init_calls), 1)
+        self.assertTrue(self.init_calls[0]["important_stdio_only"])
+        # No DYNRUNNER_* logging env var appeared.
+        new_dynrunner = {
+            k for k in os.environ if k.startswith("DYNRUNNER_") and k not in snapshot
+        }
+        self.assertEqual(
+            new_dynrunner, set(), f"setup_logging leaked env vars: {new_dynrunner}"
+        )
 
     def test_full_log_dir_forwarded_to_init_logging(self) -> None:
         # The per-role-log feature is wired via the forwarded --full-log-dir
@@ -293,15 +288,12 @@ class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
         )
         self.assertEqual(self.init_calls[0]["full_log_dir"], "/app/log/sec-0")
 
-    def _file_handlers(self):
-        return [
-            h
-            for h in logging.getLogger().handlers
-            if isinstance(h, logging.FileHandler)
-        ]
-
 
 class PythonLoggingReconfigTests(_RootLoggerSandbox):
+    """The Python side bridges its records into Rust tracing for ALL roles
+    (the general per-role mechanism replacing the submitter-only FileHandler
+    redirect), and additionally drops the console handler in importance mode."""
+
     def _file_handlers(self):
         return [
             h
@@ -317,49 +309,68 @@ class PythonLoggingReconfigTests(_RootLoggerSandbox):
             and not isinstance(h, logging.FileHandler)
         ]
 
-    def test_flag_off_keeps_console_no_file(self) -> None:
+    def _bridge_handlers(self):
+        return [
+            h
+            for h in logging.getLogger().handlers
+            if isinstance(h, logging_setup._TracingBridgeHandler)
+        ]
+
+    def test_flag_off_installs_bridge_keeps_console_no_file(self) -> None:
         logging_setup.setup_logging(_parse(["--debug"]))
+        self.assertEqual(
+            len(self._bridge_handlers()),
+            1,
+            "flag off must STILL install the per-role tracing bridge",
+        )
         self.assertTrue(
             self._bare_stream_handlers(),
             "flag off must keep the console StreamHandler",
         )
         self.assertFalse(
-            self._file_handlers(), "flag off must NOT add a full-log FileHandler"
+            self._file_handlers(),
+            "the submitter-only full-log FileHandler is retired — none must appear",
         )
 
-    def test_flag_on_removes_console_adds_file(self) -> None:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as d:
-            full_log = pathlib.Path(d) / "full.log"
-            logging_setup.setup_logging(
-                _parse(["--important-stdio-only", "--full-log-file", str(full_log)])
-            )
-            self.assertFalse(
-                self._bare_stream_handlers(),
-                "flag on must drop the console StreamHandler",
-            )
-            file_handlers = self._file_handlers()
-            self.assertEqual(len(file_handlers), 1)
-            self.assertEqual(
-                pathlib.Path(file_handlers[0].baseFilename), full_log.resolve()
-            )
-
-    def test_flag_on_file_handler_uses_default_path(self) -> None:
+    def test_flag_on_installs_bridge_removes_console_no_file(self) -> None:
         logging_setup.setup_logging(_parse(["--important-stdio-only"]))
-        try:
-            file_handlers = self._file_handlers()
-            self.assertEqual(len(file_handlers), 1)
-            self.assertEqual(
-                pathlib.Path(file_handlers[0].baseFilename),
-                pathlib.Path(logging_setup.DEFAULT_FULL_LOG_FILE).resolve(),
-            )
-        finally:
-            for h in self._file_handlers():
-                h.close()
-            stray = pathlib.Path(logging_setup.DEFAULT_FULL_LOG_FILE)
-            if stray.exists():
-                stray.unlink()
+        self.assertEqual(
+            len(self._bridge_handlers()),
+            1,
+            "importance mode must install the per-role tracing bridge",
+        )
+        self.assertFalse(
+            self._bare_stream_handlers(),
+            "flag on must drop the console StreamHandler",
+        )
+        self.assertFalse(
+            self._file_handlers(),
+            "the FileHandler redirect is replaced by the bridge — none must appear",
+        )
+
+    def test_bridge_forwards_record_via_py_log(self) -> None:
+        # The bridge's whole job: a Python record reaches the native `py_log`
+        # (level name, logger name, rendered message). This is the Python end
+        # of the Python->tracing bridge; the Rust side routes it to the
+        # per-role file by the run future's role span.
+        logging_setup.setup_logging(_parse(["--debug"]))
+        logging.getLogger("consumer.task").warning("phase complete: %d", 7)
+        self.assertTrue(self.py_log_calls, "bridge did not forward to py_log")
+        level, name, message = self.py_log_calls[-1]
+        self.assertEqual(level, "WARNING")
+        self.assertEqual(name, "consumer.task")
+        self.assertEqual(message, "phase complete: 7")
+
+    def test_bridge_install_is_idempotent(self) -> None:
+        # A re-entrant setup_logging (respawn / cli_main-then-run) must not
+        # stack duplicate bridges.
+        logging_setup.setup_logging(_parse([]))
+        logging_setup.setup_logging(_parse([]))
+        self.assertEqual(
+            len(self._bridge_handlers()),
+            1,
+            "re-running setup_logging stacked duplicate bridge handlers",
+        )
 
 
 if __name__ == "__main__":

@@ -59,6 +59,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // force the config to be read from the environment before argparse runs
     // — the exact import-time coupling this surface removes.
     m.add_function(wrap_pyfunction!(logging::py_init_logging, m)?)?;
+    // The Python→tracing bridge: a `logging.Handler` installed by
+    // `logging_setup.setup_logging` forwards every consumer Python record
+    // here so it lands in the per-role full-log file via the role span (see
+    // `crate::logging::py_log`).
+    m.add_function(wrap_pyfunction!(logging::py_log, m)?)?;
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;
