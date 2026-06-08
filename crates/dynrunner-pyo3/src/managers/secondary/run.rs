@@ -17,7 +17,7 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, PromotedPrimary, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -285,6 +285,14 @@ impl PySecondaryCoordinator {
                 // peer mesh; the secondary's `can_be_primary` marker
                 // reads `is_some()`. See `MeshSendHandle`.
                 let mesh_send_handle = mesh_bundle.mesh_send;
+                // Pillar 1 (mesh-always): a network secondary ALWAYS holds a
+                // peer mesh, so it is always primary-capable. The previous
+                // `mesh_send_handle.is_some()` advertisement keyed capability
+                // off mesh presence — now an invariant, not a runtime branch.
+                debug_assert!(
+                    mesh_send_handle.is_some(),
+                    "mesh-always: a network secondary must always hold a peer mesh"
+                );
 
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
@@ -307,14 +315,18 @@ impl PySecondaryCoordinator {
                         dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                     unconfigured_deadline: dist_unconfigured_deadline,
                     // Primary-capability marker (twin of the wire `is_observer`
-                    // role advertisement): a
-                    // compute secondary can host the primary ON DEMAND iff
-                    // a peer mesh is present (`mesh_send_handle`), so
-                    // it can construct a `PrimaryCoordinator` when named.
-                    // Advertised in the
-                    // `SecondaryWelcome`; recorded in the replicated
-                    // `RoleTable.can_be_primary` the submitter reads.
-                    can_be_primary: mesh_send_handle.is_some(),
+                    // role advertisement): a network compute secondary can host
+                    // the primary ON DEMAND — under mesh-always (pillar 1) it
+                    // ALWAYS holds a peer mesh, so it can always construct a
+                    // `PrimaryCoordinator` when named. Constant `true`
+                    // (the `debug_assert!(mesh_send_handle.is_some())` above
+                    // pins the invariant the old `is_some()` branch read).
+                    // Advertised in the `SecondaryWelcome`; recorded in the
+                    // replicated `RoleTable.can_be_primary` the submitter reads.
+                    // Only OBSERVERS (and the in-process same-host secondary,
+                    // built separately in the distributed manager) advertise
+                    // `false`.
+                    can_be_primary: true,
                     resource_check_interval: dist_resource_check_interval,
                     log_oom_watcher: dist_log_oom_watcher,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
@@ -690,6 +702,10 @@ fn build_promoted_primary_recipe(
             client,
             inbox,
             demote_rx,
+            // A promotion-built primary: this host won the role on failover
+            // and IS a compute peer — it must STAY local, never relocate
+            // again (relocation is the BOOTSTRAP submitter's tail only).
+            RelocationPolicy::StayLocal,
             scheduler_config.build_memory_scheduler(),
             estimator.clone(),
         );

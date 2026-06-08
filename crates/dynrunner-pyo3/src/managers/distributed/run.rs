@@ -12,7 +12,8 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, RunError, SecondaryConfig,
+    SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -238,6 +239,12 @@ impl PyDistributedManager {
         // the GIL-side tail (never the `Other` swallow). Same shape as
         // `PyPrimaryCoordinator::run`.
         let mut spawn_rejected: Option<RunError> = None;
+        // No-relocation-target config error. Structurally unreachable on this
+        // in-process path (the primary is built `RelocationPolicy::StayLocal`,
+        // so the bootstrap stays local and never selects a target), but the
+        // `RunError` match must be exhaustive; RAISES at the GIL-side tail if
+        // it ever occurs rather than silently swallowing.
+        let mut no_relocation_target: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -647,6 +654,11 @@ impl PyDistributedManager {
                     pri_client,
                     pri_inbox,
                     pri_demote_rx,
+                    // In-process `--multi-computer local`: the sole authority
+                    // stays local (every secondary joins `can_be_primary =
+                    // false`, so there is no eligible compute peer to relocate
+                    // to). Pillar 2 does not apply to the in-process path.
+                    RelocationPolicy::StayLocal,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
@@ -788,6 +800,12 @@ impl PyDistributedManager {
                             e @ RunError::SpawnRejected { .. } => {
                                 spawn_rejected = Some(e);
                             }
+                            e @ RunError::NoRelocationTarget => {
+                                // Unreachable on the in-process path
+                                // (RelocationPolicy::StayLocal); RAISE if it
+                                // ever occurs rather than silently swallow.
+                                no_relocation_target = Some(e);
+                            }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
                                 // (exit 0) — see `PyPrimaryCoordinator::run`.
@@ -846,6 +864,12 @@ impl PyDistributedManager {
             // A runtime spawn_tasks batch was wholesale-rejected → the phase
             // dispatched ZERO tasks. RAISE so the wrapper sees a non-zero
             // exit instead of the silent rc=0 that masked the dropped work.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = no_relocation_target {
+            // Defensive: unreachable on the in-process path (StayLocal), but
+            // RAISE rather than swallow if it ever surfaces.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

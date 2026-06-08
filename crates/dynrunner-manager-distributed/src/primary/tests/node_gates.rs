@@ -371,6 +371,7 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 pri_client,
                 pri_inbox,
                 demote_rx,
+                crate::primary::RelocationPolicy::StayLocal,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );

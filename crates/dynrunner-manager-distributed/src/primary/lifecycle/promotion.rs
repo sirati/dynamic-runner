@@ -198,4 +198,82 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         Ok(())
     }
+
+    /// Choose the compute peer this bootstrap primary relocates its role to.
+    ///
+    /// Single concern: the deterministic selection — the LOWEST-id member of
+    /// `alive_secondary_members() ∩ can_be_primary − observers`, computed off
+    /// this primary's replicated `cluster_state`, with this primary's own id
+    /// excluded defensively (the submitter advertises no worker capacity /
+    /// `can_be_primary = false`, so it is absent from the set anyway). A
+    /// peer is eligible iff it is an alive worker-secondary (worker_count > 0,
+    /// the structural exclusion of observers in `alive_secondary_members`)
+    /// that carries the explicit `RoleTable.can_be_primary` capability and is
+    /// NOT in the observers set. The `observers` filter is belt-and-suspenders
+    /// over the worker-capacity exclusion.
+    ///
+    /// `None` when there is no promotable compute peer; the caller
+    /// ([`Self::bootstrap_tail_dispatch`]'s relocate arm) maps that to a hard
+    /// [`crate::primary::RunError::NoRelocationTarget`] (pillar 2: the
+    /// submitter must never stay the run's primary).
+    pub(crate) fn select_relocation_target(&self) -> Option<String> {
+        let observers = &self.cluster_state.role_table().observers;
+        let own_id = self.config.node_id.as_str();
+        self.cluster_state
+            .alive_secondary_members()
+            .filter(|id| *id != own_id)
+            .filter(|id| !observers.contains(*id))
+            .filter(|id| self.cluster_state.can_be_primary(id))
+            .min()
+            .map(|id| id.to_string())
+    }
+
+    /// Hand the primary role to `chosen` by originating
+    /// `PrimaryChanged { new: chosen, epoch: primary_epoch()+1, reason:
+    /// Transferred }`.
+    ///
+    /// Single concern: the bootstrap-tail role TRANSFER origination. Modelled
+    /// on [`Self::originate_primary_changed`] (`new = self`) but with the
+    /// opposite intent — it names ANOTHER peer the primary, so it must NOT
+    /// set `primary_id = self` and must NOT self-keepalive (this host is
+    /// stepping DOWN, not asserting authority). The local apply of the
+    /// mutation advances `current_primary` to `chosen`; the role-change hook
+    /// installed by `register_demote_on_displaced` observes the self→other
+    /// flip and fires the demote signal, so `run_consuming` relocates this
+    /// coordinator by-value into a standalone observer
+    /// (`PrimaryRunOutcome::Relocated`). The fan-out reaches the chosen peer,
+    /// whose secondary self-names primary and fires its `PromotionSignal` —
+    /// the Node builds the snapshot-seeded promoted primary.
+    ///
+    /// # Convergence — `Transferred` is advisory; `chosen` is not asserted to win
+    ///
+    /// The `Transferred` reason is advisory routing metadata only: the
+    /// epoch-LWW register-adopt rule ("higher epoch wins; equal epoch →
+    /// lex-lower id wins") in `apply.rs` is reason-blind. So this origination
+    /// MUST tolerate the `RoleTable` converging on a DIFFERENT (lex-lower)
+    /// successor than `chosen`: a concurrent failover election at the SAME
+    /// `epoch+1` can win the equal-epoch lex tiebreak, making this local
+    /// `PrimaryChanged { chosen }` apply a NoOp. That is correct + convergent
+    /// — the hook still fires (on the WINNING apply, which names winner ≠
+    /// self), so the submitter still demotes, just toward the winner rather
+    /// than `chosen`. This method deliberately adds NO logic asserting
+    /// `chosen` won; it only originates the handoff intent.
+    pub(crate) async fn relocate_primary_to(&mut self, chosen: String) {
+        let epoch = self.cluster_state.primary_epoch() + 1;
+        tracing::info!(
+            target: super::super::important_events::IMPORTANT_TARGET,
+            chosen = %chosen,
+            epoch,
+            "relocating primary role to compute peer (bootstrap handoff)"
+        );
+        self.apply_and_broadcast_cluster_mutations(vec![
+            dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+                new: chosen,
+                epoch,
+                reason:
+                    dynrunner_protocol_primary_secondary::PrimaryChangeReason::Transferred,
+            },
+        ])
+        .await;
+    }
 }

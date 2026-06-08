@@ -316,11 +316,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     peer_id: secondary_id.clone(),
                     is_observer,
                     // The connecting secondary advertised its own
-                    // primary-capability in the `SecondaryWelcome` (an
-                    // overlay-enabled compute secondary ⇒ true; a no-mesh
-                    // host / observer ⇒ false). Record that truth in the
-                    // replicated `RoleTable.can_be_primary` so the
-                    // bootstrap-promotion selection reads the explicit marker.
+                    // primary-capability in the `SecondaryWelcome` (under
+                    // mesh-always a network compute secondary ⇒ true; only an
+                    // observer / the in-process same-host secondary ⇒ false).
+                    // Record that truth in the replicated
+                    // `RoleTable.can_be_primary` so the bootstrap-relocation /
+                    // promotion selection reads the explicit marker.
                     can_be_primary,
                     // Stamped at the origination choke point
                     // (`apply_locally_for_broadcast` → `stamp_versions`).

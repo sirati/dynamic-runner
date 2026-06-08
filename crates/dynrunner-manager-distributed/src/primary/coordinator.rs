@@ -276,6 +276,38 @@ impl<I: Identifier> std::fmt::Debug for PrimaryRunOutcome<I> {
     }
 }
 
+/// Construction-time discriminator for the bootstrap tail: does this
+/// coordinator, on reaching the end of `run_pipeline`, hand the primary role
+/// to a compute peer, or run the operational loop in-place?
+///
+/// One concern: the bootstrap-tail action — pillar 2 of mesh-always (the
+/// primary always runs on a compute peer, never the submitter). It is a
+/// STABLE construction-time property derived from the launch TOPOLOGY, not a
+/// runtime read of cluster shape: the SLURM/network submitter is built
+/// [`RelocationPolicy::RelocateToComputePeer`] (it must never stay the run's
+/// primary), the in-process `--multi-computer local` path and a
+/// promotion-built primary are built [`RelocationPolicy::StayLocal`]. Pinned
+/// to the construction site so the choice is the same on every tick and is
+/// auditable from the `new(..)` call, never the live roster.
+///
+/// Deliberately ORTHOGONAL to the `demote_rx` wire: that wire carries a
+/// runtime loss-of-primacy signal (failover-demote, a DIFFERENT concern);
+/// the relocate-vs-stay choice is keyed off this typed policy, never off
+/// `demote_tx` liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelocationPolicy {
+    /// Bootstrap-tail RELOCATE: select the lowest-id eligible compute peer
+    /// and originate `PrimaryChanged { Transferred }` to hand the role over
+    /// (the submitter then demotes to a standalone observer). An empty
+    /// candidate set is a hard [`RunError::NoRelocationTarget`].
+    RelocateToComputePeer,
+    /// Bootstrap-tail STAY-LOCAL: activate THIS node as the local primary and
+    /// run the operational loop in-place. The legitimate single-machine /
+    /// in-process path, and the promotion-built primary (already a compute
+    /// peer that won the role — it must NOT relocate again).
+    StayLocal,
+}
+
 /// The primary coordinator: orchestrates work across secondaries.
 ///
 /// Holds a [`crate::process::MeshClient`] (egress) + a
@@ -703,6 +735,14 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// demote source is wired (the `select!` arm parks forever then).
     pub(super) demote_rx: Option<tokio_mpsc::UnboundedReceiver<()>>,
 
+    /// Construction-time bootstrap-tail policy (pillar 2). Read once by
+    /// [`Self::bootstrap_tail_dispatch`] at the end of `run_pipeline` to
+    /// decide RELOCATE-to-a-compute-peer vs STAY-LOCAL. A stable topology-
+    /// derived property set by the construction site, NOT a runtime cluster
+    /// read; orthogonal to `demote_rx` (failover-demote is a different
+    /// concern). See [`RelocationPolicy`].
+    pub(super) relocation_policy: RelocationPolicy,
+
     /// Set by the panik arm in the operational `select!` loop when
     /// the watcher signal fires. Carries the (matched_path, reason)
     /// pair the panik handler produced.
@@ -814,6 +854,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         client: crate::process::MeshClient<I>,
         inbox: crate::process::RoleInbox<I>,
         demote_rx: tokio_mpsc::UnboundedReceiver<()>,
+        relocation_policy: RelocationPolicy,
         scheduler: S,
         estimator: E,
     ) -> Self {
@@ -913,6 +954,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 preferred_secondaries::PreferredSecondariesValidator::new(),
             panik_signal_rx: None,
             demote_rx: Some(demote_rx),
+            relocation_policy,
             panik_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
@@ -2765,16 +2807,72 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             "initial setup done",
         );
 
-        // Bootstrap tail: activate THIS node as the local primary
-        // (originates its first self-announce at epoch 1, warms the role
-        // cache, emits a keepalive), then run the shared
-        // operational-loop-and-finalize tail to completion in-place.
+        // Bootstrap tail (pillar 2): RELOCATE the primary role to a compute
+        // peer, or — on the legitimate single-machine / in-process / promoted
+        // path — STAY LOCAL and run the operational loop in-place. The fork
+        // is the typed `self.relocation_policy`, not a runtime cluster read,
+        // and is extracted into its own named tail so this 300+-line pipeline
+        // god-function does not grow the fork inline.
         //
         // `wait_for_mesh_ready` above already held until the peer mesh
-        // settled, so the `PrimaryChanged` self-announce warms each
-        // replica's role cache to a real connection.
-        self.activate_local_primary().await?;
-        self.run_operational_and_finalize(total).await
+        // settled, so both arms (the relocate `PrimaryChanged { Transferred }`
+        // and the stay-local self-announce) warm each replica's role cache to
+        // a real connection.
+        self.bootstrap_tail_dispatch(total).await
+    }
+
+    /// Bootstrap-tail fork (pillar 2): hand the primary role to a compute peer
+    /// or run it in-place, chosen by the construction-time
+    /// [`Self::relocation_policy`].
+    ///
+    /// One concern: dispatch the bootstrap tail. The two arms are mutually
+    /// exclusive futures over the SAME run state — there is no shared
+    /// post-fork code, so the typed policy match is the whole body (NOT a flag
+    /// `if` threaded through a common tail).
+    ///
+    /// * [`RelocationPolicy::StayLocal`] — activate THIS node as the local
+    ///   primary (originates its first self-announce at epoch 1, warms the
+    ///   role cache, emits a keepalive), then run the shared
+    ///   operational-loop-and-finalize tail to completion in-place.
+    /// * [`RelocationPolicy::RelocateToComputePeer`] — select the lowest-id
+    ///   eligible compute peer ([`Self::select_relocation_target`]; an empty
+    ///   candidate set is a hard [`RunError::NoRelocationTarget`]) and
+    ///   originate `PrimaryChanged { Transferred }`
+    ///   ([`Self::relocate_primary_to`]). That mutation's LOCAL apply fires
+    ///   this coordinator's demote hook (the table now names target ≠ self),
+    ///   which makes `run_consuming`'s demote arm ready. We then PARK on
+    ///   `pending()`: the only exit from the pipeline future is now the demote
+    ///   arm, which wins the `run_consuming` `select!`, destructures `self`
+    ///   into an observer handoff, and returns `PrimaryRunOutcome::Relocated`.
+    ///   Returning `Ok(())` here instead would let the `select!` see the
+    ///   pipeline as COMPLETED (not demoted), wrongly keeping the setup
+    ///   `Local`; parking is what guarantees the demote arm wins. The setup
+    ///   does NOT run the operational loop — that authority now lives on the
+    ///   promoted peer.
+    pub(crate) async fn bootstrap_tail_dispatch(&mut self, total: usize) -> Result<(), RunError> {
+        match self.relocation_policy {
+            RelocationPolicy::StayLocal => {
+                self.activate_local_primary().await?;
+                self.run_operational_and_finalize(total).await
+            }
+            RelocationPolicy::RelocateToComputePeer => {
+                // The submitter must NEVER stay the run's primary (pillar 2),
+                // so an empty candidate set is an unsupported/degenerate
+                // topology — surface a hard structured error rather than
+                // silently staying local.
+                let Some(chosen) = self.select_relocation_target() else {
+                    return Err(RunError::NoRelocationTarget);
+                };
+                self.relocate_primary_to(chosen).await;
+                // Park: the demote hook fired by the relocate's local apply
+                // makes the demote arm the only way out of the pipeline
+                // future. `pending()` never resolves; the demote arm cancels
+                // this future and rides the existing chain to
+                // `PrimaryRunOutcome::Relocated`.
+                std::future::pending::<()>().await;
+                unreachable!("relocate bootstrap future is cancelled by the demote arm");
+            }
+        }
     }
 
     /// Shared operational-loop-and-finalize tail. The single mechanism

@@ -651,11 +651,47 @@ where
     S: Scheduler<TestId> + 'static,
     E: ResourceEstimator<TestId> + 'static,
 {
+    // The shared default: tests bootstrap a LOCAL primary (the relocate path
+    // is exercised by the dedicated unit tests that call
+    // `select_relocation_target` / `relocate_primary_to` directly, and the
+    // single policy-routing test, which use `build_test_primary_with_policy`).
+    build_test_primary_with_policy(
+        config,
+        transport,
+        crate::primary::RelocationPolicy::StayLocal,
+        scheduler,
+        estimator,
+    )
+}
+
+/// As [`build_test_primary`] but with an explicit bootstrap-tail
+/// [`crate::primary::RelocationPolicy`]. The single construction choke point
+/// for the rare test that needs a `RelocateToComputePeer` coordinator;
+/// `build_test_primary` delegates here with `StayLocal`.
+pub(super) fn build_test_primary_with_policy<S, E>(
+    config: PrimaryConfig,
+    transport: ChannelPeerTransport<TestId>,
+    relocation_policy: crate::primary::RelocationPolicy,
+    scheduler: S,
+    estimator: E,
+) -> (PrimaryCoordinator<S, E, TestId>, PrimaryMeshKeepalive)
+where
+    S: Scheduler<TestId> + 'static,
+    E: ResourceEstimator<TestId> + 'static,
+{
     let mut mesh = Mesh::new(transport);
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
     let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
-    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    let primary = PrimaryCoordinator::new(
+        config,
+        client,
+        inbox,
+        demote_rx,
+        relocation_policy,
+        scheduler,
+        estimator,
+    );
     // Publish live membership before the pump spawns so the primary's
     // failover/strand reads see the connected secondaries from the first tick
     // (the pump republishes every cycle thereafter).

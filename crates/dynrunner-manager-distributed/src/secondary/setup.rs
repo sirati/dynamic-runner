@@ -122,12 +122,13 @@ where
             // advertises `true` on its own join path), so this is a
             // constant `false`.
             is_observer: false,
-            // Advertise primary-capability (twin of `is_observer`): an
-            // overlay-enabled compute secondary that can host the primary
-            // role declares `true`, so the bootstrap-promotion selection
-            // may move authority to it. A no-mesh / observer host declares
-            // `false` and the submitter stays primary. The primary records
-            // this in the replicated
+            // Advertise primary-capability (twin of `is_observer`): under
+            // mesh-always (pillar 1) a network compute secondary always holds
+            // a peer mesh, so it declares `true` and the bootstrap-relocation /
+            // promotion selection may move authority to it. Only an observer
+            // host (or the in-process same-host secondary, which has no
+            // peer-to-peer mesh) declares `false` so the submitter stays
+            // primary. The primary records this in the replicated
             // `RoleTable.can_be_primary` via the `PeerJoined` it
             // originates on welcome-accept.
             can_be_primary: self.config.can_be_primary,
