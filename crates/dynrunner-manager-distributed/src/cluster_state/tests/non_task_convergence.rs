@@ -131,6 +131,142 @@ fn bilateral_equal_epoch_convergence_one_round() {
     assert!(!b.digest().is_behind(&a.digest()));
 }
 
+// ── CRD-2 / D-P: relocate-vs-failover compose convergence (Phase 6b) ──
+
+/// Phase 6b — same apply path, reason-BLIND. Relocation
+/// (`PrimaryChanged{Transferred}`) and failover (`PrimaryChanged{Election}`)
+/// move `current_primary` through the IDENTICAL epoch-LWW
+/// `primary_register_adopt` rule: the `reason` is advisory routing metadata
+/// only and is never read by the adopt rule. So at any fixed `(epoch, id)`,
+/// SWAPPING the reason cannot change which id the register holds — the
+/// epoch-LWW + equal-epoch lex tiebreak alone decide. Drive a representative
+/// matrix (lower-then-higher, higher-then-lower, higher-epoch override) on
+/// two replicas that differ ONLY in the reason stamped on each mutation; the
+/// two replicas must end on the byte-identical primary register every time.
+#[test]
+fn relocate_and_failover_share_reason_blind_apply_path() {
+    use dynrunner_protocol_primary_secondary::PrimaryChangeReason::{Election, Transferred};
+
+    // One mutation as (id, epoch); the reason is supplied per-replica so the
+    // ONLY difference between the two replicas is the advisory reason field.
+    let script: &[(&str, u64)] = &[
+        ("sec-z", 5), // initial primary at epoch 5
+        ("sec-a", 5), // equal-epoch lex-lower → adopts
+        ("sec-z", 5), // equal-epoch lex-higher → NoOp (no regress)
+        ("sec-m", 6), // higher epoch → overrides regardless of id ordering
+        ("sec-a", 6), // equal-epoch lex-lower than sec-m → adopts
+    ];
+
+    // Replica T stamps EVERY mutation `Transferred` (the relocate reason);
+    // replica E stamps EVERY mutation `Election` (the failover reason).
+    let run = |reason| {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let mut outcomes = Vec::new();
+        for (id, epoch) in script {
+            outcomes.push(s.apply(ClusterMutation::PrimaryChanged {
+                new: (*id).into(),
+                epoch: *epoch,
+                reason,
+            }));
+        }
+        (s.current_primary().map(str::to_owned), s.primary_epoch(), outcomes)
+    };
+    let (prim_t, epoch_t, outcomes_t) = run(Transferred);
+    let (prim_e, epoch_e, outcomes_e) = run(Election);
+
+    // The per-step Applied/NoOp decisions are identical: the adopt rule never
+    // consulted the reason, so the relocate-reason and failover-reason
+    // replicas took the SAME branch at every step.
+    assert_eq!(
+        outcomes_t, outcomes_e,
+        "swapping the PrimaryChanged reason must not change any apply outcome \
+         (the epoch-LWW adopt rule is reason-blind)"
+    );
+    // And they converge on the byte-identical register: lex-lower sec-a at the
+    // highest epoch 6.
+    assert_eq!(prim_t.as_deref(), Some("sec-a"));
+    assert_eq!(prim_t, prim_e, "relocate and failover reasons name the same primary");
+    assert_eq!(epoch_t, 6);
+    assert_eq!(epoch_t, epoch_e, "relocate and failover reasons settle the same epoch");
+}
+
+/// Phase 6b — heal after a mid-run PARTITION. Two partitions each elect at the
+/// SAME new epoch E+1 with DIFFERENT ids, via DIFFERENT reasons (one relocate
+/// `Transferred`, one failover `Election`). While partitioned, each replica's
+/// register holds its own pick — a transient equal-epoch split. On heal,
+/// anti-entropy detects the divergence BILATERALLY (`is_behind` both ways at
+/// equal epoch with divergent identity), each side pulls the other's snapshot,
+/// and `restore`'s reason-blind `primary_register_adopt` converges BOTH onto
+/// the lex-lower id — the same id the election's `lowest_alive` `.min()` leader
+/// would name — in a single round, with no permanent split-brain. Exercises
+/// the real merge path (`digest`/`is_behind`/`snapshot`/`restore`), not a
+/// hand-asserted tiebreak.
+#[test]
+fn partition_relocate_vs_failover_heals_to_one_primary() {
+    use dynrunner_protocol_primary_secondary::PrimaryChangeReason::{Election, Transferred};
+
+    // Both partitions start from a shared pre-partition primary at epoch 7,
+    // so they each independently mint epoch 7+1 = 8 (the concurrency that
+    // collides at one epoch).
+    let mut p_reloc = ClusterState::<RunnerIdentifier>::new();
+    let mut p_fail = ClusterState::<RunnerIdentifier>::new();
+    for s in [&mut p_reloc, &mut p_fail] {
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-old".into(),
+            epoch: 7,
+            reason: Election,
+        });
+    }
+
+    // Partition A: a relocate hands authority to the lex-HIGHER `sec-9` at
+    // epoch 8 (Transferred — names a peer that is not the originator).
+    p_reloc.apply(ClusterMutation::PrimaryChanged {
+        new: "sec-9".into(),
+        epoch: 8,
+        reason: Transferred,
+    });
+    // Partition B: a failover election self-names the lex-LOWER `sec-0` at the
+    // SAME epoch 8 (Election — the self-announce shape).
+    p_fail.apply(ClusterMutation::PrimaryChanged {
+        new: "sec-0".into(),
+        epoch: 8,
+        reason: Election,
+    });
+    assert_eq!(p_reloc.current_primary(), Some("sec-9"));
+    assert_eq!(p_fail.current_primary(), Some("sec-0"));
+
+    // Heal: equal epoch (8 == 8), divergent identity → BOTH sides detect the
+    // split, so anti-entropy is bilateral (each pulls the other).
+    assert_eq!(p_reloc.digest().primary_epoch, p_fail.digest().primary_epoch);
+    assert!(p_reloc.digest().is_behind(&p_fail.digest()));
+    assert!(p_fail.digest().is_behind(&p_reloc.digest()));
+
+    // One anti-entropy round: each restores the other's snapshot. The
+    // reason-blind adopt rule converges BOTH on the lex-lower `sec-0`
+    // regardless of pull order (the relocate's Transferred does NOT pin sec-9).
+    let snap_reloc = p_reloc.snapshot();
+    let snap_fail = p_fail.snapshot();
+    p_reloc.restore(snap_fail);
+    p_fail.restore(snap_reloc);
+    assert_eq!(
+        p_reloc.current_primary(),
+        Some("sec-0"),
+        "the relocate partition heals onto the lex-lower failover winner \
+         (Transferred is advisory; the equal-epoch lex tiebreak decides)"
+    );
+    assert_eq!(p_fail.current_primary(), Some("sec-0"));
+    assert_eq!(
+        p_reloc.current_primary(),
+        p_fail.current_primary(),
+        "both partitions converge on ONE primary — no permanent split-brain"
+    );
+
+    // Quiesce: a second round pulls nothing (the lattice is at a fixpoint).
+    assert_eq!(p_reloc.digest(), p_fail.digest());
+    assert!(!p_reloc.digest().is_behind(&p_fail.digest()));
+    assert!(!p_fail.digest().is_behind(&p_reloc.digest()));
+}
+
 // ── CRD-3 / D-G: phase_deps deterministic merge ──
 
 fn deps(pairs: &[(&str, &[&str])]) -> HashMap<PhaseId, Vec<PhaseId>> {
