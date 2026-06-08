@@ -138,9 +138,17 @@ impl PyPrimaryCoordinator {
         let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
         );
-        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
-        );
+        // Honest on_phase_end: the closure records a consumer-hook raise
+        // into this latch; the SAME latch is installed on the coordinator
+        // (`set_phase_hook_raise_latch` below) so the phase cascade
+        // surfaces the raise as a non-zero `RunError::FatalPolicyExit`.
+        let phase_hook_raise_latch =
+            dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+            Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                self.task_definition.clone_ref(py),
+                phase_hook_raise_latch.clone(),
+            ));
 
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
@@ -429,6 +437,13 @@ impl PyPrimaryCoordinator {
                 // `PrimaryHandle` Python is holding talks to the same
                 // receiver the operational loop reads from.
                 primary.replace_command_channel(command_tx, command_rx);
+
+                // Wire the on_phase_end raise-latch (built above and
+                // captured by the closure) onto the coordinator BEFORE
+                // `run()` enters, so the phase cascade reads a recorded
+                // consumer-hook raise and surfaces `FatalPolicyExit`. Same
+                // pre-run-setter contract as the registrations below.
+                primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
 
                 // Relay the SLURM-pipeline-parked deployment-mode job
                 // manager onto the inner coordinator BEFORE `run()`

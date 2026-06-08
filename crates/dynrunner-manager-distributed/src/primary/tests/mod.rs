@@ -27,6 +27,7 @@ mod initial_assignment;
 mod node_gates;
 mod oom_bucket;
 mod phase_decision;
+mod phase_end_raise;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;

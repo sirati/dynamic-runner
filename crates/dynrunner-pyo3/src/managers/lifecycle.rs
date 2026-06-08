@@ -8,10 +8,17 @@
 //! single-source them here.
 //!
 //! Error policy:
-//! - `on_phase_start` / `on_phase_end` exceptions log and continue.
-//!   Phase boundaries are not the place to surface fatal errors;
-//!   exceptions out of the consumer's hook are a consumer bug, not a
-//!   reason to abort an in-flight pool drain.
+//! - `on_phase_start` exceptions log and continue. Phase-start is a
+//!   narration hook; a raise there is a consumer bug, not a reason to
+//!   abort an in-flight pool drain.
+//! - `on_phase_end` exceptions log AND record into a shared
+//!   [`PhaseHookRaiseLatch`] the closure captures. A consumer
+//!   `on_phase_end` raise is a deliberate policy abort: the real-primary
+//!   paths wire a latch the coordinator reads (it surfaces a non-zero
+//!   `RunError::FatalPolicyExit`); the local-manager / secondary / test
+//!   paths build the closure against a detached latch nobody reads, so
+//!   those keep the legacy warn-and-continue. The closure's `()` return
+//!   is unchanged either way — the latch is the side-channel.
 //! - `on_run_start` exceptions abort the run (see
 //!   `run::run_local`/`run_primary`/`run_distributed`): the consumer's
 //!   setup hasn't completed; dispatching items would race with
@@ -23,6 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use dynrunner_core::PhaseId;
+use dynrunner_manager_distributed::PhaseHookRaiseLatch;
 
 /// Boxed `on_phase_start` callback shape callers wire into the
 /// manager run loop.
@@ -92,6 +100,39 @@ pub(crate) fn make_on_phase_end(
 ) -> impl FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>)
 + Send
 + 'static {
+    // Warn-and-continue paths (local manager, secondary, tests): build
+    // against a detached latch the coordinator never reads. A raise is
+    // logged and recorded into a latch nobody consumes — behaviourally
+    // identical to the legacy swallow.
+    make_on_phase_end_core(task_definition, PhaseHookRaiseLatch::detached())
+}
+
+/// Like [`make_on_phase_end`], but the closure records a raised
+/// `on_phase_end` into the supplied [`PhaseHookRaiseLatch`]. The
+/// real-primary paths install the SAME latch on the coordinator via
+/// `PrimaryCoordinator::set_phase_hook_raise_latch`, so the phase
+/// cascade reads the recorded raise and surfaces a non-zero
+/// `RunError::FatalPolicyExit` instead of warn-and-continue.
+pub(crate) fn make_on_phase_end_with_raise_latch(
+    task_definition: Py<PyAny>,
+    raise_latch: PhaseHookRaiseLatch,
+) -> impl FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>)
++ Send
++ 'static {
+    make_on_phase_end_core(task_definition, raise_latch)
+}
+
+/// The single-sourced `on_phase_end` closure body, parameterised by the
+/// raise sink. BOTH the kwarg-call arm and the legacy positional-only
+/// fallback arm route a raise through the SAME `record_raise` helper, so
+/// there is one classification of "the hook raised" regardless of which
+/// call shape produced it.
+fn make_on_phase_end_core(
+    task_definition: Py<PyAny>,
+    raise_latch: PhaseHookRaiseLatch,
+) -> impl FnMut(&PhaseId, u32, u32, &std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>)
++ Send
++ 'static {
     move |phase_id: &PhaseId,
           completed: u32,
           failed: u32,
@@ -99,6 +140,21 @@ pub(crate) fn make_on_phase_end(
         Python::attach(|py| {
             let task = task_definition.bind(py);
             let positional = (phase_id.as_str(), completed, failed);
+            // Log the raise AND record it into the shared latch. The warn
+            // is unchanged from the legacy path; the `record` is the
+            // side-channel the real-primary cascade reads to surface a
+            // fatal run failure. First-raise-wins is enforced by the
+            // latch itself.
+            let record_raise = |e: &PyErr| {
+                tracing::warn!(
+                    error = %e,
+                    phase = %phase_id,
+                    completed,
+                    failed,
+                    "TaskDefinition.on_phase_end raised"
+                );
+                raise_latch.record(e.value(py).to_string());
+            };
             // Serialise the phase outputs to the wire-canonical JSON and
             // decode into a Python object GIL-side, so the consumer reads
             // the same `{task_id: {key: {"kind","value"}}}` dict shape a
@@ -129,11 +185,7 @@ pub(crate) fn make_on_phase_end(
                      calling positional-only"
                 );
                 if let Err(e) = task.call_method1("on_phase_end", positional) {
-                    tracing::warn!(
-                        error = %e,
-                        phase = %phase_id,
-                        "TaskDefinition.on_phase_end raised; continuing"
-                    );
+                    record_raise(&e);
                 }
                 return;
             }
@@ -141,27 +193,19 @@ pub(crate) fn make_on_phase_end(
                 Ok(_) => {}
                 // Legacy signature without the kwarg: the arg-binder
                 // rejected the call BEFORE the body ran, so retrying
-                // positional-only is safe (no double-execution).
+                // positional-only is safe (no double-execution). A raise
+                // from the retried (real) call routes through the SAME
+                // `record_raise` as the kwarg arm.
                 Err(e)
                     if e.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
                         && e.value(py).to_string().contains("phase_outputs") =>
                 {
                     if let Err(e2) = task.call_method1("on_phase_end", positional) {
-                        tracing::warn!(
-                            error = %e2,
-                            phase = %phase_id,
-                            "TaskDefinition.on_phase_end raised; continuing"
-                        );
+                        record_raise(&e2);
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        phase = %phase_id,
-                        completed,
-                        failed,
-                        "TaskDefinition.on_phase_end raised; continuing"
-                    );
+                    record_raise(&e);
                 }
             }
         });
@@ -503,5 +547,77 @@ mod tests {
                 "the body runs exactly once after the kwarg-binding TypeError",
             );
         });
+    }
+
+    /// Honest on_phase_end (Phase 6c): a MODERN-signature
+    /// `on_phase_end(self, ..., *, phase_outputs=None)` that RAISES from
+    /// its body records the raise into the wired latch (the side-channel
+    /// the real-primary cascade reads to surface
+    /// `RunError::FatalPolicyExit`). The closure's `()` return is
+    /// unchanged.
+    #[test]
+    fn make_on_phase_end_records_modern_signature_raise_into_latch() {
+        let (task_obj, _globals) = make_task(
+            "def on_phase_end(self, phase_id, completed, failed, *, phase_outputs=None):\n        \
+                 raise RuntimeError('modern hook boom')",
+        );
+        let empty: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs> =
+            std::collections::BTreeMap::new();
+        let latch = PhaseHookRaiseLatch::new();
+        let mut cb = make_on_phase_end_with_raise_latch(task_obj, latch.clone());
+        cb(&PhaseId::from("p0"), 1, 0, &empty);
+
+        let recorded = latch.take().expect("modern-signature raise must be recorded");
+        assert!(
+            recorded.contains("modern hook boom"),
+            "the recorded reason carries the consumer exception text; got: {recorded}"
+        );
+    }
+
+    /// Honest on_phase_end (Phase 6c): a LEGACY-signature
+    /// `on_phase_end(self, phase_id, completed, failed)` (no
+    /// `phase_outputs`) that RAISES from its body records the raise into
+    /// the latch via the SAME `record_raise` path — the positional-only
+    /// retry arm routes a body-raise identically to the modern kwarg arm.
+    /// (The kwarg-binding `TypeError` that triggers the legacy fallback
+    /// is NOT itself recorded as a raise — only the retried real call's
+    /// raise is.)
+    #[test]
+    fn make_on_phase_end_records_legacy_signature_raise_into_latch() {
+        let (task_obj, _globals) = make_task(
+            "def on_phase_end(self, phase_id, completed, failed):\n        \
+                 raise RuntimeError('legacy hook boom')",
+        );
+        let empty: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs> =
+            std::collections::BTreeMap::new();
+        let latch = PhaseHookRaiseLatch::new();
+        let mut cb = make_on_phase_end_with_raise_latch(task_obj, latch.clone());
+        cb(&PhaseId::from("p0"), 2, 1, &empty);
+
+        let recorded = latch.take().expect("legacy-signature raise must be recorded");
+        assert!(
+            recorded.contains("legacy hook boom"),
+            "the legacy positional-only retry arm records the body raise; got: {recorded}"
+        );
+    }
+
+    /// Control: a non-raising `on_phase_end` leaves the latch empty — the
+    /// fatal path is gated strictly on an actual raise.
+    #[test]
+    fn make_on_phase_end_leaves_latch_empty_when_hook_does_not_raise() {
+        let (task_obj, _globals) = make_task(
+            "def on_phase_end(self, phase_id, completed, failed, *, phase_outputs=None):\n        \
+                 pass",
+        );
+        let empty: std::collections::BTreeMap<String, dynrunner_core::TaskOutputs> =
+            std::collections::BTreeMap::new();
+        let latch = PhaseHookRaiseLatch::new();
+        let mut cb = make_on_phase_end_with_raise_latch(task_obj, latch.clone());
+        cb(&PhaseId::from("p0"), 1, 0, &empty);
+
+        assert!(
+            latch.take().is_none(),
+            "a non-raising on_phase_end must not record into the latch"
+        );
     }
 }

@@ -102,6 +102,36 @@ pub async fn drain_worker_signal_batch(
     Some(WorkerSignalBatch { signals })
 }
 
+/// Non-blocking drain: collect every signal CURRENTLY queued on `rx`
+/// into one batch WITHOUT awaiting the idle window (or anything at all).
+/// `Some(batch)` iff at least one signal was already queued; `None` when
+/// the channel was momentarily empty (or closed) — there is nothing to
+/// react to right now.
+///
+/// Why separate from [`drain_worker_signal_batch`]: that helper is the
+/// operational loop's PARKED arm — it blocks until a burst arrives and
+/// coalesces with a 50ms idle window. This helper is the SYNCHRONOUS
+/// completion-gate pre-drain: when the loop is about to declare the run
+/// complete, a `RunShouldFail` / `PolicyFatalExit` emitted onto the bus
+/// in the SAME iteration that finished the last task is already queued
+/// but has not yet been selected by the parked arm. Draining it here
+/// (with no idle wait) lets the loop observe the fatal break outcome
+/// before the clean-completion exit wins — without busy-waiting the 50ms
+/// window on the hot completion path.
+pub fn try_collect_worker_signal_batch(
+    rx: &mut UnboundedReceiver<WorkerMgmtSignal>,
+) -> Option<WorkerSignalBatch> {
+    let mut signals = Vec::new();
+    while let Ok(signal) = rx.try_recv() {
+        signals.push(signal);
+    }
+    if signals.is_empty() {
+        None
+    } else {
+        Some(WorkerSignalBatch { signals })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dynrunner_core::PhaseId;

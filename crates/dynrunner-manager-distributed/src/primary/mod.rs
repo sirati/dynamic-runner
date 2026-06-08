@@ -54,7 +54,7 @@ mod tests;
 pub use command_channel::{
     COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
-pub use config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
+pub use config::{OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
 pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome, RelocationPolicy};
 pub use error::RunError;
 

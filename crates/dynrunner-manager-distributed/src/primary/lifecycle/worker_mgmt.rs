@@ -17,8 +17,13 @@
 //!     none AND no fleet recovery is in progress or possible, the phase
 //!     can never make progress → escalate to a clean run failure.
 //!   - [`WorkerMgmtSignal::RunShouldFail`] → record the break outcome
+//!     (typed `RunError::Other`, the swallow-eligible generic failure)
 //!     so the operational loop exits and `run_pipeline` surfaces the
 //!     failure (the worker arm OWNS the clean-shutdown drive).
+//!   - [`WorkerMgmtSignal::PolicyFatalExit`] → identical break-outcome
+//!     mechanism, but the typed outcome is `RunError::FatalPolicyExit`
+//!     (the PyO3 boundary RAISES it, never swallows) — the consumer
+//!     `on_phase_end`-raise path.
 //!
 //! Each reaction runs against `&mut self` (worker-management state) from
 //! inside the operational `select!`, never on a spawned task, so the
@@ -27,7 +32,7 @@
 use dynrunner_core::Identifier;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use crate::primary::PrimaryCoordinator;
+use crate::primary::{PrimaryCoordinator, RunError};
 use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -56,7 +61,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.handle_phase_started_needs_workers(&phase, min);
                 }
                 WorkerMgmtSignal::RunShouldFail { reason } => {
-                    self.handle_run_should_fail(reason);
+                    // Generic run-should-fail wedge → the swallow-eligible
+                    // `Other` (the pre-existing stay-local-primary exit-0
+                    // behaviour the PyO3 boundary keeps for unexpected
+                    // generic failures).
+                    self.record_run_fail_outcome(RunError::Other(reason));
+                }
+                WorkerMgmtSignal::PolicyFatalExit { reason } => {
+                    // Consumer-/policy-driven fatal abort (e.g. an
+                    // `on_phase_end` hook raised) → the structured
+                    // `FatalPolicyExit` the PyO3 boundary RAISES on. Same
+                    // break-outcome latch + clean-shutdown drive as the
+                    // generic case; only the typed outcome differs.
+                    self.record_run_fail_outcome(RunError::FatalPolicyExit { reason });
                 }
             }
         }
@@ -146,20 +163,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
              none alive and no fleet recovery is in progress or possible"
         );
         tracing::error!(phase = %phase, min, "{reason}");
-        self.handle_run_should_fail(reason);
+        // The phase-floor liveness wedge is the generic run-should-fail
+        // class (swallow-eligible `Other`), same as the phase
+        // proceed-or-fail decision — NOT a consumer-policy fatal.
+        self.record_run_fail_outcome(RunError::Other(reason));
     }
 
-    /// Record the run-should-fail break outcome. Idempotent: the first
-    /// reason wins (a later signal in the same run does not overwrite
-    /// the originating cause). The operational loop reads
-    /// `worker_mgmt_fail_outcome.is_some()` at the top of its next
-    /// iteration and breaks; `run_pipeline` then surfaces the failure.
-    fn handle_run_should_fail(&mut self, reason: String) {
+    /// Record the run-fail break outcome as the TYPED `RunError` the run
+    /// should surface. Idempotent: the first outcome wins (a later
+    /// signal in the same run does not overwrite the originating cause).
+    /// The operational loop reads `worker_mgmt_fail_outcome.is_some()` at
+    /// the top of its next iteration and breaks; `run_pipeline` then
+    /// returns the recorded outcome verbatim. The signal-to-`RunError`
+    /// classification happens at the single call site in
+    /// `react_to_worker_signal_batch` (generic wedge → `Other`,
+    /// consumer-policy abort → `FatalPolicyExit`); this method is the one
+    /// latch-write both classes funnel through.
+    fn record_run_fail_outcome(&mut self, outcome: RunError) {
         if self.worker_mgmt_fail_outcome.is_some() {
             return;
         }
-        tracing::warn!(reason = %reason, "worker management: run should fail");
-        self.worker_mgmt_fail_outcome = Some(reason);
+        tracing::warn!(error = %outcome, "worker management: run should fail");
+        self.worker_mgmt_fail_outcome = Some(outcome);
     }
 
     /// Count of alive workers across the fleet. A worker is alive iff it

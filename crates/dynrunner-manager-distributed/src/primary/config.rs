@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use std::collections::BTreeMap;
@@ -29,6 +30,88 @@ pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
 /// the callback holds no borrow against the `&mut self` coordinator that
 /// fires it. It is empty for a phase whose tasks published nothing.
 pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &BTreeMap<String, TaskOutputs>) + Send>;
+
+/// A shared side-channel by which an [`OnPhaseEnd`] closure records that
+/// the consumer's phase-end hook RAISED, without changing the closure's
+/// `()` return.
+///
+/// Single concern: carry "the on_phase_end hook raised, with this
+/// reason" from the closure (which runs at the phase-lifecycle call site
+/// and is the only code that sees the raise) back to the coordinator
+/// that fired it. The coordinator reads (and clears) the latch
+/// immediately after invoking the closure; on a recorded raise it emits
+/// [`crate::worker_signal::WorkerMgmtSignal::PolicyFatalExit`] onto the
+/// decoupled worker-management bus — so the run surfaces a non-zero
+/// [`crate::primary::RunError::FatalPolicyExit`] instead of the old
+/// warn-and-continue false-green. The phase layer NEVER drives shutdown
+/// directly (the dispatch-decoupling law): it only records, then emits a
+/// signal the worker-management arm owns.
+///
+/// Why a shared latch rather than a callback-signature change: the
+/// `OnPhaseEnd` type is consumed by the local manager, the secondary,
+/// every test, and the promotion path; widening its return type ripples
+/// across all of them. A captured latch keeps the callback shape
+/// untouched — the consumer-hook closure (built in pyo3) captures one
+/// clone and `record`s a raise; the coordinator holds the other clone
+/// and `take`s it. Callers that do not wire a real latch (the local
+/// manager, the secondary, tests) build their closure against a
+/// [`PhaseHookRaiseLatch::detached`] one nobody reads — the closure's
+/// raise log is unchanged and nothing surfaces, preserving the legacy
+/// warn-and-continue exactly.
+///
+/// First-raise-wins: once a reason is recorded, a later raise in the
+/// same run does not overwrite it (the originating cause is the one the
+/// operator wants surfaced).
+#[derive(Clone)]
+pub struct PhaseHookRaiseLatch {
+    inner: Arc<Mutex<Option<String>>>,
+}
+
+impl PhaseHookRaiseLatch {
+    /// A fresh, empty latch. Clone it to share one end with the closure
+    /// and the other with the coordinator that reads it.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A latch with no reader. Constructed identically to [`Self::new`];
+    /// the name documents the caller's intent — a closure built against
+    /// a detached latch records into a latch the coordinator never reads
+    /// (the local-manager / secondary / test paths), so a raise stays
+    /// warn-and-continue.
+    pub fn detached() -> Self {
+        Self::new()
+    }
+
+    /// Record that the phase-end hook raised, with a human-readable
+    /// reason. First-raise-wins: a no-op if a reason is already set.
+    /// Called by the closure (off the GIL-reacquire path) the moment it
+    /// observes the consumer hook raise.
+    pub fn record(&self, reason: String) {
+        let mut slot = self.inner.lock().expect("phase-hook raise latch poisoned");
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
+
+    /// Read and clear the recorded raise reason, if any. Called by the
+    /// coordinator immediately after firing the hook; `Some(reason)`
+    /// means the consumer hook raised and the run must fail.
+    pub fn take(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("phase-hook raise latch poisoned")
+            .take()
+    }
+}
+
+impl Default for PhaseHookRaiseLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {

@@ -53,4 +53,20 @@ pub enum WorkerMgmtSignal {
         /// Human-readable failure cause.
         reason: String,
     },
+    /// A consumer-/policy-driven FATAL abort: the run must surface a
+    /// non-zero exit, never the generic-failure swallow that
+    /// [`Self::RunShouldFail`] maps to. The canonical case is a
+    /// consumer `on_phase_end` phase-hook that raised — a deliberate
+    /// policy abort the framework must propagate, not a wedge/strand.
+    ///
+    /// Worker management reacts identically to `RunShouldFail` (record
+    /// the break outcome, own the clean-shutdown drive) but records a
+    /// DIFFERENT typed outcome so the run surfaces
+    /// [`crate::primary::RunError::FatalPolicyExit`] rather than the
+    /// swallow-eligible `Other`. `reason` is captured at emit time.
+    PolicyFatalExit {
+        /// Human-readable cause naming the policy that aborted the run
+        /// (e.g. the phase id whose `on_phase_end` hook raised).
+        reason: String,
+    },
 }
