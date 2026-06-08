@@ -212,12 +212,8 @@ pub(crate) fn run_slurm_pipeline<'py>(
     // submitter has no local view of the staged corpus — those files
     // live on the cluster filesystem the secondaries see, not on the
     // dispatcher. Skip the discovery walk here and hand the
-    // coordinator an empty list; the Step 6 PyO3 wrapper reads
-    // `binaries.is_empty() && source_pre_staged_root.is_some()` to
-    // derive `required_setup_on_promote = true`, which in turn makes
-    // the bootstrap setup-defer handshake carry `pre_staged_mode=true` so
-    // the chosen secondary runs `task.discover_items` against its
-    // bind-mounted `src_network` and seeds the cluster ledger.
+    // coordinator an empty list; the corpus is resolved against the
+    // secondaries' bind-mounted `src_network` at dispatch time.
     let binaries = PyList::empty(py);
     if !attr_truthy(args, "source_already_staged") {
         for item in task

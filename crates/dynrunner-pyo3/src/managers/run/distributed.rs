@@ -19,14 +19,11 @@ use super::module;
 /// `source_pre_staged_root` (optional) carries the
 /// `--source-already-staged` signal for the `--multi-computer
 /// single-process` path: forwarded to `RustDistributedManager` which
-/// threads it into its `PrimaryConfig` and derives
-/// `required_setup_on_promote = source_pre_staged_root.is_some()`.
-/// The Python dispatch helper has already returned an empty
-/// `binaries` list in pre-staged mode, so the bootstrap
-/// the setup-defer handshake defers discovery + ledger-seed to the chosen
-/// secondary. Mirrors the kwarg on `run_primary` and the SLURM
-/// pipeline's direct `RustPrimaryCoordinator` construction so all
-/// three multi-computer modes share one signal.
+/// threads it into its `PrimaryConfig`, driving the secondary's
+/// pre-staged binary resolution (the bind-mount IS the contract).
+/// Mirrors the kwarg on `run_primary` and the SLURM pipeline's direct
+/// `RustPrimaryCoordinator` construction so all three multi-computer
+/// modes share one signal.
 #[pyfunction]
 #[pyo3(signature = (
     primary_config,

@@ -73,20 +73,6 @@ pub(crate) struct DistributedConfig {
     /// delta + kill log lines at `target = "oom_watcher"`. Operators
     /// flip this via `--log-oom-watcher`. Default `false`.
     log_oom_watcher: bool,
-    /// Setup-promote deadline in seconds. The demoted submitter
-    /// (`required_setup_on_promote = true`, i.e. `--source-already-staged`)
-    /// waits at most this long for the promoted secondary to broadcast
-    /// its first `TaskAdded` / `TasksSpawned` / `RunComplete` before
-    /// surfacing `RunError::SetupDeadlineExpired`. Defaults to 600s
-    /// (10 minutes). Operators set this large when the consumer's
-    /// `discover_items` walk is genuinely slow (e.g. large file trees
-    /// with per-file hashing) and short when the consumer should
-    /// dispatch within seconds and a 10-min wait would mask a hung
-    /// discovery. See
-    /// `PrimaryConfig.setup_promote_deadline` (Rust) for the full
-    /// rationale — including why no other exit path on the demoted
-    /// primary catches this scenario.
-    setup_promote_deadline_secs: f64,
 }
 
 impl Default for DistributedConfig {
@@ -104,7 +90,6 @@ impl Default for DistributedConfig {
             unconfigured_deadline_secs: 600.0,
             resource_check_interval_secs: 0.1,
             log_oom_watcher: false,
-            setup_promote_deadline_secs: 600.0,
         }
     }
 }
@@ -125,7 +110,6 @@ impl DistributedConfig {
         unconfigured_deadline_secs = None,
         resource_check_interval_secs = None,
         log_oom_watcher = None,
-        setup_promote_deadline_secs = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -143,7 +127,6 @@ impl DistributedConfig {
         unconfigured_deadline_secs: Option<f64>,
         resource_check_interval_secs: Option<f64>,
         log_oom_watcher: Option<bool>,
-        setup_promote_deadline_secs: Option<f64>,
     ) -> Self {
         let d = DistributedConfig::default();
         // Default `oom_retry_max_passes` mirrors the effective
@@ -170,8 +153,6 @@ impl DistributedConfig {
             resource_check_interval_secs: resource_check_interval_secs
                 .unwrap_or(d.resource_check_interval_secs),
             log_oom_watcher: log_oom_watcher.unwrap_or(d.log_oom_watcher),
-            setup_promote_deadline_secs: setup_promote_deadline_secs
-                .unwrap_or(d.setup_promote_deadline_secs),
         }
     }
 }
@@ -207,9 +188,6 @@ impl DistributedConfig {
     pub(crate) fn unconfigured_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.unconfigured_deadline_secs)
     }
-    pub(crate) fn setup_promote_deadline(&self) -> std::time::Duration {
-        std::time::Duration::from_secs_f64(self.setup_promote_deadline_secs)
-    }
     pub(crate) fn resource_check_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.resource_check_interval_secs)
     }
@@ -234,7 +212,7 @@ mod tests {
         // And via the kwarg-merge constructor with everything omitted.
         let cfg = DistributedConfig::new(
             None, None, None, None, None, None, None, None, None,
-            /* unconfigured_deadline_secs */ None, None, None, None,
+            /* unconfigured_deadline_secs */ None, None, None,
         );
         assert_eq!(
             cfg.unconfigured_deadline(),
@@ -260,7 +238,6 @@ mod tests {
             None,
             None,
             /* unconfigured_deadline_secs */ Some(123.0),
-            None,
             None,
             None,
         );

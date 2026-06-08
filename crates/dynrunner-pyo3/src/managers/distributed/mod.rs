@@ -69,12 +69,9 @@ pub(crate) struct PyDistributedManager {
     pub(super) stranded: u32,
     /// Pre-staged-source mode (`--source-already-staged`) signal.
     /// Mirrors `PyPrimaryCoordinator.source_pre_staged_root`: when
-    /// `Some`, the submitter has no local view of the corpus and
-    /// the `_dispatch_single_process` helper has handed us an empty
-    /// `binaries` list on purpose. The primary's bootstrap
-    /// then runs in setup-defer mode (`required_setup_on_promote`) so
-    /// the chosen secondary runs discovery + ledger-seed on its bind-
-    /// mounted source root. Threaded through to `PrimaryConfig`
+    /// `Some`, the corpus is bind-mounted on the secondaries and the
+    /// secondary's pre-staged binary resolution (the bind-mount IS the
+    /// contract) drives dispatch. Threaded through to `PrimaryConfig`
     /// uniformly with the SLURM / network-primary paths so
     /// `--source-already-staged` works in every multi-computer mode
     /// without per-caller special casing.

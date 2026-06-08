@@ -33,7 +33,6 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold = self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
-        let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let source_dir = self.source_dir.clone();
@@ -118,22 +117,6 @@ impl PyPrimaryCoordinator {
         let unfulfillable_reinject_max_per_task = wiring.cap_snapshot;
         let command_tx = wiring.command_tx;
         let command_rx = wiring.command_rx;
-        // Load-bearing flip for the setup-deferred run path. When
-        // `--source-already-staged` is set on the submitter (so
-        // `source_pre_staged_root.is_some()`) AND the Python pipeline
-        // has not supplied any pre-discovered binaries (the pipeline
-        // skips its own `task.discover_items` walk in pre-staged mode
-        // and hands an empty list to `run()`), the submitter primary
-        // owes no setup work. The bootstrap announcement it emits
-        // carries `required_setup=true`, and the chosen secondary
-        // runs discovery + ledger-seed on its bind-mounted
-        // `src_network` instead. Either signal alone is insufficient:
-        // an empty-binaries run with `source_pre_staged_root=None` is
-        // a legitimate empty-corpus run, and a non-empty-binaries run
-        // with the staged flag means the pipeline already discovered
-        // and the local primary should seed normally.
-        let required_setup_on_promote =
-            source_pre_staged_root.is_some() && rust_binaries.is_empty();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -267,17 +250,6 @@ impl PyPrimaryCoordinator {
         // of this method calls `std::process::exit(137)` so the SLURM
         // wrapper reaps the container.
         let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
-        // Setup-promote deadline carried out of the detached tokio
-        // runtime. `Some(RunError::SetupDeadlineExpired { .. })` iff
-        // the inner `PrimaryCoordinator::run` exited via the demoted-
-        // primary setup-deadline arm — the promoted secondary never
-        // broadcast TaskAdded / TasksSpawned / RunComplete within
-        // `setup_promote_deadline`. The GIL-side tail of this method
-        // translates this into a `PyRuntimeError` carrying the
-        // diagnostic Display so the consumer's Python wrapper raises
-        // a clean exception instead of returning exit 0 with empty
-        // counters.
-        let mut setup_deadline_expired: Option<RunError> = None;
         // Pre-phase duplicate-task-id carried out of the detached tokio
         // runtime. `Some(RunError::DuplicateTaskIdPrePhase { .. })` iff
         // the inner `PrimaryCoordinator::run` aborted because the
@@ -367,7 +339,6 @@ impl PyPrimaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     source_pre_staged_root,
                     uses_file_based_items,
-                    required_setup_on_promote,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     oom_retry_max_passes: dist_oom_retry_max_passes,
@@ -385,7 +356,6 @@ impl PyPrimaryCoordinator {
                     // remote-only primaries).
                     source_dir,
                     unfulfillable_reinject_max_per_task,
-                    setup_promote_deadline: dist_setup_promote_deadline,
                     // The submitter's node-local run-config (the operator's
                     // `args.forwarded_argv`). Answered verbatim on
                     // `RequestRunConfig` so every joining / promoted node
@@ -588,9 +558,6 @@ impl PyPrimaryCoordinator {
                             RunError::PanikShutdown { matched_path, .. } => {
                                 panik_shutdown_path = Some(matched_path);
                             }
-                            e @ RunError::SetupDeadlineExpired { .. } => {
-                                setup_deadline_expired = Some(e);
-                            }
                             e @ RunError::DuplicateTaskIdPrePhase { .. } => {
                                 duplicate_task_id_pre_phase = Some(e);
                             }
@@ -663,27 +630,6 @@ impl PyPrimaryCoordinator {
             std::process::exit(137);
         }
 
-        if let Some(err) = setup_deadline_expired {
-            // GIL is back. Surface the structured deadline-expiry as
-            // a `PyRuntimeError` carrying the Display of the
-            // `SetupDeadlineExpired` variant (the diagnostic message
-            // is composed in `error.rs::Display`). The consumer's
-            // Python wrapper observes a non-zero exit instead of the
-            // pre-fix silent hang.
-            //
-            // Sequenced after `panik_shutdown_path` (panik is a
-            // strictly-stronger terminal) but BEFORE
-            // `cluster_collapsed` because the setup-deadline path
-            // exits with zero tasks dispatched — there's nothing for
-            // the stranded-count accounting to surface. Surfacing
-            // setup-deadline first keeps the operator's diagnostic
-            // pointer at the actual cause ("discovery never started")
-            // instead of letting the run trickle through to a
-            // `ClusterCollapsed { stranded = 0 }` shape that's
-            // technically correct but operationally misleading.
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
-        }
-
         if let Some(err) = duplicate_task_id_pre_phase {
             // GIL is back. The primary aborted the run before any phase
             // started because the initial batch had a duplicate
@@ -691,9 +637,8 @@ impl PyPrimaryCoordinator {
             // (secondaries/observers exit 1); surface the structured
             // Display as a `PyRuntimeError` so the primary's Python
             // wrapper raises a clean exception instead of returning
-            // exit 0. Sequenced alongside `setup_deadline_expired` (both
-            // are structured pre-dispatch terminals with no per-task
-            // breakdown) and BEFORE `cluster_collapsed`.
+            // exit 0. A structured pre-dispatch terminal with no per-task
+            // breakdown, sequenced BEFORE `cluster_collapsed`.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

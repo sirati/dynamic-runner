@@ -53,14 +53,9 @@ impl PyObserverLateJoiner {
         }
 
         let observer_id = self.observer_id.clone();
-        // Strand-backstop + setup-deadline thresholds for the standalone
-        // observer's `ObserverConfig`. `peer_timeout` is the primary-silence
-        // backstop; `setup_promote_deadline` is plumbed for config-shape
-        // completeness but is inert here — `required_setup_on_promote=false`
-        // (a late-joiner joins an already-running cluster, it is never the
-        // setup-promoted node), so the deadline arm never arms.
+        // Strand-backstop thresholds for the standalone observer's
+        // `ObserverConfig`. `peer_timeout` is the primary-silence backstop.
         let peer_timeout = self.distributed_config.peer_timeout();
-        let setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         // Move the holdings set out of `self` so it can be handed to the
         // cold-join factory's announcer attach. After this point
         // `self.holdings` is empty; the observer is single-shot per
@@ -157,17 +152,11 @@ impl PyObserverLateJoiner {
                     //    scheduler / worker / dispatch fields — an observer
                     //    has none of those concerns; the config carries only
                     //    the node identity, the strand-backstop thresholds,
-                    //    the (inert here) setup-promote deadline, and the
-                    //    panik trigger inputs.
+                    //    and the panik trigger inputs.
                     let config = ObserverConfig {
                         node_id: observer_id.clone(),
                         fleet_dead_timeout: OBSERVER_FLEET_DEAD_TIMEOUT,
                         peer_timeout,
-                        setup_promote_deadline,
-                        // A late-joiner joins an already-running cluster; it
-                        // is never the setup-promoted node, so the deadline
-                        // arm is structurally inert.
-                        required_setup_on_promote: false,
                         panik_watcher_paths,
                         panik_watcher_poll_interval,
                     };

@@ -80,8 +80,6 @@ fn observer_config(node_id: &str) -> ObserverConfig {
         node_id: node_id.to_string(),
         fleet_dead_timeout: Duration::from_millis(50),
         peer_timeout: Duration::from_secs(300),
-        setup_promote_deadline: Duration::from_secs(600),
-        required_setup_on_promote: false,
         panik_watcher_paths: Vec::new(),
         panik_watcher_poll_interval: Duration::from_secs(60),
     }
@@ -574,64 +572,6 @@ async fn observer_recovers_from_snapshot_reply() {
     .expect("the recovery observer must terminate");
 }
 
-/// Negative control (item 2): with NO snapshot reply + setup pending, the
-/// observer still terminates — via the setup-promote-deadline backstop.
-/// The recovery request is fire-and-forget; a missing reply cannot
-/// deadlock. peer_count == 1 so fleet-dead never arms.
-#[tokio::test(flavor = "current_thread")]
-async fn observer_no_reply_still_terminates_via_deadline() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (inbound_tx, inbound_rx) =
-                    mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-                let (to_primary_tx, _to_primary_rx) = mpsc::unbounded_channel();
-                let mut outgoing = HashMap::new();
-                outgoing.insert("promoted-sec".to_string(), to_primary_tx);
-                let transport =
-                    ChannelPeerTransport::from_raw_channels("obs".into(), outgoing, inbound_rx);
-                // Hold inbound open but never feed it.
-                let _inbound_tx = inbound_tx;
-
-                let mut cs = ClusterState::<TestId>::new();
-                cs.apply(ClusterMutation::PrimaryChanged {
-                    new: "promoted-sec".into(),
-                    epoch: 2,
-                    reason: PrimaryChangeReason::Election,
-                });
-
-                let mut config = observer_config("obs");
-                // Setup-defer + empty ledger ⇒ setup_pending() true.
-                config.required_setup_on_promote = true;
-                config.setup_promote_deadline = Duration::from_millis(150);
-                // Far out so the deadline arm is the one that fires
-                // (peer_count == 1 means fleet-dead never arms anyway).
-                config.peer_timeout = Duration::from_secs(60);
-                config.fleet_dead_timeout = Duration::from_secs(60);
-
-                let (client, inbox, pump) = observer_mesh(transport, "obs");
-                tokio::task::spawn_local(pump);
-                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
-                let err = observer
-                    .run()
-                    .await
-                    .expect_err("no reply + setup pending must exit via the deadline arm");
-                assert!(
-                    matches!(err, crate::primary::RunError::SetupDeadlineExpired { .. }),
-                    "the deadline exit must be SetupDeadlineExpired: {err}"
-                );
-                assert!(
-                    observer.setup_deadline_elapsed().is_some(),
-                    "the elapsed must be recorded for the GIL-side tail"
-                );
-            })
-            .await;
-    })
-    .await
-    .expect("the no-reply observer must terminate via the deadline");
-}
-
 /// BUG-1: `run_aborted` ⇒ non-zero exit (Aborted terminal), checked
 /// BEFORE `run_complete` so an aborted run never exits as completed.
 #[tokio::test(flavor = "current_thread")]
@@ -826,94 +766,6 @@ async fn observer_refreshes_primary_clock_on_restore_repoint() {
     .expect("the restore-refresh observer must terminate");
 }
 
-/// R2/BUG-7: the setup-promote deadline uses a LIVE `setup_pending`. When a
-/// `TaskAdded` seeds the ledger BEFORE the deadline, the arm goes inert and
-/// the observer does NOT exit via the deadline — it rides on to RunComplete.
-/// This pins that `setup_pending` is recomputed live (not frozen at entry).
-#[tokio::test(flavor = "current_thread")]
-async fn observer_setup_deadline_uses_live_setup_pending() {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (transport, inbound, _peers) = transport_with_peers("obs", 1);
-                let mut cs = ClusterState::<TestId>::new();
-                cs.apply(ClusterMutation::PrimaryChanged {
-                    new: "promoted-sec".into(),
-                    epoch: 2,
-                    reason: PrimaryChangeReason::Election,
-                });
-                let mut config = observer_config("obs");
-                config.required_setup_on_promote = true;
-                config.setup_promote_deadline = Duration::from_millis(150);
-                config.peer_timeout = Duration::from_secs(60);
-                config.fleet_dead_timeout = Duration::from_secs(60);
-
-                let (client, inbox, pump) = observer_mesh(transport, "obs");
-                tokio::task::spawn_local(pump);
-                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
-
-                tokio::task::spawn_local(async move {
-                    // Seed the ledger BEFORE the 150ms deadline ⇒ task_count
-                    // > 0 ⇒ setup_pending() goes false ⇒ the deadline arm is
-                    // inert. Then complete the run.
-                    tokio::time::sleep(Duration::from_millis(40)).await;
-                    let t = task("p", "seed", &[]);
-                    inbound
-                        .send(DistributedMessage::ClusterMutation {
-                            target: None,
-                            sender_id: "promoted-sec".into(),
-                            timestamp: 0.0,
-                            mutations: vec![ClusterMutation::TaskAdded {
-                                hash: t.task_id.clone(),
-                                task: t,
-                            }],
-                        })
-                        .expect("inbound open");
-                    inbound
-                        .send(DistributedMessage::ClusterMutation {
-                            target: None,
-                            sender_id: "promoted-sec".into(),
-                            timestamp: 0.0,
-                            mutations: vec![ClusterMutation::TaskCompleted {
-                                attempt: 0,
-                                hash: "seed".into(),
-                                result_data: None,
-                            }],
-                        })
-                        .expect("inbound open");
-                    // Past the 150ms deadline window: if the gate were frozen
-                    // the observer would already have exited Err.
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    inbound
-                        .send(DistributedMessage::ClusterMutation {
-                            target: None,
-                            sender_id: "promoted-sec".into(),
-                            timestamp: 0.0,
-                            mutations: vec![ClusterMutation::RunComplete],
-                        })
-                        .expect("inbound open");
-                });
-
-                let terminal = observer
-                    .run()
-                    .await
-                    .expect("a seeded ledger must make the deadline arm inert (live gate)");
-                assert!(
-                    matches!(terminal, ObserverTerminal::Done),
-                    "got {terminal:?}"
-                );
-                assert!(
-                    observer.setup_deadline_elapsed().is_none(),
-                    "the deadline must NOT have fired"
-                );
-            })
-            .await;
-    })
-    .await
-    .expect("the live-setup-pending observer must terminate");
-}
-
 /// The shared inbound + bookkeeping a [`build_test_handoff`] hands back.
 struct HandoffTestRig {
     handoff: super::ObserverHandoff<TestId>,
@@ -978,7 +830,6 @@ fn build_test_handoff(
         node_id: node_id.to_string(),
         deadlines: config.clone(),
         started_phases: std::collections::HashSet::new(),
-        required_setup_on_promote: config.required_setup_on_promote,
         panik_signal_rx: None,
         task_completed_dispatcher_handle: inherited_task_completed_dispatcher,
         lifecycle_dispatcher_handle,

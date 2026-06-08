@@ -719,18 +719,6 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// call `exit(137)`.
     pub(super) panik_outcome: Option<(std::path::PathBuf, String)>,
 
-    /// Set by the setup-promote-deadline arm in the operational
-    /// `select!` loop when the deadline fires while `setup_pending`
-    /// is still true. Carries the wall-clock elapsed since
-    /// operational-loop entry so the outer `run_pipeline` can surface
-    /// `RunError::SetupDeadlineExpired { elapsed }` with the diagnostic
-    /// duration.
-    ///
-    /// Same write-only/read-only discipline as `panik_outcome`: the
-    /// arm WRITES, the outer wrapper READS. Avoids touching the
-    /// `Result<(), String>` signature of the inner loop.
-    pub(super) setup_deadline_outcome: Option<std::time::Duration>,
-
     /// Worker-management signal receiver, paired with the
     /// `worker_mgmt_tx` installed on `cluster_state` at construction.
     /// Taken out at the operational loop's start so its `select!` arm
@@ -745,10 +733,10 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// Set by the operational `select!` loop's worker-management arm
     /// when it drains a [`WorkerMgmtSignal::RunShouldFail`]. Carries the
     /// emit-time reason so the outer `run_pipeline` can surface the run
-    /// failure. Same write-only/read-only discipline as `panik_outcome`
-    /// / `setup_deadline_outcome`: the arm WRITES, the outer wrapper
-    /// READS — keeping the inner loop's `Result<(), String>` signature
-    /// untouched. The worker arm OWNS the clean-shutdown drive; the
+    /// failure. Same write-only/read-only discipline as `panik_outcome`:
+    /// the arm WRITES, the outer wrapper READS — keeping the inner loop's
+    /// `Result<(), String>` signature untouched. The worker arm OWNS the
+    /// clean-shutdown drive; the
     /// phase layer that emitted the signal never breaks the loop
     /// directly (decoupling law).
     pub(super) worker_mgmt_fail_outcome: Option<String>,
@@ -762,7 +750,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// `ClusterMutation::RunAborted { reason }`, and returns
     /// `RunError::DuplicateTaskIdPrePhase` — a hard cluster shutdown.
     /// `None` on a clean seed. Write-only at seed, read-once at the
-    /// abort gate (same discipline as `setup_deadline_outcome`).
+    /// abort gate (same discipline as `panik_outcome`).
     pub(super) pending_run_abort: Option<String>,
 
     /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
@@ -926,7 +914,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             panik_signal_rx: None,
             demote_rx: Some(demote_rx),
             panik_outcome: None,
-            setup_deadline_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
             pending_run_abort: None,
@@ -1657,7 +1644,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// HASH and `free_slot_on_terminal` frees the held slot. Folds in the
     /// deleted `pre_owned_in_flight` concept: the terminal cascade reads
     /// this entry exactly like a locally-dispatched one.
-    #[allow(dead_code)] // TODO(R4): reachable via hydrate_from_cluster_state (P4 composition)
     pub(super) fn seed_inflight(
         &mut self,
         task_hash: String,
@@ -2014,36 +2000,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Pending/InFlight inspections are constant-time per entry.
     pub fn outcome_summary(&self) -> OutcomeSummary {
         self.cluster_state.outcome_counts()
-    }
-
-    /// Setup-defer gate (CRDT-derived).
-    ///
-    /// True while this primary deferred discovery (`config.
-    /// required_setup_on_promote`) AND the chosen secondary has not yet
-    /// broadcast its first task into the replicated ledger
-    /// (`cluster_state.task_count() == 0`). While true, `total_tasks`
-    /// is 0 and every declared phase is `Active` with zero items — not
-    /// because the run is empty but because discovery hasn't seeded the
-    /// ledger yet. The counter-based run-complete exit and the
-    /// per-phase `on_phase_end` drain must NOT fire in this window
-    /// (a `0+0 >= 0` counter trip or a spurious empty-phase drain would
-    /// declare the run done before any task exists). The gate clears the
-    /// moment the first `TaskAdded` lands — exactly the flip condition
-    /// the pre-demolition `setup_pending` latch used, now read off the
-    /// CRDT every replica converges to.
-    ///
-    /// On the legacy bootstrap path (`required_setup_on_promote =
-    /// false`) this is always `false`, so the gate is permanently
-    /// satisfied and the normal exit/drain logic runs.
-    ///
-    /// The authoritative primary owns this gate: it suppresses
-    /// `run_complete_check`'s counter / pool-drain exits while discovery
-    /// is pending (see `lifecycle/operational_loop.rs`) and arms the
-    /// setup-promote-deadline backstop. The setup-deferred discovery feed
-    /// (`ingest_setup_discovery`) seeds the ledger; the first `TaskAdded`
-    /// flips this predicate false and normal dispatch resumes.
-    pub(super) fn setup_pending(&self) -> bool {
-        self.config.required_setup_on_promote && self.cluster_state.task_count() == 0
     }
 
     /// Tasks the run loop never accounted for (neither completed nor
@@ -2441,10 +2397,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// (ingress), the replicated `cluster_state` (with its already-installed
     /// `task_completed_tx`), the node id, the deadlines as an
     /// [`ObserverConfig`], the `started_phases` narration seed (the
-    /// `phase_started_emitted` set), the STABLE `required_setup_on_promote`
-    /// config bool (the observer recomputes `setup_pending` LIVE — never a
-    /// frozen snapshot), the panik signal receiver, and the two dispatcher
-    /// join handles. The `holdings` are empty: the submitter primary
+    /// `phase_started_emitted` set), the panik signal receiver, and the two
+    /// dispatcher join handles. The `holdings` are empty: the submitter primary
     /// advertised no resource-holdings (workers run on secondaries). The
     /// `client` + `inbox` move across unchanged — the observer keeps
     /// addressing the mesh through the SAME role slot (the `Process` retags
@@ -2480,8 +2434,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 node_id: config.node_id,
                 fleet_dead_timeout: config.fleet_dead_timeout,
                 peer_timeout: config.peer_timeout,
-                setup_promote_deadline: config.setup_promote_deadline,
-                required_setup_on_promote: config.required_setup_on_promote,
                 // The submitter's panik watcher already ran; its signal
                 // receiver rides across directly (below), so the observer
                 // does NOT re-spawn a watcher from these — they are inert
@@ -2490,7 +2442,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 panik_watcher_poll_interval: Duration::from_secs(60),
             },
             started_phases: phase_started_emitted,
-            required_setup_on_promote: config.required_setup_on_promote,
             panik_signal_rx,
             // The dispatchers are spawned unconditionally at `run_pipeline`
             // entry (`spawn_run_dispatchers`), so both handles are present
@@ -2528,11 +2479,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `spawn_tasks` task; a coordinator re-used across runs must not
         // inherit a stale rejection.
         self.spawn_rejected_task_ids.clear();
-        // Reset the setup-promote-deadline outcome so a previous
-        // run's residue (the field is only written when the deadline
-        // arm fires; a clean run leaves it untouched, but a coordinator
-        // re-used across runs must not inherit a stale outcome).
-        self.setup_deadline_outcome = None;
         // Same per-run reset for the worker-management run-should-fail
         // outcome: only written when the worker-management arm drains a
         // `RunShouldFail`; a coordinator re-used across runs must not
@@ -2543,18 +2489,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // coordinator re-used across runs must not inherit a previous run's
         // seed residue.
         self.pending_run_abort = None;
-
-        // The setup-pending gate is a CRDT-derived predicate
-        // (`Self::setup_pending`) rather than a stateful latch field: in
-        // setup-promote mode (`config.required_setup_on_promote`) it
-        // stays true until the first task lands in the replicated ledger
-        // (`cluster_state.task_count() > 0`), derived from the CRDT every
-        // replica converges to. No per-run reset is needed because the
-        // predicate reads live state. The authoritative primary owns this
-        // gate: `run_complete_check` suppresses its
-        // exits while it holds and the operational loop arms the
-        // setup-promote-deadline backstop; the setup-deferred discovery
-        // feed (`ingest_setup_discovery`) seeds the ledger that flips it.
 
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
@@ -2677,32 +2611,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // seed/assignment step below, preserving the load-bearing
         // "cascade before initial assignment" ordering.
         //
-        // Gated on `!self.setup_pending` because in setup-defer mode
-        // the local primary enters `run()` with `binaries = []` and
-        // every declared phase is `Active` with zero items — but only
-        // transiently: the setup-promoted secondary will broadcast
-        // `TaskAdded` once its discovery completes and populate the
-        // cluster ledger. Running the initial-empty-phase cascade now
-        // would mark every phase `Drained` and fire spurious
-        // `on_phase_end(.., 0, 0)` callbacks for phases that haven't
-        // had a chance to receive items yet. Both halves of the
-        // cascade (`drain_empty_active_phases` flipping `Active` →
-        // `Drained`, and `process_phase_lifecycle` firing
-        // `on_phase_end`) must be skipped together to keep the pool
-        // in a coherent state while setup is pending; gating only the
-        // cascade would leave phases stuck in `Drained` with no
-        // organic re-activation path on a setup-defer demoted primary
-        // (TaskAdded mirrors into `cluster_state`, not the local pool,
-        // so `reinject` never runs to unwind `Drained` → `Active`).
-        //
-        // `process_phase_lifecycle` carries its own `setup_pending`
-        // early-return for defence-in-depth at every other call site
-        // (note_item_completed / note_item_failed), but here we keep
-        // the explicit pre-call `drain_empty_active_phases` and the
-        // ALSO-redundant cascade invocation paired under a single
-        // gate — the two are one logical unit (the pre-call exists
-        // only to feed the cascade).
-        //
         // Required at this pre-loop site (not optional): a consumer
         // `on_phase_end` callback fired by the initial-empty-phase
         // cascade can itself queue `spawn_tasks(next_phase_items)`,
@@ -2724,10 +2632,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Asm-tokenizer's lazy-spawn consumer pattern
         // (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
         // is the live consumer of this contract.
-        if !self.setup_pending() {
-            self.pool_mut().drain_empty_active_phases();
-            self.process_phase_lifecycle(&mut command_rx).await;
-        }
+        self.pool_mut().drain_empty_active_phases();
+        self.process_phase_lifecycle(&mut command_rx).await;
 
         // #3a abort gate. `originate_cold_seed` recorded a pending
         // abort iff the INITIAL batch had a `(phase_id, task_id)`
@@ -2801,33 +2707,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.rebroadcast_full_roster().await;
 
         // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
-        // perform the initial per-secondary assignment. Both steps are
-        // skipped when this primary is operating in setup-defer mode
-        // (`required_setup_on_promote` — i.e. the submitter was
-        // launched with `--source-already-staged` and has no local
-        // view of the corpus to discover or seed); in that mode the
-        // chosen secondary runs task discovery + ledger seed after the
-        // bootstrap promotion (the discovery-yield rides
-        // `InitialAssignment { pre_staged_mode: true }`, emitted by
-        // `emit_setup_defer_handshake` below). To keep the secondaries'
-        // `wait_for_setup`
-        // loop unchanged in either mode, `emit_setup_defer_handshake`
-        // sends the degenerate InitialAssignment + state transitions
-        // the legacy path would have sent — empty payloads but the
-        // same wire-frame triple. The non-defer path ships the cold-start
-        // seed (the `PhaseDepsSet` + `TaskAdded` fan-out + the #2 invalid-dep
-        // `TaskFailed` transitions, applied LOCALLY at `originate_cold_seed`
-        // and staged for this post-connection broadcast so they reach the
-        // fleet) + `perform_initial_assignment` (round-robin worker
-        // assignments, staged-files inline). On a promotion the staged seed
-        // is empty (the inherited CRDT replicates via anti-entropy), so
-        // `broadcast_cold_seed` is a no-op there.
-        if self.config.required_setup_on_promote {
-            self.emit_setup_defer_handshake().await?;
-        } else {
-            self.broadcast_cold_seed().await;
-            self.perform_initial_assignment().await?;
-        }
+        // perform the initial per-secondary assignment. Ships the
+        // cold-start seed (the `PhaseDepsSet` + `TaskAdded` fan-out + the #2
+        // invalid-dep `TaskFailed` transitions, applied LOCALLY at
+        // `originate_cold_seed` and staged for this post-connection
+        // broadcast so they reach the fleet) + `perform_initial_assignment`
+        // (round-robin worker assignments, staged-files inline). On a
+        // promotion the staged seed is empty (the inherited CRDT replicates
+        // via anti-entropy), so `broadcast_cold_seed` is a no-op there.
+        self.broadcast_cold_seed().await;
+        self.perform_initial_assignment().await?;
 
         // Phase 6: Send transfer complete
         self.send_transfer_complete().await?;
@@ -2863,13 +2752,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // (`maybe_auto_stage_initial`), peer-linked (`send_peer_lists` +
         // `wait_for_peer_connections`), the primary's own membership is
         // recorded (`originate_primary_membership`), the ledger is seeded +
-        // tasks assigned (`seed_cluster_state` + `perform_initial_assignment`)
-        // OR the setup-defer handshake is emitted (`emit_setup_defer_handshake`),
+        // tasks assigned (`seed_cluster_state` + `perform_initial_assignment`),
         // transfer-complete is sent (`send_transfer_complete`), and the peer
-        // mesh has settled (`wait_for_mesh_ready`). Both modes reconverge here
-        // (the `required_setup_on_promote` if/else above rejoins before
-        // `send_transfer_complete`), so a single emit at this point fires
-        // EXACTLY ONCE regardless of non-defer vs setup-defer mode.
+        // mesh has settled (`wait_for_mesh_ready`). A single emit at this
+        // point fires EXACTLY ONCE per run.
         //
         // Placed at the end of the connect/seed/mesh-ready chain, just
         // before the bootstrap tail activates the local primary, so it
@@ -2940,25 +2826,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 "primary run aborted by worker-management run-should-fail signal"
             );
             return Err(RunError::Other(reason));
-        }
-
-        // Setup-promote-deadline check: if the operational loop's
-        // deadline arm fired (the promoted secondary never broadcast
-        // TaskAdded / TasksSpawned / RunComplete within
-        // `config.setup_promote_deadline`), surface as
-        // `RunError::SetupDeadlineExpired`. Skip the retry-pass /
-        // drain / accounting tail — no task ever entered the pool, so
-        // there's nothing to retry, drain, or account for. The RunComplete
-        // broadcast tail is also skipped: the cluster never reached an
-        // operational state to begin with, so no peers are sitting on
-        // a "run-is-over" cue.
-        if let Some(elapsed) = self.setup_deadline_outcome.take() {
-            tracing::error!(
-                elapsed_s = elapsed.as_secs_f64(),
-                "primary run aborted by setup-promote deadline expiry; \
-                 surfacing SetupDeadlineExpired"
-            );
-            return Err(RunError::SetupDeadlineExpired { elapsed });
         }
 
         // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
@@ -3313,24 +3180,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
-        // Pre-discovery transient state in setup-defer mode. While
-        // `setup_pending()` is true the local primary has `total_tasks
-        // = 0` and every declared phase is `Active` with zero items —
-        // not because they're truly empty, but because the
-        // setup-promoted secondary has not yet broadcast its first
-        // `TaskAdded` / `TasksSpawned`. Firing `on_phase_end(.., 0, 0)`
-        // now would surface a spurious "empty drain" for every phase
-        // before the chosen secondary has had a chance to populate them
-        // (a consumer callback walking just-discovered outputs would
-        // OSError on missing paths). The gate clears the moment the
-        // first task lands in the replicated ledger; subsequent cascade
-        // calls resume normal operation. See `Self::setup_pending`.
-        //
-        // Idempotent on the legacy bootstrap path: `setup_pending()`
-        // is always false there, so the gate is always satisfied.
-        if self.setup_pending() {
-            return;
-        }
         loop {
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {

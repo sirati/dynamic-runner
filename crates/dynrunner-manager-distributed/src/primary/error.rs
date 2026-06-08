@@ -58,25 +58,6 @@ pub enum RunError {
         matched_path: std::path::PathBuf,
         reason: String,
     },
-    /// Demoted submitter in setup-promote mode (`required_setup_on_promote
-    /// = true`) timed out waiting for the promoted secondary to broadcast
-    /// its first `ClusterMutation::TaskAdded` / `TasksSpawned` /
-    /// `RunComplete`. The operational loop's setup-pending arm
-    /// (`config.setup_promote_deadline`) fired with `setup_pending`
-    /// still latched true.
-    ///
-    /// Distinct from `Other(String)` so the PyO3 boundary can render a
-    /// clear, structured failure (rather than the legacy log-and-swallow
-    /// path that surfaces as a stranded-count discrepancy or a silent
-    /// 4-hour hang). Distinct from `ClusterCollapsed` because no task
-    /// was ever assigned — there is no per-category breakdown to render,
-    /// only the elapsed wall-clock that pins the operator's diagnostic
-    /// pointer at "the promoted secondary never started broadcasting".
-    SetupDeadlineExpired {
-        /// Wall-clock duration the demoted submitter spent in the
-        /// setup-pending wait before the arm fired.
-        elapsed: std::time::Duration,
-    },
     /// A `(phase_id, task_id)` duplicate was detected in the INITIAL
     /// task batch — BEFORE any phase started (#3a). A collision in the
     /// initial batch is a producer-side bug that would silently mask
@@ -88,10 +69,10 @@ pub enum RunError {
     /// Distinct from `Other(String)` so the PyO3 boundary translates it
     /// to a structured `PyRuntimeError` (the `Other` path is
     /// log-and-swallowed → exit 0, which would hide the abort).
-    /// Mirrors `SetupDeadlineExpired`'s role: a structured pre-dispatch
-    /// terminal with no per-task breakdown to render — only the reason
-    /// naming the colliding identities. (A duplicate detected AFTER a
-    /// phase started — #3b — does NOT reach this variant: it
+    /// A structured pre-dispatch terminal with no per-task breakdown to
+    /// render — only the reason naming the colliding identities. (A
+    /// duplicate detected AFTER a phase started — #3b — does NOT reach
+    /// this variant: it
     /// invalidates the not-yet-terminal tasks run-wide and the run
     /// CONTINUES to its normal completion.)
     DuplicateTaskIdPrePhase {
@@ -177,16 +158,6 @@ impl fmt::Display for RunError {
                 f,
                 "primary panik shutdown: {reason} (matched_path={})",
                 matched_path.display()
-            ),
-            Self::SetupDeadlineExpired { elapsed } => write!(
-                f,
-                "setup-promote deadline expired after {:.1}s: the promoted \
-                 secondary never broadcast TaskAdded / TasksSpawned / RunComplete \
-                 — discovery may be hung on the consumer side, or the secondary's \
-                 SLURM job died before its first broadcast. Tune \
-                 `setup_promote_deadline` upward if the consumer's `discover_items` \
-                 walk is legitimately long-running.",
-                elapsed.as_secs_f64()
             ),
             Self::DuplicateTaskIdPrePhase { reason } => write!(
                 f,

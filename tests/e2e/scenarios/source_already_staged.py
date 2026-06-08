@@ -53,7 +53,7 @@ The plan acknowledges that path; it's covered by the
 scenarios' regression-pin semantics for their respective dispatch
 helpers — they don't currently parametrize over the
 ``--source-already-staged`` flag, but the framework path for SLURM
-is the SAME as for local (same ``required_setup_on_promote`` gate
+is the SAME as for local (same ``source_pre_staged_root`` plumbing
 in the PyO3 wrapper). Adding a SLURM plan here would be
 test-infrastructure-heavy for a near-redundant assertion; the
 single-process + local pair is the smallest set that proves the

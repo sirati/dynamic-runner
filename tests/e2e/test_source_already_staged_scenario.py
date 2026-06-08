@@ -75,10 +75,9 @@ def test_prepare_emits_one_plan_per_mode() -> None:
 def test_every_plan_carries_source_already_staged_flag() -> None:
     """The load-bearing CLI flag is on every plan's argv.
 
-    Without ``--source-already-staged`` the framework's setup-promote
-    discriminator (``required_setup_on_promote`` in
-    ``PyPrimaryCoordinator``) never flips, and the scenario silently
-    reverts to legacy bootstrap mode. The test guards against an
+    Without ``--source-already-staged`` the framework's pre-staged
+    binary-resolution path never engages, and the scenario silently
+    reverts to local-discovery mode. The test guards against an
     accidental flag drop in the builder.
     """
     with tempfile.TemporaryDirectory() as raw_tmp:

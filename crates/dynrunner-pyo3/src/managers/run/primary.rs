@@ -38,13 +38,11 @@ use super::module;
 ///
 /// `source_pre_staged_root` (optional) carries the
 /// `--source-already-staged` signal for the `--multi-computer local`
-/// path: when `Some`, the Python dispatch helper has already returned
-/// an empty `binaries` list and `RustPrimaryCoordinator::run` will
-/// flip `required_setup_on_promote=true` so the chosen secondary runs
-/// discovery + ledger-seed on its bind-mounted `src_network`.
-/// Mirrors the SLURM pipeline's direct construction of
+/// path: threaded into `RustPrimaryCoordinator`, it drives the
+/// secondary's pre-staged binary resolution (the bind-mount IS the
+/// contract). Mirrors the SLURM pipeline's direct construction of
 /// `RustPrimaryCoordinator(source_pre_staged_root=...)` so all three
-/// multi-computer modes use the same setup-promote handshake.
+/// multi-computer modes share one signal.
 #[pyfunction]
 #[pyo3(signature = (
     config,

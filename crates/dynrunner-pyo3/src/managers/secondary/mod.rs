@@ -58,16 +58,18 @@ pub(crate) struct PySecondaryCoordinator {
     /// Phase dependency graph extracted from
     /// `LoadedTaskDefinition::from_python`. Retained on the wrapper
     /// (rather than left to drop after construction like the legacy
-    /// path did) because the setup-promote yield needs it: the Python
+    /// path did) because pre-staged discovery needs it: the Python
     /// `task.discover_items` call resolves the per-task list but not
     /// the graph metadata, and the Rust core seeds both as a single
-    /// mutation batch via `ingest_setup_discovery`.
+    /// mutation batch.
+    // Phase 5 wires this into the relocated-primary discovery recipe;
+    // write-only in the interim.
+    #[allow(dead_code)]
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) skip_existing: bool,
     pub(super) estimator: PyMemoryEstimatorBridge,
-    /// Held for the setup-promote outer loop. When the Rust core
-    /// signals `RunOutcome::SetupPending`, the wrapper re-acquires the
-    /// GIL and invokes `task_definition_py.discover_items(<root>,
+    /// Held for pre-staged discovery: the wrapper re-acquires the GIL
+    /// and invokes `task_definition_py.discover_items(<root>,
     /// task_args_py)` to enumerate the staged corpus. Kept as a
     /// `Py<PyAny>` (not `Bound<'py, _>`) because the wrapper outlives
     /// any single `Python<'py>` lifetime; `bind(py)` re-materialises a
@@ -76,6 +78,9 @@ pub(crate) struct PySecondaryCoordinator {
     /// Held for the same reason as `task_definition_py`: the second
     /// positional argument to `discover_items`. Originates from the
     /// `task_args` Python object passed into the constructor.
+    // Phase 5 wires this into the relocated-primary discovery recipe;
+    // write-only in the interim.
+    #[allow(dead_code)]
     pub(super) task_args_py: Py<PyAny>,
     /// Optional Python peer-lifecycle listener supplied at `__init__`.
     /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;

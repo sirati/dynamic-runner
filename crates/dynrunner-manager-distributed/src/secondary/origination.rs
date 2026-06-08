@@ -1,31 +1,21 @@
-//! Originator-side cluster-mutation broadcast, panik self-departure,
-//! and setup-discovery ingest.
+//! Originator-side cluster-mutation broadcast + panik self-departure.
 //!
 //! Single concern: originate cluster-state changes from THIS node —
 //! produce a batch of `ClusterMutation`s, run the
 //! `apply_locally_for_broadcast` apply-first filter, and fan the
-//! `Applied` subset out to the mesh. `ingest_setup_discovery` is the
-//! wrapper entry-point that turns the wrapper-driven discovery result
-//! into the canonical `PhaseDepsSet + N×TaskAdded` batch through the
-//! same broadcast helper; `handle_panik_signal` originates the
+//! `Applied` subset out to the mesh. `handle_panik_signal` originates the
 //! self-departure announcement (file source) and tears down local
 //! workers on the Phase-0B emergency-stop path.
 //!
 //! Relocated here from the removed `secondary/primary/*` mirror: these
-//! three functions are NOT mirror logic (they originate cluster state
-//! on the live-secondary side and serve the pyo3 + panik surfaces), so
-//! they survive the mirror demolition. The free pool helper
+//! functions are NOT mirror logic (they originate cluster state on the
+//! live-secondary side and serve the pyo3 + panik surfaces), so they
+//! survive the mirror demolition. The free pool helper
 //! `cascade_drain_done` also relocates here (it was a free function in
 //! the removed `secondary/primary/mod.rs`); the symmetric primary-side
-//! hydration re-uses it. `ingest_setup_discovery` keys its seed
-//! `TaskAdded`s with the wire-canonical [`dynrunner_core::compute_task_hash`]
-//! — the SAME recipe the primary's assignment + completion paths use —
-//! so a setup-defer-discovered task's ledger key matches the
-//! promoted primary's later assignment/completion key.
+//! hydration re-uses it.
 
-use std::collections::HashMap;
-
-use dynrunner_core::{BoundedString, Identifier, PhaseId, TaskInfo};
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, Destination, DistributedMessage, RemovalCause,
@@ -274,90 +264,4 @@ where
         (matched_path, reason)
     }
 
-    /// Ingest the result of Python's `task.discover_items` after a
-    /// setup-defer promotion (the chosen peer received an
-    /// `InitialAssignment { pre_staged_mode: true }` and yielded
-    /// `SetupPending`).
-    ///
-    /// The outer process-tasks loop yielded back to the PyO3 wrapper,
-    /// which ran `task.discover_items` against the locally bind-mounted
-    /// staged source filesystem and is now feeding the result back into
-    /// the Rust core.
-    ///
-    /// Sequence:
-    ///   1. Build the mutation batch: one `PhaseDepsSet` carrying the
-    ///      task graph's static phase dependency map (so every
-    ///      receiver's `cluster_state.phase_deps()` is populated
-    ///      before any post-promotion hydration consults it), then one
-    ///      `TaskAdded` per discovered binary.
-    ///   2. Originate the batch via `apply_and_broadcast_mutations` —
-    ///      applies locally to `cluster_state` and fans out to the mesh
-    ///      (every member, including the same-peer authority, receives
-    ///      it). This is legitimate originator-side cluster-state
-    ///      production from the node that ran discovery; the secondary
-    ///      is the producer of the discovery result, not an authority
-    ///      over dispatch.
-    ///
-    /// Idempotency: `ClusterMutation::TaskAdded` is no-op-on-duplicate
-    /// (the CRDT silently drops it via the `apply` filter), and
-    /// `apply_locally_for_broadcast` filters NoOp mutations out before
-    /// broadcast, so a duplicate `ingest_setup_discovery` call (e.g.
-    /// from a wrapper retry on transport hiccup) doesn't re-broadcast
-    /// the same batch.
-    ///
-    /// Feed to the composed authoritative primary: the `TaskAdded`
-    /// broadcast reaches the same-peer primary as any mesh member would
-    /// receive it (the discovering node and the authority are both mesh
-    /// members). The primary's `handle_cluster_mutation` applies the
-    /// batch to its `cluster_state`, refreshes `total_tasks` from the
-    /// now-populated ledger, and the CRDT-derived `setup_pending()` gate
-    /// flips false — re-enabling the run-complete exits the gate had
-    /// suppressed. No separate loopback hydration call is needed: the
-    /// mesh broadcast IS the feed (the pre-demolition `setup_pending =
-    /// false` + `populate_primary_from_cluster_state()` steps lived on
-    /// the secondary's deleted authority mirror; the composed primary
-    /// reaches the same state reactively off the replicated ledger).
-    pub async fn ingest_setup_discovery(
-        &mut self,
-        binaries: Vec<TaskInfo<I>>,
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
-    ) -> Result<(), String> {
-        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(binaries.len() + 1);
-        mutations.push(ClusterMutation::PhaseDepsSet { deps: phase_deps });
-        for b in &binaries {
-            mutations.push(ClusterMutation::TaskAdded {
-                hash: dynrunner_core::compute_task_hash(b),
-                task: b.clone(),
-            });
-        }
-        let task_count = binaries.len();
-        self.apply_and_broadcast_mutations(mutations).await?;
-        // Latch the one-shot so `setup_discovery_pending()` (the
-        // `process_tasks` yield discriminator) never fires again on this
-        // node — set unconditionally so the empty-discovery path (which
-        // leaves the ledger empty) does not re-yield on re-entry. The
-        // latch now lives in `OperationalState`: `ingest_setup_discovery`
-        // is called by the wrapper AFTER `process_tasks` yielded
-        // `SetupPending`, which only happens from the operational loop, so
-        // the lifecycle is `Operational` here. See the
-        // `OperationalState::setup_discovery_done` doc.
-        self.op_mut().setup_discovery_done = true;
-        tracing::info!(
-            tasks = task_count,
-            "ingested setup-discovery; broadcast PhaseDepsSet + TaskAdded batch"
-        );
-        // Empty-discovery happy path: when discovery surfaces zero
-        // items (e.g. every binary's output already exists under a
-        // `--skip-existing` filter), the pool is drained from
-        // inception and there will never be a `TaskCompleted` to
-        // trigger the normal counter-driven RunComplete broadcast.
-        // Originate RunComplete directly so every peer's exit arm
-        // observes the same authoritative terminal signal.
-        if task_count == 0 {
-            self.apply_and_broadcast_mutations(vec![ClusterMutation::RunComplete])
-                .await?;
-            tracing::info!("empty-discovery: RunComplete broadcast — no tasks to run");
-        }
-        Ok(())
-    }
 }
