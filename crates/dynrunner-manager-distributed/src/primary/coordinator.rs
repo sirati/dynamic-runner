@@ -2757,11 +2757,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.fire_pending_run_abort().await?;
 
         // ── Peer-mesh formation (UNCONDITIONAL — both roles need a routable
-        // mesh). The setup peer's `relocate_primary_to` broadcasts
-        // `PrimaryChanged { Transferred }`, which MUST land on a settled mesh
-        // (the `wait_for_mesh_ready` rationale below): a pre-mesh-formation
-        // announcement routes into the void. The promoted destination needs
-        // the same routable mesh for its operational broadcasts. ───────────
+        // mesh). `send_peer_lists` fans out `PeerInfo`; the Node mesh-pump
+        // dials the peer-secondary links off it (see `send_peer_lists` /
+        // `wait_for_setup`'s PeerInfo arm) — a TRANSPORT fact, independent of
+        // any secondary's role/operational state. The setup peer's
+        // `relocate_primary_to` broadcasts `PrimaryChanged { Transferred }`
+        // over the links `wait_for_connections` already established to the
+        // connected fleet; the promoted destination uses the same routable
+        // mesh for its operational broadcasts. The promoted destination
+        // additionally awaits `MeshReady` (peer mesh settled) on its own arm
+        // AFTER it has sent the initial assignment — the setup peer does NOT
+        // (gating its relocate on a secondary-operational signal it never
+        // triggers is a circular deadlock; see the role branch below). ──────
 
         // Phase 3: Send peer lists.
         self.send_peer_lists().await?;
@@ -2795,22 +2802,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // holds. Both roles pass here.
         self.rebroadcast_full_roster().await;
 
-        // Phase 6.5: Wait for every connected secondary to report its
-        // peer-mesh has settled before the role branch acts. Pre-fix the
-        // `PrimaryChanged` announcement fired ~750µs after cert-exchange
-        // completed — the newly-named primary then became authoritative
-        // against a still-forming peer mesh (per-peer dial budget: 10s QUIC +
-        // 10s WSS) and every pre-mesh-formation peer-broadcast routed into the
-        // void for the duration. Holding until every secondary signals
-        // `MeshReady` (mesh formed, watchdog elapsed, or single-secondary
-        // instant) is the event-driven "wait until the mesh is real". Bounded
-        // by `config.mesh_ready_timeout` (warning + proceed on straggler,
-        // never deadlock). This is the BINDING CONSTRAINT for the setup peer's
-        // relocate: its `PrimaryChanged { Transferred }` (and the promoted
-        // destination's self-announce in `activate_local_primary`) only warm
-        // each replica's role cache to a real connection once the mesh has
-        // settled here.
-        self.wait_for_mesh_ready(&mut command_rx).await?;
+        // Mesh-readiness is NOT gated here (transport ⊥ role/operational).
+        // `MeshReady` is the secondary's report that its peer-mesh settled,
+        // and a secondary only emits it from its OPERATIONAL loop — which it
+        // reaches only after `wait_for_setup` consumes an `InitialAssignment`.
+        // Under mesh-always the SETUP PEER never sends one (it relocates the
+        // role away in the branch below); the InitialAssignment is the
+        // operational primary's (the relocate TARGET's) concern. So gating the
+        // setup peer's relocate on `MeshReady` is a circular deadlock —
+        // wait_for_mesh_ready ⇒ secondary-operational ⇒ InitialAssignment ⇒
+        // operational-primary ⇒ relocation ⇒ blocked behind the wait. The
+        // event the gate actually protects (the role announce landing on a
+        // settled peer mesh) is observed where it is satisfiable: the
+        // `BootstrapRole::PromotedDestination` arm runs `wait_for_mesh_ready`
+        // AFTER it has sent `InitialAssignment` + `TransferComplete`, by which
+        // point the secondaries it just drove operational can emit `MeshReady`
+        // over the REAL mesh. The peer-mesh links themselves form at the Node
+        // mesh-pump (dialed off `PeerInfo`, see `send_peer_lists` above) — a
+        // transport fact independent of any secondary's operational state, so
+        // the setup peer's `PrimaryChanged { Transferred }` already routes over
+        // the live links to the connected fleet `wait_for_connections`
+        // established.
 
         // Phase 4.5 (UNCONDITIONAL): ship the cold-start seed to the fleet.
         // Drains the staged `PhaseDepsSet` + `TaskAdded` fan-out (+ the #2
@@ -3020,6 +3032,32 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 if self.mesh_pump_gone {
                     return self.bail_to_finalize(command_rx).await;
                 }
+
+                // Phase 6.5: wait for the peer mesh to settle before this
+                // operational primary asserts authority and starts driving
+                // dispatch over it. The `PrimaryChanged` self-announce
+                // (`activate_local_primary`) and every subsequent operational
+                // broadcast route over the QUIC peer mesh; the pre-fix gap fired
+                // the announce ~750µs after cert-exchange, against a
+                // still-forming mesh (per-peer dial budget: 10s QUIC + 10s WSS),
+                // so every pre-mesh-formation peer-broadcast routed into the void
+                // for the duration. Holding until every secondary signals
+                // `MeshReady` (mesh formed, watchdog elapsed, or single-secondary
+                // instant) is the event-driven "wait until the mesh is real",
+                // bounded by `config.mesh_ready_timeout` (warning + proceed on
+                // straggler, never deadlock).
+                //
+                // Non-circular HERE (unlike the old unconditional pre-branch
+                // placement): this runs AFTER `perform_initial_assignment` +
+                // `send_transfer_complete` above, so the secondaries this primary
+                // just drove operational can reach their `process_tasks` loop and
+                // emit `MeshReady`. The gate belongs on THIS
+                // `BootstrapRole::PromotedDestination` arm only — an operational
+                // primary that has already sent the assignment is the sole role
+                // for which `MeshReady` is satisfiable. The setup peer (which
+                // relocated the role away without ever sending an assignment)
+                // must NOT gate on it.
+                self.wait_for_mesh_ready(&mut command_rx).await?;
 
                 // Put the command-channel receiver back on `self` so
                 // `operational_loop`'s own `self.command_rx.take()` picks it up
