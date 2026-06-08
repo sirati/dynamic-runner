@@ -141,6 +141,27 @@ impl PyDistributedManager {
         // identically.
         let forwarded_argv = self.forwarded_argv.clone();
         let source_pre_staged_root = self.source_pre_staged_root.clone();
+        // In-process `--source-already-staged` signal. Unlike the SLURM
+        // submitter (which relocates), the in-process primary stays LOCAL
+        // (StayLocal) — but it still OWES discovery: it has the host fs, so it
+        // seeds `DiscoveryDebt=Owed` (via `SeedSource::RelocatedSeed`) and runs
+        // `discover_on_promotion` ITSELF (the driver gates on the marker, not
+        // on relocation). The COLD in-process path (no `--source-already-staged`)
+        // discovers the corpus upfront in Python and cold-seeds it, so it is
+        // `Settled` from t0 and unaffected. Captured as a bool here because
+        // `source_pre_staged_root` moves into `PrimaryConfig` inside the
+        // detached-runtime closure before the seed is built.
+        let source_pre_staged = source_pre_staged_root.is_some();
+        // Discovery-policy captures for the in-process local primary's
+        // `discover_on_promotion` (the GIL-thread capture pattern, mirroring
+        // `make_on_phase_*`): the task definition + args + the staged-corpus
+        // root. In-process shares one fs, so the corpus root IS
+        // `source_pre_staged_root` (the path Python passed via
+        // `--source-already-staged`). `None` on the cold path (the policy is
+        // never built then).
+        let discovery_task_definition_py = self.task_definition.clone_ref(py);
+        let discovery_task_args_py = self.task_args.clone_ref(py);
+        let discovery_root = source_pre_staged_root.clone();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -592,11 +613,13 @@ impl PyDistributedManager {
                     peer_timeout: dist_peer_timeout,
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
-                    // `--source-already-staged` is a dispatch-layer
-                    // discriminator threaded through the constructor's
-                    // `source_pre_staged_root` kwarg and hoisted onto the
-                    // PrimaryConfig; it drives the secondary's pre-staged
-                    // binary resolution (the bind-mount IS the contract).
+                    // `--source-already-staged` threaded onto the PrimaryConfig
+                    // as the staging root. Under mesh-always the in-process
+                    // primary OWES discovery on this marker: the
+                    // `SeedSource::RelocatedSeed` below declares
+                    // `DiscoveryDebt=Owed` and the discovery policy registered
+                    // above lets `discover_on_promotion` walk this root on the
+                    // host fs and seed the tasks (no relocation — StayLocal).
                     source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
@@ -685,6 +708,28 @@ impl PyDistributedManager {
                     primary.register_task_completed_listener(listener);
                 }
 
+                // In-process `--source-already-staged`: register the consumer's
+                // discovery policy on the LOCAL primary. The relocated-seed
+                // below declares `DiscoveryDebt=Owed`, so `discover_on_promotion`
+                // (fired in `run_pipeline` post-connect) runs this policy on the
+                // host fs and seeds the discovered tasks. Built only on the
+                // pre-staged path — the cold path is `Settled` from t0 and the
+                // driver short-circuits, so registering it there would be inert
+                // anyway, but we skip the GIL-thread closure build entirely.
+                if source_pre_staged {
+                    primary.register_setup_discovery(
+                        dynrunner_manager_distributed::SetupDiscovery {
+                            discover:
+                                crate::managers::secondary::run::build_setup_discovery_fn(
+                                    discovery_task_definition_py,
+                                    discovery_task_args_py,
+                                    discovery_root,
+                                ),
+                            phase_deps: phase_deps.clone(),
+                        },
+                    );
+                }
+
                 // Panik watcher for the in-process primary. Each
                 // in-process secondary spawn_local closure above also
                 // wires its own watcher — every coordinator on this
@@ -741,6 +786,20 @@ impl PyDistributedManager {
                 // role-agnostic terminal (+ counts).
                 let (node, _node_promo_tx) = Node::new(pri_mesh);
                 let node = node.with_primary(primary, pri_slot);
+                // Construct the typed seed at the boundary from the pre-staged
+                // signal (a construction-site decision, NOT a runtime flag-if
+                // inside the coordinator). Pre-staged: originate ONLY the phase
+                // graph + `DiscoveryDebt=Owed`; the local primary discovers the
+                // staged corpus via the policy registered above. Cold: the
+                // corpus was discovered upfront in Python and is cold-seeded.
+                let seed = if source_pre_staged {
+                    SeedSource::RelocatedSeed { phase_deps }
+                } else {
+                    SeedSource::ColdStart {
+                        binaries: rust_binaries,
+                        phase_deps,
+                    }
+                };
                 let inputs: NodeRunInputs<
                     SubprocessWorkerFactory,
                     dynrunner_scheduler::ResourceStealingScheduler,
@@ -748,10 +807,7 @@ impl PyDistributedManager {
                     RunnerIdentifier,
                 > = NodeRunInputs {
                     primary_run_args: Some(PrimaryRunArgs {
-                        seed: SeedSource::ColdStart {
-                            binaries: rust_binaries,
-                            phase_deps,
-                        },
+                        seed,
                         on_phase_start,
                         on_phase_end,
                     }),

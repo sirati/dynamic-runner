@@ -1,19 +1,20 @@
 """Regression pins for `_forwarded_argv.filter_framework_argv`.
 
-The bug this guards against (Tier-2 setup-promote dispatch repro):
+The bug this guards against (pre-staged dispatch repro):
 ``--multi-computer slurm --source-already-staged ...`` discovered
 ``tasks=0`` whenever the user supplied task-side filter flags
 (e.g. ``--platform x64 --compiler gcc --name-regex foo``) on the
 dispatcher CLI. Root cause: the SLURM wrapper plumbed only
-``--cores`` and ``--max-memory`` through to the secondary, dropping
-every other user-supplied argv token. The setup-promoted secondary
-then ran ``task.discover_items`` against the full corpus and reported
-zero matches because its argparse never saw the filter flags.
+``--cores`` and ``--max-memory`` through to the joining node, dropping
+every other user-supplied argv token. The run's primary (which owns
+discovery on the staged corpus via ``discover_on_promotion``) then ran
+``task.discover_items`` and reported zero matches because the delivered
+run-config never carried the filter flags.
 
 The fix forwards ``sys.argv[1:]`` (minus the framework-regenerated
-flags the wrapper emits afresh) to the secondary's container_command.
-This module owns the filter; the layers below it are dumb data
-carriers.
+flags the wrapper emits afresh) to the joining node's
+container_command. This module owns the filter; the layers below it
+are dumb data carriers.
 
 unittest-based — pytest is not in the dev shell, so we stay stdlib
 to keep the test runnable from any environment.
@@ -411,7 +412,7 @@ class ReparseFinalizerTests(unittest.TestCase):
         args._boot_argv = list(boot_argv)
         args.forwarded_argv = []
         args.resolved_output_root = "/tmp/out"
-        args._setup_deferred_to_secondary = False
+        args._discovery_deferred_to_primary = False
         return task, args
 
     def test_reparse_splices_boot_and_delivered_into_complete_namespace(self) -> None:
@@ -438,7 +439,7 @@ class ReparseFinalizerTests(unittest.TestCase):
         finalize = _run.make_reparse_finalizer(task, "test", args)
         reparsed = finalize(["--platform", "arm"])
         self.assertEqual(reparsed.resolved_output_root, "/tmp/out")
-        self.assertFalse(reparsed._setup_deferred_to_secondary)
+        self.assertFalse(reparsed._discovery_deferred_to_primary)
         self.assertEqual(reparsed._boot_argv, ["--cores", "2"])
 
     def test_reparse_empty_delivered_is_byte_identical_to_boot_parse(self) -> None:

@@ -1,10 +1,12 @@
-"""Filter ``sys.argv[1:]`` for forwarding to a setup-promoted secondary.
+"""Filter ``sys.argv[1:]`` for forwarding to a joining cluster node.
 
-Single concern: given the dispatcher's argv, return the subset the
-secondary's argparse should re-parse on its own. The secondary uses
-the same parser (``build_arg_parser + task.add_task_arguments``) so
-anything that parsed on the dispatcher will re-parse identically on
-the secondary — *except* two categories of flag this filter drops:
+Single concern: given the dispatcher's argv, return the subset a
+joining node's argparse should re-parse on its own (the run-config
+delivered post-welcome; consumed by any node, including one later
+promoted to primary). The node uses the same parser
+(``build_arg_parser + task.add_task_arguments``) so anything that
+parsed on the dispatcher will re-parse identically on the joining
+node — *except* two categories of flag this filter drops:
 
   * **framework-regenerated value flags** (``--secondary``,
     ``--secondary-id``, ``--secondary-quic-port``, ``--src-network``,

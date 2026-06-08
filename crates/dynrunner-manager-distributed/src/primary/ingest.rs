@@ -264,12 +264,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// seed reuses that staging field). The local apply lands the marker on
     /// THIS node so the seed is coherent with its own ledger even before the
     /// broadcast reaches the fleet.
-    // The PRODUCTION caller (the mode-2 submitter + the in-process
-    // `--source-already-staged` pre-staged path) is wired in Phase 5c (the
-    // pyo3 recipe + in-process rewire); 5b builds the Rust mechanism + the
-    // test caller (`primary/tests/setup_promote.rs`). The lib target sees no
-    // production call until 5c, so allow dead_code here meanwhile.
-    #[allow(dead_code)]
+    // The PRODUCTION caller is the `run_pipeline` `SeedSource::RelocatedSeed`
+    // match arm (`primary/coordinator.rs`), reached when the pyo3 layer
+    // constructs that variant from the pre-staged signal — the mode-2 SLURM
+    // submitter (`managers/primary/run.rs`) and the in-process
+    // `--source-already-staged` local primary (`managers/distributed/run.rs`).
     pub(crate) fn originate_relocated_seed(
         &mut self,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,

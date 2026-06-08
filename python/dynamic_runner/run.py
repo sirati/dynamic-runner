@@ -104,21 +104,22 @@ def run(
     # Stash the boot argv (the tokens THIS process parsed, minus any
     # forwarded run-config the boot CLI omits) as a dispatch-time-only
     # attribute, consistent with the `args.forwarded_argv` /
-    # `args._setup_deferred_to_secondary` pattern. The secondary's deferred
-    # run-config finalize re-parses `[*boot_argv, *delivered_forwarded_argv]`
-    # once the primary's post-welcome push delivers the forwarded slice, so
-    # `dispatch`'s signature stays unchanged. On the `args=` path the boot
-    # argv is empty (the consumer's namespace is already complete).
+    # `args._discovery_deferred_to_primary` pattern. The joining node's
+    # deferred run-config finalize re-parses `[*boot_argv,
+    # *delivered_forwarded_argv]` once the primary's post-welcome push delivers
+    # the forwarded slice, so `dispatch`'s signature stays unchanged. On the
+    # `args=` path the boot argv is empty (the consumer's namespace is already
+    # complete).
     args._boot_argv = list(parse_argv)
 
     # Stash the dispatcher's argv-minus-framework-regenerated-flags so
     # the SLURM wrapper can forward task-specific filter args
     # (e.g. `--platform`, `--compiler`, `--name-regex`) verbatim to
-    # the setup-promoted secondary. Filtering is centralised in
+    # the joining node. Filtering is centralised in
     # `_forwarded_argv.filter_framework_argv`; every layer below this
     # is a dumb data carrier. Computed unconditionally — `args` already
     # carries other dispatch-time-only attributes (`resolved_output_root`,
-    # `_setup_deferred_to_secondary`) and the non-SLURM dispatch paths
+    # `_discovery_deferred_to_primary`) and the non-SLURM dispatch paths
     # simply ignore the field.
     args.forwarded_argv = filter_framework_argv(forward_source)
 
@@ -149,7 +150,7 @@ def run(
 _DISPATCH_TIME_ATTRS = (
     "forwarded_argv",
     "resolved_output_root",
-    "_setup_deferred_to_secondary",
+    "_discovery_deferred_to_primary",
     "_boot_argv",
 )
 
@@ -343,10 +344,13 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     print from inside `discover_items` directly.
 
     Pre-staged-source mode (`--source-already-staged <path>`) defers
-    discovery to the cluster secondary that has the staged path
-    bind-mounted as `src_network`. The submitter has no local view
-    of those files, so we return an empty list.
-    `args._setup_deferred_to_secondary` is set so dispatch helpers can
+    discovery to the PRIMARY that owns the run's CRDT — a SLURM-relocated
+    compute-peer primary, or the in-process local primary — which has the
+    staged corpus on its filesystem. The submitter has no local view of
+    those files, so we return an empty list; the relocated/local primary
+    seeds `DiscoveryDebt=Owed` and runs `discover_items` itself
+    (`discover_on_promotion`) to seed the cluster ledger.
+    `args._discovery_deferred_to_primary` is set so dispatch helpers can
     distinguish "intentionally empty" from "task discovered nothing" —
     only the latter is a useful no-op.
     """
@@ -359,9 +363,9 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     if getattr(args, "source_already_staged", None):
         logger.info(
             "Pre-staged source mode: deferring task discovery to the "
-            "setup-promoted secondary."
+            "run's primary (relocated compute peer or in-process local)."
         )
-        args._setup_deferred_to_secondary = True
+        args._discovery_deferred_to_primary = True
         return []
 
     logger.info("Discovering items via task.discover_items(...)")
@@ -813,10 +817,11 @@ def _dispatch_single_process(task, args, config, logger) -> None:
 
     binaries = _collect_binaries(task, args, config)
     # Pre-staged-source mode hands the manager an empty list on
-    # purpose; the setup-promoted secondary will run discovery and
-    # seed the cluster ledger. The "no binaries to process" no-op is
-    # only correct when discovery actually ran and found nothing.
-    if not binaries and not getattr(args, "_setup_deferred_to_secondary", False):
+    # purpose; the in-process local primary owes discovery
+    # (`DiscoveryDebt=Owed`) and runs it itself to seed the cluster
+    # ledger. The "no binaries to process" no-op is only correct when
+    # discovery actually ran and found nothing.
+    if not binaries and not getattr(args, "_discovery_deferred_to_primary", False):
         logger.info("No binaries to process")
         return
 
@@ -866,12 +871,13 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         memprofile_enabled=getattr(args, "memprofile", False),
     )
     # Pre-staged-source plumbing: `_collect_binaries` already returned
-    # `[]` and set `args._setup_deferred_to_secondary` when
+    # `[]` and set `args._discovery_deferred_to_primary` when
     # `args.source_already_staged` is set. The string path goes
     # through to the Rust pyfunction's `Option<PathBuf>` kwarg
-    # uniformly with the SLURM and local-multi-computer paths; it drives
-    # the secondary's pre-staged binary resolution (the bind-mount IS
-    # the contract).
+    # uniformly with the SLURM and local-multi-computer paths; the
+    # in-process run constructs `SeedSource::RelocatedSeed`
+    # (`DiscoveryDebt=Owed`) and the local primary's
+    # `discover_on_promotion` walks the staged root on the host fs.
     # `unfulfillable_reinject_max_per_task` is the CLI knob plumbed
     # uniformly through every primary path; the in-process distributed
     # manager mints its `PrimaryHandle` from a shared
@@ -917,9 +923,10 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     config = process_selection_arguments(args)
     binaries = _collect_binaries(task, args, config)
     # See `_dispatch_single_process` for the pre-staged-mode rationale:
-    # an empty list in pre-staged mode is the intended setup-promote
-    # signal, not a "nothing to process" no-op.
-    if not binaries and not getattr(args, "_setup_deferred_to_secondary", False):
+    # an empty list in pre-staged mode is the intended discovery-deferred
+    # signal (the relocated compute-peer primary discovers the corpus),
+    # not a "nothing to process" no-op.
+    if not binaries and not getattr(args, "_discovery_deferred_to_primary", False):
         logger.info("No binaries to process")
         return
 
@@ -935,9 +942,10 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     )
     # Pre-staged-source plumbing — see `_dispatch_single_process` for
     # the rationale; `run_primary` forwards the kwarg into the inner
-    # `RustPrimaryCoordinator(source_pre_staged_root=...)`, which drives
-    # the secondary's pre-staged binary resolution (the bind-mount IS
-    # the contract).
+    # `RustPrimaryCoordinator(source_pre_staged_root=...)`, which makes the
+    # submitter originate `SeedSource::RelocatedSeed` (`DiscoveryDebt=Owed`)
+    # and relocate; the promoted compute-peer primary's
+    # `discover_on_promotion` discovers the staged corpus and seeds it.
     unfulfillable_cap = getattr(args, "unfulfillable_reinject_max_per_task", None)
     # Build the respawn-pipeline wiring from the CLI knobs. The
     # `_build_respawn_args` helper centralises the policy +

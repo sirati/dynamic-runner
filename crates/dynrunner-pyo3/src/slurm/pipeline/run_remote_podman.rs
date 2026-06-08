@@ -194,7 +194,7 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
     let resolved_output = slurm_config.call_method0("get_output_dir")?;
     args.setattr("resolved_output_root", resolved_output.str()?)?;
 
-    // ---- Discover items (or defer to setup-promoted secondary). ----
+    // ---- Discover items (or defer to the relocated compute-peer primary). ----
     let binaries = PyList::empty(py);
     if !attr_truthy(args, "source_already_staged") {
         for item in task
@@ -210,9 +210,12 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
             )?;
         }
     } else {
+        // Pre-staged: the submitter passes empty binaries; the primary
+        // relocates onto a compute peer that has the staged corpus and runs
+        // `discover_on_promotion` to seed the tasks (DiscoveryDebt=Owed).
         log.call_method1(
             "info",
-            ("Pre-staged source mode: deferring task discovery to the setup-promoted secondary.",),
+            ("Pre-staged source mode: deferring task discovery to the relocated compute-peer primary.",),
         )?;
     }
 

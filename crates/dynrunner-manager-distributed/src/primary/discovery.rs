@@ -26,7 +26,7 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DiscoveryDebt};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::wire::compute_task_hash;
-use crate::primary::{PrimaryCoordinator, RunError};
+use crate::primary::{PrimaryCoordinator, RelocationPolicy, RunError};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Mode-2 discover-on-promotion. Fires at most once, ONLY when the CRDT
@@ -47,17 +47,36 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// NoOp-on-duplicate, so even a re-run after a partial broadcast
     /// converges.
     ///
-    /// Inert on every non-relocated primary: a cold mode-1 / legacy run
-    /// never declares debt (`discovery_debt() == Undeclared`), so the gate
-    /// short-circuits and no policy is consulted. The driver ends with
-    /// [`Self::hydrate_from_cluster_state`] — the SOLE pool builder — so THIS
-    /// primary's pool holds the discovered tasks without duplicating the
-    /// receive-path rebuild (`apply_and_broadcast_cluster_mutations` grows
-    /// `cluster_state` but does NOT rebuild the pool).
+    /// Inert on every non-debt primary: a cold mode-1 / legacy run never
+    /// declares debt (`discovery_debt() == Undeclared`), so the gate
+    /// short-circuits and no policy is consulted. It is ALSO inert on a
+    /// [`RelocationPolicy::RelocateToComputePeer`] primary even when it owes
+    /// debt: that primary is the mode-2 bootstrap submitter, which seeded the
+    /// `Owed` marker only to HAND it to the compute peer it relocates to (the
+    /// submitter has no corpus + no discovery policy). Discovery is owed by the
+    /// primary that STAYS — the relocate TARGET (built `StayLocal` by the
+    /// promotion recipe, which inherits the `Owed` marker via its snapshot and
+    /// carries the registered discovery policy), or the in-process `StayLocal`
+    /// local primary. So the driver fires only on a `StayLocal` primary that
+    /// owes debt; a relocating submitter hands the marker on untouched.
+    ///
+    /// The driver ends with [`Self::hydrate_from_cluster_state`] — the SOLE
+    /// pool builder — so THIS primary's pool holds the discovered tasks
+    /// without duplicating the receive-path rebuild
+    /// (`apply_and_broadcast_cluster_mutations` grows `cluster_state` but does
+    /// NOT rebuild the pool).
     pub(crate) async fn discover_on_promotion(&mut self) -> Result<(), RunError> {
         if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed {
             // Not a relocated / pre-staged primary, or discovery already
             // settled (re-promotion after a prior origination). NO-OP.
+            return Ok(());
+        }
+        if self.relocation_policy == RelocationPolicy::RelocateToComputePeer {
+            // The mode-2 bootstrap submitter: it seeded `Owed` only to relocate
+            // the role (and the marker) to a compute peer that owns the corpus
+            // and the discovery policy. The submitter never discovers — the
+            // `StayLocal` relocate target does, on the same `Owed` marker it
+            // inherits. NO-OP here (the relocate fires at the bootstrap tail).
             return Ok(());
         }
         let Some(mut sd) = self.setup_discovery.take() else {
