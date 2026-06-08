@@ -3,9 +3,10 @@
 //! These re-create the observer-behaviour contract Wave 0 removed from
 //! `relocate_observe.rs` / `crdt_convergence.rs`, now targeting the
 //! standalone coordinator: run-complete / run-aborted / panik exits, the
-//! three strand backstops (fleet-dead, primary-silence, setup-promote
-//! deadline), CRDT narration, snapshot recovery, and the BUG-1/4/5/7
-//! fixes. Each test builds the observer via [`ObserverCoordinator::new`]
+//! BUG-B lost-visibility contract (visibility loss is reported + retried,
+//! NEVER a run verdict — the observer keeps observing and exits only on the
+//! primary's observed terminal), CRDT narration, snapshot recovery, and the
+//! BUG-1/4/5/7 fixes. Each test builds the observer via [`ObserverCoordinator::new`]
 //! over a real [`ChannelPeerTransport`] (or a minimal feed), drives the
 //! single `run()` loop, and asserts on its terminal / `Err` / emitted
 //! narration. The relocation/handoff e2e is a LATER wave's concern.
@@ -139,10 +140,10 @@ fn transport_with_peers(
 ///     via `apply_local_dispatch` → the wire (`send_to_peer`/`broadcast`),
 ///     so a test draining a peer outbox still observes the observer's sends.
 ///   - MEMBERSHIP: the pump publishes the live transport cardinality each
-///     cycle (and ONCE upfront, before the observer's first `evaluate_exit`,
-///     so the strand guards read the real peer count rather than the
-///     fresh-view 0). The channel transport's membership is static for a
-///     test's lifetime (peers held by the `PeerKeepalive`).
+///     cycle (and ONCE upfront, before the observer's first visibility
+///     check, so the visibility classifier reads the real peer count rather
+///     than the fresh-view 0). The channel transport's membership is static
+///     for a test's lifetime (peers held by the `PeerKeepalive`).
 #[allow(clippy::type_complexity)]
 fn observer_mesh(
     transport: ChannelPeerTransport<TestId>,
@@ -222,50 +223,93 @@ async fn observer_returns_on_run_complete() {
         .await;
 }
 
-/// Fleet-dead grace (§1): zero peers + no RunComplete ⇒ exit `Err`
-/// (fleet-dead) after `fleet_dead_timeout`, never hang.
+/// BUG-B: zero peers + no RunComplete (the observer lost ALL visibility —
+/// its `-R` setup tunnel dropped) must NOT collapse the run. The observer
+/// carries zero authority: it reports lost + keeps observing, and
+/// terminates ONLY on the PRIMARY's observed RunComplete. Asserts (a) the
+/// observer does NOT return early / strand while the fleet is empty, (b) it
+/// exits `Ok(Done)` once RunComplete converges over the (later-arriving)
+/// inbound — NEVER `Err(ClusterCollapsed)`.
+///
+/// Drives the REAL run loop end-to-end (no pre-built shortcut): the
+/// observer starts with zero peers and no terminal, sits through several
+/// fleet-empty re-check ticks (the window that USED to strand), then the
+/// test feeds a live `RunComplete` over the inbound — the observer's own
+/// recv-arm applies it and exits Done. A revert (re-adding the §5/§6
+/// strand-exit) makes this fail: the observer would `Err(ClusterCollapsed)`
+/// before the RunComplete arrives, so the `expect("…Done")` trips.
 #[tokio::test(flavor = "current_thread")]
-async fn observer_exits_on_dead_fleet() {
+async fn observer_does_not_collapse_on_dead_fleet_exits_on_observed_run_complete() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
     tokio::time::timeout(Duration::from_secs(5), async {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
+                // Zero peers: the observer's transport view is empty for the
+                // whole run (the by-design setup-tunnel drop).
+                let (transport, inbound, _peers) = transport_with_peers("obs", 0);
                 let cs = ClusterState::<TestId>::new();
+                let mut config = observer_config("obs");
+                // Tiny re-check cadence so many fleet-empty ticks elapse in
+                // the window the pre-fix strand grace would have fired in —
+                // proving the observer rides through instead of stranding.
+                config.fleet_dead_timeout = Duration::from_millis(10);
                 let (client, inbox, pump) = observer_mesh(transport, "obs");
                 tokio::task::spawn_local(pump);
-                let mut observer =
-                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
-                let err = observer
-                    .run()
-                    .await
-                    .expect_err("dead fleet with no RunComplete must exit Err");
-                // The strand backstop is typed `ClusterCollapsed` (a STRUCTURED
-                // error that the PyO3 boundary RAISES on — the §14/§15 contract:
-                // a strand must surface non-zero, never the `Other` swallow).
-                // The "fleet-dead" detail rides the tracing log, not the
-                // Display; the structural assertion is the variant.
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+
+                // Feed RunComplete over the LIVE inbound after a delay that is
+                // many times the (former) strand grace, so a regressed
+                // strand-exit would have already fired by the time it lands.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "primary".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::RunComplete],
+                    });
+                });
+
+                let terminal = observer.run().await.expect(
+                    "a fleet-empty observer must NOT collapse the run — it keeps observing \
+                     and exits on the PRIMARY's observed RunComplete, never \
+                     Err(ClusterCollapsed)",
+                );
                 assert!(
-                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
-                    "dead-fleet exit must surface a structured ClusterCollapsed strand: {err}"
+                    matches!(terminal, ObserverTerminal::Done),
+                    "the run verdict is the primary's RunComplete (Done), not the observer's \
+                     view: got {terminal:?}"
                 );
             })
             .await;
     })
     .await
-    .expect("the dead-fleet observer must terminate, not hang");
+    .expect("the fleet-empty observer must observe RunComplete + exit, not hang");
 }
 
-/// Primary-silence backstop (§2): a NAMED primary goes silent (resident
-/// peer, no RunComplete) ⇒ exit `Err` (stranded) within `peer_timeout`,
-/// never hang. peer_count == 1 so the fleet-dead arm can never fire.
+/// BUG-B: a NAMED primary going silent (resident peer, no RunComplete) past
+/// `peer_timeout` must NOT strand the run. A silent primary from the
+/// observer's vantage means the observer lost ITS path to the primary's
+/// signals — NOT that the cluster died (the primary is reachable from its
+/// own mesh). The observer reports lost-visibility and keeps observing,
+/// terminating only on the primary's observed RunComplete — never
+/// `Err(ClusterCollapsed)`. peer_count == 1 throughout so this exercises the
+/// half-open-link silence path specifically.
+///
+/// Drives the REAL run loop: the observer sits through the silence window
+/// (which the pre-fix §6 backstop would have stranded in), then the test
+/// feeds a live `RunComplete` and the observer exits Done. Revert (re-add
+/// the §6 strand-exit) → the observer Errs before RunComplete lands → the
+/// `expect("…Done")` trips.
 #[tokio::test(flavor = "current_thread")]
-async fn observer_exits_on_silent_primary_with_resident_peer() {
+async fn observer_does_not_strand_on_silent_primary_exits_on_observed_run_complete() {
+    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation as CM;
     tokio::time::timeout(Duration::from_secs(5), async {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
+                let (transport, inbound, _peers) = transport_with_peers("obs", 1);
                 let mut cs = ClusterState::<TestId>::new();
                 cs.apply(ClusterMutation::PrimaryChanged {
                     new: "sec-0".into(),
@@ -273,36 +317,41 @@ async fn observer_exits_on_silent_primary_with_resident_peer() {
                     reason: PrimaryChangeReason::Transferred,
                 });
                 let mut config = observer_config("obs");
-                // Short silence threshold; fleet-dead cadence (= re-check
-                // tick) smaller still so the loop re-evaluates the silence
-                // backstop before peer_timeout's deadline.
-                config.peer_timeout = Duration::from_millis(80);
-                config.fleet_dead_timeout = Duration::from_millis(30);
+                // Short silence threshold + smaller re-check cadence so the
+                // observer crosses the (former) §6 strand window well before
+                // the RunComplete arrives.
+                config.peer_timeout = Duration::from_millis(40);
+                config.fleet_dead_timeout = Duration::from_millis(10);
                 let (client, inbox, pump) = observer_mesh(transport, "obs");
                 tokio::task::spawn_local(pump);
                 let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
-                let err = observer
-                    .run()
-                    .await
-                    .expect_err("silent named primary must exit Err");
-                // Typed `ClusterCollapsed` (a STRUCTURED strand the PyO3
-                // boundary RAISES on — §14/§15). The silent-primary id rides
-                // the tracing log (the `detail`), not the Display; the
-                // structural assertion is the variant + the "stranded"
-                // accounting the Display still renders.
-                assert!(
-                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
-                    "the silence exit must surface a structured ClusterCollapsed strand: {err}"
+
+                // RunComplete lands AFTER the silence window — the observer
+                // must have ridden through it (report-and-retry), not
+                // stranded, to still be alive to observe it.
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let _ = inbound.send(DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "sec-0".into(),
+                        timestamp: 0.0,
+                        mutations: vec![CM::RunComplete],
+                    });
+                });
+
+                let terminal = observer.run().await.expect(
+                    "a silent-primary observer must NOT strand — it keeps observing and exits \
+                     on the PRIMARY's observed RunComplete, never Err(ClusterCollapsed)",
                 );
                 assert!(
-                    err.to_string().contains("stranded"),
-                    "the strand Display still renders the stranded accounting: {err}"
+                    matches!(terminal, ObserverTerminal::Done),
+                    "the run verdict is the primary's RunComplete (Done): got {terminal:?}"
                 );
             })
             .await;
     })
     .await
-    .expect("the silent-primary observer must terminate via the backstop, not hang");
+    .expect("the silent-primary observer must ride through + exit on RunComplete, not hang");
 }
 
 /// The observer narrates phases + exactly one completion summary from the
@@ -622,8 +671,9 @@ async fn observer_panik_arm_returns_panik_terminal() {
                 let mut config = observer_config("obs");
                 config.panik_watcher_paths = vec![panik_path.clone()];
                 config.panik_watcher_poll_interval = Duration::from_millis(20);
-                // Keep the strand backstops far out so the panik arm is the
-                // only exit path.
+                // Resident peer (peer_count==1) so visibility stays Visible;
+                // slow re-check cadence so nothing competes with the panik
+                // arm. The panik arm is the only exit path here.
                 config.fleet_dead_timeout = Duration::from_secs(60);
                 config.peer_timeout = Duration::from_secs(60);
 
@@ -1446,8 +1496,8 @@ async fn peer_digests_pruned_on_peer_removed() {
 
 /// #235 observer half (primitive): `emit_terminal_reason_important` lands
 /// exactly one event on the importance channel, carrying the terminal
-/// reason. This is the single emit site every exit arm (strand backstop,
-/// setup-deadline, fatal-policy, panik) routes through; the synchronous,
+/// reason. This is the single emit site the observer's LOCAL terminal arms
+/// (fatal-policy, panik) route through; the synchronous,
 /// yield-free drive (no `.await` between subscriber install and emit) makes
 /// the importance assertion immune to the cross-test per-callsite Interest
 /// cache poisoning — the documented requirement for `capture_important`.
@@ -1479,80 +1529,43 @@ async fn emit_terminal_reason_lands_on_important_channel() {
         .await;
 }
 
-/// #235 observer half (end-to-end): the strand backstop arm, when it fires
-/// inside the real `run()` loop, emits the terminal reason on the importance
-/// channel — covering the fully-partitioned case where the observer can't
-/// receive the primary's `RunAborted` broadcast (so the narrator never
-/// projects an aborted summary). Drives the dead-fleet strand (the existing
-/// `observer_exits_on_dead_fleet` path) under a thread-local importance
-/// capture held across the await — the same `current_thread` single-thread
-/// capture idiom the failure-policy tests use.
-#[tokio::test(flavor = "current_thread")]
-async fn strand_arm_emits_terminal_reason_on_important_channel() {
-    use std::sync::{Arc, Mutex};
-    use tracing_subscriber::layer::SubscriberExt;
+/// BUG-B (report content): when the observer loses visibility, the report
+/// it emits on the importance channel is the operator-facing "lost
+/// connection — retrying" notice, and crucially NOT a "run terminated"
+/// reason — visibility loss is not a terminal. This is the EXACT emit the
+/// run loop produces: the run loop's only lost-visibility side effect is
+/// `LostVisibilityReporter::observe(Lost { .. })`, so driving that observe
+/// synchronously reproduces the loop's emission. Captured through the
+/// narrator's own `capture_important` idiom (a SYNCHRONOUS, yield-free
+/// drive with no `.await` between subscriber install and emit — the
+/// documented non-flaky requirement, immune to the cross-test per-callsite
+/// Interest cache poisoning that a `set_default`-across-`.await` capture
+/// flakes on).
+///
+/// The end-to-end "does not collapse + exits on the primary's RunComplete"
+/// behaviour is asserted separately by
+/// `observer_does_not_collapse_on_dead_fleet_exits_on_observed_run_complete`
+/// (which drives the real async `run()` loop). This test isolates the
+/// report CONTENT so the importance assertion stays deterministic.
+#[test]
+fn lost_visibility_report_is_retry_notice_not_a_run_terminal() {
+    use crate::observer::lost_visibility::{LostVisibilityReporter, Visibility};
 
-    struct ImportantMessages(Arc<Mutex<Vec<String>>>);
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ImportantMessages {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != dynrunner_core::IMPORTANT_TARGET {
-                return;
-            }
-            struct V(String);
-            impl tracing::field::Visit for V {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut v = V(String::new());
-            event.record(&mut v);
-            self.0.lock().unwrap().push(v.0);
-        }
-    }
+    let events = crate::test_capture::capture_important(|| {
+        let mut reporter = LostVisibilityReporter::new();
+        reporter.observe(&Visibility::Lost {
+            reason: "no reachable peer".to_string(),
+        });
+    });
 
-    let records: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let subscriber =
-        tracing_subscriber::Registry::default().with(ImportantMessages(Arc::clone(&records)));
-    let _guard = tracing::subscriber::set_default(subscriber);
-
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let (transport, _inbound, _peers) = transport_with_peers("obs", 0);
-                let cs = ClusterState::<TestId>::new();
-                let (client, inbox, pump) = observer_mesh(transport, "obs");
-                tokio::task::spawn_local(pump);
-                let mut observer =
-                    ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
-                let err = observer
-                    .run()
-                    .await
-                    .expect_err("dead fleet with no RunComplete must exit Err");
-                assert!(
-                    matches!(err, crate::primary::RunError::ClusterCollapsed { .. }),
-                    "dead-fleet exit must surface a structured ClusterCollapsed strand: {err}"
-                );
-            })
-            .await;
-    })
-    .await
-    .expect("the dead-fleet observer must terminate, not hang");
-
-    let captured = records.lock().unwrap().clone();
     assert!(
-        captured.iter().any(|m| m.contains("run terminated")),
-        "the strand backstop must emit the terminal reason on the importance \
-         channel (partitioned-observer backstop): {captured:?}"
+        events.iter().any(|e| e.message.contains("lost connection")),
+        "a lost-visibility observer must report lost-connection + retry on the \
+         importance channel: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.message.contains("run terminated")),
+        "visibility loss is NOT a run terminal — no 'run terminated' reason must be \
+         emitted for it: {events:?}"
     );
 }
