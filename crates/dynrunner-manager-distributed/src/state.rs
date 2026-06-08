@@ -34,9 +34,10 @@ pub struct SecondaryConnection<S> {
     /// to exclude this peer from `lowest_alive` candidate selection.
     pub is_observer: bool,
     /// Primary-capability marker, received in `SecondaryWelcome` (twin
-    /// of `is_observer`). An overlay-enabled compute secondary that can
-    /// host the primary role on demand advertises `true`; a no-mesh
-    /// host / observer advertises `false`. Persisted here so the post-
+    /// of `is_observer`). Under mesh-always (pillar 1) a network compute
+    /// secondary always holds a peer mesh, so it advertises `true`; only an
+    /// observer (or the in-process same-host secondary) advertises `false`.
+    /// Persisted here so the post-
     /// mesh roster re-broadcast (`rebroadcast_full_roster`) can re-emit
     /// the exact capability the welcome carried, without consulting a
     /// second source — this typestate is the single record of every

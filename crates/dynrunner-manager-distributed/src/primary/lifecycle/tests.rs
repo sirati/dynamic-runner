@@ -160,6 +160,7 @@ fn make_recording_coordinator(
         client,
         inbox,
         demote_rx,
+        crate::primary::RelocationPolicy::StayLocal,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

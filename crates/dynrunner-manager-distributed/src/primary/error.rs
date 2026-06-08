@@ -103,6 +103,16 @@ pub enum RunError {
         /// (e.g. the invalid-task monitor's threshold breach).
         reason: String,
     },
+    /// The bootstrap submitter is built `RelocationPolicy::RelocateToComputePeer`
+    /// (pillar 2: the primary always runs on a compute peer, never the
+    /// submitter) but found NO eligible compute peer to promote at the
+    /// bootstrap tail — `select_relocation_target` returned `None`. A run
+    /// with no promotable compute peer is an unsupported topology (e.g. every
+    /// secondary joined `can_be_primary = false`, or only observers are
+    /// present). Surfaced as a hard structured error rather than silently
+    /// keeping the submitter as the run's primary; the PyO3 boundary RAISES
+    /// it (never the `Other` swallow).
+    NoRelocationTarget,
     /// A runtime `spawn_tasks` batch (typically from `on_phase_end`)
     /// was REJECTED by the validator — every named task failed
     /// `UnknownDependency` / `DuplicateTaskHash` — so the framework
@@ -174,6 +184,15 @@ impl fmt::Display for RunError {
                 "run aborted by policy: {reason}. A run-loop policy (e.g. the \
                  observer's invalid-task monitor) signalled a deliberate non-zero \
                  exit — the run did not complete cleanly."
+            ),
+            Self::NoRelocationTarget => write!(
+                f,
+                "bootstrap could not relocate the primary role: no eligible \
+                 compute peer to promote (no alive worker-secondary advertised \
+                 `can_be_primary`). The submitter must NEVER stay the run's \
+                 primary (mesh-always pillar 2), so this topology is \
+                 unsupported — launch at least one compute peer that can host \
+                 the primary role (a real peer-mesh secondary, not an observer)."
             ),
             Self::SpawnRejected { rejected_task_ids } => {
                 // Cap the inline list so a large rejected batch doesn't

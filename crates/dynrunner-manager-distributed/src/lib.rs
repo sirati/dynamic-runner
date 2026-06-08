@@ -19,7 +19,9 @@ mod test_capture;
 
 pub use primary::staging::{StagingEntry, StagingError, compute_initial_staging_entries};
 pub use primary::wire::compute_task_hash;
-pub use primary::{PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RunError};
+pub use primary::{
+    PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RelocationPolicy, RunError,
+};
 pub use secondary::{
     DEFAULT_PRIMARY_SILENCE_BACKSTOP, FinalizeRunConfigFn, PeerCertInfo, RunOutcome,
     SecondaryConfig, SecondaryCoordinator, SecondaryTerminal, SetupDiscovery, SetupDiscoveryFn,

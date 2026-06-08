@@ -45,8 +45,8 @@ mod worker_lifecycle;
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, PrimaryMeshKeepalive, SlowFakeWorkerFactory, TestId,
-    build_test_primary, fake_secondary, fake_secondary_with_addrs, make_binary,
-    make_relative_binary, setup_test,
+    build_test_primary, build_test_primary_with_policy, fake_secondary, fake_secondary_with_addrs,
+    make_binary, make_relative_binary, setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;

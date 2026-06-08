@@ -9,7 +9,9 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
+use dynrunner_manager_distributed::{
+    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, RunError,
+};
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::identifier::RunnerIdentifier;
@@ -277,6 +279,14 @@ impl PyPrimaryCoordinator {
         // wrapper sees a non-zero exit instead of the silent rc=0 that
         // masked the dropped planned work.
         let mut spawn_rejected: Option<RunError> = None;
+        // No-relocation-target config error carried out of the detached tokio
+        // runtime. `Some(RunError::NoRelocationTarget)` iff this
+        // `RelocateToComputePeer` submitter found NO eligible compute peer to
+        // promote (pillar 2: the submitter must never stay the run's
+        // primary). The GIL-side tail raises a `PyRuntimeError` so the
+        // operator sees a clear non-zero exit naming the unsupported topology,
+        // never the `Other` swallow.
+        let mut no_relocation_target: Option<RunError> = None;
         // Relocated-observer cluster-abort carried out of the detached tokio
         // runtime. `Some(reason)` iff the submitter relocated and the
         // observer tail observed a cluster-wide `RunAborted`
@@ -396,6 +406,10 @@ impl PyPrimaryCoordinator {
                         pri_client,
                         pri_inbox,
                         demote_rx,
+                        // Pillar 2: the SLURM/network submitter must NEVER
+                        // stay the run's primary — it relocates the role to a
+                        // compute peer at the bootstrap tail.
+                        RelocationPolicy::RelocateToComputePeer,
                         scheduler_config.build_memory_scheduler(),
                         estimator,
                     );
@@ -575,6 +589,14 @@ impl PyPrimaryCoordinator {
                                 // variant exists to break.
                                 spawn_rejected = Some(e);
                             }
+                            e @ RunError::NoRelocationTarget => {
+                                // The RelocateToComputePeer submitter found no
+                                // eligible compute peer to promote. RAISE — the
+                                // submitter must NEVER stay primary (pillar 2);
+                                // a silent stay-local is exactly what this
+                                // errors out instead of.
+                                no_relocation_target = Some(e);
+                            }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
                                 // (exit 0): a genuinely-unexpected generic
@@ -672,6 +694,14 @@ impl PyPrimaryCoordinator {
             // masked the dropped planned work. Sequenced alongside the other
             // structured raises and before `cluster_collapsed` (no strand to
             // render — the work never entered the ledger).
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(err) = no_relocation_target {
+            // GIL is back. The RelocateToComputePeer submitter had no eligible
+            // compute peer to promote (pillar 2). RAISE the structured Display
+            // so the operator sees the unsupported-topology message, never the
+            // silent rc=0 `Other` swallow.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

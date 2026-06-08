@@ -8,7 +8,7 @@ use dynrunner_core::{
     MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -159,6 +159,7 @@ where
         client,
         inbox,
         demote_rx,
+        RelocationPolicy::StayLocal,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

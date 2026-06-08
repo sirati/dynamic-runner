@@ -230,24 +230,27 @@ pub struct SecondaryConfig {
     /// Tests construct it with a tiny value for sub-second drive.
     pub primary_silence_backstop: Duration,
 
-    /// Whether this secondary can host the primary role on promotion — it
-    /// is an overlay-enabled (real peer mesh present), non-observer compute
-    /// secondary whose host can build a `PrimaryCoordinator` when this node
+    /// Whether this secondary can host the primary role on promotion — under
+    /// mesh-always (pillar 1) a network compute secondary ALWAYS holds a peer
+    /// mesh, so it is always primary-capable and its host can build a
+    /// `PrimaryCoordinator` when this node
     /// is named primary (Phase-C: the secondary signals `Process`, which
     /// constructs + spawns it). The secondary advertises this in its
     /// `SecondaryWelcome`; the primary records it in the replicated
-    /// `RoleTable.can_be_primary`, which the bootstrap-promotion selection
-    /// reads as the single authoritative capability marker.
+    /// `RoleTable.can_be_primary`, which the bootstrap-relocation /
+    /// promotion selection reads as the single authoritative capability marker.
     ///
     /// This is the JOIN-TIME advertised value (twin of the wire
     /// `is_observer` role advertisement). It
     /// is NOT itself the activation gate — the activation site reads
     /// `cluster_state.can_be_primary(self)` (the replicated marker, which
-    /// a client may also flip at runtime via `SetCanBePrimary`). An
-    /// observer joins with
-    /// `false` so the submitter never moves authority to it.
+    /// a client may also flip at runtime via `SetCanBePrimary`). Only an
+    /// OBSERVER joins with `false` so the submitter never moves authority to
+    /// it (and the in-process same-host secondary, which has no peer-to-peer
+    /// mesh).
     ///
-    /// Default `false` (regular non-overlay secondary).
+    /// Default `false` (the conservative "submitter stays primary" value;
+    /// every network compute secondary advertises `true`).
     pub can_be_primary: bool,
 
     /// How often the OOM/resource-pressure check fires inside the

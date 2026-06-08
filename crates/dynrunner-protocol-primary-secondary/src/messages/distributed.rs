@@ -62,12 +62,14 @@ pub enum DistributedMessage<I> {
         #[serde(default)]
         is_observer: bool,
         /// Whether this secondary can host the primary role on promotion —
-        /// it is an overlay-enabled (real peer mesh present), non-observer
-        /// compute secondary, so its host can build a `PrimaryCoordinator`
-        /// when it is named primary. The primary translates this
-        /// into the secondary's replicated `RoleTable.can_be_primary`
+        /// under mesh-always (pillar 1) a network compute secondary always
+        /// holds a peer mesh, so its host can build a `PrimaryCoordinator`
+        /// when it is named primary (only an observer / the in-process
+        /// same-host secondary advertises `false`). The primary translates
+        /// this into the secondary's replicated `RoleTable.can_be_primary`
         /// entry (the `PeerJoined { can_be_primary }` it originates on
-        /// welcome-accept), which the bootstrap-promotion selection reads
+        /// welcome-accept), which the bootstrap-relocation / promotion
+        /// selection reads
         /// as the single authoritative capability marker. Mirrors the
         /// `is_observer` advertisement exactly. `#[serde(default)]` keeps
         /// pre-field senders wire-compatible (they decode as `false` — the
