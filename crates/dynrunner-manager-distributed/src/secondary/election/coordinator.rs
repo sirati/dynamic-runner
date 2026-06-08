@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::wire::timestamp_now;
-use super::{ElectionState, ElectionTickActions, next_round};
+use super::{ElectionState, ElectionTickActions, failover_quorum, next_round};
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
@@ -363,7 +363,13 @@ where
                     })
                     .count()
                     + 1; // include us
-                let quorum = peer_count.div_ceil(2) + 1;
+                // Single-source quorum rule (`election::failover_quorum`):
+                // adapts to the CURRENT live-peer set (`peer_count` from
+                // `live_peer_ids`, which shrinks symmetrically on a
+                // partition — the 2-node-trap fix), never a fixed
+                // `config.num_secondaries`. Observers are absent from
+                // `peer_count` by construction (no `Secondary` keepalive).
+                let quorum = failover_quorum(peer_count);
                 if agreeing < quorum {
                     tracing::info!(agreeing, quorum, "no quorum on primary death; waiting");
                     return actions;
@@ -544,7 +550,10 @@ where
         // `live_peer_ids` is a `&self` read; take the owned count before
         // borrowing `op` mutably for the confirm tally + transition.
         let peer_count = self.live_peer_ids().count();
-        let quorum = peer_count.div_ceil(2) + 1;
+        // Same single-source quorum rule as the Suspecting tally
+        // (`election::failover_quorum`) — the two sites read ONE function so
+        // the majority arithmetic cannot desync on a live failover.
+        let quorum = failover_quorum(peer_count);
         let op = self.op_mut();
         let promoted = match &mut op.election {
             ElectionState::Candidate {

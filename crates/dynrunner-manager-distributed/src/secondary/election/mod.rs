@@ -76,3 +76,40 @@ pub(super) fn next_round(state: &ElectionState) -> u32 {
         _ => 1,
     }
 }
+
+/// The failover quorum size for a live mesh of `live_peer_count` peers
+/// (the count of [`SecondaryCoordinator::live_peer_ids`], which is
+/// `peer_keepalives` MINUS the current primary — so it is the set of peers
+/// that could vote/become-candidate, NOT counting the node being
+/// failed-over-FROM). The voter itself is NOT in `live_peer_count`; the
+/// caller adds itself (`+1`) when tallying agreement/confirms against this.
+///
+/// SINGLE SOURCE for the rule (CLAUDE.md: no duplicated logic). It is
+/// consulted at BOTH the Suspecting-tally site and the
+/// PromotionConfirm-tally site in [`coordinator`]; before extraction the
+/// formula `peer_count.div_ceil(2) + 1` was copy-pasted at both, and a
+/// desync only manifests on a LIVE failover (not locally reproducible), so
+/// the rule lives here exactly once.
+///
+/// ADAPTS TO THE LIVE FLEET — the denominator is the CURRENT live-peer set,
+/// never a fixed `config.num_secondaries`. On a partition the live set
+/// shrinks symmetrically, so a 2-survivor fleet (primary + 2 secondaries,
+/// primary dies → each survivor sees `live_peer_count == 1`) computes
+/// `quorum = 1.div_ceil(2) + 1 = 2`, reachable by self + the one surviving
+/// peer — the "2-node trap" fix. A genuinely-lone (zero-peer) secondary
+/// would compute `quorum = 0.div_ceil(2) + 1 = 1` and self-promote solo;
+/// that `quorum == 1` self-promotion is a split-brain and is blocked
+/// UPSTREAM by the `mesh_degraded` guard in `run_election_tick` (a lone
+/// secondary never reaches a tally), NOT here — this function only states
+/// the majority arithmetic.
+///
+/// OBSERVERS are NEITHER voters NOR counted in this denominator (F4): they
+/// emit no `Secondary` keepalive, so they are structurally absent from
+/// `peer_keepalives` → never in `live_peer_ids` → never in
+/// `live_peer_count`. This is by design — an observer can neither reply
+/// `TimeoutResponse` (so it cannot agree) nor accept a `PromotionVote` (so
+/// it cannot confirm), so counting it would inflate the quorum past what
+/// the agreeing/confirming set can ever reach (re-opening a quorum trap).
+pub(super) fn failover_quorum(live_peer_count: usize) -> usize {
+    live_peer_count.div_ceil(2) + 1
+}

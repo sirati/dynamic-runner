@@ -2,8 +2,11 @@
 //! the post-promotion peer-message dispatch test. The promotion tests
 //! share the `r1_helpers::make_with_peers` builder, which wires a
 //! routing-aware channel-backed mesh stub (N peer outboxes, no primary
-//! link) so the processing-loop sees a healthy mesh while
-//! `send_to_primary` returns a real no-route `Err`.
+//! link) so the processing-loop sees a healthy mesh while the primary
+//! stays unrouteable — driving `send_to_primary` into its no-route
+//! failover-health probe. Post-failover-B that no-route is ABSORBED into
+//! `Ok(())` (a no-route is a failover signal, never a run-fatal error that
+//! aborts a voter); these tests assert the PROBE arming, not a return Err.
 
 #![cfg(test)]
 
@@ -25,11 +28,12 @@ mod r1_helpers {
     //! mesh stub with N peer outboxes so the processing-loop's peer-count
     //! check observes a healthy mesh (which is what makes promotion via
     //! election possible) while the primary stays unrouteable (no primary
-    //! link), so `send_to_primary` returns a real no-route `Err`. The
-    //! `make_secondary` helper in `test_helpers.rs` uses `NoPeers`, which
-    //! reports peer_count=0 — fine for election-state tests that don't go
-    //! through the operational threshold path, but wrong for R1 tests
-    //! that do.
+    //! link), so `send_to_primary` hits its no-route failover-health probe
+    //! (the no-route condition is absorbed into `Ok(())` post-failover-B;
+    //! the probe arms as the side effect). The `make_secondary` helper in
+    //! `test_helpers.rs` uses `NoPeers`, which reports peer_count=0 — fine
+    //! for election-state tests that don't go through the operational
+    //! threshold path, but wrong for R1 tests that do.
 
     use super::*;
     use crate::secondary::test_helpers::{
@@ -41,18 +45,20 @@ mod r1_helpers {
 
     /// Construct a secondary over a routing-aware channel-backed mesh stub
     /// with `peers` peer outboxes but NO primary link, so mesh-health reads
-    /// observe the configured size while `send_to_primary` returns a real
-    /// no-route `Err`.
+    /// observe the configured size while the primary stays unrouteable —
+    /// driving `send_to_primary` into its no-route failover-health probe.
     ///
     /// The egress edge resolves `Destination::Primary` to the bootstrap id
     /// `"primary"` (set below); the mesh has no member with that id (the
     /// stub registers no primary link), so the egress `has_peer("primary")`
-    /// gate surfaces the no-route `Err` that drives the send-side
+    /// gate surfaces the no-route condition that drives the send-side
     /// failover-health probe — the real one-mesh no-route signal the R1
     /// arming tests need (the prior `FixedPeerCount` stub was identity-blind
-    /// and could only no-op `Ok` on every send). `make_secondary_channel`
-    /// publishes the live membership, so the gate reads the stub's
-    /// `connected_ids` (which exclude `"primary"`).
+    /// and could only no-op `Ok` on every send). The no-route is recorded
+    /// into the probe then absorbed into `Ok(())` (failover-B); the arming
+    /// is what the tests assert. `make_secondary_channel` publishes the live
+    /// membership, so the gate reads the stub's `connected_ids` (which
+    /// exclude `"primary"`).
     pub(super) fn make_with_peers(secondary_id: &str, peers: usize) -> R1Secondary {
         let mut sec = make_secondary_channel(
             election_config(secondary_id),
@@ -109,12 +115,12 @@ mod r1_helpers {
 
 /// T-R1-promotion-on-no-route (count axis): a non-promoted secondary
 /// with a healthy peer mesh drives the send-side failover-health probe
-/// — `send_to_primary` returns a no-route `Err` (the primary is not a
+/// — `send_to_primary` hits the no-route condition (the primary is not a
 /// member of the mesh stub, so its resolved id has no outbox), which arms
-/// the primary-link count axis and backdates `primary_last_seen`; the
-/// next election tick enters Suspecting. Replaces the deleted recv-None
-/// arming path; the count axis keeps the test deterministic (no
-/// wall-clock).
+/// the primary-link count axis and backdates `primary_last_seen` before
+/// absorbing the no-route into `Ok(())` (failover-B); the next election
+/// tick enters Suspecting. Replaces the deleted recv-None arming path; the
+/// count axis keeps the test deterministic (no wall-clock).
 #[tokio::test(flavor = "current_thread")]
 async fn r1_promotion_on_no_route_count_axis() {
     use super::super::election::ElectionState;
@@ -144,19 +150,24 @@ async fn r1_promotion_on_no_route_count_axis() {
 
     // Drive the count-axis via the SEND-SIDE probe: each
     // `send_to_primary` resolves `Destination::Primary` to the bootstrap
-    // id `"primary"`, finds no outbox for it on the mesh stub, errors
-    // no-route, and records one failover-health probe. threshold=3 in
+    // id `"primary"`, finds no outbox for it on the mesh stub, hits the
+    // no-route condition, and records one failover-health probe.
+    // FAILOVER-B: the no-route is ABSORBED into `Ok(())` (it is a failover
+    // signal, never a run-fatal error that would abort a VOTER) — the
+    // load-bearing effect is the PROBE arming, asserted via
+    // `should_arm_failover()`, NOT the return value. threshold=3 in
     // election_config; the third breaches.
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok(),
+        "no-route must NOT abort the voter — absorbed into Ok + the probe"
     );
     assert!(!sec.op_mut().primary_link.should_arm_failover());
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(!sec.op_mut().primary_link.should_arm_failover());
     // Third no-route send breaches the threshold and backdates
@@ -164,7 +175,7 @@ async fn r1_promotion_on_no_route_count_axis() {
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(
         sec.op_mut().primary_link.should_arm_failover(),
@@ -209,11 +220,14 @@ async fn r1_recover_on_primary_back() {
         .insert("sec-b".into(), std::time::Instant::now());
     sec.record_primary_message();
 
-    // One no-route send opens the health window — a short flap.
+    // One no-route send opens the health window — a short flap. The
+    // no-route is absorbed into `Ok(())` (failover-B: never aborts the
+    // voter); the load-bearing effect is the opened window
+    // (`is_link_failing`).
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(sec.op_mut().primary_link.is_link_failing());
 
@@ -263,21 +277,23 @@ async fn r1_respects_degraded_guard() {
     sec.record_primary_message();
 
     // Drive the count-axis past threshold via the send-side probe;
-    // the third no-route send arms + backdates primary_last_seen.
+    // the third no-route send arms + backdates primary_last_seen. Each
+    // no-route is absorbed into `Ok(())` (failover-B); arming is the
+    // load-bearing effect.
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(sec.op_mut().primary_link.should_arm_failover());
 
@@ -331,21 +347,22 @@ async fn r1_no_mesh_rebuild_during_arming() {
 
     // Drive the failover-health probe past threshold via no-route
     // sends. The probe touches ONLY the primary-link health
-    // sub-state — never the mesh.
+    // sub-state — never the mesh. Each no-route is absorbed into
+    // `Ok(())` (failover-B); arming is the load-bearing effect.
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(
         sec.send_to_primary(r1_helpers::probe_msg("sec-a"))
             .await
-            .is_err()
+            .is_ok()
     );
     assert!(sec.op_mut().primary_link.should_arm_failover());
 
