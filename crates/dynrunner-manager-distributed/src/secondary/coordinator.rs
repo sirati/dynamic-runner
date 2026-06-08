@@ -509,11 +509,12 @@ where
     /// Record the run-config dispatch flags (`pre_staged_mode` /
     /// `uses_file_based_items`) the primary stamped into this secondary's
     /// `InitialAssignment`. The SINGLE writer to the shared
-    /// [`super::StagingDispatchContext`] handle: the dispatch resolver
-    /// ([`Self::resolve_for_dispatch`]) and the promotion recipe both read
-    /// the same handle, so a node promoted to primary stamps the SAME flags
-    /// the submitter primary did. Called from `wait_for_setup`'s
-    /// `InitialAssignment` handler.
+    /// [`super::StagingDispatchContext`] handle, whose SOLE reader is the
+    /// dispatch resolver ([`Self::resolve_for_dispatch`]). Called from
+    /// `wait_for_setup`'s `InitialAssignment` handler. (The promotion recipe
+    /// does NOT read this cell — a relocate-target's cell is at `Default` at
+    /// promotion; the recipe sources the flags from the node's own local
+    /// producer instead.)
     pub(in crate::secondary) fn set_staging_dispatch_context(
         &mut self,
         ctx: super::StagingDispatchContext,
@@ -525,6 +526,14 @@ where
     }
 
     /// Read the current staging-dispatch context off the shared handle.
+    ///
+    /// The DISPATCH-side reader: `resolve_for_dispatch` consults this so a
+    /// PLAIN secondary executing assigned tasks keys off the flags its primary
+    /// stamped into the `InitialAssignment` (the cell's sole writer). NOT the
+    /// promotion-recipe source — a relocate-target's cell is at `Default` at
+    /// promotion (no `InitialAssignment` yet), so the recipe sources the two
+    /// flags from this node's own local producer instead (see
+    /// `managers/secondary/run.rs::extract_staging_dispatch_flags`).
     fn staging_dispatch_context(&self) -> super::StagingDispatchContext {
         *self
             .staging_dispatch_context
@@ -532,13 +541,13 @@ where
             .expect("staging_dispatch_context mutex poisoned")
     }
 
-    /// Clone of the SHARED staging-dispatch-context handle (single source of
-    /// truth). The pyo3 promotion recipe captures this clone so it reads the
-    /// flags the primary's `InitialAssignment` delivered (post-setup) at the
-    /// promotion instant — without the recipe ever borrowing the coordinator.
-    /// Mirrors [`Self::run_config_handle`];
-    /// [`Self::set_staging_dispatch_context`] is the single writer.
-    pub fn staging_dispatch_context_handle(
+    /// Clone of the shared cell handle, for the relocate-staging Tier-2 test:
+    /// it captures the relocate-target's live cell into the promote recipe to
+    /// PROVE the cell stays at `Default` at promotion (no `InitialAssignment`)
+    /// while the recipe still stamps the correct flags from the local producer.
+    /// Not on the production path (the recipe no longer reads the cell).
+    #[cfg(test)]
+    pub(crate) fn staging_dispatch_context_handle_for_test(
         &self,
     ) -> std::sync::Arc<std::sync::Mutex<super::StagingDispatchContext>> {
         self.staging_dispatch_context.clone()

@@ -20,10 +20,14 @@
 //!     carries each facet stamps the matching wire flags (the chain a
 //!     promoted primary's recipe-threaded config must reproduce).
 //!   * `relocated_primary_*` — drive the FULL `Node::run` relocate with a
-//!     config-carrying promote recipe (modelling the pyo3 recipe's output —
-//!     the staging context threaded into the promoted `PrimaryConfig`) and a
-//!     SEPARATE real secondary as the dispatch target; assert the target
-//!     dispatch does NOT wrongly raise "not pre-staged".
+//!     promote recipe that mirrors the PRODUCTION pyo3 recipe's SOURCE: it
+//!     stamps the flags from the node's own LOCAL PRODUCER while the
+//!     relocate-target's `InitialAssignment`-fed cell stays at `Default` (the
+//!     recipe asserts this) — exactly the lifecycle a relocate-target sees (no
+//!     `InitialAssignment` before promotion). A SEPARATE real secondary is the
+//!     dispatch target; assert it does NOT wrongly raise "not pre-staged".
+//!     This catches the false-green that a pre-built config (which bypasses
+//!     the cell-vs-producer source question) silently passed.
 
 use super::*;
 
@@ -186,15 +190,18 @@ async fn stamped_initial_assignment_flags_mode1_defaults() {
 
 // ─────────────────────────────────────────────────────────────────────────
 // Tier 2: FULL Node::run relocate, dispatch-acceptance on a SEPARATE real
-// secondary. The promoted primary is built via the config-carrying promote
-// recipe (modelling the pyo3 recipe output: the staging context threaded into
-// the promoted PrimaryConfig). The dispatch TARGET is a plain real secondary
-// whose `report_unresolvable_task` guard would FIRE if the promoted primary
-// stamped the wrong flags.
+// secondary. The promoted primary is built via a promote recipe that mirrors
+// the PRODUCTION pyo3 recipe's SOURCE: it stamps the staging flags from the
+// node's own LOCAL PRODUCER, and ASSERTS the relocate-target's
+// `InitialAssignment`-fed cell is still at `Default` at the promotion instant
+// (the relocate-target receives no `InitialAssignment` before it promotes).
+// The dispatch TARGET is a plain real secondary whose
+// `report_unresolvable_task` guard FIRES if the promoted primary stamps the
+// wrong flags — which it WOULD if the recipe read the (Default) cell.
 // ─────────────────────────────────────────────────────────────────────────
 
-/// What the promote recipe threads from the secondary's staging context into
-/// the relocated primary's `PrimaryConfig`. One per facet.
+/// What the promote recipe sources from the relocate-target's local producer
+/// into the relocated primary's `PrimaryConfig`. One per facet.
 struct RelocateStagingFacet {
     /// The relocated primary's `PrimaryConfig.uses_file_based_items`.
     uses_file_based_items: bool,
@@ -267,8 +274,9 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
     };
 
     // ── sec-0: the relocate TARGET (promotion-eligible). Its promote recipe
-    //    carries the FACET'S PrimaryConfig — modelling the pyo3 recipe output
-    //    (the staging context threaded into the promoted PrimaryConfig). ─────
+    //    sources the FACET'S staging flags from the LOCAL PRODUCER (mirroring
+    //    the pyo3 recipe) while asserting the wire-fed cell stays at `Default`
+    //    at promotion. ─────────────────────────────────────────────────────
     let mut sec0_mesh = Mesh::new(sec0_transport);
     let (sec0_slot, sec0_client, sec0_inbox) =
         sec0_mesh.register_local_role(LocalRole::Secondary, PeerId::from("sec-0"));
@@ -287,19 +295,29 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
     sec0.set_bootstrap_primary_id("setup".to_string());
     let (sec0_node, sec0_promo_tx) = Node::new(sec0_mesh);
     sec0.register_promotion_signal(sec0_promo_tx);
-    // The promote recipe's config — the production pyo3 recipe builds this from
-    // the secondary's threaded staging context; here we pass it directly.
-    let promote_config = PrimaryConfig {
-        node_id: "sec-0".to_string(),
-        mesh_ready_timeout: Duration::from_secs(5),
-        keepalive_interval: Duration::from_secs(60),
-        peer_timeout: Duration::from_secs(120),
-        uses_file_based_items,
-        source_pre_staged_root,
-        source_dir,
-        ..PrimaryConfig::default()
-    };
-    let promote = build_test_promote_recipe_with_config(promote_config, None);
+    // Capture the relocate-target's LIVE staging-dispatch cell BEFORE
+    // `with_secondary` consumes `sec0`. The recipe below threads it in to PROVE
+    // it stays at `Default` at the promotion instant — a relocate-target gets
+    // no `InitialAssignment` before it promotes — while the stamped flags come
+    // from the LOCAL PRODUCER (`flags`). This drives the PRODUCTION recipe's
+    // source discipline (the pyo3 recipe sources from the producer, not the
+    // cell); a pre-built config would bypass it and re-create the false-green.
+    let sec0_staging_cell = sec0.staging_dispatch_context_handle_for_test();
+    let promote = build_test_promote_recipe_from_producer(
+        "sec-0".to_string(),
+        ProducerStagingFlags {
+            uses_file_based_items,
+            // The local producer's pre-staged discriminant: the recipe stamps
+            // `source_pre_staged_root` IFF this is set (mirrors the submitter's
+            // `source_pre_staged_root.is_some()` and the pyo3 recipe's
+            // `pre_staged_mode` gate).
+            pre_staged_mode: source_pre_staged_root.is_some(),
+            source_pre_staged_root,
+            source_dir,
+        },
+        sec0_staging_cell,
+        None,
+    );
     let sec0_node = sec0_node.with_secondary(sec0, sec0_slot);
     let sec0_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
         secondary_factory: Some(FakeWorkerFactory),

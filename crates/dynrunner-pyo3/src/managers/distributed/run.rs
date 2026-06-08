@@ -383,6 +383,17 @@ impl PyDistributedManager {
                     // `move` task owns its own copy.
                     let promote_pre_staged_root = source_pre_staged_root.clone();
                     let promote_source_dir = Some(source_dir.clone());
+                    // The two staging-dispatch flags the PROMOTE recipe stamps,
+                    // sourced from the LOCAL PRODUCER (NOT the
+                    // `InitialAssignment`-fed cell — a relocate-target's cell is
+                    // at `Default` at promotion). Both are already extracted on
+                    // this in-process manager: `uses_file_based_items` off the
+                    // `task_definition`, `source_pre_staged` =
+                    // `source_pre_staged_root.is_some()` (mirroring the
+                    // submitter's discriminant). `Copy` bools, captured by the
+                    // per-secondary `move` task below.
+                    let promote_uses_file_based_items = uses_file_based_items;
+                    let promote_pre_staged_mode = source_pre_staged;
 
                     let handle = tokio::task::spawn_local(async move {
                         // This secondary's all-to-all mpsc mesh transport
@@ -608,13 +619,6 @@ impl PyDistributedManager {
                         // the submitter's argv directly, so this is byte-
                         // identical to the setup peer's `forwarded_argv`.
                         let promote_run_config_handle = secondary.run_config_handle();
-                        // The shared staging-dispatch-context handle the
-                        // coordinator's `InitialAssignment` handler writes; the
-                        // promote recipe reads it at promotion so the relocated
-                        // primary stamps the SAME dispatch flags the setup peer
-                        // did (the relocate-staging fix).
-                        let promote_staging_ctx_handle =
-                            secondary.staging_dispatch_context_handle();
 
                         // Build this secondary's discovery policy INSIDE the
                         // detached runtime (the `SetupDiscovery` CLOSURE is not
@@ -654,7 +658,8 @@ impl PyDistributedManager {
                             on_phase_start: sec_on_phase_start,
                             on_phase_end: sec_on_phase_end,
                             forwarded_argv: promote_run_config_handle,
-                            staging_dispatch_context: promote_staging_ctx_handle,
+                            uses_file_based_items: promote_uses_file_based_items,
+                            pre_staged_mode: promote_pre_staged_mode,
                             source_pre_staged_root: promote_pre_staged_root,
                             source_dir: promote_source_dir,
                             setup_discovery: sec_setup_discovery,

@@ -18,7 +18,6 @@ use dynrunner_manager_distributed::process::{
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
-    StagingDispatchContext,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -177,6 +176,24 @@ impl PySecondaryCoordinator {
         // built inside the detached runtime where `self` is gone.
         let promote_pre_staged_root = self.src_network.clone();
         let promote_source_dir = Some(self.source_dir.clone());
+        // The two run-config dispatch flags the PROMOTE recipe stamps into the
+        // relocated primary's `PrimaryConfig`, sourced from this node's OWN
+        // LOCAL PRODUCER (the `task_definition` / `task_args` it booted with) —
+        // NOT the `InitialAssignment`-fed `StagingDispatchContext` cell. A
+        // relocate-TARGET never receives an `InitialAssignment` before it is
+        // promoted (the setup peer relocates → the target promotes → the
+        // PROMOTED primary runs `perform_initial_assignment`), so its cell is
+        // still at `Default { pre_staged_mode: false, uses_file_based_items:
+        // true }` at the promotion instant — reading it stamps the wrong flags
+        // (the relocate-staging bug). The local producer is run-uniform, so it
+        // carries the value the submitter primary stamped. Mirrors
+        // `managers/primary/new.rs` (`uses_file_based_items`) and the
+        // `discover_items_under_gil` pre-staged probe (`source_already_staged`).
+        let (promote_uses_file_based_items, promote_pre_staged_mode) =
+            extract_staging_dispatch_flags(
+                self.task_definition_py.bind(py),
+                self.task_args_py.bind(py),
+            );
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -501,12 +518,6 @@ impl PySecondaryCoordinator {
                 // on promotion it threads the DELIVERED argv (post-push) into
                 // its `PrimaryConfig` — not the stale boot seed (step 7).
                 let promote_run_config_handle = secondary.run_config_handle();
-                // Likewise the SHARED staging-dispatch-context handle the
-                // coordinator's `InitialAssignment` handler writes, so on
-                // promotion the recipe threads the DELIVERED dispatch flags
-                // (uses_file_based_items / pre_staged_mode) into the promoted
-                // `PrimaryConfig` — the relocate-staging fix.
-                let promote_staging_ctx_handle = secondary.staging_dispatch_context_handle();
 
                 // Compose the compute-peer `Node`: a secondary that may be
                 // PROMOTED to primary. `Node::new` hands out the
@@ -556,7 +567,8 @@ impl PySecondaryCoordinator {
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
                     forwarded_argv: promote_run_config_handle,
-                    staging_dispatch_context: promote_staging_ctx_handle,
+                    uses_file_based_items: promote_uses_file_based_items,
+                    pre_staged_mode: promote_pre_staged_mode,
                     source_pre_staged_root: promote_pre_staged_root,
                     source_dir: promote_source_dir,
                     setup_discovery: Some(setup_discovery),
@@ -702,17 +714,32 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// — byte-identical to the original submitter (no split-brain) — rather
     /// than the stale boot copy a pre-push capture would have frozen (step 7).
     pub forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// The SHARED staging-dispatch-context handle (single source of truth —
-    /// the secondary's `InitialAssignment` handler is the one writer). Read
-    /// `.lock()` at the promotion instant (always AFTER the submitter
-    /// primary's `InitialAssignment` landed), so the promoted primary's
-    /// `PrimaryConfig` carries the SAME `uses_file_based_items` +
-    /// `pre_staged_mode` the submitter stamped — and its own
-    /// `InitialAssignment` re-stamps those flags identically. Without this a
-    /// promoted primary stamps the defaults, and a worker re-requires a
-    /// StageFile for a no-file / bind-mounted item (the relocate-staging bug).
-    pub staging_dispatch_context:
-        std::sync::Arc<std::sync::Mutex<StagingDispatchContext>>,
+    /// Whether the run's dispatched items are real files
+    /// (`TaskDefinition.uses_file_based_items`). Read from this node's OWN
+    /// LOCAL PRODUCER (the `task_definition` it booted with) — NOT from the
+    /// `InitialAssignment`-fed `StagingDispatchContext` cell, because a
+    /// relocate-TARGET never receives an `InitialAssignment` before it is
+    /// promoted (the setup peer relocates, then the target promotes, then the
+    /// PROMOTED primary runs `perform_initial_assignment`), so its cell is
+    /// still at `Default { uses_file_based_items: true }` when the recipe
+    /// fires. The local producer is run-uniform (every node booted from the
+    /// same consumer `task_definition`), so it carries the value the submitter
+    /// primary stamped. Threaded into `PrimaryConfig.uses_file_based_items` so
+    /// the promoted primary's own `InitialAssignment` re-stamps it identically;
+    /// without it a worker re-requires a StageFile for a no-file item (the
+    /// relocate-staging bug). The dispatch resolver (`resolve_for_dispatch`)
+    /// keeps reading the wire-fed cell — a PLAIN secondary executing assigned
+    /// tasks always has a populated cell, so that path is unchanged.
+    pub uses_file_based_items: bool,
+    /// Whether the run is in pre-staged mode (`--source-already-staged`).
+    /// Sourced from this node's OWN LOCAL PRODUCER (the SLURM secondary reads
+    /// `task_args.source_already_staged` non-None — mirroring the submitter's
+    /// `source_pre_staged_root.is_some()`; the in-process path passes
+    /// `source_pre_staged_root.is_some()` directly) for the SAME reason
+    /// `uses_file_based_items` is: the relocate-target's wire-fed cell is at
+    /// its `pre_staged_mode: false` default at promotion. Gates whether
+    /// `source_pre_staged_root` is threaded into the promoted `PrimaryConfig`.
+    pub pre_staged_mode: bool,
     /// The staged-corpus root the secondary's source is bind-mounted under
     /// (`--source-already-staged` → the secondary's `src_network`). Threaded
     /// into the promoted `PrimaryConfig.source_pre_staged_root` IFF the
@@ -741,6 +768,41 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// promotion (the driver gates on `Owed`).
     pub setup_discovery:
         Option<dynrunner_manager_distributed::SetupDiscovery<RunnerIdentifier>>,
+}
+
+/// Read the run's two staging-dispatch flags from this node's OWN LOCAL
+/// PRODUCER — the consumer `task_definition` + `task_args` it booted with.
+///
+/// Single concern: "what does the local producer say the run's dispatch mode
+/// is?". This is the SOURCE the promote recipe must consult (NOT the
+/// `InitialAssignment`-fed `StagingDispatchContext` cell): a relocate-TARGET
+/// has no `InitialAssignment` before it is promoted, so its cell is still at
+/// `Default { pre_staged_mode: false, uses_file_based_items: true }`. The local
+/// producer is run-uniform (every node booted from the same consumer
+/// `task_definition`), so it carries the value the original submitter primary
+/// stamped.
+///
+/// Mirrors the two existing reads verbatim:
+///   * `uses_file_based_items` — `managers/primary/new.rs`: missing/unparseable
+///     attribute defaults to `true` (the historical file-based contract).
+///   * `pre_staged_mode` — the `discover_items_under_gil` pre-staged probe:
+///     `task_args.source_already_staged` non-`None`, mirroring the submitter's
+///     `source_pre_staged_root.is_some()`.
+fn extract_staging_dispatch_flags(
+    task_definition: &Bound<'_, PyAny>,
+    task_args: &Bound<'_, PyAny>,
+) -> (bool, bool) {
+    let uses_file_based_items: bool = task_definition
+        .getattr("uses_file_based_items")
+        .ok()
+        .and_then(|v| v.extract().ok())
+        .unwrap_or(true);
+    let pre_staged_mode = task_args
+        .getattr("source_already_staged")
+        .ok()
+        .filter(|v| !v.is_none())
+        .is_some();
+    (uses_file_based_items, pre_staged_mode)
 }
 
 /// Build the `PromotedPrimaryBuilder` recipe `Node::run` invokes on a
@@ -782,7 +844,8 @@ pub(crate) fn build_promoted_primary_recipe(
         on_phase_start,
         on_phase_end,
         forwarded_argv,
-        staging_dispatch_context,
+        uses_file_based_items,
+        pre_staged_mode,
         source_pre_staged_root,
         source_dir,
         setup_discovery,
@@ -796,21 +859,14 @@ pub(crate) fn build_promoted_primary_recipe(
     // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
     // `discover` closure that is not `Clone`); take it on the single fire.
     let mut setup_discovery = setup_discovery;
-    // The run-config + staging-context handles are shared (not single-use):
-    // the recipe READS them at promotion, leaving the secondary's copies
-    // intact. No `Option`/`take` — they are cloned-in and read by value at the
-    // promotion instant.
+    // The run-config handle is shared (not single-use): the recipe READS it at
+    // promotion, leaving the secondary's copy intact. No `Option`/`take` — it
+    // is cloned-in and read by value at the promotion instant. The two staging
+    // flags (`uses_file_based_items` / `pre_staged_mode`) were extracted from
+    // this node's OWN local producer on the GIL thread and captured by value;
+    // they are NOT read off the `InitialAssignment`-fed cell (a relocate-target
+    // has no `InitialAssignment` before promotion — its cell is at `Default`).
     Box::new(move |client, inbox, demote_rx, snapshot| {
-        // Read the DELIVERED staging-dispatch context off the shared handle at
-        // the promotion instant (the submitter primary's `InitialAssignment`
-        // landed during this secondary's setup, so the flags are settled). The
-        // promoted primary's `PrimaryConfig` must carry the SAME flags so its
-        // own `InitialAssignment` re-stamps them identically — otherwise a
-        // relocated primary requires a StageFile for a no-file / bind-mounted
-        // item and dispatch collapses.
-        let staging_ctx = *staging_dispatch_context
-            .lock()
-            .expect("staging_dispatch_context mutex poisoned");
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
             keepalive_interval,
@@ -832,11 +888,14 @@ pub(crate) fn build_promoted_primary_recipe(
             // fix). `uses_file_based_items` and `source_pre_staged_root` feed
             // `assignment.rs`'s `InitialAssignment` stamps + `wire_local_path`;
             // `source_dir` feeds `maybe_auto_stage_initial`'s re-walk (the
-            // relocated primary re-stages from scratch). `source_pre_staged_root`
+            // relocated primary re-stages from scratch). Both staging flags are
+            // sourced from this node's OWN local producer (extracted on the GIL
+            // thread), NOT the `InitialAssignment`-fed cell — the relocate-
+            // target's cell is at `Default` at promotion. `source_pre_staged_root`
             // is consulted only in pre-staged mode — mirror the submitter's
             // `is_some()` discriminant by gating on `pre_staged_mode`.
-            uses_file_based_items: staging_ctx.uses_file_based_items,
-            source_pre_staged_root: if staging_ctx.pre_staged_mode {
+            uses_file_based_items,
+            source_pre_staged_root: if pre_staged_mode {
                 source_pre_staged_root.clone()
             } else {
                 None
@@ -1410,5 +1469,95 @@ mod tests {
             )
             .is_none()
         );
+    }
+}
+
+/// Tests for [`extract_staging_dispatch_flags`] — the SOURCE the promote
+/// recipe reads (the relocate-staging fix). The relocate-target's
+/// `InitialAssignment`-fed cell is at `Default` at promotion, so these flags
+/// MUST come from the node's own local producer (`task_definition` /
+/// `task_args`). These exercise the real getattr path against duck-typed
+/// Python stubs.
+///
+/// Require an embedded CPython interpreter (gated behind `test-with-python`):
+///   `cargo test -p dynrunner-pyo3 --lib --no-default-features \
+///        --features test-with-python staging_dispatch_flags`
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod staging_dispatch_flags_tests {
+    use super::extract_staging_dispatch_flags;
+    use pyo3::prelude::*;
+    use pyo3::types::PyModule;
+
+    /// Compile a tiny module exposing a `task_definition` with the given
+    /// `uses_file_based_items` and a `task_args` whose `source_already_staged`
+    /// is either `None` (not pre-staged) or a path string (pre-staged). Returns
+    /// the two stub objects. Stubs are pure-Python `SimpleNamespace`s the
+    /// extractor duck-types via `getattr` — no wheel needed.
+    fn stubs<'py>(
+        py: Python<'py>,
+        uses_file_based_items_attr: &str,
+        source_already_staged_attr: &str,
+    ) -> (Bound<'py, PyAny>, Bound<'py, PyAny>) {
+        let source = format!(
+            "from types import SimpleNamespace\n\
+             task_definition = SimpleNamespace({uses_file_based_items_attr})\n\
+             task_args = SimpleNamespace({source_already_staged_attr})\n"
+        );
+        let module = PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new("stub_staging.py").unwrap().as_c_str(),
+            std::ffi::CString::new("stub_staging").unwrap().as_c_str(),
+        )
+        .expect("compile staging stub module");
+        (
+            module.getattr("task_definition").unwrap(),
+            module.getattr("task_args").unwrap(),
+        )
+    }
+
+    /// asm-dataset facet: `uses_file_based_items=False`, not pre-staged. The
+    /// recipe must stamp `uses_file_based_items=false` so the dispatch target
+    /// passes opaque identifiers through (no StageFile).
+    #[test]
+    fn uses_file_based_items_false_not_pre_staged() {
+        Python::attach(|py| {
+            let (td, ta) = stubs(py, "uses_file_based_items=False", "source_already_staged=None");
+            let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
+            assert!(!uses_files, "uses_file_based_items=False must extract false");
+            assert!(!pre_staged, "source_already_staged=None must extract not-pre-staged");
+        });
+    }
+
+    /// asm-tokenizer mode-2 facet: `--source-already-staged` (a non-None
+    /// `source_already_staged`). The recipe must stamp `pre_staged_mode=true`.
+    #[test]
+    fn pre_staged_mode_from_source_already_staged() {
+        Python::attach(|py| {
+            let (td, ta) = stubs(
+                py,
+                "uses_file_based_items=True",
+                "source_already_staged='/some/staged/root'",
+            );
+            let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
+            assert!(uses_files, "file-based stays true in pre-staged mode");
+            assert!(pre_staged, "non-None source_already_staged must extract pre-staged");
+        });
+    }
+
+    /// mode-1 default facet: file-based, not pre-staged — the historical
+    /// contract. A producer with NEITHER attribute set must still yield the
+    /// safe defaults (`uses_file_based_items=true`, `pre_staged_mode=false`),
+    /// mirroring `managers/primary/new.rs`'s `unwrap_or(true)`.
+    #[test]
+    fn missing_attributes_default_to_file_based_not_pre_staged() {
+        Python::attach(|py| {
+            // SimpleNamespace with no fields at all.
+            let (td, ta) = stubs(py, "", "");
+            let (uses_files, pre_staged) = extract_staging_dispatch_flags(&td, &ta);
+            assert!(uses_files, "missing uses_file_based_items defaults to file-based");
+            assert!(!pre_staged, "missing source_already_staged defaults to not-pre-staged");
+        });
     }
 }

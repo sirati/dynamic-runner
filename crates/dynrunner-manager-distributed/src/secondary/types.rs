@@ -36,20 +36,26 @@ pub type FinalizeRunConfigFn =
 /// The two run-config dispatch flags the original submitter primary stamped
 /// into every `InitialAssignment` (`pre_staged_mode` /
 /// `uses_file_based_items`). A NODE-LOCAL run constant — NOT replicated
-/// lattice data — that the secondary learns from the primary's
-/// `InitialAssignment` and BOTH the local dispatch resolver AND a
-/// promotion-built primary must read so they agree on what a worker can
-/// open.
+/// lattice data — that a PLAIN secondary learns from the primary's
+/// `InitialAssignment` so the local dispatch resolver agrees with the primary
+/// on what a worker can open.
 ///
-/// Single source of truth: the `InitialAssignment` handler is the SOLE
-/// writer (`SecondaryCoordinator::set_staging_dispatch_context`); the
-/// dispatch resolver (`resolve_for_dispatch`) and the promotion recipe
-/// (which threads these into the promoted `PrimaryConfig` so its own
-/// `InitialAssignment` re-stamps the SAME flags) are the readers. Shared
-/// behind an `Arc<Mutex<_>>` for the same reason `forwarded_argv` is: the
-/// promotion recipe is a standalone closure that cannot borrow the
-/// coordinator, so it captures a clone of the handle and reads it at the
-/// promotion instant (always after the `InitialAssignment` landed).
+/// The `InitialAssignment` handler is the SOLE writer
+/// (`SecondaryCoordinator::set_staging_dispatch_context`); the dispatch
+/// resolver (`resolve_for_dispatch`) is the SOLE reader. This is the
+/// DISPATCH-time source, fed by the wire.
+///
+/// It is deliberately NOT the source the promotion recipe reads: a
+/// relocate-TARGET never receives an `InitialAssignment` before it is promoted
+/// (the setup peer relocates, then the target promotes, then the PROMOTED
+/// primary runs `perform_initial_assignment`), so its cell is still at
+/// `Default` at the promotion instant. The recipe instead sources the same two
+/// flags from the node's OWN local producer (the run-uniform consumer
+/// `task_definition`/`task_args` it booted with — see
+/// `managers/secondary/run.rs::extract_staging_dispatch_flags`), which carries
+/// the value the submitter primary stamped. The two sources answer the same
+/// question at two different lifecycle points (wire-at-dispatch vs.
+/// producer-at-promotion); they are not redundant copies of one computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StagingDispatchContext {
     /// Pre-staged source mode (`--source-already-staged`): the data is

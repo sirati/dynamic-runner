@@ -818,6 +818,108 @@ pub(super) fn build_test_promote_recipe_with_config(
     })
 }
 
+/// The two staging-dispatch flags the promote recipe sources from the node's
+/// OWN local producer (the relocate-staging fix). A FAITHFUL mirror of the
+/// pyo3 recipe inputs (`managers/secondary/run.rs::PromotedPrimaryRecipeInputs`'s
+/// `uses_file_based_items` / `pre_staged_mode`), so the manager-distributed
+/// relocate test drives the SAME stamping logic the production recipe runs —
+/// rather than a pre-built config that bypasses the source entirely.
+pub(super) struct ProducerStagingFlags {
+    /// From the consumer `task_definition.uses_file_based_items`.
+    pub uses_file_based_items: bool,
+    /// From `task_args.source_already_staged` non-None (mirrors the submitter's
+    /// `source_pre_staged_root.is_some()`).
+    pub pre_staged_mode: bool,
+    /// The pre-staged corpus root, threaded into `source_pre_staged_root` IFF
+    /// `pre_staged_mode` (the recipe's gating discriminant).
+    pub source_pre_staged_root: Option<std::path::PathBuf>,
+    /// The local source-tree root for `maybe_auto_stage_initial`'s re-walk.
+    pub source_dir: Option<std::path::PathBuf>,
+}
+
+/// Build a promote recipe that mirrors the PRODUCTION pyo3 recipe's source:
+/// it stamps `uses_file_based_items` / `source_pre_staged_root` from the
+/// node's own LOCAL PRODUCER (`flags`), NOT from the `InitialAssignment`-fed
+/// `StagingDispatchContext` cell. `cell` is the relocate-target secondary's
+/// live cell handle — captured to PROVE it stays at `Default` (a relocate-
+/// target receives no `InitialAssignment` before promotion) and is irrelevant
+/// to the stamped flags. This is what makes the relocate test actually catch
+/// the false-green: the cell is on the path but is NOT the source.
+///
+/// REVERT-CHECK seam: flipping the two `flags.*` reads below to
+/// `cell.lock()...` reproduces the bug (the cell is at `Default`, so the
+/// promoted primary stamps `uses_file_based_items=true` / no pre-staging) and
+/// the dispatch-target assertions fail — confirming the test exercises the
+/// real gap.
+pub(super) fn build_test_promote_recipe_from_producer(
+    config_id: String,
+    flags: ProducerStagingFlags,
+    cell: std::sync::Arc<std::sync::Mutex<crate::secondary::StagingDispatchContext>>,
+    setup_discovery: Option<crate::discovery::SetupDiscovery<TestId>>,
+) -> crate::process::PromotedPrimaryBuilder<
+    dynrunner_scheduler::ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+> {
+    let ProducerStagingFlags {
+        uses_file_based_items,
+        pre_staged_mode,
+        source_pre_staged_root,
+        source_dir,
+    } = flags;
+    let mut setup_discovery = setup_discovery;
+    Box::new(move |client, inbox, demote_rx, snapshot| {
+        // The cell is captured (on the live promotion path) but deliberately
+        // NOT read for the stamped flags — assert it is still at `Default` to
+        // pin that a relocate-target gets no `InitialAssignment` pre-promotion.
+        let cell_at_promotion = *cell
+            .lock()
+            .expect("staging_dispatch_context mutex poisoned");
+        assert_eq!(
+            cell_at_promotion,
+            crate::secondary::StagingDispatchContext::default(),
+            "a relocate-target's wire-fed cell MUST be at Default at promotion \
+             (no InitialAssignment yet) — if this fails the test's premise is wrong"
+        );
+        let config = PrimaryConfig {
+            node_id: config_id.clone(),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            keepalive_interval: std::time::Duration::from_secs(60),
+            peer_timeout: std::time::Duration::from_secs(120),
+            // Sourced from the LOCAL PRODUCER (`flags`), mirroring the pyo3
+            // recipe — NOT the `cell` above.
+            uses_file_based_items,
+            source_pre_staged_root: if pre_staged_mode {
+                source_pre_staged_root.clone()
+            } else {
+                None
+            },
+            source_dir: source_dir.clone(),
+            ..PrimaryConfig::default()
+        };
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            client,
+            inbox,
+            demote_rx,
+            dynrunner_scheduler::ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        if let Some(sd) = setup_discovery.take() {
+            primary.register_setup_discovery(sd);
+        }
+        primary.seed_from_promotion_snapshot(snapshot);
+        crate::process::PromotedPrimary {
+            coordinator: primary,
+            run_args: crate::process::PrimaryRunArgs {
+                seed: crate::process::SeedSource::PromotionSnapshot,
+                on_phase_start: Box::new(|_| {}),
+                on_phase_end: Box::new(|_, _, _, _| {}),
+            },
+        }
+    })
+}
+
 /// Allocate the channel-pairs for `num_secondaries` and return the
 /// primary's single `ChannelPeerTransport` plus per-secondary
 /// (id, secondary→primary inbox, secondary→primary outbox) tuples
