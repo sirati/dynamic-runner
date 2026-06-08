@@ -90,6 +90,24 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// emit target and the gate can never diverge.
 pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
+/// Tracing target carrying CONSUMER Python log records forwarded into Rust
+/// tracing by [`py_log`] (the `dynamic_runner` Python→tracing bridge).
+///
+/// A forwarded record inherits the emitting thread's role span (the consumer
+/// hook runs inside the run future's role scope — `on_phase_end` on the
+/// run-loop thread, `discover_items` on a role-span-entered blocking thread),
+/// so it routes to the matching per-role full-log file
+/// (`primary.log` / `secondary.log` / `observer.log`) through the SAME
+/// [`RoleFilter`] every framework event uses — no per-role branch.
+///
+/// It is a REGULAR (non-important) target: the operator-facing stdio sink
+/// already carries Python chatter through the Python root console handler, so
+/// the bridged copy is gated OUT of the stdio sink ([`stdio_layer`]) to avoid
+/// a double line, while the full/per-role file sinks (which record everything)
+/// keep it. This is the durable per-role Python sink the relocated primary /
+/// observer lacked on SLURM.
+pub(crate) const BRIDGE_TARGET: &str = "dynrunner_py_bridge";
+
 /// Filename for primary-role events under the per-node full-log dir: every
 /// event a primary coordinator's run future emits (it carries the
 /// [`PRIMARY_ROLE_SPAN`]). Separate from [`SECONDARY_LOG_FILENAME`] so a
@@ -323,11 +341,26 @@ impl FormatTime for LocalHhMm {
     }
 }
 
+/// The single layer-level gate for the ungated stdio sink: pass every event
+/// EXCEPT the Python→tracing bridge target ([`BRIDGE_TARGET`]). A bridged
+/// consumer record is already on stdout via the Python root console handler,
+/// so admitting it here too would double the line; the full/per-role file
+/// sinks (which carry everything) are the bridge's destination. This is the
+/// ONLY place the bridge target is excluded from stdout; the importance
+/// branch excludes it implicitly (it admits ONLY [`IMPORTANT_TARGET`]).
+fn non_bridge_stdio_filter() -> FilterFn<fn(&Metadata<'_>) -> bool> {
+    fn predicate(meta: &Metadata<'_>) -> bool {
+        meta.target() != BRIDGE_TARGET
+    }
+    FilterFn::new(predicate as fn(&Metadata<'_>) -> bool)
+}
+
 /// Build the stdio `fmt` layer over `writer`. Target-gated to
-/// [`IMPORTANT_TARGET`] when `important_only`; otherwise ungated. The
-/// verbosity ceiling is the single global subscriber-level filter (see
-/// [`init_with`]), so this layer owns only the IMPORTANCE-gate concern —
-/// never a per-layer level filter.
+/// [`IMPORTANT_TARGET`] when `important_only`; otherwise admits everything
+/// EXCEPT the Python→tracing bridge target (see [`non_bridge_stdio_filter`]).
+/// The verbosity ceiling is the single global subscriber-level filter (see
+/// [`init_with`]), so this layer owns only the IMPORTANCE/bridge-gate concern
+/// — never a per-layer level filter.
 ///
 /// In importance mode the layer is also reformatted for operators: a
 /// compact local-time [`LocalHhMm`] stamp and no event target (so the
@@ -360,6 +393,10 @@ where
     } else {
         tracing_subscriber::fmt::layer()
             .with_writer(make_writer)
+            // Drop the bridged consumer-Python copy: it is already on stdout
+            // via the Python root console handler (see logging_setup.py); the
+            // bridge's durable destination is the per-role/full file sinks.
+            .with_filter(non_bridge_stdio_filter())
             .boxed()
     }
 }
@@ -488,6 +525,64 @@ pub(crate) fn py_init_logging(
 ) {
     let config = LogConfig::new(important_stdio_only, full_log_file, full_log_dir, debug);
     init_with(&config);
+}
+
+/// Forward ONE consumer Python log record into Rust tracing so it lands in
+/// the correct per-role full-log file via the existing role-span routing.
+///
+/// Single concern: emit a `tracing::event!` at [`BRIDGE_TARGET`] carrying the
+/// record's message, mapping the Python level NAME to the tracing level. The
+/// event inherits the CURRENT thread's role span (the consumer hook runs
+/// inside the run future's role scope), so the per-role [`RoleFilter`] routes
+/// it to `primary.log` / `secondary.log` / `observer.log` with NO role tag
+/// passed across the boundary — role attribution lives entirely in the span,
+/// where the run loop owns it. The Python side (a `logging.Handler` installed
+/// by `logging_setup.setup_logging`) is the only caller.
+///
+/// `tracing::event!` needs a compile-time-constant level, so the runtime
+/// level name selects one of the five const-level emits. An unrecognised name
+/// degrades to `INFO` (the record is never dropped — a forwarded record is a
+/// real consumer log line). The `target` is fixed to [`BRIDGE_TARGET`]; the
+/// `record_target` (the Python logger NAME) rides along as a structured field
+/// so the per-role file still attributes which consumer logger spoke, without
+/// the bridge target ever varying (the gate/routing keys must not drift).
+#[pyfunction]
+#[pyo3(name = "py_log", signature = (level, record_target, message))]
+pub(crate) fn py_log(level: &str, record_target: &str, message: &str) {
+    match level {
+        "CRITICAL" | "ERROR" => tracing::event!(
+            target: BRIDGE_TARGET,
+            tracing::Level::ERROR,
+            logger = record_target,
+            "{message}"
+        ),
+        "WARNING" | "WARN" => tracing::event!(
+            target: BRIDGE_TARGET,
+            tracing::Level::WARN,
+            logger = record_target,
+            "{message}"
+        ),
+        "DEBUG" => tracing::event!(
+            target: BRIDGE_TARGET,
+            tracing::Level::DEBUG,
+            logger = record_target,
+            "{message}"
+        ),
+        "TRACE" | "NOTSET" => tracing::event!(
+            target: BRIDGE_TARGET,
+            tracing::Level::TRACE,
+            logger = record_target,
+            "{message}"
+        ),
+        // "INFO" and any unrecognised name: a forwarded record is a real
+        // consumer log line, so never drop it — default to INFO.
+        _ => tracing::event!(
+            target: BRIDGE_TARGET,
+            tracing::Level::INFO,
+            logger = record_target,
+            "{message}"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1023,6 +1118,163 @@ mod tests {
                  secondary.log contents: {secondary:?}"
             );
         });
+    }
+
+    /// SMELL E (the bridge): a consumer Python record forwarded through
+    /// [`py_log`] from INSIDE a non-submitter role span lands in that role's
+    /// per-role full-log file — the durable per-role Python sink the relocated
+    /// primary / observer lacked on SLURM. Driven over the PRODUCTION
+    /// `build_layers` PerNodeDir + ungated-stdio stack (the relocated primary's
+    /// `--full-log-dir` + non-importance compute-node config), so it exercises
+    /// the real role routing and the stdio bridge-exclusion together.
+    ///
+    /// Asserts BOTH halves of the role attribution: the record enters the
+    /// matching per-role file (`primary.log` here — a relocated primary is a
+    /// non-submitter role), AND is excluded from the other role files and from
+    /// the ungated stdout (it is already on stdout via the Python console
+    /// handler; admitting the bridge copy would double the line).
+    #[test]
+    fn py_log_bridge_routes_consumer_record_to_role_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("compute-0");
+        // The compute-node relocated-primary config: per-node-dir full sink,
+        // importance OFF (it is NOT forwarded to non-submitter roles).
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+
+        let stdio_buf = BufWriter::default();
+        // Mirror production `build_layers` for PerNodeDir (the three role files)
+        // but route the always-present stdio layer to an in-memory buffer so the
+        // bridge-exclusion is observable. Same shapes, same filters.
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            role_full_layer(
+                open_append_create(&node_dir.join(PRIMARY_LOG_FILENAME)),
+                PRIMARY_ROLE_SPAN,
+            ),
+            role_full_layer(
+                open_append_create(&node_dir.join(SECONDARY_LOG_FILENAME)),
+                SECONDARY_ROLE_SPAN,
+            ),
+            role_full_layer(
+                open_append_create(&node_dir.join(OBSERVER_LOG_FILENAME)),
+                OBSERVER_ROLE_SPAN,
+            ),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), config.important_stdio_only),
+        ];
+        // Layers first then the global level (order-independent for a global
+        // filter), so the boxed `Layer<Registry>` set keeps its base type —
+        // exactly how the sibling `role_span_routes_*` tests compose.
+        let subscriber = Registry::default().with(layers).with(config.level);
+
+        with_default(subscriber, || {
+            // The consumer hook runs INSIDE the run future's role span (here
+            // PRIMARY, as on a relocated primary). The bridge forwards the
+            // Python record via `py_log`, which emits at `BRIDGE_TARGET`; the
+            // role span on the current thread is what routes it.
+            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary", node = "compute-0")
+                .in_scope(|| {
+                    py_log("INFO", "consumer.task", "phase complete: 7 done");
+                });
+        });
+
+        let primary = std::fs::read_to_string(node_dir.join(PRIMARY_LOG_FILENAME))
+            .expect("primary.log should exist");
+        let secondary = std::fs::read_to_string(node_dir.join(SECONDARY_LOG_FILENAME))
+            .expect("secondary.log should exist");
+        let observer = std::fs::read_to_string(node_dir.join(OBSERVER_LOG_FILENAME))
+            .expect("observer.log should exist");
+
+        assert!(
+            primary.contains("phase complete: 7 done"),
+            "bridged consumer record missing from the relocated primary's \
+             primary.log: {primary:?}"
+        );
+        assert!(
+            !secondary.contains("phase complete: 7 done"),
+            "bridged consumer record leaked into secondary.log: {secondary:?}"
+        );
+        assert!(
+            !observer.contains("phase complete: 7 done"),
+            "bridged consumer record leaked into observer.log: {observer:?}"
+        );
+        // The bridged copy is excluded from the ungated stdio sink (it is on
+        // stdout via the Python console handler; no double line).
+        assert!(
+            !stdio_buf.contents().contains("phase complete: 7 done"),
+            "bridged consumer record doubled onto stdout: {}",
+            stdio_buf.contents()
+        );
+    }
+
+    /// REVERT-CHECK for the role-attribution half of the bridge: without the
+    /// emitting thread carrying the role span (the `spawn_blocking` detach the
+    /// `build_setup_discovery_fn` span-propagation restores), a `py_log` record
+    /// reaches NO per-role file. This is what made the GAP invisible on
+    /// SLURM — a relocated primary's off-thread `discover_items` logging fell
+    /// through every per-role filter. Drop the `discover_items` span re-entry
+    /// (i.e. remove the role span from the current thread) and this test shows
+    /// the record vanishing from primary.log; that is the failure the fix
+    /// prevents.
+    #[test]
+    fn py_log_outside_role_span_reaches_no_role_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("compute-0");
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let layers = build_layers::<Registry>(&config);
+        let subscriber = Registry::default().with(layers).with(config.level);
+
+        with_default(subscriber, || {
+            // No role span entered (the detached blocking thread): the emit has
+            // no role scope to route by.
+            py_log("INFO", "consumer.task", "orphan-bridge-record");
+        });
+
+        for role_file in [
+            PRIMARY_LOG_FILENAME,
+            SECONDARY_LOG_FILENAME,
+            OBSERVER_LOG_FILENAME,
+        ] {
+            let contents = std::fs::read_to_string(node_dir.join(role_file))
+                .unwrap_or_else(|_| panic!("{role_file} should exist"));
+            assert!(
+                !contents.contains("orphan-bridge-record"),
+                "a role-span-less bridge record reached {role_file} — the \
+                 role routing is not scope-gated: {contents:?}"
+            );
+        }
+    }
+
+    /// The `py_log` level NAME maps to the tracing level: a Python `WARNING`
+    /// forwarded under a `--debug`-OFF (INFO ceiling) config still passes
+    /// (WARN ≥ INFO), while a `DEBUG` record is dropped by the same ceiling —
+    /// confirming the level mapping feeds the real verbosity gate rather than
+    /// being a flat INFO emit.
+    #[test]
+    fn py_log_level_name_maps_to_tracing_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("compute-0");
+        // INFO ceiling (debug off).
+        let config = LogConfig::new(false, None, Some(node_dir.display().to_string()), false);
+        let layers = build_layers::<Registry>(&config);
+        let subscriber = Registry::default().with(layers).with(config.level);
+
+        with_default(subscriber, || {
+            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary", node = "c0").in_scope(|| {
+                py_log("WARNING", "consumer.task", "warn-passes-info-ceiling");
+                py_log("DEBUG", "consumer.task", "debug-dropped-by-info-ceiling");
+            });
+        });
+
+        let primary = std::fs::read_to_string(node_dir.join(PRIMARY_LOG_FILENAME))
+            .expect("primary.log should exist");
+        assert!(
+            primary.contains("warn-passes-info-ceiling"),
+            "WARNING-level bridge record did not pass the INFO ceiling: {primary:?}"
+        );
+        assert!(
+            !primary.contains("debug-dropped-by-info-ceiling"),
+            "DEBUG-level bridge record leaked past the INFO ceiling — the level \
+             name is not feeding the verbosity gate: {primary:?}"
+        );
     }
 
     /// CURATION-PRESERVED: raising the ceiling to DEBUG must NOT widen the
