@@ -95,9 +95,9 @@ where
     /// keeping both would double-deliver to the now-meshed primary. The
     /// degraded-mesh early-return is likewise gone: the primary is a
     /// member of the broadcast set regardless of the role-aware degraded
-    /// latch (the `Real` arm still holds the folded primary in its
-    /// `connections`; the firewalled arm routes `All` to the sole folded
-    /// member), so skipping the broadcast when degraded would starve the
+    /// latch (the mesh holds the folded primary as a plain `connections`
+    /// member and broadcasts `All` to every member including it), so
+    /// skipping the broadcast when degraded would starve the
     /// primary of keepalives and trip a false primary-death.
     pub(in crate::secondary) async fn send_keepalive(&mut self) {
         let active_count = self

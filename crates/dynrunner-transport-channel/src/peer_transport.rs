@@ -67,7 +67,7 @@ pub struct ChannelPeerTransport<I: Identifier> {
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         // Role-blind fan-out to every connection incl the folded primary
-        // (mirrors the QUIC `PeerNetwork` Real arm post de-role). The
+        // (mirrors the QUIC `PeerNetwork` broadcast post de-role). The
         // primary also receiving the secondary's broadcast keepalive/CRDT
         // is a benign idempotent double (it also arrives via
         // `send_to_primary`); excluding it would be a role concern the
@@ -139,7 +139,7 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         // secondaries" question is the coordinator edge's single
         // authoritative concern (`alive_secondary_count`, computed over
         // global state, NOT transport arithmetic). Mirrors the QUIC
-        // `PeerNetwork` Real arm.
+        // `PeerNetwork` broadcast set.
         self.outgoing.len()
     }
 
