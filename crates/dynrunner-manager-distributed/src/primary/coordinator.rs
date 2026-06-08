@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
-use dynrunner_protocol_primary_secondary::ClusterMutation;
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DiscoveryDebt};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -432,6 +432,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// caller didn't supply a hook.
     pub(super) on_phase_start: Option<OnPhaseStart>,
     pub(super) on_phase_end: Option<OnPhaseEnd>,
+    /// The consumer's discovery policy for a relocated (mode-2) primary or
+    /// an in-process `--source-already-staged` local primary, plus the
+    /// phase graph it seeds alongside the discovered tasks. `None` on every
+    /// cold mode-1 / legacy primary — the [`Self::discover_on_promotion`]
+    /// driver is then inert because the CRDT's `discovery_debt()` is
+    /// `Undeclared` anyway. Registered BEFORE `run` via
+    /// [`Self::register_setup_discovery`]; taken on the single discovery
+    /// fire (the `Option::take` IS the fire-once latch, alongside the
+    /// `discovery_debt() == Owed` gate — the V6 CRDT-intrinsic latch).
+    pub(super) setup_discovery: Option<crate::discovery::SetupDiscovery<I>>,
     /// Phases that have already had `on_phase_start` fired. The pool's
     /// state machine doesn't track "did we observe this transition" —
     /// that's the manager's bookkeeping, kept here so the pool stays
@@ -922,6 +932,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
+            setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             silence_warn_stage: HashMap::new(),
@@ -1160,24 +1171,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.hydrate_from_cluster_state();
         self.reconstruct_workers_from_cluster_state();
         self.reconstruct_secondaries_from_cluster_state();
-        // Promote-ONLY projection (this method is the promote-path's
-        // construction primitive; cold start never calls it — so the call
-        // site IS the discriminator, no runtime `if seeded` fork). A phase
-        // is "started" iff its rollup `has_any` (≥1 ledger entry), the same
-        // predicate that fired `on_phase_start` pre-failover; seeding this
-        // here keeps `phase_started_emitted` symmetric with the relocate
-        // path's `started_phases` threading so a promoted primary does NOT
-        // re-fire `on_phase_start` for an already-started phase. It does NOT
-        // live in the shared `hydrate_from_cluster_state` because the cold
-        // path's freshly-seeded CRDT is all-`Pending` (`has_any` would be
-        // prematurely true and suppress the legitimate first fire).
-        self.phase_started_emitted = self
-            .cluster_state
-            .phase_rollups()
-            .iter()
-            .filter(|(_, r)| r.has_any)
-            .map(|(p, _)| (*p).clone())
-            .collect();
+        // `phase_started_emitted` is seeded by `hydrate_from_cluster_state`
+        // (V3) — derived from the CRDT's per-phase progressed-task set on
+        // BOTH the cold and promote paths, so it is no longer a promote-ONLY
+        // projection here. The inherited ledger's started phases (those with
+        // ≥1 InFlight/terminal task) are seeded so a promoted primary does
+        // NOT re-fire `on_phase_start`; a blocked-only inherited phase is
+        // correctly NOT seeded (the V3 correction over the old `has_any`).
     }
 
     /// Tear down the peer-lifecycle dispatcher task spawned at
@@ -1383,6 +1383,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ) {
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
+    }
+
+    /// Register the consumer's discovery policy + phase graph on a
+    /// relocated (mode-2) / `--source-already-staged` local primary BEFORE
+    /// `run`. Mirrors [`Self::register_phase_lifecycle_callbacks`]: the pyo3
+    /// recipe builds the policy closure (the same `discover_items` excursion
+    /// the secondary used) and hands it here; [`Self::discover_on_promotion`]
+    /// takes it on the single discovery fire.
+    ///
+    /// Inert unless the CRDT declares discovery `Owed` (the mode-2 seed
+    /// originates `DiscoveryDebtDeclared` before relocate; an in-process
+    /// pre-staged local primary seeds it on the local CRDT). A primary that
+    /// never owes discovery (cold mode-1 / legacy) ignores a registered
+    /// policy entirely.
+    pub fn register_setup_discovery(&mut self, discovery: crate::discovery::SetupDiscovery<I>) {
+        self.setup_discovery = Some(discovery);
     }
 
     /// Set the per-task budget cap for
@@ -2609,6 +2625,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections(&mut command_rx).await?;
 
+        // Mode-2 discover-on-promotion (V6). Runs the consumer's discovery
+        // policy IFF the CRDT declares discovery `Owed` (a relocated
+        // compute-peer primary, or an in-process `--source-already-staged`
+        // local primary, that inherited the empty-ledger + `Owed` marker),
+        // originates `PhaseDepsSet + TaskAdded* + DiscoverySettled` (or, on an
+        // empty corpus, `DiscoverySettled + RunComplete`), and re-hydrates the
+        // pool. INERT on every current path (cold mode-1 / legacy / promotion
+        // of an already-seeded run reads `Undeclared`/`Settled`, so the gate
+        // short-circuits to a no-op) — but the ORDERING is load-bearing for
+        // when 5c originates `Owed`:
+        //   * AFTER `wait_for_connections` so the discovery seed's broadcast
+        //     reaches the connected fleet (the same post-connect-broadcast
+        //     discipline `broadcast_cold_seed` uses);
+        //   * BEFORE `fire_initial_phase_starts` + the empty-phase cascade so,
+        //     by the time the cascade evaluates its `discovery_debt() != Owed`
+        //     gate, the driver has already flipped `Owed → Settled` and
+        //     hydrated the discovered tasks — a declared-but-empty phase then
+        //     correctly drains to Done firing `on_phase_end(.., 0, 0)`, and a
+        //     phase that drew real work stays `Active` (no spurious empty
+        //     drain). See `mode2-discovery-design.md` Part 3 for the proof.
+        self.discover_on_promotion().await?;
+
         // Fire on_phase_start for every phase the pool initialised as
         // Active (zero-deps phases), THEN cascade trivially-empty phases.
         // Subsequent activations triggered by `mark_phase_done` are
@@ -2631,9 +2669,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         //     path — `originate_cold_seed` vs `apply_spawn_tasks`), not a
         //     runtime read of `phase_started_emitted`; the only runtime read
         //     of `phase_started_emitted` is `fire_initial_phase_starts`' own
-        //     `insert` guard, and `originate_cold_seed`'s `debug_assert!`
-        //     (must run before fire) is satisfied — the cold seed still runs
-        //     far above, before connect.
+        //     `insert` guard. `phase_started_emitted` itself is seeded by
+        //     hydrate (V3) — empty on the cold path's all-`Pending` ledger —
+        //     so the first fire here is legitimate and the cold seed still
+        //     runs far above, before connect.
         //   * No `on_phase_end` can fire DURING `wait_for_connections`: no
         //     task has been assigned yet (`perform_initial_assignment` runs
         //     below, after connect), and because `drain_empty_active_phases`
@@ -2674,8 +2713,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Asm-tokenizer's lazy-spawn consumer pattern
         // (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
         // is the live consumer of this contract.
-        self.pool_mut().drain_empty_active_phases();
-        self.process_phase_lifecycle(&mut command_rx).await;
+        //
+        // Gated on `discovery_debt() != Owed` (V6): while discovery is owed
+        // the ledger is unseeded and every declared phase is a transiently-
+        // empty `Active` — draining it now would mark every phase `Drained`
+        // and fire spurious `on_phase_end(.., 0, 0)` for phases that have no
+        // items only because discovery hasn't run yet. `discover_on_promotion`
+        // (run above, BEFORE this) flips `Owed → Settled` after seeding the
+        // discovered tasks, so by the time the cascade evaluates this gate the
+        // debt is cleared and the discovered work is hydrated — a genuinely-
+        // empty declared phase then drains + narrates correctly, and a phase
+        // that drew real work stays `Active`. On every cold mode-1 / legacy /
+        // already-seeded path the marker is `Undeclared`/`Settled`, so the
+        // gate is open and the cascade runs exactly as before. Both halves
+        // (the drain + the cascade) stay paired under ONE gate — the
+        // `drain_empty_active_phases` pre-call exists only to feed the
+        // cascade, so gating only one would leave phases stuck `Drained`.
+        if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed {
+            self.pool_mut().drain_empty_active_phases();
+            self.process_phase_lifecycle(&mut command_rx).await;
+        }
 
         // #3a abort gate. `originate_cold_seed` recorded a pending
         // abort iff the INITIAL batch had a `(phase_id, task_id)`
@@ -2748,15 +2805,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // holds. Both defer + non-defer modes pass here.
         self.rebroadcast_full_roster().await;
 
+        // V2: rebuild the remote-worker roster from the replicated
+        // per-secondary capacity NOW — `wait_for_connections` has originated
+        // every connected secondary's `SecondaryCapacity` (and
+        // `rebroadcast_full_roster` above re-emitted the full set), so
+        // `known_secondaries()` is populated. `reconstruct_workers_from_cluster_state`
+        // is the SOLE roster builder (the round-robin `self.workers.push`
+        // block was deleted from `perform_initial_assignment`, which is now a
+        // pure scheduler over the existing `self.workers`). The initial
+        // hydrate (before connect) built an EMPTY roster on the cold path —
+        // no capacity records existed yet — so this re-invoke is where the
+        // cold roster is derived; on a promote / discover-on-promotion path
+        // the roster was already rebuilt and this wholesale-replace is
+        // idempotent (same capacity → same roster). It MUST run BEFORE
+        // `perform_initial_assignment` commits any slot: the wholesale
+        // replace re-derives occupancy only from CRDT `InFlight`, so a
+        // re-invoke AFTER assignment began committing would zero
+        // committed-but-not-yet-originated slots — FORBIDDEN. (No reconstruct
+        // call exists past this point on the run-init path; the only other
+        // invocations are the failover/promotion construction primitive
+        // `seed_from_promotion_snapshot` and discover-on-promotion's hydrate,
+        // both before assignment.)
+        self.reconstruct_workers_from_cluster_state();
+
         // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
         // perform the initial per-secondary assignment. Ships the
         // cold-start seed (the `PhaseDepsSet` + `TaskAdded` fan-out + the #2
         // invalid-dep `TaskFailed` transitions, applied LOCALLY at
         // `originate_cold_seed` and staged for this post-connection
         // broadcast so they reach the fleet) + `perform_initial_assignment`
-        // (round-robin worker assignments, staged-files inline). On a
-        // promotion the staged seed is empty (the inherited CRDT replicates
-        // via anti-entropy), so `broadcast_cold_seed` is a no-op there.
+        // (a pure scheduler over the reconstructed `self.workers`,
+        // staged-files inline). On a promotion the staged seed is empty (the
+        // inherited CRDT replicates via anti-entropy), so `broadcast_cold_seed`
+        // is a no-op there.
         self.broadcast_cold_seed().await;
         self.perform_initial_assignment().await?;
 
@@ -3278,6 +3359,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
+        // Discovery-owed defence-in-depth (V6): while the CRDT declares
+        // discovery `Owed` the ledger is unseeded and every declared phase is
+        // a transiently-empty `Active` — firing `on_phase_end(.., 0, 0)` now
+        // would surface a spurious "empty drain" for every phase before
+        // `discover_on_promotion` has had a chance to populate them (a
+        // consumer callback walking just-discovered outputs would OSError on
+        // missing paths). The gate clears the moment the driver originates
+        // `DiscoverySettled`; subsequent cascade calls resume normal
+        // operation. Idempotent on every cold mode-1 / legacy / already-seeded
+        // path: the marker is `Undeclared`/`Settled` (`!= Owed`), so the gate
+        // is always satisfied there. The run-init pre-loop cascade is already
+        // gated identically at its call site; this is the per-call backstop
+        // for the inbound-driven (`dispatch_message`) cascade entries.
+        if self.cluster_state.discovery_debt() == DiscoveryDebt::Owed {
+            return;
+        }
         loop {
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {

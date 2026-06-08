@@ -64,7 +64,6 @@ mod tests;
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{
     FinalizeRunConfigFn, PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal,
-    SetupDiscovery, SetupDiscoveryFn,
 };
 
 /// A task DEFERRED on this secondary because the target worker's

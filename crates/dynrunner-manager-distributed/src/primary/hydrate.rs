@@ -97,6 +97,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // live path. The replicated `retry_passes_used` budget gates
         // re-retry, so seeding every recoverable `Failed` is safe.
         let mut failed_tasks: HashMap<String, ErrorType> = HashMap::new();
+        // V3: the set of phases that have fired `on_phase_start`, derived
+        // from the CRDT on BOTH the cold and promote paths (replacing the
+        // old split: `originate_cold_seed`'s `.clear()` + the promote-only
+        // `seed_from_promotion_snapshot` `has_any` projection). A phase is
+        // "started" iff it holds ≥1 task that has PROGRESSED past
+        // `Pending`/`Blocked` — i.e. ≥1 `InFlight` or terminal
+        // (`Completed`/`Failed`/`Unfulfillable`/`InvalidTask`) entry. This is
+        // exactly `has_any && (in_flight || terminal-present)`:
+        //   * COLD: a freshly-seeded CRDT is all-`Pending` ⇒ the set is EMPTY
+        //     (the equivalent of the old `.clear()`), so the subsequent
+        //     `fire_initial_phase_starts` legitimately fires each phase's
+        //     first `on_phase_start`.
+        //   * RESUME (promotion): a phase that started pre-failover dispatched
+        //     work, so it holds an `InFlight`/terminal entry ⇒ it is seeded,
+        //     and `fire_initial_phase_starts` does NOT re-fire it.
+        //   * BLOCKED-ONLY phase: a phase whose every task is `Blocked`
+        //     (waiting on an unfinished prereq) was never `Active` ⇒ never
+        //     fired `on_phase_start` ⇒ correctly NOT seeded (the old
+        //     promote-side `has_any` over-suppressed it; this is the V3
+        //     correction). When its prereq completes it activates and fires
+        //     its legitimate first `on_phase_start`.
+        let mut started_phases: HashSet<PhaseId> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             all_binaries.push(state.task().clone());
@@ -139,12 +161,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // `failed_tasks.contains_key`, so it still dedupes without
                 // the `completed_tasks` membership.
                 TaskState::Failed { task, kind, .. } => {
+                    started_phases.insert(task.phase_id.clone());
                     completed_task_ids.insert(task.task_id.clone());
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
                 TaskState::Completed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. } => {
+                    started_phases.insert(task.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                 }
@@ -209,6 +233,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // (1) and (2) are owned by the pool via
                     // `mark_tasks_in_flight` below; (3) is the ledger
                     // seed performed after `extend` succeeds.
+                    started_phases.insert(task.phase_id.clone());
                     in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
                     in_flight_seed.push((
                         hash.clone(),
@@ -222,6 +247,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
 
         self.completed_tasks = primary_completed;
+        // V3: seed `phase_started_emitted` from the CRDT-derived started set
+        // (a phase with ≥1 progressed task). On the cold path this is empty
+        // (all-`Pending`), so `fire_initial_phase_starts` fires every phase's
+        // first `on_phase_start`; on the promote path the inherited started
+        // phases are seeded so they do NOT re-fire. The SOLE seeder of this
+        // set at construction time (the live `fire_initial_phase_starts`
+        // `insert` guard is the only OTHER writer, and it runs after hydrate).
+        self.phase_started_emitted = started_phases;
         // Rebuild the OOM/retry candidate universe from the CRDT so a
         // promoted primary's retry bucket has a candidate source (it was
         // empty on the seeded path before this). Pure derived cache.

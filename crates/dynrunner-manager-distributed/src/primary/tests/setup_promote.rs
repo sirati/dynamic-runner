@@ -3,6 +3,437 @@
 
 use super::*;
 
+use dynrunner_protocol_primary_secondary::DiscoveryDebt;
+
+use crate::primary::wire::compute_task_hash;
+
+/// Build a [`crate::discovery::SetupDiscovery`] whose policy yields a FIXED
+/// batch of `TaskInfo` (cloned per fire) and the given phase graph. The
+/// discovery counter increments on each fire so a test can assert the policy
+/// ran exactly once (or never).
+fn fixed_discovery(
+    binaries: Vec<TaskInfo<TestId>>,
+    phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
+) -> crate::discovery::SetupDiscovery<TestId> {
+    crate::discovery::SetupDiscovery {
+        discover: Box::new(move || {
+            fire_count.set(fire_count.get() + 1);
+            let out = binaries.clone();
+            Box::pin(async move { Ok(out) })
+        }),
+        phase_deps,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// V6: originate_relocated_seed + discover_on_promotion + the DiscoveryDebt
+// re-gating (run_complete_check / empty-phase cascade / process_phase_lifecycle).
+// ────────────────────────────────────────────────────────────────────────
+
+/// `originate_relocated_seed` stages ONLY the phase graph + the discovery-debt
+/// marker (NO tasks), sets `all_binaries` empty, and ratchets
+/// `discovery_debt` `Undeclared → Owed` on the LOCAL apply. The staged frames
+/// are the post-connection broadcast (shipped by `broadcast_cold_seed`).
+#[tokio::test(flavor = "current_thread")]
+async fn originate_relocated_seed_declares_debt_and_seeds_phase_graph_only() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Undeclared,
+                "a fresh CRDT is Undeclared (bottom)"
+            );
+
+            let mut deps = HashMap::new();
+            deps.insert(
+                dynrunner_core::PhaseId::from("ship"),
+                vec![dynrunner_core::PhaseId::from("build")],
+            );
+            primary.originate_relocated_seed(deps.clone());
+
+            // Local apply ratcheted to Owed; NO tasks seeded; phase graph set.
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Owed,
+                "the relocated seed must declare debt (Undeclared → Owed)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                0,
+                "the relocated seed must seed NO tasks (discovery runs later)"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().phase_deps(),
+                &deps,
+                "the relocated seed must replicate the phase graph"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` is a NO-OP when the CRDT is `Undeclared` (cold
+/// mode-1 / legacy): the gate short-circuits and the registered policy is
+/// NEVER consulted. The NO-REDO invariant at the driver level.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_noop_when_undeclared() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                vec![make_binary("x", 100)],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Undeclared → no-op Ok");
+
+            assert_eq!(fires.get(), 0, "the policy must NOT run when Undeclared");
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                0,
+                "no tasks seeded on the no-op path"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Undeclared,
+                "the marker stays Undeclared on the no-op path"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` is a NO-OP when the CRDT is already `Settled` (a
+/// re-promotion AFTER a prior origination completed). The NO-REDO invariant:
+/// a populated-CRDT promoted primary does NOT re-discover.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_noop_when_settled() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // A prior origination already settled (Owed then Settled).
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::DiscoveryDebtDeclared);
+                cs.apply(ClusterMutation::DiscoverySettled);
+            }
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                vec![make_binary("x", 100)],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Settled → no-op Ok");
+
+            assert_eq!(fires.get(), 0, "the policy must NOT run when Settled");
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                0,
+                "no tasks seeded on the no-op path (no re-discovery)"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` on `Owed` + a NON-empty corpus: runs the policy
+/// ONCE, originates `PhaseDepsSet` + one `TaskAdded` per binary +
+/// `DiscoverySettled` (ratcheting `Owed → Settled`), and hydrates the pool.
+/// No `RunComplete` on the non-empty arm.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            let t1 = make_binary("disc-1", 100);
+            let t2 = make_binary("disc-2", 100);
+            let h1 = compute_task_hash(&t1);
+            let h2 = compute_task_hash(&t2);
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                vec![t1, t2],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Owed + non-empty → Ok");
+
+            assert_eq!(fires.get(), 1, "the policy runs EXACTLY once");
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "discovery must settle (Owed → Settled) atomically with the seed"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                2,
+                "both discovered tasks must be seeded as TaskAdded"
+            );
+            assert!(
+                primary.cluster_state_for_test().task_state(&h1).is_some()
+                    && primary.cluster_state_for_test().task_state(&h2).is_some(),
+                "both discovered hashes must be present in the ledger"
+            );
+            assert!(
+                !primary.cluster_state_for_test().run_complete(),
+                "the NON-empty arm must NOT originate RunComplete"
+            );
+            // hydrate built the pool from the seeded tasks.
+            assert_eq!(
+                primary.total_tasks, 2,
+                "hydrate must set total_tasks from the seeded ledger"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` on `Owed` + an EMPTY corpus: originates
+/// `DiscoverySettled` AND `RunComplete` (the empty-corpus terminal — no
+/// `TaskCompleted` will ever drive the counter finalize). The
+/// `ingest_setup_discovery` precedent.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_owed_empty_settles_and_run_completes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                Vec::new(),
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Owed + empty → Ok");
+
+            assert_eq!(fires.get(), 1, "the policy runs exactly once");
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "empty discovery must still settle the debt"
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                0,
+                "an empty corpus seeds no tasks"
+            );
+            assert!(
+                primary.cluster_state_for_test().run_complete(),
+                "the EMPTY arm must originate RunComplete (no TaskCompleted will \
+                 ever drive the counter finalize)"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` on `Owed` with NO policy registered is a hard
+/// `RunError` — a primary that owes discovery MUST carry the policy; silently
+/// stranding would never exit (the counter arm is gated on `Owed`).
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_owed_without_policy_is_hard_error() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+            // No register_setup_discovery.
+
+            let r = primary.discover_on_promotion().await;
+            assert!(
+                matches!(r, Err(crate::primary::RunError::Other(_))),
+                "Owed but no policy must hard-fail, not silently strand; got {r:?}"
+            );
+        })
+        .await;
+}
+
+/// `run_complete_check` gated on `discovery_debt() == Owed` (V6): a zero-task
+/// CRDT that declares debt must NOT trip the counter exit (`0+0 >= 0`) — the
+/// driver hasn't seeded yet. After `DiscoverySettled` lands, the same
+/// zero-task CRDT trips the exit (an empty corpus legitimately completes).
+#[test]
+fn run_complete_check_gated_on_discovery_owed() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        test_primary_config(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    // Empty pool, zero tasks, no active workers: the counter arm would
+    // otherwise trip `0+0 >= 0 && active==0`.
+    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+        [dynrunner_core::PhaseId::from("default")],
+        HashMap::new(),
+    )
+    .expect("default-phase pool");
+    primary.pending = Some(pool);
+    primary.total_tasks = 0;
+
+    // Declare debt → the exit must be SUPPRESSED.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::DiscoveryDebtDeclared);
+    assert!(
+        !primary.run_complete_check(),
+        "while discovery is Owed the counter/pool-drain exits must be suppressed"
+    );
+
+    // Settle → the empty-corpus run legitimately completes via the counter.
+    primary
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::DiscoverySettled);
+    assert!(
+        primary.run_complete_check(),
+        "once discovery Settles, the zero-task counter exit fires (empty corpus done)"
+    );
+}
+
+/// Ported `setup_pending_suppresses_initial_phase_cascade_until_task_added`
+/// (re-expressed on the V6 marker): while `DiscoveryDebtDeclared` holds the
+/// CRDT `Owed`, `process_phase_lifecycle` is a defence-in-depth NO-OP — no
+/// `on_phase_end` fires for the transiently-empty declared phases. After the
+/// driver's seed batch (incl. `DiscoverySettled`) lands, the cascade resumes
+/// and narrates the seeded phases. Drives the marker, not
+/// `required_setup_on_promote` + a bare `TaskAdded`.
+#[tokio::test(flavor = "current_thread")]
+async fn discovery_owed_suppresses_phase_cascade_until_settled() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicU32, Ordering};
+            // `OnPhaseEnd` is `+ Send`, so the counter must be `Send` — Arc/atomic.
+            let phase_end_fires = Arc::new(AtomicU32::new(0));
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let fires_for_cb = phase_end_fires.clone();
+            primary.register_phase_lifecycle_callbacks(
+                Box::new(|_| {}),
+                Box::new(move |_, _, _, _| {
+                    fires_for_cb.fetch_add(1, Ordering::SeqCst);
+                }),
+            );
+
+            // A declared-but-empty phase graph + Owed: the relocated-seed
+            // shape (PhaseDepsSet + DiscoveryDebtDeclared, no tasks).
+            let mut deps = HashMap::new();
+            deps.insert(dynrunner_core::PhaseId::from("build"), vec![]);
+            primary.originate_relocated_seed(deps);
+            primary.hydrate_from_cluster_state();
+
+            // While Owed, the cascade is a defence-in-depth no-op: NO
+            // on_phase_end fires for the transiently-empty "build" phase.
+            let mut rx = None;
+            primary.process_phase_lifecycle(&mut rx).await;
+            assert_eq!(
+                phase_end_fires.load(Ordering::SeqCst),
+                0,
+                "while discovery is Owed no on_phase_end may fire (the phases \
+                 are only transiently-empty, awaiting the discovery seed)"
+            );
+
+            // The driver's seed batch lands (the discovered tasks for "build"
+            // + DiscoverySettled): debt flips to Settled.
+            let fires2 = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let mut t = make_binary("build-1", 100);
+            t.phase_id = dynrunner_core::PhaseId::from("build");
+            primary.register_setup_discovery(fixed_discovery(
+                vec![t],
+                {
+                    let mut d = HashMap::new();
+                    d.insert(dynrunner_core::PhaseId::from("build"), vec![]);
+                    d
+                },
+                fires2.clone(),
+            ));
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("seed batch incl. DiscoverySettled");
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "the driver's seed batch settles the debt"
+            );
+            // Now the gate is open — the cascade resumes normal operation
+            // (the "build" phase holds a real Pending task, so it does not
+            // false-drain; no spurious empty on_phase_end).
+            primary.process_phase_lifecycle(&mut rx).await;
+            assert_eq!(
+                phase_end_fires.load(Ordering::SeqCst),
+                0,
+                "a phase holding real discovered work must NOT fire a spurious \
+                 empty on_phase_end after settle"
+            );
+        })
+        .await;
+}
+
 /// Pre-seeded bootstrap exit semantics: the counter-based exit at the top
 /// of `operational_loop` fires immediately when
 /// `completed + failed >= total_tasks && active_workers == 0`. Pins the

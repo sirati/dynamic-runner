@@ -10,7 +10,7 @@ use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler};
 use crate::state::SecondaryConnectionState;
 
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
-use super::{PrimaryCoordinator, RemoteWorkerState};
+use super::PrimaryCoordinator;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
@@ -36,87 +36,30 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 });
         }
 
-        // Build self.workers in ROUND-ROBIN order across secondaries
-        // (interleaved) rather than contiguous-per-secondary, so the
-        // downstream `for worker_idx in 0..self.workers.len()` loop —
-        // which assigns one task per worker in order — distributes
-        // initial assignments one-per-secondary-per-round. Pre-fix
-        // (contiguous-per-secondary) meant tasks < total_workers
-        // would fill the early secondaries fully before any task
-        // reached the later ones; with N=4 secondaries × 2 workers
-        // and 4 tasks, two secondaries got 2 tasks each and two got
-        // none in the initial batch. The operational loop's
-        // TaskRequest cycle self-balances post-initial, but the
-        // startup transient was visible in small-task-set runs.
-        //
-        // Secondary iteration order is now NAME-SORTED (was
-        // HashMap-random) so initial assignment is deterministic
-        // across runs — important for repro of subtle scheduler
-        // behaviour and for log-diffing.
-        let mut secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
+        // V5: the roster READ routes through the replicated
+        // `cluster_state.known_secondaries()` — the CRDT-derived known set —
+        // NOT `self.secondaries` (which keeps transport-handle metadata
+        // only). Name-sorted so the per-secondary `InitialAssignment`
+        // fan-out + Operational transition below are deterministic across
+        // runs (important for repro / log-diffing). The matching `self.workers`
+        // roster was already built — round-robin name-sorted, the SAME
+        // ordering — by `reconstruct_workers_from_cluster_state` (the SOLE
+        // roster builder, V2) at the run-init call site just before this.
+        let mut secondary_ids: Vec<String> = self
+            .cluster_state
+            .known_secondaries()
+            .map(String::from)
+            .collect();
         secondary_ids.sort();
 
-        // Per-secondary metadata snapshot (num_workers + max_res),
-        // pulled up here so the round-robin loop below holds no
-        // overlapping borrows on `self`.
-        struct SecondaryMeta {
-            id: String,
-            num_workers: u32,
-            max_res: dynrunner_core::ResourceMap,
-        }
-        let secondary_meta: Vec<SecondaryMeta> = secondary_ids
-            .iter()
-            .map(|sid| {
-                let state = self.secondaries.get(sid).unwrap();
-                let ram_bytes = state
-                    .resources()
-                    .iter()
-                    .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
-                    .map(|r| r.amount)
-                    .unwrap_or(0);
-                SecondaryMeta {
-                    id: sid.clone(),
-                    num_workers: state.num_workers(),
-                    max_res: dynrunner_core::ResourceMap::from([(
-                        dynrunner_core::ResourceKind::memory(),
-                        ram_bytes,
-                    )]),
-                }
-            })
-            .collect();
-
-        let max_workers_per_secondary = secondary_meta
-            .iter()
-            .map(|m| m.num_workers)
-            .max()
-            .unwrap_or(0);
-
-        // Heterogeneous worker counts: a secondary that runs out of
-        // workers in earlier rounds is just skipped — `if round <
-        // meta.num_workers` keeps the round-robin tight to the
-        // remaining set. Example with sec_a=3, sec_b=2, sec_c=4:
-        //   round 0: [a/w0, b/w0, c/w0]
-        //   round 1: [a/w1, b/w1, c/w1]
-        //   round 2: [a/w2,       c/w2]     (b skipped)
-        //   round 3: [             c/w3]    (a, b skipped)
-        // Resulting self.workers preserves the "earliest available
-        // worker per round" semantic without bunching the
-        // higher-count secondary's tail at the end.
-        let mut global_worker_id: u32 = 0;
-        for round in 0..max_workers_per_secondary {
-            for meta in &secondary_meta {
-                if round < meta.num_workers {
-                    let budget = self.scheduler.initial_budget(round, &meta.max_res);
-                    self.workers.push(RemoteWorkerState {
-                        worker_id: global_worker_id,
-                        secondary_id: meta.id.clone(),
-                        resource_budgets: budget,
-                        state: super::SlotState::Idle,
-                    });
-                    global_worker_id += 1;
-                }
-            }
-        }
+        // V2: `perform_initial_assignment` no longer BUILDS the roster — it
+        // is a pure scheduler over the existing `self.workers` (rebuilt by
+        // `reconstruct_workers_from_cluster_state`, which is the sole builder
+        // and produces the identical round-robin name-sorted shape this loop
+        // used to construct). The round-robin `self.workers.push` block that
+        // lived here (duplicating `reconstruct_workers_from_cluster_state`)
+        // was deleted; this function now reads `self.workers` and never
+        // constructs it.
 
         // Perform initial assignment for each worker. The pool is
         // pre-sorted by `run()` (size DESC) and bucketed by

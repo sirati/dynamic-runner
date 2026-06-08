@@ -608,3 +608,59 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
         })
         .await;
 }
+
+/// V2 single-builder idempotency: `reconstruct_workers_from_cluster_state`
+/// wholesale-REPLACES `self.workers` (it is the SOLE roster builder, the
+/// round-robin `self.workers.push` block having been deleted from
+/// `perform_initial_assignment`). So invoking it TWICE yields a roster of
+/// cardinality Σ(per-secondary capacity), NOT 2× — the second call re-derives
+/// from the same CRDT capacity, never appends. Pins the "double-invoke ⇒ Σ
+/// capacity (not 2×)" V2 acceptance.
+#[tokio::test(flavor = "current_thread")]
+async fn reconstruct_workers_double_invoke_is_sum_capacity_not_double() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Two secondaries advertise capacity: sec-0 → 3 slots, sec-1 → 2.
+            // Σ capacity = 5.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 3,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-1".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+            }
+
+            primary.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                primary.alive_worker_count_for_test(),
+                5,
+                "first reconstruct must build Σ capacity (3 + 2) slots"
+            );
+
+            // Re-invoke: the wholesale REPLACE re-derives the SAME 5-slot
+            // roster from the unchanged CRDT — never 10 (which an append-based
+            // builder would produce).
+            primary.reconstruct_workers_from_cluster_state();
+            assert_eq!(
+                primary.alive_worker_count_for_test(),
+                5,
+                "double-invoke must remain Σ capacity (5), NOT 2× (10) — the \
+                 sole builder wholesale-replaces, never appends"
+            );
+        })
+        .await;
+}

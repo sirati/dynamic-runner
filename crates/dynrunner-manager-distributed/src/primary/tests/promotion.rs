@@ -5,6 +5,123 @@ use super::*;
 
 use crate::primary::wire::compute_task_hash;
 
+/// NO-REDO (the headline acceptance): a promoted primary whose inherited CRDT
+/// is POPULATED — a started phase with an InFlight task on a secondary, plus a
+/// Completed task — must NOT, on promotion-hydrate:
+///   * re-discover (the marker is `Settled` from the prior origination, so
+///     `discover_on_promotion` is a no-op even with a policy registered);
+///   * re-fire `on_phase_start` for the already-started phase (V3:
+///     `phase_started_emitted` is seeded from the progressed tasks);
+///   * reassign the InFlight task (its slot reconstructs `Assigned`, holding
+///     the inherited hash — the slot is busy, not idle).
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut promoted, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Inherited replicated ledger: capacity for sec-0 (2 slots),
+            // a Completed task + an InFlight task in phase "build", and the
+            // discovery marker SETTLED (a prior origination completed).
+            let mut inflight = make_binary("inflight-1", 100);
+            inflight.phase_id = dynrunner_core::PhaseId::from("build");
+            let ih = compute_task_hash(&inflight);
+            let mut done = make_binary("done-1", 100);
+            done.phase_id = dynrunner_core::PhaseId::from("build");
+            let dh = compute_task_hash(&done);
+            {
+                let cs = promoted.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 2,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::DiscoveryDebtDeclared);
+                cs.apply(ClusterMutation::DiscoverySettled);
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: dh.clone(),
+                    task: done,
+                });
+                cs.apply(ClusterMutation::TaskCompleted {
+                    attempt: 0,
+                    hash: dh.clone(),
+                    result_data: None,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: ih.clone(),
+                    task: inflight,
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
+                    hash: ih.clone(),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                });
+            }
+            // A discovery policy IS registered — NO-REDO must hold even so.
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            promoted.register_setup_discovery(crate::discovery::SetupDiscovery {
+                discover: {
+                    let fires = fires.clone();
+                    Box::new(move || {
+                        fires.set(fires.get() + 1);
+                        Box::pin(async { Ok(vec![make_binary("SHOULD-NOT-RUN", 1)]) })
+                    })
+                },
+                phase_deps: HashMap::new(),
+            });
+
+            let snapshot = promoted.cluster_state_for_test().snapshot();
+            promoted.seed_from_promotion_snapshot(snapshot);
+
+            // (1) phase_started_emitted seeded → "build" not re-fired.
+            assert!(
+                promoted
+                    .phase_started_emitted
+                    .contains(&dynrunner_core::PhaseId::from("build")),
+                "the inherited started phase must be seeded so on_phase_start \
+                 does not re-fire"
+            );
+            // (2) InFlight slot reconstructed Assigned (busy, not re-offered).
+            assert!(
+                promoted.slot_holds_hash_for_test("sec-0", 0, &ih),
+                "the inherited InFlight task's slot must reconstruct Assigned, \
+                 not idle — so dispatch never reassigns it"
+            );
+            assert_eq!(
+                promoted.active_workers_for_test(),
+                1,
+                "exactly the InFlight slot is busy"
+            );
+            // (3) discover_on_promotion is a no-op (Settled) — no re-discovery.
+            promoted
+                .discover_on_promotion()
+                .await
+                .expect("Settled → no-op");
+            assert_eq!(
+                fires.get(),
+                0,
+                "a populated (Settled) CRDT must NOT re-run discovery"
+            );
+            // Ledger unchanged by the no-op (the SHOULD-NOT-RUN task absent).
+            assert!(
+                promoted
+                    .cluster_state_for_test()
+                    .task_state(&compute_task_hash(&make_binary("SHOULD-NOT-RUN", 1)))
+                    .is_none(),
+                "no re-discovered task may enter the ledger"
+            );
+        })
+        .await;
+}
+
 /// One advertised-memory resource amount (in bytes), the live welcome
 /// shape: a single `memory` `ResourceAmount`.
 fn mem(bytes: u64) -> Vec<dynrunner_core::ResourceAmount> {
@@ -954,12 +1071,13 @@ fn promoted_hydrate_advances_next_secondary_id_past_roster_max() {
     );
 }
 
-/// A promotion-hydrate must seed `phase_started_emitted` from the inherited
-/// CRDT (a phase is "started" iff its rollup `has_any`), so a promoted
+/// A promotion-hydrate (V3) must seed `phase_started_emitted` from the
+/// inherited CRDT (a phase is "started" iff it holds ≥1 task PROGRESSED past
+/// `Pending`/`Blocked` — i.e. ≥1 `InFlight`/terminal entry), so a promoted
 /// primary does NOT re-fire `on_phase_start` for a phase that already started
-/// pre-failover. Seeded ONLY on the promote path
-/// (`seed_from_promotion_snapshot`); the cold path's freshly-`Pending` CRDT
-/// must NOT suppress the legitimate first fire.
+/// (and dispatched work) pre-failover. Seeded in `hydrate_from_cluster_state`
+/// on BOTH paths; the cold path's freshly-`Pending` CRDT yields an EMPTY set,
+/// so the legitimate first fire is never suppressed.
 #[test]
 fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() {
     let (transport, _ends) = setup_test(1);
@@ -971,13 +1089,22 @@ fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() 
     );
     {
         let cs = live.cluster_state_mut_for_test();
-        // A started phase "build" (≥1 ledger entry) and a never-reached
-        // phase "ship" (no entries).
+        // A started phase "build" — its task progressed to InFlight (the
+        // realistic resume shape: a phase that fired on_phase_start
+        // dispatched work). A never-reached phase "ship" (no entries).
         let mut t = make_binary("b-1", 100);
         t.phase_id = dynrunner_core::PhaseId::from("build");
+        let hash = compute_task_hash(&t);
         cs.apply(ClusterMutation::TaskAdded {
-            hash: "b-1".into(),
+            hash: hash.clone(),
             task: t,
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
+            hash,
+            secondary: "sec-0".into(),
+            worker: 0,
+            version: Default::default(),
         });
     }
     let snapshot = live.cluster_state_for_test().snapshot();
@@ -998,13 +1125,127 @@ fn promoted_hydrate_seeds_phase_started_emitted_so_on_phase_start_not_refired() 
         promoted
             .phase_started_emitted
             .contains(&dynrunner_core::PhaseId::from("build")),
-        "an already-started phase must be seeded so on_phase_start does not re-fire"
+        "an already-started phase (with a progressed task) must be seeded so \
+         on_phase_start does not re-fire"
     );
     assert!(
         !promoted
             .phase_started_emitted
             .contains(&dynrunner_core::PhaseId::from("ship")),
         "a never-reached phase must NOT be marked started"
+    );
+}
+
+/// V3 cold-path: a freshly-seeded ColdStart CRDT is all-`Pending`, so
+/// `hydrate_from_cluster_state` seeds an EMPTY `phase_started_emitted` — the
+/// equivalent of the old `originate_cold_seed` `.clear()` — so
+/// `fire_initial_phase_starts` legitimately fires each phase's first
+/// `on_phase_start`. Pins the cold leg of the V3 equivalence (first-fire-once
+/// cold) at the seed/hydrate level.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_seed_hydrate_leaves_phase_started_emitted_empty() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Cold seed: two phases of all-`Pending` work via the production
+            // originator, then hydrate (the run-init order).
+            let mut a = make_binary("a", 100);
+            a.phase_id = dynrunner_core::PhaseId::from("build");
+            let mut b = make_binary("b", 100);
+            b.phase_id = dynrunner_core::PhaseId::from("ship");
+            b.task_depends_on = vec![];
+            primary
+                .originate_cold_seed(vec![a, b], HashMap::new())
+                .expect("cold seed");
+            primary.hydrate_from_cluster_state();
+
+            assert!(
+                primary.phase_started_emitted.is_empty(),
+                "a cold all-`Pending` seed must leave phase_started_emitted EMPTY \
+                 so fire_initial_phase_starts fires each phase's first \
+                 on_phase_start; got {:?}",
+                primary.phase_started_emitted
+            );
+        })
+        .await;
+}
+
+/// V3 blocked-only correction: a phase whose every task is `Blocked` (waiting
+/// on an unfinished prereq) was never `Active`, so it never fired
+/// `on_phase_start` — `hydrate_from_cluster_state` must NOT seed it as
+/// started. The old promote-side `has_any` over-suppressed it (it would have
+/// been marked started and its legitimate first fire skipped); the V3
+/// progressed-task predicate gets it right. The prereq phase (with an
+/// InFlight task) IS seeded.
+#[test]
+fn hydrate_does_not_seed_blocked_only_phase_as_started() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        // Phase graph: "ship" depends on "build".
+        let mut deps = HashMap::new();
+        deps.insert(
+            dynrunner_core::PhaseId::from("ship"),
+            vec![dynrunner_core::PhaseId::from("build")],
+        );
+        cs.apply(ClusterMutation::PhaseDepsSet { deps });
+        // "build": an InFlight task → started.
+        let mut bt = make_binary("build-1", 100);
+        bt.phase_id = dynrunner_core::PhaseId::from("build");
+        let bh = compute_task_hash(&bt);
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: bh.clone(),
+            task: bt,
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            attempt: 0,
+            hash: bh,
+            secondary: "sec-0".into(),
+            worker: 0,
+            version: Default::default(),
+        });
+        // "ship": a Pending task whose dep ("build") is not yet terminal —
+        // it hydrates as Blocked (never Active → never started).
+        let mut st = make_binary("ship-1", 100);
+        st.phase_id = dynrunner_core::PhaseId::from("ship");
+        st.task_id = "ship-1".into();
+        st.task_depends_on = vec![dynrunner_core::TaskDep {
+            task_id: "build-1".into(),
+            phase_id: dynrunner_core::PhaseId::from("build"),
+            inherit_outputs: false,
+        }];
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: compute_task_hash(&st),
+            task: st,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    assert!(
+        primary
+            .phase_started_emitted
+            .contains(&dynrunner_core::PhaseId::from("build")),
+        "the prereq phase with an InFlight task must be seeded started"
+    );
+    assert!(
+        !primary
+            .phase_started_emitted
+            .contains(&dynrunner_core::PhaseId::from("ship")),
+        "a blocked-only phase (never Active) must NOT be seeded started — the \
+         V3 correction over the old `has_any` over-suppression"
     );
 }
 
@@ -1028,9 +1269,11 @@ async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // --- Live primary: seed one Pending task in phase "build" plus a
-            // SecondaryCapacity, then snapshot. The single phase "build" is
-            // thereby already-started (≥1 ledger entry → rollup has_any). ---
+            // --- Live primary: seed one task in phase "build" that has
+            // PROGRESSED to Completed (the realistic resume shape: a phase
+            // that fired on_phase_start dispatched + finished work), plus a
+            // SecondaryCapacity, then snapshot. Phase "build" is thereby
+            // already-started (V3: a progressed — InFlight/terminal — task). ---
             let snapshot = {
                 let (transport, _ends) = setup_test(1);
                 let (mut live, _mesh) = build_test_primary(
@@ -1050,9 +1293,15 @@ async fn promoted_run_does_not_refire_on_phase_start_for_inherited_started_phase
                 });
                 let mut task = make_binary("b-1", 100);
                 task.phase_id = dynrunner_core::PhaseId::from("build");
+                let hash = compute_task_hash(&task);
                 cs.apply(ClusterMutation::TaskAdded {
-                    hash: compute_task_hash(&task),
+                    hash: hash.clone(),
                     task,
+                });
+                cs.apply(ClusterMutation::TaskCompleted {
+                    attempt: 0,
+                    hash,
+                    result_data: None,
                 });
                 live.cluster_state_for_test().snapshot()
             };

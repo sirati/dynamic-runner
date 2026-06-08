@@ -1,5 +1,6 @@
 pub mod anti_entropy;
 pub mod cluster_state;
+pub mod discovery;
 pub mod fulfillability_matcher;
 pub mod message_router;
 pub mod observer;
@@ -22,9 +23,10 @@ pub use primary::wire::compute_task_hash;
 pub use primary::{
     PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RelocationPolicy, RunError,
 };
+pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 pub use secondary::{
     DEFAULT_PRIMARY_SILENCE_BACKSTOP, FinalizeRunConfigFn, PeerCertInfo, RunOutcome,
-    SecondaryConfig, SecondaryCoordinator, SecondaryTerminal, SetupDiscovery, SetupDiscoveryFn,
+    SecondaryConfig, SecondaryCoordinator, SecondaryTerminal,
 };
 pub use zip_extract::compute_file_hash;
 // Re-export transport traits from the comm API crate for convenience.

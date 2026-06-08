@@ -199,6 +199,21 @@ fn seed_secondary(
         secondary_id.into(),
         SecondaryConnectionState::AwaitingWelcome(SecondaryConnection::new(secondary_id.into())),
     );
+    // Model a fully-connected secondary: a real welcome originates BOTH the
+    // transport-handle entry above AND the replicated `SecondaryCapacity`
+    // record. The latter is what `known_secondaries()` reads — the
+    // CRDT-derived roster the V5 `wait_for_mesh_ready` `expected` set (and
+    // the assignment roster read) consult.
+    coordinator
+        .cluster_state_mut_for_test()
+        .apply(ClusterMutation::SecondaryCapacity {
+            secondary: secondary_id.into(),
+            worker_count: 1,
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 1024 * 1024 * 1024,
+            }],
+        });
 }
 
 /// Count the `Keepalive` messages in a recorded broadcast log.
