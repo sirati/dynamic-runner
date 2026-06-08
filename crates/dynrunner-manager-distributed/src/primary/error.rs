@@ -103,15 +103,17 @@ pub enum RunError {
         /// (e.g. the invalid-task monitor's threshold breach).
         reason: String,
     },
-    /// The bootstrap submitter is built `RelocationPolicy::RelocateToComputePeer`
-    /// (pillar 2: the primary always runs on a compute peer, never the
-    /// submitter) but found NO eligible compute peer to promote at the
-    /// bootstrap tail — `select_relocation_target` returned `None`. A run
-    /// with no promotable compute peer is an unsupported topology (e.g. every
-    /// secondary joined `can_be_primary = false`, or only observers are
-    /// present). Surfaced as a hard structured error rather than silently
-    /// keeping the submitter as the run's primary; the PyO3 boundary RAISES
-    /// it (never the `Other` swallow).
+    /// The run's setup peer (a `SeedSource::ColdStart` / `RelocatedSeed`
+    /// primary — mesh-always: the primary ALWAYS runs on a compute peer, never
+    /// the setup peer) found NO eligible compute peer to relocate to at the
+    /// bootstrap role branch — `select_relocation_target` returned `None`. A
+    /// run with no promotable compute peer is an unsupported topology (e.g.
+    /// every secondary joined `can_be_primary = false`, or only observers are
+    /// present). UNIFORM across every backend — a LIVE error path on the
+    /// in-process mpsc mesh AND the SLURM QUIC mesh alike (no longer
+    /// "unreachable" for the in-process topology). Surfaced as a hard
+    /// structured error rather than silently keeping the setup peer as the
+    /// run's primary; the PyO3 boundary RAISES it (never the `Other` swallow).
     NoRelocationTarget,
     /// A runtime `spawn_tasks` batch (typically from `on_phase_end`)
     /// was REJECTED by the validator — every named task failed

@@ -276,36 +276,54 @@ impl<I: Identifier> std::fmt::Debug for PrimaryRunOutcome<I> {
     }
 }
 
-/// Construction-time discriminator for the bootstrap tail: does this
-/// coordinator, on reaching the end of `run_pipeline`, hand the primary role
-/// to a compute peer, or run the operational loop in-place?
+/// Run-time discriminator for the bootstrap tail, derived STRUCTURALLY from
+/// the [`crate::process::SeedSource`] this coordinator's `run_pipeline`
+/// receives — never a stored construction-time policy, never a live-roster
+/// read.
 ///
-/// One concern: the bootstrap-tail action — pillar 2 of mesh-always (the
-/// primary always runs on a compute peer, never the submitter). It is a
-/// STABLE construction-time property derived from the launch TOPOLOGY, not a
-/// runtime read of cluster shape: the SLURM/network submitter is built
-/// [`RelocationPolicy::RelocateToComputePeer`] (it must never stay the run's
-/// primary), the in-process `--multi-computer local` path and a
-/// promotion-built primary are built [`RelocationPolicy::StayLocal`]. Pinned
-/// to the construction site so the choice is the same on every tick and is
-/// auditable from the `new(..)` call, never the live roster.
+/// One concern: "am I a SETUP PEER (I seed the run, then hand the primary
+/// role to a compute peer) or am I the PROMOTED DESTINATION (I AM the compute
+/// peer that won the role; I run the operational loop in place)?". That fact
+/// is EXACTLY the `SeedSource` discriminant the coordinator already receives,
+/// so it carries no new state:
+/// - [`crate::process::SeedSource::ColdStart`] /
+///   [`crate::process::SeedSource::RelocatedSeed`] ⇒ [`Self::SetupPeer`]: this
+///   node bootstrapped the run (originated the corpus or the discovery
+///   marker) and MUST relocate the primary onto a compute peer (mesh-always
+///   pillar 2 — uniform across the in-process mpsc mesh AND the SLURM QUIC
+///   mesh; the transport behind `Mesh` is the only difference).
+/// - [`crate::process::SeedSource::PromotionSnapshot`] ⇒
+///   [`Self::PromotedDestination`]: this node IS the compute peer the role was
+///   handed to (it inherited the converged snapshot). It runs the operational
+///   loop in place and never relocates again.
 ///
-/// Deliberately ORTHOGONAL to the `demote_rx` wire: that wire carries a
-/// runtime loss-of-primacy signal (failover-demote, a DIFFERENT concern);
-/// the relocate-vs-stay choice is keyed off this typed policy, never off
-/// `demote_tx` liveness.
+/// Same single-discriminator discipline `SeedSource` already enforces for
+/// CRDT origination, reused for the bootstrap tail — there is no second
+/// source of truth and no local-vs-distributed branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelocationPolicy {
-    /// Bootstrap-tail RELOCATE: select the lowest-id eligible compute peer
-    /// and originate `PrimaryChanged { Transferred }` to hand the role over
-    /// (the submitter then demotes to a standalone observer). An empty
-    /// candidate set is a hard [`RunError::NoRelocationTarget`].
-    RelocateToComputePeer,
-    /// Bootstrap-tail STAY-LOCAL: activate THIS node as the local primary and
-    /// run the operational loop in-place. The legitimate single-machine /
-    /// in-process path, and the promotion-built primary (already a compute
-    /// peer that won the role — it must NOT relocate again).
-    StayLocal,
+enum BootstrapRole {
+    /// The run's setup peer: relocate the primary role to a compute peer at
+    /// the bootstrap tail, then park (the demote hook fired by the relocate's
+    /// local apply carries this coordinator out as a standalone observer).
+    SetupPeer,
+    /// The compute-peer destination the role was relocated/promoted onto:
+    /// activate THIS node as the local primary and run the operational loop
+    /// in place.
+    PromotedDestination,
+}
+
+impl BootstrapRole {
+    /// Derive the bootstrap role structurally from the seed the pipeline
+    /// received. A `Copy` discriminant captured BEFORE the `match seed` arm
+    /// consumes the payload, so the relocate-vs-operational decision keys on
+    /// the typed `SeedSource` and nothing else.
+    fn from_seed<I: Identifier>(seed: &crate::process::SeedSource<I>) -> Self {
+        match seed {
+            crate::process::SeedSource::ColdStart { .. }
+            | crate::process::SeedSource::RelocatedSeed { .. } => BootstrapRole::SetupPeer,
+            crate::process::SeedSource::PromotionSnapshot => BootstrapRole::PromotedDestination,
+        }
+    }
 }
 
 /// The primary coordinator: orchestrates work across secondaries.
@@ -760,14 +778,6 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// demote source is wired (the `select!` arm parks forever then).
     pub(super) demote_rx: Option<tokio_mpsc::UnboundedReceiver<()>>,
 
-    /// Construction-time bootstrap-tail policy (pillar 2). Read once by
-    /// [`Self::bootstrap_tail_dispatch`] at the end of `run_pipeline` to
-    /// decide RELOCATE-to-a-compute-peer vs STAY-LOCAL. A stable topology-
-    /// derived property set by the construction site, NOT a runtime cluster
-    /// read; orthogonal to `demote_rx` (failover-demote is a different
-    /// concern). See [`RelocationPolicy`].
-    pub(super) relocation_policy: RelocationPolicy,
-
     /// Set by the panik arm in the operational `select!` loop when
     /// the watcher signal fires. Carries the (matched_path, reason)
     /// pair the panik handler produced.
@@ -885,7 +895,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         client: crate::process::MeshClient<I>,
         inbox: crate::process::RoleInbox<I>,
         demote_rx: tokio_mpsc::UnboundedReceiver<()>,
-        relocation_policy: RelocationPolicy,
         scheduler: S,
         estimator: E,
     ) -> Self {
@@ -990,7 +999,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 preferred_secondaries::PreferredSecondariesValidator::new(),
             panik_signal_rx: None,
             demote_rx: Some(demote_rx),
-            relocation_policy,
             panik_outcome: None,
             worker_mgmt_rx: Some(worker_mgmt_rx),
             worker_mgmt_fail_outcome: None,
@@ -2628,6 +2636,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `hydrate`, means the pool is available for `fire_initial_phase_starts`
         // / `perform_initial_assignment` below; the #3a abort short-circuit
         // inside `originate_cold_seed` seeds nothing on a doomed run.
+
+        // Capture the bootstrap role STRUCTURALLY from the seed BEFORE the
+        // `match` below consumes the payload. This `Copy` discriminant is the
+        // SOLE relocate-vs-operational decision (mesh-always: a setup peer
+        // ALWAYS relocates the primary onto a compute peer; the promoted
+        // destination runs in place). It keys on the typed `SeedSource` and
+        // NOTHING else — no stored policy, no local-vs-distributed branch.
+        let bootstrap_role = BootstrapRole::from_seed(&seed);
         match seed {
             crate::process::SeedSource::ColdStart {
                 binaries,
@@ -2673,161 +2689,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // loop's own `self.command_rx.take()` re-acquires the same receiver.
         let mut command_rx = self.command_rx.take();
 
-        // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
+        // Phase 1+2: Wait for all secondaries to send welcome + cert exchange.
+        // UNCONDITIONAL (both roles): a setup peer needs the fleet registered
+        // so `alive_secondary_members()` is non-empty for relocation-target
+        // selection; the promoted destination needs it for its assignment.
         self.wait_for_connections(&mut command_rx).await?;
 
-        // Mode-2 discover-on-promotion (V6). Runs the consumer's discovery
-        // policy IFF the CRDT declares discovery `Owed` (a relocated
-        // compute-peer primary, or an in-process `--source-already-staged`
-        // local primary, that inherited the empty-ledger + `Owed` marker),
-        // originates `PhaseDepsSet + TaskAdded* + DiscoverySettled` (or, on an
-        // empty corpus, `DiscoverySettled + RunComplete`), and re-hydrates the
-        // pool. INERT on every current path (cold mode-1 / legacy / promotion
-        // of an already-seeded run reads `Undeclared`/`Settled`, so the gate
-        // short-circuits to a no-op) — but the ORDERING is load-bearing for
-        // when 5c originates `Owed`:
-        //   * AFTER `wait_for_connections` so the discovery seed's broadcast
-        //     reaches the connected fleet (the same post-connect-broadcast
-        //     discipline `broadcast_cold_seed` uses);
-        //   * BEFORE `fire_initial_phase_starts` + the empty-phase cascade so,
-        //     by the time the cascade evaluates its `discovery_debt() != Owed`
-        //     gate, the driver has already flipped `Owed → Settled` and
-        //     hydrated the discovered tasks — a declared-but-empty phase then
-        //     correctly drains to Done firing `on_phase_end(.., 0, 0)`, and a
-        //     phase that drew real work stays `Active` (no spurious empty
-        //     drain). See `mode2-discovery-design.md` Part 3 for the proof.
-        self.discover_on_promotion().await?;
-
-        // Fire on_phase_start for every phase the pool initialised as
-        // Active (zero-deps phases), THEN cascade trivially-empty phases.
-        // Subsequent activations triggered by `mark_phase_done` are
-        // observed via `process_phase_lifecycle`.
-        //
-        // Ordering: the "all secondaries connected" milestone must precede
-        // the first "starting job phase" milestone. This MUST run AFTER
-        // `wait_for_connections` so the operator's "all secondaries
-        // connected" milestone (`primary/connect.rs`) prints BEFORE the
-        // "starting job phase" milestone `fire_initial_phase_starts` emits.
-        // The relocation here is behaviour-preserving:
-        //   * The fire-before-cascade COUPLING is kept intact (the cascade's
-        //     `on_phase_end(.., 0, 0)` for an empty initial phase must come
-        //     AFTER that phase's `on_phase_start`, so `fire_initial_phase_starts`
-        //     stays immediately before the cascade).
-        //   * `wait_for_connections` reads no phase-start state (only
-        //     `self.secondaries` connection states + `num_secondaries`), so
-        //     seeding phases after it changes nothing it observes.
-        //   * The 3a/3b duplicate discriminator is STRUCTURAL (the code
-        //     path — `originate_cold_seed` vs `apply_spawn_tasks`), not a
-        //     runtime read of `phase_started_emitted`; the only runtime read
-        //     of `phase_started_emitted` is `fire_initial_phase_starts`' own
-        //     `insert` guard. `phase_started_emitted` itself is seeded by
-        //     hydrate (V3) — empty on the cold path's all-`Pending` ledger —
-        //     so the first fire here is legitimate and the cold seed still
-        //     runs far above, before connect.
-        //   * No `on_phase_end` can fire DURING `wait_for_connections`: no
-        //     task has been assigned yet (`perform_initial_assignment` runs
-        //     below, after connect), and because `drain_empty_active_phases`
-        //     now runs only AFTER connect, `drained_pending` is empty during
-        //     connect — so any inbound-driven `process_phase_lifecycle`
-        //     (`dispatch_message`'s TaskComplete/TaskFailed cascade) is a
-        //     guaranteed no-op there. The on_phase_start-before-on_phase_end
-        //     contract is therefore preserved.
-        self.fire_initial_phase_starts();
-
-        // Trivially-empty Active phases (no items at all) need to drain
-        // and cascade Done before initial assignment, otherwise their
-        // `Blocked` dependents — which may hold all the run's actual
-        // work — never become visible to `view_for_worker`. Triggers
-        // `on_phase_end(.., 0, 0)` for each empty phase via the
-        // lifecycle cascade. Runs after connect but BEFORE the
-        // seed/assignment step below, preserving the load-bearing
-        // "cascade before initial assignment" ordering.
-        //
-        // Required at this pre-loop site (not optional): a consumer
-        // `on_phase_end` callback fired by the initial-empty-phase
-        // cascade can itself queue `spawn_tasks(next_phase_items)`,
-        // and the cascade's next `drain_empty_active_phases` poll
-        // would otherwise false-fire `on_phase_end(.., 0, 0)` on the
-        // successor phase exactly the way the in-loop bug class did.
-        // The `command_rx` taken above is handed into
-        // `process_phase_lifecycle` so the cascade's per-iteration drain
-        // step picks up callback-queued `SpawnTasks` / `FailPermanent` /
-        // `ReinjectTask` / `UpdatePreferredSecondaries` commands inline.
-        //
-        // Required because `operational_loop`'s entry-time exit
-        // check (`completed + failed >= total_tasks && active_workers
-        // == 0`) trips IMMEDIATELY on entry if every pre-loop-dispatched
-        // task happens to finish (and have its on_phase_end fire)
-        // during a pre-loop wait — without inline drain, the
-        // SpawnTasks command sits on the channel until the entry-
-        // time check that exits the loop without ever polling it.
-        // Asm-tokenizer's lazy-spawn consumer pattern
-        // (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
-        // is the live consumer of this contract.
-        //
-        // Gated on `discovery_debt() != Owed` (V6): while discovery is owed
-        // the ledger is unseeded and every declared phase is a transiently-
-        // empty `Active` — draining it now would mark every phase `Drained`
-        // and fire spurious `on_phase_end(.., 0, 0)` for phases that have no
-        // items only because discovery hasn't run yet. `discover_on_promotion`
-        // (run above, BEFORE this) flips `Owed → Settled` after seeding the
-        // discovered tasks, so by the time the cascade evaluates this gate the
-        // debt is cleared and the discovered work is hydrated — a genuinely-
-        // empty declared phase then drains + narrates correctly, and a phase
-        // that drew real work stays `Active`. On every cold mode-1 / legacy /
-        // already-seeded path the marker is `Undeclared`/`Settled`, so the
-        // gate is open and the cascade runs exactly as before. Both halves
-        // (the drain + the cascade) stay paired under ONE gate — the
-        // `drain_empty_active_phases` pre-call exists only to feed the
-        // cascade, so gating only one would leave phases stuck `Drained`.
-        if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed {
-            self.pool_mut().drain_empty_active_phases();
-            self.process_phase_lifecycle(&mut command_rx).await;
-        }
-
-        // #3a abort gate. `originate_cold_seed` recorded a pending
-        // abort iff the INITIAL batch had a `(phase_id, task_id)`
-        // duplicate (pre-phase). Fire it HERE — the first point the
-        // secondaries are connected — so the `RunAborted` broadcast
-        // reaches them (at seed time none were connected). Returns
-        // `Err(RunError::DuplicateTaskIdPrePhase)` on the abort path
-        // (the primary's PyO3 boundary surfaces a non-zero exit); a
-        // no-op on the clean path. Hard cluster shutdown — short-
-        // circuits before any seeding / assignment.
+        // #3a abort gate (UNCONDITIONAL, must precede the role branch).
+        // `originate_cold_seed` recorded a pending abort iff the INITIAL batch
+        // had a `(phase_id, task_id)` duplicate (pre-phase). Fire it HERE —
+        // the first point the secondaries are connected — so the `RunAborted`
+        // broadcast reaches them (at seed time none were connected). Returns
+        // `Err(RunError::DuplicateTaskIdPrePhase)` on the abort path (the
+        // primary's PyO3 boundary surfaces a non-zero exit); a no-op on the
+        // clean path AND on a `PromotionSnapshot` (which never originated a
+        // cold seed, so `pending_run_abort` is `None`). Run BEFORE the role
+        // branch so a doomed cold-seed run aborts WITHOUT relocating: the
+        // setup peer holds the abort directive node-locally (it is not CRDT
+        // state the relocate target inherits), so a relocate-before-abort
+        // would silently strand the doomed run. Hard cluster shutdown — short-
+        // circuits before mesh formation, relocation, seeding, or assignment.
         self.fire_pending_run_abort().await?;
 
-        // Phase 2.5: Auto-stage. Run the staging walk on behalf of
-        // callers that didn't pre-queue via `queue_stage_file` /
-        // `queue_initial_staging_from_binaries`. Gate semantics
-        // (and the rationale for each one) live on
-        // `staging::maybe_auto_stage_initial`. The four-way gate
-        // collapses to "we have a root to walk, items are file-
-        // backed, we're not in pre-staged mode, and no caller pre-
-        // populated the queue" — any one false skips silently.
-        //
-        // Performed AFTER `wait_for_connections` so `self.secondaries`
-        // has the welcome-registered IDs (the staging fan-out is
-        // per-secondary), and BEFORE `perform_initial_assignment`
-        // which drains `pending_stage_files` into each recipient's
-        // `InitialAssignment.staged_files`. This is the single
-        // Rust-side call site for the staging walk; pyo3 wrappers
-        // just thread `source_dir` into config.
-        //
-        // Without this, the network-primary + local-secondaries
-        // pipeline (`--multi-computer local`) had no staging call
-        // site at all and lost every task to "expected StageFile
-        // notification first" on the secondary's
-        // unresolvable-task guard. The in-process distributed
-        // pipeline kept its explicit pre-call from #7, which the
-        // gate detects (non-empty queue) and skips — consistent
-        // SLURM-pipeline semantics where the explicit pre-call
-        // also wins.
-        self.maybe_auto_stage_initial()?;
+        // ── Peer-mesh formation (UNCONDITIONAL — both roles need a routable
+        // mesh). The setup peer's `relocate_primary_to` broadcasts
+        // `PrimaryChanged { Transferred }`, which MUST land on a settled mesh
+        // (the `wait_for_mesh_ready` rationale below): a pre-mesh-formation
+        // announcement routes into the void. The promoted destination needs
+        // the same routable mesh for its operational broadcasts. ───────────
 
-        // Phase 3: Send peer lists
+        // Phase 3: Send peer lists.
         self.send_peer_lists().await?;
 
-        // Phase 4: Wait for peer connections (skip for single secondary)
+        // Phase 4: Wait for peer connections (skip for single secondary).
         self.wait_for_peer_connections().await?;
 
         // The primary is a first-class mesh member: register its own
@@ -2835,10 +2729,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // membership via a self-authored `PeerJoined`, the same CRDT path
         // the secondary accept site uses for each secondary. Originated
         // here — after the fleet is connected (so the broadcast reaches
-        // every secondary) and BEFORE the seed/setup-defer branch below
-        // (so membership is recorded uniformly in both modes). Membership
-        // only: this does NOT announce `PrimaryChanged` and does NOT add
-        // the primary to the `PeerInfo` dial-list.
+        // every secondary) and BEFORE the role branch below (so membership
+        // is recorded uniformly for both roles). Membership only: this does
+        // NOT announce `PrimaryChanged` and does NOT add the primary to the
+        // `PeerInfo` dial-list.
         self.originate_primary_membership().await;
 
         // Post-mesh roster re-broadcast: each secondary's
@@ -2853,158 +2747,246 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // pure re-emission (the records already exist in the primary's own
         // mirror), so it ships straight over the mesh; the receiver-side
         // set-once idempotency absorbs the records a secondary already
-        // holds. Both defer + non-defer modes pass here.
+        // holds. Both roles pass here.
         self.rebroadcast_full_roster().await;
 
-        // V2: rebuild the remote-worker roster from the replicated
-        // per-secondary capacity NOW — `wait_for_connections` has originated
-        // every connected secondary's `SecondaryCapacity` (and
-        // `rebroadcast_full_roster` above re-emitted the full set), so
-        // `known_secondaries()` is populated. `reconstruct_workers_from_cluster_state`
-        // is the SOLE roster builder (the round-robin `self.workers.push`
-        // block was deleted from `perform_initial_assignment`, which is now a
-        // pure scheduler over the existing `self.workers`). The initial
-        // hydrate (before connect) built an EMPTY roster on the cold path —
-        // no capacity records existed yet — so this re-invoke is where the
-        // cold roster is derived; on a promote / discover-on-promotion path
-        // the roster was already rebuilt and this wholesale-replace is
-        // idempotent (same capacity → same roster). It MUST run BEFORE
-        // `perform_initial_assignment` commits any slot: the wholesale
-        // replace re-derives occupancy only from CRDT `InFlight`, so a
-        // re-invoke AFTER assignment began committing would zero
-        // committed-but-not-yet-originated slots — FORBIDDEN. (No reconstruct
-        // call exists past this point on the run-init path; the only other
-        // invocations are the failover/promotion construction primitive
-        // `seed_from_promotion_snapshot` and discover-on-promotion's hydrate,
-        // both before assignment.)
-        self.reconstruct_workers_from_cluster_state();
-
-        // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
-        // perform the initial per-secondary assignment. Ships the
-        // cold-start seed (the `PhaseDepsSet` + `TaskAdded` fan-out + the #2
-        // invalid-dep `TaskFailed` transitions, applied LOCALLY at
-        // `originate_cold_seed` and staged for this post-connection
-        // broadcast so they reach the fleet) + `perform_initial_assignment`
-        // (a pure scheduler over the reconstructed `self.workers`,
-        // staged-files inline). On a promotion the staged seed is empty (the
-        // inherited CRDT replicates via anti-entropy), so `broadcast_cold_seed`
-        // is a no-op there.
-        self.broadcast_cold_seed().await;
-        self.perform_initial_assignment().await?;
-
-        // Phase 6: Send transfer complete
-        self.send_transfer_complete().await?;
-
-        // Phase 6.5: Wait for every connected secondary to report
-        // its peer-mesh has settled before announcing the primary.
-        // Pre-fix the `PrimaryChanged` announcement fired ~750µs
-        // after cert-exchange completed — the newly-named
-        // primary then became authoritative against a still-
-        // forming peer mesh (per-peer dial budget: 10s QUIC + 10s
-        // WSS) and every pre-mesh-formation peer-broadcast routed
-        // into the void for the duration. Holding the promotion
-        // until every secondary signals `MeshReady` (mesh formed,
-        // watchdog elapsed, or single-secondary instant) is the
-        // event-driven equivalent of "wait until the mesh is
-        // real". Bounded by `config.mesh_ready_timeout` (warning
-        // + proceed on straggler, never deadlock — a buggy
-        // secondary's silence must not stall the run).
+        // Phase 6.5: Wait for every connected secondary to report its
+        // peer-mesh has settled before the role branch acts. Pre-fix the
+        // `PrimaryChanged` announcement fired ~750µs after cert-exchange
+        // completed — the newly-named primary then became authoritative
+        // against a still-forming peer mesh (per-peer dial budget: 10s QUIC +
+        // 10s WSS) and every pre-mesh-formation peer-broadcast routed into the
+        // void for the duration. Holding until every secondary signals
+        // `MeshReady` (mesh formed, watchdog elapsed, or single-secondary
+        // instant) is the event-driven "wait until the mesh is real". Bounded
+        // by `config.mesh_ready_timeout` (warning + proceed on straggler,
+        // never deadlock). This is the BINDING CONSTRAINT for the setup peer's
+        // relocate: its `PrimaryChanged { Transferred }` (and the promoted
+        // destination's self-announce in `activate_local_primary`) only warm
+        // each replica's role cache to a real connection once the mesh has
+        // settled here.
         self.wait_for_mesh_ready(&mut command_rx).await?;
 
-        // Put the command-channel receiver back on `self` so
-        // `operational_loop`'s own `self.command_rx.take()` picks
-        // it up again (on the paths that run it). Symmetric with the
-        // take at the top of the pre-loop chain. The observer tail does
-        // not consult `command_rx`; restoring it here keeps the field's
-        // ownership symmetric across every fork branch.
-        self.command_rx = command_rx;
+        // Phase 4.5 (UNCONDITIONAL): ship the cold-start seed to the fleet.
+        // Drains the staged `PhaseDepsSet` + `TaskAdded` fan-out (+ the #2
+        // invalid-dep `TaskFailed` transitions) that `originate_cold_seed`
+        // applied LOCALLY and parked for this post-connection broadcast (a
+        // pre-connection broadcast is dropped). Run BEFORE the role branch —
+        // not just before `perform_initial_assignment` — because on a
+        // `ColdStart` the SETUP PEER is the ONLY corpus holder until this
+        // broadcast lands: the relocate target captures its promotion snapshot
+        // when `PrimaryChanged { Transferred }` names it, and that snapshot
+        // must already carry the seeded `TaskAdded`s for the target's run to
+        // have any work. So the corpus fan-out happens here, then the setup
+        // peer relocates. On a `RelocatedSeed` it ships only the phase graph +
+        // the `Owed` marker (the target's `discover_on_promotion` produces the
+        // corpus). On a `PromotionSnapshot` the staged set is empty (the
+        // inherited CRDT replicates via anti-entropy), so this is a no-op.
+        self.broadcast_cold_seed().await;
 
-        // Initial-setup-done important event. This is the honest
-        // once-per-run "all initial setup complete, entering steady-state"
-        // milestone for the OPERATOR's submitter process: the fleet is
-        // connected (`wait_for_connections`), staged
-        // (`maybe_auto_stage_initial`), peer-linked (`send_peer_lists` +
-        // `wait_for_peer_connections`), the primary's own membership is
-        // recorded (`originate_primary_membership`), the ledger is seeded +
-        // tasks assigned (`seed_cluster_state` + `perform_initial_assignment`),
-        // transfer-complete is sent (`send_transfer_complete`), and the peer
-        // mesh has settled (`wait_for_mesh_ready`). A single emit at this
-        // point fires EXACTLY ONCE per run.
-        //
-        // Placed at the end of the connect/seed/mesh-ready chain, just
-        // before the bootstrap tail activates the local primary, so it
-        // emits exactly once per run.
-        tracing::info!(
-            target: super::important_events::IMPORTANT_TARGET,
-            "initial setup done",
-        );
-
-        // Bootstrap tail (pillar 2): RELOCATE the primary role to a compute
-        // peer, or — on the legitimate single-machine / in-process / promoted
-        // path — STAY LOCAL and run the operational loop in-place. The fork
-        // is the typed `self.relocation_policy`, not a runtime cluster read,
-        // and is extracted into its own named tail so this 300+-line pipeline
-        // god-function does not grow the fork inline.
-        //
-        // `wait_for_mesh_ready` above already held until the peer mesh
-        // settled, so both arms (the relocate `PrimaryChanged { Transferred }`
-        // and the stay-local self-announce) warm each replica's role cache to
-        // a real connection.
-        self.bootstrap_tail_dispatch(total).await
-    }
-
-    /// Bootstrap-tail fork (pillar 2): hand the primary role to a compute peer
-    /// or run it in-place, chosen by the construction-time
-    /// [`Self::relocation_policy`].
-    ///
-    /// One concern: dispatch the bootstrap tail. The two arms are mutually
-    /// exclusive futures over the SAME run state — there is no shared
-    /// post-fork code, so the typed policy match is the whole body (NOT a flag
-    /// `if` threaded through a common tail).
-    ///
-    /// * [`RelocationPolicy::StayLocal`] — activate THIS node as the local
-    ///   primary (originates its first self-announce at epoch 1, warms the
-    ///   role cache, emits a keepalive), then run the shared
-    ///   operational-loop-and-finalize tail to completion in-place.
-    /// * [`RelocationPolicy::RelocateToComputePeer`] — select the lowest-id
-    ///   eligible compute peer ([`Self::select_relocation_target`]; an empty
-    ///   candidate set is a hard [`RunError::NoRelocationTarget`]) and
-    ///   originate `PrimaryChanged { Transferred }`
-    ///   ([`Self::relocate_primary_to`]). That mutation's LOCAL apply fires
-    ///   this coordinator's demote hook (the table now names target ≠ self),
-    ///   which makes `run_consuming`'s demote arm ready. We then PARK on
-    ///   `pending()`: the only exit from the pipeline future is now the demote
-    ///   arm, which wins the `run_consuming` `select!`, destructures `self`
-    ///   into an observer handoff, and returns `PrimaryRunOutcome::Relocated`.
-    ///   Returning `Ok(())` here instead would let the `select!` see the
-    ///   pipeline as COMPLETED (not demoted), wrongly keeping the setup
-    ///   `Local`; parking is what guarantees the demote arm wins. The setup
-    ///   does NOT run the operational loop — that authority now lives on the
-    ///   promoted peer.
-    pub(crate) async fn bootstrap_tail_dispatch(&mut self, total: usize) -> Result<(), RunError> {
-        match self.relocation_policy {
-            RelocationPolicy::StayLocal => {
-                self.activate_local_primary().await?;
-                self.run_operational_and_finalize(total).await
-            }
-            RelocationPolicy::RelocateToComputePeer => {
-                // The submitter must NEVER stay the run's primary (pillar 2),
-                // so an empty candidate set is an unsupported/degenerate
-                // topology — surface a hard structured error rather than
-                // silently staying local.
+        // ── Bootstrap role branch (mesh-always, SeedSource-keyed) ──────────
+        match bootstrap_role {
+            // The run's setup peer (ColdStart / RelocatedSeed): hand the
+            // primary role to a compute peer and park. It does the MINIMUM —
+            // connect + form mesh + ship the corpus (above) + relocate — and
+            // does NOT discover / fire phase-starts / stage / assign /
+            // transfer: those are the OPERATIONAL primary's concern, and the
+            // relocate TARGET re-runs this SAME `run_pipeline` (as a
+            // `PromotionSnapshot` ⇒ `PromotedDestination`), doing all of them
+            // itself over its inherited roster.
+            BootstrapRole::SetupPeer => {
+                // An empty candidate set is an unsupported/degenerate topology
+                // — the setup peer must NEVER stay the run's primary (mesh-
+                // always), so surface a hard structured error rather than
+                // silently staying local. NOW A LIVE error path on EVERY
+                // backend (in-process mpsc AND SLURM QUIC) — no longer
+                // "unreachable" for any topology.
                 let Some(chosen) = self.select_relocation_target() else {
                     return Err(RunError::NoRelocationTarget);
                 };
                 self.relocate_primary_to(chosen).await;
                 // Park: the demote hook fired by the relocate's local apply
-                // makes the demote arm the only way out of the pipeline
-                // future. `pending()` never resolves; the demote arm cancels
-                // this future and rides the existing chain to
-                // `PrimaryRunOutcome::Relocated`.
+                // (the role table now names target ≠ self) makes the demote
+                // arm the only way out of the pipeline future.
+                // `run_consuming`'s demote arm wins the `select!`,
+                // destructures `self` into an observer handoff, and returns
+                // `PrimaryRunOutcome::Relocated`. Returning `Ok(())` here would
+                // let the `select!` see the pipeline as COMPLETED (not
+                // demoted), wrongly keeping the setup `Local`; parking is what
+                // guarantees the demote arm wins.
                 std::future::pending::<()>().await;
                 unreachable!("relocate bootstrap future is cancelled by the demote arm");
             }
+            // The compute-peer destination (PromotionSnapshot): run the FULL
+            // operational pre-loop chain in place, then the operational tail.
+            BootstrapRole::PromotedDestination => {
+                // Mode-2 discover-on-promotion (V6). Runs the consumer's
+                // discovery policy IFF the CRDT declares discovery `Owed` (a
+                // relocated compute-peer primary, or an in-process
+                // `--source-already-staged` local primary, that inherited the
+                // empty-ledger + `Owed` marker via its snapshot), originates
+                // `PhaseDepsSet + TaskAdded* + DiscoverySettled` (or, on an
+                // empty corpus, `DiscoverySettled + RunComplete`), and
+                // re-hydrates the pool. INERT on a failover/promotion of an
+                // already-seeded run (reads `Settled`, so the gate short-
+                // circuits). ORDERING is load-bearing: BEFORE
+                // `fire_initial_phase_starts` + the empty-phase cascade so, by
+                // the time the cascade evaluates its `discovery_debt() != Owed`
+                // gate, the driver has already flipped `Owed → Settled` and
+                // hydrated the discovered tasks. The setup peer never reaches
+                // this function (it relocated above), so a setup peer that owed
+                // debt without a discovery policy hands the `Owed` marker on
+                // untouched — the "Owed but no policy = hard error" branch is
+                // reachable ONLY by a `PromotionSnapshot` primary (which MUST
+                // carry the policy). See `mode2-discovery-design.md` Part 3.
+                self.discover_on_promotion().await?;
+
+                // Fire on_phase_start for every phase the pool initialised as
+                // Active (zero-deps phases), THEN cascade trivially-empty
+                // phases. Subsequent activations triggered by `mark_phase_done`
+                // are observed via `process_phase_lifecycle`.
+                //
+                // The fire-before-cascade COUPLING is kept intact (the
+                // cascade's `on_phase_end(.., 0, 0)` for an empty initial phase
+                // must come AFTER that phase's `on_phase_start`, so
+                // `fire_initial_phase_starts` stays immediately before the
+                // cascade). The 3a/3b duplicate discriminator is STRUCTURAL
+                // (the code path — `originate_cold_seed` vs `apply_spawn_tasks`
+                // — not a runtime read of `phase_started_emitted`);
+                // `phase_started_emitted` is seeded by hydrate (V3).
+                self.fire_initial_phase_starts();
+
+                // Trivially-empty Active phases (no items at all) need to drain
+                // and cascade Done before initial assignment, otherwise their
+                // `Blocked` dependents — which may hold all the run's actual
+                // work — never become visible to `view_for_worker`. Triggers
+                // `on_phase_end(.., 0, 0)` for each empty phase via the
+                // lifecycle cascade. Runs BEFORE the seed/assignment step
+                // below, preserving the load-bearing "cascade before initial
+                // assignment" ordering.
+                //
+                // Required at this pre-loop site (not optional): a consumer
+                // `on_phase_end` callback fired by the initial-empty-phase
+                // cascade can itself queue `spawn_tasks(next_phase_items)`, and
+                // the cascade's next `drain_empty_active_phases` poll would
+                // otherwise false-fire `on_phase_end(.., 0, 0)` on the
+                // successor phase exactly the way the in-loop bug class did.
+                // The `command_rx` taken above is handed into
+                // `process_phase_lifecycle` so the cascade's per-iteration
+                // drain step picks up callback-queued `SpawnTasks` /
+                // `FailPermanent` / `ReinjectTask` /
+                // `UpdatePreferredSecondaries` commands inline.
+                //
+                // Required because `operational_loop`'s entry-time exit check
+                // (`completed + failed >= total_tasks && active_workers == 0`)
+                // trips IMMEDIATELY on entry if every pre-loop-dispatched task
+                // happens to finish (and have its on_phase_end fire) during a
+                // pre-loop wait — without inline drain, the SpawnTasks command
+                // sits on the channel until the entry-time check that exits the
+                // loop without ever polling it. Asm-tokenizer's lazy-spawn
+                // consumer pattern (`FullPipelineTask.on_phase_end →
+                // primary_handle.spawn_tasks`) is the live consumer.
+                //
+                // Gated on `discovery_debt() != Owed` (V6): while discovery is
+                // owed the ledger is unseeded and every declared phase is a
+                // transiently-empty `Active` — draining it now would mark every
+                // phase `Drained` and fire spurious `on_phase_end(.., 0, 0)`.
+                // `discover_on_promotion` (run above) flips `Owed → Settled`
+                // after seeding, so by the time the cascade evaluates this gate
+                // the debt is cleared and the discovered work is hydrated. On
+                // every already-seeded / failover path the marker is
+                // `Undeclared`/`Settled`, so the gate is open. Both halves (the
+                // drain + the cascade) stay paired under ONE gate.
+                if self.cluster_state.discovery_debt() != DiscoveryDebt::Owed {
+                    self.pool_mut().drain_empty_active_phases();
+                    self.process_phase_lifecycle(&mut command_rx).await;
+                }
+
+                // Phase 2.5: Auto-stage. Run the staging walk on behalf of
+                // callers that didn't pre-queue via `queue_stage_file` /
+                // `queue_initial_staging_from_binaries`. Gate semantics live on
+                // `staging::maybe_auto_stage_initial`: "we have a root to walk,
+                // items are file-backed, we're not in pre-staged mode, and no
+                // caller pre-populated the queue" — any one false skips
+                // silently. Runs AFTER the fleet is registered (the staging
+                // fan-out is per-secondary) and BEFORE
+                // `perform_initial_assignment`, which drains
+                // `pending_stage_files` into each recipient's
+                // `InitialAssignment.staged_files`. This is the operational
+                // primary's concern (the relocate target re-runs it itself);
+                // the setup peer never reaches here.
+                self.maybe_auto_stage_initial()?;
+
+                // V2: rebuild the remote-worker roster from the replicated
+                // per-secondary capacity NOW — `wait_for_connections` has
+                // originated every connected secondary's `SecondaryCapacity`
+                // (and `rebroadcast_full_roster` above re-emitted the full
+                // set), so `known_secondaries()` is populated.
+                // `reconstruct_workers_from_cluster_state` is the SOLE roster
+                // builder. It MUST run BEFORE `perform_initial_assignment`
+                // commits any slot: the wholesale replace re-derives occupancy
+                // only from CRDT `InFlight`, so a re-invoke AFTER assignment
+                // began committing would zero committed-but-not-yet-originated
+                // slots — FORBIDDEN.
+                self.reconstruct_workers_from_cluster_state();
+
+                // Phase 5: the initial per-secondary assignment — a pure
+                // scheduler over the reconstructed `self.workers`, staged-files
+                // inline. The cold-seed broadcast already ran UNCONDITIONALLY
+                // above (it had to precede a possible relocate); the assignment
+                // is the operational primary's concern and assigns over the
+                // inherited roster.
+                self.perform_initial_assignment().await?;
+
+                // Phase 6: Send transfer complete.
+                self.send_transfer_complete().await?;
+
+                // Put the command-channel receiver back on `self` so
+                // `operational_loop`'s own `self.command_rx.take()` picks it up
+                // again. Symmetric with the take at the top of the pre-loop
+                // chain.
+                self.command_rx = command_rx;
+
+                // Initial-setup-done important event — the honest once-per-run
+                // "all initial setup complete, entering steady-state"
+                // milestone: the fleet is connected, staged, peer-linked, the
+                // primary's own membership is recorded, the ledger is seeded +
+                // tasks assigned, transfer-complete is sent, and the peer mesh
+                // has settled. A single emit at this point fires EXACTLY ONCE
+                // per run on the operational primary.
+                tracing::info!(
+                    target: super::important_events::IMPORTANT_TARGET,
+                    "initial setup done",
+                );
+
+                // Bootstrap tail: activate THIS node as the local primary and
+                // run the operational loop to completion in place. The
+                // `wait_for_mesh_ready` above held until the peer mesh settled,
+                // so the self-announce warms each replica's role cache to a
+                // real connection.
+                self.bootstrap_tail_dispatch(total).await
+            }
         }
+    }
+
+    /// The operational bootstrap tail: activate THIS node as the local primary
+    /// and run the operational loop to completion in place.
+    ///
+    /// One concern: the OPERATIONAL primary's bootstrap tail. Reached ONLY on
+    /// the `BootstrapRole::PromotedDestination` arm of `run_pipeline` (a
+    /// `SeedSource::PromotionSnapshot` — the relocated target / failover-
+    /// promoted primary). The setup-peer RELOCATE is NOT here: it fired inline
+    /// in `run_pipeline`'s `BootstrapRole::SetupPeer` arm (before
+    /// `discover_on_promotion` / assignment), so this tail is uniform across
+    /// every operational primary — there is no relocate-vs-stay fork and no
+    /// local-vs-distributed branch.
+    ///
+    /// Activates the local primary (originates its self-announce at
+    /// `primary_epoch()+1`, warms the role cache, emits a keepalive), then runs
+    /// the shared operational-loop-and-finalize tail to completion in place.
+    pub(crate) async fn bootstrap_tail_dispatch(&mut self, total: usize) -> Result<(), RunError> {
+        self.activate_local_primary().await?;
+        self.run_operational_and_finalize(total).await
     }
 
     /// Shared operational-loop-and-finalize tail. The single mechanism

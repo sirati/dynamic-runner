@@ -84,15 +84,12 @@ async fn on_phase_end_raise_surfaces_fatal_policy_exit() {
                 hook_latch.record("synthetic on_phase_end raise".to_string());
             });
 
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never reaching the on_phase_end raise this test asserts).
+            seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: HashMap::new(),
-                    },
-                    on_start,
-                    on_end,
-                )
+                .run(SeedSource::PromotionSnapshot, on_start, on_end)
                 .await;
 
             // The contract under test is the RUN RESULT. The
@@ -178,15 +175,11 @@ async fn non_raising_on_phase_end_completes_cleanly() {
             let on_start: OnPhaseStart = Box::new(|_p: &dynrunner_core::PhaseId| {});
             let on_end: OnPhaseEnd = Box::new(|_p, _c, _f, _outputs| {});
 
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
+            seed_operational_ledger(&mut primary, binaries, HashMap::new());
             let result = primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: HashMap::new(),
-                    },
-                    on_start,
-                    on_end,
-                )
+                .run(SeedSource::PromotionSnapshot, on_start, on_end)
                 .await;
 
             let completed = primary.completed_count();

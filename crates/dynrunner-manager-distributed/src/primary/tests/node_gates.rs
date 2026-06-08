@@ -281,15 +281,22 @@ async fn bug4_primary_slot_receives_build_window_keepalive_before_first_tick() {
         .await;
 }
 
-/// **TRUE `Node::run` e2e.** A submitter `Node` (bootstrap primary) and a
-/// compute `Node` (secondary), each composed + driven by the PRODUCTION
-/// `Node::run` — NOT a bespoke harness — run a 3-task batch to completion over
-/// a connected channel mesh. This is the end-to-end proof that `Node::run`
-/// composes the role + the mesh-pump + the lifecycle correctly: the submitter
-/// dispatches, the compute secondary runs the tasks on its worker pool and
-/// reports back, and the primary's run loop reaches its completion count.
+/// **TRUE `Node::run` RELOCATE e2e (cold, over the mpsc peer_mesh).** A setup
+/// peer `Node` (bootstrap primary, `SeedSource::ColdStart`) and a compute
+/// `Node` (a promotion-eligible secondary, `can_be_primary:true` + a `promote`
+/// recipe), each composed + driven by the PRODUCTION `Node::run`. Under
+/// mesh-always the setup peer RELOCATES the primary role onto the secondary:
+/// it ships the cold corpus to the fleet, originates
+/// `PrimaryChanged { Transferred }`, and demotes to a standalone observer
+/// (`PrimaryRunOutcome::Relocated`); the secondary's `PromotionSignal` fires,
+/// `Node::run` builds the snapshot-seeded promoted same-peer primary via the
+/// recipe, and THAT primary dispatches + drives the 3-task batch to completion
+/// on the secondary's worker pool. The end-to-end proof that the uniform
+/// relocate works locally over the channel mesh: completion is observed on the
+/// relocate TARGET (the secondary node), and the setup peer's node ends as a
+/// converged observer (its inherited completion count matches).
 #[tokio::test(flavor = "current_thread")]
-async fn node_run_e2e_submitter_primary_and_compute_secondary() {
+async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_cold() {
     use crate::process::{Node, NodeRunInputs, PrimaryRunArgs};
     use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
     use dynrunner_transport_channel::peer_mesh;
@@ -298,13 +305,14 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            // A 2-node fully-connected channel mesh: "primary" + "sec-0".
+            // A 2-node fully-connected channel mesh: "setup" + "sec-0".
             let ids = vec!["setup".to_string(), "sec-0".to_string()];
             let mut transports = peer_mesh::<TestId>(&ids);
             let sec_transport = transports.pop().unwrap(); // "sec-0"
             let pri_transport = transports.pop().unwrap(); // "setup"
 
-            // ── Compute node: secondary, driven by Node::run ───────────────
+            // ── Compute node: a PROMOTION-ELIGIBLE secondary, driven by
+            //    Node::run with a `promote` recipe (the relocate TARGET). ────
             let mut sec_mesh = Mesh::new(sec_transport);
             let (sec_slot, sec_client, sec_inbox) =
                 sec_mesh.register_local_role(LocalRole::Secondary, PeerId::from("sec-0"));
@@ -329,7 +337,8 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 primary_link_failure_window: Duration::from_secs(30),
                 primary_silence_backstop: Duration::from_secs(120),
                 unconfigured_deadline: Duration::from_secs(600),
-                can_be_primary: false,
+                // Promotion-eligible: the relocate target candidate.
+                can_be_primary: true,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
@@ -347,15 +356,20 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 FixedEstimator(100),
             );
             secondary.set_bootstrap_primary_id("setup".to_string());
-            let (sec_node, _sec_promo_tx) = Node::new(sec_mesh);
+            let (sec_node, sec_promo_tx) = Node::new(sec_mesh);
+            secondary.register_promotion_signal(sec_promo_tx);
+            // Cold path: the snapshot carries the seeded tasks, so the promoted
+            // primary needs no discovery policy.
+            let promote = build_test_promote_recipe("sec-0".to_string(), None);
             let sec_node = sec_node.with_secondary(secondary, sec_slot);
             let sec_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 secondary_factory: Some(FakeWorkerFactory),
+                promote: Some(promote),
                 ..Default::default()
             };
             let sec_handle = tokio::task::spawn_local(sec_node.run(sec_inputs));
 
-            // ── Submitter node: bootstrap primary, driven by Node::run ─────
+            // ── Setup-peer node: bootstrap primary that RELOCATES ──────────
             let mut pri_mesh = Mesh::new(pri_transport);
             let (pri_slot, pri_client, pri_inbox) =
                 pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
@@ -371,7 +385,6 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                 pri_client,
                 pri_inbox,
                 demote_rx,
-                crate::primary::RelocationPolicy::StayLocal,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -389,26 +402,224 @@ async fn node_run_e2e_submitter_primary_and_compute_secondary() {
                     on_phase_start: Box::new(|_| {}),
                     on_phase_end: Box::new(|_, _, _, _| {}),
                 }),
+                // LIVE demote hook: the relocate's local apply fires it, so the
+                // setup peer's `run_consuming` carries out a `Relocated` handoff.
                 primary_demote_tx: Some(demote_tx),
                 ..Default::default()
             };
 
-            // Drive the submitter Node::run to its outcome; the compute node
-            // runs alongside on the same LocalSet.
-            let outcome = pri_node.run(pri_inputs).await;
+            // Drive the setup-peer Node::run; the compute node runs alongside.
+            // The setup peer relocates → its node resolves to the converged
+            // observer outcome (it did NOT run the operational loop itself).
+            let setup_outcome = tokio::time::timeout(
+                Duration::from_secs(20),
+                pri_node.run(pri_inputs),
+            )
+            .await
+            .expect("setup-peer node must resolve (relocate → observer) within 20s");
             assert!(
-                matches!(outcome.terminal, crate::process::RunTerminal::Done),
-                "Node::run primary outcome: {:?}",
-                outcome.terminal
+                matches!(setup_outcome.terminal, crate::process::RunTerminal::Done),
+                "setup-peer node (relocated observer) outcome: {:?}",
+                setup_outcome.terminal
+            );
+
+            // The RELOCATE TARGET (the secondary's promoted same-peer primary)
+            // is where the run actually executed: it dispatched + completed all
+            // 3 tasks on its own worker pool. The compute node's outcome counts
+            // come from the promoted primary it built + ran.
+            let sec_outcome = tokio::time::timeout(Duration::from_secs(20), sec_handle)
+                .await
+                .expect("compute node must finish within 20s")
+                .expect("compute node task join");
+            assert!(
+                matches!(sec_outcome.terminal, crate::process::RunTerminal::Done),
+                "compute node (promoted primary) outcome: {:?}",
+                sec_outcome.terminal
             );
             assert_eq!(
-                outcome.completed, 3,
-                "all 3 tasks complete through Node::run"
+                sec_outcome.completed, 3,
+                "the relocated primary on the compute secondary must complete all 3 tasks \
+                 (this is where the run RAN — the setup peer relocated away)"
             );
-            assert_eq!(outcome.failed, 0);
+            // The setup peer's converged observer ledger sees the same total.
+            assert_eq!(
+                setup_outcome.completed, 3,
+                "the relocated setup peer's converged observer ledger must reflect the \
+                 target's 3 completions (no redo, no loss)"
+            );
+            assert_eq!(setup_outcome.failed, 0);
+        })
+        .await;
+}
 
-            // The compute node winds down once the wire closes.
-            let _ = sec_handle.await;
+/// **TRUE `Node::run` RELOCATE e2e (PRE-STAGED, over the mpsc peer_mesh).** The
+/// mode-2 `--source-already-staged` shape: the setup peer seeds ONLY the phase
+/// graph + `DiscoveryDebt=Owed` (`SeedSource::RelocatedSeed`, NO tasks) and
+/// RELOCATES onto a promotion-eligible secondary whose `promote` recipe carries
+/// a discovery POLICY. The relocate target inherits the `Owed` marker via its
+/// promotion snapshot, runs `discover_on_promotion` (the policy yields the
+/// corpus), seeds the discovered tasks + `DiscoverySettled`, and drives them to
+/// completion. Proves the pre-staged relocate-then-discover path end-to-end
+/// over the channel mesh: discovery runs on the TARGET (not the setup peer),
+/// and the run completes with no redo.
+#[tokio::test(flavor = "current_thread")]
+async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_pre_staged() {
+    use crate::process::{Node, NodeRunInputs, PrimaryRunArgs};
+    use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
+    use dynrunner_transport_channel::peer_mesh;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let ids = vec!["setup".to_string(), "sec-0".to_string()];
+            let mut transports = peer_mesh::<TestId>(&ids);
+            let sec_transport = transports.pop().unwrap(); // "sec-0"
+            let pri_transport = transports.pop().unwrap(); // "setup"
+
+            // ── Compute node: promotion-eligible secondary with a discovery
+            //    policy on its promote recipe (the relocate TARGET). ─────────
+            let mut sec_mesh = Mesh::new(sec_transport);
+            let (sec_slot, sec_client, sec_inbox) =
+                sec_mesh.register_local_role(LocalRole::Secondary, PeerId::from("sec-0"));
+            sec_mesh.publish_membership();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            let sec_config = SecondaryConfig {
+                secondary_id: "sec-0".into(),
+                num_workers: 2,
+                max_resources: max_res,
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
+                unconfigured_deadline: Duration::from_secs(600),
+                can_be_primary: true,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
+                output_dir: None,
+                memuse_log_path: None,
+                forwarded_argv: Vec::new(),
+            };
+            let mut secondary = SecondaryCoordinator::new(
+                sec_config,
+                sec_client,
+                sec_inbox,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let (sec_node, sec_promo_tx) = Node::new(sec_mesh);
+            secondary.register_promotion_signal(sec_promo_tx);
+            // The discovery policy the relocate target runs on the inherited
+            // `Owed` marker — yields the corpus the setup peer did NOT seed.
+            let discover_fires = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let fires_for_policy = discover_fires.clone();
+            let setup_discovery = crate::discovery::SetupDiscovery {
+                discover: Box::new(move || {
+                    fires_for_policy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let out = vec![
+                        make_binary("disc-a", 50),
+                        make_binary("disc-b", 60),
+                        make_binary("disc-c", 70),
+                    ];
+                    Box::pin(async move { Ok(out) })
+                }),
+                phase_deps: HashMap::new(),
+            };
+            let promote = build_test_promote_recipe("sec-0".to_string(), Some(setup_discovery));
+            let sec_node = sec_node.with_secondary(secondary, sec_slot);
+            let sec_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
+                secondary_factory: Some(FakeWorkerFactory),
+                promote: Some(promote),
+                ..Default::default()
+            };
+            let sec_handle = tokio::task::spawn_local(sec_node.run(sec_inputs));
+
+            // ── Setup-peer node: RelocatedSeed (phase graph + Owed, no tasks). ─
+            let mut pri_mesh = Mesh::new(pri_transport);
+            let (pri_slot, pri_client, pri_inbox) =
+                pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
+            pri_mesh.publish_membership();
+            let pri_config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                ..test_primary_config()
+            };
+            let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let primary = PrimaryCoordinator::new(
+                pri_config,
+                pri_client,
+                pri_inbox,
+                demote_rx,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+            let pri_node = pri_node.with_primary(primary, pri_slot);
+            let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
+                primary_run_args: Some(PrimaryRunArgs {
+                    // Pre-staged: NO tasks seeded — only the phase graph + the
+                    // `Owed` marker. The relocate target discovers the corpus.
+                    seed: SeedSource::RelocatedSeed {
+                        phase_deps: HashMap::new(),
+                    },
+                    on_phase_start: Box::new(|_| {}),
+                    on_phase_end: Box::new(|_, _, _, _| {}),
+                }),
+                primary_demote_tx: Some(demote_tx),
+                ..Default::default()
+            };
+
+            let setup_outcome =
+                tokio::time::timeout(Duration::from_secs(20), pri_node.run(pri_inputs))
+                    .await
+                    .expect("setup-peer node must resolve (relocate → observer) within 20s");
+            assert!(
+                matches!(setup_outcome.terminal, crate::process::RunTerminal::Done),
+                "setup-peer node (relocated observer) outcome: {:?}",
+                setup_outcome.terminal
+            );
+
+            let sec_outcome = tokio::time::timeout(Duration::from_secs(20), sec_handle)
+                .await
+                .expect("compute node must finish within 20s")
+                .expect("compute node task join");
+            assert!(
+                matches!(sec_outcome.terminal, crate::process::RunTerminal::Done),
+                "compute node (promoted primary) outcome: {:?}",
+                sec_outcome.terminal
+            );
+            // Discovery ran exactly once — on the TARGET (the relocated primary),
+            // NOT the setup peer.
+            assert_eq!(
+                discover_fires.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the discovery policy must run exactly once, on the relocate target"
+            );
+            assert_eq!(
+                sec_outcome.completed, 3,
+                "the relocated primary must discover + complete all 3 staged tasks \
+                 (discovery ran on the TARGET, not the setup peer)"
+            );
+            assert_eq!(
+                setup_outcome.completed, 3,
+                "the relocated setup peer's converged observer ledger must reflect the \
+                 target's 3 discovered completions"
+            );
+            assert_eq!(setup_outcome.failed, 0);
         })
         .await;
 }

@@ -12,14 +12,15 @@ use dynrunner_manager_distributed::process::{
     LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs, RunTerminal, SeedSource,
 };
 use dynrunner_manager_distributed::{
-    PrimaryConfig, PrimaryCoordinator, RelocationPolicy, RunError, SecondaryConfig,
-    SecondaryCoordinator,
+    PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
 use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
-use crate::managers::transport_factory;
+use crate::managers::secondary::run::{
+    PromotedPrimaryRecipeInputs, build_promoted_primary_recipe, build_setup_discovery_fn,
+};
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
@@ -141,27 +142,19 @@ impl PyDistributedManager {
         // identically.
         let forwarded_argv = self.forwarded_argv.clone();
         let source_pre_staged_root = self.source_pre_staged_root.clone();
-        // In-process `--source-already-staged` signal. Unlike the SLURM
-        // submitter (which relocates), the in-process primary stays LOCAL
-        // (StayLocal) — but it still OWES discovery: it has the host fs, so it
-        // seeds `DiscoveryDebt=Owed` (via `SeedSource::RelocatedSeed`) and runs
-        // `discover_on_promotion` ITSELF (the driver gates on the marker, not
-        // on relocation). The COLD in-process path (no `--source-already-staged`)
-        // discovers the corpus upfront in Python and cold-seeds it, so it is
-        // `Settled` from t0 and unaffected. Captured as a bool here because
-        // `source_pre_staged_root` moves into `PrimaryConfig` inside the
-        // detached-runtime closure before the seed is built.
+        // In-process `--source-already-staged` signal. Under mesh-always the
+        // in-process setup peer RELOCATES (uniform with SLURM); on the
+        // pre-staged path it seeds `DiscoveryDebt=Owed` (via
+        // `SeedSource::RelocatedSeed`), and the RELOCATE TARGET (a promoted
+        // in-process secondary) runs `discover_on_promotion` itself on the
+        // shared host fs (the driver gates on the inherited `Owed` marker). The
+        // COLD in-process path (no `--source-already-staged`) discovers the
+        // corpus upfront in Python and cold-seeds it, so the snapshot the
+        // target inherits carries the tasks and the marker stays `Settled`.
+        // Captured as a bool here because `source_pre_staged_root` moves into
+        // `PrimaryConfig` inside the detached-runtime closure before the seed
+        // is built.
         let source_pre_staged = source_pre_staged_root.is_some();
-        // Discovery-policy captures for the in-process local primary's
-        // `discover_on_promotion` (the GIL-thread capture pattern, mirroring
-        // `make_on_phase_*`): the task definition + args + the staged-corpus
-        // root. In-process shares one fs, so the corpus root IS
-        // `source_pre_staged_root` (the path Python passed via
-        // `--source-already-staged`). `None` on the cold path (the policy is
-        // never built then).
-        let discovery_task_definition_py = self.task_definition.clone_ref(py);
-        let discovery_task_args_py = self.task_args.clone_ref(py);
-        let discovery_root = source_pre_staged_root.clone();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -182,21 +175,33 @@ impl PyDistributedManager {
                 phase_hook_raise_latch.clone(),
             ));
 
-        // Clone the task_definition once per secondary so the in-process
-        // composition can fire `on_phase_end` through a promoted
-        // secondary's same-peer primary on the SAME Python
-        // `TaskDefinition` instance the live primary's callback already
-        // targets. Each spawned in-process secondary registers these
-        // callbacks and, under composition, transfers them to its
-        // same-peer primary built on promotion (which owns the phase machine
-        // and fires the cascade once activated). Each per-secondary closure
-        // pair is pushed in the order the secondaries are spawned below;
-        // the spawn loop pops one pair off this vec per iteration so each
-        // closure captures its own `Py<PyAny>` ref-bump.
+        // Per-secondary PROMOTE-recipe inputs, built on the GIL thread so each
+        // captures its own `Py<PyAny>` ref-bumps. Under mesh-always the
+        // in-process setup peer relocates onto ONE of these secondaries, whose
+        // promoted same-peer primary then OWNS the phase machine + fires the
+        // `on_phase_*` cascade on the SAME Python `TaskDefinition` the run
+        // targets, and (on the pre-staged path) runs `discover_on_promotion`
+        // with its own discovery policy. Built per-secondary (any one may be
+        // the relocate target) and consumed by the recipe builder in the spawn
+        // loop below. The `discover` closure consumes its `Py` handles on its
+        // single fire, so each secondary needs its OWN clone.
         let mut sec_phase_lifecycle_callbacks: Vec<(
             crate::managers::lifecycle::OnPhaseStart,
             crate::managers::lifecycle::OnPhaseEnd,
         )> = Vec::with_capacity(num_secondaries as usize);
+        // Per-secondary RAW discovery handles for the pre-staged path: the
+        // `task_definition` + `task_args` Py refs + the staged-corpus root.
+        // Captured as bare `Py<PyAny>` (GIL-independent, `Ungil`-safe to move
+        // into the detached runtime) — the `SetupDiscovery` policy CLOSURE
+        // (not `Ungil`) is built from these INSIDE the per-secondary spawn task
+        // via `build_setup_discovery_fn`, mirroring how the SLURM secondary
+        // builds its own. `None` on the cold path (no discovery anywhere).
+        // (task_definition, task_args, staged-corpus-root) — the raw,
+        // `Ungil`-safe discovery handles per secondary; the `SetupDiscovery`
+        // closure is built from these INSIDE the detached runtime.
+        type SecDiscoveryHandle = (Py<PyAny>, Py<PyAny>, PathBuf);
+        let mut sec_discovery_handles: Vec<Option<SecDiscoveryHandle>> =
+            Vec::with_capacity(num_secondaries as usize);
         for _ in 0..num_secondaries {
             let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
                 crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
@@ -205,6 +210,17 @@ impl PyDistributedManager {
                 crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
             );
             sec_phase_lifecycle_callbacks.push((on_start, on_end));
+            // Pre-staged: capture this secondary's own discovery Py-handle
+            // clones (the corpus root IS `source_pre_staged_root` — in-process
+            // shares one fs). The relocate target inherits `DiscoveryDebt=Owed`
+            // and runs discovery on the host fs. Cold: `None`.
+            sec_discovery_handles.push(source_pre_staged_root.clone().map(|root| {
+                (
+                    self.task_definition.clone_ref(py),
+                    self.task_args.clone_ref(py),
+                    root,
+                )
+            }));
         }
 
         // Take the Python peer-lifecycle listener (if any) out of
@@ -268,11 +284,12 @@ impl PyDistributedManager {
         // the GIL-side tail (never the `Other` swallow). Same shape as
         // `PyPrimaryCoordinator::run`.
         let mut spawn_rejected: Option<RunError> = None;
-        // No-relocation-target config error. Structurally unreachable on this
-        // in-process path (the primary is built `RelocationPolicy::StayLocal`,
-        // so the bootstrap stays local and never selects a target), but the
-        // `RunError` match must be exhaustive; RAISES at the GIL-side tail if
-        // it ever occurs rather than silently swallowing.
+        // No-relocation-target config error. A LIVE error path under
+        // mesh-always: the in-process setup peer relocates (uniform with
+        // SLURM), so a fleet where no in-process secondary is eligible
+        // (`can_be_primary=false`, all observers, or zero secondaries)
+        // surfaces `RunError::NoRelocationTarget`. RAISES at the GIL-side tail
+        // rather than silently swallowing.
         let mut no_relocation_target: Option<RunError> = None;
 
         py.detach(|| {
@@ -283,60 +300,52 @@ impl PyDistributedManager {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                use tokio::sync::mpsc as tokio_mpsc;
-
                 let mut sec_handles = Vec::new();
 
-                // Build the in-process primary's single mesh transport
-                // through the backend-opaque factory. Post-collapse this
-                // is the ONE transport the coordinator holds.
-                // `shared_outgoing` is the writer table the in-process
-                // path registers each per-secondary writer into directly
-                // (no accept loops here); `inbound` is the sink the
-                // per-secondary forwarder feeds — the transport's real,
-                // single inbound stream (no fan-out tap). `Destination`
-                // sends and the unified `recv_peer()` both run over this
-                // one transport.
-                let primary_bundle =
-                    transport_factory::inprocess_primary_mesh::<RunnerIdentifier>();
-                let peer_transport = primary_bundle.transport;
-                let shared_outgoing = primary_bundle.shared_outgoing;
-                let inbound = primary_bundle.inbound;
+                // Build the FULL N+1-node mpsc peer mesh up front via the
+                // EXISTING all-to-all builder (`transport-channel::peer_mesh`):
+                // one `ChannelPeerTransport` per node — the setup peer
+                // (`SETUP_NODE_ID`) PLUS every secondary (`sec-{i}`) — each a
+                // first-class member of a fully-connected mpsc mesh. This
+                // replaces the old hand-rolled STAR (a `TunneledPeerTransport`
+                // primary + per-secondary channels + forwarder tasks that
+                // folded ONLY the primary in): under mesh-always the setup peer
+                // RELOCATES onto a secondary, and the promoted secondary must
+                // reach every other secondary directly — the all-to-all mesh
+                // gives every node that reach. The coordinator stays blind to
+                // the backend (it sees only `Mesh`/`PeerTransport`); the only
+                // difference from the SLURM QUIC mesh is the transport. No new
+                // transport-channel machinery — the primitive already exists.
+                let mut peer_ids: Vec<String> =
+                    Vec::with_capacity(num_secondaries as usize + 1);
+                peer_ids.push(dynrunner_core::SETUP_NODE_ID.to_string());
+                for (sid, _) in &sec_log_dirs {
+                    peer_ids.push(sid.clone());
+                }
+                let mut mesh_transports =
+                    dynrunner_transport_channel::peer_mesh::<RunnerIdentifier>(&peer_ids);
+                // Index 0 is the setup peer's transport (peer_ids[0] ==
+                // SETUP_NODE_ID); the remaining transports, in `sec_log_dirs`
+                // order, are the secondaries'. Drain the secondary transports
+                // off the front-trimmed tail so each per-secondary closure owns
+                // its own member of the mesh.
+                let peer_transport = mesh_transports.remove(0);
+                let mut sec_transports = mesh_transports.into_iter();
 
-                for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
-                    sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
+                for (
+                    ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)),
+                    sec_discovery_handle,
+                ) in sec_log_dirs
+                    .into_iter()
+                    .zip(sec_phase_lifecycle_callbacks)
+                    .zip(sec_discovery_handles)
                 {
-                    // primary→secondary channel
-                    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-                    // secondary→primary channel
-                    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-
-                    // Register the per-secondary writer directly into the
-                    // transport's shared writer table so
-                    // `transport.send_to_peer(sec_id, ..)` /
-                    // `Address::Peer(sec_id)` / role-resolved dispatch
-                    // reach this secondary. (The QUIC path registers via
-                    // the accept-loop registration sink instead; in-
-                    // process there are no accept loops, so the direct
-                    // insert is the registration.)
-                    shared_outgoing
-                        .borrow_mut()
-                        .insert(secondary_id.clone(), pri_to_sec_tx);
-
-                    // Forward secondary→primary messages straight into
-                    // the transport's single inbound stream — the
-                    // in-process analogue of a QUIC/WSS accept loop's
-                    // reader task feeding the inbound sink. No fan-out
-                    // tap: `recv_peer()` drains this same stream.
-                    let fwd_tx = inbound.clone();
-                    tokio::task::spawn_local(async move {
-                        let mut rx = sec_to_pri_rx;
-                        while let Some(msg) = rx.recv().await {
-                            if fwd_tx.send(msg).is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    // This secondary's pre-wired all-to-all mesh transport (its
+                    // `outgoing` table already reaches the setup peer + every
+                    // peer secondary; its inbox is fed by their outboxes).
+                    let transport = sec_transports
+                        .next()
+                        .expect("one mesh transport per secondary (peer_mesh built N+1)");
 
                     let sec_python = python_executable.clone();
                     let sec_worker_spec = worker_spec.clone();
@@ -355,24 +364,28 @@ impl PyDistributedManager {
                     // own copy; the primary config below still holds the
                     // original to seed itself identically.
                     let sec_forwarded_argv = forwarded_argv.clone();
+                    // Second per-secondary clones for the PROMOTE recipe: the
+                    // `SecondaryCoordinator` below moves one scheduler/estimator
+                    // copy; the recipe (which builds the promoted same-peer
+                    // primary on relocation) needs its own.
+                    let promote_scheduler_config = scheduler_config.clone();
+                    let promote_estimator = estimator.clone();
+                    // The run's phase graph for this secondary's discovery
+                    // policy (pre-staged path) — the relocate target pairs it
+                    // with the discovered corpus in `discover_on_promotion`.
+                    let sec_phase_deps = phase_deps.clone();
 
                     let handle = tokio::task::spawn_local(async move {
-                        // Channel-backed mesh built through the
-                        // backend-opaque factory: the in-process primary is
-                        // folded in as an ordinary mesh peer keyed by the
-                        // submitter id (no per-role uplink leg). Inbound is
-                        // the primary→secondary channel; the outbound
-                        // primary link is the secondary→primary channel.
-                        let transport =
-                            transport_factory::inprocess_secondary_mesh::<RunnerIdentifier>(
-                                secondary_id.clone(),
-                                dynrunner_core::SETUP_NODE_ID.to_string(),
-                                pri_to_sec_rx,
-                                sec_to_pri_tx,
-                            );
+                        // This secondary's all-to-all mpsc mesh transport
+                        // (`peer_mesh`, built above): an ordinary first-class
+                        // member that reaches the setup peer + every peer
+                        // secondary directly — so a promotion lands it on a
+                        // routable mesh. Moved in by value; no per-role uplink
+                        // leg, no forwarder task.
+                        let transport = transport;
                         // The local-slot peer-id for the secondary's `Node`
-                        // mesh registration (the same logical id the channel
-                        // mesh keys this secondary under).
+                        // mesh registration (the same logical id the mesh keys
+                        // this secondary under).
                         let sec_id_for_slot = secondary_id.clone();
                         let config = SecondaryConfig {
                             secondary_id,
@@ -414,13 +427,15 @@ impl PyDistributedManager {
                             primary_silence_backstop:
                                 dynrunner_manager_distributed::DEFAULT_PRIMARY_SILENCE_BACKSTOP,
                             unconfigured_deadline: dist_unconfigured_deadline,
-                            // In-process distributed manager: secondaries
-                            // hold a channel mesh with ONLY the primary
-                            // folded in (no peer-to-peer mesh among
-                            // secondaries), so none registers an on-demand
-                            // primary-activator and none can host the
-                            // primary. `false` keeps the submitter primary.
-                            can_be_primary: false,
+                            // Mesh-always: in-process secondaries hold a full
+                            // all-to-all mpsc mesh (`peer_mesh` above), so each
+                            // is a promotion-eligible compute peer. The setup
+                            // peer relocates onto the lowest-id eligible
+                            // secondary; `true` is what makes it a valid
+                            // `select_relocation_target` candidate AND lights up
+                            // its `PromotionSignal` path (paired with the
+                            // `promote` recipe below).
+                            can_be_primary: true,
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
@@ -565,26 +580,67 @@ impl PyDistributedManager {
                             secondary.register_panik_signal_rx(rx);
                         }
 
-                        // The in-process secondary cannot be PROMOTED
-                        // (`can_be_primary = false`: a channel mesh with only
-                        // the primary folded in, no peer-to-peer mesh among the
-                        // secondaries), so it registers NO setup-discovery /
-                        // promotion recipe and its phase-lifecycle callbacks
-                        // would never fire (the in-process `PrimaryCoordinator`
-                        // built below is the authority that owns the phase
-                        // machine + its own `on_phase_*`). The per-secondary
-                        // `sec_on_phase_*` closures are therefore dropped here
-                        // (they were only ever shape-parity for the promotable
-                        // SLURM path).
-                        let _ = (sec_on_phase_start, sec_on_phase_end);
+                        // Mesh-always: this in-process secondary is a
+                        // promotion-eligible compute peer (`can_be_primary =
+                        // true`). Compose the `Node` (one role composition per
+                        // logical peer); `Node::new` hands out the
+                        // `promotion_tx` the secondary signals on a self-named
+                        // `PrimaryChanged`, wired via `register_promotion_signal`.
+                        // The setup peer relocates onto the lowest-id eligible
+                        // secondary, whose `PromotionSignal` fires this path and
+                        // makes `Node::run` invoke the `promote` recipe below to
+                        // BUILD the snapshot-seeded same-peer primary (the
+                        // secondary NEVER constructs a primary — SUPREME-LAW #3).
+                        let (node, promotion_tx) = Node::new(sec_mesh);
+                        secondary.register_promotion_signal(promotion_tx);
 
-                        // Compose the per-secondary `Node` (one OS-process role
-                        // composition per logical peer) and drive it. `Node::run`
-                        // owns the mesh-pump + the secondary's worker-teardown
-                        // ladder (gated off panik). A pure-secondary node with
-                        // no promotion recipe — the in-process secondary never
-                        // becomes primary.
-                        let (node, _promo_tx) = Node::new(sec_mesh);
+                        // The shared run-config handle the promote recipe reads
+                        // at the promotion instant. In-process every node shares
+                        // the submitter's argv directly, so this is byte-
+                        // identical to the setup peer's `forwarded_argv`.
+                        let promote_run_config_handle = secondary.run_config_handle();
+
+                        // Build this secondary's discovery policy INSIDE the
+                        // detached runtime (the `SetupDiscovery` CLOSURE is not
+                        // `Ungil`, so it cannot cross the `py.detach` boundary —
+                        // only the raw `Py` handles did). `Some` on the
+                        // pre-staged path; `None` on cold (the marker is
+                        // `Settled`, so the driver never consults it).
+                        let sec_setup_discovery = sec_discovery_handle.map(|(td, ta, root)| {
+                            dynrunner_manager_distributed::SetupDiscovery {
+                                discover: build_setup_discovery_fn(td, ta, Some(root)),
+                                phase_deps: sec_phase_deps,
+                            }
+                        });
+
+                        // Build the promoted-primary recipe by REUSING the
+                        // SLURM submitter's transport-agnostic recipe builder
+                        // (`build_promoted_primary_recipe`). The promoted
+                        // same-peer primary OWNS the phase machine (fires the
+                        // per-secondary `on_phase_*`) and, on the pre-staged
+                        // path, runs `discover_on_promotion` with the
+                        // per-secondary discovery policy on the shared host fs.
+                        // `command_channel: None` — the ONE Python `PrimaryHandle`
+                        // is held by the setup peer; the promoted primary keeps
+                        // the internal command channel `new` mints (the run loop
+                        // is fully driven; only runtime `spawn_tasks` via that
+                        // handle does not re-route to the relocated primary).
+                        let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
+                            secondary_id: sec_id_for_slot.clone(),
+                            keepalive_interval: dist_keepalive,
+                            peer_timeout: dist_peer_timeout,
+                            keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                            retry_max_passes: dist_retry_max_passes,
+                            oom_retry_max_passes: dist_oom_retry_max_passes,
+                            scheduler_config: promote_scheduler_config,
+                            estimator: promote_estimator,
+                            command_channel: None,
+                            on_phase_start: sec_on_phase_start,
+                            on_phase_end: sec_on_phase_end,
+                            forwarded_argv: promote_run_config_handle,
+                            setup_discovery: sec_setup_discovery,
+                        });
+
                         let node = node.with_secondary(secondary, sec_slot);
                         let inputs: NodeRunInputs<
                             SubprocessWorkerFactory,
@@ -593,7 +649,7 @@ impl PyDistributedManager {
                             RunnerIdentifier,
                         > = NodeRunInputs {
                             secondary_factory: Some(factory),
-                            promote: None,
+                            promote: Some(promote),
                             primary_run_args: None,
                             primary_demote_tx: None,
                         };
@@ -606,13 +662,14 @@ impl PyDistributedManager {
 
                     sec_handles.push(handle);
                 }
-                // Drop the original inbound sink so only the per-secondary
-                // forwarding tasks hold senders — once every secondary
-                // exits and its forwarder ends, the transport's
-                // `recv_peer()` observes `None` (the inbound-closed
-                // signal the operational loop's `transport_closed` gate
-                // keys off).
-                drop(inbound);
+                // No manual inbound-sink drop: with the all-to-all `peer_mesh`,
+                // the setup peer's inbox is fed only by the secondaries'
+                // outboxes (held in their `ChannelPeerTransport.outgoing`). Once
+                // every secondary node exits and drops its transport, those
+                // senders drop and the setup peer's `recv_peer()` observes
+                // `None` — the inbound-closed signal the operational loop's
+                // `transport_closed` gate keys off (the relocate target's
+                // observer/primary owns the live mesh while the run proceeds).
 
                 let config = PrimaryConfig {
                     node_id: dynrunner_core::SETUP_NODE_ID.into(),
@@ -623,11 +680,12 @@ impl PyDistributedManager {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     // `--source-already-staged` threaded onto the PrimaryConfig
                     // as the staging root. Under mesh-always the in-process
-                    // primary OWES discovery on this marker: the
-                    // `SeedSource::RelocatedSeed` below declares
-                    // `DiscoveryDebt=Owed` and the discovery policy registered
-                    // above lets `discover_on_promotion` walk this root on the
-                    // host fs and seed the tasks (no relocation — StayLocal).
+                    // setup peer seeds `DiscoveryDebt=Owed` (the
+                    // `SeedSource::RelocatedSeed` below) and RELOCATES; the
+                    // relocate target inherits the `Owed` marker via its
+                    // snapshot and runs `discover_on_promotion` with its own
+                    // discovery policy on the shared host fs. The setup peer
+                    // itself never discovers.
                     source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
@@ -666,30 +724,33 @@ impl PyDistributedManager {
                     ..PrimaryConfig::default()
                 };
 
-                // Wrap the in-process primary's mesh transport in the
-                // role-demux `Mesh` and register the Primary slot. The
-                // in-process primary is the sole authority (every secondary
-                // joins `can_be_primary = false`), so its demote channel never
-                // fires — but `PrimaryCoordinator::new` requires the receiver,
-                // so we mint an inert pair (no `primary_demote_tx` is handed to
-                // the node, so no role-change hook feeds it).
+                // Wrap the in-process setup peer's mesh transport in the
+                // role-demux `Mesh` and register the Primary slot. Under
+                // mesh-always the setup peer RELOCATES the primary onto a
+                // compute secondary, so its demote channel is LIVE (Gap C): the
+                // relocate's local apply names the target ≠ self, the role-
+                // change hook (`register_demote_on_displaced`, wired by
+                // `Node::run` from `primary_demote_tx` below) fires the demote
+                // signal, and `run_consuming` carries this coordinator out as a
+                // standalone observer (`PrimaryRunOutcome::Relocated`). Mirrors
+                // the SLURM submitter (`managers/primary/run.rs`).
                 let mut pri_mesh = Mesh::new(peer_transport);
                 let (pri_slot, pri_client, pri_inbox) = pri_mesh.register_local_role(
                     LocalRole::Primary,
                     PeerId::from(dynrunner_core::SETUP_NODE_ID),
                 );
-                let (_pri_demote_tx, pri_demote_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                let (pri_demote_tx, pri_demote_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     pri_client,
                     pri_inbox,
                     pri_demote_rx,
-                    // In-process `--multi-computer local`: the sole authority
-                    // stays local (every secondary joins `can_be_primary =
-                    // false`, so there is no eligible compute peer to relocate
-                    // to). Pillar 2 does not apply to the in-process path.
-                    RelocationPolicy::StayLocal,
+                    // Mesh-always: the in-process setup peer's seed is
+                    // `ColdStart` / `RelocatedSeed` (below) ⇒
+                    // `BootstrapRole::SetupPeer`, so `run_pipeline` relocates
+                    // the primary onto a compute secondary — uniform with the
+                    // SLURM submitter, no construction-time policy.
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
@@ -722,27 +783,16 @@ impl PyDistributedManager {
                     primary.register_task_completed_listener(listener);
                 }
 
-                // In-process `--source-already-staged`: register the consumer's
-                // discovery policy on the LOCAL primary. The relocated-seed
-                // below declares `DiscoveryDebt=Owed`, so `discover_on_promotion`
-                // (fired in `run_pipeline` post-connect) runs this policy on the
-                // host fs and seeds the discovered tasks. Built only on the
-                // pre-staged path — the cold path is `Settled` from t0 and the
-                // driver short-circuits, so registering it there would be inert
-                // anyway, but we skip the GIL-thread closure build entirely.
-                if source_pre_staged {
-                    primary.register_setup_discovery(
-                        dynrunner_manager_distributed::SetupDiscovery {
-                            discover:
-                                crate::managers::secondary::run::build_setup_discovery_fn(
-                                    discovery_task_definition_py,
-                                    discovery_task_args_py,
-                                    discovery_root,
-                                ),
-                            phase_deps: phase_deps.clone(),
-                        },
-                    );
-                }
+                // The setup peer registers NO discovery policy: under
+                // mesh-always it RELOCATES before `discover_on_promotion` (the
+                // `BootstrapRole::SetupPeer` arm fires the relocate before
+                // discover). On the pre-staged path the discovery policy lives
+                // on the RELOCATE TARGET's promote recipe
+                // (`sec_setup_discoveries` → `build_promoted_primary_recipe`
+                // above), which inherits the `Owed` marker via its snapshot and
+                // walks the shared host fs itself. On the cold path the corpus
+                // was cold-seeded upfront and rides the snapshot; the marker is
+                // `Settled`, so no discovery runs anywhere.
 
                 // Panik watcher for the in-process primary. Each
                 // in-process secondary spawn_local closure above also
@@ -793,19 +843,22 @@ impl PyDistributedManager {
                 // unique to it; the gate detects the non-empty
                 // queue and skips.
 
-                // Compose the in-process primary `Node` (a pure-primary node —
-                // no co-located secondary, no promotion recipe: the in-process
-                // primary is the sole authority). `Node::run` owns the
-                // mesh-pump + the primary's lifecycle and resolves to ONE
-                // role-agnostic terminal (+ counts).
+                // Compose the in-process setup peer's `Node` (a pure-primary
+                // node — no co-located secondary; the relocate TARGET is a
+                // separate secondary node). `Node::run` owns the mesh-pump +
+                // runs the primary CONSUMING, so the relocate's demote arm
+                // carries this coordinator out as `Relocated { handoff }` (it
+                // becomes a standalone observer for the rest of the run).
                 let (node, _node_promo_tx) = Node::new(pri_mesh);
                 let node = node.with_primary(primary, pri_slot);
                 // Construct the typed seed at the boundary from the pre-staged
                 // signal (a construction-site decision, NOT a runtime flag-if
-                // inside the coordinator). Pre-staged: originate ONLY the phase
-                // graph + `DiscoveryDebt=Owed`; the local primary discovers the
-                // staged corpus via the policy registered above. Cold: the
-                // corpus was discovered upfront in Python and is cold-seeded.
+                // inside the coordinator). Both seeds derive
+                // `BootstrapRole::SetupPeer`, so the setup peer relocates either
+                // way. Pre-staged: originate ONLY the phase graph +
+                // `DiscoveryDebt=Owed`; the relocate target discovers the staged
+                // corpus. Cold: the corpus was discovered upfront in Python and
+                // is cold-seeded (it rides the target's promotion snapshot).
                 let seed = if source_pre_staged {
                     SeedSource::RelocatedSeed { phase_deps }
                 } else {
@@ -825,10 +878,14 @@ impl PyDistributedManager {
                         on_phase_start,
                         on_phase_end,
                     }),
-                    // No demote hook (the in-process primary is the sole
-                    // authority — it never relocates), no co-located secondary,
-                    // no promotion recipe.
-                    primary_demote_tx: None,
+                    // Gap C: LIVE demote hook. `Node::run` installs it on the
+                    // setup peer's role-change hook
+                    // (`register_demote_on_displaced`), so the relocate's local
+                    // `PrimaryChanged { Transferred }` apply fires the demote
+                    // signal and `run_consuming` relocates this coordinator into
+                    // a standalone observer. No co-located secondary, no promote
+                    // recipe (this node is the setup peer, never a target).
+                    primary_demote_tx: Some(pri_demote_tx),
                     secondary_factory: None,
                     promote: None,
                 };
@@ -871,9 +928,10 @@ impl PyDistributedManager {
                                 spawn_rejected = Some(e);
                             }
                             e @ RunError::NoRelocationTarget => {
-                                // Unreachable on the in-process path
-                                // (RelocationPolicy::StayLocal); RAISE if it
-                                // ever occurs rather than silently swallow.
+                                // LIVE under mesh-always: the in-process setup
+                                // peer relocates, so a fleet with no eligible
+                                // compute secondary surfaces this. RAISE rather
+                                // than silently swallow.
                                 no_relocation_target = Some(e);
                             }
                             RunError::Other(_) => {
@@ -938,8 +996,9 @@ impl PyDistributedManager {
         }
 
         if let Some(err) = no_relocation_target {
-            // Defensive: unreachable on the in-process path (StayLocal), but
-            // RAISE rather than swallow if it ever surfaces.
+            // LIVE under mesh-always: the in-process setup peer relocates, so a
+            // fleet with no eligible compute secondary surfaces this. RAISE so
+            // the operator sees the unsupported-topology message.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 

@@ -35,15 +35,13 @@ async fn single_secondary_processes_all_tasks() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // and run as a `PromotionSnapshot` — a `ColdStart` would
+                // relocate away, never running the dispatch loop this test
+                // asserts.
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -85,15 +83,9 @@ async fn two_secondaries_distribute_work() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -182,15 +174,9 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             // the "both secondaries reached process_tasks and observed the
             // run-complete cue" signal under the composed semantics.
             let (deps, ops, ope) = noop_phase_args();
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -260,15 +246,9 @@ async fn live_distribution_continues_past_initial_batch() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };

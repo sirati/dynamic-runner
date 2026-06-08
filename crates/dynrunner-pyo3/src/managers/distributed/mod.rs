@@ -72,14 +72,15 @@ pub(crate) struct PyDistributedManager {
     /// `Some`, the corpus is already staged on the host fs and the
     /// submitter passed no locally-discovered binaries. The in-process
     /// run then constructs `SeedSource::RelocatedSeed` (phase graph +
-    /// `DiscoveryDebt=Owed`, no tasks) and registers the consumer's
-    /// discovery policy on the LOCAL primary: it does NOT relocate
-    /// (`RelocationPolicy::StayLocal`) but it OWES discovery, so its
-    /// `discover_on_promotion` driver runs `task.discover_items` on the host
-    /// fs and seeds the tasks itself (the driver gates on the `Owed` marker,
-    /// not on relocation). Also threaded into `PrimaryConfig` as the staging
-    /// root. The cold path (`None`) discovers the corpus upfront in Python
-    /// and cold-seeds it (`DiscoveryDebt` stays `Undeclared`).
+    /// `DiscoveryDebt=Owed`, no tasks). Under mesh-always the setup peer
+    /// RELOCATES (uniform with SLURM); the relocate TARGET (a promoted
+    /// in-process secondary) carries the consumer's discovery policy on its
+    /// promote recipe and inherits the `Owed` marker via its snapshot, so its
+    /// `discover_on_promotion` driver runs `task.discover_items` on the shared
+    /// host fs and seeds the tasks (the driver gates on the `Owed` marker, not
+    /// on relocation). Also threaded into `PrimaryConfig` as the staging root.
+    /// The cold path (`None`) discovers the corpus upfront in Python and
+    /// cold-seeds it (`DiscoveryDebt` stays `Undeclared`).
     pub(super) source_pre_staged_root: Option<PathBuf>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B). The

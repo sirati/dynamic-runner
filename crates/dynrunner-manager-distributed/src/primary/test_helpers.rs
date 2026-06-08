@@ -651,47 +651,18 @@ where
     S: Scheduler<TestId> + 'static,
     E: ResourceEstimator<TestId> + 'static,
 {
-    // The shared default: tests bootstrap a LOCAL primary (the relocate path
-    // is exercised by the dedicated unit tests that call
-    // `select_relocation_target` / `relocate_primary_to` directly, and the
-    // single policy-routing test, which use `build_test_primary_with_policy`).
-    build_test_primary_with_policy(
-        config,
-        transport,
-        crate::primary::RelocationPolicy::StayLocal,
-        scheduler,
-        estimator,
-    )
-}
-
-/// As [`build_test_primary`] but with an explicit bootstrap-tail
-/// [`crate::primary::RelocationPolicy`]. The single construction choke point
-/// for the rare test that needs a `RelocateToComputePeer` coordinator;
-/// `build_test_primary` delegates here with `StayLocal`.
-pub(super) fn build_test_primary_with_policy<S, E>(
-    config: PrimaryConfig,
-    transport: ChannelPeerTransport<TestId>,
-    relocation_policy: crate::primary::RelocationPolicy,
-    scheduler: S,
-    estimator: E,
-) -> (PrimaryCoordinator<S, E, TestId>, PrimaryMeshKeepalive)
-where
-    S: Scheduler<TestId> + 'static,
-    E: ResourceEstimator<TestId> + 'static,
-{
+    // Mesh-always: there is no construction-time relocation policy. Whether a
+    // primary built here relocates or runs operationally is decided ENTIRELY
+    // by the `SeedSource` its `run`/`run_consuming` receives (`ColdStart` /
+    // `RelocatedSeed` ⇒ setup peer ⇒ relocate; `PromotionSnapshot` ⇒
+    // operational). The relocate path is exercised by the dedicated unit tests
+    // that call `select_relocation_target` / `relocate_primary_to` directly,
+    // and by the seed-keyed bootstrap-role tests.
     let mut mesh = Mesh::new(transport);
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
     let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
-    let primary = PrimaryCoordinator::new(
-        config,
-        client,
-        inbox,
-        demote_rx,
-        relocation_policy,
-        scheduler,
-        estimator,
-    );
+    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
     // Publish live membership before the pump spawns so the primary's
     // failover/strand reads see the connected secondaries from the first tick
     // (the pump republishes every cycle thereafter).
@@ -738,6 +709,113 @@ where
             },
         )
     }
+}
+
+/// Pre-seed a test primary's replicated ledger with a cold-task corpus so a
+/// subsequent `run(SeedSource::PromotionSnapshot)` resumes it as an
+/// OPERATIONAL primary in place — the honest mesh-always seed for "a primary
+/// that runs the dispatch/retry/phase loop locally" (≡ the relocated target /
+/// failover-promoted primary; a `ColdStart` is now a setup peer that relocates
+/// AWAY, so it would never run the loop itself).
+///
+/// Applies `PhaseDepsSet` + one Pending `TaskAdded` per binary to the LOCAL
+/// `cluster_state` (the inherited-ledger shape a promotion carries); the
+/// always-run hydrate in `run_pipeline` then rebuilds the pool + `total_tasks`.
+/// The operational-loop unit tests that previously seeded via `ColdStart` use
+/// this + `run(PromotionSnapshot)` to assert the SAME dispatch behaviour
+/// honestly under the uniform model. Single choke point so the cold→operational
+/// re-key is one line per test, not an inline mutation loop each.
+pub(super) fn seed_operational_ledger<S, E>(
+    primary: &mut PrimaryCoordinator<S, E, TestId>,
+    binaries: Vec<TaskInfo<TestId>>,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+) where
+    S: Scheduler<TestId>,
+    E: ResourceEstimator<TestId>,
+{
+    let cs = primary.cluster_state_mut_for_test();
+    cs.apply(ClusterMutation::PhaseDepsSet { deps: phase_deps });
+    for task in &binaries {
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: crate::primary::wire::compute_task_hash(task),
+            task: task.clone(),
+        });
+    }
+}
+
+/// Build a [`crate::process::PromotedPrimaryBuilder`] for a relocate/failover
+/// TARGET in the test crate — the transport-agnostic recipe `Node::run`
+/// invokes on a `PromotionSignal` to construct the snapshot-seeded promoted
+/// primary. Mirrors the pyo3 `build_promoted_primary_recipe` minus the
+/// Python/config plumbing: given the just-minted mesh ends + the node-owned
+/// demote receiver + the promoting host's converged snapshot, it builds the
+/// coordinator, optionally registers a discovery policy (for the pre-staged /
+/// `RelocatedSeed` path, where the target runs `discover_on_promotion`), seeds
+/// from the snapshot, and returns the ready-to-`run` primary with a
+/// `PromotionSnapshot` seed (⇒ `BootstrapRole::PromotedDestination`, so it runs
+/// the operational loop in place).
+///
+/// `setup_discovery` is `Some` only on the pre-staged path; `None` on the cold
+/// path (the snapshot already carries the seeded tasks). The optional
+/// `on_phase_*` default to no-ops; a caller that asserts phase narration passes
+/// real closures.
+pub(super) fn build_test_promote_recipe(
+    config_id: String,
+    setup_discovery: Option<crate::discovery::SetupDiscovery<TestId>>,
+) -> crate::process::PromotedPrimaryBuilder<
+    dynrunner_scheduler::ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+> {
+    build_test_promote_recipe_with_config(
+        PrimaryConfig {
+            node_id: config_id,
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            ..PrimaryConfig::default()
+        },
+        setup_discovery,
+    )
+}
+
+/// As [`build_test_promote_recipe`] but with an explicit [`PrimaryConfig`] for
+/// the promoted primary — for tests that need fast death-detection timeouts
+/// (`keepalive_interval` / `peer_timeout` / `fleet_dead_timeout`) so the
+/// operational target promptly strands work routed to dead compute peers.
+pub(super) fn build_test_promote_recipe_with_config(
+    config: PrimaryConfig,
+    setup_discovery: Option<crate::discovery::SetupDiscovery<TestId>>,
+) -> crate::process::PromotedPrimaryBuilder<
+    dynrunner_scheduler::ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+> {
+    let mut setup_discovery = setup_discovery;
+    // The recipe fires at most once (a node promotes once); take the
+    // single-use `PrimaryConfig` (not `Clone`) on that one invocation.
+    let mut config = Some(config);
+    Box::new(move |client, inbox, demote_rx, snapshot| {
+        let config = config.take().expect("promote recipe invoked more than once");
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            client,
+            inbox,
+            demote_rx,
+            dynrunner_scheduler::ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        if let Some(sd) = setup_discovery.take() {
+            primary.register_setup_discovery(sd);
+        }
+        primary.seed_from_promotion_snapshot(snapshot);
+        crate::process::PromotedPrimary {
+            coordinator: primary,
+            run_args: crate::process::PrimaryRunArgs {
+                seed: crate::process::SeedSource::PromotionSnapshot,
+                on_phase_start: Box::new(|_| {}),
+                on_phase_end: Box::new(|_, _, _, _| {}),
+            },
+        }
+    })
 }
 
 /// Allocate the channel-pairs for `num_secondaries` and return the

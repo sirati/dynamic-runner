@@ -73,15 +73,7 @@ where
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
     let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
-    let primary = PrimaryCoordinator::new(
-        config,
-        client,
-        inbox,
-        demote_rx,
-        crate::primary::RelocationPolicy::StayLocal,
-        scheduler,
-        estimator,
-    );
+    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
     (primary, mesh, slot, demote_tx)
 }
 

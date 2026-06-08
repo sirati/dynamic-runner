@@ -55,15 +55,12 @@ async fn e2e_primary_and_secondary_single_node() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -141,15 +138,12 @@ async fn e2e_primary_and_two_secondaries() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -271,133 +265,175 @@ async fn notify_stage_file_emits_wire_message() {
 ///     applied locally so the primary's own ledger converges.
 #[tokio::test(flavor = "current_thread")]
 async fn cluster_state_converges_on_primary_and_secondary() {
+    use crate::process::{LocalRole, Mesh, Node, NodeRunInputs, PrimaryRunArgs};
+    use dynrunner_protocol_primary_secondary::address::PeerId;
+    use dynrunner_transport_channel::peer_mesh;
+
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let secondary_id = "sec-0".to_string();
+            // Mesh-always convergence proof: the cold-seed `TaskAdded` fan-out
+            // is broadcast by the SETUP PEER (before it relocates), and the
+            // per-completion `TaskCompleted` broadcasts come from the
+            // OPERATIONAL primary (the relocate target). A `PromotionSnapshot`
+            // primary does NOT re-broadcast the seed (it rides the snapshot /
+            // anti-entropy), so the honest fixture is a real relocate: the
+            // setup peer ColdStart-broadcasts to the fleet, relocates onto
+            // sec-0 (a promotable target that runs the work), and the SEPARATE
+            // non-target sec-1's replicated mirror must converge to 5
+            // Completed via those broadcasts.
+            let ids = vec!["setup".to_string(), "sec-0".to_string(), "sec-1".to_string()];
+            let mut transports = peer_mesh::<TestId>(&ids);
+            let checked_transport = transports.pop().unwrap(); // "sec-1" (checked)
+            let target_transport = transports.pop().unwrap(); // "sec-0" (target)
+            let pri_transport = transports.pop().unwrap(); // "setup"
             let max_res = dynrunner_core::ResourceMap::from([(
                 dynrunner_core::ResourceKind::memory(),
                 1024 * 1024 * 1024u64,
             )]);
+            let sec_config = |id: &str, can_be_primary: bool| SecondaryConfig {
+                secondary_id: id.into(),
+                num_workers: 2,
+                max_resources: max_res.clone(),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                oom_retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                primary_silence_backstop: Duration::from_secs(120),
+                unconfigured_deadline: Duration::from_secs(600),
+                can_be_primary,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
+                output_dir: None,
+                memuse_log_path: None,
+                forwarded_argv: Vec::new(),
+            };
 
-            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            // ── sec-1: the CHECKED non-target secondary (can_be_primary:false).
+            // Its replicated mirror converges via the cold-seed `TaskAdded`
+            // broadcast + the operational `TaskCompleted` broadcasts. ─────────
+            let checked_handle: tokio::task::JoinHandle<(usize, crate::cluster_state::StateCounts)> =
+                tokio::task::spawn_local(run_secondary_node_reading(
+                    sec_config("sec-1", false),
+                    checked_transport,
+                    FakeWorkerFactory,
+                    |s| (s.local_tasks_run_for_test(), s.cluster_state_counts_for_test()),
+                ));
 
-            let sec_secondary_id = secondary_id.clone();
-            let sec_handle: tokio::task::JoinHandle<(usize, crate::cluster_state::StateCounts)> =
-                tokio::task::spawn_local(async move {
-                    // Channel-backed mesh secondary: the in-process primary
-                    // is folded in as an ordinary mesh peer keyed by
-                    // `"primary"` (no per-role uplink). Inbound is the
-                    // primary→secondary channel; the outbound primary link
-                    // is the secondary→primary channel.
-                    let mut transport = ChannelPeerTransport::from_raw_channels(
-                        sec_secondary_id.clone(),
-                        HashMap::new(),
-                        pri_to_sec_rx,
-                    );
-                    transport.register_primary_link("setup".into(), sec_to_pri_tx);
+            // ── sec-0: the relocate TARGET (can_be_primary:true + promote). ──
+            let mut target_mesh = Mesh::new(target_transport);
+            let (target_slot, target_client, target_inbox) =
+                target_mesh.register_local_role(LocalRole::Secondary, PeerId::from("sec-0"));
+            target_mesh.publish_membership();
+            let mut target = SecondaryCoordinator::new(
+                sec_config("sec-0", true),
+                target_client,
+                target_inbox,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            target.set_bootstrap_primary_id("setup".to_string());
+            let (target_node, target_promo_tx) = Node::new(target_mesh);
+            target.register_promotion_signal(target_promo_tx);
+            let promote = build_test_promote_recipe("sec-0".to_string(), None);
+            let target_node = target_node.with_secondary(target, target_slot);
+            let target_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
+                secondary_factory: Some(FakeWorkerFactory),
+                promote: Some(promote),
+                ..Default::default()
+            };
+            let target_handle = tokio::task::spawn_local(target_node.run(target_inputs));
 
-                    let config = SecondaryConfig {
-                        secondary_id: sec_secondary_id,
-                        num_workers: 2,
-                        max_resources: max_res,
-                        hostname: "test-host".into(),
-                        keepalive_interval: Duration::from_secs(60),
-                        src_network: None,
-                        src_tmp: None,
-                        peer_timeout: Duration::from_secs(120),
-                        keepalive_miss_threshold: 3,
-                        retry_max_passes: 1,
-                        oom_retry_max_passes: 1,
-                        primary_link_failure_threshold: 5,
-                        primary_link_failure_window: Duration::from_secs(30),
-                        primary_silence_backstop: Duration::from_secs(120),
-                        unconfigured_deadline: Duration::from_secs(600),
-                        can_be_primary: false,
-                        resource_check_interval: Duration::from_millis(100),
-                        log_oom_watcher: false,
-                        promoted_primary_quiesce_grace: Duration::from_millis(100),
-                        unfulfillable_reinject_max_per_task: None,
-                        mem_manager_reserved_bytes: None,
-                        output_dir: None,
-                        memuse_log_path: None,
-                        forwarded_argv: Vec::new(),
-                    };
-                    // Drive the real secondary against the production
-                    // mesh-pump and collect BOTH the own-worker count and the
-                    // replicated cluster-state counts off the same coordinator.
-                    run_secondary_node_reading(config, transport, FakeWorkerFactory, |s| {
-                        (
-                            s.local_tasks_run_for_test(),
-                            s.cluster_state_counts_for_test(),
-                        )
-                    })
-                    .await
-                });
-
-            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-            let mut outgoing = HashMap::new();
-            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
-
-            tokio::task::spawn_local(async move {
-                let mut rx = sec_to_pri_rx;
-                while let Some(msg) = rx.recv().await {
-                    if incoming_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            let transport =
-                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            // ── setup peer: ColdStart (broadcasts the seed to the fleet) →
+            // relocates onto sec-0. ──────────────────────────────────────────
+            let mut pri_mesh = Mesh::new(pri_transport);
+            let (pri_slot, pri_client, pri_inbox) =
+                pri_mesh.register_local_role(LocalRole::Primary, PeerId::from("setup"));
+            pri_mesh.publish_membership();
             let config = PrimaryConfig {
+                num_secondaries: 2,
                 connect_timeout: Duration::from_secs(10),
                 peer_timeout: Duration::from_secs(10),
                 ..test_primary_config()
             };
-            let (mut primary, _mesh) = build_test_primary(
+            let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
+            let primary = PrimaryCoordinator::new(
                 config,
-                transport,
+                pri_client,
+                pri_inbox,
+                demote_rx,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
-
+            let (pri_node, _pri_promo_tx) = Node::new(pri_mesh);
+            let pri_node = pri_node.with_primary(primary, pri_slot);
             let binaries: Vec<TaskInfo<TestId>> = (0..5)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
-
-            let (deps, ops, ope) = noop_phase_args();
-            primary
-                .run(
-                    SeedSource::ColdStart {
+            let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
+                primary_run_args: Some(PrimaryRunArgs {
+                    seed: SeedSource::ColdStart {
                         binaries,
-                        phase_deps: deps,
+                        phase_deps: HashMap::new(),
                     },
-                    ops,
-                    ope,
-                )
+                    on_phase_start: Box::new(|_| {}),
+                    on_phase_end: Box::new(|_, _, _, _| {}),
+                }),
+                primary_demote_tx: Some(demote_tx),
+                ..Default::default()
+            };
+
+            let setup_outcome =
+                tokio::time::timeout(Duration::from_secs(20), pri_node.run(pri_inputs))
+                    .await
+                    .expect("setup-peer node must resolve (relocate → observer) within 20s");
+            assert!(
+                matches!(setup_outcome.terminal, crate::process::RunTerminal::Done),
+                "setup-peer node outcome: {:?}",
+                setup_outcome.terminal
+            );
+
+            // The relocate target ran the work; its converged mirror = 5.
+            let target_outcome = tokio::time::timeout(Duration::from_secs(20), target_handle)
                 .await
-                .unwrap();
-
-            let primary_counts = primary.cluster_state_counts_for_test();
+                .expect("target node must finish within 20s")
+                .expect("target join");
             assert_eq!(
-                primary_counts.completed, 5,
-                "primary's own cluster_state should reflect all 5 completions"
+                target_outcome.completed, 5,
+                "the relocate target must complete all 5 tasks"
             );
-            assert_eq!(primary_counts.pending, 0);
 
-            drop(primary);
-
-            let (sec_completed, sec_counts) = sec_handle.await.unwrap();
-            assert_eq!(sec_completed, 5);
+            // THE convergence assertion: the SEPARATE non-target secondary's
+            // replicated mirror converged to 5 Completed purely via the
+            // cold-seed `TaskAdded` fan-out (setup peer, pre-relocate) + the
+            // per-completion `TaskCompleted` broadcasts (the target primary).
+            let (checked_own, checked_counts) = tokio::time::timeout(
+                Duration::from_secs(20),
+                checked_handle,
+            )
+            .await
+            .expect("checked secondary must finish within 20s")
+            .expect("checked join");
             assert_eq!(
-                sec_counts.completed, 5,
-                "secondary's mirror should converge to 5 Completed via \
-                 TaskAdded + TaskCompleted broadcasts"
+                checked_counts.completed, 5,
+                "the non-target secondary's mirror must converge to 5 Completed via \
+                 the cold-seed TaskAdded fan-out + TaskCompleted broadcasts"
             );
-            assert_eq!(sec_counts.pending, 0);
+            assert_eq!(checked_counts.pending, 0);
+            // The checked secondary may or may not have drawn own-work (the
+            // target has 2 workers and can absorb all 5); the convergence is
+            // mirror-based, independent of own-work distribution.
+            let _ = checked_own;
         })
         .await;
 }
@@ -513,15 +549,12 @@ async fn e2e_pre_staged_source_mode() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -611,15 +644,12 @@ async fn e2e_uses_file_based_items_false() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -711,15 +741,12 @@ async fn e2e_per_type_max_concurrent() {
 
             {
                 let (deps, ops, ope) = noop_phase_args();
+                // Operational primary (mesh-always): seed the inherited ledger
+                // + run as `PromotionSnapshot` (a `ColdStart` would relocate
+                // away, never running the dispatch loop this test asserts).
+                seed_operational_ledger(&mut primary, binaries, deps);
                 primary
-                    .run(
-                        SeedSource::ColdStart {
-                            binaries,
-                            phase_deps: deps,
-                        },
-                        ops,
-                        ope,
-                    )
+                    .run(SeedSource::PromotionSnapshot, ops, ope)
                     .await
                     .unwrap()
             };
@@ -804,15 +831,12 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             let binaries = vec![make_relative_binary("missing/binary", 50)];
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -949,15 +973,12 @@ async fn run_with_initial_staging_succeeds() {
                 .expect("staging walk should succeed for a present, readable file");
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 

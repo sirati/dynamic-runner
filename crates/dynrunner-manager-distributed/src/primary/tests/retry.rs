@@ -98,15 +98,11 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             let binaries = vec![make_binary("ok", 50), make_binary("flaky", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -216,15 +212,12 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             let binaries = vec![make_binary("ok", 50), make_binary("doomed", 40)];
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -356,15 +349,12 @@ async fn recoverable_failure_twice_becomes_permanent() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -477,15 +467,12 @@ async fn retry_max_passes_zero_disables_retry() {
             });
 
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -622,14 +609,10 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
             // a hang. Mesh-ready collapses fast (500ms above);
             // post-promotion the secondary's quiesce grace contributes
             // ~2s, hence the 10s budget.
-            let run_fut = primary.run(
-                SeedSource::ColdStart {
-                    binaries,
-                    phase_deps: HashMap::new(),
-                },
-                on_start,
-                on_end,
-            );
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
+            seed_operational_ledger(&mut primary, binaries, HashMap::new());
+            let run_fut = primary.run(SeedSource::PromotionSnapshot, on_start, on_end);
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(
@@ -730,15 +713,12 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
 
             let binaries = vec![make_binary("flaky", 50)];
             let (deps, ops, ope) = noop_phase_args();
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away,
+            // never running the dispatch loop this test asserts).
+            seed_operational_ledger(&mut primary, binaries, deps);
             primary
-                .run(
-                    SeedSource::ColdStart {
-                        binaries,
-                        phase_deps: deps,
-                    },
-                    ops,
-                    ope,
-                )
+                .run(SeedSource::PromotionSnapshot, ops, ope)
                 .await
                 .unwrap();
 
@@ -918,14 +898,10 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                 log_ends.lock().unwrap().push(Ev::End(p.to_string()));
             });
 
-            let run_fut = primary.run(
-                SeedSource::ColdStart {
-                    binaries,
-                    phase_deps,
-                },
-                on_start,
-                on_end,
-            );
+            // Operational primary (mesh-always): seed the inherited ledger +
+            // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
+            seed_operational_ledger(&mut primary, binaries, phase_deps);
+            let run_fut = primary.run(SeedSource::PromotionSnapshot, on_start, on_end);
             match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
                 Ok(res) => res.unwrap(),
                 Err(_) => panic!(
