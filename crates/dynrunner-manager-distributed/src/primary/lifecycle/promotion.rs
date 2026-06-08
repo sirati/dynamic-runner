@@ -258,6 +258,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// self), so the submitter still demotes, just toward the winner rather
     /// than `chosen`. This method deliberately adds NO logic asserting
     /// `chosen` won; it only originates the handoff intent.
+    ///
+    /// # Keepalive window — no spurious failover against the relocating-away primary
+    ///
+    /// Between originating `PrimaryChanged { chosen }` and `chosen` announcing
+    /// its own primary keepalives, this host has stepped down. No surviving
+    /// secondary arms a failover in that window: (a) `chosen` is drawn from
+    /// `alive_secondary_members()` — already a connected mesh peer — so
+    /// `send_to_primary` resolves and never no-routes, and the in-place
+    /// primary→observer retag (`swap_primary_to_observer`) keeps THIS host's
+    /// QUIC connection alive, so the fast failover leg
+    /// (`primary_link::should_arm_failover`, armed only on a send no-route)
+    /// never arms on either side of the apply; (b) applying `PrimaryChanged`
+    /// resets any mid-Suspecting secondary to Normal; (c) the patient silence
+    /// backstop (~120s) is far beyond the sub-second relocation window. So the
+    /// relocate path introduces no NEW window — it reuses the same
+    /// mesh-routable-observer dynamics as the already-proven failover-demote.
     pub(crate) async fn relocate_primary_to(&mut self, chosen: String) {
         let epoch = self.cluster_state.primary_epoch() + 1;
         tracing::info!(
