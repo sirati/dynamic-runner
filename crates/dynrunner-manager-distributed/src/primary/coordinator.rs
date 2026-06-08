@@ -3099,9 +3099,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// every operational primary — there is no relocate-vs-stay fork and no
     /// local-vs-distributed branch.
     ///
-    /// Activates the local primary (originates its self-announce at
-    /// `primary_epoch()+1`, warms the role cache, emits a keepalive), then runs
-    /// the shared operational-loop-and-finalize tail to completion in place.
+    /// Activates the local primary (originates its self-announce as a SINGLE
+    /// epoch transition — re-asserting at the inherited epoch when the promoted
+    /// snapshot already names this host, see `originate_primary_changed` —
+    /// warms the role cache, emits a keepalive), then runs the shared
+    /// operational-loop-and-finalize tail to completion in place.
     pub(crate) async fn bootstrap_tail_dispatch(&mut self) -> Result<(), RunError> {
         self.activate_local_primary().await?;
         self.run_operational_and_finalize().await

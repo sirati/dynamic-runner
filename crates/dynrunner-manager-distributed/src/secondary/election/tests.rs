@@ -11,11 +11,13 @@
 //! `crate::primary::heartbeat::tests`.
 
 use super::super::test_helpers::{
-    FakeWorkerFactory, election_config, make_secondary, make_secondary_recording,
+    FakeWorkerFactory, election_config, make_secondary, make_secondary_membership,
+    make_secondary_recording,
 };
 use super::super::wire::timestamp_now;
 use super::*;
 use dynrunner_protocol_primary_secondary::KeepaliveRole;
+use dynrunner_protocol_primary_secondary::address::PeerId;
 use std::time::Duration;
 
 /// The death deadline given the helper's keepalive_interval (50ms) and
@@ -834,7 +836,16 @@ fn keepalive_from(
 #[tokio::test(flavor = "current_thread")]
 async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut sec = make_secondary(election_config("sec-b"));
+    // Membership-backed harness with the promoted primary (`sec-a`) AND the
+    // surviving peer (`sec-c`) seeded as transport members: this test asserts
+    // a HEALTHY promoted primary keeps us Normal, so leg (C)
+    // (primary-left-membership) must read the primary as PRESENT — the death
+    // here is driven by leg (B) (backdated `primary_last_seen`), not by
+    // membership. (Dedicated leg-(C) coverage lives in `failover_membership`.)
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-b"),
+        vec![PeerId::from("sec-a"), PeerId::from("sec-c")],
+    );
     sec.enter_operational_for_test();
     // A surviving mesh peer so the election path is non-degraded and
     // can actually broadcast `TimeoutQuery` when the primary dies.
