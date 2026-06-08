@@ -49,8 +49,8 @@ pub(super) use super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, PrimaryMeshKeepalive, ProducerStagingFlags,
     SlowFakeWorkerFactory, TestId, build_test_primary, build_test_promote_recipe,
     build_test_promote_recipe_from_producer, build_test_promote_recipe_with_config, fake_secondary,
-    fake_secondary_with_addrs, make_binary, make_relative_binary, seed_operational_ledger,
-    setup_test,
+    fake_secondary_transport_only_no_meshready, fake_secondary_with_addrs, make_binary,
+    make_relative_binary, seed_operational_ledger, setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;

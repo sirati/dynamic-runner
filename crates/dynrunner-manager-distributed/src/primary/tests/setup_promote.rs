@@ -923,3 +923,87 @@ async fn setup_peer_empty_candidate_set_is_no_relocation_target() {
         })
         .await;
 }
+
+/// BUG C regression — the setup peer relocates WITHOUT gating on the
+/// secondary OPERATIONAL `MeshReady` signal (a circular deadlock).
+///
+/// The compute secondary here ([`fake_secondary_transport_only_no_meshready`])
+/// is TRANSPORT-CONNECTED (welcome + cert-exchange) and an eligible relocation
+/// target (`can_be_primary: true`), but it NEVER emits `MeshReady` — it models
+/// a secondary still in `wait_for_setup`, which only goes operational (and
+/// thus only emits `MeshReady`) after it receives an `InitialAssignment`. Under
+/// mesh-always the setup peer never sends one (it relocates the role away), so
+/// `MeshReady` is structurally unreachable on this path.
+///
+/// `mesh_ready_timeout` is set ABSURDLY HIGH (1 hour): the pre-fix code's
+/// unconditional `wait_for_mesh_ready` would block on the never-arriving
+/// `MeshReady` for the full hour, so the tight outer `timeout(5s)` would trip
+/// and FAIL the test. With the fix the setup peer relocates off the transport-
+/// connected fleet immediately — mesh-readiness is a transport fact, decoupled
+/// from any secondary's operational state — and the run returns
+/// `PrimaryRunOutcome::Relocated` in milliseconds, well inside the 5s budget.
+///
+/// REVERT CHECK: re-instating the pre-branch `self.wait_for_mesh_ready(..)?`
+/// call regresses this test (the 5s `timeout` fires before the 1h mesh-ready
+/// deadline → `expect` panics).
+#[tokio::test(flavor = "current_thread")]
+async fn setup_peer_relocates_without_gating_on_secondary_operational_meshready() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // One transport-connected, eligible-but-NOT-operational secondary.
+            let (transport, secondary_ends) = setup_test(1);
+            let config = PrimaryConfig {
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                // Absurdly high: if the relocate were (wrongly) gated on the
+                // operational `MeshReady`, it would block here for an hour. The
+                // 5s outer timeout below is the deadlock detector.
+                mesh_ready_timeout: Duration::from_secs(3600),
+                ..test_primary_config()
+            };
+            let (primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_transport_only_no_meshready(
+                    id,
+                    2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
+
+            let (deps, ops, ope) = noop_phase_args();
+            let exit = tokio::time::timeout(
+                Duration::from_secs(5),
+                primary.run_consuming(
+                    SeedSource::ColdStart { binaries: vec![], phase_deps: deps },
+                    ops,
+                    ope,
+                ),
+            )
+            .await
+            .expect(
+                "the setup peer must relocate WITHOUT waiting on the secondary's \
+                 operational MeshReady — a 5s relocate that overruns means the \
+                 circular wait_for_mesh_ready deadlock is back (BUG C)",
+            );
+
+            // The setup peer handed the role to the connected compute peer:
+            // `run_consuming`'s demote arm wins and returns `Relocated` — proof
+            // the relocate fired off TRANSPORT connectivity alone, never the
+            // operational MeshReady the fake withheld.
+            assert!(
+                matches!(exit, Ok(crate::primary::PrimaryRunOutcome::Relocated { .. })),
+                "a transport-connected eligible compute peer must let the setup \
+                 peer RELOCATE (PrimaryRunOutcome::Relocated) even though no \
+                 MeshReady was ever sent; got {exit:?}"
+            );
+        })
+        .await;
+}

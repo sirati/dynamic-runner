@@ -586,6 +586,107 @@ pub(super) async fn fake_secondary_with_addrs(
     }
 }
 
+/// A relocation-target fake that is TRANSPORT-CONNECTED but NEVER
+/// OPERATIONAL: it sends `SecondaryWelcome` (with `can_be_primary: true`,
+/// so it is an eligible `select_relocation_target` candidate) +
+/// `CertExchange`, then drains the replicated ledger and answers the
+/// `PrimaryChanged { new = self }` promotion handoff exactly like
+/// [`fake_secondary_with_addrs`] — but it DELIBERATELY never emits
+/// `MeshReady`.
+///
+/// This models a secondary still inside `wait_for_setup` (it has cert-
+/// exchanged with the setup peer but has not yet received an
+/// `InitialAssignment`, so it has not reached its operational loop where
+/// `report_mesh_ready_if_needed` fires). It is the fixture that proves BUG
+/// C is fixed: with the pre-fix code the setup peer's unconditional
+/// `wait_for_mesh_ready` blocks on a `MeshReady` this fake never sends
+/// (circular: the assignment that would make it operational only comes from
+/// the operational primary, which only exists after relocation), so the
+/// relocate burns the full `mesh_ready_timeout`. With the fix the setup peer
+/// relocates immediately off the transport-connected fleet, ignoring the
+/// absent operational signal.
+///
+/// Trimmed vs [`fake_secondary_with_addrs`]: no `InitialAssignment` /
+/// `TaskAssignment` worker-drain arms (the setup peer never assigns — it
+/// relocates), only the `PrimaryChanged`-promotion ledger drain needed to
+/// let the relocated-target run reach a clean terminal.
+pub(super) async fn fake_secondary_transport_only_no_meshready(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    outgoing_to_primary
+        .send(DistributedMessage::SecondaryWelcome {
+            target: Some(Destination::Primary),
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: ram_bytes,
+            }],
+            worker_count: num_workers,
+            hostname: "test-host".into(),
+            is_observer: false,
+            // Eligible relocation target (a network compute secondary).
+            can_be_primary: true,
+        })
+        .unwrap();
+
+    outgoing_to_primary
+        .send(DistributedMessage::CertExchange {
+            target: Some(Destination::Primary),
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            public_cert_pem: "FAKE_CERT".into(),
+            ipv4_address: Some("127.0.0.1".into()),
+            ipv6_address: None,
+            quic_port: 5000,
+        })
+        .unwrap();
+
+    // NO MeshReady — this is the whole point: a transport-connected but
+    // not-yet-operational secondary. The setup peer must relocate WITHOUT it.
+
+    // Mirror the live ledger so the promotion-handoff drain can fire (same
+    // shape as `fake_secondary_with_addrs`, minus the assignment arms).
+    let mut pending_hashes: HashSet<String> = HashSet::new();
+    while let Some(msg) = incoming_from_primary.recv().await {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            for m in mutations {
+                match m {
+                    ClusterMutation::TaskAdded { hash, .. } => {
+                        pending_hashes.insert(hash);
+                    }
+                    ClusterMutation::TaskCompleted { hash, .. }
+                    | ClusterMutation::TaskFailed { hash, .. } => {
+                        pending_hashes.remove(&hash);
+                    }
+                    ClusterMutation::PrimaryChanged { new, .. } if new == secondary_id => {
+                        for task_hash in pending_hashes.drain() {
+                            outgoing_to_primary
+                                .send(DistributedMessage::TaskComplete {
+                                    target: Some(Destination::Primary),
+                                    sender_id: secondary_id.clone(),
+                                    timestamp: 0.0,
+                                    secondary_id: secondary_id.clone(),
+                                    worker_id: 0,
+                                    task_hash,
+                                    result_data: None,
+                                })
+                                .unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 /// Keeps the primary role-slot `Arc` + the demote sender + the running
 /// production mesh-pump alive for as long as the [`PrimaryCoordinator`] built
 /// by [`build_test_primary`] lives.
@@ -662,7 +763,17 @@ where
     let (slot, client, inbox) =
         mesh.register_local_role(LocalRole::Primary, PeerId::from(config.node_id.as_str()));
     let (demote_tx, demote_rx) = tokio_mpsc::unbounded_channel();
-    let primary = PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    let mut primary =
+        PrimaryCoordinator::new(config, client, inbox, demote_rx, scheduler, estimator);
+    // Wire the loss-of-primacy hook exactly as the production `Node` does the
+    // moment it builds a primary: the local apply of a `PrimaryChanged` naming
+    // ANOTHER peer fires `demote_tx`, so a setup peer's `relocate_primary_to`
+    // drives `run_consuming`'s demote arm to a `PrimaryRunOutcome::Relocated`
+    // handoff. Without this the relocate's local apply has no observer and the
+    // SetupPeer arm parks forever. Harmless on the non-relocating paths (the
+    // hook only fires on a self→other flip; the unbounded `demote_rx` sits on
+    // `self` undrained otherwise).
+    primary.register_demote_on_displaced(demote_tx.clone());
     // Publish live membership before the pump spawns so the primary's
     // failover/strand reads see the connected secondaries from the first tick
     // (the pump republishes every cycle thereafter).
