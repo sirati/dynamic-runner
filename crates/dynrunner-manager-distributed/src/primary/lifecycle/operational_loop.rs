@@ -241,13 +241,39 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // setup-promote deadline, stuck-worker watchdog) are a
             // different concern and stay in the loop.
             if self.run_complete_check() {
-                break;
+                // Completion-gate fatal pre-drain. A `RunShouldFail` /
+                // `PolicyFatalExit` (e.g. a consumer `on_phase_end` hook
+                // that RAISED) emitted onto the worker-management bus
+                // DURING the same iteration that finished the last task
+                // is already queued but has not yet been selected by the
+                // parked worker-management arm — so a naive clean exit
+                // here would mask the failure as exit-0. Before
+                // concluding the run is clean, synchronously drain
+                // whatever is queued right now (no idle-window wait) and
+                // run the SAME worker-management reaction the parked arm
+                // uses. Scoped to the completion gate so the normal
+                // `TasksAdded` recheck cadence (run-not-complete) is
+                // untouched. The decoupling law holds: the loop owns the
+                // drive, the phase layer only emitted. If the drain
+                // recorded a fatal outcome, fall through to the
+                // run-should-fail break below; otherwise the run really
+                // is clean.
+                if let Some(batch) = worker_mgmt_rx
+                    .as_mut()
+                    .and_then(crate::worker_signal::try_collect_worker_signal_batch)
+                {
+                    self.react_to_worker_signal_batch(batch).await;
+                }
+                if self.worker_mgmt_fail_outcome.is_none() {
+                    break;
+                }
             }
 
             // Worker-management run-should-fail exit. The
-            // worker-management `select!` arm records a break outcome on
-            // `worker_mgmt_fail_outcome` when it drains a
-            // `RunShouldFail` (emitted by the phase layer onto the
+            // worker-management `select!` arm (or the completion-gate
+            // pre-drain above) records a break outcome on
+            // `worker_mgmt_fail_outcome` when it drains a `RunShouldFail`
+            // / `PolicyFatalExit` (emitted by the phase layer onto the
             // decoupled bus, OR by the phase-floor liveness check). The
             // worker arm OWNS the clean-shutdown drive; breaking here —
             // not from the emit path — keeps phase/task management fully

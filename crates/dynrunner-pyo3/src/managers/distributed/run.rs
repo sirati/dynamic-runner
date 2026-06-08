@@ -170,9 +170,17 @@ impl PyDistributedManager {
         let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py)),
         );
-        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
-            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py)),
-        );
+        // Honest on_phase_end: the in-process primary's hook records a
+        // consumer raise into this latch; the SAME latch is installed on
+        // the coordinator below so the cascade surfaces a non-zero
+        // `RunError::FatalPolicyExit`.
+        let phase_hook_raise_latch =
+            dynrunner_manager_distributed::PhaseHookRaiseLatch::new();
+        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd =
+            Box::new(crate::managers::lifecycle::make_on_phase_end_with_raise_latch(
+                self.task_definition.clone_ref(py),
+                phase_hook_raise_latch.clone(),
+            ));
 
         // Clone the task_definition once per secondary so the in-process
         // composition can fire `on_phase_end` through a promoted
@@ -691,6 +699,12 @@ impl PyDistributedManager {
                 // receiver the operational loop reads from. Same
                 // pre-`run()` contract as `PyPrimaryCoordinator`.
                 primary.replace_command_channel(command_tx, command_rx);
+
+                // Wire the on_phase_end raise-latch (built above, captured
+                // by the in-process primary's closure) onto the
+                // coordinator so a consumer-hook raise surfaces
+                // `FatalPolicyExit`. Same pre-`run()` setter contract.
+                primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE the primary's `run()` enters — the

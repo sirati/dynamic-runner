@@ -21,7 +21,8 @@ mod test_capture;
 pub use primary::staging::{StagingEntry, StagingError, compute_initial_staging_entries};
 pub use primary::wire::compute_task_hash;
 pub use primary::{
-    PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RelocationPolicy, RunError,
+    PhaseHookRaiseLatch, PrimaryConfig, PrimaryCoordinator, PrimaryRunOutcome, RelocationPolicy,
+    RunError,
 };
 pub use discovery::{SetupDiscovery, SetupDiscoveryFn};
 pub use secondary::{

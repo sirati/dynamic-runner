@@ -12,7 +12,7 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerB
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::command_channel::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
-use super::config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
+use super::config::{OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
 use super::error::RunError;
 use super::preferred_secondaries;
 use super::respawn::{
@@ -432,6 +432,21 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// caller didn't supply a hook.
     pub(super) on_phase_start: Option<OnPhaseStart>,
     pub(super) on_phase_end: Option<OnPhaseEnd>,
+    /// Side-channel by which the [`on_phase_end`](Self::on_phase_end)
+    /// closure records that the consumer's hook RAISED. The cascade
+    /// reads (and clears) it immediately after firing the hook; on a
+    /// recorded raise it emits
+    /// [`WorkerMgmtSignal::PolicyFatalExit`] onto the worker-management
+    /// bus so the run surfaces `RunError::FatalPolicyExit`. Defaults to
+    /// a detached (never-read-by-anyone-else) latch shared with NO
+    /// closure — the cascade's `take()` is then always `None`, a no-op —
+    /// until a caller wires the SAME latch into both the closure (via the
+    /// pyo3 `make_on_phase_end_with_raise_latch`) and this field (via
+    /// [`Self::set_phase_hook_raise_latch`]). Callers that build their
+    /// closure against a detached latch (the local manager, the
+    /// secondary, tests) leave this default in place and keep the legacy
+    /// warn-and-continue.
+    pub(super) phase_hook_raise_latch: PhaseHookRaiseLatch,
     /// The consumer's discovery policy for a relocated (mode-2) primary or
     /// an in-process `--source-already-staged` local primary, plus the
     /// phase graph it seeds alongside the discovered tasks. `None` on every
@@ -781,15 +796,21 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
         Option<tokio::sync::mpsc::UnboundedReceiver<crate::worker_signal::WorkerMgmtSignal>>,
 
     /// Set by the operational `select!` loop's worker-management arm
-    /// when it drains a [`WorkerMgmtSignal::RunShouldFail`]. Carries the
-    /// emit-time reason so the outer `run_pipeline` can surface the run
-    /// failure. Same write-only/read-only discipline as `panik_outcome`:
-    /// the arm WRITES, the outer wrapper READS — keeping the inner loop's
+    /// when it drains a [`WorkerMgmtSignal::RunShouldFail`] or
+    /// [`WorkerMgmtSignal::PolicyFatalExit`]. Carries the TYPED outcome
+    /// the run should surface (`RunError::Other` for the generic
+    /// run-should-fail wedge; `RunError::FatalPolicyExit` for a
+    /// consumer-policy fatal abort such as an `on_phase_end` raise) so
+    /// the outer `run_pipeline` returns it verbatim — the
+    /// signal-to-`RunError` classification lives ONCE in the drain arm,
+    /// not split between the emit side and the pipeline tail. Same
+    /// write-only/read-only discipline as `panik_outcome`: the arm
+    /// WRITES, the outer wrapper READS — keeping the inner loop's
     /// `Result<(), String>` signature untouched. The worker arm OWNS the
     /// clean-shutdown drive; the
     /// phase layer that emitted the signal never breaks the loop
     /// directly (decoupling law).
-    pub(super) worker_mgmt_fail_outcome: Option<String>,
+    pub(super) worker_mgmt_fail_outcome: Option<RunError>,
 
     /// Set at cold-start seed (`originate_cold_seed`) when the
     /// dependency-existence partition found a `(phase_id, task_id)`
@@ -932,6 +953,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
+            // Detached by default: no closure shares this end, so the
+            // cascade's `take()` is always `None` until a caller wires a
+            // real latch via `set_phase_hook_raise_latch`.
+            phase_hook_raise_latch: PhaseHookRaiseLatch::detached(),
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
@@ -1383,6 +1408,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ) {
         self.on_phase_start = Some(on_phase_start);
         self.on_phase_end = Some(on_phase_end);
+    }
+
+    /// Wire the shared [`PhaseHookRaiseLatch`] the [`on_phase_end`] hook
+    /// closure records raises into, so the cascade can read it and
+    /// surface a consumer-hook raise as a fatal run failure.
+    ///
+    /// Pre-run setter (same contract as the other `register_*` / `set_*`
+    /// installers): the caller (pyo3) creates ONE latch, builds the
+    /// `on_phase_end` closure against a clone of it, and installs the
+    /// other clone here BEFORE `run`. Only the real-primary paths wire a
+    /// latch; callers that leave the default detached latch in place keep
+    /// the legacy warn-and-continue (the closure records into a latch
+    /// nobody reads).
+    ///
+    /// [`on_phase_end`]: Self::on_phase_end
+    pub fn set_phase_hook_raise_latch(&mut self, latch: PhaseHookRaiseLatch) {
+        self.phase_hook_raise_latch = latch;
     }
 
     /// Register the consumer's discovery policy + phase graph on a
@@ -3002,18 +3044,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // Worker-management run-should-fail check: if the operational
         // loop's worker-management arm recorded a break outcome (a
         // `RunShouldFail` signal — emitted by the phase layer's
-        // proceed-or-fail decision OR the phase-floor liveness check),
-        // surface it as a typed failure and skip the retry-pass / drain
-        // / accounting tail. The worker arm OWNS the clean-shutdown
+        // proceed-or-fail decision OR the phase-floor liveness check —
+        // OR a `PolicyFatalExit` from a consumer `on_phase_end` raise),
+        // surface the TYPED outcome the arm classified and skip the
+        // retry-pass / drain / accounting tail. The arm already mapped
+        // the signal to the right `RunError` variant (generic wedge →
+        // `Other`, consumer-policy abort → `FatalPolicyExit`), so this
+        // is a pure pass-through. The worker arm OWNS the clean-shutdown
         // drive; the phase/task layer that emitted the signal never
         // broke the loop directly (decoupling law). Same write-by-arm /
         // read-by-pipeline discipline as `panik_outcome`.
-        if let Some(reason) = self.worker_mgmt_fail_outcome.take() {
+        if let Some(outcome) = self.worker_mgmt_fail_outcome.take() {
             tracing::error!(
-                reason = %reason,
+                error = %outcome,
                 "primary run aborted by worker-management run-should-fail signal"
             );
-            return Err(RunError::Other(reason));
+            return Err(outcome);
         }
 
         // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
@@ -3460,6 +3506,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 let phase_outputs = self.cluster_state.phase_task_outputs(p);
                 if let Some(cb) = self.on_phase_end.as_mut() {
                     cb(p, completed, failed, &phase_outputs);
+                }
+                // Honest on_phase_end: if the consumer's hook RAISED, the
+                // closure recorded the reason into the shared raise-latch
+                // (it could not break the cascade itself — its `()` return
+                // is unchanged). The cascade reads-and-clears the latch
+                // here and EMITS `PolicyFatalExit` onto the decoupled
+                // worker-management bus — the SAME emit shape the
+                // proceed-or-fail decision below uses for `RunShouldFail`.
+                // A consumer-hook raise is a deliberate policy abort, so it
+                // surfaces the structured `RunError::FatalPolicyExit` (the
+                // PyO3 boundary RAISES it) rather than the warn-and-continue
+                // false-green this latch replaces. The phase layer NEVER
+                // drives shutdown directly (decoupling law): it only emits;
+                // the worker-management arm owns the clean-shutdown drive
+                // and records the typed break outcome the pipeline tail
+                // surfaces.
+                if let Some(reason) = self.phase_hook_raise_latch.take() {
+                    self.cluster_state
+                        .emit_worker_mgmt(WorkerMgmtSignal::PolicyFatalExit {
+                            reason: format!("on_phase_end hook for phase {p} raised: {reason}"),
+                        });
                 }
                 // Apply any commands the on_phase_end callback queued
                 // via the in-runtime PrimaryHandle path. Without this,

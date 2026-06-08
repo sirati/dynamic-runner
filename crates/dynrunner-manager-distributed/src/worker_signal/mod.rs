@@ -8,7 +8,7 @@
 //!   from phase/task management (the emit side) to worker management
 //!   (the drain side). One variant per kind of thing worker management
 //!   may need to react to (`TasksAdded`, `PhaseStartedNeedsWorkers`,
-//!   `RunShouldFail`).
+//!   `RunShouldFail`, `PolicyFatalExit`).
 //! - [`pipeline`] is the batched drain helper worker management's
 //!   operational `select!` awaits. It coalesces a burst of signals with
 //!   a 50ms idle window and yields one [`WorkerSignalBatch`] carrying
@@ -25,5 +25,8 @@
 pub mod pipeline;
 pub mod signal;
 
-pub use pipeline::{WORKER_SIGNAL_BATCH_IDLE_WINDOW, WorkerSignalBatch, drain_worker_signal_batch};
+pub use pipeline::{
+    WORKER_SIGNAL_BATCH_IDLE_WINDOW, WorkerSignalBatch, drain_worker_signal_batch,
+    try_collect_worker_signal_batch,
+};
 pub use signal::WorkerMgmtSignal;
