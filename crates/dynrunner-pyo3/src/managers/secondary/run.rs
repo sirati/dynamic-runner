@@ -18,6 +18,7 @@ use dynrunner_manager_distributed::process::{
 };
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator,
+    StagingDispatchContext,
 };
 use dynrunner_protocol_primary_secondary::address::PeerId;
 
@@ -166,6 +167,16 @@ impl PySecondaryCoordinator {
         let discovery_task_args_py = self.task_args_py.clone_ref(py);
         let discovery_root = self.src_network.clone();
         let discovery_phase_deps = self.phase_deps.clone();
+        // Staging/discovery config the PROMOTED primary's recipe threads into
+        // its `PrimaryConfig` so a relocated primary's dispatch matches the
+        // submitter's (the relocate-staging fix). `pre_staged_root` is the
+        // secondary's bind-mount root (`src_network`), consulted only in
+        // pre-staged mode; `promote_source_dir` is the local source-tree root
+        // the relocated primary re-walks for its initial staging (mode-1
+        // file-based). Captured here (before `py.detach`) because the recipe is
+        // built inside the detached runtime where `self` is gone.
+        let promote_pre_staged_root = self.src_network.clone();
+        let promote_source_dir = Some(self.source_dir.clone());
         // Panik-watcher config captured before `py.detach` so the
         // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
         // is cheap; the watcher only needs read-only access.
@@ -490,6 +501,12 @@ impl PySecondaryCoordinator {
                 // on promotion it threads the DELIVERED argv (post-push) into
                 // its `PrimaryConfig` — not the stale boot seed (step 7).
                 let promote_run_config_handle = secondary.run_config_handle();
+                // Likewise the SHARED staging-dispatch-context handle the
+                // coordinator's `InitialAssignment` handler writes, so on
+                // promotion the recipe threads the DELIVERED dispatch flags
+                // (uses_file_based_items / pre_staged_mode) into the promoted
+                // `PrimaryConfig` — the relocate-staging fix.
+                let promote_staging_ctx_handle = secondary.staging_dispatch_context_handle();
 
                 // Compose the compute-peer `Node`: a secondary that may be
                 // PROMOTED to primary. `Node::new` hands out the
@@ -539,6 +556,9 @@ impl PySecondaryCoordinator {
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
                     forwarded_argv: promote_run_config_handle,
+                    staging_dispatch_context: promote_staging_ctx_handle,
+                    source_pre_staged_root: promote_pre_staged_root,
+                    source_dir: promote_source_dir,
                     setup_discovery: Some(setup_discovery),
                 });
 
@@ -682,6 +702,34 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// — byte-identical to the original submitter (no split-brain) — rather
     /// than the stale boot copy a pre-push capture would have frozen (step 7).
     pub forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The SHARED staging-dispatch-context handle (single source of truth —
+    /// the secondary's `InitialAssignment` handler is the one writer). Read
+    /// `.lock()` at the promotion instant (always AFTER the submitter
+    /// primary's `InitialAssignment` landed), so the promoted primary's
+    /// `PrimaryConfig` carries the SAME `uses_file_based_items` +
+    /// `pre_staged_mode` the submitter stamped — and its own
+    /// `InitialAssignment` re-stamps those flags identically. Without this a
+    /// promoted primary stamps the defaults, and a worker re-requires a
+    /// StageFile for a no-file / bind-mounted item (the relocate-staging bug).
+    pub staging_dispatch_context:
+        std::sync::Arc<std::sync::Mutex<StagingDispatchContext>>,
+    /// The staged-corpus root the secondary's source is bind-mounted under
+    /// (`--source-already-staged` → the secondary's `src_network`). Threaded
+    /// into the promoted `PrimaryConfig.source_pre_staged_root` IFF the
+    /// staging context says `pre_staged_mode` — so the promoted primary's
+    /// `wire_local_path` strips the SAME prefix the submitter did. `None`
+    /// outside pre-staged mode (the field is consulted only when
+    /// `pre_staged_mode` is set).
+    pub source_pre_staged_root: Option<std::path::PathBuf>,
+    /// The local source-tree root the promoted primary reads file contents
+    /// from for its initial staging walk (mode-1 file-based, non-pre-staged
+    /// runs). Threaded into the promoted `PrimaryConfig.source_dir` so
+    /// `maybe_auto_stage_initial` re-emits the StageFile records the worker
+    /// dispatch requires — the relocated primary RE-STAGES from scratch (it
+    /// re-runs the full pre-loop chain), so it needs the same source root the
+    /// submitter had. `None` for callers without a local source root
+    /// (`uses_file_based_items=false` / pre-staged / tests).
+    pub source_dir: Option<std::path::PathBuf>,
     /// The consumer's discovery policy + phase graph for the PROMOTED primary's
     /// `discover_on_promotion` driver (mode-2 relocate — SLURM submitter OR the
     /// in-process `--source-already-staged` setup peer that relocates onto this
@@ -734,6 +782,9 @@ pub(crate) fn build_promoted_primary_recipe(
         on_phase_start,
         on_phase_end,
         forwarded_argv,
+        staging_dispatch_context,
+        source_pre_staged_root,
+        source_dir,
         setup_discovery,
     } = inputs;
     // Single-use pieces captured in Options so the FnMut can take them on its
@@ -745,10 +796,21 @@ pub(crate) fn build_promoted_primary_recipe(
     // The discovery policy is already `Option`-wrapped (it carries an `FnMut`
     // `discover` closure that is not `Clone`); take it on the single fire.
     let mut setup_discovery = setup_discovery;
-    // The run-config handle is shared (not single-use): the recipe READS it at
-    // promotion, leaving the secondary's copy intact. No `Option`/`take` — the
-    // handle is cloned-in and read by value at the promotion instant.
+    // The run-config + staging-context handles are shared (not single-use):
+    // the recipe READS them at promotion, leaving the secondary's copies
+    // intact. No `Option`/`take` — they are cloned-in and read by value at the
+    // promotion instant.
     Box::new(move |client, inbox, demote_rx, snapshot| {
+        // Read the DELIVERED staging-dispatch context off the shared handle at
+        // the promotion instant (the submitter primary's `InitialAssignment`
+        // landed during this secondary's setup, so the flags are settled). The
+        // promoted primary's `PrimaryConfig` must carry the SAME flags so its
+        // own `InitialAssignment` re-stamps them identically — otherwise a
+        // relocated primary requires a StageFile for a no-file / bind-mounted
+        // item and dispatch collapses.
+        let staging_ctx = *staging_dispatch_context
+            .lock()
+            .expect("staging_dispatch_context mutex poisoned");
         let config = PrimaryConfig {
             node_id: secondary_id.clone(),
             keepalive_interval,
@@ -765,6 +827,21 @@ pub(crate) fn build_promoted_primary_recipe(
                 .lock()
                 .expect("forwarded_argv mutex poisoned")
                 .clone(),
+            // Carry the run's staging/discovery context so the relocated
+            // primary's dispatch matches the submitter's (the relocate-staging
+            // fix). `uses_file_based_items` and `source_pre_staged_root` feed
+            // `assignment.rs`'s `InitialAssignment` stamps + `wire_local_path`;
+            // `source_dir` feeds `maybe_auto_stage_initial`'s re-walk (the
+            // relocated primary re-stages from scratch). `source_pre_staged_root`
+            // is consulted only in pre-staged mode — mirror the submitter's
+            // `is_some()` discriminant by gating on `pre_staged_mode`.
+            uses_file_based_items: staging_ctx.uses_file_based_items,
+            source_pre_staged_root: if staging_ctx.pre_staged_mode {
+                source_pre_staged_root.clone()
+            } else {
+                None
+            },
+            source_dir: source_dir.clone(),
             ..PrimaryConfig::default()
         };
         let mut primary = PrimaryCoordinator::new(

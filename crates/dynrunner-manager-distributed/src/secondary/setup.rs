@@ -459,8 +459,12 @@ where
                                 ..
                             } = msg
                             {
-                                self.set_pre_staged_mode(pre_staged_mode);
-                                self.set_uses_file_based_items(uses_file_based_items);
+                                self.set_staging_dispatch_context(
+                                    super::StagingDispatchContext {
+                                        pre_staged_mode,
+                                        uses_file_based_items,
+                                    },
+                                );
                                 self.handle_initial_assignment(
                                     zip_files,
                                     workers_ready,
@@ -523,10 +527,10 @@ where
     /// Idempotent: a no-op unless the lifecycle is still
     /// `AwaitingPrimary`, so it fires at most once per run (subsequent
     /// setup frames find the lifecycle already `Configuring`). The
-    /// carried-forward config flags (`pre_staged_mode` /
-    /// `uses_file_based_items`) start at their historical defaults
-    /// (`false` / `true`) and are updated by the `InitialAssignment`
-    /// handler via `set_pre_staged_mode` / `set_uses_file_based_items`.
+    /// pre-staged / file-based dispatch flags are NOT lifecycle state — they
+    /// live on the coordinator's shared `StagingDispatchContext` handle
+    /// (seeded at its historical defaults in `new`) and are updated by the
+    /// `InitialAssignment` handler via `set_staging_dispatch_context`.
     pub(in crate::secondary) async fn enter_configuring_on_first_primary_frame(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
@@ -556,11 +560,12 @@ where
             &mut self.lifecycle,
             super::lifecycle::SecondaryLifecycle::connecting(),
         );
-        // `pre_staged_mode` / `uses_file_based_items` default to the
-        // historical pre-InitialAssignment values; the InitialAssignment
-        // handler overwrites them via `set_pre_staged_mode` /
-        // `set_uses_file_based_items` once that frame lands.
-        self.lifecycle = lifecycle.enter_configuring(pool, false, true);
+        // The pre-staged / file-based dispatch flags live on the
+        // coordinator's shared `StagingDispatchContext` handle (seeded at its
+        // historical pre-InitialAssignment default in `new`); the
+        // InitialAssignment handler overwrites them via
+        // `set_staging_dispatch_context` once that frame lands.
+        self.lifecycle = lifecycle.enter_configuring(pool);
         // Stand up the memprofile sampler now that the pool exists —
         // BEFORE the InitialAssignment dispatch so the initial-assignment
         // sampler hook captures the first batch (the same ordering the

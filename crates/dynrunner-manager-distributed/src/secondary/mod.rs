@@ -64,6 +64,7 @@ mod tests;
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{
     FinalizeRunConfigFn, PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal,
+    StagingDispatchContext,
 };
 
 /// A task DEFERRED on this secondary because the target worker's
@@ -503,4 +504,32 @@ where
     /// promotion instant (which is always after the push has landed). Empty
     /// for a run with no forwarded args.
     pub(super) forwarded_argv: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+
+    /// The run-config dispatch flags (`pre_staged_mode` /
+    /// `uses_file_based_items`) the primary stamped into this secondary's
+    /// `InitialAssignment`. A NODE-LOCAL run constant (NOT replicated lattice
+    /// data), so it lives on the coordinator, never in `cluster_state`.
+    ///
+    /// SINGLE source of truth with exactly one writer
+    /// ([`Self::set_staging_dispatch_context`], fired from the
+    /// `InitialAssignment` handler) and two readers:
+    ///   * the dispatch resolver ([`Self::resolve_for_dispatch`]) — chooses
+    ///     whether to do filesystem IO / content-hash verification on the
+    ///     wire `local_path`;
+    ///   * the promotion recipe (built in the pyo3 wrapper) — reads it at the
+    ///     promotion instant and threads it into the promoted
+    ///     `PrimaryConfig.uses_file_based_items` / `.source_pre_staged_root`
+    ///     so the relocated primary's own `InitialAssignment` re-stamps the
+    ///     SAME flags the submitter primary did (without it, a promoted
+    ///     primary stamps the defaults and the worker re-requires a StageFile
+    ///     for a no-file / bind-mounted item — the relocate-staging bug).
+    ///
+    /// `Arc<Mutex<_>>` for the same reason `forwarded_argv` is: the promotion
+    /// recipe is a standalone closure that cannot borrow the coordinator, so
+    /// it captures a clone of this handle and reads it at promotion time
+    /// (always after the `InitialAssignment` landed). Seeded `Default`
+    /// (file-based, not pre-staged) — the historical pre-`InitialAssignment`
+    /// contract — until the handler overwrites it.
+    pub(super) staging_dispatch_context:
+        std::sync::Arc<std::sync::Mutex<types::StagingDispatchContext>>,
 }

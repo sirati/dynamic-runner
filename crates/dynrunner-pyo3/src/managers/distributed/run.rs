@@ -374,6 +374,15 @@ impl PyDistributedManager {
                     // policy (pre-staged path) — the relocate target pairs it
                     // with the discovered corpus in `discover_on_promotion`.
                     let sec_phase_deps = phase_deps.clone();
+                    // Staging/discovery config the PROMOTE recipe threads into
+                    // the relocated primary's `PrimaryConfig` so its dispatch
+                    // matches the submitter's (the relocate-staging fix). The
+                    // in-process setup peer shares one fs, so the pre-staged
+                    // root IS `source_pre_staged_root` and the source root IS
+                    // `source_dir`. Per-secondary clones because each spawned
+                    // `move` task owns its own copy.
+                    let promote_pre_staged_root = source_pre_staged_root.clone();
+                    let promote_source_dir = Some(source_dir.clone());
 
                     let handle = tokio::task::spawn_local(async move {
                         // This secondary's all-to-all mpsc mesh transport
@@ -599,6 +608,13 @@ impl PyDistributedManager {
                         // the submitter's argv directly, so this is byte-
                         // identical to the setup peer's `forwarded_argv`.
                         let promote_run_config_handle = secondary.run_config_handle();
+                        // The shared staging-dispatch-context handle the
+                        // coordinator's `InitialAssignment` handler writes; the
+                        // promote recipe reads it at promotion so the relocated
+                        // primary stamps the SAME dispatch flags the setup peer
+                        // did (the relocate-staging fix).
+                        let promote_staging_ctx_handle =
+                            secondary.staging_dispatch_context_handle();
 
                         // Build this secondary's discovery policy INSIDE the
                         // detached runtime (the `SetupDiscovery` CLOSURE is not
@@ -638,6 +654,9 @@ impl PyDistributedManager {
                             on_phase_start: sec_on_phase_start,
                             on_phase_end: sec_on_phase_end,
                             forwarded_argv: promote_run_config_handle,
+                            staging_dispatch_context: promote_staging_ctx_handle,
+                            source_pre_staged_root: promote_pre_staged_root,
+                            source_dir: promote_source_dir,
                             setup_discovery: sec_setup_discovery,
                         });
 
