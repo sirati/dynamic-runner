@@ -7,24 +7,8 @@ use dynrunner_protocol_primary_secondary::DiscoveryDebt;
 
 use crate::primary::wire::compute_task_hash;
 
-/// Build a [`crate::discovery::SetupDiscovery`] whose policy yields a FIXED
-/// batch of `TaskInfo` (cloned per fire) and the given phase graph. The
-/// discovery counter increments on each fire so a test can assert the policy
-/// ran exactly once (or never).
-fn fixed_discovery(
-    binaries: Vec<TaskInfo<TestId>>,
-    phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
-    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
-) -> crate::discovery::SetupDiscovery<TestId> {
-    crate::discovery::SetupDiscovery {
-        discover: Box::new(move || {
-            fire_count.set(fire_count.get() + 1);
-            let out = binaries.clone();
-            Box::pin(async move { Ok(out) })
-        }),
-        phase_deps,
-    }
-}
+// `fixed_discovery` lives in `tests::mod` (shared with the `stranded`
+// Owed-seed collapse regression); picked up here via `use super::*`.
 
 // ────────────────────────────────────────────────────────────────────────
 // V6: originate_relocated_seed + discover_on_promotion + the DiscoveryDebt
@@ -849,10 +833,11 @@ async fn bootstrap_tail_activates_local_primary() {
             seed_member(&mut primary, "sec-0", 2, false, true);
 
             // Drive only the operational bootstrap tail directly (no full run):
-            // total=0 so the operational loop's counter exit fires immediately.
+            // the seed leaves `self.total_tasks == 0` (read LIVE by the tail),
+            // so the operational loop's counter exit fires immediately.
             let exit = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                primary.bootstrap_tail_dispatch(0),
+                primary.bootstrap_tail_dispatch(),
             )
             .await;
             assert!(

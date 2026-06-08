@@ -98,6 +98,26 @@ pub(super) fn noop_phase_args() -> (
     (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _, _| {}))
 }
 
+/// Build a [`crate::discovery::SetupDiscovery`] whose policy yields a FIXED
+/// batch of `TaskInfo` (cloned per fire) and the given phase graph. The
+/// discovery counter increments on each fire so a test can assert the policy
+/// ran exactly once (or never). Shared by the mode-2 discovery tests
+/// (`setup_promote`) and the Owed-seed collapse regression (`stranded`).
+pub(super) fn fixed_discovery(
+    binaries: Vec<TaskInfo<TestId>>,
+    phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
+) -> crate::discovery::SetupDiscovery<TestId> {
+    crate::discovery::SetupDiscovery {
+        discover: Box::new(move || {
+            fire_count.set(fire_count.get() + 1);
+            let out = binaries.clone();
+            Box::pin(async move { Ok(out) })
+        }),
+        phase_deps,
+    }
+}
+
 /// Shared `PrimaryConfig` starting point for the in-process coordinator
 /// tests. Returns `PrimaryConfig::default()` with the one deviation the
 /// in-process harness shares almost universally baked in:

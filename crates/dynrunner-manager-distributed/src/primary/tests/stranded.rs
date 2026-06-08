@@ -622,6 +622,160 @@ async fn stranded_at_transfer_complete_window_returns_err_with_counts() {
         .await;
 }
 
+/// T-stranded-after-Owed-discovery: the mode-2 `RelocatedSeed`/`--source-
+/// already-staged` collapse path — the false-green this whole strand-accounting
+/// machinery exists to prevent, on the ONE seed shape the prior collapse tests
+/// never exercised.
+///
+/// The operational primary inherits a `DiscoveryDebt::Owed` ledger with NO
+/// corpus (the pre-staged / relocated-seed shape: the setup peer staged only
+/// the phase graph + the `Owed` marker, never the tasks). At hydrate the ledger
+/// is empty, so a denominator captured THEN would be `0`. `discover_on_promotion`
+/// then runs the registered policy, seeds N tasks, and RE-hydrates
+/// `self.total_tasks` to N. A cluster collapse AFTER discovery (secondaries die
+/// post-mesh-ready, so they are gone by `perform_initial_assignment`) must
+/// strand all N discovered-but-undispatched tasks: `RunError::ClusterCollapsed`
+/// with `stranded == N`, the honest `RunAborted` terminal broadcast, and the
+/// collapse diagnostic.
+///
+/// Regression guard: pre-fix `run_pipeline` captured `let total =
+/// self.total_tasks` AFTER hydrate but BEFORE `discover_on_promotion`, so on
+/// this Owed/pre-staged path the captured `total` was the stale pre-discovery
+/// `0` and flowed into `finalize_terminal_accounting`, where `stranded =
+/// 0.saturating_sub(0) = 0` ⇒ the gate broadcast `RunComplete` and returned
+/// `Ok(())` — rc=0 on a collapsed cluster with N tasks never dispatched. The
+/// fix makes the finalize tail read the LIVE `self.total_tasks` (refreshed by
+/// discovery's re-hydrate), so the stale snapshot can never reach the stranded
+/// denominator. The existing collapse tests seed via `seed_operational_ledger`
+/// (corpus present, debt `Undeclared`/`Settled`) so they never hit this path —
+/// this test's distinguishing setup is the `Owed` marker + discovery seed.
+#[tokio::test(flavor = "current_thread")]
+async fn stranded_after_owed_discovery_collapse_returns_err_not_run_complete() {
+    let (log_buf, _log_guard) = capture_logs_thread_local();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
+
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                fleet_dead_timeout: std::time::Duration::from_secs(600),
+                ..test_primary_config()
+            };
+
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Inherited Owed ledger with NO corpus: declare the discovery debt
+            // (the relocated-seed / pre-staged shape) and DO NOT
+            // `seed_operational_ledger` — at hydrate the ledger is empty, so a
+            // denominator captured then would be the stale `0`.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            // The discovery policy that `discover_on_promotion` runs on the
+            // inherited `Owed` marker — yields the N-task corpus the setup peer
+            // never seeded, then re-hydrates `total_tasks` to N.
+            const N: usize = 6;
+            let discovered: Vec<TaskInfo<TestId>> = (0..N)
+                .map(|i| make_binary(&format!("disc_{i}"), 50 + (i as u64) * 10))
+                .collect();
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery(
+                discovered,
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            // Secondaries die post-mesh-ready → they are gone by the time the
+            // operational primary's `perform_initial_assignment` fans out (the
+            // assignment-time collapse), which fires AFTER `discover_on_promotion`
+            // has already seeded + re-hydrated to N. So the full discovered pool
+            // is stranded.
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary_dies_post_mesh_ready(
+                    id,
+                    /* num_workers = */ 1,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
+
+            let (_deps, ops, ope) = noop_phase_args();
+            // Operational primary on the Owed/discovery seed path:
+            // `PromotionSnapshot` ⇒ `BootstrapRole::PromotedDestination`, which
+            // runs `discover_on_promotion` then the in-place tail.
+            let outcome = primary.run(SeedSource::PromotionSnapshot, ops, ope).await;
+
+            assert_eq!(
+                fires.get(),
+                1,
+                "the discovery policy must run exactly once on the Owed path"
+            );
+
+            // Post-fix: the live `self.total_tasks` (N, set by discovery's
+            // re-hydrate) is the denominator, so the full pool strands.
+            match outcome {
+                Err(RunError::ClusterCollapsed { stranded, outcome }) => {
+                    assert_eq!(
+                        stranded, N,
+                        "every discovered-but-undispatched task must strand \
+                         (N discovered, none dispatched before the collapse)"
+                    );
+                    assert_eq!(
+                        outcome.total_terminal() + stranded,
+                        N,
+                        "succeeded + fail_retry + fail_oom + fail_final + stranded must equal N"
+                    );
+                    assert_eq!(stranded, primary.stranded_count());
+                }
+                other => panic!(
+                    "pre-fix this returned Ok(()) (the false-green: stale total=0 ⇒ \
+                     stranded=0 ⇒ RunComplete); expected RunError::ClusterCollapsed with \
+                     stranded={N}, got {other:?} (counters: succeeded={} failed={} \
+                     stranded={} total_tasks={})",
+                    primary.completed_count(),
+                    primary.failed_count(),
+                    primary.stranded_count(),
+                    primary.total_tasks,
+                ),
+            }
+
+            // The peer-facing broadcast is the honest RunAborted, NOT the
+            // false-success RunComplete the stale-total path latched pre-fix.
+            let state = primary.cluster_state_for_test();
+            assert!(
+                state.run_aborted().is_some(),
+                "Owed-discovery collapse must broadcast RunAborted; run_complete()={}",
+                state.run_complete()
+            );
+            assert!(
+                !state.run_complete(),
+                "Owed-discovery collapse must NOT latch RunComplete — that is the \
+                 exact false-green the stale-total bug produced (rc=0 on a collapsed \
+                 cluster with {N} tasks never dispatched)"
+            );
+
+            // The shared collapse diagnostic must fire so ops scripts detect it.
+            let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
+            assert!(
+                captured.contains("tasks left unassigned because cluster routing collapsed"),
+                "the collapse diagnostic must fire on the Owed-discovery collapse arm; \
+                 captured error-level logs:\n{captured}"
+            );
+        })
+        .await;
+}
+
 /// #235 primary half, clean twin: a happy-path run must still broadcast
 /// `RunComplete` (not `RunAborted`) — the conditional only diverges on
 /// `stranded > 0`. Same local-apply observable as the strand twin.
