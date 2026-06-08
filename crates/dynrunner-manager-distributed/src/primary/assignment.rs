@@ -13,7 +13,9 @@ use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 use super::PrimaryCoordinator;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
-    pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
+    pub(super) async fn perform_initial_assignment(
+        &mut self,
+    ) -> Result<InitialAssignmentOutcome, String> {
         tracing::info!("performing initial assignment");
 
         // Group pending StageFile records by recipient so they can
@@ -201,11 +203,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.send_to(
-                Destination::Secondary(PeerId::from(secondary_id.clone())),
-                msg,
-            )
-            .await?;
+            // A failed send here is a CLUSTER COLLAPSE, not a transient: the
+            // destination is a concrete `Secondary(id)` (always resolvable —
+            // it carries its own host), so the only way `send_to` errors is
+            // the mesh-pump's egress receiver being dropped (the Node winding
+            // down / the mesh gone). That is the egress-side twin of the
+            // operational loop's `recv() -> None` collapse criterion — the
+            // SAME mesh-pump, observed from the send side. Rather than
+            // `?`-escape as a raw `RunError::Other` (which bypasses the
+            // strand-classification that runs only AFTER assignment, in
+            // `run_operational_and_finalize`), surface the typed collapse so
+            // the caller routes it into the SOLE classification site
+            // (`finalize_terminal_accounting`): the full pool is stranded, the
+            // honest `RunAborted` terminal is broadcast, and the run returns
+            // `ClusterCollapsed` — identical to a secondary dying mid-loop.
+            // Short-circuit the fan-out: no further sends, no
+            // `originate_task_assigned` (no replicated `InFlight` to
+            // compensate), no `Operational` transition.
+            if self
+                .send_to(
+                    Destination::Secondary(PeerId::from(secondary_id.clone())),
+                    msg,
+                )
+                .await
+                .is_err()
+            {
+                tracing::error!(
+                    secondary_id = %secondary_id,
+                    "initial-assignment send failed: mesh-pump gone (cluster collapse); \
+                     routing through the strand-classification finalize tail"
+                );
+                return Ok(InitialAssignmentOutcome::ClusterCollapsed);
+            }
 
             // Send succeeded: originate the CRDT `Pending → InFlight`
             // transition for each task in this secondary's initial
@@ -268,8 +297,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             "initial assignment complete"
         );
 
-        Ok(())
+        Ok(InitialAssignmentOutcome::Completed)
     }
 
     // ── Phase 6: Transfer Complete ──
+}
+
+/// The terminal outcome of [`PrimaryCoordinator::perform_initial_assignment`].
+///
+/// Single concern: tell the caller whether the initial per-secondary
+/// assignment completed normally or hit a cluster-collapse send failure
+/// (the mesh-pump gone), so the caller can route a collapse into the
+/// SAME strand-classification path the operational loop uses instead of
+/// `?`-escaping as a raw `RunError::Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InitialAssignmentOutcome {
+    /// Every connected secondary received its `InitialAssignment`; the
+    /// pre-loop chain continues normally (transfer-complete, op-loop).
+    Completed,
+    /// A send to a secondary failed because the mesh-pump's egress
+    /// receiver was dropped — the cluster is collapsing. The caller must
+    /// skip straight to the strand-classification finalize tail.
+    ClusterCollapsed,
 }

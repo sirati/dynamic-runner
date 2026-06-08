@@ -131,16 +131,26 @@ async fn fake_secondary_dies_post_mesh_ready(
     drop(outgoing_to_primary);
 }
 
-/// Thread-local tracing buffer: captures every event emitted on the
-/// current thread for the lifetime of the returned guard. Used by
-/// the cluster-collapse test to pin the diagnostic log line without
-/// touching the process-global subscriber that other tests in this
-/// binary set via `tracing_subscriber::fmt::try_init`.
+/// Thread-local tracing buffer: captures every ERROR event emitted on the
+/// current thread for the lifetime of the returned guard.
 ///
 /// `current_thread` tokio flavour + `LocalSet` keep every spawned
 /// fake-secondary on the same thread as the test future, so a
 /// `set_default()` thread-local subscriber is reached by every
 /// `tracing::error!` site that the `run()` flow hits.
+///
+/// PARALLEL-SAFETY: `tracing` caches per-callsite interest GLOBALLY. With no
+/// process-global subscriber (the `--lib` test binary's default when run
+/// alone or filtered), a sibling test running in parallel evaluates the
+/// diagnostic's `error!` callsite against the no-op global dispatcher first
+/// and CACHES it as `never` — after which a thread-local subscriber never
+/// sees the event. To defeat that we (1) idempotently install an
+/// ERROR-interested process-global subscriber so the callsite can never cache
+/// as `never` (a no-op when a sibling's `fmt::try_init` already set one — both
+/// are ERROR-interested), and (2) `rebuild_interest_cache()` after attaching
+/// the thread-local recorder so any already-poisoned `never` is recomputed to
+/// `always`. The thread-local recorder then takes precedence on this thread,
+/// so the line lands in `buf`.
 fn capture_logs_thread_local() -> (
     std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     tracing::dispatcher::DefaultGuard,
@@ -164,6 +174,14 @@ fn capture_logs_thread_local() -> (
         }
     }
 
+    // (1) Ensure SOME ERROR-interested process-global subscriber exists so the
+    // diagnostic's callsite is never globally cached as `never`. Idempotent:
+    // a no-op once any sibling test's `fmt::try_init` (also ERROR-interested)
+    // has set the global. The `Err` (already-set) is the success case here.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .try_init();
+
     let buf = Arc::new(Mutex::new(Vec::new()));
     let writer = SharedWriter(buf.clone());
     let subscriber = tracing_subscriber::fmt()
@@ -171,7 +189,11 @@ fn capture_logs_thread_local() -> (
         .with_max_level(tracing::Level::ERROR)
         .with_ansi(false)
         .finish();
+    // (2) Attach the per-thread recorder, then recompute every callsite's
+    // interest against the now-ERROR-interested global so a prior parallel
+    // `never`-poisoning is cleared and the diagnostic is recorded on emit.
     let guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
     (buf, guard)
 }
 
@@ -183,35 +205,26 @@ fn capture_logs_thread_local() -> (
 /// fire so consumers grepping for "tasks left unassigned because cluster
 /// routing collapsed" see it on every collapse.
 ///
-/// IGNORED — documents a REAL latent gap the mesh-always restructure EXPOSED
-/// (assertion is the CORRECT expectation; a separate root-cause agent owns the
-/// fix, per owner direction — single-concern: strand-classification, not
-/// relocate). THE GAP: when the cluster collapses BEFORE/DURING the initial
-/// per-secondary assignment, `perform_initial_assignment`'s `send_to` fails
-/// (here: the only secondaries all die post-mesh-ready, closing the operational
-/// primary's mesh pump), and that error `?`-propagates straight out of
-/// `run_pipeline` as `Err(RunError::Other("mesh-pump (local-dispatch receiver)
-/// dropped"))` — it never reaches the operational loop's strand-classification
-/// (`drain_pending_messages` → `outcome_summary` → `ClusterCollapsed`), which
-/// runs only in `run_operational_and_finalize`, AFTER assignment. The OLD
-/// pipeline ordering masked this: `perform_initial_assignment` ran BEFORE
-/// `wait_for_mesh_ready`, so the secondary (which dies post-mesh-ready) was
-/// still alive at assignment; it died mid-operational-loop, where strand IS
-/// classified. The corrected uniform-relocate ordering moves
-/// `wait_for_mesh_ready` ahead of the role branch (so the relocate announcement
-/// lands on a settled mesh), so a secondary dying at mesh-ready now dies BEFORE
-/// the (operational primary's) assignment — exposing the unclassified
-/// assignment-time send-failure. THE FIX (root-cause agent): route an
-/// assignment-time `send_to` failure that signifies cluster collapse into the
-/// SAME strand classification the operational loop uses (a clean
-/// `ClusterCollapsed` with counts + the `RunAborted` broadcast), so a secondary
-/// dying during assignment is a clean collapse, not a raw `Other`. Un-ignore
-/// this + `strand_broadcasts_run_aborted_not_run_complete` once that lands.
+/// This pins the assignment-time collapse path specifically: the secondaries
+/// die post-mesh-ready, so they are gone by the time the operational primary's
+/// `perform_initial_assignment` fans out `InitialAssignment`. The `send_to` to
+/// the first (now-dead) secondary fails because the mesh-pump's egress receiver
+/// has been dropped — the egress-side twin of the operational loop's
+/// `recv() -> None` collapse criterion. `perform_initial_assignment` surfaces
+/// the typed `InitialAssignmentOutcome::ClusterCollapsed`, and `run_pipeline`'s
+/// `PromotedDestination` arm routes it into `finalize_terminal_accounting` —
+/// the SOLE strand-classification site, shared with the operational-loop
+/// finalize tail — so the full un-dispatched pool surfaces as stranded with the
+/// proper `ClusterCollapsed` counts (NOT a raw `RunError::Other`).
 ///
-/// Pre-fix (the bug the ASSERTION guards): `run()` returned `Ok(())` with
-/// completed=0 / failed=0 / total=N, hiding the un-dispatched tasks.
-#[ignore = "documents a real assignment-time strand-classification gap exposed by the \
-            mesh-always restructure; separate root-cause agent owns the fix (see doc)"]
+/// Regression guard: pre-fix the assignment-time `send_to` failure
+/// `?`-escaped `run_pipeline` as `Err(RunError::Other("mesh-pump (local-dispatch
+/// receiver) dropped"))`, bypassing the strand-classification (which ran only
+/// in `run_operational_and_finalize`, AFTER assignment) — a latent gap the
+/// uniform-relocate reorder exposed by moving `wait_for_mesh_ready` ahead of the
+/// role branch (so a secondary dying at mesh-ready now dies BEFORE assignment,
+/// where the OLD ordering had it still alive). Twin:
+/// `strand_broadcasts_run_aborted_not_run_complete`.
 #[tokio::test(flavor = "current_thread")]
 async fn stranded_on_cluster_collapse_returns_err_with_counts() {
     let (log_buf, _log_guard) = capture_logs_thread_local();
@@ -291,6 +304,11 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
                 ),
             }
 
+            // The collapse-arm's `tracing::error!` in
+            // `finalize_terminal_accounting` must fire so ops scripts grepping
+            // the log can detect every routing collapse. Captured via the
+            // parallel-safe thread-local recorder (see
+            // `capture_logs_thread_local`).
             let captured = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
             assert!(
                 captured.contains("tasks left unassigned because cluster routing collapsed"),
@@ -316,16 +334,17 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
 /// `Some` and `run_complete()` is false. The locally-returned
 /// `RunError::ClusterCollapsed` is unchanged (asserted separately).
 ///
-/// IGNORED — blocked on the SAME assignment-time strand-classification gap as
-/// [`stranded_on_cluster_collapse_returns_err_with_counts`] (see its doc): when
-/// the secondaries die post-mesh-ready, the operational primary's
-/// `perform_initial_assignment` send-failure escapes as `Err(Other("mesh-pump
-/// dropped"))` BEFORE the finalize tail runs, so the `RunAborted` terminal this
-/// test asserts is never reached. Assertion is the CORRECT expectation;
-/// un-ignore once the root-cause agent routes the assignment-time collapse into
-/// the strand-classification + terminal-`RunAborted` path.
-#[ignore = "blocked on the same assignment-time strand-classification gap; separate \
-            root-cause agent owns the fix (see stranded_on_cluster_collapse doc)"]
+/// Exercises the SAME assignment-time collapse path as
+/// [`stranded_on_cluster_collapse_returns_err_with_counts`] (see its doc): the
+/// secondaries die post-mesh-ready, so `perform_initial_assignment` hits the
+/// mesh-pump-gone send failure, surfaces `InitialAssignmentOutcome::Cluster
+/// Collapsed`, and `run_pipeline` routes it into `finalize_terminal_accounting`
+/// — the shared strand-classification site that broadcasts the honest
+/// `RunAborted` terminal. This test pins the BROADCAST half: the peer-facing
+/// terminal is `RunAborted` (carrying the `ClusterCollapsed` render), NOT
+/// `RunComplete`. Regression guard: pre-fix the assignment-time collapse
+/// escaped as `Err(Other("mesh-pump dropped"))` BEFORE any terminal broadcast,
+/// so neither `RunAborted` nor `RunComplete` was ever applied.
 #[tokio::test(flavor = "current_thread")]
 async fn strand_broadcasts_run_aborted_not_run_complete() {
     let local = tokio::task::LocalSet::new();

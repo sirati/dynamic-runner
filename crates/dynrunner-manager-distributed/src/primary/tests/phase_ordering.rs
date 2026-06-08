@@ -706,8 +706,7 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             // `.await` — and `current_thread` + `LocalSet` keep every
             // spawned secondary task on this thread, so the primary's
             // important emits (fired from inside `primary.run().await`)
-            // are all reached. See `stranded.rs::capture_logs_thread_local`
-            // for the same discipline.
+            // are all reached.
             let capture = ImportantCapture::default();
             let subscriber =
                 Registry::default().with(capture.clone().with_filter(important_only()));

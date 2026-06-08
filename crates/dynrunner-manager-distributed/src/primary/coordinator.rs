@@ -11,6 +11,7 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DiscoveryDebt};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc as tokio_mpsc;
 
+use super::assignment::InitialAssignmentOutcome;
 use super::command_channel::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
 use super::config::{OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
 use super::error::RunError;
@@ -2936,7 +2937,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // above (it had to precede a possible relocate); the assignment
                 // is the operational primary's concern and assigns over the
                 // inherited roster.
-                self.perform_initial_assignment().await?;
+                //
+                // A `ClusterCollapsed` outcome means a secondary died during
+                // the initial assignment (the mesh-pump went away mid-send —
+                // the egress-side twin of the operational loop's
+                // `recv() -> None` collapse). The operational loop tolerates a
+                // mid-loop collapse by breaking and letting the finalize tail
+                // classify the strand; an assignment-time collapse must reach
+                // that SAME classification rather than `?`-escaping as a raw
+                // `RunError::Other` (which is the gap the uniform-relocate
+                // reorder exposed). So skip the rest of the pre-loop chain
+                // (transfer-complete / op-loop) — every send would just hit the
+                // same dead mesh — and route straight into the SOLE
+                // strand-classification site, where the full (un-dispatched)
+                // pool surfaces as stranded and the honest `RunAborted`
+                // terminal is broadcast. Put `command_rx` back first for
+                // symmetry with the take at the top of the pre-loop chain.
+                if let InitialAssignmentOutcome::ClusterCollapsed =
+                    self.perform_initial_assignment().await?
+                {
+                    self.command_rx = command_rx;
+                    return self.finalize_terminal_accounting(total).await;
+                }
 
                 // Phase 6: Send transfer complete.
                 self.send_transfer_complete().await?;
@@ -3073,6 +3095,83 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             });
         }
 
+        // Drain in-flight completions, run the final per-task accounting,
+        // broadcast the terminal mutation, and — on a routing collapse —
+        // return the structured `RunError::ClusterCollapsed`. This is the
+        // SOLE strand-classification site: the assignment-time collapse path
+        // (`run_pipeline`'s `PromotedDestination` arm) routes through the
+        // SAME helper, so a secondary dying during the initial assignment is
+        // classified identically to one dying mid-operational-loop. On a
+        // clean run (`stranded == 0`) the helper returns `Ok(())` and we fall
+        // through to the spawn-rejection backstop + clean-finish tail below.
+        self.finalize_terminal_accounting(total).await?;
+
+        // Loud-fail backstop for the silent zero-dispatch path. A runtime
+        // `spawn_tasks` batch (typically `on_phase_end` spawning the next
+        // phase) whose EVERY task the validator rejected nets that phase
+        // ZERO dispatch — `apply_spawn_tasks` never refreshed `total_tasks`,
+        // so `run_complete_check`'s counter exit tripped against the
+        // pre-spawn total and the run reached this clean tail with that
+        // planned work silently dropped (the asm-dataset-nix c39034f2
+        // producer-path silent total=0). Surfacing it as a structured
+        // `RunError::SpawnRejected` makes the submitter's PyO3 boundary
+        // RAISE instead of returning rc=0 — a non-empty spawn plan that
+        // dispatched nothing must never present as a clean run.
+        //
+        // Sequenced AFTER the strand check (a routing collapse is the
+        // stronger terminal and already raises). The per-index `SpawnError`
+        // the consumer received from `spawn_tasks` is unchanged; this is
+        // the run-level net the consumer's per-task WARN-and-continue
+        // otherwise slips through.
+        if !self.spawn_rejected_task_ids.is_empty() {
+            let rejected_task_ids = std::mem::take(&mut self.spawn_rejected_task_ids);
+            tracing::error!(
+                rejected = rejected_task_ids.len(),
+                "runtime spawn_tasks rejected every task in a batch — the \
+                 phase dispatched ZERO tasks and the run would otherwise have \
+                 exited rc=0 with that planned work silently dropped"
+            );
+            return Err(RunError::SpawnRejected { rejected_task_ids });
+        }
+
+        let outcome = self.outcome_summary();
+        tracing::info!(
+            succeeded = outcome.succeeded,
+            fail_retry = outcome.fail_retry,
+            fail_oom = outcome.fail_oom,
+            fail_final = outcome.fail_final,
+            total,
+            "primary finished"
+        );
+
+        Ok(())
+    }
+
+    /// The SOLE strand-classification + terminal-broadcast site.
+    ///
+    /// One concern: turn the run's final per-task ledger state into the
+    /// terminal outcome — drain any in-flight completions, compute the
+    /// stranded count, broadcast the honest terminal mutation
+    /// (`RunAborted` on a routing collapse, `RunComplete` on a clean run),
+    /// settle, and return `Err(RunError::ClusterCollapsed { .. })` iff any
+    /// task was stranded (else `Ok(())`, so the caller continues to its
+    /// clean-finish tail).
+    ///
+    /// Reached from BOTH terminal paths so the classification is identical
+    /// on each:
+    /// - `run_operational_and_finalize` — the operational loop exited
+    ///   (clean completion, fleet-dead, or a mid-loop transport collapse the
+    ///   loop tolerates by breaking); and
+    /// - `run_pipeline`'s `PromotedDestination` arm — the initial
+    ///   per-secondary assignment hit a cluster-collapse send failure (the
+    ///   mesh-pump is gone, the egress-side twin of the operational loop's
+    ///   `recv() -> None` collapse criterion), so the loop is never entered
+    ///   and the full pool is stranded.
+    ///
+    /// `total` is the run's task count, captured by the caller from
+    /// `self.total_tasks` after seeding so the accounting matches on both
+    /// paths.
+    async fn finalize_terminal_accounting(&mut self, total: usize) -> Result<(), RunError> {
         // Drain any TaskComplete / TaskFailed messages that crossed the
         // wire while the operational loop was winding down but hadn't
         // been pulled by `transport.recv` yet. Without this, the
@@ -3082,7 +3181,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // the cost on a fully-quiesced happy-path exit is one
         // 50ms quiet-window probe; the longer ceiling covers
         // heavily-pipelined teardowns where a burst of TaskCompletes
-        // is still in flight as the loop exits.
+        // is still in flight as the loop exits. On a collapsed mesh the
+        // inbound is already closed, so the drain returns immediately.
         self.drain_pending_messages(Duration::from_millis(500))
             .await?;
 
@@ -3167,43 +3267,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             );
             return Err(RunError::ClusterCollapsed { stranded, outcome });
         }
-
-        // Loud-fail backstop for the silent zero-dispatch path. A runtime
-        // `spawn_tasks` batch (typically `on_phase_end` spawning the next
-        // phase) whose EVERY task the validator rejected nets that phase
-        // ZERO dispatch — `apply_spawn_tasks` never refreshed `total_tasks`,
-        // so `run_complete_check`'s counter exit tripped against the
-        // pre-spawn total and the run reached this clean tail with that
-        // planned work silently dropped (the asm-dataset-nix c39034f2
-        // producer-path silent total=0). Surfacing it as a structured
-        // `RunError::SpawnRejected` makes the submitter's PyO3 boundary
-        // RAISE instead of returning rc=0 — a non-empty spawn plan that
-        // dispatched nothing must never present as a clean run.
-        //
-        // Sequenced AFTER the strand check (a routing collapse is the
-        // stronger terminal and already raises). The per-index `SpawnError`
-        // the consumer received from `spawn_tasks` is unchanged; this is
-        // the run-level net the consumer's per-task WARN-and-continue
-        // otherwise slips through.
-        if !self.spawn_rejected_task_ids.is_empty() {
-            let rejected_task_ids = std::mem::take(&mut self.spawn_rejected_task_ids);
-            tracing::error!(
-                rejected = rejected_task_ids.len(),
-                "runtime spawn_tasks rejected every task in a batch — the \
-                 phase dispatched ZERO tasks and the run would otherwise have \
-                 exited rc=0 with that planned work silently dropped"
-            );
-            return Err(RunError::SpawnRejected { rejected_task_ids });
-        }
-
-        tracing::info!(
-            succeeded = outcome.succeeded,
-            fail_retry = outcome.fail_retry,
-            fail_oom = outcome.fail_oom,
-            fail_final = outcome.fail_final,
-            total,
-            "primary finished"
-        );
 
         Ok(())
     }
