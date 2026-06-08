@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
-use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
@@ -65,6 +65,16 @@ pub struct ClusterState<I> {
     /// on it too (failover has nothing left to guard once the run is
     /// aborting). Carries the abort reason for the PyO3-boundary log.
     pub(super) run_aborted: Option<String>,
+    /// Replicated "this run still owes discovery" fact (V6). Declared by
+    /// the mode-2 seed BEFORE relocation; settled exactly once by the
+    /// compute-peer primary's discover-on-promotion driver after it has
+    /// originated its discovery seed (TaskAdded batch, or the empty-corpus
+    /// RunComplete). Sticky-monotone THREE-state lattice (join = `max` over
+    /// `Undeclared ⊑ Owed ⊑ Settled`): a replica only ever moves UP, never
+    /// back. A run that never declares debt is `Undeclared` from t0 (the
+    /// cold mode-1 path and every legacy run), which is `!= Owed`, so it is
+    /// unaffected.
+    pub(super) discovery_debt: DiscoveryDebt,
     /// Replicated role bookkeeping. Updated in lockstep with
     /// `current_primary` on every `PrimaryChanged` apply so the
     /// transport-layer cache (registered via `role_change_hooks`)
@@ -323,6 +333,7 @@ where
             phase_deps,
             run_complete,
             run_aborted,
+            discovery_debt,
             role_table,
             // Deliberately not cloned — see field doc.
             role_change_hooks: _role_change_hooks,
@@ -357,6 +368,8 @@ where
             phase_deps: phase_deps.clone(),
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Replicated CRDT data — clone preserves it (like `run_complete`).
+            discovery_debt: *discovery_debt,
             role_table: role_table.clone(),
             // Deliberately not cloned — see field doc.
             role_change_hooks: Vec::new(),
@@ -408,6 +421,7 @@ where
             phase_deps,
             run_complete,
             run_aborted,
+            discovery_debt,
             role_table,
             role_change_hooks,
             peer_state,
@@ -432,6 +446,7 @@ where
             .field("phase_deps", phase_deps)
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
+            .field("discovery_debt", discovery_debt)
             .field("role_table", role_table)
             .field("role_change_hooks", &role_change_hooks.len())
             .field("peer_state", peer_state)
@@ -465,6 +480,7 @@ impl<I> Default for ClusterState<I> {
             phase_deps: HashMap::new(),
             run_complete: false,
             run_aborted: None,
+            discovery_debt: DiscoveryDebt::default(),
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),

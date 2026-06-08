@@ -63,6 +63,17 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
+            // The discovery-debt latch IS summarised (it is snapshot-healable
+            // via the sticky `max`-join), carried VERBATIM (the full
+            // `DiscoveryDebt` value, NOT a bool) into the digest so the
+            // detector can compare lattice height in BOTH directions. A bool
+            // is provably insufficient for a 3-state lattice: it would map
+            // `Undeclared` and `Settled` to the same `false`, so a replica
+            // that missed the `Declared` (Undeclared) could never detect it
+            // is behind an `Owed` peer and would never pull — silent
+            // non-convergence (the mode-2 stall). The scalar enum + `Ord`
+            // compare in `is_behind` carries all three states.
+            discovery_debt,
             // The role-CAPABILITY 2P-set IS summarised (C6): it is a
             // proper CRDT (merged monotonically in `restore`), so folding
             // it is detect-WITH-heal — a flagged divergence is one a
@@ -212,6 +223,12 @@ impl<I: Identifier> ClusterState<I> {
             primary_epoch: *primary_epoch,
             run_complete: *run_complete,
             run_aborted: run_aborted.is_some(),
+            // Discovery-debt lattice height, carried VERBATIM (the full
+            // three-state enum, not a bool) so the AE detector can compare
+            // it in both directions: `is_behind` is "the peer is STRICTLY
+            // higher in the lattice" (`self.discovery_debt <
+            // other.discovery_debt`). See `StateDigest::is_behind`.
+            discovery_debt: *discovery_debt,
             phase_event_tallies_count: phase_event_tallies.len() as u64,
             phase_event_tallies_hash,
             retry_passes_used_count: retry_passes_used.len() as u64,

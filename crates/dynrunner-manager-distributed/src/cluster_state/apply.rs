@@ -18,7 +18,7 @@
 //! side caller that locally owns a dispatch pool can grow it.
 
 use dynrunner_core::{ErrorType, Identifier, SoftPreferredSecondaries, TaskInfo};
-use dynrunner_protocol_primary_secondary::ClusterMutation;
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DiscoveryDebt};
 
 use super::merge::MergeOutcome;
 use super::{ApplyOutcome, ClusterState, TaskState};
@@ -288,6 +288,35 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 }
                 self.run_aborted = Some(reason);
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::DiscoveryDebtDeclared => {
+                // Declare the per-run discovery debt: `Undeclared → Owed`.
+                // Sticky-monotone: the declare is Applied ONLY from the
+                // lattice BOTTOM (`Undeclared`). From `Owed` (already
+                // declared) or `Settled` (already done) it is a NoOp — the
+                // monotonicity lives HERE (in the apply rule), not on the
+                // wire, so a reordered/redelivered `Declared` that arrives
+                // AFTER `Settled` can NEVER drag the run back down. This is
+                // exactly the case the distinct `Undeclared` bottom exists to
+                // disambiguate from a cold replica's first declare.
+                if self.discovery_debt != DiscoveryDebt::Undeclared {
+                    return ApplyOutcome::NoOp;
+                }
+                self.discovery_debt = DiscoveryDebt::Owed;
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::DiscoverySettled => {
+                // Ratchet the per-run discovery debt to `Settled` (the
+                // lattice TOP): `Applied` iff it CHANGED the local value,
+                // else a NoOp. Once `Settled` it never reverts, so a
+                // duplicate / re-broadcast `DiscoverySettled` is idempotent.
+                // (Settling directly from `Undeclared` is also valid — the
+                // join only moves UP.)
+                if self.discovery_debt == DiscoveryDebt::Settled {
+                    return ApplyOutcome::NoOp;
+                }
+                self.discovery_debt = DiscoveryDebt::Settled;
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskReinjected { hash, version } => {

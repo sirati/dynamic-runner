@@ -20,6 +20,7 @@ mod apply_basics;
 mod cascade_and_reinject;
 mod convergence;
 mod digest;
+mod discovery_debt;
 mod dispatchers;
 mod grow_max;
 mod non_task_convergence;

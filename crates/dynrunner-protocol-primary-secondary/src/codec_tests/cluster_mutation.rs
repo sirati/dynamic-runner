@@ -143,6 +143,33 @@ fn roundtrip_run_aborted() {
     }
 }
 
+/// `DiscoveryDebtDeclared` (the payload-free debt-declare latch, twin of
+/// `RunComplete`'s wire shape) round-trips through serde — the variant
+/// discriminant survives encode→decode so a relocated submitter's debt
+/// declaration reaches every replica.
+#[test]
+fn roundtrip_discovery_debt_declared() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::DiscoveryDebtDeclared;
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    assert!(matches!(decoded, ClusterMutation::DiscoveryDebtDeclared));
+}
+
+/// `DiscoverySettled` (the payload-free debt-settle ratchet) round-trips
+/// through serde — the discriminant survives encode→decode so the
+/// compute-peer primary's settle reaches every replica.
+#[test]
+fn roundtrip_discovery_settled() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::DiscoverySettled;
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    assert!(matches!(decoded, ClusterMutation::DiscoverySettled));
+}
+
 /// `PrimaryChanged` round-trips through serde carrying a NON-DEFAULT
 /// `reason: Transferred` — the bootstrap-transfer marker survives
 /// encode→decode rather than collapsing to the `Election` default. A

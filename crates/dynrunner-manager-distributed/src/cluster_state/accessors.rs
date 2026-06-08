@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
-use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
+use dynrunner_protocol_primary_secondary::{DiscoveryDebt, RoleTable, SecondaryCapacityRecord};
 
 use super::{ClusterState, OutcomeSummary, PhaseRollup, StateCounts, TaskState};
 
@@ -430,6 +430,18 @@ impl<I: Identifier> ClusterState<I> {
     /// the `mesh_watchdog` disarms on it too.
     pub fn run_aborted(&self) -> Option<&str> {
         self.run_aborted.as_deref()
+    }
+
+    /// The replicated per-run discovery-debt latch (V6). `Settled` (the
+    /// default) means no discovery is owed — the run was cold-seeded
+    /// (mode-1 / legacy) or its discovery has completed; `Owed` means a
+    /// relocated compute-peer primary still owes a `discover_items` seed.
+    /// Sticky-monotone: ratchets `Owed → Settled`, never back (the mirror
+    /// of [`Self::run_complete`]'s `false → true` ratchet, with `Settled`
+    /// as the lattice TOP). The discover-on-promotion driver (Phase 5b)
+    /// gates on `== Owed`.
+    pub fn discovery_debt(&self) -> DiscoveryDebt {
+        self.discovery_debt
     }
 
     /// Borrow a secondary's static capacity record (worker-slot count +

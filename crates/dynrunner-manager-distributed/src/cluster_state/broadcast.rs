@@ -157,6 +157,8 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::RunComplete
             | ClusterMutation::RunAborted { .. }
+            | ClusterMutation::DiscoveryDebtDeclared
+            | ClusterMutation::DiscoverySettled
             | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::SecondaryCapacity { .. }
