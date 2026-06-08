@@ -393,6 +393,63 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
+/// PeerTransport whose membership id-set is CONTROLLABLE by the test via a
+/// shared `Rc<RefCell<Vec<PeerId>>>`. `broadcast` / `send_to_peer` are
+/// best-effort no-ops (Ok), `recv_peer` blocks forever — the failover tests
+/// drive the coordinator by direct method calls, not through inbound. The
+/// point is `connected_ids` / `has_peer` / `peer_count`, which read the
+/// shared set LIVE, so a test can model the current primary LEAVING the mesh
+/// (the `handle_peer_disconnect` republish) by removing its id and calling
+/// `publish_membership` again. This is the membership-departure analogue of
+/// `channel_mesh_no_primary` (which models a permanent no-route) — here the
+/// primary STARTS present and is removed mid-test.
+pub(super) struct MembershipControlPeer {
+    pub(super) connected: Rc<RefCell<Vec<PeerId>>>,
+}
+
+impl MembershipControlPeer {
+    fn new(initial: Vec<PeerId>) -> Self {
+        Self {
+            connected: Rc::new(RefCell::new(initial)),
+        }
+    }
+
+    /// Shared handle to the live id-set so a test mutates membership after
+    /// the stub is moved into the coordinator.
+    fn handle(&self) -> Rc<RefCell<Vec<PeerId>>> {
+        self.connected.clone()
+    }
+}
+
+impl<I: Identifier> PeerTransport<I> for MembershipControlPeer {
+    async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        _msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        self.connected.borrow().len()
+    }
+    fn has_peer(&self, id: &PeerId) -> bool {
+        self.connected.borrow().iter().any(|c| c == id)
+    }
+    fn connected_ids(&self) -> Vec<PeerId> {
+        self.connected.borrow().clone()
+    }
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
 /// WorkerFactory that fakes a runner: replies Ready, then echoes Done for
 /// each ProcessTask without doing real work.
 pub(super) struct FakeWorkerFactory;
@@ -521,6 +578,30 @@ pub(super) fn make_secondary_recording(
         FixedEstimator(100),
     );
     (harness, log)
+}
+
+/// Construct a secondary over a [`MembershipControlPeer`] mesh stub seeded
+/// with `initial` connected ids, returning the harness + the shared id-set
+/// handle so a test can drive the primary LEAVING the transport mesh (the
+/// `handle_peer_disconnect` republish) and then re-publish the view. Pair
+/// with `publish_membership()` after each mutation so the coordinator's
+/// `MeshClient::has_peer` reads the change.
+pub(super) fn make_secondary_membership(
+    config: SecondaryConfig,
+    initial: Vec<PeerId>,
+) -> (
+    SecondaryHarness<MembershipControlPeer>,
+    Rc<RefCell<Vec<PeerId>>>,
+) {
+    let peer = MembershipControlPeer::new(initial);
+    let handle = peer.handle();
+    let harness = build_harness(
+        config,
+        peer,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (harness, handle)
 }
 
 /// Build a secondary over a `ChannelPeerTransport` mesh stub, returning the

@@ -737,6 +737,77 @@ async fn relocate_primary_to_originates_transferred_to_chosen_not_self() {
         .await;
 }
 
+/// EPOCH SINGLE-BUMP (relocate→promotion is ONE transition): when the chosen
+/// peer promotes, its `seed_from_promotion_snapshot` has ALREADY restored
+/// `current_primary = self` at the epoch the submitter's relocate committed
+/// (E). `originate_primary_changed` (via `activate_local_primary`) must then
+/// RE-ASSERT at E — NOT bump to E+1 — so the cluster sees exactly one epoch
+/// transition for the holder, never a double-announce that would pin a
+/// disconnected submitter-observer at E while the cluster ran at E+1.
+///
+/// Drive it at the unit level: seed `current_primary = self` at a non-zero
+/// epoch E (the post-restore state of a relocate target), then call
+/// `originate_primary_changed` and assert the epoch is UNCHANGED. The
+/// complementary genuine-first-assertion case (no prior `current_primary` ⇒
+/// bump to 1) is covered by `bootstrap_tail_activates_local_primary`.
+#[tokio::test(flavor = "current_thread")]
+async fn promote_reasserts_at_inherited_epoch_single_bump() {
+    use dynrunner_protocol_primary_secondary::PrimaryChangeReason;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let config = test_primary_config();
+            let own_id = config.node_id.clone();
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Simulate `seed_from_promotion_snapshot`'s restored state: the
+            // upstream relocate already named THIS host the primary at epoch E.
+            const E: u64 = 7;
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::PrimaryChanged {
+                    new: own_id.clone(),
+                    epoch: E,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+            assert_eq!(
+                primary.cluster_state_for_test().primary_epoch(),
+                E,
+                "precondition: the restore committed epoch E naming self",
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().current_primary(),
+                Some(own_id.as_str()),
+                "precondition: the restore named self the primary",
+            );
+
+            // The promoted primary's self-announce: it must RE-ASSERT at E,
+            // not bump to E+1 (the double-announce SMELL the fix closes).
+            primary.originate_primary_changed().await;
+
+            assert_eq!(
+                primary.cluster_state_for_test().primary_epoch(),
+                E,
+                "SINGLE bump: a promoted primary whose snapshot already names it \
+                 must re-assert at the inherited epoch E, NOT bump to E+1 — the \
+                 relocate→promotion is one epoch transition, not two",
+            );
+            assert_eq!(
+                primary.cluster_state_for_test().current_primary(),
+                Some(own_id.as_str()),
+                "the re-assert keeps this host the primary",
+            );
+        })
+        .await;
+}
+
 /// Race tolerance (F6): a concurrent failover election at the SAME `epoch+1`
 /// can win the equal-epoch lex tiebreak against this primary's
 /// `relocate_primary_to { chosen }`, so the converged `current_primary` is the

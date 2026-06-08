@@ -186,6 +186,46 @@ where
         // original per-arm re-reads. `current_primary_id` is the silent
         // primary's diagnostic identity + the `TimeoutQuery` target.
         let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
+        // (C) primary DEPARTED the transport mesh — the idle-independent
+        // primary-death signal. The mesh-pump republishes the
+        // `MembershipView` on every peer connect/disconnect
+        // (`handle_peer_disconnect` → live `transport.connected_ids()`
+        // re-read), so `MeshClient::has_peer` flips to `false` the pump
+        // cycle a primary's QUIC connection tears down — regardless of
+        // whether THIS node ever issued a primary-bound send. That is the
+        // gap legs (A)/(B) cannot cover for an IDLE survivor: (A) opens its
+        // health window only on a `send_to_primary` no-route (an idle node
+        // issues none), and (B) is the patient ~120s backstop; a node with
+        // no pending send to the dead primary would otherwise loop the
+        // transport's reconnect-ticker silently and never elect. Reading the
+        // transport `MembershipView` (NOT the CRDT `is_peer_alive` ledger)
+        // is correct because a dead primary cannot originate its own
+        // `PeerRemoved`, and no surviving secondary originates one for it —
+        // the CRDT membership stays stale on primary death, while the
+        // transport view is the direct, role-independent death observation
+        // (mesh ⊥ role; built on the same pump/`MembershipView` layer rc-C
+        // landed). Snapshotted here as a `&self` read alongside
+        // `current_primary_id`, before the `&mut op` borrow below.
+        //
+        // SELF-EXCLUSION: a `current_primary` naming THIS node (a same-peer /
+        // self-promoted primary co-located with the secondary role) is NEVER
+        // a membership-departure signal — a node is structurally absent from
+        // its OWN transport `connected_ids` (the view enumerates REMOTE
+        // peers), so `has_peer(self)` is always `false` while the local
+        // primary is perfectly alive. Reading that as "primary left" would
+        // make a promoted/co-located node spuriously elect against itself, so
+        // leg (C) is keyed only on a REMOTE primary identity — exactly the
+        // single-source self-skip `live_peer_ids` / `check_peer_timeouts`
+        // apply for the quorum side.
+        let primary_left_membership = current_primary_id
+            .as_deref()
+            .filter(|id| *id != self.config.secondary_id.as_str())
+            .map(|id| {
+                !self.client.has_peer(
+                    &dynrunner_protocol_primary_secondary::address::PeerId::from(id),
+                )
+            })
+            .unwrap_or(false);
         let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
         let observers: std::collections::HashSet<String> = self
             .cluster_state
@@ -199,12 +239,12 @@ where
 
         // Honest liveness — by SOURCE, not by a bare receive-staleness
         // clock. The decision to suspect the primary and start a failover
-        // election is the OR of two predicates, each honest about a
+        // election is the OR of three predicates, each honest about a
         // distinct death mode, so the secondary rides out a transient
         // keepalive blip exactly as the primary side does (the QUIC layer
         // keeps a quiet-but-live link up to `max_idle_timeout` ≈60s):
         //
-        //   (A) genuine-dead-link (fast): `primary_link.should_arm_failover()`.
+        //   (A) genuine-dead-link (fast, SEND-driven): `primary_link.should_arm_failover()`.
         //       The primary-link health window arms ONLY when a
         //       primary-bound send returns a no-route `Err` via
         //       `send_to_primary` (the connection is closed / no primary
@@ -213,20 +253,33 @@ where
         //       leg stays SILENT during a blip and fires only on a genuine
         //       link death — the honest fast signal, identical to the one
         //       `check_primary_link_threshold` already polls each keepalive
-        //       tick.
+        //       tick. Structurally BLIND to an IDLE survivor that issues no
+        //       primary-bound send (keepalives fan `Destination::All`, never
+        //       no-route) — that gap is leg (C).
         //   (B) wedged-primary backstop (patient): `primary_last_seen`
         //       staleness past `primary_silence_backstop` (≈2 min). Covers
-        //       the ONLY case (A) cannot — a primary alive at QUIC but
-        //       wedged at the application layer (it sends nothing yet its
-        //       connection stays routable, so no send ever errors).
+        //       the case neither (A) nor (C) can — a primary alive at QUIC
+        //       (still a mesh member) but wedged at the application layer (it
+        //       sends nothing yet its connection stays routable, so no send
+        //       ever errors and it never leaves membership).
+        //   (C) primary-left-membership (fast, IDLE-INDEPENDENT):
+        //       `primary_left_membership_after_seen`. The mesh-pump
+        //       republishes the `MembershipView` on the primary's QUIC
+        //       teardown (`handle_peer_disconnect`), so `MeshClient::has_peer`
+        //       flips `false` without any send from this node. This is the
+        //       leg an IDLE survivor relies on: it neither issues the
+        //       send (A) needs nor waits the ~120s (B) takes. Gated on
+        //       `primary_last_seen.is_some()` so a not-yet-dialled relocation
+        //       target does not false-arm (see the snapshot above).
         //
         // The bare `keepalive_interval × keepalive_miss_threshold` (≈15s)
         // receive-staleness trigger is GONE: it could not distinguish a
         // blip from a dead primary, so it spuriously elected at 15s during
         // a blip while the primary side patiently waited. Lengthening it to
         // 2 min would instead delay EVERY genuine failover by 2 min; the
-        // (A)+(B) split keeps fast failover for a real dead link and is
-        // patient only when death is genuinely indistinguishable from a blip.
+        // (A)+(C) fast legs keep fast failover for a real dead/departed link
+        // and (B) is patient only when death is genuinely indistinguishable
+        // from a blip (still-routable, still-a-member, just silent).
         //
         // `primary_last_seen` is refreshed by `record_primary_message`,
         // driven by the role-tagged recognition path in `handle_inbound`'s
@@ -269,8 +322,27 @@ where
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > backstop)
             .unwrap_or(false);
+        // (C) primary departed the transport mesh — the idle-independent
+        // death signal (snapshotted above off `MeshClient::has_peer`).
+        // GATED on `primary_last_seen.is_some()`: leg (C) fires only for a
+        // primary this node has actually SEEN (received ≥1 message from) and
+        // that is now absent from membership — a genuine death of a
+        // previously-live primary. The gate suppresses the relocation
+        // bring-up window, where a freshly-named compute primary is in
+        // `current_primary()` but this survivor's transport has not yet
+        // dialled it (so `has_peer` is transiently `false`): there
+        // `primary_last_seen` is still `None` (no primary message yet, and
+        // neither backdate site has run — both require a prior no-route), so
+        // (C) correctly stays silent until the primary has proven liveness
+        // once. A transient single-cycle membership flicker on a still-live
+        // primary is self-cancelling: the next primary keepalive routes
+        // through `record_primary_message`, which reverts an
+        // (A)/(B)/(C)-triggered Suspecting back to Normal.
+        let primary_left_membership_after_seen =
+            primary_left_membership && op.primary_last_seen.is_some();
 
-        let need_election = link_dead || primary_silence_exceeded;
+        let need_election =
+            link_dead || primary_silence_exceeded || primary_left_membership_after_seen;
 
         match &op.election {
             ElectionState::Normal if need_election => {
@@ -297,7 +369,8 @@ where
                         "peer mesh required for failover but not \
                          available: primary death suspected \
                          (link_dead={link_dead}, \
-                         primary_silence_exceeded={primary_silence_exceeded}) \
+                         primary_silence_exceeded={primary_silence_exceeded}, \
+                         primary_left_membership={primary_left_membership_after_seen}) \
                          and no peers connected to elect a new primary; \
                          exiting",
                     );
@@ -305,6 +378,7 @@ where
                         secondary = %secondary_id,
                         link_dead,
                         primary_silence_exceeded,
+                        primary_left_membership = primary_left_membership_after_seen,
                         primary = ?current_primary_id,
                         "{reason}"
                     );
@@ -319,9 +393,10 @@ where
                     secondary = %secondary_id,
                     link_dead,
                     primary_silence_exceeded,
+                    primary_left_membership = primary_left_membership_after_seen,
                     primary = ?current_primary_id,
-                    "primary death suspected (dead link or app-silence backstop); \
-                     entering Suspecting"
+                    "primary death suspected (dead link, app-silence backstop, \
+                     or primary departed the mesh); entering Suspecting"
                 );
                 op.election = ElectionState::Suspecting {
                     since: Instant::now(),

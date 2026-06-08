@@ -179,12 +179,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// peer (registered in every replica's `connections` under its
     /// host-id), so warming the `Role::Primary` cache to its id routes
     /// correctly — there is no longer a "sole authority" special case
-    /// that suppresses the announce. Epoch is `primary_epoch() + 1`, so
-    /// on failover the announce strictly supersedes the prior primary
-    /// identity via epoch-LWW; the re-announce names the same holder the
-    /// election winner's `PrimaryChanged` already installed, so the
-    /// primary-changed important-event hook (which fires only on a
-    /// genuine holder transition) stays silent.
+    /// that suppresses the announce. The epoch is a SINGLE transition (see
+    /// `originate_primary_changed`): on the promoted paths the converged
+    /// snapshot already names this host, so the announce RE-ASSERTS at the
+    /// epoch already held rather than bumping again — the relocate→promotion
+    /// is one epoch step, not two. The re-announce names the same holder the
+    /// upstream `PrimaryChanged` already installed, so the primary-changed
+    /// important-event hook (which fires only on a genuine holder transition)
+    /// stays silent.
     ///
     /// `primary_id` is set to this node's own id for the heartbeat
     /// requeue path's "did the primary just die?" check — which can

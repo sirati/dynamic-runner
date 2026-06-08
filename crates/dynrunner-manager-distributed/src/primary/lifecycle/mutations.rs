@@ -319,17 +319,51 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// uniformly cluster-wide through the one mesh — the SAME mechanism
     /// every primary uses, replacing the old "sole authority" special
     /// case. Sibling to `originate_primary_membership` (which records
-    /// MEMBERSHIP); this records the ROLE. The epoch is
-    /// `primary_epoch() + 1`, mirroring the election winner's
-    /// `fire_local_promotion`, so a failover re-announce strictly
-    /// supersedes the prior identity via epoch-LWW. Routed through
+    /// MEMBERSHIP); this records the ROLE. The epoch is a SINGLE transition:
+    /// it re-asserts at the epoch ALREADY held when the converged snapshot
+    /// already names this host (the relocate-target / election-winner promoted
+    /// paths), and bumps `primary_epoch() + 1` only on a genuine first
+    /// assertion — so a relocate→promotion is one epoch step, not two (see the
+    /// body). Routed through
     /// `apply_and_broadcast_cluster_mutations`, so it inherits the same
     /// local-apply and wire fan-out as every other primary-originated
     /// mutation. The local apply warms the transport `Role::Primary`
     /// write-through cache and fires the primary-changed important-event
     /// hook on a genuine holder transition.
     pub(crate) async fn originate_primary_changed(&mut self) {
-        let epoch = self.cluster_state.primary_epoch() + 1;
+        // SINGLE epoch transition across relocate→promotion / election→promotion.
+        //
+        // This convergence point is reached ONLY on the
+        // `BootstrapRole::PromotedDestination` arm (a `SeedSource::PromotionSnapshot`
+        // primary — the relocate target or the failover-election winner; the
+        // submitter ALWAYS relocates via the `SetupPeer` arm and never reaches
+        // here). On BOTH promoted paths the converged snapshot this node was
+        // `seed_from_promotion_snapshot`-restored from ALREADY names this host the
+        // primary at the epoch the upstream transition committed:
+        //   - relocate:  the submitter broadcast `PrimaryChanged { chosen, E+1,
+        //                 Transferred }`, which the chosen peer applied (epoch E+1,
+        //                 current_primary = chosen) before capturing the snapshot;
+        //   - election:  `fire_local_promotion` broadcast `PrimaryChanged { self,
+        //                 E+1, Election }`, applied locally before the snapshot.
+        // A blind `primary_epoch() + 1` here would then announce a SECOND
+        // `PrimaryChanged` for the SAME holder one epoch higher (E+2), leaving a
+        // submitter-observer that disconnected at the relocate pinned at E+1 while
+        // the cluster ran at E+2 — a double-bump for an unchanged primary.
+        //
+        // So when `current_primary()` ALREADY names this host, RE-ASSERT at the
+        // epoch already held (no +1): a single transition, convergent under the
+        // epoch-LWW register-adopt rule. Re-emitting the SAME (id, epoch) is an
+        // apply NoOp on every replica that already converged (no spurious wire
+        // fan-out, no duplicate important-event), and on any replica still behind
+        // it lands the authoritative identity exactly once. The genuine first
+        // assertion (no prior `current_primary`, e.g. a future direct-bootstrap
+        // path) still bumps `primary_epoch() + 1` to supersede the prior identity.
+        let already_self = self.cluster_state.current_primary() == Some(self.config.node_id.as_str());
+        let epoch = if already_self {
+            self.cluster_state.primary_epoch()
+        } else {
+            self.cluster_state.primary_epoch() + 1
+        };
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
             new: self.config.node_id.clone(),
             epoch,
