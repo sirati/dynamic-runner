@@ -8,6 +8,7 @@ pub(crate) mod observer_late_joiner;
 pub(crate) mod primary;
 pub(crate) mod primary_handle;
 pub(crate) mod run;
+pub(crate) mod run_config;
 pub(crate) mod secondary;
 pub(crate) mod subprocess_spec;
 pub(crate) mod transport_factory;
