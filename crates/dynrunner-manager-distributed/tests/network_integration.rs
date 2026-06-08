@@ -195,9 +195,9 @@ where
 
 /// End-to-end: 1 primary + 1 secondary over real WSS networking.
 ///
-/// Step 5b: the primary is constructed with a `TunneledPeerTransport`
-/// paired against the legacy `NetworkServer` (instead of the prior
-/// `NoPeerTransport`). The happy-path counters must still settle to
+/// The primary is constructed with a `TunneledPeerTransport`
+/// paired against the legacy `NetworkServer`. The happy-path counters
+/// must settle to
 /// 5/0 — proves the tunnel wiring did not regress the wire flow
 /// (per-secondary writes go via the same `connections` map, inbound
 /// flows through the same `incoming_rx`, and the role-cache stays
@@ -307,9 +307,9 @@ async fn e2e_primary_secondary_over_wss() {
 
 /// End-to-end: 1 primary + 1 secondary over real QUIC networking.
 ///
-/// Same Step-5b shape as the WSS sibling: primary's `peer_transport`
-/// is a `TunneledPeerTransport` paired against the `NetworkServer`,
-/// not `NoPeerTransport`. Pins the QUIC path's tunneled-peer wiring
+/// Same shape as the WSS sibling: primary's `peer_transport`
+/// is a `TunneledPeerTransport` paired against the `NetworkServer`.
+/// Pins the QUIC path's tunneled-peer wiring
 /// matches the WSS path (the accept loops both register through the
 /// same `new_conn_tx` channel; `drain_new_connections` mirrors into
 /// the shared writer table for both).

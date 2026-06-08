@@ -4,9 +4,7 @@
 //!
 //! Single primitive for "this node never speaks the primary-secondary
 //! wire protocol — every meaningful exchange travels via the peer
-//! mesh". Sibling stub to [`crate::NoPeerTransport`]: where
-//! `NoPeerTransport` is for single-secondary deployments that don't
-//! need a peer overlay, `NoPrimaryTransport` is for late-joining
+//! mesh". `NoPrimaryTransport` is for late-joining
 //! observer dispatchers that join the mesh via
 //! [`dynrunner_protocol_primary_secondary::PeerTransport::join_running_cluster`]
 //! and rely exclusively on the peer mesh (the edge resolves

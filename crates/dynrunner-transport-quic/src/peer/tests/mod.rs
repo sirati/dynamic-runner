@@ -10,8 +10,6 @@
 //!   authoritative disconnect detector + the `same_channel`
 //!   generation check that keeps a stale signal from pruning a
 //!   freshly-reconnected entry.
-//! - [`either`]: `NoPeerTransport` + `EitherPeerTransport::Disabled`
-//!   parity, plus `Real`-variant round-trip.
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
 //!   used only by the silent-reconnect scenario; kept here because
 //!   no other scenario observes the relay log trace.
@@ -29,7 +27,6 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct TestId(pub(crate) String);
 
 mod cert_parsing;
-mod either;
 mod log_capture;
 mod primary_link;
 mod reader_exit_disconnect;

@@ -265,8 +265,8 @@ pub struct SecondaryConfig {
     /// `is_observer` role advertisement). It
     /// is NOT itself the activation gate — the activation site reads
     /// `cluster_state.can_be_primary(self)` (the replicated marker, which
-    /// a client may also flip at runtime via `SetCanBePrimary`). A host
-    /// with no mesh / `disable_peer_overlay` or an observer joins with
+    /// a client may also flip at runtime via `SetCanBePrimary`). An
+    /// observer joins with
     /// `false` so the submitter never moves authority to it.
     ///
     /// Default `false` (regular non-overlay secondary).

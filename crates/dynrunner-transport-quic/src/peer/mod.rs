@@ -19,10 +19,8 @@ use crate::wss::WssListener;
 
 mod accept;
 mod dial;
-mod either;
 mod handler;
 mod mesh_send;
-mod no_peer;
 mod reconnect;
 mod transport_impl;
 mod util;
@@ -30,9 +28,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
-pub use either::EitherPeerTransport;
 pub use mesh_send::MeshSendHandle;
-pub use no_peer::NoPeerTransport;
 
 use mesh_send::MeshSend;
 
@@ -343,8 +339,8 @@ impl<I: Identifier> PeerNetwork<I> {
     ///
     /// The on-demand same-host `PrimaryCoordinator`'s send-proxy holds the
     /// returned handle to reach remote secondaries over the SAME mesh
-    /// this `PeerNetwork` owns (the secondary's `EitherPeerTransport::Real`
-    /// arm) — without aliasing this network's `connections` ownership.
+    /// this `PeerNetwork` owns (the secondary's peer mesh)
+    /// — without aliasing this network's `connections` ownership.
     /// Sends queued on the handle are drained + dispatched (relay-aware)
     /// inside [`Self::recv_peer`]. See the [`mesh_send`] module docs.
     pub fn mesh_send_handle(&self) -> MeshSendHandle<I> {

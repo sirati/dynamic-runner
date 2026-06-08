@@ -623,12 +623,11 @@ def _dispatch_secondary(task, args, logger) -> None:
             "stored but not yet enforced."
         )
 
-    # `--disable-peer-overlay` and `--log-oom-watcher` both live on
-    # `DistributedConfig` (the struct that already owns the
-    # peer-related + setup-phase tuning knobs). Construct an explicit
-    # DistributedConfig only when at least one flag deviates from the
-    # default; otherwise let `SecondaryConfig.__new__` install the
-    # stock default.
+    # `--log-oom-watcher` lives on `DistributedConfig` (the struct that
+    # already owns the peer-related + setup-phase tuning knobs).
+    # Construct an explicit DistributedConfig only when at least one
+    # flag deviates from the default; otherwise let
+    # `SecondaryConfig.__new__` install the stock default.
     dc_kwargs: dict[str, object] = {}
     # `--log-oom-watcher` rides through to the secondary via the
     # SLURM wrapper's `forwarded_argv` block (it's NOT a
@@ -637,8 +636,6 @@ def _dispatch_secondary(task, args, logger) -> None:
     # so the Rust-side `OomWatcher` picks it up.
     if getattr(args, "log_oom_watcher", False):
         dc_kwargs["log_oom_watcher"] = True
-    if args.disable_peer_overlay:
-        dc_kwargs["disable_peer_overlay"] = True
     # `--unconfigured-deadline-secs` rides through to the secondary the
     # same way (NOT a framework-regenerated flag, so it passes verbatim
     # in `forwarded_argv`); wire it onto THIS secondary's
@@ -797,24 +794,11 @@ def _dispatch_late_joiner(task, args, logger) -> None:
     """
     import dynamic_runner as _rs
 
-    # `--disable-peer-overlay` would tell the secondary to install
-    # `NoPeerTransport`; a late-joiner relies on the peer mesh as its
-    # ONLY transport (no primary URL is dialed — see Rust
-    # `no_primary.rs` for the design contract). The validator
-    # short-circuited the obvious-error case (`--secondary` +
-    # `--observer-join-from-peer-info-dir`); here we tolerate
-    # `--disable-peer-overlay` but skip applying it so the observer
-    # actually gets a working peer transport. The warning makes the
-    # silent override visible to the operator.
+    # A late-joiner relies on the peer mesh as its ONLY transport (no
+    # primary URL is dialed — see Rust `no_primary.rs` for the design
+    # contract), so it always uses the real `PeerNetwork` with the stock
+    # DistributedConfig default.
     distributed_config = None
-    if args.disable_peer_overlay:
-        logger.warning(
-            "--disable-peer-overlay is ignored under "
-            "--observer-join-from-peer-info-dir: the observer relies on "
-            "the peer mesh as its ONLY transport. Constructing the "
-            "observer with the real PeerNetwork; rerun without "
-            "--disable-peer-overlay to silence this warning."
-        )
 
     logger.info(
         f"Late-joiner observer: peer-info-dir={args.observer_join_from_peer_info_dir}"
