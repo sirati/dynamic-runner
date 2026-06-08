@@ -257,25 +257,24 @@ fn fire_initial_phase_starts_emits_one_starting_job_phase_important_event() {
 
     let (mut primary, _mesh) = make_primary();
 
+    // "build" carries a PENDING task — a genuinely cold/just-active phase
+    // that has never started. V3 seeds `phase_started_emitted` from
+    // PROGRESSED (InFlight/terminal) tasks only, so an all-`Pending` ledger
+    // leaves it EMPTY; `fire_initial_phase_starts` then fires exactly once for
+    // the one newly-active work-carrying phase, and the idempotent re-fire
+    // emits nothing. (Pre-V3 this seeded a COMPLETED toolchain and pinned a
+    // re-fire of the already-completed phase — exactly the resume re-fire V3
+    // now correctly suppresses; the once-per-phase emit guard this test pins
+    // is unchanged.)
     let toolchain = dep_binary("toolchain", "build", &[]);
-    let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+            deps: HashMap::new(),
         });
         cs.apply(ClusterMutation::TaskAdded {
             hash: "toolchain".into(),
             task: toolchain,
-        });
-        cs.apply(ClusterMutation::TaskCompleted {
-            attempt: 0,
-            hash: "toolchain".into(),
-            result_data: None,
-        });
-        cs.apply(ClusterMutation::TaskAdded {
-            hash: "dep-a".into(),
-            task: dep_a,
         });
     }
     primary.hydrate_from_cluster_state();

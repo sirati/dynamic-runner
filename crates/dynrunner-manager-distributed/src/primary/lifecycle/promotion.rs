@@ -34,12 +34,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
-        // The expected set is the live-secondaries set captured
+        // The expected set is the known-secondary roster captured
         // AT this moment (post-quorum, post-cert-exchange). It is
         // not `config.num_secondaries` because the connect phase
         // may have dropped no-show secondaries on its own
         // timeout — we only wait for who's actually here.
-        let expected: HashSet<String> = self.secondaries.keys().cloned().collect();
+        //
+        // V5: the roster READ routes through the replicated
+        // `cluster_state.known_secondaries()` (the CRDT-derived known set)
+        // rather than `self.secondaries` (transport-handle metadata only).
+        // Each connected secondary has a `SecondaryCapacity` record (the
+        // mesh-ready signal source) so the two sets coincide on the cold
+        // path; reading the CRDT keeps the roster reads uniform with the
+        // assignment-site read (assignment.rs).
+        let expected: HashSet<String> =
+            self.cluster_state.known_secondaries().map(String::from).collect();
         if expected.is_empty() {
             tracing::debug!("no secondaries connected; skipping wait_for_mesh_ready");
             return Ok(());

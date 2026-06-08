@@ -28,6 +28,7 @@ mod command_channel;
 mod config;
 mod connect;
 mod coordinator;
+mod discovery;
 mod error;
 mod fulfillability_matcher;
 mod heartbeat;

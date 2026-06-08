@@ -73,18 +73,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         batch: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     ) -> Result<(), RunError> {
-        // The cold-start `phase_started_emitted` reset lives HERE (the
-        // `ColdStart` seed's concern), NOT unconditionally in `run_pipeline`:
-        // a fresh seed's CRDT is all-`Pending`, so no phase has legitimately
-        // started yet and the set must begin empty so `fire_initial_phase_starts`
-        // can fire each phase's first `on_phase_start`. The `PromotionSnapshot`
-        // path NEVER calls this, so the projection
-        // `seed_from_promotion_snapshot` seeded from the inherited ledger
-        // survives there — the call site IS the discriminator (no runtime
-        // `if seeded`). The clear must precede the `#3a` duplicate
-        // `debug_assert!(phase_started_emitted.is_empty())` below so a
-        // coordinator reused across runs still satisfies that invariant.
-        self.phase_started_emitted.clear();
+        // NB: `phase_started_emitted` is NOT cleared here (V3). Seeding it is
+        // now `hydrate_from_cluster_state`'s sole concern, derived from the
+        // CRDT (`has_any && has-a-non-pending/blocked-task` per phase) on BOTH
+        // the cold and promote paths: a freshly-seeded cold CRDT is all
+        // `Pending`, so the derived set is empty (the equivalent of the old
+        // `.clear()`); a promotion's inherited ledger has progressed tasks, so
+        // its started phases are seeded. Removing the non-idempotent `.clear()`
+        // here makes `originate_cold_seed` re-runnable without wiping a
+        // legitimately-populated set (V1: idempotency-on-resume from the apply
+        // layer's TaskAdded/PhaseDepsSet NoOps PLUS no local non-idempotent
+        // side-effect). hydrate runs AFTER this in `run_pipeline`, so the
+        // derived seed reflects the just-applied cold ledger.
 
         // Sort by size descending for better packing — same intent as
         // pre-Phase-4b. The pool preserves insertion order within a bucket,
@@ -128,12 +128,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // seeding; `run_pipeline` fires the abort at the post-connection gate
         // so the `RunAborted` broadcast actually reaches the fleet.
         if !partition.duplicates.is_empty() {
-            debug_assert!(
-                self.phase_started_emitted.is_empty(),
-                "originate_cold_seed must run before fire_initial_phase_starts \
-                 (the 3a/3b discriminator); a non-empty phase_started_emitted \
-                 here means the seed order regressed"
-            );
+            // The #3a/#3b discriminator is STRUCTURAL — this path runs before
+            // `fire_initial_phase_starts`, so it is unconditionally pre-phase
+            // (3a). It does NOT read `phase_started_emitted` (whose seeding
+            // moved to hydrate, V3): the code-path ordering is the
+            // discriminator, not the set's emptiness.
             let reasons: Vec<String> = partition
                 .duplicates
                 .iter()
@@ -238,6 +237,63 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let batch = apply_locally_for_broadcast(&mut self.cluster_state, seed);
         self.pending_cold_seed_broadcast = batch.applied;
         Ok(())
+    }
+
+    /// Mode-2 relocated-seed origination: seed ONLY the phase graph + the
+    /// discovery-debt marker, NO tasks. The CRDT-pure replacement for the
+    /// deleted setup-defer handshake — the empty ledger + the `Owed` marker
+    /// IS the "awaiting seed" state a relocated compute-peer primary (or an
+    /// in-process `--source-already-staged` local primary) inherits and
+    /// resolves via [`Self::discover_on_promotion`].
+    ///
+    /// A SEPARATE originator (NOT a flag on [`Self::originate_cold_seed`],
+    /// whose body is dense with #2/#3a ingest classification that is
+    /// meaningless for an empty relocated seed — folding a `declare_debt`
+    /// flag in would add a mode-`if` to a single-concern function):
+    ///   1. `PhaseDepsSet { deps: phase_deps }` so every replica — including
+    ///      the compute-peer primary that will run discovery — has the phase
+    ///      graph before hydrate (the consumer declares the phase graph
+    ///      independent of discovery, which only resolves the per-task list).
+    ///   2. `DiscoveryDebtDeclared` — ratchets `discovery_debt` `Undeclared →
+    ///      Owed`, the signal `discover_on_promotion` gates on.
+    ///
+    /// Seeds NO `TaskAdded` (there are no tasks yet) and sets
+    /// `self.all_binaries = Vec::new()`. The staged version-stamped frames
+    /// ship post-connect via the existing [`Self::broadcast_cold_seed`]
+    /// drain (it ships `pending_cold_seed_broadcast` verbatim; the relocated
+    /// seed reuses that staging field). The local apply lands the marker on
+    /// THIS node so the seed is coherent with its own ledger even before the
+    /// broadcast reaches the fleet.
+    // The PRODUCTION caller (the mode-2 submitter + the in-process
+    // `--source-already-staged` pre-staged path) is wired in Phase 5c (the
+    // pyo3 recipe + in-process rewire); 5b builds the Rust mechanism + the
+    // test caller (`primary/tests/setup_promote.rs`). The lib target sees no
+    // production call until 5c, so allow dead_code here meanwhile.
+    #[allow(dead_code)]
+    pub(crate) fn originate_relocated_seed(
+        &mut self,
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    ) {
+        // Capture the canonical phase-deps graph for the run (mirrors
+        // `originate_cold_seed`): the `PhaseDepsSet` mutation replicates it so
+        // every replica's `cluster_state.phase_deps` mirrors the same map,
+        // and the post-discovery hydrate consults it to rebuild the pool.
+        self.phase_deps = phase_deps.clone();
+        // No tasks discovered yet — the relocated/local primary runs
+        // discovery itself post-connect.
+        self.all_binaries = Vec::new();
+
+        let seed: Vec<ClusterMutation<I>> = vec![
+            ClusterMutation::PhaseDepsSet { deps: phase_deps },
+            ClusterMutation::DiscoveryDebtDeclared,
+        ];
+        // Apply locally (stamps versions, filters NoOps) and STAGE the
+        // applied frames for the post-connection broadcast — the same split
+        // across the connect boundary `originate_cold_seed` uses (a
+        // pre-connection broadcast is dropped). `broadcast_cold_seed` ships
+        // `pending_cold_seed_broadcast` verbatim.
+        let batch = apply_locally_for_broadcast(&mut self.cluster_state, seed);
+        self.pending_cold_seed_broadcast = batch.applied;
     }
 
     /// Broadcast the staged cold-start seed frames to the connected fleet.

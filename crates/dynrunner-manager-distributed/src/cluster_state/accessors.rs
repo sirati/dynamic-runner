@@ -432,14 +432,16 @@ impl<I: Identifier> ClusterState<I> {
         self.run_aborted.as_deref()
     }
 
-    /// The replicated per-run discovery-debt latch (V6). `Settled` (the
-    /// default) means no discovery is owed — the run was cold-seeded
-    /// (mode-1 / legacy) or its discovery has completed; `Owed` means a
-    /// relocated compute-peer primary still owes a `discover_items` seed.
-    /// Sticky-monotone: ratchets `Owed → Settled`, never back (the mirror
-    /// of [`Self::run_complete`]'s `false → true` ratchet, with `Settled`
-    /// as the lattice TOP). The discover-on-promotion driver (Phase 5b)
-    /// gates on `== Owed`.
+    /// The replicated per-run discovery-debt latch (V6). `Undeclared` (the
+    /// default/bottom) means no discovery is owed — the run was cold-seeded
+    /// (mode-1 / legacy) or never declared debt; `Owed` means a relocated
+    /// compute-peer primary still owes a `discover_items` seed; `Settled`
+    /// (the lattice TOP) means its discovery has completed (the tasks are now
+    /// in the CRDT). Sticky-monotone THREE-state lattice: ratchets only UP
+    /// (`Undeclared → Owed → Settled`), never back (join = `max` over
+    /// `Undeclared ⊑ Owed ⊑ Settled`). The discover-on-promotion driver
+    /// (Phase 5b) gates on `== Owed`; both `Undeclared` and `Settled` are
+    /// `!= Owed`, so a cold/legacy run and a post-discovery run alike skip it.
     pub fn discovery_debt(&self) -> DiscoveryDebt {
         self.discovery_debt
     }

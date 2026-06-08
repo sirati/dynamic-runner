@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier};
-use dynrunner_protocol_primary_secondary::MessageType;
+use dynrunner_protocol_primary_secondary::{DiscoveryDebt, MessageType};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::primary::PrimaryCoordinator;
@@ -73,10 +73,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // guarantees we only exit when every dispatched
         // assignment has been reconciled.
         let active_workers = self.workers.iter().filter(|w| !w.is_idle()).count();
+        // Discovery-owed gate (V6): while the CRDT declares discovery `Owed`
+        // the ledger has not yet been seeded (`total_tasks == 0` and every
+        // declared phase is a transiently-empty `Active`), so the counter
+        // exit (`0+0 >= 0`) and the pool-drain exit would both false-fire
+        // "the run is done" before any task exists. Both are skipped together
+        // until `discover_on_promotion` originates `DiscoverySettled`
+        // (flipping `Owed → Settled`). On every cold mode-1 / legacy /
+        // already-seeded path the marker is `Undeclared`/`Settled` (`!= Owed`),
+        // so these exits run unchanged. The replicated-ledger `RunComplete`
+        // arm below is a real terminal cue and is NOT gated — an external
+        // authority's `RunComplete`, and the empty-corpus terminal
+        // `discover_on_promotion` itself originates, must still exit even
+        // mid-debt.
+        let discovery_owed = self.cluster_state.discovery_debt() == DiscoveryDebt::Owed;
         // Counter-based exit: every task accounted for (completed or
         // failed) and no worker mid-dispatch. Re-read every iteration
         // so lazy `spawn_tasks` / `TasksSpawned` growth is absorbed.
-        if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+        if !discovery_owed
+            && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
             && active_workers == 0
         {
             tracing::info!("all tasks completed or failed");
@@ -89,7 +104,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // where in-flight is zero but a worker hasn't reported
         // completion yet (mostly defensive — `on_item_finished`
         // runs synchronously off the wire message).
-        if self.pool().is_run_complete() && active_workers == 0 {
+        if !discovery_owed && self.pool().is_run_complete() && active_workers == 0 {
             tracing::info!("pool drained and no active workers");
             return true;
         }
