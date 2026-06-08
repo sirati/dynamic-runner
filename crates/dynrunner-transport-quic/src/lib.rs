@@ -8,6 +8,6 @@ pub mod wss;
 pub use certs::CertPair;
 pub use network::{NetworkClient, NetworkServer};
 pub use no_primary::NoPrimaryTransport;
-pub use peer::{EitherPeerTransport, MeshSendHandle, NoPeerTransport, PeerNetwork};
+pub use peer::{MeshSendHandle, PeerNetwork};
 pub use transport::{QuicConnection, QuicListener};
 pub use wss::{WssConnection, WssListener};

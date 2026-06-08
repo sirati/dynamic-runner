@@ -36,13 +36,6 @@ pub(crate) struct DistributedConfig {
     /// `PrimaryConfig.oom_retry_max_passes` (Rust) for the per-bucket
     /// scope and the LMU-regression rationale.
     oom_retry_max_passes: u32,
-    /// When true, the secondary skips starting a `PeerNetwork` and
-    /// uses `NoPeerTransport` instead. Intended for clusters that
-    /// firewall inter-compute-node networking (LMU SLURM and similar)
-    /// where every peer dial would time out anyway. Note: this
-    /// disables the failover/promote-primary path — with no
-    /// peer mesh, primary loss = job loss.
-    disable_peer_overlay: bool,
     /// R1 primary-link failover threshold: number of recv-None probes
     /// after which the secondary arms failover. Defaults to 5
     /// (matches `dynrunner_manager_distributed::secondary::primary_link::DEFAULT_FAILURE_THRESHOLD`).
@@ -106,7 +99,6 @@ impl Default for DistributedConfig {
             keepalive_miss_threshold: 3,
             retry_max_passes: 1,
             oom_retry_max_passes: 1,
-            disable_peer_overlay: false,
             primary_link_failure_threshold: 5,
             primary_link_failure_window_secs: 30.0,
             unconfigured_deadline_secs: 600.0,
@@ -128,7 +120,6 @@ impl DistributedConfig {
         keepalive_miss_threshold = None,
         retry_max_passes = None,
         oom_retry_max_passes = None,
-        disable_peer_overlay = None,
         primary_link_failure_threshold = None,
         primary_link_failure_window_secs = None,
         unconfigured_deadline_secs = None,
@@ -147,7 +138,6 @@ impl DistributedConfig {
         keepalive_miss_threshold: Option<u32>,
         retry_max_passes: Option<u32>,
         oom_retry_max_passes: Option<u32>,
-        disable_peer_overlay: Option<bool>,
         primary_link_failure_threshold: Option<u32>,
         primary_link_failure_window_secs: Option<f64>,
         unconfigured_deadline_secs: Option<f64>,
@@ -171,7 +161,6 @@ impl DistributedConfig {
                 .unwrap_or(d.keepalive_miss_threshold),
             retry_max_passes: effective_retry_max_passes,
             oom_retry_max_passes: oom_retry_max_passes.unwrap_or(effective_retry_max_passes),
-            disable_peer_overlay: disable_peer_overlay.unwrap_or(d.disable_peer_overlay),
             primary_link_failure_threshold: primary_link_failure_threshold
                 .unwrap_or(d.primary_link_failure_threshold),
             primary_link_failure_window_secs: primary_link_failure_window_secs
@@ -209,9 +198,6 @@ impl DistributedConfig {
     pub(crate) fn oom_retry_max_passes(&self) -> u32 {
         self.oom_retry_max_passes
     }
-    pub(crate) fn disable_peer_overlay(&self) -> bool {
-        self.disable_peer_overlay
-    }
     pub(crate) fn primary_link_failure_threshold(&self) -> u32 {
         self.primary_link_failure_threshold
     }
@@ -247,7 +233,7 @@ mod tests {
         );
         // And via the kwarg-merge constructor with everything omitted.
         let cfg = DistributedConfig::new(
-            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
             /* unconfigured_deadline_secs */ None, None, None, None,
         );
         assert_eq!(
@@ -264,7 +250,6 @@ mod tests {
     #[test]
     fn unconfigured_deadline_kwarg_propagates() {
         let cfg = DistributedConfig::new(
-            None,
             None,
             None,
             None,

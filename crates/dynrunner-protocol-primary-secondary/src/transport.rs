@@ -199,8 +199,8 @@ pub trait PeerTransport<I: Identifier> {
     /// joiner's own entry when iterating the seed list.
     ///
     /// Default impl returns the empty string: transports whose join
-    /// path never needs a self-identifying return address (the
-    /// `NoPeerTransport` arm, or any transport that pre-wires its
+    /// path never needs a self-identifying return address (any
+    /// transport that pre-wires its
     /// mesh) compile cleanly without overriding. A transport that
     /// participates in the snapshot-bootstrap rendezvous overrides to
     /// return its real id so the responder's `PeerJoined` broadcast

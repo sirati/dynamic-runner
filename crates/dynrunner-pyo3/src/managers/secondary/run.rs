@@ -60,7 +60,6 @@ impl PySecondaryCoordinator {
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
         let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
-        let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
@@ -279,13 +278,8 @@ impl PySecondaryCoordinator {
 
                 // Stand up the secondary's mesh transport through the
                 // backend-opaque factory. It owns every backend-naming
-                // step: the WSS dial + retry loop, the peer-overlay
-                // selection (real peer mesh for normal clusters vs the
-                // firewalled no-overlay path for clusters that firewall
-                // inter-compute-node networking — selection comes from
-                // `DistributedConfig.disable_peer_overlay`, see the CLI
-                // flag's help text for the failover-incompat caveat),
-                // reading the backend's cert + QUIC port into the
+                // step: the WSS dial + retry loop, starting the peer
+                // mesh, reading the backend's cert + QUIC port into the
                 // `PeerCertInfo` the `CertExchange` ships, extracting the
                 // mesh-send capability, and folding the dialed bootstrap
                 // wire into the mesh under the primary's peer-id ("the
@@ -312,7 +306,6 @@ impl PySecondaryCoordinator {
                         addr,
                         connect_timeout: dist_connect_timeout,
                         retry_delay: dist_connect_retry_delay,
-                        disable_peer_overlay: dist_disable_peer_overlay,
                         secondary_id: &secondary_id,
                         bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
                         ipv4_address: Some(detect_ipv4(None)),
@@ -323,10 +316,9 @@ impl PySecondaryCoordinator {
                 .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
                 let peer_network = mesh_bundle.transport;
                 let secondary_cert_info = mesh_bundle.peer_cert_info;
-                // Cloneable mesh-send capability (`Some` only when a real
-                // peer mesh exists — `Disabled` overlays have no remote
-                // secondaries and thus no failover, so the secondary's
-                // `can_be_primary` marker is `false`). See `MeshSendHandle`.
+                // Cloneable mesh-send capability over the secondary's
+                // peer mesh; the secondary's `can_be_primary` marker
+                // reads `is_some()`. See `MeshSendHandle`.
                 let mesh_send_handle = mesh_bundle.mesh_send;
 
                 let config = SecondaryConfig {
@@ -352,11 +344,9 @@ impl PySecondaryCoordinator {
                     // Primary-capability marker (twin of the wire `is_observer`
                     // role advertisement): a
                     // compute secondary can host the primary ON DEMAND iff
-                    // a REAL peer mesh is present (`mesh_send_handle`), so
+                    // a peer mesh is present (`mesh_send_handle`), so
                     // it can construct a `PrimaryCoordinator` when named.
-                    // A `disable_peer_overlay` host has no mesh handle and
-                    // joins with `false`, so the submitter never relocates
-                    // to it ("primary loss = job loss"). Advertised in the
+                    // Advertised in the
                     // `SecondaryWelcome`; recorded in the replicated
                     // `RoleTable.can_be_primary` the submitter reads.
                     can_be_primary: mesh_send_handle.is_some(),

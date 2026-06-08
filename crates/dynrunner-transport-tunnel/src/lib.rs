@@ -46,16 +46,6 @@
 //! both use the `current_thread` flavour and `spawn_local`). The
 //! workspace's `clippy::await_holding_refcell_ref = "deny"` lint
 //! catches any future regression that holds a borrow across an await.
-//!
-//! # What stays available on the SECONDARY side
-//!
-//! `dynrunner_transport_quic::NoPeerTransport` is unaffected by this
-//! crate and remains the right choice for the
-//! `disable_peer_overlay` path (firewalled inter-compute fabrics like
-//! LMU SLURM). The primary's call sites stop using `NoPeerTransport`
-//! once their constructors thread [`TunneledPeerTransport`] through;
-//! secondary call sites keep it for as long as that disable path
-//! exists.
 
 mod transport;
 

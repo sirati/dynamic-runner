@@ -9,14 +9,14 @@
 //! `Tr: PeerTransport` and address peers by id. Before this module the
 //! four pyo3 manager `run.rs` constructors each named a concrete
 //! backend (`NetworkServer`, `NetworkClient`, `PeerNetwork`,
-//! `EitherPeerTransport`, `NoPeerTransport`, `TunneledPeerTransport`,
+//! `TunneledPeerTransport`,
 //! `ChannelPeerTransport`) and read
 //! backend-only scalars off it (`.port()`, `.cert_pem()`), so the
 //! backend choice leaked across the manager boundary.
 //!
 //! This factory closes that leak. Per run-mode it constructs the
 //! backend, performs the backend-specific bootstrap (bind / dial+retry
-//! / peer-overlay selection / bootstrap-wire fold), and hands the
+//! / bootstrap-wire fold), and hands the
 //! manager back an **opaque** `impl PeerTransport` plus the
 //! backend-derived values the manager still needs (the respawn trust
 //! anchor, the `PeerCertInfo` a secondary/observer ships in its
@@ -36,7 +36,7 @@
 use dynrunner_core::{Identifier, SETUP_NODE_ID};
 use dynrunner_manager_distributed::PeerCertInfo;
 use dynrunner_transport_quic::{
-    EitherPeerTransport, MeshSendHandle, NetworkClient, NetworkServer, NoPeerTransport, PeerNetwork,
+    MeshSendHandle, NetworkClient, NetworkServer, PeerNetwork,
 };
 use dynrunner_transport_tunnel::{InboundTap, SharedOutgoing, TunneledPeerTransport};
 
@@ -118,15 +118,13 @@ pub(crate) async fn bind_primary_mesh<I: Identifier>(
 pub(crate) struct SecondaryMeshBundle<I: Identifier> {
     /// The opaque mesh transport the `SecondaryCoordinator` holds by
     /// value, with the bootstrap primary wire already folded in.
-    pub transport: EitherPeerTransport<I>,
+    pub transport: PeerNetwork<I>,
     /// The `PeerCertInfo` this secondary ships in its `CertExchange`,
     /// built from the backend's cert PEM + QUIC port (so the manager
     /// never reads `.cert_pem()` / `.port()` itself).
     pub peer_cert_info: PeerCertInfo,
-    /// Cloneable mesh-send capability — `Some` only when a REAL peer
-    /// mesh exists (a `Disabled` overlay has no remote secondaries and
-    /// thus no failover). The manager reads `is_some()` as the
-    /// primary-capability marker.
+    /// Cloneable mesh-send capability over the secondary's peer mesh.
+    /// The manager reads `is_some()` as the primary-capability marker.
     pub mesh_send: Option<MeshSendHandle<I>>,
 }
 
@@ -139,8 +137,6 @@ pub(crate) struct SecondaryDialParams<'a> {
     pub connect_timeout: std::time::Duration,
     /// Delay between dial attempts.
     pub retry_delay: std::time::Duration,
-    /// Select the firewalled (no inter-compute dialing) fabric.
-    pub disable_peer_overlay: bool,
     /// This secondary's logical id (the peer-mesh cert CN).
     pub secondary_id: &'a str,
     /// Peer-id the folded bootstrap wire is keyed under (the
@@ -155,11 +151,10 @@ pub(crate) struct SecondaryDialParams<'a> {
 /// Dial the bootstrap primary and build the secondary's mesh transport.
 ///
 /// Encapsulates every backend-naming step on the secondary path: the
-/// WSS dial + retry loop, the peer-overlay selection (real `PeerNetwork`
-/// vs the firewalled `NoPeerTransport`), reading the backend's cert /
-/// port into a `PeerCertInfo`, extracting the mesh-send capability, and
-/// folding the dialed bootstrap wire into the mesh under the primary's
-/// peer-id (`register_primary_link`).
+/// WSS dial + retry loop, starting the real `PeerNetwork`, reading the
+/// backend's cert / port into a `PeerCertInfo`, extracting the mesh-send
+/// capability, and folding the dialed bootstrap wire into the mesh under
+/// the primary's peer-id (`register_primary_link`).
 ///
 /// Must run inside the coordinator's `LocalSet`.
 pub(crate) async fn dial_secondary_mesh<I: Identifier>(
@@ -169,7 +164,6 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         addr,
         connect_timeout,
         retry_delay,
-        disable_peer_overlay,
         secondary_id,
         bootstrap_primary_id,
         ipv4_address,
@@ -221,37 +215,22 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         }
     };
 
-    // Pick the peer transport at runtime: real `PeerNetwork` for normal
-    // clusters, `NoPeerTransport` for clusters that firewall
-    // inter-compute-node networking (LMU SLURM, etc.) where every peer
-    // dial would time out anyway. The identity passed to
+    // Start the secondary's peer mesh. The identity passed to
     // `PeerNetwork::start` is BOTH the CN baked into this secondary's
     // QUIC certificate AND the `peer_id` other secondaries pass to
     // quinn's `connect(addr, server_name)` to validate that cert — the
     // primary distributes peer info keyed by `secondary_id` (the logical
     // id), so the cert CN must match the logical id.
-    let (mut transport, cert_pem, port): (EitherPeerTransport<I>, String, u16) =
-        if disable_peer_overlay {
-            tracing::info!("peer overlay disabled by config; using NoPeerTransport");
-            (
-                EitherPeerTransport::Disabled(NoPeerTransport),
-                String::new(),
-                0,
-            )
-        } else {
-            let pn = PeerNetwork::<I>::start(secondary_id).await.map_err(|e| {
-                tracing::error!(error = %e, "failed to start peer network");
-                format!("peer network start failed: {e}")
-            })?;
-            let cert_pem = pn.cert_pem().to_string();
-            let port = pn.port();
-            (EitherPeerTransport::Real(Box::new(pn)), cert_pem, port)
-        };
+    let mut transport = PeerNetwork::<I>::start(secondary_id).await.map_err(|e| {
+        tracing::error!(error = %e, "failed to start peer network");
+        format!("peer network start failed: {e}")
+    })?;
+    let cert_pem = transport.cert_pem().to_string();
+    let port = transport.port();
 
-    // Cloneable mesh-send capability (`Some` only when a real peer mesh
-    // exists). Taken BEFORE the bootstrap wire fold so the handle reflects
-    // the live `PeerNetwork`.
-    let mesh_send = transport.mesh_send_handle();
+    // Cloneable mesh-send capability. Taken BEFORE the bootstrap wire fold
+    // so the handle reflects the live `PeerNetwork`.
+    let mesh_send = Some(transport.mesh_send_handle());
 
     // Fold the dialed primary bootstrap wire into the mesh as a
     // directed-routable member keyed by the primary's peer-id: BOTH the

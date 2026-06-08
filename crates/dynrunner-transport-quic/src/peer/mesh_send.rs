@@ -3,8 +3,8 @@
 //!
 //! # Concern
 //!
-//! A node owns a SINGLE [`PeerNetwork`] mesh, held by value behind the
-//! `EitherPeerTransport`. A second consumer on the same `LocalSet` may
+//! A node owns a SINGLE [`PeerNetwork`] mesh, held by value. A second
+//! consumer on the same `LocalSet` may
 //! still need to reach the mesh's remote peers without taking ownership
 //! of the `connections` table — this handle is that cloneable mesh-send
 //! view.
