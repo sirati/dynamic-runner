@@ -9,7 +9,9 @@ use crate::primary::command_channel::PrimaryCommand;
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Block on every connected secondary reporting `MeshReady`
-    /// before letting `promote_primary` fire. The 750µs gap
+    /// before this operational primary asserts authority
+    /// (`activate_local_primary`) and starts driving dispatch over
+    /// the peer mesh. The 750µs gap
     /// between "all secondaries cert-exchanged" and the previous
     /// promotion call left the promoted secondary
     /// authoritative against a still-forming peer mesh — every
@@ -18,6 +20,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// each secondary has signalled its mesh has settled (mesh
     /// formed, watchdog elapsed, or no peers were expected for
     /// single-secondary).
+    ///
+    /// CALLED ONLY on the `BootstrapRole::PromotedDestination` arm of
+    /// `run_pipeline`, AFTER `perform_initial_assignment` +
+    /// `send_transfer_complete`. `MeshReady` is the secondary's report
+    /// from its OPERATIONAL loop, which it reaches only after consuming an
+    /// `InitialAssignment` — so the report is satisfiable only once an
+    /// operational primary has sent one. The SETUP PEER (which relocates
+    /// the role away without ever sending an assignment) must NOT call
+    /// this: gating its relocate on a signal it never triggers is a
+    /// circular deadlock. The setup peer relies instead on the
+    /// transport-level peer-mesh formation the Node pump drives off
+    /// `PeerInfo` (transport ⊥ role/operational), which makes its
+    /// `PrimaryChanged { Transferred }` route over the live links without
+    /// any operational handshake.
     ///
     /// Bounded by `config.mesh_ready_timeout` (default 60s):
     /// stragglers past the deadline log a warning and the run
