@@ -716,6 +716,18 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// arm never consults it.
     pub(super) respawn_budget: Option<RespawnBudget>,
 
+    /// Transport-recovery port handed to the observer at relocation
+    /// (BUG-B reconnect). The submitter primary never uses it itself —
+    /// it carries it ONLY so that when this primary relocates onto a
+    /// compute peer and steps down into a standalone observer, the
+    /// observer can rebuild its dropped `-R` reverse tunnels (the
+    /// submitter's transport has no dial path / no QUIC reconnect ticker).
+    /// `None` on backends whose transport heals its own links (e.g.
+    /// `--multi-computer local` mpsc mesh). Wired from the deployment
+    /// layer via [`Self::set_tunnel_reconnector`], symmetric with
+    /// `respawn_spawner`. See [`crate::observer::reconnect`].
+    pub(super) tunnel_reconnector: crate::observer::ReconnectorHandle,
+
     /// Sender side of the dispatcher → operational-loop respawn
     /// request channel. Cloned into the registered listener at
     /// `run()` start so synchronous `on_event` calls have a place
@@ -1007,6 +1019,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_tasks: JoinSet::new(),
             respawn_spawner: None,
             respawn_budget: None,
+            tunnel_reconnector: None,
             respawn_request_tx: None,
             respawn_request_rx: None,
             respawn_primary_endpoint: String::new(),
@@ -1345,6 +1358,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// [`Self::slurm_job_manager`] back to the concrete handle it parked.
     pub fn set_slurm_job_manager(&mut self, jm: Arc<dyn Any + Send + Sync>) {
         self.slurm_job_manager = Some(jm);
+    }
+
+    /// Install the transport-recovery port (BUG-B reconnect) the submitter
+    /// primary hands to its observer tail at relocation. The submitter
+    /// never reconnects itself — it stays the primary until it relocates —
+    /// so this is pure forward-wiring: when the primary relocates onto a
+    /// compute peer and `into_observer_handoff` runs, the observer inherits
+    /// this handle and uses it to rebuild dropped `-R` reverse tunnels.
+    /// Must be set BEFORE `run()` enters (pre-run wiring contract, same as
+    /// [`Self::set_slurm_job_manager`] / [`Self::enable_respawn`]). Absence
+    /// leaves the observer with no reconnector (the transport-self-heals
+    /// path). See [`crate::observer::reconnect`].
+    pub fn set_tunnel_reconnector(&mut self, reconnector: Arc<dyn crate::observer::TunnelReconnector>) {
+        self.tunnel_reconnector = Some(reconnector);
     }
 
     /// Read the parked deployment-mode job manager. Returns `None`
@@ -2564,6 +2591,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             lifecycle_dispatcher_handle,
             task_completed_dispatcher_handle,
             panik_signal_rx,
+            tunnel_reconnector,
             ..
         } = self;
 
@@ -2596,6 +2624,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             lifecycle_dispatcher_handle: lifecycle_dispatcher_handle
                 .expect("peer-lifecycle dispatcher spawned at run_pipeline entry"),
             holdings: HashSet::new(),
+            // Hand the observer the transport-recovery port so it can
+            // rebuild its dropped `-R` reverse tunnels (BUG-B reconnect).
+            // `None` on backends that self-heal — the observer then has
+            // nothing to drive.
+            reconnector: tunnel_reconnector,
         }
     }
 

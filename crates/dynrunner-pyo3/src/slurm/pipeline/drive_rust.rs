@@ -242,6 +242,41 @@ pub(super) fn drive_rust_primary<'py>(
             .set_slurm_job_manager_from_rust(arc);
     }
 
+    // Wire the observer's transport-recovery port (BUG-B reconnect) onto
+    // the coordinator so that when this submitter primary relocates onto a
+    // compute peer and steps down into a standalone observer, the observer
+    // can rebuild its dropped `-R` reverse tunnels. UNCONDITIONAL on the
+    // tunnel manager being present (reverse-connection mode) — independent
+    // of `--respawn-policy`: a passive observer rebuilds the EXISTING
+    // per-secondary tunnels when they blip, it never re-spawns SLURM jobs.
+    // Built from the SAME `Arc<SlurmPreparation>` the cohort setup used, so
+    // a rebuilt tunnel rejoins the shared cleanup set + rate-limiter.
+    // Skipped silently when there is no tunnel manager (non-reverse
+    // topology) — that path's transport has no `-R` to rebuild.
+    if let Some(mgr) = tunnel_manager.as_ref()
+        && let Ok(prep) = mgr
+            .bind(py)
+            .cast::<crate::slurm::preparation::PySlurmPreparation>()
+    {
+        let (preparation_arc, info_reader) = {
+            let prep_borrow = prep.borrow();
+            (
+                prep_borrow.arc_handle(),
+                crate::slurm::preparation::PyGatewayReader::new(prep_borrow.gateway_handle(py)),
+            )
+        };
+        let reconnector: std::sync::Arc<
+            dyn dynrunner_manager_distributed::observer::TunnelReconnector,
+        > = std::sync::Arc::new(dynrunner_slurm::SlurmPreparationTunnelReconnector::new(
+            preparation_arc,
+            info_reader,
+        ));
+        coord
+            .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
+            .borrow_mut()
+            .set_tunnel_reconnector_from_rust(reconnector);
+    }
+
     let coord_uses_file_based: bool = coord.getattr("uses_file_based_items")?.extract()?;
 
     if !coord_uses_file_based {

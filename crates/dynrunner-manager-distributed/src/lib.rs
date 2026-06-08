@@ -47,6 +47,7 @@ pub use dynrunner_protocol_primary_secondary::{RoleChangeHookRegistrar, RoleTabl
 // import path so consumers don't have to descend into the submodule.
 pub use observer::{
     AnnounceTrigger, AnnouncerHandle, AnnouncerSender, ErrorAggregationPolicy,
-    InvalidTaskMonitorPolicy, PeerResourceHoldingsUpdatedPayload, Reporter, SharedSnapshotSource,
-    StatsSnapshot, TokioClock, attach_observer_announcer, run_observer_announcer, run_reporter,
+    InvalidTaskMonitorPolicy, PeerResourceHoldingsUpdatedPayload, ReconnectorHandle, Reporter,
+    SharedSnapshotSource, StatsSnapshot, TokioClock, TunnelReconnector, attach_observer_announcer,
+    run_observer_announcer, run_reporter,
 };

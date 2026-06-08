@@ -57,6 +57,12 @@ impl PyPrimaryCoordinator {
         // in-process / network-primary paths that never wire it.
         let slurm_job_manager = self.slurm_job_manager.take();
 
+        // The observer's transport-recovery port (BUG-B reconnect). Parked
+        // by the SLURM pipeline in reverse-connection mode; carried onto the
+        // observer tail via `set_tunnel_reconnector` below. `None` for
+        // self-healing-transport paths.
+        let tunnel_reconnector = self.tunnel_reconnector.take();
+
         // Materialise the respawn pipeline wiring. Only the
         // (budget, spawner) pair is meaningful — when either is
         // absent the inner coordinator's respawn pipeline stays
@@ -451,6 +457,15 @@ impl PyPrimaryCoordinator {
                 // late installs would be invisible.
                 if let Some(jm) = slurm_job_manager {
                     primary.set_slurm_job_manager(jm);
+                }
+
+                // Carry the observer's transport-recovery port onto the
+                // coordinator BEFORE `run()` enters — `into_observer_handoff`
+                // reads it at relocation to hand the observer its `-R`
+                // tunnel-rebuild capability (BUG-B). Same pre-run contract as
+                // the job-manager relay above.
+                if let Some(reconnector) = tunnel_reconnector {
+                    primary.set_tunnel_reconnector(reconnector);
                 }
 
                 // Wire the respawn pipeline iff both a budget and a

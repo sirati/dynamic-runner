@@ -4,11 +4,20 @@
 //!
 //! ONE concern: track whether the zero-authority observer currently has
 //! visibility into the run (any peer reachable, the named primary not
-//! silent) and emit operator-facing reports when that visibility is LOST,
-//! recurs while still lost, or is REGAINED. It NEVER decides an exit — a
-//! lost-visibility observer keeps observing (the existing transport
-//! reconnect ticker redials the wire underneath it), reporting that it is
-//! retrying, until it OBSERVES the primary's run-terminal via the CRDT.
+//! silent), emit operator-facing reports when that visibility is LOST,
+//! recurs while still lost, or is REGAINED, AND tell the coordinator when
+//! a reconnect ATTEMPT is due (the same ~60s cadence as the recurrence
+//! report — one clock, one concern). It NEVER decides an exit — a
+//! lost-visibility observer keeps observing, reporting + retrying, until
+//! it OBSERVES the primary's run-terminal via the CRDT.
+//!
+//! This module owns the report/retry CADENCE (the lost-since clock + the
+//! "is an attempt due" decision); it does NOT own the reconnect MECHANISM
+//! — the coordinator acts on the returned [`RetryDirective`] by triggering
+//! the [`super::reconnect::TunnelReconnector`] port (which the provider
+//! layer rebuilds the `-R` tunnel behind). The split keeps the cadence
+//! state in one place and the ssh-rebuild concern out of this state
+//! machine entirely.
 //!
 //! # Why this exists (the BUG-B sever)
 //!
@@ -19,10 +28,25 @@
 //! observer carries ZERO authority over the job: its OWN loss of transport
 //! view says "I (observer) lost visibility", NOT "the cluster died". The
 //! compute mesh (primary + secondaries, directly meshed) keeps running
-//! autonomously; the by-design `-R` setup-tunnel drop after relocation
-//! must cause no hiccup. So visibility loss can never be the run's verdict.
-//! This reporter REPLACES the §5/§6 strand-exit: it reports lost + retries,
-//! the observer never self-strands.
+//! autonomously. So visibility loss can never be the run's verdict. This
+//! reporter REPLACES the §5/§6 strand-exit: it reports lost + retries, the
+//! observer never self-strands.
+//!
+//! # Why the observer must DRIVE the reconnect (the `-R` rebuild)
+//!
+//! The relocated submitter→observer inherits the submitter's
+//! [`dynrunner_transport_tunnel::TunneledPeerTransport`]: the compute peers
+//! DIAL the submitter over per-secondary `ssh -R` reverse tunnels, the
+//! submitter never dials out, and that transport has NO QUIC reconnect
+//! ticker (the ticker lives only on the secondary/late-joiner
+//! `PeerNetwork`). So when a `-R` tunnel drops (an external ssh blip /
+//! `ServerAliveCountMax` exhaustion — there is no auto-reconnect on the ssh
+//! side), NOTHING re-establishes the link on its own: the compute peer's
+//! redial can't punch through a dead `-R`, and the observer's transport
+//! cannot dial. The observer MUST actively trigger a `-R` rebuild. This
+//! reporter therefore tells the coordinator when an attempt is due (the
+//! returned [`RetryDirective`]); the coordinator fires the
+//! [`super::reconnect::TunnelReconnector`] port.
 //!
 //! # Boundary
 //!
@@ -31,9 +55,10 @@
 //! primary) and the run-loop tick that drives the recurrence cadence. Each
 //! top-of-loop it hands this reporter the CURRENT visibility verdict; the
 //! reporter owns only the report-state machine (lost-since clock, last
-//! report instant, the operator-facing emits). The actual wire reconnect
-//! is the transport's role-blind concern (`transport-quic` reconnect
-//! ticker); this reporter narrates that retry, it does not drive the dial.
+//! report instant, the operator-facing emits) and returns whether a
+//! reconnect attempt is due this iteration. It does NOT name a transport,
+//! drive a dial, or know about ssh — the coordinator acts on the returned
+//! directive by triggering the reconnect port.
 
 use std::time::{Duration, Instant};
 
@@ -59,6 +84,27 @@ pub enum Visibility {
     Lost { reason: String },
 }
 
+/// What the coordinator should do this iteration, returned from
+/// [`LostVisibilityReporter::observe`]. The reporter owns the cadence
+/// (lost-since clock + the ~60s recurrence), the coordinator owns the
+/// action (trigger the reconnect port). NEVER an exit — visibility loss
+/// is not a run verdict (BUG-B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryDirective {
+    /// Visibility is fine (or just regained) — nothing to do.
+    Idle,
+    /// Visibility is currently lost AND a reconnect attempt is due this
+    /// iteration (the first lost loop, then once per recurrence interval).
+    /// The coordinator should trigger the [`super::reconnect::TunnelReconnector`]
+    /// with its current roster. The same cadence as the recurrence report,
+    /// so a single clock drives both "remind the operator" and "retry the
+    /// tunnel".
+    ReconnectDue,
+    /// Visibility is currently lost but no attempt is due yet (the
+    /// inter-recurrence wait) — keep observing, do not re-fire the rebuild.
+    WaitingToRetry,
+}
+
 /// Report-state machine for the observer's connection visibility.
 ///
 /// Single writer (the coordinator's run loop, single-threaded LocalSet),
@@ -79,16 +125,21 @@ impl LostVisibilityReporter {
         Self::default()
     }
 
-    /// Feed the current visibility verdict. On the FIRST loop where
-    /// visibility is lost, emit the "connection lost — observer continues
-    /// passively, retrying reconnect" report; while still lost, re-emit at
-    /// most once per [`REPORT_RECURRENCE`]; on the loop visibility is
-    /// REGAINED, emit a "reconnected" report and clear the loss state.
+    /// Feed the current visibility verdict and learn what to do this
+    /// iteration. On the FIRST loop where visibility is lost, emit the
+    /// "connection lost — observer continues passively, retrying reconnect"
+    /// report AND return [`RetryDirective::ReconnectDue`]; while still
+    /// lost, re-emit + signal a fresh attempt at most once per
+    /// [`REPORT_RECURRENCE`] (otherwise [`RetryDirective::WaitingToRetry`]);
+    /// on the loop visibility is REGAINED, emit a "reconnected" report,
+    /// clear the loss state, and return [`RetryDirective::Idle`].
     ///
     /// NEVER returns an exit signal — a lost-visibility observer keeps
-    /// observing. This is the entire BUG-B contract: the observer reports
-    /// and retries, it does not reap the run.
-    pub fn observe(&mut self, visibility: &Visibility) {
+    /// observing. This is the entire BUG-B contract: the observer reports,
+    /// retries the tunnel rebuild, and does not reap the run. The single
+    /// `due` decision drives BOTH the operator report and the reconnect
+    /// attempt, so they share one ~60s clock.
+    pub fn observe(&mut self, visibility: &Visibility) -> RetryDirective {
         match visibility {
             Visibility::Visible => {
                 if let Some(since) = self.lost_since.take() {
@@ -100,6 +151,7 @@ impl LostVisibilityReporter {
                     );
                 }
                 self.last_report = None;
+                RetryDirective::Idle
             }
             Visibility::Lost { reason } => {
                 let now = Instant::now();
@@ -117,11 +169,14 @@ impl LostVisibilityReporter {
                         lost_secs = since.elapsed().as_secs(),
                         "observer lost connection to the run — this does NOT mean the cluster \
                          died (the compute mesh runs autonomously over its direct links); the \
-                         observer carries zero authority and stays a passive monitor, retrying \
-                         reconnect (~60s cadence). The run's verdict comes from the primary, \
-                         never from the observer's own view."
+                         observer carries zero authority and stays a passive monitor, rebuilding \
+                         its tunnel + retrying reconnect (~60s cadence). The run's verdict comes \
+                         from the primary, never from the observer's own view."
                     );
                     self.last_report = Some(now);
+                    RetryDirective::ReconnectDue
+                } else {
+                    RetryDirective::WaitingToRetry
                 }
             }
         }
@@ -147,31 +202,62 @@ mod tests {
 
     #[test]
     fn observe_never_signals_exit_while_lost() {
-        // The contract is purely that `observe` returns `()` — there is NO
-        // path by which a lost-visibility observer is told to exit. This
-        // test pins the type-level guarantee: feeding repeated losses only
-        // updates internal report state, never yields a terminal.
+        // The contract is that `observe` returns a `RetryDirective` (Idle /
+        // ReconnectDue / WaitingToRetry) — there is NO variant by which a
+        // lost-visibility observer is told to exit. This test pins the
+        // type-level guarantee: feeding repeated losses only updates
+        // internal report state + asks for reconnects, never a terminal.
         let mut r = LostVisibilityReporter::new();
-        r.observe(&lost("fleet empty"));
+        let d = r.observe(&lost("fleet empty"));
         assert!(r.is_lost());
-        r.observe(&lost("fleet empty"));
+        assert_eq!(
+            d,
+            RetryDirective::ReconnectDue,
+            "the first lost loop must request a reconnect attempt"
+        );
+        // The immediately-following lost loop is inside the recurrence
+        // window, so no fresh attempt is due — but the observer keeps
+        // observing (no exit variant exists).
+        let d2 = r.observe(&lost("fleet empty"));
         assert!(r.is_lost(), "still lost — observer keeps observing, no exit");
+        assert_eq!(
+            d2,
+            RetryDirective::WaitingToRetry,
+            "a second lost loop within the recurrence window waits, does not re-fire"
+        );
+    }
+
+    #[test]
+    fn first_loss_requests_reconnect() {
+        // The owner directive: a lost observer must TRY to rebuild its
+        // tunnel + reconnect. The first lost observation surfaces the
+        // ReconnectDue directive the coordinator acts on (trigger the
+        // TunnelReconnector). This is the unit pin of "the observer drives
+        // the reconnect", independent of the wall-clock recurrence.
+        let mut r = LostVisibilityReporter::new();
+        assert_eq!(
+            r.observe(&lost("no reachable peer")),
+            RetryDirective::ReconnectDue,
+        );
     }
 
     #[test]
     fn regaining_visibility_clears_loss_state() {
         let mut r = LostVisibilityReporter::new();
-        r.observe(&lost("primary silent"));
+        assert_eq!(
+            r.observe(&lost("primary silent")),
+            RetryDirective::ReconnectDue
+        );
         assert!(r.is_lost());
-        r.observe(&Visibility::Visible);
+        assert_eq!(r.observe(&Visibility::Visible), RetryDirective::Idle);
         assert!(!r.is_lost(), "regained visibility clears the loss episode");
     }
 
     #[test]
     fn visible_throughout_stays_clear() {
         let mut r = LostVisibilityReporter::new();
-        r.observe(&Visibility::Visible);
-        r.observe(&Visibility::Visible);
+        assert_eq!(r.observe(&Visibility::Visible), RetryDirective::Idle);
+        assert_eq!(r.observe(&Visibility::Visible), RetryDirective::Idle);
         assert!(!r.is_lost());
     }
 }

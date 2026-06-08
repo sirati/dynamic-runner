@@ -52,12 +52,15 @@
 //! (Done), `run_aborted` (Aborted — the primary's broadcast verdict), or
 //! its OWN local panik (137). It carries ZERO authority over the run, so
 //! its loss of transport visibility — zero peers, a silent named primary,
-//! a by-design `-R` setup-tunnel drop after relocation — is NEVER a run
-//! verdict: it is reported as "connection lost, retrying" while the
-//! transport's role-blind reconnect ticker redials underneath, and the
-//! observer keeps observing until the primary's terminal converges into
-//! the CRDT (or the run truly ends, observed). See
-//! [`crate::observer::lost_visibility`].
+//! a dropped `-R` reverse tunnel — is NEVER a run verdict: it is reported
+//! as "connection lost, retrying" AND it actively rebuilds its path. The
+//! relocated submitter→observer's [`crate::observer::reconnect`] port
+//! rebuilds the dropped `-R` tunnel (the compute peers dial the submitter
+//! over those tunnels; that transport has no dial path / no QUIC reconnect
+//! ticker of its own, so the observer must DRIVE the rebuild). The observer
+//! keeps observing until the primary's terminal converges into the CRDT
+//! (or the run truly ends, observed). See
+//! [`crate::observer::lost_visibility`] + [`crate::observer::reconnect`].
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -78,7 +81,8 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
-use crate::observer::lost_visibility::{LostVisibilityReporter, Visibility};
+use crate::observer::lost_visibility::{LostVisibilityReporter, RetryDirective, Visibility};
+use crate::observer::reconnect::ReconnectorHandle;
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
 use crate::panik_watcher::{self, PanikSignal, PanikWatcherConfig};
@@ -158,6 +162,14 @@ where
     pub lifecycle_dispatcher_handle: JoinHandle<()>,
     /// The observer's static resource-holdings set (default empty).
     pub holdings: HashSet<String>,
+    /// The transport-recovery port (BUG-B reconnect). `Some` on the SLURM
+    /// reverse-tunnel path (the submitter's `-R` tunnels must be rebuilt
+    /// out-of-band when they drop); `None` when the transport heals itself
+    /// (e.g. a `--multi-computer local` mpsc mesh, or a non-tunnel backend).
+    /// Carried on the handoff so the relocation wave wires whatever the
+    /// provider supplied — the observer never names ssh. See
+    /// [`crate::observer::reconnect`].
+    pub reconnector: ReconnectorHandle,
 }
 
 /// Terminal of one observer run. Drives the PyO3 boundary's exit-code
@@ -234,6 +246,17 @@ where
     /// tick that has a candidate, so a malformed-snapshot responder is not
     /// retried on the immediately-following tick.
     recovery_cursor: usize,
+    /// The transport-recovery port (BUG-B reconnect). `Some` on the
+    /// relocated submitter→observer path, whose
+    /// [`dynrunner_transport_tunnel::TunneledPeerTransport`] reaches the
+    /// compute mesh over per-secondary `-R` reverse tunnels and has no dial
+    /// path / no QUIC reconnect ticker — so on lost visibility the observer
+    /// triggers this port to rebuild the dropped `-R` (the provider layer
+    /// owns the ssh). `None` on a path whose transport heals its own links
+    /// (the late-joiner's `PeerNetwork` QUIC reconnect ticker), where there
+    /// is nothing for the observer to drive. The observer NEVER owns ssh —
+    /// it calls `reconnect(roster)`; see [`crate::observer::reconnect`].
+    reconnector: ReconnectorHandle,
 }
 
 impl<I> ObserverCoordinator<I>
@@ -267,6 +290,10 @@ where
             HashSet::new(),
             None,
             HashSet::new(),
+            // Cold-join observers run over a real `PeerNetwork`, whose QUIC
+            // reconnect ticker + dial path re-establish links on their own
+            // — there is no out-of-band `-R` for the observer to rebuild.
+            None,
         )
     }
 
@@ -308,6 +335,7 @@ where
             task_completed_dispatcher_handle,
             lifecycle_dispatcher_handle,
             holdings,
+            reconnector,
         } = handoff;
         // Install a FRESH task-completed channel on the moved-in
         // `cluster_state`, REPLACING the inherited primary sender (see the
@@ -344,6 +372,7 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            reconnector,
         }
     }
 
@@ -362,6 +391,7 @@ where
         started_phases: HashSet<dynrunner_core::PhaseId>,
         panik_signal_rx: Option<oneshot::Receiver<PanikSignal>>,
         holdings: HashSet<String>,
+        reconnector: ReconnectorHandle,
     ) -> Self {
         // Install the task_completed sender HERE so the dispatcher channel
         // exists before any caller-side apply/restore. Events the apply
@@ -396,6 +426,7 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            reconnector,
         }
     }
 
@@ -715,7 +746,18 @@ where
                 if let Some(terminal) = self.evaluate_exit(transport_closed) {
                     return Ok(terminal);
                 }
-                visibility_reporter.observe(&self.current_visibility(primary_last_seen));
+                // Feed the reporter the current visibility; on a due
+                // reconnect attempt (the first lost loop, then once per
+                // ~60s recurrence) actively trigger a `-R` tunnel rebuild
+                // for the roster the observer expects to reach. The reporter
+                // owns the cadence; the coordinator owns the action (the
+                // reconnect port). Visibility flips back to Visible on its
+                // own once a compute peer re-dials over the rebuilt tunnel.
+                let directive =
+                    visibility_reporter.observe(&self.current_visibility(primary_last_seen));
+                if directive == RetryDirective::ReconnectDue {
+                    self.trigger_reconnect();
+                }
 
                 // 3. Await events.
                 tokio::select! {
@@ -891,6 +933,51 @@ where
             };
         }
         Visibility::Visible
+    }
+
+    /// Trigger a transport-path rebuild for the observer's expected roster
+    /// (BUG-B reconnect). Single concern at this seam: the observer hands
+    /// the [`crate::observer::reconnect::TunnelReconnector`] the ids it
+    /// expects to reach and lets the provider layer rebuild the dropped
+    /// `-R` tunnels — the observer NEVER names ssh. No-op when no
+    /// reconnector is wired (a transport that heals its own links) or when
+    /// the roster is empty (nothing known to reach yet).
+    ///
+    /// The roster is the SAME `current_primary ∪ alive secondaries` set the
+    /// AE-3 recovery tick targets — the peers whose `-R` tunnels carry the
+    /// observer's link to the run. The port call is SPAWNED detached on the
+    /// LocalSet so the observer loop never blocks on the (info-file-polling,
+    /// ssh-handshaking) rebuild; the observer keeps observing + narrating,
+    /// and its visibility flips back to `Visible` on its own once a compute
+    /// peer re-dials over the rebuilt tunnel (the pump republishes
+    /// membership). A failed rebuild is simply retried on the next
+    /// lost-visibility cadence tick.
+    fn trigger_reconnect(&self) {
+        let Some(reconnector) = self.reconnector.clone() else {
+            return;
+        };
+        let mut roster: HashSet<String> = self
+            .cluster_state
+            .alive_secondary_members()
+            .map(str::to_owned)
+            .collect();
+        if let Some(p) = self.cluster_state.current_primary() {
+            roster.insert(p.to_owned());
+        }
+        if roster.is_empty() {
+            tracing::debug!(
+                "observer reconnect due but no known roster yet; nothing to rebuild this tick"
+            );
+            return;
+        }
+        let peer_ids: Vec<String> = roster.into_iter().collect();
+        tracing::info!(
+            peers = peer_ids.len(),
+            "observer triggering tunnel rebuild for lost roster (BUG-B reconnect)"
+        );
+        tokio::task::spawn_local(async move {
+            reconnector.reconnect(&peer_ids).await;
+        });
     }
 
     /// Dispatch one inbound mesh frame. Apply-only: the observer mirrors
@@ -1205,6 +1292,10 @@ where
         HashSet::new(),
         panik_signal_rx,
         holdings,
+        // Cold-join observers run over a real `PeerNetwork` (QUIC reconnect
+        // ticker + dial path), so the transport heals its own links — there
+        // is no out-of-band `-R` for the observer to rebuild.
+        None,
     );
     for snap in snapshots {
         coordinator.cluster_state.restore(snap);
