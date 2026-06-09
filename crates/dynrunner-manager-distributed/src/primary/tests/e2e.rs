@@ -383,7 +383,8 @@ async fn cluster_state_converges_on_primary_and_secondary() {
             let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 primary_run_args: Some(PrimaryRunArgs {
                     seed: SeedSource::ColdStart {
-                        binaries,
+                        // Unmarked cold-seed (all `Pending`).
+                        binaries: binaries.into_iter().map(|b| (b, false)).collect(),
                         phase_deps: HashMap::new(),
                     },
                     on_phase_start: Box::new(|_| {}),

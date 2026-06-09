@@ -34,11 +34,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// policy off the runtime thread (the closure already does the
     /// `spawn_blocking` GIL excursion — §14/§15), then originates ONE batch:
     /// `PhaseDepsSet` + one `TaskAdded` per discovered binary +
+    /// one `TaskSkippedAlreadyDone` per discovery-marked already-done item +
     /// `DiscoverySettled`, through the canonical broadcast/apply pipeline.
-    /// On an empty discovery it additionally originates `RunComplete` (the
-    /// empty-corpus terminal — no `TaskCompleted` will ever drive the
-    /// counter finalize; the precedent the deleted `ingest_setup_discovery`
-    /// set for the empty-discovery happy path).
+    /// When there is NO to-run work — an empty corpus OR a 100%-already-done
+    /// corpus — it additionally originates `RunComplete` (no `TaskCompleted`
+    /// will ever drive the counter finalize; the precedent the deleted
+    /// `ingest_setup_discovery` set for the empty-discovery happy path,
+    /// generalised: a fully-skipped corpus is terminal exactly like an empty
+    /// one).
     ///
     /// Idempotent + failover-safe: gated on `discovery_debt() == Owed`,
     /// which a completed prior origination ratcheted to `Settled` (and which
@@ -105,23 +108,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         batch.push(ClusterMutation::PhaseDepsSet {
             deps: sd.phase_deps.clone(),
         });
-        for b in &binaries {
+        for (task, _skipped) in &binaries {
             batch.push(ClusterMutation::TaskAdded {
-                hash: compute_task_hash(b),
-                task: b.clone(),
+                hash: compute_task_hash(task),
+                task: task.clone(),
             });
         }
+        // Discovery already-done partition: after EVERY discovered item is
+        // seeded `Pending` by the `TaskAdded` fan-out (so `task_count` ==
+        // all items), materialise the marked subset terminal
+        // `SkippedAlreadyDone`. One shared helper with `originate_cold_seed`
+        // — no duplicated partition logic.
+        batch.extend(self.skip_transitions(&binaries));
         batch.push(ClusterMutation::DiscoverySettled);
         self.apply_and_broadcast_cluster_mutations(batch).await;
 
         // `all_binaries` is a pure derived cache of the CRDT task universe;
         // hydrate rebuilds it from `tasks_iter()` below, so we do NOT set it
         // here (single builder).
-        if binaries.is_empty() {
-            // Empty corpus: no `TaskCompleted` will ever fire, so the
-            // counter-based finalize cannot drive the run terminal —
-            // originate the terminal directly (the deleted
-            // `ingest_setup_discovery` empty-discovery precedent).
+        //
+        // Finalize on NO to-run work: an empty corpus AND a 100%-already-done
+        // corpus both have ZERO tasks that will ever fire a `TaskCompleted`,
+        // so the counter-based finalize cannot drive the run terminal — the
+        // skipped items are seeded terminal directly (no dispatch, no
+        // completion event). Originate the terminal directly in either case
+        // (the deleted `ingest_setup_discovery` empty-discovery precedent,
+        // generalised to "no to-run work").
+        let to_run = binaries.iter().filter(|(_, skipped)| !skipped).count();
+        if to_run == 0 {
             self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete])
                 .await;
         }

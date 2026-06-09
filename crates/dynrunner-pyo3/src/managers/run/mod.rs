@@ -45,7 +45,10 @@ pub(crate) use secondary::run_secondary;
 pub(crate) fn compute_task_hash(py: Python<'_>, binary: &Bound<'_, PyAny>) -> PyResult<String> {
     let single = pyo3::types::PyList::new(py, [binary])?;
     let mut rust_binaries = extract_binaries(&single)?;
-    let bin = rust_binaries.pop().ok_or_else(|| {
+    // The content hash is over the scheduling unit only; the discovery
+    // already-done marker does not participate (it is not on `TaskInfo`),
+    // so discard the bit and hash the task.
+    let (bin, _skipped) = rust_binaries.pop().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("compute_task_hash: failed to extract binary")
     })?;
     Ok(dynrunner_manager_distributed::compute_task_hash(&bin))

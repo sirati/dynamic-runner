@@ -117,6 +117,23 @@ class TaskInfo:
     # not only the direct predecessor's published outputs but also
     # those predecessor's predecessors' outputs (and so on, transitively).
     task_depends_on: tuple["TaskDep | str", ...] = field(default_factory=tuple)
+    # Discovery-time "this item's outputs already exist" marker. When a
+    # producer determines (during ``discover_items``) that a task's work
+    # was already done by a prior run, it sets this to ``True`` instead
+    # of dropping the item. The framework then materialises the item
+    # DIRECTLY as a terminal ``SkippedAlreadyDone`` ledger entry — never
+    # dispatched, never re-running the already-done work, but still
+    # counted as a real task of the phase (so a 100%-already-done phase
+    # is a phase WITH tasks, not an empty phase that would fail loud).
+    #
+    # Default ``False`` ⇒ today's behaviour (the item is a normal
+    # ``Pending`` task). This is a discovery-boundary routing signal, NOT
+    # a property of the scheduling unit: it rides alongside the task at
+    # the extract boundary and is consumed by the ingest seam to choose
+    # the initial ledger state; it is deliberately NOT folded into the
+    # task's content hash. See ``PhaseSpec.may_be_empty`` for the related
+    # empty-phase proceed-or-fail contract.
+    skipped_already_done: bool = False
 
     @property
     def binary_name(self) -> str:

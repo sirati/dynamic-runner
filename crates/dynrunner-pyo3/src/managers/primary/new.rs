@@ -144,7 +144,13 @@ impl PyPrimaryCoordinator {
         binaries: &Bound<'_, pyo3::types::PyList>,
         source_root: String,
     ) -> PyResult<()> {
-        let rust_binaries = crate::pytypes::extract_binaries(binaries)?;
+        // Staging-entry computation is independent of the discovery
+        // already-done marker (every discovered item still names a source
+        // file to stage); strip the bit at this call site.
+        let rust_binaries: Vec<_> = crate::pytypes::extract_binaries(binaries)?
+            .into_iter()
+            .map(|(task, _skipped)| task)
+            .collect();
         let source_root = std::path::PathBuf::from(source_root);
         // Secondary IDs the SLURM/network primary spawns under;
         // mirrors the format used in `run` below (line ~225) and in

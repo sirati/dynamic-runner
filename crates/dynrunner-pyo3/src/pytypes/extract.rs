@@ -53,6 +53,10 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
             .map(|dep| dep.task_id.clone())
             .collect(),
         preferred_secondaries: task.preferred_secondaries.as_slice().to_vec(),
+        // The already-done marker is a discovery-INPUT signal only; it
+        // does not live on `TaskInfo<I>`, so the Rust→Python projection
+        // reconstitutes the default.
+        skipped_already_done: false,
     }
 }
 
@@ -141,9 +145,23 @@ fn extract_task_depends_on(
     Ok(out)
 }
 
+/// Convert a Python list of `TaskInfo`-shaped objects into the
+/// Rust-side scheduling units, each PAIRED with its discovery-time
+/// `skipped_already_done` marker.
+///
+/// The marker rides the discovery boundary as a parallel bit, NOT on the
+/// core `TaskInfo<I>` (a "this item's outputs already exist" signal is a
+/// discovery-time routing decision, not a property of the scheduling
+/// unit, and is meaningless on every non-skip task — see the
+/// `cluster_mutation::TaskSkippedAlreadyDone` design). Missing attribute
+/// / non-bool value ⇒ `false` (back-compat: a producer that never marks a
+/// skip yields today's all-`Pending` batch). This is the ONE extract
+/// function (R4): each consumer (distributed seed seam / single-process /
+/// `--list-files`) takes the pair and decides whether the bit matters —
+/// there is no bit-discarding near-duplicate.
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
-) -> PyResult<Vec<TaskInfo<RunnerIdentifier>>> {
+) -> PyResult<Vec<(TaskInfo<RunnerIdentifier>, bool)>> {
     let py = binaries.py();
     // We use Python's `json.dumps` on the (potentially-arbitrary) `payload`
     // dict to bridge it through to a `serde_json::Value`. Round-tripping via
@@ -253,20 +271,36 @@ pub(crate) fn extract_binaries(
                 .and_then(|v| v.extract::<Vec<String>>().ok())
                 .unwrap_or_default();
 
-            Ok(TaskInfo {
-                path: PathBuf::from(path),
-                size,
-                identifier,
-                phase_id,
-                type_id,
-                affinity_id,
-                payload,
-                task_id,
-                task_depends_on,
-                preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
-                preferred_version: Default::default(),
-                resolved_path: None,
-            })
+            // Discovery-time already-done marker. Missing attribute or a
+            // non-bool value collapses to `false` (back-compat: the bit
+            // is OPTIONAL — a producer that predates the marker, or never
+            // marks a skip, yields today's all-`Pending` batch). The bit
+            // is NOT written into the constructed `TaskInfo` — it rides
+            // back alongside it as the second tuple element so the ingest
+            // seam can partition on it.
+            let skipped_already_done: bool = item
+                .getattr("skipped_already_done")
+                .ok()
+                .and_then(|v| v.extract::<bool>().ok())
+                .unwrap_or(false);
+
+            Ok((
+                TaskInfo {
+                    path: PathBuf::from(path),
+                    size,
+                    identifier,
+                    phase_id,
+                    type_id,
+                    affinity_id,
+                    payload,
+                    task_id,
+                    task_depends_on,
+                    preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
+                    preferred_version: Default::default(),
+                    resolved_path: None,
+                },
+                skipped_already_done,
+            ))
         })
         .collect()
 }
@@ -399,6 +433,82 @@ mod tests {
             let none = py.None().into_bound(py);
             let deps = extract_task_depends_on(&none, &enclosing).expect("None");
             assert!(deps.is_empty());
+        });
+    }
+
+    /// Build a minimal TaskInfo-shaped `SimpleNamespace` the duck-typed
+    /// `extract_binaries` accepts. `skipped` is `Some(bool)` to SET the
+    /// `skipped_already_done` attribute, or `None` to OMIT it entirely
+    /// (the back-compat / pre-marker producer shape).
+    fn make_task_item<'py>(
+        py: Python<'py>,
+        task_id: &str,
+        skipped: Option<bool>,
+    ) -> Bound<'py, PyAny> {
+        let types = py.import("types").expect("types module");
+        let simplens = types.getattr("SimpleNamespace").expect("SimpleNamespace");
+        let ident_kwargs = pyo3::types::PyDict::new(py);
+        ident_kwargs.set_item("binary_name", task_id).unwrap();
+        ident_kwargs.set_item("platform", "x64").unwrap();
+        ident_kwargs.set_item("compiler", "gcc").unwrap();
+        ident_kwargs.set_item("version", "1").unwrap();
+        ident_kwargs.set_item("opt_level", "O0").unwrap();
+        let identifier = simplens
+            .call((), Some(&ident_kwargs))
+            .expect("identifier SimpleNamespace");
+
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("task_id", task_id).unwrap();
+        kwargs
+            .set_item("path", format!("/corpus/{task_id}"))
+            .unwrap();
+        kwargs.set_item("size", 1u64).unwrap();
+        kwargs.set_item("identifier", identifier).unwrap();
+        kwargs.set_item("type_id", "t").unwrap();
+        kwargs.set_item("task_depends_on", Vec::<String>::new()).unwrap();
+        // Only set the marker when the test asks for it — `None` leaves
+        // the attribute absent so the missing-attr ⇒ false path is real.
+        if let Some(flag) = skipped {
+            kwargs.set_item("skipped_already_done", flag).unwrap();
+        }
+        simplens.call((), Some(&kwargs)).expect("item SimpleNamespace")
+    }
+
+    /// R5 plumbing-e2e (extract layer): the `skipped_already_done` bit on a
+    /// Python discovery item must survive the extract boundary as the
+    /// second element of the marked pair — a MARKED item yields `true`, an
+    /// explicitly-UNMARKED item yields `false`, and an item that OMITS the
+    /// attribute entirely yields `false` (the optional / back-compat
+    /// contract). The bit must NOT bleed into the constructed core
+    /// `TaskInfo` (it has no such field — that is the boundary invariant).
+    #[test]
+    fn extract_binaries_threads_skipped_marker() {
+        Python::attach(|py| {
+            let marked = make_task_item(py, "already-done", Some(true));
+            let unmarked = make_task_item(py, "needs-run", Some(false));
+            let absent = make_task_item(py, "legacy-producer", None);
+            let list = PyList::new(py, [marked, unmarked, absent]).expect("list");
+
+            let out = extract_binaries(&list).expect("extract");
+            assert_eq!(out.len(), 3, "every item is extracted (none dropped)");
+
+            // Order is preserved; the marker rides as the second element.
+            assert_eq!(out[0].0.task_id, "already-done");
+            assert!(
+                out[0].1,
+                "an item with skipped_already_done=True must extract as marked"
+            );
+            assert_eq!(out[1].0.task_id, "needs-run");
+            assert!(
+                !out[1].1,
+                "an item with skipped_already_done=False must extract as unmarked"
+            );
+            assert_eq!(out[2].0.task_id, "legacy-producer");
+            assert!(
+                !out[2].1,
+                "an item that OMITS the attribute must extract as unmarked \
+                 (the optional / back-compat default)"
+            );
         });
     }
 }

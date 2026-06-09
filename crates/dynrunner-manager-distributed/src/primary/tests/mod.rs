@@ -107,8 +107,27 @@ pub(super) fn noop_phase_args() -> (
 /// discovery counter increments on each fire so a test can assert the policy
 /// ran exactly once (or never). Shared by the mode-2 discovery tests
 /// (`setup_promote`) and the Owed-seed collapse regression (`stranded`).
+///
+/// All items are UNMARKED (`skipped_already_done = false`) — the common
+/// case. A test that needs the already-done marker uses
+/// [`fixed_discovery_marked`].
 pub(super) fn fixed_discovery(
     binaries: Vec<TaskInfo<TestId>>,
+    phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+    fire_count: std::rc::Rc<std::cell::Cell<u32>>,
+) -> crate::discovery::SetupDiscovery<TestId> {
+    fixed_discovery_marked(
+        binaries.into_iter().map(|b| (b, false)).collect(),
+        phase_deps,
+        fire_count,
+    )
+}
+
+/// As [`fixed_discovery`] but each item carries its discovery-time
+/// `skipped_already_done` marker, so a test can exercise the
+/// already-done partition the seed seam materialises terminal.
+pub(super) fn fixed_discovery_marked(
+    binaries: Vec<(TaskInfo<TestId>, bool)>,
     phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
     fire_count: std::rc::Rc<std::cell::Cell<u32>>,
 ) -> crate::discovery::SetupDiscovery<TestId> {

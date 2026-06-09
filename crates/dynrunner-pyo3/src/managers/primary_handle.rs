@@ -400,7 +400,14 @@ impl PyPrimaryHandle {
         // entries BEFORE releasing the GIL — the conversion touches
         // Python-allocated objects (string interning, dict payloads)
         // and `getattr` calls require the GIL.
-        let typed: Vec<TaskInfo<RunnerIdentifier>> = crate::pytypes::extract_binaries(tasks)?;
+        // Runtime task injection (`spawn_tasks`) does not partition on
+        // the discovery already-done marker — already-done items are a
+        // setup-discovery concern, not a mid-run lazy-spawn one. Strip
+        // the bit at this call site.
+        let typed: Vec<TaskInfo<RunnerIdentifier>> = crate::pytypes::extract_binaries(tasks)?
+            .into_iter()
+            .map(|(task, _skipped)| task)
+            .collect();
 
         let sender = self.sender.clone();
         let rt = self.rt.clone();
