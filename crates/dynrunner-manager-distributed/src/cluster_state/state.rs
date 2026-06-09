@@ -269,9 +269,10 @@ pub struct ClusterState<I> {
     /// is one event), so this is NOT a projection of the single terminal
     /// `TaskState`. The live primary bumps it on every `note_item_*`; the
     /// snapshot / AE path replicates it, so a promoted primary reports the
-    /// SAME event-shaped `on_phase_end` numbers and the
-    /// `phase_can_proceed` / `RunShouldFail` gate reads the replicated
-    /// tallies, not a wrong terminal-projection.
+    /// SAME event-shaped `on_phase_end(p, completed, failed, ..)` numbers —
+    /// the consumer-hook contract. (The proceed-or-fail decision itself is
+    /// ledger-derived via `phase_rollups`, not tally-derived; these tallies
+    /// feed ONLY the `on_phase_end` hook now.)
     ///
     /// Merge: grow-only MAX (see `grow_max.rs`); converges under per-key
     /// `max`; never LWW, never decrement. Replicated via snapshot + AE

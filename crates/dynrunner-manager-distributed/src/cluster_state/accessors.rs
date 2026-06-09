@@ -56,6 +56,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
                 TaskState::Blocked { .. } => c.blocked += 1,
                 TaskState::InvalidTask { .. } => c.invalid_task += 1,
+                TaskState::SkippedAlreadyDone { .. } => c.skipped_already_done += 1,
             }
         }
         c
@@ -114,6 +115,13 @@ impl<I: Identifier> ClusterState<I> {
                 // dedicated invalid_task stat line lands in Part C; the
                 // mapping keeps the operator-readable partition stable.
                 TaskState::InvalidTask { .. } => o.fail_final += 1,
+                // Discovery-time skip: a SUCCESS-LIKE terminal kept in its
+                // OWN accounting category (`counts().skipped_already_done`),
+                // NOT a success and NOT any failure bucket. Folding it into
+                // `succeeded` would mis-report it on the run-complete summary
+                // / the narrator's success count, so `outcome_counts` ignores
+                // it here.
+                TaskState::SkippedAlreadyDone { .. } => {}
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to
@@ -142,6 +150,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
+                | TaskState::SkippedAlreadyDone { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
@@ -149,15 +158,19 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for terminal entries
-    /// (`Completed`, `Failed`, `Unfulfillable`, `InvalidTask`).
-    /// `Blocked` is non-terminal (auto-resumes to `Pending` when its
-    /// prereq completes) and is excluded.
+    /// (`Completed`, `Failed`, `Unfulfillable`, `InvalidTask`,
+    /// `SkippedAlreadyDone`). `Blocked` is non-terminal (auto-resumes to
+    /// `Pending` when its prereq completes) and is excluded. A
+    /// `SkippedAlreadyDone` IS surfaced — its dependents resolve their
+    /// `task_depends_on` reference against it exactly as against a
+    /// `Completed` prereq.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Completed { task, .. }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
-            | TaskState::InvalidTask { task, .. } => Some((h, task)),
+            | TaskState::InvalidTask { task, .. }
+            | TaskState::SkippedAlreadyDone { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -252,6 +265,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
+                | TaskState::SkippedAlreadyDone { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             let entry = base.entry(&task.phase_id).or_insert((false, false));
@@ -351,6 +365,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. }
+                | TaskState::SkippedAlreadyDone { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (task.task_id == task_id && &task.phase_id == phase_id).then_some(h.as_str())
@@ -411,6 +426,7 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
                     | TaskState::InvalidTask { task, .. }
+                    | TaskState::SkippedAlreadyDone { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 if &task.phase_id != phase_id {
@@ -420,6 +436,35 @@ impl<I: Identifier> ClusterState<I> {
                 Some((task.task_id.clone(), outputs.clone()))
             })
             .collect()
+    }
+
+    /// Per-phase `(to_run, skipped)` partition over the replicated ledger:
+    /// `skipped` is the count of `SkippedAlreadyDone` entries in `phase`,
+    /// `to_run` is every OTHER task entry of `phase` (in any state). One
+    /// ledger pass matching `task.phase_id == phase`, partitioned on the
+    /// skip discriminant.
+    ///
+    /// The SINGLE owner of the "how many of this phase's tasks are real work
+    /// vs already-done" projection: the operator run-narrator's per-phase
+    /// "<N> to run, <M> skipped (already done)" line and any structural
+    /// reader both read it here, so neither re-walks the ledger with a
+    /// private partition rule. Ledger-derived, so it is failover-consistent
+    /// (every replica converges to the same answer after the same mutation
+    /// set lands).
+    pub fn phase_task_partition(&self, phase: &PhaseId) -> (usize, usize) {
+        let mut to_run = 0usize;
+        let mut skipped = 0usize;
+        for state in self.tasks.values() {
+            if &state.task().phase_id != phase {
+                continue;
+            }
+            if matches!(state, TaskState::SkippedAlreadyDone { .. }) {
+                skipped += 1;
+            } else {
+                to_run += 1;
+            }
+        }
+        (to_run, skipped)
     }
 
     /// Whether the run has been declared finished by the primary.

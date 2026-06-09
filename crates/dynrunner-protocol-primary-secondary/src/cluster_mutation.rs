@@ -423,6 +423,31 @@ pub enum ClusterMutation<I> {
         hash: String,
         on: String,
     },
+    /// Discovery-time skip: the originator determined the item's outputs
+    /// already exist on the shared filesystem, so the ledger entry is
+    /// materialized DIRECTLY terminal (`TaskState::SkippedAlreadyDone`) and
+    /// never dispatched. The item IS a real task in the phase (so the phase
+    /// is no longer "a phase without tasks that should error") — it simply
+    /// reached a spawn-time terminal that never transitions, reinjects, or
+    /// re-fails.
+    ///
+    /// Carries only `hash`: the `TaskInfo` lives on the ledger entry the
+    /// prior `TaskAdded` (same batch) seeded as `Pending`, exactly like the
+    /// `TaskRequeued` / `TaskReinjected` resets carry only the hash and reuse
+    /// the preserved `TaskInfo`. The apply rule transitions `Pending →
+    /// SkippedAlreadyDone`; any other state is a NoOp (a skip is the WEAKEST
+    /// terminal — an in-flight assignment or a real terminal locks it out).
+    ///
+    /// A SEPARATE mutation (not a flag on `TaskAdded`, not a field on a
+    /// terminal): `TaskAdded` is the universal vacant-insert-as-`Pending`, so
+    /// a `skipped: bool` would force a mode-`if` into that one arm and make
+    /// every caller reason about a bit it never sets. Wire-safe under rolling
+    /// upgrade exactly like `PhaseMayBeEmptySet` / `DiscoveryDebtDeclared` —
+    /// the originator is always the newest primary; a consumer that never
+    /// marks a skip never originates it, so non-adopters see zero new wire.
+    TaskSkippedAlreadyDone {
+        hash: String,
+    },
     /// External-control update of the per-task preferred-secondaries
     /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes

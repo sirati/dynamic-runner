@@ -102,6 +102,7 @@ where
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
+            | TaskState::SkippedAlreadyDone { task, .. }
             | TaskState::Blocked { task, .. } => task,
         };
         Some((task.phase_id.clone(), task.task_id.clone()))

@@ -165,6 +165,28 @@ pub enum TaskState<I> {
         /// preserved WITHIN an attempt by `TerminalRank`).
         attempt: u32,
     },
+    /// The discovery originator determined the item's outputs already
+    /// exist on the shared filesystem, so it was materialized DIRECTLY
+    /// terminal (the `--skip-existing` "nothing left to do" case) and is
+    /// never dispatched. SUCCESS-LIKE (it counts toward phase-done) but a
+    /// DISTINCT accounting category — NOT folded into `Completed`, NOT into
+    /// the `fail_*` buckets: `outcome_counts` ignores it and `counts()`
+    /// tallies it in its OWN field. The item being a real ledger entry is
+    /// the whole point — a phase whose items were all skipped now HAS tasks,
+    /// so it is no longer "a phase without tasks that should error".
+    ///
+    /// A spawn-time terminal that never transitions / reinjects / re-fails,
+    /// so it carries NO `version` and NO error payload. It is the WEAKEST
+    /// terminal in [`TerminalRank`] — a skip never out-ranks a real outcome
+    /// in a hypothetical hash collision. Carries `task` (uniform; the
+    /// `task()`/`task_mut()`/`iter_*` accessors need it) and `attempt`
+    /// (uniform with the F2 generation accessor). LOAD-BEARING: its
+    /// `to_completed_event` is `None` so the skip stays silent on the
+    /// completion channel.
+    SkippedAlreadyDone {
+        task: TaskInfo<I>,
+        attempt: u32,
+    },
 }
 
 impl<I> TaskState<I> {
@@ -180,6 +202,7 @@ impl<I> TaskState<I> {
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
+            | TaskState::SkippedAlreadyDone { task, .. }
             | TaskState::Blocked { task, .. } => task,
         }
     }
@@ -196,6 +219,7 @@ impl<I> TaskState<I> {
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
             | TaskState::InvalidTask { task, .. }
+            | TaskState::SkippedAlreadyDone { task, .. }
             | TaskState::Blocked { task, .. } => task,
         }
     }
@@ -214,6 +238,7 @@ impl<I> TaskState<I> {
             | TaskState::Failed { attempt, .. }
             | TaskState::Unfulfillable { attempt, .. }
             | TaskState::InvalidTask { attempt, .. }
+            | TaskState::SkippedAlreadyDone { attempt, .. }
             | TaskState::Blocked { attempt, .. } => *attempt,
         }
     }
@@ -237,9 +262,12 @@ impl<I> TaskState<I> {
     /// phase-rollup derivation and the pyo3 stats projection share the
     /// permanent-failure set rather than each re-spelling the match: the
     /// pool resolves a dep once its prereq is `Completed` OR permanently
-    /// failed, and in the CRDT the permanent-failure set is `Failed` ∪
-    /// `Unfulfillable` ∪ `InvalidTask`. `Blocked` is cascade-paused
-    /// (auto-resumes to `Pending`), so it is NOT terminal.
+    /// failed, and in the CRDT the terminal set is `Completed` ∪ `Failed` ∪
+    /// `Unfulfillable` ∪ `InvalidTask` ∪ `SkippedAlreadyDone`. `Blocked` is
+    /// cascade-paused (auto-resumes to `Pending`), so it is NOT terminal. A
+    /// `SkippedAlreadyDone` IS terminal — a dependent of a skipped task is
+    /// unblocked exactly like a dependent of a completed one (the outputs
+    /// the skip validated as already-present are what the dependent reads).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -247,6 +275,7 @@ impl<I> TaskState<I> {
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
                 | TaskState::InvalidTask { .. }
+                | TaskState::SkippedAlreadyDone { .. }
         )
     }
 
@@ -298,9 +327,16 @@ impl<I> TaskState<I> {
                 error_kind: Some(format!("invalid_task:{reason}")),
                 last_error: Some(last_error.clone()),
             }),
-            TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => {
-                None
-            }
+            // A `SkippedAlreadyDone` is neither a success nor a failure
+            // observation, so it fires NO `task_completed_listener` — it
+            // stays silent on the completion channel (LOAD-BEARING: a skip
+            // must not be counted as a completion by a downstream consumer
+            // bucket). Grouped with the non-terminal `None` arms because it,
+            // like them, projects to no terminal event.
+            TaskState::Pending { .. }
+            | TaskState::InFlight { .. }
+            | TaskState::Blocked { .. }
+            | TaskState::SkippedAlreadyDone { .. } => None,
         }
     }
 }
@@ -318,18 +354,6 @@ impl<I> TaskState<I> {
 /// `PhaseRollup` / `outcome_counts` stay terminal-shaped (a distinct
 /// concern).
 ///
-/// `SkippedExisting` (F-honesty) is the discriminator that keeps the
-/// empty-drain proceed-or-fail policy honest: a non-leaf phase that drained
-/// with NO terminal accounting AND NO recorded skip is a genuine
-/// never-injected wedge (fail loud), whereas a phase whose items were all
-/// SKIPPED-AS-EXISTING (outputs already present — the legitimate
-/// `--skip-existing` "nothing left to do" case) recorded that skip here and
-/// proceeds as success. It is NOT a terminal task observation (a skipped
-/// item never dispatches), so it lives in the same grow-only-MAX EVENT map
-/// purely as a third count the discovery originator may report — distinct
-/// from `Completed`/`Failed`, which only terminal task transitions bump. See
-/// [`crate::primary::PrimaryCoordinator::phase_can_proceed`].
-///
 /// Derives `Serialize`/`Deserialize` because it crosses the wire INSIDE the
 /// snapshot's `(PhaseId, PhaseTally)` map key; `Copy`/`Eq`/`Hash` so it is a
 /// cheap `HashMap` key.
@@ -337,7 +361,6 @@ impl<I> TaskState<I> {
 pub enum PhaseTally {
     Completed,
     Failed,
-    SkippedExisting,
 }
 
 /// One accepted respawn event in the replicated respawn ledger (F7).
@@ -387,16 +410,21 @@ pub(super) enum JoinBand {
     Terminal = 2,
 }
 
-/// Within the `Terminal` band: `{Failed, Unfulfillable} < Completed <
-/// InvalidTask` (D-T — InvalidTask is the unique TOP). `FailedLike`
-/// covers `Failed | Unfulfillable`; they tie-break below by a fixed
-/// `failedlike` discriminant then the payload content hash, but only
-/// when both are `FailedLike` at equal version.
+/// Within the `Terminal` band: `SkippedAlreadyDone < {Failed,
+/// Unfulfillable} < Completed < InvalidTask` (D-T — InvalidTask is the
+/// unique TOP). `SkippedAlreadyDone` is the WEAKEST terminal so a skip
+/// never out-ranks a real outcome in a hypothetical hash collision (a
+/// real Completed/Failed/Unfulfillable/InvalidTask for the same hash
+/// always wins the join over the spawn-time skip). `FailedLike` covers
+/// `Failed | Unfulfillable`; they tie-break below by a fixed `failedlike`
+/// discriminant then the payload content hash, but only when both are
+/// `FailedLike` at equal version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum TerminalRank {
-    FailedLike = 0,
-    Completed = 1,
-    InvalidTask = 2,
+    SkippedAlreadyDone = 0,
+    FailedLike = 1,
+    Completed = 2,
+    InvalidTask = 3,
 }
 
 /// Within the `NonTerminal` band, the rank sub-key (`Pending < InFlight`),
@@ -501,6 +529,10 @@ pub struct StateCounts {
     /// Tasks in `TaskState::InvalidTask { .. }` — terminal, non-
     /// reinjectable structural failures (missing dep / duplicate id).
     pub invalid_task: usize,
+    /// Tasks in `TaskState::SkippedAlreadyDone { .. }` — discovery-time
+    /// skips whose outputs already existed. SUCCESS-LIKE terminal kept in
+    /// its OWN category (NOT folded into `completed` nor any `fail_*`).
+    pub skipped_already_done: usize,
 }
 
 /// Per-phase derived view used by every reader that needs the phase

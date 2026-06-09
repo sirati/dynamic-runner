@@ -55,6 +55,46 @@ fn legacy_task_completed_decodes_without_result_data() {
     }
 }
 
+/// `TaskSkippedAlreadyDone` round-trips through serde with its `hash`
+/// preserved (the discovery-time skip carries only the hash; the
+/// preserved `TaskInfo` lives on the ledger entry the prior `TaskAdded`
+/// seeded, not on the wire).
+#[test]
+fn roundtrip_task_skipped_already_done() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskSkippedAlreadyDone {
+        hash: "h-skip".into(),
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskSkippedAlreadyDone { hash } => {
+            assert_eq!(hash, "h-skip");
+        }
+        _ => panic!("expected TaskSkippedAlreadyDone"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes a sender emits — `{"TaskSkippedAlreadyDone":{"hash":"..."}}`
+/// — rather than re-encoding our own value. A future field reorder/rename
+/// that still round-trips against itself would slip past a symmetric test;
+/// pinning the literal sender bytes catches the divergence against the
+/// other side's actual wire.
+#[test]
+fn task_skipped_already_done_decodes_literal_sender_bytes() {
+    let bytes = r#"{"TaskSkippedAlreadyDone":{"hash":"h-from-sender"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskSkippedAlreadyDone { hash } => {
+            assert_eq!(hash, "h-from-sender");
+        }
+        _ => panic!("expected TaskSkippedAlreadyDone"),
+    }
+}
+
 /// `SecondaryCapacity` round-trips through serde with its
 /// `worker_count` + advertised `resources` preserved verbatim.
 #[test]

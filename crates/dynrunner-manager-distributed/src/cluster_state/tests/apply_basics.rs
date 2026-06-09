@@ -315,6 +315,94 @@ fn invalid_task_counts_as_fail_final_and_is_terminal() {
     assert!(!terminal_ids.contains("pend"), "Pending is not terminal");
 }
 
+/// `TaskSkippedAlreadyDone` materializes a `Pending` entry DIRECTLY
+/// terminal as `SkippedAlreadyDone`. The skip:
+///   * applies `Pending → SkippedAlreadyDone` (and preserves the attempt);
+///   * is `is_terminal()` true and surfaces on `iter_terminal`;
+///   * projects to NO `TaskCompletedEvent` (`to_completed_event → None`) —
+///     it is neither a success nor a failure observation;
+///   * is counted in its OWN `counts().skipped_already_done` category, NOT
+///     folded into `succeeded` nor any `fail_*` bucket;
+///   * is the WEAKEST terminal — a real terminal (here `Completed`) for the
+///     same hash LOCKS IT OUT, and a late skip against a real terminal is a
+///     NoOp;
+///   * is idempotent under re-application.
+#[test]
+fn skipped_already_done_is_weakest_terminal_and_silent() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+
+    // Pending → SkippedAlreadyDone.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "skip".into(),
+        task: mk_task("skip"),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskSkippedAlreadyDone {
+            hash: "skip".into(),
+        }),
+        ApplyOutcome::Applied
+    );
+    let st = s.task_state("skip").expect("skip entry present");
+    assert!(matches!(st, TaskState::SkippedAlreadyDone { .. }));
+    assert!(st.is_terminal(), "a skip IS terminal");
+    assert!(
+        st.to_completed_event("skip").is_none(),
+        "a skip projects to NO terminal event (silent on the completion channel)"
+    );
+
+    // Idempotent re-apply is a NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskSkippedAlreadyDone {
+            hash: "skip".into(),
+        }),
+        ApplyOutcome::NoOp
+    );
+
+    // Own accounting category — not succeeded, not a fail bucket.
+    let c = s.counts();
+    assert_eq!(c.skipped_already_done, 1);
+    assert_eq!(c.completed, 0);
+    assert_eq!(c.failed, 0);
+    let o = s.outcome_counts();
+    assert_eq!(o.succeeded, 0, "a skip is NOT a success");
+    assert_eq!(o.total_terminal(), 0, "a skip is in neither outcome bucket");
+
+    // iter_terminal surfaces it (dependents resolve against it).
+    let terminal_ids: std::collections::HashSet<&str> =
+        s.iter_terminal().map(|(_, t)| t.task_id.as_str()).collect();
+    assert!(terminal_ids.contains("skip"));
+
+    // Weakest-terminal lockout: a skip against a REAL terminal NoOps.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "done".into(),
+        task: mk_task("done"),
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        attempt: 0,
+        hash: "done".into(),
+        result_data: None,
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskSkippedAlreadyDone {
+            hash: "done".into(),
+        }),
+        ApplyOutcome::NoOp,
+        "a skip cannot overwrite a real terminal (weakest-terminal lockout)"
+    );
+    assert!(matches!(
+        s.task_state("done"),
+        Some(TaskState::Completed { .. })
+    ));
+
+    // A skip against a never-added hash is a NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskSkippedAlreadyDone {
+            hash: "ghost".into(),
+        }),
+        ApplyOutcome::NoOp
+    );
+}
+
 /// A HIGHER-version re-failure supersedes the prior failure record
 /// (`attempts` is dropped — convergence rides the per-task version, D-A/
 /// D-V). The newer failure's `(kind, last_error)` wins the join.

@@ -4,15 +4,16 @@
 //!
 //! Two concerns, both synchronous and deterministic (no operational
 //! loop, no wall-clock waits):
-//! - [`phase_can_proceed`] decides advance-vs-fail from the phase's
-//!   terminal counters (completed / failed / skipped-as-existing), its
-//!   residual-work probe, the replicated `may_be_empty` opt-out, AND the
-//!   outstanding-work probe (`pool.is_empty()`) for the genuinely-empty
-//!   case — exercised directly across every policy branch (proceed on
-//!   completion/failure/skip/may_be_empty; proceed on a genuinely-empty
-//!   undeclared phase that still leaves real work in the pool — leaf or
-//!   upstream; fail on residual-work and on a genuinely-empty undeclared
-//!   phase that empties the run).
+//! - [`phase_can_proceed`] decides advance-vs-fail from the replicated
+//!   ledger (`phase_rollups`: a phase that drained with tasks reads
+//!   `has_any && !has_live`), the per-phase residual-work probe, the
+//!   replicated `may_be_empty` opt-out, AND the outstanding-work probe
+//!   (`pool.is_empty()`) for the genuinely-empty case — exercised directly
+//!   across every policy branch (proceed on a phase that drained with
+//!   completed / failed / all-skipped terminal tasks; proceed on
+//!   may_be_empty; proceed on a genuinely-empty undeclared phase that still
+//!   leaves real work in the pool — leaf or upstream; fail on residual-work
+//!   and on a genuinely-empty undeclared phase that empties the run).
 //! - `fire_initial_phase_starts` EMITs `PhaseStartedNeedsWorkers` for
 //!   each newly-started phase that carries work; the emit is asserted by
 //!   installing a worker-management sender and draining the channel
@@ -113,34 +114,84 @@ fn cold_seed_cross_phase_same_task_id_is_not_a_duplicate() {
     assert_eq!(primary.pool().len(), 2, "both tasks landed in the pool");
 }
 
-/// PROCEED when the phase produced at least one completed item, even if
-/// some siblings failed.
+/// PROCEED when the phase drained with tasks that all reached a terminal
+/// state, at least one of them a completion (with a failed sibling). The
+/// decision is now ledger-derived (`has_any && !has_live`), so the test
+/// seeds the terminal ledger entries rather than passing counter args.
 #[test]
 fn phase_can_proceed_when_some_completed() {
-    let (primary, _mesh) = make_primary();
+    let (mut primary, _mesh) = make_primary();
+
+    // One Completed + one Failed item in `compile`: the phase has tasks and
+    // every one is terminal ⇒ has_any && !has_live ⇒ proceed.
+    let ok = dep_binary("ok", "compile", &[]);
+    let bad = dep_binary("bad", "compile", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "ok".into(),
+            task: ok,
+        });
+        cs.apply(ClusterMutation::TaskCompleted {
+            attempt: 0,
+            hash: "ok".into(),
+            result_data: None,
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "bad".into(),
+            task: bad,
+        });
+        cs.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
+            hash: "bad".into(),
+            kind: dynrunner_core::ErrorType::NonRecoverable,
+            error: "x".into(),
+            version: Default::default(),
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
     let p = PhaseId::from("compile");
-    assert!(primary.phase_can_proceed(&p, 3, 0, 0));
-    assert!(primary.phase_can_proceed(&p, 1, 2, 0));
+    assert!(primary.phase_can_proceed(&p));
 }
 
 /// PROCEED when the phase's items reached a terminal FAILED outcome with
 /// no completion. By this point the retry buckets have exhausted, so the
 /// failures are PERMANENT and recorded; the canonical contract advances
 /// the phase and surfaces the failures in the outcome summary rather than
-/// aborting the run (see `retry_bucket` budget-exhausted branch).
+/// aborting the run (see `retry_bucket` budget-exhausted branch). The
+/// phase has tasks and every one is terminal ⇒ has_any && !has_live ⇒
+/// proceed, derived from the seeded ledger.
 #[test]
 fn phase_can_proceed_when_all_items_failed_terminally() {
-    let (primary, _mesh) = make_primary();
+    let (mut primary, _mesh) = make_primary();
+
+    for name in ["f1", "f2"] {
+        let item = dep_binary(name, "compile", &[]);
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: name.into(),
+            task: item,
+        });
+        cs.apply(ClusterMutation::TaskFailed {
+            attempt: 0,
+            hash: name.into(),
+            kind: dynrunner_core::ErrorType::NonRecoverable,
+            error: "boom".into(),
+            version: Default::default(),
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
     let p = PhaseId::from("compile");
-    assert!(primary.phase_can_proceed(&p, 0, 1, 0));
-    assert!(primary.phase_can_proceed(&p, 0, 5, 0));
+    assert!(primary.phase_can_proceed(&p));
 }
 
-/// FAIL the genuine wedge: a phase that produced NO terminal accounting
-/// (zero completed, zero failed, zero skipped) yet still owns residual
-/// pending work — advancing would strand dependents on never-resolved
-/// inputs. We seed a single Pending item for the phase so
-/// `phase_min_workers` reports residual work, then assert the veto.
+/// FAIL the genuine wedge: a phase that still owns a LIVE (non-terminal)
+/// task yet has no terminal-drained tasks — advancing would strand
+/// dependents on never-resolved inputs. We seed a single Pending item for
+/// the phase so the rollup reads `has_live` and `phase_min_workers` reports
+/// residual work, then assert the veto.
 #[test]
 fn phase_cannot_proceed_with_residual_unresolved_work() {
     let (mut primary, _mesh) = make_primary();
@@ -158,9 +209,10 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
     primary.hydrate_from_cluster_state();
 
     let p = PhaseId::from("compile");
-    // Residual pending item ⇒ phase_min_workers > 0 ⇒ with zero terminal
-    // accounting the phase cannot proceed.
-    assert!(!primary.phase_can_proceed(&p, 0, 0, 0));
+    // Residual pending item ⇒ the phase has a LIVE task (has_live) ⇒ it is
+    // NOT the all-terminal first arm ⇒ the residual `phase_min_workers > 0`
+    // guard vetoes.
+    assert!(!primary.phase_can_proceed(&p));
 }
 
 /// F-honesty PROCEED — empty UPSTREAM phase with a blocked dependent (the
@@ -203,16 +255,17 @@ fn empty_upstream_phase_with_blocked_dependent_proceeds() {
     primary.hydrate_from_cluster_state();
 
     let build_compilers = PhaseId::from("build_compilers");
-    // No `build_compilers` item ⇒ zero residual (`phase_min_workers == 0`),
-    // zero accounting, zero skip, not declared may_be_empty ⇒ genuinely-empty.
-    // BUT the pool is non-empty (the blocked `matrix_eval` item) ⇒ the run
-    // still owns real work this phase's `Done` will unblock ⇒ PROCEED.
+    // No `build_compilers` ledger entry ⇒ no rollup ⇒ the `_` fallback; zero
+    // residual (`phase_min_workers == 0`), not declared may_be_empty ⇒
+    // genuinely-empty. BUT the pool is non-empty (the blocked `matrix_eval`
+    // item) ⇒ the run still owns real work this phase's `Done` will unblock
+    // ⇒ PROCEED.
     assert_eq!(primary.pool().in_flight(&build_compilers), 0);
     assert!(
         !primary.pool().is_empty(),
         "the blocked matrix_eval dependent is real outstanding work"
     );
-    assert!(primary.phase_can_proceed(&build_compilers, 0, 0, 0));
+    assert!(primary.phase_can_proceed(&build_compilers));
 }
 
 /// F-honesty PROCEED — empty LEAF phase while real work remains elsewhere:
@@ -246,7 +299,7 @@ fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
         !primary.pool().is_empty(),
         "the pending `work` item is real outstanding work"
     );
-    assert!(primary.phase_can_proceed(&tail, 0, 0, 0));
+    assert!(primary.phase_can_proceed(&tail));
 }
 
 /// F-honesty FAIL — the genuine SILENT PARTIAL SUCCESS: an activated phase
@@ -274,13 +327,14 @@ fn empty_phase_with_no_work_remaining_fails_loud() {
     primary.hydrate_from_cluster_state();
 
     let build = PhaseId::from("build");
-    // Empty pool, zero accounting, zero skip, not may_be_empty ⇒ the run
-    // would finish having done nothing ⇒ veto, fail loud.
+    // No `build` ledger entry ⇒ no rollup ⇒ `_` fallback; empty pool, not
+    // may_be_empty ⇒ the run would finish having done nothing ⇒ veto, fail
+    // loud.
     assert!(
         primary.pool().is_empty(),
         "no real work anywhere — the genuine silent-partial-success"
     );
-    assert!(!primary.phase_can_proceed(&build, 0, 0, 0));
+    assert!(!primary.phase_can_proceed(&build));
 }
 
 /// F-honesty PROCEED — declared `may_be_empty`: an activated phase that
@@ -321,25 +375,28 @@ fn declared_may_be_empty_phase_proceeds_when_empty() {
     assert!(primary.cluster_state_for_test().phase_may_be_empty(&tail));
     // Both empty + declared may_be_empty ⇒ proceed (non-leaf gate AND leaf
     // tail), even though an UNDECLARED empty phase in the same position fails.
-    assert!(primary.phase_can_proceed(&gate, 0, 0, 0));
-    assert!(primary.phase_can_proceed(&tail, 0, 0, 0));
+    assert!(primary.phase_can_proceed(&gate));
+    assert!(primary.phase_can_proceed(&tail));
 }
 
-/// F-honesty PROCEED — all items SKIPPED-AS-EXISTING: a phase that drained
-/// empty because ALL its items were skipped because their outputs already
-/// exist (the `--skip-existing` "nothing left to do" case) is SUCCESS, not a
-/// failure — distinct from the never-injected wedge. The recorded
-/// `PhaseTally::SkippedExisting` count is the discriminator; with
-/// `skipped > 0` the phase proceeds even though it is empty, undeclared, and
-/// non-leaf.
+/// PROCEED — all items SKIPPED-AS-EXISTING: a phase whose items were ALL
+/// skipped because their outputs already exist (the `--skip-existing`
+/// "nothing left to do" case) is SUCCESS, not a failure — distinct from the
+/// never-injected wedge. The skipped items are now REAL terminal ledger
+/// entries (`TaskState::SkippedAlreadyDone`), so the phase reads `has_any &&
+/// !has_live` and proceeds STRUCTURALLY (no special skip-count branch),
+/// even though it is undeclared and non-leaf.
 #[test]
 fn phase_all_skipped_as_existing_proceeds() {
     let (mut primary, _mesh) = make_primary();
 
-    // Non-leaf topology (compile depends on build), build seeded with no
-    // items but a recorded skipped-as-existing count — and NOT declared
-    // may_be_empty, so success here is owed purely to the skip count.
+    // Non-leaf topology (compile depends on build); `build` seeded with two
+    // items that are BOTH skipped-already-done, and NOT declared
+    // may_be_empty — so success here is owed purely to the all-terminal
+    // ledger state, not a may_be_empty opt-out.
     let dep = dep_binary("dep", "compile", &[]);
+    let s1 = dep_binary("s1", "build", &[]);
+    let s2 = dep_binary("s2", "build", &[]);
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PhaseDepsSet {
@@ -349,27 +406,36 @@ fn phase_all_skipped_as_existing_proceeds() {
             hash: "dep".into(),
             task: dep,
         });
+        // Seed each build item Pending FIRST, then transition to
+        // SkippedAlreadyDone — the same originate-Pending-then-skip pattern
+        // the discovery seed seam uses.
+        for (h, task) in [("s1", s1), ("s2", s2)] {
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: h.into(),
+                task,
+            });
+            assert_eq!(
+                cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: h.into() }),
+                crate::cluster_state::ApplyOutcome::Applied,
+                "Pending → SkippedAlreadyDone applies"
+            );
+        }
     }
     primary.hydrate_from_cluster_state();
 
     let build = PhaseId::from("build");
-    // Record the skipped-as-existing count via the same grow-only-MAX
-    // accessor the discovery originator uses.
-    primary.cluster_state_mut_for_test().record_phase_event_tally(
-        (build.clone(), crate::cluster_state::PhaseTally::SkippedExisting),
-        3,
-    );
-
-    let skipped = primary
-        .cluster_state_for_test()
-        .phase_event_tally_for(&(build.clone(), crate::cluster_state::PhaseTally::SkippedExisting));
-    assert_eq!(skipped, 3, "skipped-as-existing count recorded");
     assert!(
         !primary.cluster_state_for_test().phase_may_be_empty(&build),
-        "success owed to the skip count, NOT a may_be_empty declaration"
+        "success owed to the all-terminal skip ledger, NOT a may_be_empty declaration"
     );
-    // Zero accounting, zero residual, undeclared — but skipped > 0 ⇒ proceed.
-    assert!(primary.phase_can_proceed(&build, 0, 0, skipped));
+    assert_eq!(
+        primary.cluster_state_for_test().phase_task_partition(&build),
+        (0, 2),
+        "both build items are SkippedAlreadyDone (0 to-run, 2 skipped)"
+    );
+    // The phase has tasks and every one is terminal (skipped) ⇒ has_any &&
+    // !has_live ⇒ proceed, structurally.
+    assert!(primary.phase_can_proceed(&build));
 }
 
 /// `fire_initial_phase_starts` emits `PhaseStartedNeedsWorkers { min: 1 }`

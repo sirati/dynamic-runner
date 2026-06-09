@@ -189,9 +189,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     completed_task_ids.insert(task.task_id.clone());
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
+                // `SkippedAlreadyDone` is a terminal that was NEVER
+                // dispatched, so it is seeded EXACTLY like the other
+                // success-/terminal-ish states (its task_id resolves its
+                // dependents' `task_depends_on` in `extend()`, and the phase
+                // is marked started + carrying a terminal) but is CRITICALLY
+                // NOT pushed into `items`: re-dispatching an already-done
+                // item on failover would re-run work whose outputs already
+                // exist (the NO-REDO failover-routing decision). The CRDT
+                // entry itself stays `SkippedAlreadyDone`.
                 TaskState::Completed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. } => {
+                | TaskState::InvalidTask { task, .. }
+                | TaskState::SkippedAlreadyDone { task, .. } => {
                     started_phases.insert(task.phase_id.clone());
                     phases_with_terminal.insert(task.phase_id.clone());
                     primary_completed.insert(hash.clone());

@@ -304,9 +304,13 @@ impl<I: Identifier> ClusterState<I> {
                             blocked_on_unfulfillable = Some(dep_hash);
                         }
                     }
-                    Some(TaskState::Completed { .. }) => {
+                    Some(TaskState::Completed { .. })
+                    | Some(TaskState::SkippedAlreadyDone { .. }) => {
                         // Resolved dep — contributes nothing to the
-                        // blocking decision.
+                        // blocking decision. A skipped prereq's outputs
+                        // already exist on the shared fs, so a dependent of
+                        // it is unblocked exactly like a dependent of a
+                        // completed task.
                     }
                     Some(TaskState::Pending { .. })
                     | Some(TaskState::InFlight { .. })

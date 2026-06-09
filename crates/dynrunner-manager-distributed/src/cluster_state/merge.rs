@@ -73,6 +73,11 @@ fn terminal_payload_hash<I>(state: &TaskState<I>) -> u64 {
         TaskState::InvalidTask {
             reason, last_error, ..
         } => hash_one((3u8, reason, last_error)),
+        // Fixed discriminant tag; a skip carries no error payload, so the
+        // content hash is the constant `4u8` (the terminal_rank already
+        // separates it as the weakest terminal — two replicas holding the
+        // skip for the same hash share this constant and idempotent-NoOp).
+        TaskState::SkippedAlreadyDone { .. } => hash_one(4u8),
         TaskState::Pending { .. } | TaskState::InFlight { .. } | TaskState::Blocked { .. } => 0,
     }
 }
@@ -157,6 +162,19 @@ pub(super) fn task_join_key<I>(state: &TaskState<I>) -> TaskJoinKey {
             band: JoinBand::Terminal,
             terminal_rank: TerminalRank::InvalidTask,
             version: *version,
+            nonterminal_rank: NonTerminalRank::Pending,
+            failedlike: FailedLikeRank::Failed,
+            payload_content_hash: terminal_payload_hash(state),
+        },
+        TaskState::SkippedAlreadyDone { attempt, .. } => TaskJoinKey {
+            attempt: *attempt,
+            band: JoinBand::Terminal,
+            // The WEAKEST terminal rank: a real terminal for the same hash
+            // always wins the join over the spawn-time skip. A skip carries
+            // no version; the terminal rank already places it below every
+            // other terminal.
+            terminal_rank: TerminalRank::SkippedAlreadyDone,
+            version: TaskVersion::default(),
             nonterminal_rank: NonTerminalRank::Pending,
             failedlike: FailedLikeRank::Failed,
             payload_content_hash: terminal_payload_hash(state),
