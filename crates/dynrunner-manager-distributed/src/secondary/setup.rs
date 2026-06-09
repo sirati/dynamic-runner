@@ -367,12 +367,26 @@ where
                     // is the `AwaitingPrimary → Configuring` boundary: the
                     // primary has made contact, so spawn the worker pool
                     // (the entry action of `Configuring`) BEFORE handling
-                    // this frame's content. The frames are ordered
-                    // (PeerInfo → InitialAssignment → TransferComplete) on
-                    // the primary link, so the pool exists before any
-                    // `InitialAssignment` dispatch — no race. Awaited
-                    // before the match below exactly as the pre-relocation
-                    // flow awaited `initialize_workers` before
+                    // this frame's content. Fired on EVERY primary frame and
+                    // idempotent (a no-op once `Configuring`), and AWAITED
+                    // before the per-type match below — so the worker pool
+                    // exists before any `InitialAssignment` dispatch arm runs,
+                    // WHICHEVER frame arrives first. This pool-before-dispatch
+                    // guarantee does NOT rely on the three setup frames arriving
+                    // in a fixed order: `got_peer_info / got_assignment /
+                    // got_transfer` are tracked independently and the gate
+                    // releases once all three are set, in any interleaving. That
+                    // independence matters because the frames ride DIFFERENT
+                    // egress edges — PeerInfo broadcasts over `Destination::All`,
+                    // while `InitialAssignment` and `TransferComplete` are
+                    // directed `Destination::Secondary(id)` sends (the
+                    // relay-capable router path; see
+                    // `primary::lifecycle::mutations::send_transfer_complete`) —
+                    // so no single ordered link carries all three. The two
+                    // directed frames to THIS secondary DO arrive in send order
+                    // (same directed link, FIFO), but the gate does not depend on
+                    // it. Awaited before the match below exactly as the
+                    // pre-relocation flow awaited `initialize_workers` before
                     // `wait_for_setup`. Idempotent: only fires while the
                     // lifecycle is still `AwaitingPrimary` (the
                     // `enter_configuring` transition is a no-op from any
