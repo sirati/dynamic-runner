@@ -1126,3 +1126,217 @@ async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
          death quorum — relative-age keying, never a wall-clock subtraction",
     );
 }
+
+// ── Single-survivor convergence (de51731b "2-node can't fail over to 1"
+//    family, extended to N=1) ───────────────────────────────────────────
+//
+// Topology these tests pin: a fleet meshed (so `mesh.degraded` stayed
+// FALSE — the watchdog saw ≥1 peer and took the partial/degraded-but-capable
+// branch), then ALL peer secondaries departed and the primary died. The
+// lone survivor's `live_peer_ids` is now empty (`peer_count == 0`), so
+// `failover_quorum(0) == 1` is met by its own single self-confirm. It MUST
+// commit the promotion and converge — NOT flap Suspecting/Candidate↔Normal
+// forever (the consumer-confirmed bug: every self-promotion was reverted by
+// a non-primary mesh frame mis-read as "the primary is back").
+
+/// A non-primary inbound mesh frame (a peer secondary's anti-entropy
+/// `StateDigest`, the submitter's snapshot/run-config request, a relayed
+/// `ClusterMutation`) routed through `dispatch_message` must NOT revert an
+/// in-flight election. Pre-fix the dispatch path called the un-gated
+/// `record_primary_message` for EVERY frame, so any such frame from the
+/// still-connected submitter cancelled the survivor's election — the
+/// flap. THE REVERT-CHECK: drive Suspecting, then feed a `StateDigest` from
+/// a NON-primary sender; the election must STAY Suspecting.
+#[tokio::test(flavor = "current_thread")]
+async fn non_primary_frame_does_not_revert_election() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+    // The mesh formed (NOT degraded) — this survivor was failover-capable.
+    sec.mesh.degraded = false;
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    // Primary suspected dead → Suspecting.
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.run_election_tick();
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Suspecting { .. }),
+        "a suspected-dead primary must enter Suspecting",
+    );
+
+    // A NON-primary frame (anti-entropy digest from a peer, sender != the
+    // current primary "primary-orig") routed through dispatch_message MUST
+    // NOT reset the election: it is not a primary-liveness signal.
+    let digest = DistributedMessage::StateDigest {
+        target: None,
+        sender_id: "peer-observer".into(),
+        timestamp: timestamp_now(),
+        digest: sec.cluster_state.digest(),
+    };
+    sec.dispatch_message(digest, &mut FakeWorkerFactory)
+        .await
+        .expect("StateDigest handler succeeds");
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Suspecting { .. }),
+        "a non-primary mesh frame must NOT revert the election (pre-fix it \
+         reverted to Normal — the single-survivor flap)",
+    );
+}
+
+/// END-TO-END convergence: a lone survivor (mesh formed, then peers gone,
+/// primary dead) reaches quorum with its OWN single confirm and COMMITS the
+/// promotion in-tick — `run_election_tick` returns `promoted == true`, the
+/// caller's `fire_local_promotion` advances `current_primary` onto self and
+/// rebroadcasts `PrimaryChanged { new = self }`. The election does NOT flap:
+/// a subsequent non-primary frame can no longer revert it (it is now the
+/// primary), and the node stays converged.
+#[tokio::test(flavor = "current_thread")]
+async fn single_survivor_election_converges_and_commits() {
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, PrimaryChangeReason};
+
+    // Recording harness so the `PrimaryChanged { new = self }` re-point is
+    // observable after `drain_egress`; `promotion_rx` is the C4 signal.
+    let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 0);
+    sec.enter_operational_for_test();
+    // Mesh formed (NOT degraded), no live peer secondaries
+    // (`peer_keepalives` empty → live_peer_ids empty → peer_count 0 →
+    // quorum failover_quorum(0) == 1).
+    sec.mesh.degraded = false;
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+    assert_eq!(
+        failover_quorum(0),
+        1,
+        "a lone survivor's quorum is 1 — met by its own single self-confirm",
+    );
+
+    // Primary suspected dead → Suspecting.
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.run_election_tick();
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
+
+    // Wait the gather window, then tick again: with zero live peers the
+    // self-quorum is ALREADY met, so the tick commits the promotion in-tick
+    // (no Candidate wait for a peer confirm that can never arrive).
+    tokio::time::sleep(ONE_INTERVAL).await;
+    let actions = sec.run_election_tick();
+    assert!(
+        actions.promoted,
+        "a single-survivor self-quorum must COMMIT the promotion in-tick \
+         (the caller drives fire_local_promotion), not sit in Candidate \
+         awaiting a peer confirm that never comes",
+    );
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Promoted),
+        "the committing tick leaves the election Promoted for the terminal action",
+    );
+
+    // Drive the terminal action the loop drives off `actions.promoted`.
+    sec.fire_local_promotion().await;
+    sec.drain_egress().await;
+
+    // The C4 promotion signal fired, identity advanced onto self, the
+    // re-point was rebroadcast, and the election reset to Normal (a primary
+    // now exists — convergence, no lingering Promoted/Candidate flap).
+    assert!(
+        sec.promotion_rx.try_recv().is_ok(),
+        "the single-survivor win fires the C4 PromotionSignal",
+    );
+    assert_eq!(
+        sec.cluster_state.current_primary(),
+        Some("sec-a"),
+        "the survivor becomes the primary",
+    );
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
+    let rebroadcast = log.borrow().iter().any(|m| {
+        matches!(
+            m,
+            DistributedMessage::ClusterMutation { mutations, .. }
+                if mutations.iter().any(|mu| matches!(
+                    mu,
+                    ClusterMutation::PrimaryChanged { new, .. } if new == "sec-a"
+                ))
+        )
+    });
+    assert!(
+        rebroadcast,
+        "the single-survivor win rebroadcasts PrimaryChanged(new=self)",
+    );
+
+    // CONVERGED: once this node IS the primary, its same-peer primary's own
+    // `Primary`-role keepalives keep `primary_last_seen` fresh (recognized:
+    // sender == current_primary == self), so the election stays Normal — no
+    // self-re-election flap. (In production the `Node` builds the
+    // `PrimaryCoordinator` off the C4 signal and that primary emits the
+    // keepalives; here we feed one directly, mirroring
+    // `self_named_primary_resets_election_to_normal`.)
+    for _ in 0..3 {
+        sec.handle_inbound(
+            keepalive_from("sec-a", KeepaliveRole::Primary),
+            &mut FakeWorkerFactory,
+        )
+        .await;
+        let after = sec.run_election_tick();
+        assert!(!after.promoted);
+        assert!(
+            matches!(sec.op_mut().election, ElectionState::Normal),
+            "a converged self-primary fed its own keepalives stays Normal — no flap",
+        );
+    }
+}
+
+/// The REAL recovery path is NOT broken: a genuine `Primary`-role keepalive
+/// from the EXPECTED current primary, fed through the real `handle_inbound`
+/// recognition path, STILL aborts an in-flight election (reverts to Normal).
+/// The fix narrows the revert to genuine primary-liveness signals — it must
+/// not over-narrow and break the legitimate "primary came back" abort.
+#[tokio::test(flavor = "current_thread")]
+async fn real_primary_recovery_still_aborts_election() {
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, KeepaliveRole};
+    let mut sec = make_secondary(election_config("sec-a"));
+    sec.enter_operational_for_test();
+    sec.mesh.degraded = false;
+    sec.cluster_state.apply(ClusterMutation::PrimaryChanged {
+        new: "primary-orig".into(),
+        epoch: 1,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
+    });
+    sec.record_primary_message();
+
+    // Suspected dead → Suspecting.
+    sec.op_mut().primary_last_seen =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+    sec.run_election_tick();
+    assert!(matches!(
+        sec.op_mut().election,
+        ElectionState::Suspecting { .. }
+    ));
+
+    // The GENUINE primary "primary-orig" is reachable again and sends a
+    // Primary-role keepalive. handle_inbound recognizes it
+    // (sender == current_primary) and aborts the election.
+    sec.handle_inbound(
+        keepalive_from("primary-orig", KeepaliveRole::Primary),
+        &mut FakeWorkerFactory,
+    )
+    .await;
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "a genuine Primary keepalive from the current primary MUST still \
+         abort the election (the real-recovery path is preserved)",
+    );
+}

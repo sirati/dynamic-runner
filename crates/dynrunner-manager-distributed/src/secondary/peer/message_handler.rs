@@ -95,20 +95,20 @@ where
                 //    primary, so this entry never inflates election counts.
                 match emitter_role {
                     KeepaliveRole::Primary => {
-                        if self.cluster_state.current_primary() == Some(secondary_id.as_str()) {
-                            self.record_primary_message();
-                            tracing::trace!(
-                                primary = %secondary_id,
-                                active_workers,
-                                "primary keepalive received"
-                            );
-                        } else {
-                            tracing::trace!(
-                                origin = %secondary_id,
-                                active_workers,
-                                "primary keepalive from non-current-primary id; ignored"
-                            );
-                        }
+                        // Primary-liveness refresh, gated on the SAME single
+                        // source (`current_primary()`) the dispatch path uses
+                        // via `record_primary_message_if_from_primary`: a
+                        // `Primary` keepalive whose originator is the current
+                        // primary refreshes `primary_last_seen` and cancels a
+                        // false-alarm election; a stray one from a
+                        // demoted/zombie ex-primary (whose id no longer matches
+                        // `current_primary()`) is a no-op for primary liveness.
+                        self.record_primary_message_if_from_primary(&secondary_id);
+                        tracing::trace!(
+                            primary = %secondary_id,
+                            active_workers,
+                            "primary keepalive received (refresh gated on current_primary)"
+                        );
                     }
                     KeepaliveRole::Secondary => {
                         // Record LOCAL receipt-time monotonic `Instant`, NOT
