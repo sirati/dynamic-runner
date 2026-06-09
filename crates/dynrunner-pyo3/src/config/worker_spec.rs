@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dynrunner_core::WorkerId;
 use pyo3::prelude::*;
@@ -63,6 +63,19 @@ pub(crate) struct RenderedCommand {
     pub(crate) argv: Vec<String>,
     pub(crate) env: std::collections::HashMap<String, String>,
     pub(crate) cwd: Option<String>,
+    /// File the worker's OS-level **stdout + stderr** are redirected to
+    /// (append). `None` silences both to `/dev/null`.
+    ///
+    /// This is the SAME per-worker log file the worker also receives via
+    /// `--log-file` / `{LOG_FILE}` and writes its Python logging into; the
+    /// OS-stdio redirect additionally captures anything the worker writes
+    /// OUTSIDE Python logging — an interpreter-level traceback, a native
+    /// fault message, a bare `print`, an `exit(1)` diagnostic. Without it
+    /// those go to `/dev/null` and a worker that exits before it ever logs
+    /// (e.g. a crash-on-startup respawn) is undiagnosable. Captured here so
+    /// EVERY spawn — initial pool and per-type respawn alike — routes its
+    /// stdio identically (no respawn-specific path).
+    pub(crate) stdio_capture: Option<PathBuf>,
 }
 
 impl WorkerSpec {
@@ -88,6 +101,10 @@ impl WorkerSpec {
                 .map(|(k, v)| (k.clone(), subst(v)))
                 .collect(),
             cwd: self.cwd.as_deref().map(subst),
+            // Capture the worker's OS-stdio to the SAME per-worker log file it
+            // logs into via `{LOG_FILE}` — so a crash that prints to stderr
+            // (or never reaches Python logging at all) is preserved.
+            stdio_capture: Some(vars.log_file.to_path_buf()),
         }
     }
 }

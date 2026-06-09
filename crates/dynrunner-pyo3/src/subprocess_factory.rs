@@ -23,6 +23,41 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// `waitpid(WNOHANG)` calls are bounded by `TERMINATE_GRACE` anyway.
 const TERMINATE_POLL: Duration = Duration::from_millis(50);
 
+/// Resolve a worker's `(stdout, stderr)` stdio destinations from an
+/// optional capture-file path.
+///
+/// `Some(path)` → both streams append to that one per-worker file (two
+/// independent OS handles via `File::try_clone`, so each stream has its own
+/// file offset cursor and neither truncates the other). `None`, or any I/O
+/// error opening/cloning the file → both fall back to `/dev/null`.
+///
+/// Single concern: turn "where should this worker's stdio go?" into the two
+/// `Stdio` values `Command` consumes. Best-effort by contract — a failure to
+/// open the log file silences the stream rather than aborting the spawn, so a
+/// missing-mount or permission glitch on the log path can never stop a worker
+/// from starting (observability must not gate liveness).
+fn stdio_capture_streams(path: Option<&Path>) -> (std::process::Stdio, std::process::Stdio) {
+    let null = || std::process::Stdio::null();
+    let Some(path) = path else {
+        return (null(), null());
+    };
+    // Append so a per-type respawn extends the same `worker_<id>.log` the
+    // prior (now-killed) worker wrote — the pre-respawn output is preserved
+    // and the respawn's crash output is appended after it.
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(path);
+    match opened {
+        Ok(file) => match file.try_clone() {
+            // Two handles to the same file: one drives stdout, the other
+            // stderr. Both inherit the append flag, so the kernel serialises
+            // each `write` to end-of-file and the two streams interleave
+            // without clobbering.
+            Ok(second) => (std::process::Stdio::from(file), std::process::Stdio::from(second)),
+            Err(_) => (std::process::Stdio::from(file), null()),
+        },
+        Err(_) => (null(), null()),
+    }
+}
+
 /// Tear down a vector of tracked worker children with the
 /// SIGTERM → grace → SIGKILL ladder. Idempotent: slots that already
 /// contained `None`, or children that have already exited, are no-ops.
@@ -298,13 +333,30 @@ impl SubprocessWorkerFactory {
                 argv: self.legacy_argv(worker_id, runtime, fd_or_socket),
                 env: std::collections::HashMap::new(),
                 cwd: None,
+                // Capture OS-stdio to the SAME `worker_log` the legacy argv
+                // passes as `--log-file`, mirroring the WorkerSpec path.
+                stdio_capture: Some(worker_log),
             }
         }
     }
 
-    /// Build a `std::process::Command` from a rendered template. Stdio is
-    /// silenced; callers add transport-specific extras (e.g. socketpair
+    /// Build a `std::process::Command` from a rendered template. `stdin` is
+    /// always silenced (the comm channel is a socket / inherited fd, never
+    /// stdin); callers add transport-specific extras (e.g. socketpair
     /// `pre_exec` hooks) afterwards.
+    ///
+    /// Worker stdout + stderr capture: when `rendered.stdio_capture` is
+    /// `Some(path)`, both are redirected (append) to that per-worker file —
+    /// the SAME `worker_<id>.log` the worker logs into via `--log-file` /
+    /// `{LOG_FILE}`. This preserves anything the worker writes OUTSIDE Python
+    /// logging (an interpreter traceback, a native fault, a bare `print`, an
+    /// `exit(1)` diagnostic). Without it those bytes go to `/dev/null` and a
+    /// worker that crashes before it ever logs — e.g. a per-type respawn that
+    /// exits 1 on startup — leaves NO trace anywhere. Every spawn (initial
+    /// pool + respawn) funnels through here, so the capture is uniform with no
+    /// respawn-specific branch. If the file cannot be opened the spawn falls
+    /// back to silencing that stream (best-effort observability must never
+    /// block a worker from starting).
     ///
     /// Worker as its own process-group leader: `process_group(0)` asks the
     /// kernel to create a fresh process group with `pgid == child_pid` at
@@ -347,9 +399,12 @@ impl SubprocessWorkerFactory {
             cmd.current_dir(cwd);
         }
         cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .process_group(0);
+        // Route the worker's OS-stdout + stderr to its per-worker log file
+        // (append) so a crash that bypasses Python logging is still captured;
+        // fall back to silence when no capture path is set or the open fails.
+        let (stdout, stderr) = stdio_capture_streams(rendered.stdio_capture.as_deref());
+        cmd.stdout(stdout).stderr(stderr);
 
         if let Some(procs) = subcgroup_procs {
             // `pre_exec` runs in the forked child after `fork(2)` but
@@ -878,6 +933,7 @@ mod tests {
             argv: vec!["true".to_string()],
             env: std::collections::HashMap::new(),
             cwd: None,
+            stdio_capture: None,
         };
         let mut cmd = factory.command_from_rendered(&rendered, Some(procs_path.clone()));
         let mut child = cmd.spawn().expect("spawn true");
@@ -903,6 +959,7 @@ mod tests {
             argv: vec!["true".to_string()],
             env: std::collections::HashMap::new(),
             cwd: None,
+            stdio_capture: None,
         };
         let mut cmd = factory.command_from_rendered(&rendered, None);
         let mut child = cmd.spawn().expect("spawn true");
@@ -916,5 +973,87 @@ mod tests {
             entries.is_empty(),
             "tempdir should be untouched when no subcgroup is supplied; got: {entries:?}"
         );
+    }
+
+    /// Diagnostic-gap pin: `render_command` MUST populate
+    /// `RenderedCommand::stdio_capture` with the SAME per-worker log file it
+    /// passes as `--log-file`, so EVERY spawn that funnels through
+    /// `command_from_rendered` — initial pool AND per-type respawn — routes
+    /// its OS-stdio to a capturable file instead of `/dev/null`.
+    ///
+    /// Revert-check: drop the `stdio_capture: Some(worker_log)` assignment in
+    /// the legacy `render_command` arm (back to the pre-fix shape) and this
+    /// asserts `None`, failing.
+    #[test]
+    fn render_command_sets_stdio_capture_to_worker_log() {
+        let factory = make_factory_with_two_types();
+        let tokenize = factory
+            .type_runtime_for(&TypeId::from("tokenize"))
+            .unwrap()
+            .clone();
+        let tmp = std::path::PathBuf::from("/tmp/sock");
+        let rendered = factory.render_command(0, &tokenize, FdOrSocket::Socket(&tmp));
+
+        // The capture path is exactly the file the factory hands the worker as
+        // its `--log-file` (LogPathConfig default: `<log_dir>/worker_<id>.log`).
+        let expected = factory.log_paths.worker_log(&factory.log_dir, 0);
+        assert_eq!(
+            rendered.stdio_capture.as_deref(),
+            Some(expected.as_path()),
+            "render_command must capture worker stdio to its --log-file so a \
+             crash-on-startup respawn is diagnosable",
+        );
+    }
+
+    /// End-to-end pin that `command_from_rendered` actually REDIRECTS the
+    /// spawned worker's OS-stdout AND stderr to the `stdio_capture` file.
+    /// Spawns `/bin/sh -c 'echo OUT; echo ERR >&2'` and asserts BOTH lines
+    /// land in the file — the exact wiring that makes a respawned worker's
+    /// otherwise-`/dev/null` crash output recoverable from `worker_<id>.log`.
+    ///
+    /// Revert-check: restore the `command_from_rendered` stdout/stderr to
+    /// `Stdio::null()` and the file ends up empty, failing both asserts.
+    #[test]
+    fn command_from_rendered_routes_stdout_and_stderr_to_capture_file() {
+        let factory = make_factory_with_two_types();
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("worker_0.log");
+
+        let rendered = RenderedCommand {
+            argv: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo OUT; echo ERR >&2".to_string(),
+            ],
+            env: std::collections::HashMap::new(),
+            cwd: None,
+            stdio_capture: Some(log_path.clone()),
+        };
+        let mut cmd = factory.command_from_rendered(&rendered, None);
+        let status = cmd.spawn().expect("spawn sh").wait().expect("wait sh");
+        assert!(status.success(), "sh exited non-success: {status:?}");
+
+        let captured =
+            std::fs::read_to_string(&log_path).expect("capture file should exist post-spawn");
+        assert!(
+            captured.contains("OUT"),
+            "worker stdout must be captured to the log file; got: {captured:?}",
+        );
+        assert!(
+            captured.contains("ERR"),
+            "worker stderr must be captured to the log file; got: {captured:?}",
+        );
+    }
+
+    /// `stdio_capture_streams(None)` silences both streams to `/dev/null` —
+    /// the explicit-opt-out path the cgroup-wiring tests rely on (a worker
+    /// constructed with `stdio_capture: None` must not create any file).
+    #[test]
+    fn stdio_capture_streams_none_silences_both() {
+        // Smoke that the helper returns without panicking and creates no file
+        // when handed `None`; the observable "no file created" is asserted by
+        // `command_from_rendered_without_subcgroup_writes_nothing` above (it
+        // uses `stdio_capture: None` and asserts the tempdir stays empty).
+        let _ = stdio_capture_streams(None);
     }
 }
