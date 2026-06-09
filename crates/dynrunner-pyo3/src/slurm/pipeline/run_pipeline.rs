@@ -9,7 +9,7 @@ use pyo3::types::{PyDict, PyList};
 
 use super::drive_rust::drive_rust_primary;
 use super::preparation::run_preparation;
-use super::{CleanupGuard, attr_truthy, pkill_leftover_tunnels};
+use super::{CleanupGuard, attr_truthy, pkill_leftover_tunnels, should_upload_source_binaries};
 
 /// Python entry point. Mirrors the signature of the Python
 /// `run_slurm_pipeline(task, args, deployment, log)`. The
@@ -381,20 +381,21 @@ pub(crate) fn run_slurm_pipeline<'py>(
 
         // ---- Source-binary upload. ----
         //
-        // Gating mirrors pipeline.py exactly: file-based items, NOT
-        // pre-staged. Runs after sbatch so secondaries are already
-        // starting; the primary's InitialAssignment isn't sent until
-        // coord.run() reaches its peer-mesh-ready gate, so a slow
-        // upload simply delays dispatch rather than racing.
-        let uses_file_based_items: bool = task
-            .getattr("uses_file_based_items")
-            .ok()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(true);
-        if !binaries.is_empty()
-            && uses_file_based_items
-            && !attr_truthy(args, "source_already_staged")
-        {
+        // Gated on discovered-binaries + NOT pre-staged. Upload
+        // stageability is per-item (resolved under `--source` by the
+        // upload walk's strip-prefix skip), so the gate deliberately
+        // does NOT consult the task-class `uses_file_based_items` flag:
+        // a mixed composite (real-file items + opaque sentinels spawned
+        // later, never in `binaries` here) must upload its real files.
+        // See `should_upload_source_binaries`. Runs after sbatch so
+        // secondaries are already starting; the primary's
+        // InitialAssignment isn't sent until coord.run() reaches its
+        // peer-mesh-ready gate, so a slow upload simply delays dispatch
+        // rather than racing.
+        if should_upload_source_binaries(
+            binaries.is_empty(),
+            attr_truthy(args, "source_already_staged"),
+        ) {
             job_manager.call_method1("upload_source_binaries", (&binaries, &source_dir))?;
         }
 
