@@ -89,6 +89,30 @@ pub(super) fn next_round(state: &ElectionState) -> u32 {
     }
 }
 
+/// Build and enqueue the failover liveness query asking peers whether the
+/// silent primary (`query_node_id`) is also silent for them. SINGLE SOURCE for
+/// the `TimeoutQuery` frame: it is emitted BOTH when first entering
+/// `Suspecting` AND re-emitted on every waiting Suspecting tick that has not
+/// yet reached quorum (the continuous-poll convergence — a peer that observes
+/// the primary's death AFTER the first query still gets re-asked, so divergent
+/// abrupt-crash eviction timing cannot wedge the tally). A `None`
+/// `query_node_id` (no current primary to ask about) is a no-op. Lives here
+/// with the other pure election helpers so the two emit sites cannot drift.
+pub(super) fn push_timeout_query<I: Identifier>(
+    broadcast: &mut Vec<DistributedMessage<I>>,
+    sender_id: &str,
+    query_node_id: Option<String>,
+) {
+    if let Some(query_node_id) = query_node_id {
+        broadcast.push(DistributedMessage::TimeoutQuery {
+            target: None,
+            sender_id: sender_id.to_owned(),
+            timestamp: crate::secondary::wire::timestamp_now(),
+            query_node_id,
+        });
+    }
+}
+
 /// The failover quorum size for a live mesh of `live_peer_count` peers
 /// (the count of [`SecondaryCoordinator::live_peer_ids`], which is
 /// `peer_keepalives` MINUS the current primary — so it is the set of peers
