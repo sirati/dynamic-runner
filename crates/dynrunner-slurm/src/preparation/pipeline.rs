@@ -18,7 +18,9 @@ use tokio::task::JoinSet;
 
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
-use super::ssh::{production_spawner, reconnect_spawner, terminate_child};
+use super::ssh::{
+    LingerRestoreMap, production_spawner, reconnect_spawner, restore_linger, terminate_child,
+};
 
 /// Lifecycle for the SLURM preparation phase. Owns spawned `ssh -N -R`
 /// subprocess handles and tears them down on cleanup().
@@ -59,6 +61,13 @@ pub struct SlurmPreparation {
     /// without re-threading the value through their call site. `None`
     /// until the first `setup_ssh_tunnels` call records it.
     primary_quic_port: StdMutex<Option<u16>>,
+    /// `host -> was_linger`: each compute node's ORIGINAL logind linger
+    /// state, captured at tunnel-establish time (through the spawner) and
+    /// drained at [`Self::cleanup`] to restore nodes the run enabled linger
+    /// on. Shared into every spawner (initial cohort + respawn + reconnect)
+    /// so the whole run's linger lifecycle is one map. See
+    /// [`LingerRestoreMap`].
+    linger_restore: LingerRestoreMap,
 }
 
 impl SlurmPreparation {
@@ -70,6 +79,7 @@ impl SlurmPreparation {
             secondary_port_map: Arc::new(StdMutex::new(HashMap::new())),
             establish_pool,
             primary_quic_port: StdMutex::new(None),
+            linger_restore: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -154,10 +164,15 @@ impl SlurmPreparation {
             // the persistent port map without borrowing `self` (they
             // live on the JoinSet past the borrow).
             let port_map = Arc::clone(&self.secondary_port_map);
+            let linger_restore = Arc::clone(&self.linger_restore);
             let id_for_task = secondary_id.clone();
             watchers.spawn_local(async move {
-                let spawner =
-                    production_spawner(id_for_task.clone(), opts.clone(), primary_quic_port);
+                let spawner = production_spawner(
+                    id_for_task.clone(),
+                    opts.clone(),
+                    primary_quic_port,
+                    linger_restore,
+                );
                 let res = establish_one_tunnel_inner(
                     &id_for_task,
                     &info_path,
@@ -264,9 +279,11 @@ impl SlurmPreparation {
         let tunnels = Arc::clone(&self.ssh_tunnels);
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
+        let linger_restore = Arc::clone(&self.linger_restore);
         let id_owned = secondary_id.to_owned();
 
-        let spawner = production_spawner(id_owned.clone(), opts.clone(), primary_quic_port);
+        let spawner =
+            production_spawner(id_owned.clone(), opts.clone(), primary_quic_port, linger_restore);
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
@@ -332,9 +349,11 @@ impl SlurmPreparation {
         let tunnels = Arc::clone(&self.ssh_tunnels);
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
+        let linger_restore = Arc::clone(&self.linger_restore);
         let id_owned = secondary_id.to_owned();
 
-        let spawner = reconnect_spawner(id_owned.clone(), opts.clone(), primary_quic_port);
+        let spawner =
+            reconnect_spawner(id_owned.clone(), opts.clone(), primary_quic_port, linger_restore);
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
@@ -358,12 +377,21 @@ impl SlurmPreparation {
     /// `&self` mirrors [`Self::setup_ssh_tunnels`]: the only mutation
     /// is draining the `Arc<Mutex<Vec<Child>>>`, which is already
     /// interior-mutable.
+    ///
+    /// Linger: after the tunnels are down, RESTORE each node's logind
+    /// linger to off where the run enabled it (whole-run-scoped, race-free
+    /// — see [`restore_linger`]). The tunnels are torn down FIRST so the
+    /// submitter `-R` login sessions are already gone; the restore then
+    /// returns logind to exactly the pre-run state. Best-effort per node.
     pub async fn cleanup(&self) {
         tracing::info!("cleaning up SLURM preparation resources");
-        let mut tunnels = self.ssh_tunnels.lock().await;
-        for mut child in tunnels.drain(..) {
-            terminate_child(&mut child).await;
+        {
+            let mut tunnels = self.ssh_tunnels.lock().await;
+            for mut child in tunnels.drain(..) {
+                terminate_child(&mut child).await;
+            }
         }
+        restore_linger(&self.linger_restore, &self.opts).await;
         tracing::info!("SLURM preparation cleanup complete");
     }
 }

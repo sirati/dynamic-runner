@@ -160,8 +160,12 @@ pub struct WrapperScriptConfig<'a> {
     /// shutdown-manager process started via `systemd-run --user`
     /// inherits the user's `user@<uid>.service` cgroup instead, so
     /// SLURM cgroup-v2 teardown of the job's pidtree does not reap
-    /// it. Cluster prerequisite: `loginctl enable-linger` for the
-    /// SLURM user (LMU Krater has this set).
+    /// it. Linger (`user@<uid>.service` surviving last-session-close)
+    /// is established by the SUBMITTER's setup over its ssh to each
+    /// node at tunnel-build time and restored at run-end; the wrapper
+    /// only CHECKs + HONORs it. On a polkit-restricted node where the
+    /// setup-enable is denied, pre-setting `loginctl enable-linger`
+    /// for the SLURM user is the fallback (LMU Krater has this set).
     pub shutdown_manager_bin_path: Option<&'a Path>,
     /// Bytes to reserve for the secondary process itself when the
     /// nested workers cgroup is enabled. `Some(n)` renders an

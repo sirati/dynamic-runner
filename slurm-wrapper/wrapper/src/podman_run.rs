@@ -235,6 +235,7 @@ mod tests {
             shutdown_unit_name: "dynrunner-shutdown-2f1d4e89".to_string(),
             shutdown_log_dir: PathBuf::from("/net/log/sec-0"),
             shutdown_log_path: PathBuf::from("/net/log/sec-0/shutdown-manager.log"),
+            wrapper_log_path: PathBuf::from("/net/log/sec-0/wrapper.log"),
             shutdown_pid_file: PathBuf::from("/tmp/asm-2f1d4e89/shutdown-manager.pid"),
             local_image: PathBuf::from("/tmp/asm-2f1d4e89/asm-tokenizer.tar"),
             image_cache_root: PathBuf::from("/tmp/asm-imgcache"),

@@ -57,6 +57,16 @@ pub struct Layout {
     /// records WHY the teardown happened). This dir survives the cleanup.
     pub shutdown_log_dir: PathBuf, // <log_network>/<secondary_id>
     pub shutdown_log_path: PathBuf, // <shutdown_log_dir>/shutdown-manager.log
+    /// The wrapper's OWN tracing log, routed into the SAME persistent
+    /// per-secondary dir as the shutdown-manager log
+    /// (`<shutdown_log_dir>/wrapper.log`). It sits alongside the
+    /// secondary's container log and the shutdown-manager log so an
+    /// operator finds all three for one secondary in one place, and it
+    /// survives the `rndtmp` cleanup the manager performs on teardown
+    /// (the wrapper's teardown narrative is recorded exactly when the
+    /// scratch tree is being torn down). `init_logging` tees the wrapper's
+    /// stderr output here.
+    pub wrapper_log_path: PathBuf, // <shutdown_log_dir>/wrapper.log
     pub shutdown_pid_file: PathBuf, // <rndtmp>/shutdown-manager.pid  (:250)
     pub local_image: PathBuf,       // <rndtmp>/<image_tar_basename>  (:696)
     /// Node-local image-cache ROOT: `/tmp/<name_prefix>-imgcache`.
@@ -95,6 +105,9 @@ impl Layout {
         // survives the `rndtmp` cleanup the manager performs on teardown.
         let shutdown_log_dir = PathBuf::from(&cfg.log_network).join(&cfg.secondary_id);
         let shutdown_log_path = shutdown_log_dir.join("shutdown-manager.log");
+        // The wrapper's own log lives in the SAME persistent per-secondary
+        // dir as the shutdown-manager log (see `wrapper_log_path` field doc).
+        let wrapper_log_path = shutdown_log_dir.join("wrapper.log");
         // The pid-file stays under `rndtmp`: it is scratch state that
         // SHOULD be removed when the scratch tree is torn down.
         let shutdown_pid_file = rndtmp.join("shutdown-manager.pid");
@@ -117,6 +130,7 @@ impl Layout {
             shutdown_unit_name,
             shutdown_log_dir,
             shutdown_log_path,
+            wrapper_log_path,
             shutdown_pid_file,
             local_image,
             image_cache_root,
@@ -226,6 +240,13 @@ mod tests {
             l.shutdown_log_path,
             PathBuf::from("/net/log/sec-0/shutdown-manager.log")
         );
+        // The wrapper's own log lives in the SAME persistent per-secondary
+        // dir as the shutdown-manager log — alongside it, not under /tmp.
+        assert_eq!(
+            l.wrapper_log_path,
+            PathBuf::from("/net/log/sec-0/wrapper.log"),
+            "wrapper log must be <log_network>/<secondary_id>/wrapper.log, persistent"
+        );
         // PID file stays under the scratch tree (it is scratch state).
         assert_eq!(
             l.shutdown_pid_file,
@@ -292,6 +313,7 @@ mod tests {
             shutdown_unit_name: "dynrunner-shutdown-x".to_string(),
             shutdown_log_dir: root.join("log-network/sec-0"),
             shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
+            wrapper_log_path: root.join("log-network/sec-0/wrapper.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("img.tar"),
             image_cache_root: root.join("imgcache"),

@@ -7,7 +7,10 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
-use crate::preparation::ssh::{build_release_argv, build_ssh_argv, verify_tunnel_alive};
+use crate::preparation::ssh::{
+    LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv, linger_succeeded,
+    parse_was_linger, verify_tunnel_alive,
+};
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
 /// extra_port_forwards fan out, ExitOnForwardFailure present.
@@ -160,6 +163,136 @@ fn release_argv_with_auth_uses_proxycommand() {
     assert!(proxy_cmd.contains("'-i' '/tmp/key'"));
     assert!(proxy_cmd.contains("'-p' '2222'"));
     assert!(proxy_cmd.contains("'-W' '%h:%p'"));
+}
+
+/// The setup-side linger ENABLE argv must:
+///   1. reach the compute node over the SAME gateway jump as the reverse
+///      tunnel (`-J alice@gw.example`) and target the SAME node,
+///   2. FORCE a PTY (`-tt`) so the remote `loginctl` runs inside a
+///      pam_systemd logind session (the proven interactive-login shape),
+///   3. NOT be a reverse tunnel — no `-R`, no `-N`, no
+///      `ExitOnForwardFailure`, and no extra-port-forward leakage,
+///   4. run a self-targeting `loginctl enable-linger` (no positional user
+///      — the ssh login user IS the run user) plus the `WAS_LINGER` probe.
+#[test]
+fn linger_enable_argv_forces_pty_jumps_and_self_targets() {
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        22,
+        vec![],
+        // extra_port_forwards must NOT leak into the linger command.
+        vec![(2222, 9090)],
+    );
+    let argv = build_linger_argv("compute01", LingerVerb::Enable, &o);
+    // Same gateway jump as the tunnel.
+    let j_idx = argv.iter().position(|s| s == "-J").expect("has -J");
+    assert_eq!(argv[j_idx + 1], "alice@gw.example");
+    // Same compute-node target.
+    assert!(argv.iter().any(|s| s == "alice@compute01"));
+    // Forced PTY.
+    assert!(argv.iter().any(|s| s == "-tt"), "must force a PTY: {argv:?}");
+    // Not a reverse tunnel.
+    assert!(!argv.iter().any(|s| s == "-R"), "linger must not forward");
+    assert!(!argv.iter().any(|s| s == "-N"), "linger must run a command");
+    assert!(!argv.iter().any(|s| s == "ExitOnForwardFailure=yes"));
+    // The trailing remote command enables linger (self-targeting: no
+    // positional <user>) and probes the prior state.
+    let remote_cmd = argv.last().expect("has a trailing remote command");
+    assert!(
+        remote_cmd.contains("loginctl enable-linger"),
+        "must enable linger: {remote_cmd:?}"
+    );
+    assert!(
+        !remote_cmd.contains("enable-linger alice"),
+        "must be self-targeting (no positional user): {remote_cmd:?}"
+    );
+    assert!(
+        remote_cmd.contains("WAS_LINGER="),
+        "must probe the prior state: {remote_cmd:?}"
+    );
+    assert!(remote_cmd.contains("show-user --value -p Linger"));
+    // No collateral: no extra-forward / QUIC ports in the linger command.
+    assert!(!remote_cmd.contains("9090"));
+    assert!(!remote_cmd.contains("2222"));
+}
+
+/// The RESTORE argv mirrors the enable shape (same jump, forced PTY, no
+/// forward) but runs `disable-linger`.
+#[test]
+fn linger_disable_argv_runs_disable() {
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        22,
+        vec![],
+        vec![],
+    );
+    let argv = build_linger_argv("compute01", LingerVerb::Disable, &o);
+    assert!(argv.iter().any(|s| s == "-tt"));
+    assert!(!argv.iter().any(|s| s == "-R"));
+    let remote_cmd = argv.last().expect("has a trailing remote command");
+    assert!(
+        remote_cmd.contains("loginctl disable-linger"),
+        "must disable linger: {remote_cmd:?}"
+    );
+    assert!(remote_cmd.contains("DISABLE=ok"));
+}
+
+/// With auth_options set, the linger command MUST jump via ProxyCommand
+/// (same OpenSSH-7.3+ workaround as the tunnel) — never `-J`.
+#[test]
+fn linger_argv_with_auth_uses_proxycommand() {
+    let auth = vec![
+        "-i".to_string(),
+        "/tmp/key".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+    ];
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        2222,
+        auth,
+        vec![],
+    );
+    let argv = build_linger_argv("compute01", LingerVerb::Enable, &o);
+    assert!(!argv.iter().any(|s| s == "-J"));
+    let proxy_cmd = argv
+        .iter()
+        .find(|s| s.starts_with("ProxyCommand="))
+        .expect("has ProxyCommand=");
+    assert!(proxy_cmd.contains("'-i' '/tmp/key'"));
+    assert!(proxy_cmd.contains("'-p' '2222'"));
+    assert!(proxy_cmd.contains("'-W' '%h:%p'"));
+}
+
+/// `parse_was_linger` extracts the `WAS_LINGER=` value, tolerating the CRLF
+/// line endings a forced PTY (`-tt`) produces and interleaved markers. An
+/// absent marker (probe failed) is `None`, which the caller maps to the
+/// safe "assume already on" default.
+#[test]
+fn parse_was_linger_reads_marker_crlf_tolerant() {
+    assert_eq!(parse_was_linger("WAS_LINGER=yes\r\nENABLE=ok\r\n").as_deref(), Some("yes"));
+    assert_eq!(parse_was_linger("WAS_LINGER=no\nENABLE=ok\n").as_deref(), Some("no"));
+    // Empty value: no logind record yet.
+    assert_eq!(parse_was_linger("WAS_LINGER=\r\nENABLE=fail\r\n").as_deref(), Some(""));
+    // Absent marker (e.g. ssh failed before the printf ran).
+    assert_eq!(parse_was_linger("Permission denied\r\n"), None);
+}
+
+/// `linger_succeeded` keys off the per-verb `=ok` marker, CR-tolerant, and
+/// never confuses `ENABLE` with `DISABLE`.
+#[test]
+fn linger_succeeded_keys_off_per_verb_marker() {
+    assert!(linger_succeeded("WAS_LINGER=no\r\nENABLE=ok\r\n", LingerVerb::Enable));
+    assert!(!linger_succeeded("WAS_LINGER=no\r\nENABLE=fail\r\n", LingerVerb::Enable));
+    assert!(linger_succeeded("WAS_LINGER=yes\r\nDISABLE=ok\r\n", LingerVerb::Disable));
+    // An ENABLE=ok line must NOT satisfy a DISABLE query.
+    assert!(!linger_succeeded("ENABLE=ok\r\n", LingerVerb::Disable));
 }
 
 /// Multi-watcher race regression: with ≥2 watchers calling
