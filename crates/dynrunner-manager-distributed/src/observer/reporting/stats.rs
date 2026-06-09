@@ -81,6 +81,15 @@ pub struct StatsSnapshot {
     /// idle detector folds this against its accumulated known-secondary
     /// set.
     pub per_secondary_in_flight: HashMap<String, usize>,
+    /// The LIVE peer-secondary roster — `alive_secondary_members()`
+    /// (worker_count > 0 ∧ `is_peer_alive`). The idle detector PRUNES its
+    /// accumulated gates against this so a secondary that has DEPARTED
+    /// (`PeerRemoved` ⇒ `peer_state = Dead`) — e.g. a scancelled
+    /// ex-primary, whose sticky `SecondaryCapacity` record keeps it in
+    /// `known_secondaries()` but NOT in the alive set — stops being
+    /// reported as a perpetually-idle ghost. A pure CRDT-liveness fact,
+    /// available to a zero-authority observer.
+    pub alive_secondaries: HashSet<String>,
     /// Occupancy NUMERATOR: distinct secondaries with ≥1 `InFlight`
     /// task. Identically `per_secondary_in_flight.len()` (that map keys
     /// exactly the secondaries with ≥1 in-flight task), surfaced as its
@@ -221,6 +230,7 @@ impl StatsSnapshot {
             busy_workers: busy_worker_slots.len(),
             total_workers: state.total_worker_count() as usize,
             per_secondary_in_flight,
+            alive_secondaries: state.alive_secondary_members().map(String::from).collect(),
         }
     }
 }

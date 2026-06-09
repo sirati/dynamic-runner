@@ -12,6 +12,9 @@ fn make_remote_worker(worker_id: u32, secondary_id: &str, busy: bool) -> RemoteW
             task_hash,
             task,
             estimated: dynrunner_core::ResourceMap::new(),
+            // A live-busy worker for the dispatch-ordering tests; provenance
+            // is irrelevant to ordering, so the realistic live default.
+            provenance: crate::primary::SlotProvenance::Dispatched,
         }
     } else {
         crate::primary::SlotState::Idle

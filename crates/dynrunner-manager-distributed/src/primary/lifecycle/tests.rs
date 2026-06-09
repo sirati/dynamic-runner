@@ -198,21 +198,30 @@ fn seed_secondary(
         secondary_id.into(),
         SecondaryConnectionState::AwaitingWelcome(SecondaryConnection::new(secondary_id.into())),
     );
-    // Model a fully-connected secondary: a real welcome originates BOTH the
-    // transport-handle entry above AND the replicated `SecondaryCapacity`
-    // record. The latter is what `known_secondaries()` reads — the
-    // CRDT-derived roster the V5 `wait_for_mesh_ready` `expected` set (and
-    // the assignment roster read) consult.
-    coordinator
-        .cluster_state_mut_for_test()
-        .apply(ClusterMutation::SecondaryCapacity {
-            secondary: secondary_id.into(),
-            worker_count: 1,
-            resources: vec![dynrunner_core::ResourceAmount {
-                kind: dynrunner_core::ResourceKind::memory(),
-                amount: 1024 * 1024 * 1024,
-            }],
-        });
+    // Model a fully-connected secondary: a real welcome originates the
+    // transport-handle entry above AND the replicated `PeerJoined`
+    // (liveness) + `SecondaryCapacity` (worker roster) records. The
+    // `wait_for_mesh_ready` `expected` set is the LIVE peer roster
+    // (`alive_secondary_members()` = `is_peer_alive` ∧ `worker_count > 0`),
+    // so BOTH the `PeerJoined` (alive) and the `SecondaryCapacity`
+    // (worker_count) are needed for the seeded secondary to be expected;
+    // a `SecondaryCapacity` alone (no `PeerJoined`) would leave it
+    // not-alive and silently dropped from the expected set.
+    let cs = coordinator.cluster_state_mut_for_test();
+    cs.apply(ClusterMutation::PeerJoined {
+        peer_id: secondary_id.into(),
+        is_observer: false,
+        can_be_primary: true,
+        cap_version: Default::default(),
+    });
+    cs.apply(ClusterMutation::SecondaryCapacity {
+        secondary: secondary_id.into(),
+        worker_count: 1,
+        resources: vec![dynrunner_core::ResourceAmount {
+            kind: dynrunner_core::ResourceKind::memory(),
+            amount: 1024 * 1024 * 1024,
+        }],
+    });
 }
 
 /// Count the `Keepalive` messages in a recorded broadcast log.

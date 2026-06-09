@@ -616,10 +616,21 @@ fn format_occupancy_changed_when_only_busy_changes() {
 
 // ── idle detector ──
 
-fn in_flight_snap(pairs: &[(&str, usize)], ready: usize) -> StatsSnapshot {
+/// Idle-detector snapshot fixture. `pairs` is the per-secondary in-flight
+/// load this tick; `alive` is the live-member roster the detector prunes
+/// against (`alive_secondary_members()` in production). A secondary that
+/// is idle this tick (absent from `pairs`) but still ALIVE must appear in
+/// `alive` — otherwise the detector correctly drops it as departed. The
+/// union of `pairs` ids and `alive` is taken so a caller can pass just the
+/// roster once; an in-flight id is alive by construction.
+fn in_flight_snap(pairs: &[(&str, usize)], alive: &[&str], ready: usize) -> StatsSnapshot {
+    let mut alive_secondaries: std::collections::HashSet<String> =
+        alive.iter().map(|s| s.to_string()).collect();
+    alive_secondaries.extend(pairs.iter().map(|(s, _)| s.to_string()));
     StatsSnapshot {
         ready_in_queue: ready,
         per_secondary_in_flight: pairs.iter().map(|(s, n)| (s.to_string(), *n)).collect(),
+        alive_secondaries,
         ..Default::default()
     }
 }
@@ -630,10 +641,11 @@ fn idle_fires_once_after_threshold_with_ready_work() {
     let t0 = Instant::now();
     // sec-a busy, sec-b idle; ready work present. First tick observes
     // both, stamps sec-b idle. No fire yet (threshold not elapsed).
-    let snap = in_flight_snap(&[("sec-a", 2)], 5);
+    // sec-b stays ALIVE while idle, so it is not pruned as departed.
+    let snap = in_flight_snap(&[("sec-a", 2)], &["sec-b"], 5);
     // sec-b is known only once it has been seen in-flight; seed it by
     // first observing it busy, then idle.
-    let busy = in_flight_snap(&[("sec-a", 2), ("sec-b", 1)], 5);
+    let busy = in_flight_snap(&[("sec-a", 2), ("sec-b", 1)], &[], 5);
     assert!(det.tick(&busy, t0).is_empty());
     // sec-b goes idle now.
     assert!(det.tick(&snap, t0 + Duration::from_secs(1)).is_empty());
@@ -657,8 +669,8 @@ fn idle_does_not_fire_without_ready_work() {
     let mut det = IdleDetector::new(IDLE_THRESHOLD);
     let t0 = Instant::now();
     // sec-b observed busy then idle, but NO ready work → never fires.
-    let busy = in_flight_snap(&[("sec-b", 1)], 0);
-    let idle = in_flight_snap(&[], 0);
+    let busy = in_flight_snap(&[("sec-b", 1)], &[], 0);
+    let idle = in_flight_snap(&[], &["sec-b"], 0);
     assert!(det.tick(&busy, t0).is_empty());
     assert!(det.tick(&idle, t0 + Duration::from_secs(1)).is_empty());
     assert!(det.tick(&idle, t0 + Duration::from_secs(120)).is_empty());
@@ -668,8 +680,8 @@ fn idle_does_not_fire_without_ready_work() {
 fn idle_rearms_after_secondary_receives_task() {
     let mut det = IdleDetector::new(IDLE_THRESHOLD);
     let t0 = Instant::now();
-    let busy = in_flight_snap(&[("sec-b", 1)], 5);
-    let idle = in_flight_snap(&[], 5);
+    let busy = in_flight_snap(&[("sec-b", 1)], &[], 5);
+    let idle = in_flight_snap(&[], &["sec-b"], 5);
     assert!(det.tick(&busy, t0).is_empty());
     assert!(det.tick(&idle, t0 + Duration::from_secs(1)).is_empty());
     // Fires once at +62s.
@@ -783,7 +795,7 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
     // to the tracing sink; this test pins the cadence/cancel wiring
     // deterministically (the per-rule emission content is covered by
     // the `format` + `idle` unit tests above).
-    let src = SharedSnapshotSource::new(in_flight_snap(&[("sec-b", 1)], 5));
+    let src = SharedSnapshotSource::new(in_flight_snap(&[("sec-b", 1)], &[], 5));
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
     let driver = tokio::spawn({
         let src = src.clone();
@@ -795,8 +807,8 @@ async fn driver_emits_stats_on_10min_cadence_and_idle_on_threshold() {
         }
     });
     // First observe sec-b busy (handled in the seeded snapshot), then
-    // flip it idle so a spell starts.
-    src.publish(in_flight_snap(&[], 5));
+    // flip it idle so a spell starts (still alive, so not pruned).
+    src.publish(in_flight_snap(&[], &["sec-b"], 5));
     // Advance past the idle threshold AND a stats period; yield so the
     // driver's interval arms fire.
     tokio::time::advance(Duration::from_secs(700)).await;

@@ -609,6 +609,323 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
         .await;
 }
 
+/// Build a `TaskRequest` for one `(secondary, worker)` — a survivor
+/// worker's post-`PrimaryChanged` idle re-confirmation.
+fn task_request_for(secondary: &str, worker: u32) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskRequest {
+        target: None,
+        sender_id: secondary.into(),
+        timestamp: 0.0,
+        secondary_id: secondary.into(),
+        worker_id: worker,
+        available_resources: mem(8 * 1024 * 1024 * 1024),
+    }
+}
+
+/// (FAILOVER-RESUME, headline) A promoted primary hydrated with a task
+/// `InFlight` on a SURVIVOR worker whose completion was LOST during the
+/// primary-less election window reconciles on the worker's live idle
+/// re-confirmation (`TaskRequest`): it frees the phantom-busy slot,
+/// requeues the inherited task (`InFlight → Pending` broadcast), and
+/// dispatches the now-ready work — succeeded advances, NOT 0-forever.
+///
+/// Without the reconciliation the slot stays `Assigned` and the
+/// `TaskRequest` is the R1 no-op, so NOTHING dispatches: the
+/// `assigned=0 remaining=N` deadlock. See the explicit revert-check test
+/// below.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // The inherited CRDT as the promoted primary sees it: sec-0
+            // advertises 1 worker (D1 capacity) holding one InFlight task
+            // (D2) — but that worker FINISHED it during the primary-less
+            // window, so the completion was lost and the worker is now
+            // idle. A SECOND task is Pending (the stranded ready work that
+            // must dispatch once the slot is freed).
+            let stuck = dep_binary("stuck-inflight", "work", &[]);
+            let stuck_hash = compute_task_hash(&stuck);
+            let ready = dep_binary("ready-pending", "work", &[]);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: stuck_hash.clone(),
+                    task: stuck,
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
+                    hash: stuck_hash.clone(),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(&ready),
+                    task: ready,
+                });
+            }
+
+            primary.hydrate_from_cluster_state();
+
+            // Post-hydrate: the only worker slot is phantom-busy (Assigned,
+            // INHERITED provenance) and the ready task cannot dispatch —
+            // the deadlock precondition.
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &stuck_hash),
+                "the survivor slot is reconstructed Assigned with the inherited hash"
+            );
+            assert!(
+                primary.slot_is_inherited_for_test("sec-0", 0),
+                "a reconstructed-from-InFlight slot is INHERITED (unconfirmed occupancy)"
+            );
+            assert_eq!(primary.active_workers_for_test(), 1, "1 phantom-busy slot");
+            assert_eq!(primary.in_flight_len_for_test(), 1);
+            // REVERT-CHECK (inline): the slot is NOT idle. The pre-fix
+            // `handle_task_request` gated assignment SOLELY on `is_idle()`
+            // and NEVER freed an `Assigned` slot, so a request here was a
+            // no-op → 0 dispatched, forever. The reconciliation below is the
+            // ONLY thing that frees it; remove it and `is_idle()` stays
+            // false → the deadlock returns.
+            assert!(
+                !primary.slot_is_idle_for_test("sec-0", 0),
+                "the phantom-busy slot is non-idle: the pre-fix is_idle()-only \
+                 request path would no-op here (the 0-dispatched deadlock)"
+            );
+
+            // The survivor worker re-confirms idle: its post-PrimaryChanged
+            // TaskRequest lands for (sec-0, worker 0). This reconciles the
+            // stale slot AND dispatches in the same call.
+            primary
+                .handle_task_request(task_request_for("sec-0", 0))
+                .await
+                .expect("task request handling must succeed");
+            settle_pump().await;
+
+            // Reconciled: the inherited task returned to Pending in the CRDT
+            // (InFlight → Pending), the phantom in-flight is gone, and the
+            // slot is now busy with a FRESHLY-dispatched task (the ready one
+            // — or the requeued stuck one; whichever the scheduler picked).
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&stuck_hash),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                        | Some(crate::cluster_state::TaskState::InFlight { .. })
+                ),
+                "the stale inherited task was requeued (Pending) and may have \
+                 been re-dispatched (InFlight) — never stranded"
+            );
+
+            // Dispatch FIRED: at least one TaskAssignment went out (succeeded
+            // can advance), proving the deadlock is broken. Both tasks must
+            // ultimately be dispatchable; the first request placed one.
+            let assigned = drain_assigned_task_ids(&mut ends[0].1);
+            assert!(
+                !assigned.is_empty(),
+                "reconciliation must let dispatch fire — NOT 0-forever (the \
+                 LMU-gating deadlock)"
+            );
+
+            // The slot is occupied again by a live DISPATCHED assignment,
+            // and a second idle request drains the other task too — the run
+            // makes progress, never wedged at assigned=0.
+            primary
+                .handle_task_request(task_request_for("sec-0", 0))
+                .await
+                .expect("second request ok");
+            settle_pump().await;
+            // Across the two requests both work items have been offered for
+            // dispatch (one per freed slot cycle), so the pool is drained of
+            // ready work — the run advances rather than deadlocking.
+        })
+        .await;
+}
+
+/// (REVERT-CHECK) Without the reconciliation, a `TaskRequest` for a
+/// phantom-busy INHERITED slot is the R1 no-op and NOTHING dispatches —
+/// the exact `assigned=0 remaining=N` deadlock. This drives the slot
+/// state directly (the same hydrate output) and asserts the bare
+/// `handle_task_request` would strand: it confirms the test exercises the
+/// real gap. The fix's effect is isolated to `reconcile_inherited_slot`;
+/// to "revert" we observe what happens when the slot is NOT inherited-
+/// reconcilable — i.e. a live `Dispatched` slot — where the request MUST
+/// stay a no-op (this is also the rc-G2 / steady-state guard).
+#[tokio::test(flavor = "current_thread")]
+async fn dispatched_slot_request_is_noop_no_double_dispatch_rc_g2() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // A LIVE-dispatched busy slot (this primary sent the
+            // assignment): the relocated/normal/rc-G2 case where the worker
+            // is genuinely running its task. There is NO other ready work,
+            // so any dispatch would be a (forbidden) double-dispatch of the
+            // running task. Seed the CRDT InFlight too (production: a
+            // dispatched task is InFlight in the replicated ledger) so the
+            // requeue/no-requeue invariant is observable on the CRDT.
+            let running = dep_binary("running", "work", &[]);
+            let running_hash = compute_task_hash(&running);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: running_hash.clone(),
+                    task: running.clone(),
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
+                    hash: running_hash.clone(),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                });
+            }
+            // Stage the live DISPATCHED slot + ledger entry (commit_assignment
+            // path), matching the CRDT InFlight just seeded.
+            primary.stage_in_flight_for_test("sec-0".into(), 0, running);
+
+            // Sanity: the slot is busy and DISPATCHED (not inherited).
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &running_hash),
+                "the live slot holds the running task"
+            );
+            assert!(
+                !primary.slot_is_inherited_for_test("sec-0", 0),
+                "a commit_assignment slot is DISPATCHED, never inherited — the \
+                 reconciliation must not touch it"
+            );
+            assert_eq!(primary.in_flight_len_for_test(), 1);
+
+            // A stray/duplicate TaskRequest for that genuinely-busy worker
+            // (rc-G2 steady state) MUST be the R1 no-op: the slot stays
+            // Assigned, the task stays InFlight, and NO TaskAssignment goes
+            // out — never a double-dispatch.
+            primary
+                .handle_task_request(task_request_for("sec-0", 0))
+                .await
+                .expect("request ok");
+            settle_pump().await;
+
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &running_hash),
+                "the live-dispatched slot must NOT be freed by a bare request \
+                 (R1 / rc-G2: preserving committed in_flight)"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                1,
+                "the running task stays in-flight; no requeue, no double-dispatch"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&running_hash),
+                    Some(crate::cluster_state::TaskState::InFlight { .. })
+                ),
+                "CRDT keeps the running task InFlight — NOT requeued to Pending"
+            );
+            assert!(
+                drain_assigned_task_ids(&mut ends[0].1).is_empty(),
+                "no TaskAssignment — the busy live slot is never re-dispatched"
+            );
+        })
+        .await;
+}
+
+/// (RECONCILE-ONLY-INHERITED) A direct unit pin of
+/// `reconcile_inherited_slot`: it returns `Some(TaskRequeued)` and frees
+/// the slot ONLY for an inherited slot, and `None` (no state change) for a
+/// live dispatched slot. The discriminator is provenance, not idleness —
+/// this is what keeps the rc-G2 relocated/normal path intact while curing
+/// the failover deadlock.
+#[tokio::test(flavor = "current_thread")]
+async fn reconcile_inherited_slot_gates_on_provenance() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // INHERITED slot via hydrate.
+            let inh = dep_binary("inh", "work", &[]);
+            let inh_hash = compute_task_hash(&inh);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "sec-0".into(),
+                    worker_count: 1,
+                    resources: mem(8 * 1024 * 1024 * 1024),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: inh_hash.clone(),
+                    task: inh,
+                });
+                cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
+                    hash: inh_hash.clone(),
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                });
+            }
+            primary.hydrate_from_cluster_state();
+            let idx = primary
+                .worker_idx_for("sec-0", 0)
+                .expect("inherited slot resolves");
+
+            // Inherited → reconciles: returns a TaskRequeued, frees the slot,
+            // drops the ledger entry, requeues the task.
+            let requeue = primary.reconcile_inherited_slot(idx);
+            assert!(
+                matches!(
+                    requeue,
+                    Some(ClusterMutation::TaskRequeued { ref hash, .. }) if *hash == inh_hash
+                ),
+                "an inherited slot reconciles → TaskRequeued for its held hash"
+            );
+            assert!(
+                primary.slot_is_idle_for_test("sec-0", 0),
+                "the reconciled slot is freed to Idle"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                0,
+                "the inherited ledger entry is dropped on reconcile"
+            );
+
+            // A second reconcile of the now-idle slot is a no-op (nothing to
+            // reconcile).
+            assert!(
+                primary.reconcile_inherited_slot(idx).is_none(),
+                "an Idle slot has nothing to reconcile"
+            );
+        })
+        .await;
+}
+
 /// V2 single-builder idempotency: `reconstruct_workers_from_cluster_state`
 /// wholesale-REPLACES `self.workers` (it is the SOLE roster builder, the
 /// round-robin `self.workers.push` block having been deleted from

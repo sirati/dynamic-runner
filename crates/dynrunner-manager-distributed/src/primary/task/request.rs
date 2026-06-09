@@ -28,24 +28,58 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
             let mut assigned = false;
 
+            // Failover-resume occupancy reconciliation. A promoted primary
+            // reconstructs each `TaskState::InFlight` slot `Assigned` from
+            // the replicated ledger, but that occupancy is a STALE GUESS:
+            // a survivor worker whose pre-kill task COMPLETED during the
+            // primary-less election window has its completion LOST (no
+            // primary was up to receive it), so the CRDT still says
+            // `InFlight` while the worker is idle. The worker's own
+            // post-`PrimaryChanged` `TaskRequest` (its secondary's
+            // `repoll_idle_workers`, gated on the worker being idle) is the
+            // ground-truth re-confirmation. So a request landing on an
+            // INHERITED (unconfirmed) slot reconciles it: free the slot,
+            // requeue the task (`InFlight → Pending`, broadcast for replica
+            // coherence), and fall through to the idle-assignment path
+            // below. Specific to the promoted-takeover: a live `Dispatched`
+            // slot is NEVER reconciled (R1 holds — see below), so the
+            // relocated/normal/rc-G2 cases where preserving committed
+            // in_flight IS correct are untouched. Without this the 6
+            // survivor slots stay phantom-busy forever and dispatch never
+            // fires (the LMU-gating deadlock).
+            if let Some(idx) = target_idx
+                && let Some(requeue) = self.reconcile_inherited_slot(idx)
+            {
+                // Broadcast the `InFlight → Pending` transition in lockstep
+                // with the local pool requeue just done inside the
+                // reconcile, so a stale replicated `InFlight` cannot survive
+                // and re-strand the task on a later failover. The slot is
+                // now `Idle`, so the assignment block below dispatches the
+                // requeued (and any other ready) work to it.
+                self.apply_and_broadcast_cluster_mutations(vec![requeue])
+                    .await;
+            }
+
             // R1: `TaskRequest` is a pure capacity hint that NEVER
-            // frees a slot. The removed free-on-request block
-            // (`current_task = None; is_idle = true`) and the removed
+            // frees a LIVE-dispatched slot. The removed free-on-request
+            // block (`current_task = None; is_idle = true`) and the removed
             // stale-request guard let a bare request mutate slot state;
             // R1's `SlotState` typestate makes assignment reachable
             // ONLY from `Idle` (via `commit_assignment`'s
             // `assign`/`debug_assert`) and frees a slot ONLY on a
-            // terminal outcome via `free_slot_on_terminal`. The
-            // `demoted` short-circuit is gone too — there is no
+            // terminal outcome via `free_slot_on_terminal` (or, for an
+            // UNCONFIRMED inherited slot, the reconciliation just above).
+            // The `demoted` short-circuit is gone too — there is no
             // demoted-primary self-assign race to guard against.
             //
-            // Capacity-hint contract: if the addressed slot is already
-            // `Assigned`, the request is a no-op on slot state (a
-            // delayed/duplicate request for a worker that's still
+            // Capacity-hint contract: if the addressed slot is a live
+            // `Assigned { Dispatched }`, the request is a no-op on slot
+            // state (a delayed/duplicate request for a worker that's still
             // running the task it last took) — we fall through to the
             // primary-relay arm without touching the slot or the
-            // ledger. Only an `Idle` slot refreshes its budget and
-            // attempts one assignment.
+            // ledger. Only an `Idle` slot (including one the reconciliation
+            // above just freed) refreshes its budget and attempts one
+            // assignment.
             if let Some(idx) = target_idx
                 && self.workers[idx].is_idle()
             {

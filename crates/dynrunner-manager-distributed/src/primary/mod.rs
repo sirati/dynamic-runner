@@ -63,7 +63,7 @@ pub use error::RunError;
 // these directly without going through the wire-message path; the
 // `pub(super) struct` declaration on the coordinator side keeps the
 // fields scoped to siblings within `primary/`.
-pub(crate) use coordinator::{RemoteWorkerState, SlotState};
+pub(crate) use coordinator::{RemoteWorkerState, SlotProvenance, SlotState};
 
 /// Settle window the authority sleeps after broadcasting a run-terminal
 /// CRDT mutation (`RunComplete` / `RunAborted`) before the dispatcher

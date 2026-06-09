@@ -581,3 +581,114 @@ async fn relocated_primary_mode1_file_based_restages() {
         })
         .await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Resume-detection: `maybe_auto_stage_initial` must NOT re-stage on a
+// FAILOVER-PROMOTION resume (a populated CRDT — tasks already progressed
+// past Pending). The corpus was staged once by the run's original primary;
+// re-walking it on resume re-copies every binary needlessly. A genuinely
+// FRESH promoted destination (all-Pending CRDT) still stages.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Seed `n` file-based binaries into a fresh primary's CRDT (all Pending),
+/// hydrate, and return the primary + the source dir kept alive. `progressed`
+/// drives ONE of them to `InFlight` (the resume signal) when true. The config
+/// has `source_dir` set + `uses_file_based_items` so the staging gate is
+/// OTHERWISE open — isolating the resume gate as the sole discriminator.
+fn build_staging_primary(progressed: bool) -> (TestPrimaryForStaging, tempfile::TempDir) {
+    let source = tempfile::TempDir::new().expect("source tmpdir");
+    let names: Vec<String> = (0..3).map(|i| format!("file_{i}")).collect();
+    for name in &names {
+        std::fs::write(source.path().join(name), b"payload").expect("write source file");
+    }
+    let config = PrimaryConfig {
+        uses_file_based_items: true,
+        source_dir: Some(source.path().to_path_buf()),
+        ..PrimaryConfig::default()
+    };
+    let (transport, _ends) = setup_test(1);
+    // The mesh keepalive is dropped at function exit: these tests call the
+    // sync `maybe_auto_stage_initial` (no wire sends), so a torn-down mesh
+    // is harmless.
+    let (mut primary, _mesh) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        // A capacity record so hydrate reconstructs `self.secondaries`
+        // (`maybe_auto_stage_initial` reads `self.secondaries.keys()`).
+        cs.apply(ClusterMutation::SecondaryCapacity {
+            secondary: "sec-0".into(),
+            worker_count: 1,
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 8 * 1024 * 1024 * 1024,
+            }],
+        });
+        for (i, name) in names.iter().enumerate() {
+            let mut b = make_binary(name, 7);
+            b.path = std::path::PathBuf::from(name);
+            let hash = crate::primary::wire::compute_task_hash(&b);
+            cs.apply(ClusterMutation::TaskAdded { hash: hash.clone(), task: b });
+            // Drive the first task to InFlight when modelling a RESUME (a
+            // task has progressed past Pending — the populated-CRDT signal).
+            if progressed && i == 0 {
+                cs.apply(ClusterMutation::TaskAssigned {
+                    attempt: 0,
+                    hash,
+                    secondary: "sec-0".into(),
+                    worker: 0,
+                    version: Default::default(),
+                });
+            }
+        }
+    }
+    primary.hydrate_from_cluster_state();
+    (TestPrimaryForStaging(primary), source)
+}
+
+/// Newtype so the `mesh` keepalive guard stays bound for the primary's
+/// lifetime even though the test only touches the coordinator.
+struct TestPrimaryForStaging(
+    PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+);
+
+#[tokio::test(flavor = "current_thread")]
+async fn auto_stage_skipped_on_populated_crdt_resume() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // RESUME: one task already InFlight ⇒ the CRDT is populated.
+            let (mut p, _src) = build_staging_primary(true);
+            p.0.maybe_auto_stage_initial()
+                .expect("auto-stage call ok");
+            assert!(
+                p.0.pending_stage_files.is_empty(),
+                "a populated-CRDT (failover-resume) primary must NOT re-stage \
+                 — the corpus was staged by the original primary"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn auto_stage_runs_on_fresh_all_pending_promoted_destination() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // FRESH: every task Pending ⇒ a first-ever promoted destination,
+            // NOT a resume. Staging must proceed (the gate stays open).
+            let (mut p, _src) = build_staging_primary(false);
+            p.0.maybe_auto_stage_initial()
+                .expect("auto-stage call ok");
+            assert!(
+                !p.0.pending_stage_files.is_empty(),
+                "a fresh all-Pending promoted destination MUST stage the corpus \
+                 (resume detection does not over-suppress first-ever staging)"
+            );
+        })
+        .await;
+}
