@@ -204,11 +204,29 @@ where
     /// boundary; default (empty) until the first publish.
     beacon_target: crate::liveness::BeaconTarget,
 
-    /// Per-peer liveness `SocketAddr`, captured from `PeerInfo`
-    /// (`PeerConnectionInfo.ipv4`/`liveness_port`). The sole input to
-    /// resolving `current_primary()` → a beacon target; rebuilt on each
-    /// `PeerInfo` and read when republishing `beacon_target`.
-    peer_liveness_addrs: std::collections::HashMap<String, std::net::SocketAddr>,
+    /// The transport-INDEPENDENT view of the CURRENT PRIMARY's liveness:
+    /// `node_id -> last beacon receipt Instant`, published by this node's
+    /// [`crate::liveness::LivenessListener`] per decoded datagram. The
+    /// failover-detector (`run_election_tick` / `record_promotion_vote`)
+    /// reads the current primary's entry and UNIONs it with the mesh-frame
+    /// legs: a CPU-starved-but-alive primary whose mesh keepalive froze (its
+    /// runtime starved by a co-located build) but whose dedicated-thread
+    /// beacon still flows is NOT declared dead → no spurious failover. A
+    /// clone of the listener's view is installed at the run boundary
+    /// (`set_beacon_liveness`); default (empty) for channel-only fixtures,
+    /// where the union degrades to mesh-frame-only (its prior behaviour).
+    beacon_liveness: crate::liveness::BeaconLiveness,
+
+    /// Node-scoped peer→liveness-address book, captured from `PeerInfo`
+    /// (`PeerConnectionInfo.ipv4`/`liveness_port`). The secondary WRITES it
+    /// (rebuilt on each `PeerInfo`) and reads it when republishing
+    /// `beacon_target` (resolving `current_primary()` → its beacon address).
+    /// A SHARED cell (not a plain map) so the co-located promoted
+    /// `PrimaryCoordinator` can READ the same book to build its
+    /// PRIMARY→secondaries beacon set — the promoted primary observes no
+    /// `PeerInfo` itself (it is built from the address-less CRDT), so this
+    /// is its only source of its secondaries' raw beacon addresses.
+    peer_liveness_addrs: crate::liveness::PeerLivenessAddrs,
 
     /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
     /// this secondary's OWN workers fired (i.e. tasks actually

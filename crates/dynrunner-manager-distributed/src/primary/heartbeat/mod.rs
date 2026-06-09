@@ -232,6 +232,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// Rebuild the PRIMARY→secondaries liveness-beacon target set from the
+    /// current secondary roster and publish it into the dedicated beacon
+    /// thread's [`crate::liveness::BeaconTarget`] cell. The transport-
+    /// INDEPENDENT twin of [`Self::broadcast_primary_keepalive`]: that fans a
+    /// mesh `Keepalive` to every secondary over the (build-starvable) tokio
+    /// runtime; this hands the off-runtime beacon thread the same recipient
+    /// set so the primary keeps asserting liveness even when its runtime is
+    /// CPU-starved by a co-located build and the mesh keepalive freezes.
+    ///
+    /// The recipient set is the current secondary roster (`self.secondaries`,
+    /// EXCLUDING this primary's own node id — a primary never beacons itself),
+    /// each id resolved to its raw beacon `SocketAddr` through the shared
+    /// `peer_liveness_addrs` book. A secondary whose address is unknown (the
+    /// book lacks it) is simply absent from the set (no beacon to it this
+    /// round — strictly better than beaconing a bogus address; the mesh-frame
+    /// keepalive still reaches it). Called on every roster change (welcome,
+    /// hydrate-on-promotion, dead-secondary requeue) so the set tracks the
+    /// live recipients. The beacon thread re-reads the set each tick, so a
+    /// roster change repoints it with zero beacon-side knowledge.
+    ///
+    /// Resolves via the address BOOK rather than `SecondaryConnection`'s own
+    /// `ipv4`/`liveness_port` because a PROMOTED primary's hydrated roster
+    /// carries neither (it is rebuilt from the address-less CRDT) — the book,
+    /// populated by the co-located secondary from `PeerInfo`, is the promoted
+    /// primary's only source of its secondaries' beacon addresses.
+    pub(super) fn publish_beacon_targets(&self) {
+        let own_id = self.config.node_id.as_str();
+        let addrs: Vec<std::net::SocketAddr> = self
+            .secondaries
+            .keys()
+            .filter(|id| id.as_str() != own_id)
+            .filter_map(|id| self.peer_liveness_addrs.get(id))
+            .collect();
+        self.beacon_target.publish_set(addrs);
+    }
+
     /// Take in-flight tasks back, drop the secondary from the routable set,
     /// originate a `ClusterMutation::PeerRemoved` carrying `cause` (the
     /// primary is the sole authoritative author of `PeerRemoved` — every

@@ -1510,3 +1510,77 @@ async fn genuinely_dead_secondary_without_beacon_is_still_reaped() {
          the beacon's union refresh must not break real failure detection"
     );
 }
+
+/// PRIMARY-EMIT (#325): `publish_beacon_targets` rebuilds the PRIMARY→
+/// secondaries beacon set from the live roster, resolving each secondary's
+/// raw beacon `SocketAddr` through the shared `peer_liveness_addrs` book —
+/// the source a PROMOTED primary's address-less hydrated roster relies on. It
+/// EXCLUDES this primary's own node id (a primary never beacons itself) and
+/// skips a secondary whose address the book lacks.
+#[tokio::test]
+async fn publish_beacon_targets_resolves_live_secondaries_via_book() {
+    let (transport, _rx, _tx) = empty_transport();
+    let mut cfg = config(Duration::from_millis(50), 2);
+    // The co-located node id: it is BOTH the primary and a roster secondary
+    // (the promoted-primary case), so it must be excluded from the beacon set.
+    cfg.node_id = "secondary-0".into();
+    let (mut primary, _mesh) = build_primary(
+        cfg,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // Roster: self (`secondary-0`, excluded), two remote secondaries with
+    // known addresses, and one whose address the book lacks (skipped).
+    for id in ["secondary-0", "secondary-1", "secondary-2", "secondary-3"] {
+        let conn = SecondaryConnection::new(id.into())
+            .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+            .receive_cert_exchange(String::new(), None, None, 0, None)
+            .begin_peer_discovery()
+            .peers_ready()
+            .assignments_sent();
+        primary
+            .secondaries
+            .insert(id.into(), SecondaryConnectionState::Operational(conn));
+    }
+
+    // The shared address book (populated by the co-located secondary from
+    // PeerInfo): self + two remotes have liveness addresses; secondary-3 does
+    // not (e.g. it advertised no liveness_port).
+    let book = crate::liveness::PeerLivenessAddrs::new();
+    book.ingest(&[
+        peer_info("secondary-0", "10.0.0.0", 5000),
+        peer_info("secondary-1", "10.0.0.1", 5001),
+        peer_info("secondary-2", "10.0.0.2", 5002),
+    ]);
+    primary.set_peer_liveness_addrs(book);
+    let target = primary.beacon_target();
+
+    primary.publish_beacon_targets();
+
+    let mut published = target.current();
+    published.sort();
+    let a1: std::net::SocketAddr = "10.0.0.1:5001".parse().unwrap();
+    let a2: std::net::SocketAddr = "10.0.0.2:5002".parse().unwrap();
+    assert_eq!(
+        published,
+        vec![a1, a2],
+        "the beacon set is the live REMOTE secondaries with known addresses — \
+         self (secondary-0) excluded, secondary-3 (no address) skipped",
+    );
+}
+
+/// A `PeerConnectionInfo` with a liveness address, for the address-book seed.
+fn peer_info(id: &str, ipv4: &str, port: u16) -> dynrunner_protocol_primary_secondary::PeerConnectionInfo {
+    dynrunner_protocol_primary_secondary::PeerConnectionInfo {
+        secondary_id: id.to_string(),
+        cert: String::new(),
+        ipv4: Some(ipv4.to_string()),
+        ipv6: None,
+        port: 0,
+        is_observer: false,
+        liveness_port: Some(port),
+    }
+}

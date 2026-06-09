@@ -702,6 +702,9 @@ impl PyDistributedManager {
                             // follow-up (loopback beacon between in-process
                             // threads). No regression: `None` = no beacon rx.
                             liveness_ping_rx: None,
+                            // No node beacon on the in-process path (same
+                            // follow-up): `None` = no primary→secondaries beacon.
+                            peer_liveness_addrs: None,
                         });
 
                         let node = node.with_secondary(secondary, sec_slot);

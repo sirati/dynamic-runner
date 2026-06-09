@@ -574,6 +574,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 _ = heartbeat_tick.tick() => {
                     self.broadcast_primary_keepalive().await;
+                    // Refresh the PRIMARY→secondaries liveness-beacon target
+                    // set on the SAME cadence as the mesh keepalive — the
+                    // transport-independent twin. Any roster change since the
+                    // last tick (welcome, hydrate, dead-secondary requeue) is
+                    // reflected here, well inside the death thresholds; the
+                    // off-runtime beacon thread re-reads the published set
+                    // each of its own ticks. A single placement (not one per
+                    // roster-mutation site) keeps the concern in one spot.
+                    self.publish_beacon_targets();
                     // `process_heartbeat_tick` collects the per-tick
                     // death report and hands it to the dead-secondary
                     // declaration/requeue policy. See

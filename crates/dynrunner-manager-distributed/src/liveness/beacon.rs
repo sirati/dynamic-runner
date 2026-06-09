@@ -128,14 +128,17 @@ fn run_beacon(
     while !shutdown.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= next_send {
-            // Read the live target each tick: a `PrimaryChanged` that
-            // republished a new address is picked up here with zero
-            // beacon-side election knowledge. `None` (no primary resolved
-            // yet) is a no-op for this tick.
-            if let Some(addr) = target.current() {
+            // Read the live target SET each tick: a `PrimaryChanged` (the
+            // secondary's single primary) or a roster change (the primary's
+            // live secondaries) that republished is picked up here with zero
+            // beacon-side election/membership knowledge. An empty set (no
+            // peers resolved yet) is a no-op for this tick.
+            for addr in target.current() {
                 // A transient send error (target momentarily unroutable,
                 // ICMP-unreachable on a closed socket) is non-fatal: the
                 // beacon is a periodic UDP emitter, the next tick retries.
+                // One failing target never blocks the others — each send is
+                // independent.
                 let _ = socket.send_to(&payload, addr);
             }
             next_send = now + interval;
@@ -167,7 +170,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let target = BeaconTarget::new();
-        target.publish(Some(addr));
+        target.publish_one(Some(addr));
 
         let _beacon = LivenessBeacon::spawn(
             "secondary-7".into(),
@@ -182,6 +185,44 @@ mod tests {
         let decoded = datagram::decode(&buf[..n]).expect("valid liveness datagram");
         assert_eq!(decoded.node_id, "secondary-7");
         assert_eq!(decoded.token, 0xABCD);
+    }
+
+    /// A PRIMARY's beacon reaches EVERY published target (1→N): each
+    /// secondary's listener receives the primary's liveness datagram from
+    /// the ONE dedicated beacon thread. This is the primary→secondaries
+    /// half — the same mechanism as the secondary→primary beacon, with the
+    /// target set holding N addresses instead of one.
+    #[test]
+    fn beacon_sends_to_every_published_target() {
+        let l1 = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let l2 = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let l3 = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        for l in [&l1, &l2, &l3] {
+            l.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        }
+        let target = BeaconTarget::new();
+        target.publish_set(vec![
+            l1.local_addr().unwrap(),
+            l2.local_addr().unwrap(),
+            l3.local_addr().unwrap(),
+        ]);
+
+        let _beacon = LivenessBeacon::spawn(
+            "primary-0".into(),
+            0x1234,
+            Duration::from_millis(50),
+            target,
+        )
+        .expect("beacon spawns");
+
+        // Each secondary's listener must receive the primary's beacon.
+        for l in [&l1, &l2, &l3] {
+            let mut buf = [0u8; 256];
+            let (n, _from) = l.recv_from(&mut buf).expect("primary beacon arrives at this target");
+            let decoded = datagram::decode(&buf[..n]).expect("valid liveness datagram");
+            assert_eq!(decoded.node_id, "primary-0");
+            assert_eq!(decoded.token, 0x1234);
+        }
     }
 
     /// With no target published the beacon emits nothing (no panic, no
@@ -211,7 +252,7 @@ mod tests {
         );
 
         // Publish → datagrams start flowing.
-        target.publish(Some(addr));
+        target.publish_one(Some(addr));
         listener
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -225,7 +266,7 @@ mod tests {
         let listener = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         let target = BeaconTarget::new();
-        target.publish(Some(addr));
+        target.publish_one(Some(addr));
 
         {
             let _beacon = LivenessBeacon::spawn(

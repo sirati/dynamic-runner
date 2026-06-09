@@ -848,6 +848,37 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// fixtures), in which case the loop arm parks on `pending()`.
     pub(super) liveness_ping_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 
+    /// The runtime→beacon-thread bridge for the PRIMARY→secondaries liveness
+    /// direction: the SET of this primary's live secondaries' liveness
+    /// `SocketAddr`s. The coordinator PUBLISHES the set into it whenever the
+    /// secondary roster changes (`publish_beacon_targets`); the dedicated
+    /// [`crate::liveness::LivenessBeacon`] thread READS it each tick and
+    /// sends to every address. This is the half a CPU-starved primary needs:
+    /// its OUTBOUND mesh keepalive freezes with its build-pegged runtime, but
+    /// this off-runtime beacon keeps asserting the primary's liveness so its
+    /// secondaries' failover-detector does not false-elect a successor.
+    /// Default (empty) until the run boundary installs the listener-derived
+    /// addrs and spawns the beacon; empty → the beacon no-ops.
+    pub(super) beacon_target: crate::liveness::BeaconTarget,
+
+    /// The node-scoped peer→liveness-address book (a clone of the one the
+    /// co-located `SecondaryCoordinator` populated from `PeerInfo`). The
+    /// promoted primary reads it to resolve each live secondary's raw beacon
+    /// `SocketAddr` when (re)building its `beacon_target` set — it observes
+    /// no `PeerInfo` of its own, so this shared cell is its only source of
+    /// its secondaries' beacon addresses. Default (empty) for fixtures /
+    /// the never-promoted bootstrap primary, where the primary's beacon
+    /// no-ops (the mesh-frame keepalive still reaches secondaries).
+    pub(super) peer_liveness_addrs: crate::liveness::PeerLivenessAddrs,
+
+    /// The PRIMARY's own dedicated-thread liveness beacon handle, spawned by
+    /// the run boundary on the node's runtime (a `std::thread` + `UdpSocket`,
+    /// off the build-starvable tokio runtime). Held for the primary's
+    /// lifetime so its `Drop` joins the thread at teardown. `None` when no
+    /// beacon was spawned (bind failure, or a channel-only fixture) — the
+    /// secondaries then fall back to the mesh-frame liveness legs alone.
+    pub(super) primary_beacon: Option<crate::liveness::LivenessBeacon>,
+
     /// Construction-time primary endpoint and pubkey snapshot used
     /// to build [`SecondarySpawnSpec`]. The per-provider spawner
     /// adapters cache their own copies (see
@@ -1122,6 +1153,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             respawn_request_tx: None,
             respawn_request_rx: None,
             liveness_ping_rx: None,
+            beacon_target: crate::liveness::BeaconTarget::new(),
+            peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
+            primary_beacon: None,
             respawn_primary_endpoint: String::new(),
             respawn_primary_pubkey_pem: String::new(),
             preferred_secondaries_validator:
@@ -1532,6 +1566,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// secondary's death-clock as the UNION half (beacon OR mesh frame).
     pub fn set_liveness_ping_rx(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
         self.liveness_ping_rx = Some(rx);
+    }
+
+    /// A clone of the PRIMARY→secondaries beacon-target cell. The run
+    /// boundary hands this to [`crate::liveness::LivenessBeacon::spawn`] so
+    /// the dedicated beacon thread reads the secondary-address SET the
+    /// coordinator publishes into it (on each roster change). Mirrors the
+    /// secondary's `beacon_target()` accessor.
+    pub fn beacon_target(&self) -> crate::liveness::BeaconTarget {
+        self.beacon_target.clone()
+    }
+
+    /// Install the node-scoped peer→liveness-address book (a clone of the
+    /// one the co-located `SecondaryCoordinator` populated from `PeerInfo`).
+    /// Called by the run boundary BEFORE `run()`. The promoted primary reads
+    /// it to resolve its secondaries' raw beacon addresses when building its
+    /// `beacon_target` set — it observes no `PeerInfo` of its own.
+    pub fn set_peer_liveness_addrs(&mut self, book: crate::liveness::PeerLivenessAddrs) {
+        self.peer_liveness_addrs = book;
+    }
+
+    /// Install the PRIMARY's own dedicated-thread liveness beacon handle.
+    /// Called by the run boundary AFTER it spawns the beacon (with this
+    /// coordinator's [`Self::beacon_target`]), BEFORE `run()`. Held for the
+    /// primary's lifetime so its `Drop` joins the beacon thread at teardown.
+    /// The promoted primary publishes its initial recipient set from the
+    /// hydrated roster at operational entry; subsequent roster changes
+    /// republish it.
+    pub fn set_primary_beacon(&mut self, beacon: crate::liveness::LivenessBeacon) {
+        self.primary_beacon = Some(beacon);
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers
