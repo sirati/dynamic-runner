@@ -981,3 +981,141 @@ async fn reconstruct_workers_double_invoke_is_sum_capacity_not_double() {
         })
         .await;
 }
+
+/// (a) HEADLINE: a promoted primary hydrated from a CRDT where phases X,Y,Z
+/// are ALL-terminal (completed) and a downstream phase W still has live work
+/// must seed X,Y,Z as `PhaseState::Done` — NOT re-run them. Without this the
+/// freshly built pool starts them `Active`/`Blocked` and the post-hydrate
+/// lifecycle cascade re-`(0,0,0)`-drains them → re-fires `on_phase_end` →
+/// (the real-world failure) a consumer hook re-spawns 2041 children with
+/// identical identities → run-wide invalidation. W (live, depends on Z) is
+/// `Active` (its dep Z is Done) and its work enters the pool.
+///
+/// Revert-check: drop the `seed_completed_phases` call in
+/// `hydrate_from_cluster_state` and X,Y,Z come back `Active` (a zero-dep
+/// completed phase) — which would re-drain and re-fire `on_phase_end`.
+#[test]
+fn hydrate_seeds_completed_phases_as_done_not_rerun() {
+    use dynrunner_scheduler_api::PhaseState;
+
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // Chain X → Y → Z → W. X,Y,Z are each a single Completed task (the
+    // already-ended phases that ALSO already fired on_phase_end + spawned
+    // their children pre-failover). W has a single Pending task depending on
+    // Z's task (live work — the current phase the resume should land on).
+    let x = dep_binary("x-task", "X", &[]);
+    let y = dep_binary("y-task", "Y", &["x-task"]);
+    let z = dep_binary("z-task", "Z", &["y-task"]);
+    let mut w = dep_binary("w-task", "W", &["z-task"]);
+    // W's dep names Z's task in phase Z (cross-phase dep).
+    w.task_depends_on = vec![dynrunner_core::TaskDep {
+        task_id: "z-task".into(),
+        phase_id: PhaseId::from("Z"),
+        inherit_outputs: false,
+    }];
+
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([
+                (PhaseId::from("Y"), vec![PhaseId::from("X")]),
+                (PhaseId::from("Z"), vec![PhaseId::from("Y")]),
+                (PhaseId::from("W"), vec![PhaseId::from("Z")]),
+            ]),
+        });
+        for (hash, task) in [("x-task", &x), ("y-task", &y), ("z-task", &z)] {
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: hash.into(),
+                task: task.clone(),
+            });
+            cs.apply(ClusterMutation::TaskCompleted {
+                attempt: 0,
+                hash: hash.into(),
+                result_data: None,
+            });
+        }
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "w-task".into(),
+            task: w.clone(),
+        });
+    }
+
+    primary.hydrate_from_cluster_state();
+
+    let pool = primary.pool();
+    // X, Y, Z are already-completed-and-ended → seeded straight to Done so
+    // the lifecycle cascade never observes a Drained edge for them and
+    // on_phase_end does NOT re-fire.
+    for ph in ["X", "Y", "Z"] {
+        assert_eq!(
+            pool.phase_state(&PhaseId::from(ph)),
+            Some(PhaseState::Done),
+            "completed-and-ended phase {ph} must be seeded Done on resume \
+             (pre-fix it is Active and re-fires on_phase_end)"
+        );
+    }
+    // W has live work and its only dep (Z) is Done → Active, work in pool.
+    assert_eq!(
+        pool.phase_state(&PhaseId::from("W")),
+        Some(PhaseState::Active),
+        "the live current phase W (dep Z now Done) must be Active"
+    );
+    assert!(
+        pool.iter().any(|t| t.task_id == "w-task"),
+        "W's live task must be in the pool to dispatch"
+    );
+}
+
+/// (a) cold-path NOT regressed at hydrate: a fresh all-`Pending` cold seed
+/// has NO terminal task, so the completed-phase derivation is EMPTY and NO
+/// phase is seeded `Done`. Every phase stays in its `PendingPool::new`
+/// state (zero-dep → Active, deps → Blocked) so the cold-start
+/// `fire_initial_phase_starts` + empty-phase cascade run + fire
+/// `on_phase_end` exactly once, unchanged.
+#[tokio::test(flavor = "current_thread")]
+async fn hydrate_cold_seed_does_not_seed_any_phase_done() {
+    use dynrunner_scheduler_api::PhaseState;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let a = dep_binary("a", "build", &[]);
+            let b = dep_binary("b", "ship", &[]);
+            primary
+                .originate_cold_seed(vec![a, b], HashMap::new())
+                .expect("cold seed");
+            primary.hydrate_from_cluster_state();
+
+            let pool = primary.pool();
+            for ph in ["build", "ship"] {
+                let st = pool.phase_state(&PhaseId::from(ph));
+                assert_ne!(
+                    st,
+                    Some(PhaseState::Done),
+                    "a cold all-Pending phase {ph} must NOT be seeded Done \
+                     (got {st:?})"
+                );
+                assert_eq!(
+                    st,
+                    Some(PhaseState::Active),
+                    "a zero-dep cold phase {ph} stays Active for the normal \
+                     cold-start cascade"
+                );
+            }
+        })
+        .await;
+}

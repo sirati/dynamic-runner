@@ -426,36 +426,44 @@ where
             tasks,
         );
 
-        // #3b: a `(phase_id, task_id)` duplicate in a RUNTIME spawn
-        // (any spawn reaching this handler is post-phase-start — the
+        // #3b: a WITHIN-BATCH `(phase_id, task_id)` duplicate in a RUNTIME
+        // spawn (any spawn reaching this handler is post-phase-start — the
         // 3a/3b discriminator `phase_started_emitted.is_empty()` is
-        // structurally false here) invalidates EVERY not-yet-terminal
-        // task across the whole run; the cluster CONTINUES (no
-        // `RunAborted`). `validate_spawn_tasks`'s `DuplicateTaskHash`
-        // IS the `(phase_id, task_id)` duplicate signal: `compute_task_hash`
-        // is phase-distinct (#97), so a hash already present in the
-        // ledger means the same `(phase_id, task_id)` was already
-        // spawned. We invalidate the existing not-yet-terminal set and
-        // do NOT apply this batch — the run's task set is ambiguous, so
-        // adding the (would-be) survivors only to immediately invalidate
-        // them is pointless.
-        let duplicate_reasons: Vec<String> = errors
+        // structurally false here) invalidates EVERY not-yet-terminal task
+        // across the whole run; the cluster CONTINUES (no `RunAborted`). The
+        // signal is `validate_spawn_tasks`'s `DuplicateInBatch`: the SAME
+        // `(phase_id, task_id)` appeared twice in ONE fresh spawn-set (no
+        // authoritative prior copy), so the run's task set is genuinely
+        // ambiguous and adding the would-be survivors only to immediately
+        // invalidate them is pointless.
+        //
+        // An ALREADY-IN-LEDGER duplicate (`DuplicateTaskHash`) is a DIFFERENT
+        // class and is NOT escalated: it is an idempotent re-spawn (the
+        // canonical case is a FAILOVER replay — a promoted primary's consumer
+        // `on_phase_end` hook re-fires and re-spawns the same deterministic
+        // identities it spawned pre-failover). The validator already dropped
+        // those entries from `valid_tasks` (so the apply NoOps nothing) and
+        // surfaced them as per-index errors; the prior ledger entry is the
+        // authoritative copy. Nuking the run there is the exact LMU-gating bug
+        // this path is being fixed for. The fresh survivors in the SAME batch
+        // still dispatch below.
+        let in_batch_dupes: Vec<String> = errors
             .iter()
             .filter_map(|(_, e)| match e {
-                SpawnError::DuplicateTaskHash(hash) => Some(format!("duplicate task hash {hash}")),
+                SpawnError::DuplicateInBatch(hash) => Some(format!("duplicate task hash {hash}")),
                 _ => None,
             })
             .collect();
-        if !duplicate_reasons.is_empty() {
+        if !in_batch_dupes.is_empty() {
             // `apply_spawn_tasks` IS the runtime-spawn path by
             // construction — the initial batch goes through
             // `ingest_initial_batch` (the 3a side). The path is the
             // discriminator, so no `phase_started_emitted` read is
             // needed here; reaching this handler is unconditionally 3b.
             let reason = format!(
-                "{} duplicate task identity/identities in a runtime spawn: {}",
-                duplicate_reasons.len(),
-                duplicate_reasons.join("; ")
+                "{} duplicate task identity/identities within a single runtime spawn batch: {}",
+                in_batch_dupes.len(),
+                in_batch_dupes.join("; ")
             );
             self.invalidate_all_pending(reason).await;
             return Ok(errors);
@@ -480,12 +488,25 @@ where
             // rejection still dispatches its survivors below — the per-index
             // `errors` already inform the caller of the dropped ones. The
             // per-index reply the caller receives is UNCHANGED.
-            if !errors.is_empty() {
-                self.spawn_rejected_task_ids.extend(
-                    errors
-                        .iter()
-                        .map(|(idx, _)| task_ids_by_index[*idx].clone()),
-                );
+            //
+            // EXCLUDE `DuplicateTaskHash` (already-in-ledger) rejections: an
+            // idempotent re-spawn (the FAILOVER-replay case — a promoted
+            // primary's `on_phase_end` hook re-firing) drops NO work. The
+            // prior ledger entries ARE the authoritative copies; they
+            // dispatch + complete on their own and are counted in
+            // `total_tasks`. Recording them here would surface a spurious
+            // `RunError::SpawnRejected` for work that is not lost — the same
+            // LMU-gating class as the run-wide-invalidation path above, just
+            // one branch deeper (an all-duplicate replay batch nets
+            // `valid_tasks.is_empty()`). A genuinely-lost rejection
+            // (`UnknownDependency`) IS still recorded.
+            let lost: Vec<&(usize, SpawnError)> = errors
+                .iter()
+                .filter(|(_, e)| !matches!(e, SpawnError::DuplicateTaskHash(_)))
+                .collect();
+            if !lost.is_empty() {
+                self.spawn_rejected_task_ids
+                    .extend(lost.iter().map(|(idx, _)| task_ids_by_index[*idx].clone()));
             }
             return Ok(errors);
         }

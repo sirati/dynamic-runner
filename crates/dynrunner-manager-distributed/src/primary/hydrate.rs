@@ -119,6 +119,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         //     correction). When its prereq completes it activates and fires
         //     its legitimate first `on_phase_start`.
         let mut started_phases: HashSet<PhaseId> = HashSet::new();
+        // Phase-completion derivation (failover-promotion resume). A phase
+        // was already COMPLETED-AND-ENDED on the run's original primary iff it
+        // holds ≥1 terminal task AND zero live (`Pending`/`Blocked`/`InFlight`)
+        // tasks — exactly the `(queued=0, in_flight=0, blocked=0)` condition
+        // `maybe_transition_drain` recognises as `Drained`, observed here at
+        // hydration time. The original primary already fired its `on_phase_end`
+        // (and any consumer hook that spawned its children — those children are
+        // present in this same inherited CRDT). Seeding such phases straight to
+        // `PhaseState::Done` AFTER `extend` (below) keeps them out of the
+        // post-hydrate lifecycle cascade's `poll_drain_transitions`, so
+        // `on_phase_end` does NOT re-fire and the consumer hook does NOT
+        // re-spawn its (identical-identity) children. Derived purely from task
+        // states (no explicit phase-done CRDT marker needed — the lattice
+        // already distinguishes terminal from live, which is exactly the
+        // `(0,0,0)` signal). On a COLD seed every task is `Pending`, so
+        // `phases_with_terminal` is empty and the seed set is empty: the
+        // cold-path `fire_initial_phase_starts` + empty-phase cascade run
+        // unchanged. A phase with a MIX of terminal + live tasks is NOT seeded
+        // (it has live work → its live tasks dispatch and its real
+        // `on_phase_end` fires once that work drains, exactly as the original
+        // primary would have).
+        let mut phases_with_terminal: HashSet<PhaseId> = HashSet::new();
+        let mut phases_with_live_work: HashSet<PhaseId> = HashSet::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             all_binaries.push(state.task().clone());
@@ -162,6 +185,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the `completed_tasks` membership.
                 TaskState::Failed { task, kind, .. } => {
                     started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
                     completed_task_ids.insert(task.task_id.clone());
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
@@ -169,6 +193,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 | TaskState::Unfulfillable { task, .. }
                 | TaskState::InvalidTask { task, .. } => {
                     started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                 }
@@ -183,6 +208,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // state — same dormancy, owned by the pool's existing
                 // dep machine rather than a parallel "Blocked" set.
                 TaskState::Blocked { task, .. } => {
+                    phases_with_live_work.insert(task.phase_id.clone());
                     items.push(task.clone());
                 }
                 // Unlike the secondary's hydration, the
@@ -192,6 +218,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // as `InFlight` in cluster_state. A `Pending` entry is
                 // therefore always genuinely pending: into the pool.
                 TaskState::Pending { task, .. } => {
+                    phases_with_live_work.insert(task.phase_id.clone());
                     items.push(task.clone());
                 }
                 TaskState::InFlight {
@@ -234,6 +261,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // `mark_tasks_in_flight` below; (3) is the ledger
                     // seed performed after `extend` succeeds.
                     started_phases.insert(task.phase_id.clone());
+                    phases_with_live_work.insert(task.phase_id.clone());
                     in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
                     in_flight_seed.push((
                         hash.clone(),
@@ -306,6 +334,38 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     );
                     self.pending = None;
                     return;
+                }
+                // Seed already-completed-and-ended phases straight to `Done`
+                // (failover-promotion resume). A phase that holds ≥1 terminal
+                // task and NO live (`Pending`/`Blocked`/`InFlight`) work was
+                // already drained AND had its `on_phase_end` fired (plus any
+                // children that hook spawned — present in this same CRDT) on
+                // the run's original primary. Without this seed the freshly
+                // built pool starts it `Active`/`Blocked` and the post-hydrate
+                // lifecycle cascade re-`(0,0,0)`-drains it → re-fires
+                // `on_phase_end` → the consumer hook re-spawns its children
+                // with identical deterministic identities → run-wide
+                // invalidation. Marking it `Done` here removes it from the
+                // cascade's `poll_drain_transitions` entirely. Runs AFTER
+                // `extend` (a failure leaves `pending = None` and any seeded
+                // phase state would be stranded) and the activation
+                // convergence inside `seed_completed_phases` flips a live
+                // dependent phase `Blocked → Active` if all its deps are now
+                // `Done`. EMPTY on the cold path (no terminal tasks), so the
+                // cold-start `fire_initial_phase_starts` + empty-phase cascade
+                // are untouched.
+                let completed_phases: Vec<PhaseId> = phases_with_terminal
+                    .iter()
+                    .filter(|ph| !phases_with_live_work.contains(*ph))
+                    .cloned()
+                    .collect();
+                if !completed_phases.is_empty() {
+                    tracing::info!(
+                        completed_phases = completed_phases.len(),
+                        "seeding already-completed phases as Done on resume \
+                         (failover-promotion); their on_phase_end will NOT re-fire"
+                    );
+                    p.seed_completed_phases(completed_phases);
                 }
                 // NB: empty-phase draining is NOT done here. The primary's
                 // COORDINATOR owns the narrated lifecycle cascade
