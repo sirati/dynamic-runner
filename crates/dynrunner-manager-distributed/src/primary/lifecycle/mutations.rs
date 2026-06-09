@@ -1,6 +1,6 @@
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, RemovalCause,
+    ClusterMutation, Destination, DistributedMessage, PeerId, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -438,31 +438,86 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     pub(crate) async fn send_transfer_complete(&mut self) -> Result<(), String> {
-        let msg = DistributedMessage::TransferComplete {
-            target: None,
-            sender_id: self.config.node_id.clone(),
-            timestamp: timestamp_now(),
-            total_files: 0,
-            total_bytes: 0,
-        };
-        // Uniform `Destination::All` mesh broadcast, same as the primary
-        // keepalive + CRDT-mutation fan-out. `Destination::All` always
-        // resolves, so the only way this errors is the local mesh-pump being
-        // gone (the node winding down) — a cluster collapse, which `send_to`
-        // latches on `self.mesh_pump_gone` for `run_pipeline`'s post-transfer
-        // gate to route into the strand-classification finalize tail.
-        // Warn-and-continue (uniform with the sibling `Destination::All`
-        // broadcasts) instead of `?`-escaping as a raw `RunError::Other`: a
-        // secondary dying in the window between a successful initial
-        // assignment and transfer-complete must surface as a clean
-        // `ClusterCollapsed` + `RunAborted`, not an unclassified `Other`.
-        if let Err(error) = self.send_to(Destination::All, msg).await {
-            tracing::warn!(
-                error = %error,
-                "TransferComplete delivery failed"
-            );
+        // Per-secondary directed delivery over `Destination::Secondary(id)` —
+        // the SAME router/relay path `perform_initial_assignment` uses for the
+        // `InitialAssignment` frame, and over the SAME CRDT-derived roster
+        // (`known_secondaries()`). This is the setup-GATING frame for
+        // `wait_for_setup` (`secondary::setup`): a secondary's
+        // `Configuring → Operational` gate hard-blocks on
+        // `got_peer_info && got_assignment && got_transfer`, and the only
+        // in-setup escape is the kill-on-deadline. The pre-fix `Destination::All`
+        // broadcast was a FIRE-ONCE snapshot over the currently-registered mesh
+        // connections (`PeerNetwork::broadcast` / `ChannelPeerTransport::broadcast`):
+        // no relay, no replay, no per-peer guarantee. A secondary whose peer-mesh
+        // link registered AFTER the broadcast instant (observed live: a 156 ms
+        // gap between the broadcast and the late peer's mesh registration)
+        // PERMANENTLY missed it and wedged in `wait_for_setup` until its setup
+        // deadline killed it — even though that SAME secondary had already
+        // received its `InitialAssignment`, because that frame rode the directed
+        // `send_to_peer` path which relays through any connected sibling to a
+        // not-yet-directly-connected target. Routing TransferComplete the same
+        // way makes its delivery CONVERGE with the assignment it gates: every
+        // secondary that received an `InitialAssignment` receives the
+        // TransferComplete that releases its setup gate, independent of WHEN its
+        // mesh link registers (Directive 1: the setup-gating frame's delivery is
+        // independent of role/membership/registration timing).
+        //
+        // Collect the roster to an owned `Vec` first so the `&self.cluster_state`
+        // borrow is dropped before the `&mut self` `send_to` calls (mirrors
+        // `perform_initial_assignment`'s name-sorted collect). Name-sorted for a
+        // deterministic, log-diffable fan-out order.
+        let mut secondary_ids: Vec<String> = self
+            .cluster_state
+            .known_secondaries()
+            .map(String::from)
+            .collect();
+        secondary_ids.sort();
+
+        for secondary_id in &secondary_ids {
+            let msg = DistributedMessage::TransferComplete {
+                target: None,
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                total_files: 0,
+                total_bytes: 0,
+            };
+            // A `Destination::Secondary(id)` send is QUEUED to the mesh-pump
+            // (`MeshClient::send`); its only error mode is the egress receiver —
+            // the local mesh-pump — being dropped, i.e. THIS node winding down
+            // (a cluster collapse). The per-peer routing outcome
+            // (direct / relayed / no-route) is resolved LATER inside the pump
+            // and never surfaces here, so a transient "no route to this one
+            // secondary" is NOT a send error — it is logged at the pump and the
+            // peer is recovered via the snapshot/anti-entropy backstop, exactly
+            // as for the directed `InitialAssignment` send. So the `Err` arm is
+            // uniformly the mesh-pump-gone collapse, which `send_to` latches on
+            // `self.mesh_pump_gone` for `run_pipeline`'s post-transfer gate to
+            // route into the strand-classification finalize tail. Warn-and-
+            // continue (uniform with the sibling broadcasts) instead of
+            // `?`-escaping as a raw `RunError::Other`: a node winding down in the
+            // window between a successful initial assignment and transfer-complete
+            // must surface as a clean `ClusterCollapsed` + `RunAborted`, not an
+            // unclassified `Other`. Continue the fan-out so the remaining
+            // secondaries still receive their gate-release on the same dead-pump
+            // pass — the latch is the single collapse signal the caller consults.
+            if let Err(error) = self
+                .send_to(
+                    Destination::Secondary(PeerId::from(secondary_id.clone())),
+                    msg,
+                )
+                .await
+            {
+                tracing::warn!(
+                    secondary_id = %secondary_id,
+                    error = %error,
+                    "TransferComplete delivery failed"
+                );
+            }
         }
-        tracing::info!("transfer complete sent to all secondaries");
+        tracing::info!(
+            secondaries = secondary_ids.len(),
+            "transfer complete sent to all secondaries"
+        );
         Ok(())
     }
 }
