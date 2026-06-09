@@ -40,6 +40,79 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::identifier::RunnerIdentifier;
 
+/// A `tokio::runtime::Runtime` whose `Drop` is non-blocking, so the
+/// runtime can be dropped from *any* context — including from within
+/// another tokio runtime's async context.
+///
+/// # Why this exists (the bug it fixes)
+///
+/// The default `Runtime::drop` performs a BLOCKING shutdown of the
+/// runtime's blocking pool. Tokio forbids that block from inside an
+/// asynchronous context and panics with *"Cannot drop a runtime in a
+/// context where blocking is not allowed. This happens when a runtime
+/// is dropped from within an asynchronous context."*
+///
+/// A [`PyPrimaryHandle`] owns such a runtime (for the off-loop
+/// `block_on` callers — `on_run_start` firing before the coordinator's
+/// runtime starts). On the SLURM secondary path the handle is captured
+/// into the promoted-primary recipe and threaded into the secondary's
+/// `node.run(...).await`, which runs INSIDE the secondary's own
+/// `rt.block_on(local.run_until(...))`. A plain (never-promoted)
+/// secondary never fires the recipe, so the recipe — and the
+/// `PyPrimaryHandle` it holds — is dropped when `node.run` returns at
+/// end-of-run, i.e. WITHIN that outer async context. With a default
+/// `Runtime::drop` that drop panics; this wrapper makes it a
+/// non-blocking `shutdown_background()` instead.
+///
+/// `shutdown_background()` does not wait for in-flight blocking tasks
+/// (it is `shutdown_timeout(0)`). This handle's runtime only ever
+/// drives `send().await` + `reply.await` (no `spawn_blocking`), so the
+/// "may leak still-running blocking tasks" caveat is vacuous here.
+///
+/// # Boundary
+///
+/// Single concern: drop-safety of the handle's runtime. Callers keep
+/// invoking `rt.block_on(...)` unchanged via the [`Deref`] to the inner
+/// `Runtime`; no call site knows this wrapper exists beyond its
+/// construction in [`PyPrimaryHandle::from_sender`].
+///
+/// [`Deref`]: std::ops::Deref
+pub(crate) struct BackgroundDropRuntime {
+    /// `Some` for the wrapper's whole life; taken in `Drop` so the
+    /// owned `Runtime` can be moved into `shutdown_background(self)`.
+    inner: Option<tokio::runtime::Runtime>,
+}
+
+impl BackgroundDropRuntime {
+    fn new(rt: tokio::runtime::Runtime) -> Self {
+        Self { inner: Some(rt) }
+    }
+}
+
+impl std::ops::Deref for BackgroundDropRuntime {
+    type Target = tokio::runtime::Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        // Invariant: `inner` is `Some` for the wrapper's entire life;
+        // it is only taken in `Drop`, after which no method runs.
+        self.inner
+            .as_ref()
+            .expect("BackgroundDropRuntime used after drop")
+    }
+}
+
+impl Drop for BackgroundDropRuntime {
+    fn drop(&mut self) {
+        // Non-blocking shutdown so this is safe to run inside another
+        // runtime's async context (no blocking-pool join → no
+        // "Cannot drop a runtime …" panic). `shutdown_background`
+        // consumes the `Runtime` by value, hence the `Option::take`.
+        if let Some(rt) = self.inner.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 /// Shared mutable cell carrying the per-task reinject cap. Held by
 /// both `PyPrimaryCoordinator` (which threads the cap into
 /// `PrimaryConfig` at `run()` start) and every `PyPrimaryHandle`
@@ -103,7 +176,17 @@ pub(crate) struct PyPrimaryHandle {
     /// across clones of `PrimaryHandle` so multiple calls don't each
     /// pay the runtime-construction cost. `Arc` so `#[derive(Clone)]`
     /// keeps the runtime alive across handle clones.
-    rt: Arc<tokio::runtime::Runtime>,
+    ///
+    /// Wrapped in [`BackgroundDropRuntime`] so the runtime drops
+    /// NON-BLOCKINGLY: this handle is captured into the secondary's
+    /// promoted-primary recipe and can therefore be dropped from inside
+    /// the secondary's `node.run(...).await` async context (a plain
+    /// secondary drops the never-fired recipe at end-of-run). A default
+    /// `Runtime::drop` there panics ("Cannot drop a runtime in a context
+    /// where blocking is not allowed"); the wrapper's `shutdown_background`
+    /// drop is context-safe. The `Deref` keeps `rt.block_on(...)` calls
+    /// below unchanged.
+    rt: Arc<BackgroundDropRuntime>,
 
     /// Shared cell for the per-task reinject cap. Lets the handle's
     /// `set_unfulfillable_reinject_max_per_task` setter mutate the
@@ -136,7 +219,7 @@ impl PyPrimaryHandle {
             })?;
         Ok(Self {
             sender,
-            rt: Arc::new(rt),
+            rt: Arc::new(BackgroundDropRuntime::new(rt)),
             reinject_cap,
         })
     }
@@ -499,5 +582,61 @@ mod tests {
         // closes the channel.
         drop(handle);
         stub_thread.join().expect("stub thread joined");
+    }
+
+    /// Regression: a `PyPrimaryHandle` (the LAST `Arc` to its in-handle
+    /// runtime) dropped from WITHIN another tokio runtime's async
+    /// context must NOT panic.
+    ///
+    /// This reproduces the secondary-process crash exactly. On the SLURM
+    /// secondary path the handle is captured into the promoted-primary
+    /// recipe and threaded into the secondary's
+    /// `rt.block_on(local.run_until(node.run(inputs)))`. A plain
+    /// (never-promoted) secondary never fires the recipe, so the recipe —
+    /// and the sole `PyPrimaryHandle` it owns — is dropped when `node.run`
+    /// returns at END-OF-RUN, i.e. inside that outer async context. With
+    /// the default `Runtime::drop` that drop panics ("Cannot drop a
+    /// runtime in a context where blocking is not allowed"), taking the
+    /// whole secondary process down. The [`BackgroundDropRuntime`] wrapper
+    /// makes the drop a non-blocking `shutdown_background()` instead.
+    ///
+    /// Revert-check: replace the handle's `Arc<BackgroundDropRuntime>`
+    /// with a bare `Arc<tokio::runtime::Runtime>` and this test panics on
+    /// the in-context drop (the `catch_unwind` below captures it).
+    #[test]
+    fn primary_handle_drop_inside_async_context_does_not_panic() {
+        let (tx, _rx) =
+            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(COMMAND_CHANNEL_CAPACITY);
+        let cell = ReinjectCapCell::default();
+        let handle = PyPrimaryHandle::from_sender(tx, cell).expect("handle init");
+
+        // Mirror the secondary's outer driver: a `current_thread` runtime
+        // whose `block_on` runs the (async) scope that owns the handle.
+        // Dropping `handle` at the end of the async block drops the LAST
+        // strong `Arc` to the in-handle runtime FROM WITHIN this async
+        // context — the exact shape that panics without the fix.
+        let outer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("outer runtime");
+
+        // `catch_unwind` so a regression surfaces as a clean test failure
+        // (with the captured panic message) rather than aborting the
+        // process. The runtime is `RefUnwindSafe`; the handle owns only
+        // `Send + 'static` channel/runtime state.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            outer.block_on(async move {
+                // The move-in makes this async block the SOLE owner of
+                // `handle`; it drops here, inside `block_on`.
+                let _h = handle;
+            });
+        }));
+
+        assert!(
+            result.is_ok(),
+            "dropping a PyPrimaryHandle inside an async context must not panic \
+             (its runtime must shut down in the background); got panic: {:?}",
+            result.err(),
+        );
     }
 }
