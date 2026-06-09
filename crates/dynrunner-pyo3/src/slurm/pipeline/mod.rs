@@ -50,14 +50,21 @@ pub(super) fn attr_truthy(obj: &Bound<'_, PyAny>, name: &str) -> bool {
 /// flag. Upload-stageability is a PER-ITEM property — "does this
 /// binary resolve to a real file under `--source`?" — and the per-item
 /// authority is `upload_source_binaries`' own walk, which strip-prefixes
-/// each binary against `source_root` and skips any out-of-tree item
+/// each binary against `source_root` and skips any item that is
+/// out-of-tree OR has no backing file on disk (a computed/producer item —
+/// a `uses_file_based_items=False` task discovers items it PRODUCES, with
+/// nothing to upload; the task-class flag cannot tell it apart from a
+/// mixed composite, so the walk decides per item rather than stat+scp'ing
+/// a path that does not exist)
 /// (see `dynrunner-slurm/src/job_manager/images.rs`; the primary's
-/// `compute_initial_staging_entries` applies the same predicate,
-/// aligned in the shared-`resolve_against_root` merge). A pure-opaque
-/// task whose binaries are all out-of-tree therefore uploads nothing
-/// even with this gate true; a mixed composite (real-file items +
-/// opaque sentinels spawned later, never present in `binaries` at
-/// submit time) correctly uploads its real files.
+/// `compute_initial_staging_entries` applies the same OUT-OF-TREE
+/// predicate via the shared `resolve_against_root` merge, but stays STRICT
+/// on the existence axis — it is reached only by file-based tasks, whose
+/// files exist, so a genuinely-missing source surfaces there). A
+/// pure-producer task whose binaries are all computed (no backing file)
+/// therefore uploads nothing even with this gate true; a mixed composite
+/// (real-file items + opaque sentinels spawned later, never present in
+/// `binaries` at submit time) correctly uploads its real files.
 ///
 /// `uses_file_based_items` remains the authority for the StageFile gate
 /// and `resolve_for_dispatch` (dispatch-time resolution), where the

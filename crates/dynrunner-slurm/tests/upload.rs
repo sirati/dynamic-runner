@@ -262,3 +262,63 @@ async fn mixed_inputs_skip_only_out_of_tree() {
     assert!(remotes.contains(&format!("{srcbins}/a/rel.bin")));
     assert!(remotes.contains(&format!("{srcbins}/abs.bin")));
 }
+
+/// A discovered binary that resolves UNDER `--source` but has no backing
+/// file on disk (a computed/producer item — a `uses_file_based_items=False`
+/// task discovers items it will PRODUCE, not files to upload) is SKIPPED,
+/// not stat+scp'd. Pre-fix the walk only skipped OUT-OF-tree paths, so an
+/// in-tree-nonexistent item reached `transfer_file` and OSErrored the whole
+/// dispatch (asm-dataset producer: `matrix_eval__<binary>.json` under
+/// `--shared-fs`, never staged).
+#[tokio::test]
+async fn skip_in_tree_nonexistent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().to_path_buf();
+    // Relative-under-src in shape, but the file is never created on disk.
+    let mgr = make_manager();
+    let binaries = vec![make_binary("matrix_eval__bzip2.json")];
+
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
+
+    let transfers = mgr.gateway().transfers();
+    assert!(
+        transfers.is_empty(),
+        "in-tree-but-nonexistent binary must be skipped, not uploaded; got {:?}",
+        transfers,
+    );
+}
+
+/// Selective skip on the existence axis: an existing in-tree file uploads
+/// while a nonexistent in-tree sibling in the SAME call is skipped and the
+/// loop continues (the producer/mixed shape — real outputs alongside
+/// computed items).
+#[tokio::test]
+async fn mixed_existing_and_nonexistent_in_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src_root = tmp.path().to_path_buf();
+    let real = src_root.join("real.bin");
+    std::fs::write(&real, b"x").unwrap();
+
+    let mgr = make_manager();
+    let srcbins = mgr.config.src_bins_path();
+    let binaries = vec![
+        make_binary("real.bin"),
+        make_binary("matrix_eval__bzip2.json"),
+    ];
+
+    mgr.upload_source_binaries(&binaries, &src_root)
+        .await
+        .unwrap();
+
+    let transfers = mgr.gateway().transfers();
+    let remotes: Vec<String> = transfers.iter().map(|(_, r)| r.clone()).collect();
+    assert_eq!(
+        transfers.len(),
+        1,
+        "only the existing in-tree binary uploads; got {:?}",
+        transfers,
+    );
+    assert!(remotes.contains(&format!("{srcbins}/real.bin")));
+}
