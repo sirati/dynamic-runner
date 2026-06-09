@@ -31,7 +31,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
-use super::{CleanupGuard, attr_truthy};
+use super::{CleanupGuard, attr_truthy, should_upload_source_binaries};
 
 /// `bool(getattr(obj, name, default_when_missing))` extractor for
 /// argparse-style booleans where the attribute may be absent on
@@ -366,17 +366,17 @@ pub(crate) fn run_remote_podman_pipeline<'py>(
         // ---- Phase 3: source-binary upload. ----
         //
         // Same gating shape as the SLURM pipeline: skip in pre-staged
-        // mode, skip when the task says items aren't file-based, skip
-        // when the dispatcher discovered no items.
-        let uses_file_based_items: bool = task
-            .getattr("uses_file_based_items")
-            .ok()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(true);
-        if !binaries.is_empty()
-            && uses_file_based_items
-            && !attr_truthy(args, "source_already_staged")
-        {
+        // mode, skip when the dispatcher discovered no items. Upload
+        // stageability is per-item (the upload walk strip-prefixes each
+        // binary under `--source`), so the gate does NOT consult the
+        // task-class `uses_file_based_items` flag — a mixed composite
+        // must upload its real files even though its opaque sentinels
+        // (spawned later, not in `binaries` here) keep that flag False.
+        // See `should_upload_source_binaries`.
+        if should_upload_source_binaries(
+            binaries.is_empty(),
+            attr_truthy(args, "source_already_staged"),
+        ) {
             job_manager.call_method1("upload_source_binaries", (&binaries, &source_dir))?;
         }
 

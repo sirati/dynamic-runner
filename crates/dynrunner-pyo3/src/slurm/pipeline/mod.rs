@@ -41,6 +41,35 @@ pub(super) fn attr_truthy(obj: &Bound<'_, PyAny>, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Gate for invoking `job_manager.upload_source_binaries`.
+///
+/// Fires when the dispatcher discovered binaries (`!binaries_empty`)
+/// and we are not in pre-staged mode (`!source_already_staged`).
+///
+/// Deliberately does NOT consult the task-class `uses_file_based_items`
+/// flag. Upload-stageability is a PER-ITEM property — "does this
+/// binary resolve to a real file under `--source`?" — and the per-item
+/// authority is `upload_source_binaries`' own walk, which strip-prefixes
+/// each binary against `source_root` and skips any out-of-tree item
+/// (see `dynrunner-slurm/src/job_manager/images.rs`; the primary's
+/// `compute_initial_staging_entries` applies the same predicate,
+/// aligned in the shared-`resolve_against_root` merge). A pure-opaque
+/// task whose binaries are all out-of-tree therefore uploads nothing
+/// even with this gate true; a mixed composite (real-file items +
+/// opaque sentinels spawned later, never present in `binaries` at
+/// submit time) correctly uploads its real files.
+///
+/// `uses_file_based_items` remains the authority for the StageFile gate
+/// and `resolve_for_dispatch` (dispatch-time resolution), where the
+/// opaque sentinels genuinely must resolve via the bind-mount — those
+/// readers keep the task-class flag.
+pub(super) fn should_upload_source_binaries(
+    binaries_empty: bool,
+    source_already_staged: bool,
+) -> bool {
+    !binaries_empty && !source_already_staged
+}
+
 /// Drop-guard that runs the strict teardown order
 /// (`tunnel_manager.cleanup()` → `gateway.disconnect()` → tightened
 /// `pkill`) on scope exit. Modeled on Python's `try/finally` block
@@ -176,6 +205,63 @@ pub(super) fn pkill_leftover_tunnels(py: Python<'_>) -> PyResult<()> {
             Ok(())
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_upload_source_binaries;
+
+    /// Mode-1 mixed-composite shape: the dispatcher discovered real-file
+    /// binaries (`binaries_empty=false`) and we are NOT pre-staged
+    /// (`source_already_staged=false`). The gate MUST fire — this is the
+    /// shape the task-class `uses_file_based_items=False` conjunct used
+    /// to wrongly suppress (the per-item upload walk is the real
+    /// stageability authority).
+    #[test]
+    fn gate_fires_for_mode1_mixed_composite() {
+        assert!(should_upload_source_binaries(
+            /* binaries_empty */ false, /* source_already_staged */ false,
+        ));
+    }
+
+    /// Revert-check: the pre-fix gate ANDed in `uses_file_based_items`.
+    /// For the mixed-composite shape that flag is False, so the OLD gate
+    /// (`!empty && uses_file_based_items && !staged`) did NOT fire. This
+    /// reproduces that old boolean to prove the bug was real and the
+    /// conjunct removal is what unblocks the upload.
+    #[test]
+    fn revert_check_old_conjunct_suppressed_mode1() {
+        let binaries_empty = false;
+        let source_already_staged = false;
+        let uses_file_based_items = false; // task-class flag for a mixed composite
+        let old_gate = !binaries_empty && uses_file_based_items && !source_already_staged;
+        assert!(
+            !old_gate,
+            "old task-class-gated condition wrongly suppressed mode-1 upload"
+        );
+        // The new per-item gate ignores the flag and fires.
+        assert!(should_upload_source_binaries(
+            binaries_empty,
+            source_already_staged
+        ));
+    }
+
+    /// Mode-2 (pre-staged) short-circuit is preserved: regardless of
+    /// discovered binaries, `source_already_staged=true` means no upload.
+    #[test]
+    fn gate_short_circuits_in_pre_staged_mode() {
+        assert!(!should_upload_source_binaries(
+            /* binaries_empty */ false, /* source_already_staged */ true,
+        ));
+    }
+
+    /// No discovered binaries → nothing to upload, gate is false.
+    /// (The pure-opaque case where the dispatcher discovered zero items.)
+    #[test]
+    fn gate_false_with_no_binaries() {
+        assert!(!should_upload_source_binaries(true, false));
+        assert!(!should_upload_source_binaries(true, true));
+    }
 }
 
 mod drive_rust;
