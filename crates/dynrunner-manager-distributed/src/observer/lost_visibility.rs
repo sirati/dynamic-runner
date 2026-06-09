@@ -70,18 +70,60 @@ use dynrunner_core::IMPORTANT_TARGET;
 /// is lost and try reconnecting after a minute."
 const REPORT_RECURRENCE: Duration = Duration::from_secs(60);
 
+/// Whether the observer holds POSITIVE, CRDT-derived evidence that the
+/// compute mesh is still alive at the moment it lost transport visibility.
+///
+/// # Why this gates the reassurance banner (the misdirection fix)
+///
+/// The observer's loss of its OWN transport view (zero reachable peers /
+/// a silent named primary) says NOTHING about whether the compute mesh
+/// survived: in the proven submitter-ssh-blip failure, systemd `--user`
+/// SIGTERM'd the rootless-podman containers on all 14 non-primary nodes,
+/// so the mesh genuinely died WHILE the observer had lost visibility. A
+/// banner keyed only on the observer's own `peer_count()==0` cannot tell
+/// "blip, mesh fine" from "mesh dead" apart, so it must NOT assert
+/// autonomy it cannot verify. This field carries the ONE signal that CAN
+/// distinguish them: the count of live worker-secondaries the observer's
+/// last converged CRDT snapshot still holds. The coordinator derives it
+/// (it owns the `ClusterState`); the reporter only chooses banner text
+/// from it — the reporter never touches the CRDT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshLiveness {
+    /// The observer's last CRDT snapshot still shows ≥1 live
+    /// worker-secondary member (`alive_count` > 0). POSITIVE evidence the
+    /// compute mesh is running — the reassurance ("the mesh runs
+    /// autonomously over its direct links") is now backed by a signal the
+    /// observer can actually verify.
+    KnownAlive { alive_count: usize },
+    /// The observer has NO positive evidence the mesh is alive: its last
+    /// snapshot shows zero live worker-secondaries (every member it knew
+    /// of dropped out of the membership ledger), or it never held a
+    /// roster at all. The observer must emit a NEUTRAL "compute-mesh state
+    /// UNKNOWN" line — it CANNOT assert autonomy here, because this is
+    /// exactly the shape the all-nodes-SIGTERM'd death also presents.
+    Unknown,
+}
+
 /// The current visibility the coordinator observes each loop iteration.
 ///
 /// `Visible` means the observer can see the run (a peer is reachable and,
 /// if a primary is named, it is not silent past the threshold). `Lost`
-/// carries a human reason for the operator log (which signal dropped).
+/// carries a human reason for the operator log (which signal dropped) AND
+/// the CRDT-derived [`MeshLiveness`] evidence the coordinator holds, which
+/// gates whether the reporter may assert the mesh runs autonomously or must
+/// stay neutral (see [`MeshLiveness`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Visibility {
     /// The observer currently sees the run.
     Visible,
     /// The observer currently cannot see the run; `reason` names which
-    /// signal dropped (fleet empty / named-primary silent) for the log.
-    Lost { reason: String },
+    /// signal dropped (fleet empty / named-primary silent) for the log,
+    /// and `mesh_liveness` carries the CRDT-derived evidence (if any) that
+    /// the compute mesh survived the visibility loss.
+    Lost {
+        reason: String,
+        mesh_liveness: MeshLiveness,
+    },
 }
 
 /// What the coordinator should do this iteration, returned from
@@ -153,7 +195,10 @@ impl LostVisibilityReporter {
                 self.last_report = None;
                 RetryDirective::Idle
             }
-            Visibility::Lost { reason } => {
+            Visibility::Lost {
+                reason,
+                mesh_liveness,
+            } => {
                 let now = Instant::now();
                 let first = self.lost_since.is_none();
                 self.lost_since.get_or_insert(now);
@@ -163,16 +208,45 @@ impl LostVisibilityReporter {
                         .is_none_or(|last| now.duration_since(last) >= REPORT_RECURRENCE);
                 if due {
                     let since = self.lost_since.expect("set above");
-                    tracing::warn!(
-                        target: IMPORTANT_TARGET,
-                        %reason,
-                        lost_secs = since.elapsed().as_secs(),
-                        "observer lost connection to the run — this does NOT mean the cluster \
-                         died (the compute mesh runs autonomously over its direct links); the \
-                         observer carries zero authority and stays a passive monitor, rebuilding \
-                         its tunnel + retrying reconnect (~60s cadence). The run's verdict comes \
-                         from the primary, never from the observer's own view."
-                    );
+                    let lost_secs = since.elapsed().as_secs();
+                    // Gate the reassurance on POSITIVE CRDT evidence. The
+                    // observer may only assert the mesh "runs autonomously"
+                    // when its last snapshot still shows live
+                    // worker-secondaries; otherwise it stays NEUTRAL — the
+                    // observer cannot tell an ssh blip from an all-nodes
+                    // teardown from its own transport view alone. See
+                    // [`MeshLiveness`].
+                    match mesh_liveness {
+                        MeshLiveness::KnownAlive { alive_count } => {
+                            tracing::warn!(
+                                target: IMPORTANT_TARGET,
+                                %reason,
+                                lost_secs,
+                                alive_secondaries = *alive_count,
+                                "observer lost connection to the run — the last CRDT snapshot \
+                                 still shows {alive_count} live worker-secondary member(s), so the \
+                                 compute mesh is running autonomously over its direct links; the \
+                                 observer carries zero authority and stays a passive monitor, \
+                                 rebuilding its tunnel + retrying reconnect (~60s cadence). The \
+                                 run's verdict comes from the primary, never from the observer's \
+                                 own view."
+                            );
+                        }
+                        MeshLiveness::Unknown => {
+                            tracing::warn!(
+                                target: IMPORTANT_TARGET,
+                                %reason,
+                                lost_secs,
+                                "observer lost connection to the run — compute-mesh state UNKNOWN: \
+                                 the observer holds NO live worker-secondary in its last CRDT \
+                                 snapshot, so it CANNOT confirm the mesh survived (this is also \
+                                 how an all-nodes teardown would look). The observer carries zero \
+                                 authority and stays a passive monitor, rebuilding its tunnel + \
+                                 retrying reconnect (~60s cadence); the run's verdict comes from \
+                                 the primary, never from the observer's own view."
+                            );
+                        }
+                    }
                     self.last_report = Some(now);
                     RetryDirective::ReconnectDue
                 } else {
@@ -197,6 +271,7 @@ mod tests {
     fn lost(reason: &str) -> Visibility {
         Visibility::Lost {
             reason: reason.to_string(),
+            mesh_liveness: MeshLiveness::Unknown,
         }
     }
 
@@ -259,5 +334,60 @@ mod tests {
         assert_eq!(r.observe(&Visibility::Visible), RetryDirective::Idle);
         assert_eq!(r.observe(&Visibility::Visible), RetryDirective::Idle);
         assert!(!r.is_lost());
+    }
+
+    #[test]
+    fn unknown_liveness_emits_neutral_not_autonomy() {
+        // The misdirection fix: with NO positive CRDT evidence the mesh is
+        // alive, the reporter must NEVER assert the mesh "runs autonomously"
+        // — it must emit the neutral "compute-mesh state UNKNOWN" line. This
+        // is the exact shape of the proven all-nodes-SIGTERM failure, where
+        // the old unconditional banner reassured the operator while every
+        // compute peer was dead.
+        let events = crate::test_capture::capture_important(|| {
+            let mut r = LostVisibilityReporter::new();
+            r.observe(&Visibility::Lost {
+                reason: "no reachable peer".to_string(),
+                mesh_liveness: MeshLiveness::Unknown,
+            });
+        });
+        assert!(
+            events.iter().any(|e| e.message.contains("UNKNOWN")),
+            "unknown mesh liveness must emit the neutral UNKNOWN line: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.message.contains("autonomous")),
+            "the observer must NOT assert mesh autonomy it cannot verify: {events:?}"
+        );
+    }
+
+    #[test]
+    fn known_alive_liveness_emits_autonomy_reassurance() {
+        // The reassurance is legitimate ONLY when the last CRDT snapshot
+        // still shows live worker-secondaries — then the observer CAN verify
+        // the mesh is up. Pin that the positive-evidence branch keeps the
+        // "runs autonomously" reassurance AND surfaces the live count.
+        let events = crate::test_capture::capture_important(|| {
+            let mut r = LostVisibilityReporter::new();
+            r.observe(&Visibility::Lost {
+                reason: "named primary silent".to_string(),
+                mesh_liveness: MeshLiveness::KnownAlive { alive_count: 14 },
+            });
+        });
+        assert!(
+            events.iter().any(|e| e.message.contains("autonomous")),
+            "positive CRDT liveness justifies the autonomy reassurance: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .fields
+                .get("alive_secondaries")
+                .is_some_and(|v| v.contains("14"))),
+            "the autonomy banner must surface the live worker-secondary count: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.message.contains("UNKNOWN")),
+            "the positive-evidence branch must not emit the neutral UNKNOWN line: {events:?}"
+        );
     }
 }

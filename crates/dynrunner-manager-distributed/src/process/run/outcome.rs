@@ -172,35 +172,62 @@ fn observer_terminal(run_result: Result<ObserverTerminal, RunError>) -> RunTermi
 
 /// Map a secondary's `run` outcome onto the role-agnostic [`RunTerminal`].
 ///
-/// The secondary's `run` returns `Ok(())` on a clean terminal and `Err` only
-/// on a `Failed` (a fatal-exit) — so the per-secondary [`SecondaryTerminal`]
-/// is the single source of truth for WHICH clean terminal (Done/Aborted/
-/// Panik) it reached, read back via `coordinator.terminal()`. An `Err` (or a
-/// `Failed`/absent terminal) becomes `Failed`.
+/// # The lifecycle terminal is the single source of truth, NOT the `Result`
+///
+/// The secondary's `run` returns `Ok(())` ONLY on a `Done` terminal and
+/// `Err` on `Aborted`/`Panik`/`Failed` (its `run` projects all three
+/// non-clean terminals to an `Err(String)` — see
+/// [`crate::secondary::SecondaryCoordinator::run`]). So the `Result` alone
+/// CANNOT distinguish a host-signal panik from a policy fatal-exit: both are
+/// `Err`. The per-secondary [`SecondaryTerminal`] read back via
+/// `coordinator.terminal()` is the authoritative source for WHICH terminal
+/// was reached, so this mapping branches on IT — independent of the
+/// `Ok`/`Err` shape.
+///
+/// # Why the panik must not be mislabeled `FatalPolicyExit` (the
+/// misattribution fix)
+///
+/// A SIGTERM-driven secondary teardown lands a `SecondaryTerminal::Panik`
+/// AND surfaces `run` as `Err("secondary panik shutdown: …")`. Branching on
+/// the `Err` shape alone — as the prior code did — typed that as
+/// [`RunError::FatalPolicyExit`], whose text blames "a run-loop policy (e.g.
+/// the observer's invalid-task monitor)". That sent the operator hunting an
+/// invalid-task monitor that never fired, when the real cause was a HOST
+/// signal. A `Panik` terminal is `RunTerminal::Panik` (exit 137 — the worker
+/// pgids were already killed by the role's own teardown) regardless of how
+/// `run` surfaced it; the panik reason already NAMES the SIGTERM sender pid
+/// (see [`crate::panik_watcher::panik_reason`]).
+///
+/// `FatalPolicyExit` is reserved for the genuine fatal-exit: a `Failed`
+/// terminal (the `fatal_exit` latch) OR an `Err` with NO terminal recorded
+/// (a fatal-exit propagated through `?` before any terminal landed). The OLD
+/// pyo3 secondary RAISED on those, so they stay STRUCTURED so the boundary
+/// raises.
 pub(super) fn secondary_terminal(
     run_result: Result<(), String>,
     terminal: Option<SecondaryTerminal>,
 ) -> RunTerminal {
-    match run_result {
-        Ok(()) => match terminal {
-            Some(SecondaryTerminal::Done) | None => RunTerminal::Done,
-            Some(SecondaryTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
-            Some(SecondaryTerminal::Panik { matched_path, .. }) => {
-                RunTerminal::Panik { matched_path }
-            }
-            // A `Failed` lifecycle is a deliberate fatal-exit (the secondary's
-            // `fatal_exit` latch). The OLD pyo3 secondary RAISED on it (it had
-            // no swallow path), so type it STRUCTURED (`FatalPolicyExit`) — the
-            // boundary raises, never swallows.
-            Some(SecondaryTerminal::Failed { reason }) => RunTerminal::Failed {
+    match terminal {
+        Some(SecondaryTerminal::Done) => RunTerminal::Done,
+        Some(SecondaryTerminal::Aborted { reason }) => RunTerminal::Aborted { reason },
+        Some(SecondaryTerminal::Panik { matched_path, .. }) => RunTerminal::Panik { matched_path },
+        // A `Failed` lifecycle is a deliberate fatal-exit (the secondary's
+        // `fatal_exit` latch). The OLD pyo3 secondary RAISED on it (it had
+        // no swallow path), so type it STRUCTURED (`FatalPolicyExit`) — the
+        // boundary raises, never swallows.
+        Some(SecondaryTerminal::Failed { reason }) => RunTerminal::Failed {
+            error: RunError::FatalPolicyExit { reason },
+        },
+        // No terminal recorded. `Ok(())` with no terminal is the documented
+        // clean default (`Done`). An `Err` with no terminal is a fatal-exit
+        // that propagated through `?` before any terminal landed — same
+        // disposition as a `Failed` lifecycle, so structure it so the
+        // boundary raises.
+        None => match run_result {
+            Ok(()) => RunTerminal::Done,
+            Err(reason) => RunTerminal::Failed {
                 error: RunError::FatalPolicyExit { reason },
             },
-        },
-        // The secondary's `run` returns `Err` on a fatal-exit (the `fatal_exit`
-        // latch propagated). Same disposition as a `Failed` lifecycle: the OLD
-        // wrapper RAISED, so structure it so the boundary raises.
-        Err(reason) => RunTerminal::Failed {
-            error: RunError::FatalPolicyExit { reason },
         },
     }
 }
@@ -254,6 +281,80 @@ mod tests {
             RunTerminal::Failed {
                 error: RunError::FatalPolicyExit { .. }
             }
+        ));
+    }
+
+    /// The misattribution fix: a SIGTERM-driven secondary teardown lands a
+    /// `SecondaryTerminal::Panik` AND surfaces `run` as `Err(...)`. It MUST
+    /// map to `RunTerminal::Panik` (exit 137, a host signal), NEVER to
+    /// `FatalPolicyExit` (whose text blames an invalid-task monitor). The
+    /// terminal enum — not the `Err` shape — is the source of truth.
+    #[test]
+    fn secondary_panik_with_err_result_is_panik_not_policy_exit() {
+        let terminal = secondary_terminal(
+            // The secondary's `run` projects a panik terminal to `Err`.
+            Err("secondary panik shutdown: host SIGTERM, per-host (sender_pid=4242)".into()),
+            Some(SecondaryTerminal::Panik {
+                matched_path: crate::panik_watcher::sigterm_sentinel_path(),
+                reason: "host SIGTERM, per-host (sender_pid=4242)".into(),
+            }),
+        );
+        match terminal {
+            RunTerminal::Panik { .. } => {}
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { .. },
+            } => panic!(
+                "a host-SIGTERM panik must NOT be mislabeled FatalPolicyExit — that blames a \
+                 policy monitor for a host signal (the misattribution this fix removes)"
+            ),
+            other => panic!("unexpected terminal for a SIGTERM panik: {other:?}"),
+        }
+    }
+
+    /// A genuine fatal-exit (the `fatal_exit` latch) still surfaces as
+    /// `FatalPolicyExit` — only the panik/abort terminals are severed from
+    /// it. `Failed` lifecycle terminal → `FatalPolicyExit`.
+    #[test]
+    fn secondary_failed_terminal_is_policy_exit() {
+        let terminal = secondary_terminal(
+            Err("fatal latch".into()),
+            Some(SecondaryTerminal::Failed {
+                reason: "invalid_task monitor breached".into(),
+            }),
+        );
+        assert!(matches!(
+            terminal,
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { .. }
+            }
+        ));
+    }
+
+    /// An `Err` with NO terminal recorded is a fatal-exit that propagated
+    /// through `?` before a terminal landed — it stays `FatalPolicyExit` so
+    /// the boundary raises.
+    #[test]
+    fn secondary_err_no_terminal_is_policy_exit() {
+        let terminal = secondary_terminal(Err("setup handshake failed".into()), None);
+        assert!(matches!(
+            terminal,
+            RunTerminal::Failed {
+                error: RunError::FatalPolicyExit { .. }
+            }
+        ));
+    }
+
+    /// A clean `Done` terminal maps to `RunTerminal::Done` (exit 0), as does
+    /// `Ok(())` with no terminal (the documented clean default).
+    #[test]
+    fn secondary_done_maps_to_done() {
+        assert!(matches!(
+            secondary_terminal(Ok(()), Some(SecondaryTerminal::Done)),
+            RunTerminal::Done
+        ));
+        assert!(matches!(
+            secondary_terminal(Ok(()), None),
+            RunTerminal::Done
         ));
     }
 

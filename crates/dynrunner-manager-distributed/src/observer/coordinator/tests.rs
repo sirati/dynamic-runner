@@ -1550,12 +1550,13 @@ async fn emit_terminal_reason_lands_on_important_channel() {
 /// report CONTENT so the importance assertion stays deterministic.
 #[test]
 fn lost_visibility_report_is_retry_notice_not_a_run_terminal() {
-    use crate::observer::lost_visibility::{LostVisibilityReporter, Visibility};
+    use crate::observer::lost_visibility::{LostVisibilityReporter, MeshLiveness, Visibility};
 
     let events = crate::test_capture::capture_important(|| {
         let mut reporter = LostVisibilityReporter::new();
         reporter.observe(&Visibility::Lost {
             reason: "no reachable peer".to_string(),
+            mesh_liveness: MeshLiveness::Unknown,
         });
     });
 

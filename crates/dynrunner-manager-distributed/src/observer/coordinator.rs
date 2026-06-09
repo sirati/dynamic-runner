@@ -81,7 +81,9 @@ use crate::cluster_state::ClusterState;
 use crate::observer::announcer::{AnnouncerOutboxItem, PeerMeshAnnouncerSender};
 use crate::observer::failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use crate::observer::lifecycle::{AnnouncerHandle, attach_observer_announcer};
-use crate::observer::lost_visibility::{LostVisibilityReporter, RetryDirective, Visibility};
+use crate::observer::lost_visibility::{
+    LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility,
+};
 use crate::observer::reconnect::ReconnectorHandle;
 use crate::observer::reporting::{SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};
 use crate::observer::run_observer_announcer;
@@ -911,9 +913,10 @@ where
             return Visibility::Lost {
                 reason: format!(
                     "no reachable peer (the observer's transport view is empty for \
-                     ≥{:.1}s); the compute mesh continues over its direct links",
+                     ≥{:.1}s)",
                     self.config.fleet_dead_timeout.as_secs_f64()
                 ),
+                mesh_liveness: self.mesh_liveness(),
             };
         }
         // Named-primary silence: a primary is NAMED but its keepalives /
@@ -930,9 +933,32 @@ where
                      reaching this observer)",
                     primary_last_seen.elapsed().as_secs_f64()
                 ),
+                mesh_liveness: self.mesh_liveness(),
             };
         }
         Visibility::Visible
+    }
+
+    /// CRDT-derived evidence of whether the compute mesh is still alive,
+    /// for the [`LostVisibilityReporter`]'s reassurance gate. This is the
+    /// ONLY signal that distinguishes an ssh-link blip (mesh fine, banner
+    /// may reassure) from an all-nodes teardown (mesh dead, banner must
+    /// stay neutral) — the observer's own transport `peer_count()` cannot.
+    ///
+    /// Reads the SAME positive CRDT liveness signal the AE-3 recovery tick
+    /// and the reconnect roster use ([`crate::cluster_state::ClusterState::alive_secondary_members`]):
+    /// peers that POSITIVELY advertised worker-secondary capacity AND are
+    /// still live members of the last converged snapshot. A non-zero count
+    /// is positive evidence the mesh survived; zero (the membership ledger
+    /// emptied, or no roster ever landed) is [`MeshLiveness::Unknown`] —
+    /// the observer holds nothing that confirms autonomy.
+    fn mesh_liveness(&self) -> MeshLiveness {
+        let alive_count = self.cluster_state.alive_secondary_members().count();
+        if alive_count > 0 {
+            MeshLiveness::KnownAlive { alive_count }
+        } else {
+            MeshLiveness::Unknown
+        }
     }
 
     /// Trigger a transport-path rebuild for the observer's expected roster
@@ -1196,12 +1222,10 @@ where
     /// the boundary exits 137.
     async fn on_panik(&mut self, signal: PanikSignal) -> ObserverTerminal {
         let matched_path = signal.matched_path;
-        let is_sigterm = panik_watcher::is_sigterm_signal(&matched_path);
-        let reason = if is_sigterm {
-            "panik SIGTERM (per-host)".to_string()
-        } else {
-            format!("panik file: {}", matched_path.display())
-        };
+        // The canonical source-attributed reason (owned by `panik_watcher`):
+        // a SIGTERM names the sender pid so the operator sees a HOST signal,
+        // not a policy abort. Same single owner the secondary teardown uses.
+        let reason = panik_watcher::panik_reason(&matched_path, signal.sender_pid);
         tracing::error!(
             matched_path = %matched_path.display(),
             reason = %reason,

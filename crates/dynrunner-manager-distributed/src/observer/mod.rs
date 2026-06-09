@@ -40,6 +40,6 @@ pub use coordinator::{
 };
 pub use failure_response::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 pub use lifecycle::{AnnouncerHandle, attach_observer_announcer};
-pub use lost_visibility::{LostVisibilityReporter, RetryDirective, Visibility};
+pub use lost_visibility::{LostVisibilityReporter, MeshLiveness, RetryDirective, Visibility};
 pub use reconnect::{ReconnectorHandle, TunnelReconnector};
 pub use reporting::{Reporter, SharedSnapshotSource, StatsSnapshot, TokioClock, run_reporter};

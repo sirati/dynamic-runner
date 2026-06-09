@@ -182,6 +182,34 @@ pub fn is_sigterm_signal(matched_path: &Path) -> bool {
     matched_path == Path::new(SIGTERM_SENTINEL_PATH)
 }
 
+/// The canonical human-readable terminal reason for a [`PanikSignal`],
+/// attributed to its source. The SINGLE owner of how a panik source maps
+/// to operator-facing text — every role (secondary teardown, observer
+/// self-departure) routes through here so the attribution is identical and
+/// the source-branching literal is never re-derived per call site.
+///
+/// - SIGTERM source → `"host SIGTERM, per-host (sender_pid=N)"`. A host
+///   SIGTERM is NOT a policy abort, so the reason NAMES the sender: `N` is
+///   the slurmstepd pid on a SLURM TIMEOUT/scancel, the wrapper/
+///   shutdown-manager pid, `0` for a kernel-originated SIGTERM (OOM-killer),
+///   or `unknown` when the kernel did not report a sender. This is the
+///   diagnostic that points the operator at the HOST that killed the node
+///   instead of at an invalid-task monitor that never fired.
+/// - File source → `"panik file: <path>"` (the `matched_path` verbatim),
+///   preserved exactly for downstream log-parser compatibility.
+pub fn panik_reason(matched_path: &Path, sender_pid: Option<u32>) -> String {
+    if is_sigterm_signal(matched_path) {
+        format!(
+            "host SIGTERM, per-host (sender_pid={})",
+            sender_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        )
+    } else {
+        format!("panik file: {}", matched_path.display())
+    }
+}
+
 /// Caller-supplied watcher configuration.
 #[derive(Debug, Clone)]
 pub struct PanikWatcherConfig {

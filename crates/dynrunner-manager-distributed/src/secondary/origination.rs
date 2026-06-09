@@ -192,17 +192,16 @@ where
         sender_pid: Option<u32>,
         kill_grace: std::time::Duration,
     ) -> (std::path::PathBuf, String) {
-        // Source dispatch on the watcher's documented predicate.
-        // File-source matched_path's reason is preserved verbatim for
-        // downstream log-parser compatibility ("panik file: <path>");
-        // SIGTERM-source uses a distinct reason that does not conflate
-        // "file" with the source type.
+        // Source dispatch on the watcher's documented predicate. The
+        // canonical source-attributed reason is owned by `panik_watcher`:
+        // a file-source reason is preserved verbatim ("panik file: <path>")
+        // for downstream log-parser compatibility; a SIGTERM-source reason
+        // NAMES the sender pid — carried verbatim into
+        // `SecondaryTerminal::Panik.reason` and every downstream terminal
+        // log — so the operator sees "the HOST killed this secondary"
+        // instead of hunting an invalid-task monitor that never fired.
         let is_sigterm = crate::panik_watcher::is_sigterm_signal(&matched_path);
-        let reason = if is_sigterm {
-            "panik SIGTERM (per-host)".to_string()
-        } else {
-            format!("panik file: {}", matched_path.display())
-        };
+        let reason = crate::panik_watcher::panik_reason(&matched_path, sender_pid);
         if is_sigterm {
             // `sender_pid` is the load-bearing diagnostic: who sent the
             // SIGTERM. `Some(0)` = kernel-originated (OOM-killer);

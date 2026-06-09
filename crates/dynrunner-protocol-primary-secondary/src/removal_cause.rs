@@ -36,15 +36,18 @@ pub enum RemovalCause {
     /// reporter cannot force unbounded allocation on receivers.
     FatalError(BoundedString<1024>),
     /// A node is announcing its own departure from the mesh (it observed
-    /// a panik file or per-host SIGTERM and is tearing down its own
-    /// workers and exiting locally). Self-authored: the leaving node
-    /// authors the `PeerRemoved` for its OWN id so peers LOG the
-    /// departure and mark the peer Dead — it is observability-only and
-    /// MUST NOT cancel cluster work or terminate the run on peers.
+    /// a panik FILE and is tearing down its own workers and exiting
+    /// locally). Self-authored: the leaving node authors the `PeerRemoved`
+    /// for its OWN id so peers LOG the departure and mark the peer Dead —
+    /// it is observability-only and MUST NOT cancel cluster work or
+    /// terminate the run on peers.
+    ///
+    /// Only the FILE-source panik broadcasts this: a per-host SIGTERM is a
+    /// purely local teardown that announces NOTHING on the mesh (the mesh
+    /// stays free to re-elect), so its reason is never carried here.
     ///
     /// The payload carries the human-readable reason (e.g.
-    /// `"panik file: <path>"` / `"panik SIGTERM (per-host)"`),
-    /// byte-capped identically to `FatalError`.
+    /// `"panik file: <path>"`), byte-capped identically to `FatalError`.
     SelfDeparture(BoundedString<1024>),
     /// Post-mesh roster RE-EMIT of an already-departed id (C6/B5): the
     /// primary's `rebroadcast_full_roster` re-emits a `PeerRemoved` for

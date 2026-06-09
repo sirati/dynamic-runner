@@ -183,9 +183,14 @@ impl fmt::Display for RunError {
             ),
             Self::FatalPolicyExit { reason } => write!(
                 f,
-                "run aborted by policy: {reason}. A run-loop policy (e.g. the \
-                 observer's invalid-task monitor) signalled a deliberate non-zero \
-                 exit — the run did not complete cleanly."
+                "run terminated non-zero (deliberate fatal-exit): {reason}. The \
+                 canonical case is a run-loop policy (e.g. the observer's \
+                 invalid-task monitor) signalling a deliberate non-zero exit, but \
+                 the leading reason is authoritative for the actual cause — the run \
+                 did not complete cleanly. NOTE: a host signal (SIGTERM/SLURM \
+                 TIMEOUT/scancel/OOM-killer) is NOT this terminal; a host-signal \
+                 teardown surfaces as a panik (exit 137) whose reason names the \
+                 sender pid, never as a policy abort."
             ),
             Self::NoRelocationTarget => write!(
                 f,
