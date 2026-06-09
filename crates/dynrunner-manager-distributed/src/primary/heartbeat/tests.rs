@@ -254,7 +254,7 @@ async fn dead_secondary_requeues_in_flight_task() {
     // would drop a healthy node mid-setup).
     let conn = SecondaryConnection::new("dead-sec".into())
         .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-        .receive_cert_exchange(String::new(), None, None, 0)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
@@ -343,7 +343,7 @@ fn register_operational_secondary<S, E>(
 {
     let conn = SecondaryConnection::new(secondary_id.into())
         .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-        .receive_cert_exchange(String::new(), None, None, 0)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
@@ -562,7 +562,7 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
             // and the test would falsely pass against a buggy primary.
             let sec_b_conn = SecondaryConnection::new("sec-b".into())
                 .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-                .receive_cert_exchange(String::new(), None, None, 0)
+                .receive_cert_exchange(String::new(), None, None, 0, None)
                 .begin_peer_discovery()
                 .peers_ready()
                 .assignments_sent();
@@ -706,7 +706,7 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
     // Register the dead-to-be secondary, operational.
     let conn = SecondaryConnection::new("dead-sec".into())
         .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-        .receive_cert_exchange(String::new(), None, None, 0)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();
@@ -1231,7 +1231,7 @@ async fn oracle_false_corners() {
         // Operational but holds NO in-flight task.
         let conn = SecondaryConnection::new("dead-sec".into())
             .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-            .receive_cert_exchange(String::new(), None, None, 0)
+            .receive_cert_exchange(String::new(), None, None, 0, None)
             .begin_peer_discovery()
             .peers_ready()
             .assignments_sent();
@@ -1301,7 +1301,7 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
             // sec-b is the idle survivor with a real memory budget.
             let sec_b_conn = SecondaryConnection::new("sec-b".into())
                 .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
-                .receive_cert_exchange(String::new(), None, None, 0)
+                .receive_cert_exchange(String::new(), None, None, 0, None)
                 .begin_peer_discovery()
                 .peers_ready()
                 .assignments_sent();
@@ -1386,4 +1386,127 @@ async fn lazy_requeue_fires_at_dispatch_altitude_when_only_silent_held_work_rema
             }
         })
         .await;
+}
+
+/// HEADLINE (busy-secondary-not-reaped): a secondary whose ONLY liveness
+/// signal is its liveness BEACON — i.e. it sends NO mesh frame and fires
+/// NO task-completion event for longer than the keepalive-miss threshold,
+/// the exact shape of a node pegged on one long build — must NOT be
+/// declared dead. The beacon datagram arrives on the primary's
+/// `LivenessListener` and is folded into the death-clock through
+/// `record_keepalive` (the SAME refresh the operational loop's
+/// liveness-ping arm calls). This test drives `record_keepalive` directly
+/// (the listener→loop seam) with NO `dispatch_message` (no mesh frame) and
+/// asserts the secondary survives the HARD backstop.
+///
+/// Revert-check: with the beacon coupled to / blocked by the busy runtime
+/// (the pre-fix world), NO `record_keepalive` lands during the build, the
+/// silence crosses the backstop, and `process_heartbeat_tick` reaps the
+/// node — which is precisely the genuine-death test below. So the two
+/// tests together are the before/after of the fix.
+#[tokio::test]
+async fn busy_secondary_beaconing_is_not_reaped() {
+    let (transport, _rx, _tx) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    let conn = SecondaryConnection::new("busy-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "busy-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("busy-sec");
+
+    // Simulate a long build: NO task events, NO mesh frames — only the
+    // dedicated-thread beacon keeps asserting liveness. Real-time sleeps
+    // (the death-clock reads `std::time::Instant`, which `start_paused`
+    // does NOT control — mirrors the sibling reap tests' real sleeps). Beat
+    // the keepalive cadence (50ms) repeatedly so total elapsed (~300ms) is
+    // 3x the HARD backstop (2x 50ms = 100ms), refreshing via the beacon
+    // path (`record_keepalive`) each step exactly as the listener→loop arm
+    // does per datagram.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The ONLY liveness input: a beacon ping (NOT a mesh frame, NOT a
+        // task event). This is what the operational loop's liveness-ping
+        // arm does for each datagram the listener forwards.
+        primary.record_keepalive("busy-sec");
+    }
+
+    // The death-clock must show the node as recently-seen (well under the
+    // backstop), NOT silent — the beacon kept it alive with zero task
+    // activity.
+    let report = primary.collect_heartbeat_report();
+    assert_eq!(report.silences.len(), 1, "the busy secondary is still tracked");
+    assert!(
+        report.silences[0].silence < Duration::from_millis(100),
+        "beacon keeps the death-clock fresh ({:?}) — well under the 100ms HARD \
+         backstop — despite NO task events for 300ms",
+        report.silences[0].silence
+    );
+
+    // And the reaper tick does NOT remove it.
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        primary.secondaries.contains_key("busy-sec"),
+        "a busy-but-beaconing secondary must NOT be false-declared dead"
+    );
+}
+
+/// GENUINE-DEATH (still detected): a secondary that ACTUALLY stops — NO
+/// beacon AND NO mesh frame for past the threshold — is still reaped. This
+/// guards that the beacon's union refresh did not break real
+/// failure-detection: absent EVERY liveness source, the death-clock
+/// crosses the HARD backstop and the node is removed.
+#[tokio::test]
+async fn genuinely_dead_secondary_without_beacon_is_still_reaped() {
+    let (transport, _rx, _tx) = empty_transport();
+    let (mut primary, _mesh) = build_primary(
+        config(Duration::from_millis(50), 2),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    let conn = SecondaryConnection::new("dead-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false, false)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "dead-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("dead-sec");
+
+    // NO beacon, NO frame, NO task event — total silence past the HARD
+    // backstop (2x 50ms = 100ms); 300ms is 3x. Real-time sleep (the
+    // death-clock reads `std::time::Instant`, like the sibling reap tests).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let report = primary.collect_heartbeat_report();
+    assert_eq!(report.silences.len(), 1);
+    assert!(
+        report.silences[0].silence >= Duration::from_millis(100),
+        "a genuinely silent secondary crosses the HARD backstop"
+    );
+
+    primary.process_heartbeat_tick().await.unwrap();
+    assert!(
+        !primary.secondaries.contains_key("dead-sec"),
+        "a genuinely dead secondary (no beacon AND no frames) is still reaped — \
+         the beacon's union refresh must not break real failure detection"
+    );
 }

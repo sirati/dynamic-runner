@@ -60,6 +60,7 @@ fn roundtrip_all_message_types() {
             ipv4_address: None,
             ipv6_address: None,
             quic_port: 5000,
+            liveness_port: None,
         },
         DistributedMessage::PeerInfo {
             target: None,

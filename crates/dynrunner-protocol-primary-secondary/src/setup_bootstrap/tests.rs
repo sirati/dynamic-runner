@@ -59,6 +59,7 @@ fn cert_exchange_roundtrip() {
         ipv4_address: Some("10.0.0.1".into()),
         ipv6_address: None,
         quic_port: 4242,
+        liveness_port: Some(4243),
     };
     let wire: DistributedMessage<()> = original.into();
     match wire {
@@ -67,12 +68,15 @@ fn cert_exchange_roundtrip() {
             ipv4_address,
             ipv6_address,
             quic_port,
+            liveness_port,
             ..
         } => {
             assert_eq!(public_cert_pem, "PEM");
             assert_eq!(ipv4_address.as_deref(), Some("10.0.0.1"));
             assert!(ipv6_address.is_none());
             assert_eq!(quic_port, 4242);
+            // The liveness-beacon port survives the setup↔wire conversion.
+            assert_eq!(liveness_port, Some(4243));
         }
         _ => panic!("converted to wrong wire variant"),
     }
@@ -90,6 +94,7 @@ fn peer_info_roundtrip() {
             ipv6: None,
             port: 0,
             is_observer: false,
+            liveness_port: None,
         }],
     };
     let wire: DistributedMessage<()> = original.into();

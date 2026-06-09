@@ -2,6 +2,7 @@ pub mod anti_entropy;
 pub mod cluster_state;
 pub mod discovery;
 pub mod fulfillability_matcher;
+pub mod liveness;
 pub mod message_router;
 pub mod observer;
 pub mod panik_watcher;

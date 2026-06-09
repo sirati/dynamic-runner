@@ -216,6 +216,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // case, matching the command-channel disabled-arm shape.
         let mut respawn_request_rx = self.respawn_request_rx.take();
 
+        // Liveness-beacon ping receiver. Same disabled-arm shape: `None`
+        // when no listener was wired (channel-only fixtures) → the arm
+        // parks on `pending().await`. Each forwarded node-id refreshes
+        // that secondary's death-clock as the UNION half of the reaper
+        // (beacon OR mesh frame), so a busy secondary whose tokio runtime
+        // is CPU-starved by a build still beacons and is NOT reaped.
+        let mut liveness_ping_rx = self.liveness_ping_rx.take();
+
         // Panik-watcher signal receiver. Same shape as the closed-
         // channel arms above: taken out for the loop's duration so
         // the awaiting arm owns the receiver across `select!`
@@ -629,6 +637,45 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         }
                     }
                 }
+                // Liveness-beacon ping drain. A secondary's dedicated
+                // beacon thread (independent of its CPU-starvable tokio
+                // runtime) sends a UDP datagram; this node's
+                // `LivenessListener` decoded it and forwarded the node-id
+                // here. Refresh that secondary's death-clock — the UNION
+                // half: `record_keepalive` is the SAME refresh the inbound
+                // mesh-frame path (`dispatch_message`) calls, so the reaper
+                // declares a secondary dead only when BOTH its beacon and
+                // its frames have been silent past the threshold. This is
+                // what keeps a busy, build-CPU-starved-but-alive secondary
+                // from being false-reaped. Disabled-arm shape mirrors the
+                // respawn arm: `None` rx → parks on `pending()`.
+                ping = async {
+                    match liveness_ping_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match ping {
+                        Some(node_id) => {
+                            // `record_keepalive` is a no-op for an
+                            // id not in `self.secondaries` (a stray /
+                            // already-removed node), so a beacon racing a
+                            // removal can't resurrect a reaped entry here.
+                            self.record_keepalive(&node_id);
+                        }
+                        None => {
+                            // Listener task gone (run winding down). Drop
+                            // the receiver; the mesh-frame refresh half of
+                            // the union keeps the death-clock honest.
+                            liveness_ping_rx = None;
+                            tracing::debug!(
+                                "liveness ping channel closed; disabling \
+                                 the liveness-beacon arm for the remainder \
+                                 of the loop"
+                            );
+                        }
+                    }
+                }
                 outcome = async {
                     // `JoinSet::join_next` returns `None` when the
                     // set is empty. To avoid hot-looping the select!
@@ -782,6 +829,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // passes re-enter the operational loop and a death observed
         // during a retry pass should still drive the dispatcher.
         self.respawn_request_rx = respawn_request_rx;
+        // Same rationale for the liveness-beacon ping receiver: a retry
+        // pass that re-enters the operational loop must keep refreshing
+        // death-clocks from beacon datagrams (the union half), or a busy
+        // secondary's beacon would stop counting during retry passes.
+        self.liveness_ping_rx = liveness_ping_rx;
         // Same rationale for the panik-signal receiver: a retry
         // pass that re-enters the operational loop must keep its
         // panik arm wired up. The receiver is `Some` only while the

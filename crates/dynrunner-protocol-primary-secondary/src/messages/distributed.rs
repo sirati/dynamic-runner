@@ -108,6 +108,15 @@ pub enum DistributedMessage<I> {
         ipv4_address: Option<String>,
         ipv6_address: Option<String>,
         quic_port: u16,
+        /// UDP port this node's liveness-beacon listener is bound on, to
+        /// be paired with `ipv4_address`/`ipv6_address` by a peer's beacon
+        /// once this node becomes primary (the "primary on ANY peer"
+        /// invariant — every primary-capable node advertises one).
+        /// Separate from `quic_port` (quinn owns that UDP socket).
+        /// `#[serde(default, skip_serializing_if)]` keeps pre-beacon wire
+        /// bytes unchanged while it is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        liveness_port: Option<u16>,
     },
     PeerInfo {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing

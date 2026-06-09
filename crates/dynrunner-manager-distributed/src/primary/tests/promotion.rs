@@ -430,6 +430,7 @@ async fn gated_mesh_secondary(
             ipv4_address: Some("127.0.0.1".into()),
             ipv6_address: None,
             quic_port: 5000,
+            liveness_port: None,
         })
         .unwrap();
 

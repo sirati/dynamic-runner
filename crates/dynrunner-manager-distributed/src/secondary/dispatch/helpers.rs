@@ -234,7 +234,53 @@ where
             epoch,
             "primary role changed"
         );
+        // Re-point the liveness beacon at the new primary's advertised
+        // liveness address. The beacon thread reads the published target
+        // each tick, so this is the single place a failover redirects it —
+        // with zero beacon-side election knowledge.
+        self.republish_beacon_target();
         true
+    }
+
+    /// Publish the CURRENT primary's liveness `SocketAddr` into the
+    /// beacon-target cell the dedicated beacon thread reads. Resolves
+    /// `cluster_state.current_primary()` against `peer_liveness_addrs`
+    /// (populated from `PeerInfo`); `None` (no primary yet, or its
+    /// liveness address not yet learned) makes the beacon a no-op until a
+    /// later `PeerInfo`/`PrimaryChanged` resolves it. Called on every
+    /// primary-identity advance AND whenever the peer-address view is
+    /// rebuilt, so the target stays current across both axes.
+    pub(in crate::secondary) fn republish_beacon_target(&mut self) {
+        let addr = self
+            .cluster_state
+            .current_primary()
+            .and_then(|primary_id| self.peer_liveness_addrs.get(primary_id).copied());
+        self.beacon_target.publish(addr);
+    }
+
+    /// Rebuild the id→liveness-`SocketAddr` view from a `PeerInfo` roster
+    /// and re-point the beacon. For each peer that advertised a
+    /// `liveness_port` AND a parseable `ipv4`, record `(ipv4:port)`; a
+    /// peer missing either is simply absent from the view (the beacon
+    /// no-ops if it becomes primary without an advertised address —
+    /// strictly better than beaconing a bogus address, and the union
+    /// death-clock still carries it via mesh frames). IPv4 is the beacon
+    /// transport (the QUIC mesh's primary LAN family); ipv6-only peers are
+    /// not beaconed in this pass.
+    pub(in crate::secondary) fn ingest_peer_liveness_addrs(
+        &mut self,
+        peers: &[dynrunner_protocol_primary_secondary::PeerConnectionInfo],
+    ) {
+        self.peer_liveness_addrs = peers
+            .iter()
+            .filter_map(|p| {
+                let port = p.liveness_port?;
+                let ipv4 = p.ipv4.as_deref()?;
+                let addr: std::net::SocketAddr = format!("{ipv4}:{port}").parse().ok()?;
+                Some((p.secondary_id.clone(), addr))
+            })
+            .collect();
+        self.republish_beacon_target();
     }
 
     /// Reset the failover election to `Normal` iff this node has reached

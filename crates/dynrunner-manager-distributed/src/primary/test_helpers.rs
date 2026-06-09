@@ -439,6 +439,7 @@ pub(super) async fn fake_secondary_with_addrs(
             ipv4_address: ipv4,
             ipv6_address: ipv6,
             quic_port: 5000,
+            liveness_port: None,
         })
         .unwrap();
 
@@ -645,6 +646,7 @@ pub(super) async fn fake_secondary_transport_only_no_meshready(
             ipv4_address: Some("127.0.0.1".into()),
             ipv6_address: None,
             quic_port: 5000,
+            liveness_port: None,
         })
         .unwrap();
 

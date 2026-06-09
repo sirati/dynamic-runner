@@ -726,7 +726,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     is_observer,
                     can_be_primary,
                 )
-                .receive_cert_exchange(String::new(), None, None, 0)
+                // Metadata-only seed: no liveness port either — each peer's
+                // beacon address is re-learned from PeerInfo, and a
+                // secondary's beacon re-points to this promoted primary off
+                // the `PrimaryChanged` apply (its liveness addr is already in
+                // the secondary's `peer_liveness_addrs` from the prior
+                // PeerInfo). So a hydrated roster needs none.
+                .receive_cert_exchange(String::new(), None, None, 0, None)
                 .begin_peer_discovery()
                 .peers_ready()
                 .assignments_sent();

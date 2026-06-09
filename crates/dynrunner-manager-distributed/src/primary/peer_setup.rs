@@ -41,6 +41,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // observers from `lowest_alive` candidate selection
                 // in `election.rs`.
                 is_observer: s.is_observer(),
+                // Fan out each peer's liveness-beacon UDP port (carried
+                // from its `CertExchange`) so every node knows where to
+                // beacon a peer that becomes primary. A peer that
+                // advertised none (older sender) rides `None` and is
+                // simply not beaconed.
+                liveness_port: s.liveness_port(),
             })
             .collect();
 

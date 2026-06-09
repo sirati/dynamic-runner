@@ -256,6 +256,7 @@ async fn tap_forwards_welcome_and_cert_before_cert_exchange_completes() {
                     ipv4_address: Some("127.0.0.1".into()),
                     ipv6_address: None,
                     quic_port: 5000,
+                    liveness_port: None,
                 };
                 MessageSender::send(&mut client, cert).await.unwrap();
                 // Keep the connection (and thus the writer task) alive

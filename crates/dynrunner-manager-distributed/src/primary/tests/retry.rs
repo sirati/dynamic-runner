@@ -302,6 +302,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                     ipv4_address: Some("127.0.0.1".into()),
                     ipv6_address: None,
                     quic_port: 5000,
+                    liveness_port: None,
                 })
                 .unwrap();
                 // Fail every attempt — both main and retry pass. Issue a
@@ -425,6 +426,7 @@ async fn retry_max_passes_zero_disables_retry() {
                     ipv4_address: Some("127.0.0.1".into()),
                     ipv6_address: None,
                     quic_port: 5000,
+                    liveness_port: None,
                 })
                 .unwrap();
                 while let Some(msg) = rx.recv().await {
@@ -552,6 +554,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                     ipv4_address: Some("127.0.0.1".into()),
                     ipv6_address: None,
                     quic_port: 5000,
+                    liveness_port: None,
                 })
                 .unwrap();
                 while let Some(msg) = rx.recv().await {
@@ -821,6 +824,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     ipv4_address: Some("127.0.0.1".into()),
                     ipv6_address: None,
                     quic_port: 5000,
+                    liveness_port: None,
                 })
                 .unwrap();
                 // For each assignment: send a `TaskFailed` with OOM if

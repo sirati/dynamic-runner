@@ -247,6 +247,7 @@ fn roundtrip_peer_info() {
                 ipv6: None,
                 port: 5000,
                 is_observer: false,
+                liveness_port: None,
             },
             PeerConnectionInfo {
                 secondary_id: "sec-2".into(),
@@ -255,6 +256,7 @@ fn roundtrip_peer_info() {
                 ipv6: Some("::1".into()),
                 port: 5001,
                 is_observer: false,
+                liveness_port: None,
             },
         ],
     };
