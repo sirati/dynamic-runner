@@ -11,7 +11,8 @@
 //!   2. resolve podman/rm absolute paths               (`bin_resolve`)
 //!   3. install signalfd-based signal provenance       (`signals`)
 //!   4. spawn the out-of-cgroup shutdown manager        (`shutdown_spawn`)
-//!      (then: decouple workers from the login session  (`linger`))
+//!      (then: CHECK + HONOR the submitter-set login-session
+//!      decoupling — logind linger (`linger`))
 //!   5. pre-flight orphan-container sweep               (`preflight`)
 //!   6. detect the container memory cap                 (`memcap`)
 //!   7. resolve peer IPs + allocate ports + peer-info   (`network`)
@@ -60,23 +61,29 @@ const LOG_TARGET: &str = "slurm-wrapper";
 /// SYNC entrypoint. Blocks the monitored signal set BEFORE the tokio runtime
 /// exists (C1), then builds the runtime and `block_on`s the async lifecycle.
 fn main() -> ExitCode {
-    init_logging();
-
     // C1: block the monitored set process-wide BEFORE any thread (tokio
     // workers / blocking pool) is spawned, so the signalfd is the sole
-    // consumer of every monitored delivery.
+    // consumer of every monitored delivery. This precedes the runtime and
+    // the logging init; the two fatal startup errors below predate the
+    // tracing subscriber, so they go straight to stderr via `eprintln!`.
     if let Err(e) = signals::block_signals() {
-        tracing::error!(target: LOG_TARGET, "failed to block signal set: {e}");
+        eprintln!("{LOG_TARGET}: failed to block signal set: {e}");
         return ExitCode::from(2);
     }
 
     let cfg = match dynrunner_slurm_wrapper_config::parse_args(std::env::args()) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(target: LOG_TARGET, "argv error: {e}");
+            eprintln!("{LOG_TARGET}: argv error: {e}");
             return ExitCode::from(2);
         }
     };
+
+    // Derive the scratch/log layout (PURE) so logging can be teed into the
+    // persistent per-secondary `wrapper.log` BEFORE any lifecycle line is
+    // emitted. `run` re-derives the same layout from `cfg` (cheap, pure).
+    let layout = Layout::derive(&cfg);
+    init_logging(&layout.wrapper_log_path);
 
     tracing::info!(
         target: LOG_TARGET,
@@ -142,36 +149,29 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
     let wrapper_pid = std::process::id();
     let mode = shutdown_spawn::spawn(&cfg, &layout, &bins, wrapper_pid);
 
-    // --- 4.5 decouple the workers from the submitter login session ---
-    // FAIL-FAST gate: linger must be ON before any process lands in
-    // `user@<uid>.service`, otherwise a dropped submitter ssh session reaps
-    // the user manager and fan-kills this secondary. Run AFTER the shutdown
-    // manager spawn (so its bus probe sees the unmodified runtime) and
-    // BEFORE the container launch; on `Failed` we never start in a
-    // fan-kill-exposed state.
-    match linger::ensure_linger() {
-        linger::LingerState::AlreadyOn => {
-            tracing::info!(
-                target: LOG_TARGET,
-                "linger already enabled; workers decoupled from the submitter login session"
-            );
-        }
-        linger::LingerState::Enabled => {
-            tracing::info!(
-                target: LOG_TARGET,
-                "enabled linger for the run user; workers decoupled from the submitter login session"
-            );
-        }
-        linger::LingerState::Failed { reason } => {
-            tracing::error!(
-                target: LOG_TARGET,
-                %reason,
-                "FATAL: linger NOT enabled — workers are NOT decoupled from the submitter login \
-                 session; a submitter ssh drop will fan-kill this secondary. Set `loginctl \
-                 enable-linger <user>` for the run user and resubmit. Aborting before container launch."
-            );
-            return ExitCode::from(3);
-        }
+    // --- 4.5 HONOR the submitter-set login-session decoupling (linger) ---
+    // The SUBMITTER's setup enables logind linger over its ssh to this node
+    // at tunnel-build time (that ssh carries a pam_systemd session, which the
+    // enable needs; this sbatch/slurmstepd context does NOT, so the wrapper
+    // cannot enable it here). The wrapper's role is to CHECK + HONOR that
+    // state and WARN if it reads as not set — a safety net surfacing a
+    // setup-enable that silently failed. Linger is a resilience property,
+    // NEVER a launch gate: the container always proceeds.
+    if linger::check_linger() {
+        tracing::info!(
+            target: LOG_TARGET,
+            "linger is enabled for the run user; workers are decoupled from the submitter login session"
+        );
+    } else {
+        tracing::warn!(
+            target: LOG_TARGET,
+            "linger is NOT enabled for the run user — workers are NOT decoupled from the \
+             submitter -R login session; a session drop may fan-kill this secondary. The \
+             submitter setup is expected to enable it at tunnel-build time; surface this if it \
+             persists (e.g. polkit-restricted node: pre-set `loginctl enable-linger` for the run \
+             user or delegate it). Proceeding with container launch (linger is best-effort, not \
+             a launch gate)."
+        );
     }
 
     // --- 5. pre-flight orphan sweep (generate.rs:452-489) ---
@@ -615,14 +615,61 @@ fn banner_job_completed() {
     tracing::info!(target: LOG_TARGET, "==================================================");
 }
 
-/// stderr logging via `tracing`, honouring `RUST_LOG` (default `info`).
-fn init_logging() {
+/// `tracing` logging, honouring `RUST_LOG` (default `info`). Output is TEED
+/// to two sinks: the SLURM job stderr (always) AND the persistent
+/// per-secondary `wrapper.log` (`<shutdown_log_dir>/wrapper.log`), so the
+/// operator finds the wrapper's narrative alongside the shutdown-manager log
+/// and the container log for that secondary, surviving the scratch-tree
+/// teardown.
+///
+/// The file sink is best-effort: its parent dir is created and the file
+/// opened in append mode; on any failure we degrade to stderr-only with a
+/// single warning, NEVER aborting (losing the file copy is strictly less bad
+/// than losing the run). No new crate is pulled in — `tracing_subscriber`'s
+/// `MakeWriterExt::and` tees stderr with an `Arc<File>` writer directly.
+fn init_logging(wrapper_log_path: &std::path::Path) {
+    use std::sync::Arc;
     use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+
+    // Best-effort open of the persistent file sink. The parent dir is the
+    // per-secondary network dir; `create_dirs` (in `run`) also ensures it,
+    // but logging inits FIRST, so the logging concern creates its own sink's
+    // parent here rather than depending on a later step's side effect.
+    let file = wrapper_log_path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .transpose()
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(wrapper_log_path)
+        });
+
+    match file {
+        Ok(f) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr.and(Arc::new(f)))
+                .try_init();
+        }
+        Err(e) => {
+            // Degrade to stderr-only; warn AFTER init so the warning itself
+            // is captured by the subscriber we just installed.
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .try_init();
+            tracing::warn!(
+                target: LOG_TARGET,
+                path = %wrapper_log_path.display(),
+                "could not open wrapper.log file sink ({e}); logging to stderr only"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -855,6 +902,7 @@ mod tests {
             shutdown_unit_name: "dynrunner-shutdown-test".to_string(),
             shutdown_log_dir: root.join("log-network/sec-0"),
             shutdown_log_path: root.join("log-network/sec-0/shutdown-manager.log"),
+            wrapper_log_path: root.join("log-network/sec-0/wrapper.log"),
             shutdown_pid_file: root.join("shutdown-manager.pid"),
             local_image: root.join("image.tar"),
             image_cache_root: root.join("imgcache"),

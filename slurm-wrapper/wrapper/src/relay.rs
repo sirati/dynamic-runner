@@ -528,6 +528,7 @@ mod tests {
             shutdown_unit_name: "dynrunner-shutdown-test".into(),
             shutdown_log_dir: dir.join("log-network/sec-0"),
             shutdown_log_path: dir.join("log-network/sec-0/shutdown-manager.log"),
+            wrapper_log_path: dir.join("log-network/sec-0/wrapper.log"),
             shutdown_pid_file: dir.join("shutdown-manager.pid"),
             local_image: dir.join("image.tar"),
             image_cache_root: dir.join("imgcache"),

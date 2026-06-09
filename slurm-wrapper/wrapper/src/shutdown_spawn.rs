@@ -164,10 +164,11 @@ pub fn spawn(
     //
     // NB: an unreachable user-systemd bus here does NOT leave the workers
     // exposed to the submitter-ssh-drop fan-kill — that login-session
-    // decoupling is handled by the launch-time linger gate
-    // (`linger::ensure_linger`), which talks to the SYSTEM bus (independent
-    // of this unreachable user@ bus) and fail-fasts the wrapper if linger
-    // cannot be confirmed on.
+    // decoupling is handled by logind linger, which the SUBMITTER's setup
+    // enables over its ssh to this node at tunnel-build time (talking to the
+    // SYSTEM bus, independent of this unreachable user@ bus). The wrapper
+    // only CHECKs + HONORs that state (`linger::check_linger`); it does not
+    // enable it (the slurmstepd context has no logind session to do so).
     eprintln!(
         "NOTE: out-of-cgroup shutdown manager not started (user-systemd bus \
          unreachable or systemd-run unavailable); the wrapper's in-band reap \
@@ -265,6 +266,7 @@ mod tests {
             // under the /tmp scratch tree the manager deletes on teardown.
             shutdown_log_dir: PathBuf::from("/net/log/7"),
             shutdown_log_path: PathBuf::from("/net/log/7/shutdown-manager.log"),
+            wrapper_log_path: PathBuf::from("/net/log/7/wrapper.log"),
             shutdown_pid_file: PathBuf::from("/tmp/asm-abc123/shutdown-manager.pid"),
             local_image: PathBuf::from("/tmp/asm-abc123/image.tar"),
             image_cache_root: PathBuf::from("/tmp/asm-imgcache"),
