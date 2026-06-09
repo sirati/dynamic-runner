@@ -45,6 +45,15 @@
 //!   counted, and a peer that has NOT yet observed the death correctly refuses
 //!   to confirm (split-brain safety) until it does — the candidate never
 //!   wedges on a cached stale "primary still alive" answer.
+//! - [`failover_second_round`] — SECOND-failover convergence: candidate
+//!   selection (`lowest_alive` over `live_peer_ids()`) excludes a peer that is
+//!   DEAD-but-still-lingering in `peer_keepalives` (the 300s reaper window)
+//!   because `live_peer_ids` intersects the live transport membership
+//!   (`has_peer`) — the SAME seam the lone-survivor quorum-denominator fix
+//!   shrank. So a survivor of the FIRST failover does NOT defer to the first
+//!   failover's dead lowest-id primary on the SECOND failover; it self-leads
+//!   and promotes (vs. wedging the full reaper window). A still-MEMBER lowest-id
+//!   peer is correctly still deferred to (no over-exclude).
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
@@ -67,6 +76,7 @@ mod failover_beacon_union;
 mod failover_lone_survivor;
 mod failover_membership;
 mod failover_multi_survivor;
+mod failover_second_round;
 mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;
