@@ -5,6 +5,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use super::CleanupGuard;
 use super::attr_truthy;
 use super::preparation::PreparationOutcome;
 use super::respawn::build_slurm_respawn_kwargs;
@@ -32,6 +33,7 @@ pub(super) fn drive_rust_primary<'py>(
     max_memory_spec: &str,
     use_reverse_connection: bool,
     mem_manager_reserved_bytes: Option<u64>,
+    guard: &mut CleanupGuard,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<()> {
     let runner_module = py.import("dynamic_runner")?;
@@ -338,6 +340,18 @@ pub(super) fn drive_rust_primary<'py>(
         args,
         Some(primary_handle),
     )?;
+
+    // Disarm setup-abort job rollback: everything above this line
+    // (coordinator construction, staging queue, the consumer's
+    // on_run_start hook) is still setup — an abort there leaves the
+    // guard armed and scancels the submitted cohort. `coord.run()` below
+    // hands the job lifecycle to the coordinator, whose own teardown
+    // (a separate, owner-gated concern) governs the jobs from here. A
+    // healthy fleet that reaches `run()` is therefore never scancelled
+    // by this setup guard — on success it returns to a disarmed-guard
+    // drop, and a runtime failure inside `run()` is no longer a setup
+    // abort. See `CleanupGuard`'s arm/disarm doc.
+    guard.disarm_job_cancel();
 
     let run_outcome = coord.call_method1("run", (binaries,));
     crate::managers::lifecycle::fire_on_run_end(task, run_outcome.is_ok());

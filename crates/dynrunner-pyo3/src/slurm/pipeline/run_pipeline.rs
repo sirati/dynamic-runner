@@ -374,6 +374,15 @@ pub(crate) fn run_slurm_pipeline<'py>(
             guard.set_tunnel_manager(mgr);
         }
 
+        // Arm setup-abort job rollback. sbatch has submitted the cohort
+        // and `job_manager`'s tracked `job_ids` are now populated, so any
+        // failure in the remaining setup steps below (source-binary
+        // upload, coordinator construction, the consumer's on_run_start
+        // hook) must scancel those just-submitted jobs rather than orphan
+        // them. `drive_rust_primary` disarms the instant it hands the run
+        // to `coord.run()`. See `CleanupGuard`'s arm/disarm doc.
+        guard.arm_job_cancel(job_manager.clone().unbind());
+
         log.call_method1(
             "info",
             (format!("SLURM jobs submitted; run_id={}", outcome.run_id),),
@@ -400,6 +409,10 @@ pub(crate) fn run_slurm_pipeline<'py>(
         }
 
         // ---- Hand-off to the Rust primary coordinator. ----
+        //
+        // `&mut guard` so the hand-off can disarm setup-abort job
+        // rollback at the exact instant `coord.run()` takes ownership of
+        // the run — see `drive_rust_primary` and `CleanupGuard`.
         drive_rust_primary(
             py,
             task,
@@ -414,6 +427,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
             &max_memory_spec,
             use_reverse_connection,
             mem_manager_reserved_bytes,
+            &mut guard,
             log,
         )?;
 
