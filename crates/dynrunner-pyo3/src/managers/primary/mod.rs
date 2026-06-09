@@ -38,6 +38,9 @@ pub(crate) struct PyPrimaryCoordinator {
     pub(super) num_secondaries: u32,
     pub(super) estimator: PyMemoryEstimatorBridge,
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Phases declared `PhaseSpec.may_be_empty` — registered on the
+    /// coordinator before `run()` (the empty-drain opt-out).
+    pub(super) phase_may_be_empty: Vec<PhaseId>,
     pub(super) spawn_secondary: Py<PyAny>,
     pub(super) distributed_config: DistributedConfig,
     /// Optional caller-supplied bind port for the network server.

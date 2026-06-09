@@ -101,6 +101,16 @@ impl<I: Identifier> ClusterState<I> {
             // XOR-fold (a missing event key is caught by the count; the
             // VALUE is folded too, mirroring the grow-only-MAX shape).
             respawn_events,
+            // Replicated static phase-graph metadata, but EXCLUDED from the
+            // digest: `phase_may_be_empty` is originated in the SAME seed
+            // batch as `phase_deps` (both set-once at run start, paired in
+            // every originator) and the snapshot restore heals it on the
+            // same first-bootstrap-adopt path. So whenever the digest's
+            // `phase_deps_hash` flags a graph divergence and the restore
+            // pulls, `phase_may_be_empty` converges with it — it carries no
+            // INDEPENDENT convergence signal. A `_`-bound exclusion, same
+            // rationale as `role_table` (a derived/co-converging field).
+            phase_may_be_empty: _phase_may_be_empty,
             // ── node-local: not replicated, carries no convergence signal ──
             // (see the field docs on `ClusterState`; same set `snapshot()`
             // classifies node-local).

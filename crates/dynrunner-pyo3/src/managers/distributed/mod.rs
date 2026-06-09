@@ -55,6 +55,9 @@ pub(crate) struct PyDistributedManager {
     pub(super) distributed_config: DistributedConfig,
     pub(super) types: TypeRegistry,
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Phases declared `PhaseSpec.may_be_empty` — registered on the
+    /// in-process primary before `run()` (the empty-drain opt-out).
+    pub(super) phase_may_be_empty: Vec<PhaseId>,
     pub(super) skip_existing: bool,
     pub(super) uses_file_based_items: bool,
     pub(super) max_concurrent_per_type: HashMap<TypeId, u32>,

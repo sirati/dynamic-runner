@@ -192,6 +192,27 @@ pub enum ClusterMutation<I> {
     PhaseDepsSet {
         deps: HashMap<PhaseId, Vec<PhaseId>>,
     },
+    /// Per-run static set of phases the consumer declared MAY drain with
+    /// zero dispatched items (`PhaseSpec.may_be_empty`) — a pure
+    /// sequencing gate that legitimately has no work of its own. Emitted
+    /// once by the primary at run start, paired with [`Self::PhaseDepsSet`]
+    /// (same static-graph lifecycle), and stored on every receiver's
+    /// `ClusterState` so the post-promotion empty-drain proceed-or-fail
+    /// policy sees the same opt-out the live primary used.
+    ///
+    /// A SEPARATE mutation rather than a field on `PhaseDepsSet`: the
+    /// opt-out is its own single concern (the honest empty-drain policy),
+    /// it is empty on the overwhelmingly-common no-opt-out run, and a new
+    /// variant is wire-safe without touching the many `PhaseDepsSet`
+    /// originators — a peer that predates this variant simply never emits
+    /// it and treats its absence as "no phase opted out". `Vec<PhaseId>`
+    /// wire shape (collected into a `HashSet` on apply) for the same
+    /// deterministic-ordering reason the other set-shaped wire fields use
+    /// `Vec`. Re-application is a no-op once the local set is seeded
+    /// (static for the run), mirroring `PhaseDepsSet`.
+    PhaseMayBeEmptySet {
+        phases: Vec<PhaseId>,
+    },
     /// "The run is done — every secondary should drain and exit."
     ///
     /// Emitted exactly once by the primary just before it returns

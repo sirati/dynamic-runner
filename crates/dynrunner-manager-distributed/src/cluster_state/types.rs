@@ -306,10 +306,10 @@ impl<I> TaskState<I> {
 }
 
 /// Which per-phase EVENT counter a [`ClusterState::phase_event_tally_for`]
-/// key addresses (F4). The two map keys `(PhaseId, PhaseTally)` mirror the
-/// two node-local event counters they replace (`phase_completed` /
-/// `phase_failed`) — ONE replicated field, two keys, NOT two fields and NOT
-/// a per-class breakdown.
+/// key addresses (F4). The map keys `(PhaseId, PhaseTally)` mirror the
+/// node-local event counters they replace (`phase_completed` /
+/// `phase_failed`) — ONE replicated field, several keys, NOT one field per
+/// counter and NOT a per-class breakdown.
 ///
 /// EVENT-shaped, not terminal-shaped: a fail → reinject → succeed task
 /// increments BOTH `Failed` and `Completed` (each terminal OBSERVATION is
@@ -318,6 +318,18 @@ impl<I> TaskState<I> {
 /// `PhaseRollup` / `outcome_counts` stay terminal-shaped (a distinct
 /// concern).
 ///
+/// `SkippedExisting` (F-honesty) is the discriminator that keeps the
+/// empty-drain proceed-or-fail policy honest: a non-leaf phase that drained
+/// with NO terminal accounting AND NO recorded skip is a genuine
+/// never-injected wedge (fail loud), whereas a phase whose items were all
+/// SKIPPED-AS-EXISTING (outputs already present — the legitimate
+/// `--skip-existing` "nothing left to do" case) recorded that skip here and
+/// proceeds as success. It is NOT a terminal task observation (a skipped
+/// item never dispatches), so it lives in the same grow-only-MAX EVENT map
+/// purely as a third count the discovery originator may report — distinct
+/// from `Completed`/`Failed`, which only terminal task transitions bump. See
+/// [`crate::primary::PrimaryCoordinator::phase_can_proceed`].
+///
 /// Derives `Serialize`/`Deserialize` because it crosses the wire INSIDE the
 /// snapshot's `(PhaseId, PhaseTally)` map key; `Copy`/`Eq`/`Hash` so it is a
 /// cheap `HashMap` key.
@@ -325,6 +337,7 @@ impl<I> TaskState<I> {
 pub enum PhaseTally {
     Completed,
     Failed,
+    SkippedExisting,
 }
 
 /// One accepted respawn event in the replicated respawn ledger (F7).

@@ -50,6 +50,17 @@ pub struct ClusterState<I> {
     /// derived from the consumer's `TaskDefinition` declaration and
     /// don't change for the duration of a run.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Per-run static set of phases the consumer declared `may_be_empty`
+    /// (`PhaseSpec.may_be_empty`). Set once at run start via
+    /// `ClusterMutation::PhaseMayBeEmptySet`, paired with `phase_deps`
+    /// (same static-graph lifecycle, originated by the primary, applied on
+    /// every node). Read by the empty-drain proceed-or-fail policy
+    /// (`PrimaryCoordinator::phase_can_proceed`): a non-leaf phase that
+    /// drained with zero dispatched items proceeds (instead of failing
+    /// loud) iff it is in this set — the explicit opt-out for an
+    /// intentional pure-sequencing gate. Empty on the common no-opt-out
+    /// run.
+    pub(super) phase_may_be_empty: std::collections::HashSet<PhaseId>,
     /// Set by `ClusterMutation::RunComplete`. Sticky monotonic flag —
     /// once true, the run is over and every node should drain and
     /// exit. Read by the secondary's operational loop to break out
@@ -358,6 +369,7 @@ where
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            phase_may_be_empty,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -366,6 +378,9 @@ where
             // Arc-clone is the right semantics here — see field doc.
             primary_epoch_mirror: Arc::clone(primary_epoch_mirror),
             phase_deps: phase_deps.clone(),
+            // Replicated static phase-graph metadata — clone preserves it
+            // (same lifecycle as `phase_deps`).
+            phase_may_be_empty: phase_may_be_empty.clone(),
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
             // Replicated CRDT data — clone preserves it (like `run_complete`).
@@ -419,6 +434,7 @@ where
             primary_epoch,
             primary_epoch_mirror: _primary_epoch_mirror,
             phase_deps,
+            phase_may_be_empty,
             run_complete,
             run_aborted,
             discovery_debt,
@@ -444,6 +460,7 @@ where
             .field("current_primary", current_primary)
             .field("primary_epoch", primary_epoch)
             .field("phase_deps", phase_deps)
+            .field("phase_may_be_empty", phase_may_be_empty)
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
             .field("discovery_debt", discovery_debt)
@@ -478,6 +495,7 @@ impl<I> Default for ClusterState<I> {
             primary_epoch: 0,
             primary_epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             phase_deps: HashMap::new(),
+            phase_may_be_empty: std::collections::HashSet::new(),
             run_complete: false,
             run_aborted: None,
             discovery_debt: DiscoveryDebt::default(),

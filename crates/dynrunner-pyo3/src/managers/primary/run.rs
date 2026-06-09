@@ -113,6 +113,10 @@ impl PyPrimaryCoordinator {
         // `primary.enable_respawn(...)` directly.
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
+        // The consumer's `may_be_empty` phase opt-out, captured on the GIL
+        // thread for registration on the coordinator inside the detached
+        // runtime (the empty-drain proceed-or-fail discriminator).
+        let phase_may_be_empty = self.phase_may_be_empty.clone();
         // Capture the scheduler-tuning snapshot here on the GIL thread so
         // the detached-runtime block can build the inner
         // `ResourceStealingScheduler` with the operator-supplied
@@ -448,6 +452,12 @@ impl PyPrimaryCoordinator {
                 // consumer-hook raise and surfaces `FatalPolicyExit`. Same
                 // pre-run-setter contract as the registrations below.
                 primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
+
+                // Register the consumer's `may_be_empty` phase opt-out BEFORE
+                // `run()` enters, so the cold-/relocated-seed originator emits
+                // it as `PhaseMayBeEmptySet` paired with the phase graph. Same
+                // pre-run-setter contract as the other registrations.
+                primary.register_phase_may_be_empty(phase_may_be_empty.iter().cloned());
 
                 // Relay the SLURM-pipeline-parked deployment-mode job
                 // manager onto the inner coordinator BEFORE `run()`

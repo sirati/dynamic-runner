@@ -420,6 +420,14 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// with the same phase-state machine the primary used. Empty
     /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// The set of phases the consumer declared `may_be_empty`
+    /// (`PhaseSpec.may_be_empty`), registered before `run()` via
+    /// [`Self::register_phase_may_be_empty`]. The seed originators
+    /// (`originate_cold_seed` / `originate_relocated_seed`) emit it as
+    /// `ClusterMutation::PhaseMayBeEmptySet` alongside `PhaseDepsSet`, so
+    /// every node — including a promoted primary — sees the same empty-drain
+    /// opt-out. Empty between runs and on the common no-opt-out run.
+    pub(super) phase_may_be_empty_decl: std::collections::HashSet<PhaseId>,
     pub(super) completed_tasks: HashSet<String>,
     /// THE single hash-keyed in-flight ledger. Records every task the
     /// primary believes is executing in the cluster, keyed by its
@@ -984,6 +992,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             all_binaries: Vec::new(),
             pending: None,
             phase_deps: HashMap::new(),
+            phase_may_be_empty_decl: std::collections::HashSet::new(),
             completed_tasks: HashSet::new(),
             in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
@@ -1510,6 +1519,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// policy entirely.
     pub fn register_setup_discovery(&mut self, discovery: crate::discovery::SetupDiscovery<I>) {
         self.setup_discovery = Some(discovery);
+    }
+
+    /// Register the set of phases the consumer declared `may_be_empty`
+    /// (`PhaseSpec.may_be_empty`), before `run()`. The seed originators emit
+    /// it as `ClusterMutation::PhaseMayBeEmptySet` (paired with
+    /// `PhaseDepsSet`) so the empty-drain proceed-or-fail policy sees the
+    /// opt-out on every node, including a promoted primary. Same
+    /// before-`run()` registration contract as
+    /// [`Self::register_setup_discovery`]; empty (no call) on the common
+    /// no-opt-out run.
+    pub fn register_phase_may_be_empty(
+        &mut self,
+        phases: impl IntoIterator<Item = PhaseId>,
+    ) {
+        self.phase_may_be_empty_decl = phases.into_iter().collect();
     }
 
     /// Set the per-task budget cap for
@@ -3543,9 +3567,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Default policy:
     /// - PROCEED when `completed > 0` — the phase produced output its
     ///   dependents can consume.
-    /// - PROCEED when the phase produced zero items (`completed == 0 &&
-    ///   failed == 0`) — an empty / cascade-through phase makes no demand
-    ///   and blocks nothing.
     /// - PROCEED when the phase's items reached a terminal FAILED outcome
     ///   (`failed > 0`). This is load-bearing and is NOT a "fail the run"
     ///   case: by the time control reaches this point the per-phase retry
@@ -3558,31 +3579,83 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   Aborting the whole run on a permanently-failed task would defeat
     ///   the retry-bucket machinery and regress
     ///   `sequential_phase_advance_after_oom_bucket_exhausts`.
+    /// - PROCEED when the phase recorded a SKIPPED-AS-EXISTING count
+    ///   (`skipped > 0`) — the legitimate `--skip-existing` "nothing left
+    ///   to do" case the owner directive carves out: the phase's items
+    ///   ARE there (their outputs already exist on the shared fs), so
+    ///   skipping them all VALIDATES that the phase has nothing left to
+    ///   produce. Its dependents read present outputs, not absent ones.
+    /// - PROCEED when the consumer DECLARED the phase `may_be_empty`
+    ///   (`PhaseSpec.may_be_empty`, replicated via
+    ///   `ClusterMutation::PhaseMayBeEmptySet`) — the explicit opt-out for
+    ///   an intentional pure-sequencing gate / terminal-empty phase that
+    ///   legitimately has no work of its own. "Fail loud BY DEFAULT" means
+    ///   an explicit opt-out exists; this is it.
     ///
-    /// The FAIL branch is therefore reserved for a phase that reached the
-    /// drain having owned items yet recorded NO terminal outcome of any
-    /// kind for them — a genuine wedge where advancing would silently run
-    /// dependents on absent, never-resolved inputs. `phase_min_workers`
-    /// observing residual work for an otherwise-drained phase is exactly
-    /// that signal. The phase-layer veto here is the structural backstop;
-    /// the live no-progress decision (a phase that started, needs workers,
-    /// and has none) is the worker arm's, reached via
-    /// `PhaseStartedNeedsWorkers`.
+    /// The FAIL branch (`RunShouldFail`) is reserved for the genuine
+    /// wedges:
+    /// - a phase that reached the drain having owned items yet recorded NO
+    ///   terminal outcome of any kind for them (residual unresolved work),
+    ///   surfaced by `phase_min_workers` observing residual work; and
+    /// - (F-honesty) an activated phase that drained GENUINELY EMPTY — zero
+    ///   completed, zero failed, zero skipped, zero residual — that the
+    ///   consumer did NOT declare `may_be_empty`. This is the
+    ///   silent-partial-success the consumers hit when `on_phase_end`-driven
+    ///   lazy injection (or discovery) was suppressed: the phase's planned
+    ///   work was never injected, yet the run completes clean rc=0. It is
+    ///   caught REGARDLESS of leaf/non-leaf — the suppressed phase is a LEAF
+    ///   in the asm-dataset chain (`…→dependency_graph→build_variant`) and
+    ///   NON-LEAF in the asm-tokenizer chain
+    ///   (`tokenize→unify_vocab→memmap`); both are the same bug, so the
+    ///   discriminator is the explicit `may_be_empty` declaration, NOT phase
+    ///   topology. The framework cannot otherwise distinguish an intentional
+    ///   empty barrier from a suppressed-injection bug.
     ///
-    /// `phase` is consulted only to confirm no residual work survives for
-    /// a phase that produced no terminal accounting; the policy is
-    /// otherwise phase-agnostic.
-    pub(super) fn phase_can_proceed(&self, phase: &PhaseId, completed: u32, failed: u32) -> bool {
+    /// The phase-layer veto here is the structural backstop; the live
+    /// no-progress decision (a phase that started, needs workers, and has
+    /// none) is the worker arm's, reached via `PhaseStartedNeedsWorkers`.
+    ///
+    /// `phase` is consulted for the residual-work probe (`phase_min_workers`)
+    /// and the `may_be_empty` opt-out lookup; the policy is otherwise
+    /// phase-agnostic.
+    pub(super) fn phase_can_proceed(
+        &self,
+        phase: &PhaseId,
+        completed: u32,
+        failed: u32,
+        skipped: u32,
+    ) -> bool {
         // Any terminal accounting (success OR recorded permanent failure)
         // means the phase resolved its work — advance per the canonical
         // retry-bucket-exhaustion contract.
         if completed > 0 || failed > 0 {
             return true;
         }
-        // No terminal accounting: proceed only if the phase genuinely had
-        // no work. If residual items remain for a phase the drain logic
-        // surfaced, advancing would strand dependents — veto.
-        self.phase_min_workers(phase) == 0
+        // All items skipped-as-existing (outputs already present): the
+        // legitimate `--skip-existing` "nothing left to do" case. The phase
+        // validated it has nothing left to produce — advance.
+        if skipped > 0 {
+            return true;
+        }
+        // The consumer explicitly declared this phase MAY drain empty (a
+        // pure sequencing gate / terminal-empty phase). The "fail loud by
+        // default" opt-out — advance.
+        if self.cluster_state.phase_may_be_empty(phase) {
+            return true;
+        }
+        // No terminal accounting, no skip, not opted-out. Residual
+        // unresolved work for a drained phase is a wedge (advancing strands
+        // dependents) — veto.
+        if self.phase_min_workers(phase) > 0 {
+            return false;
+        }
+        // Zero completed, zero failed, zero skipped, zero residual, and NOT
+        // declared `may_be_empty`: the phase drained genuinely empty — its
+        // planned work was never injected / discovered (the F-honesty
+        // false-green). Advancing it completes the run clean rc=0 with that
+        // work silently dropped — veto, fail loud by default, regardless of
+        // leaf/non-leaf.
+        false
     }
 
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
@@ -3698,6 +3771,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 let failed = self
                     .cluster_state
                     .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Failed));
+                // Read the replicated SKIPPED-AS-EXISTING tally (F-honesty):
+                // the count the discovery originator recorded for items it
+                // omitted because their outputs already exist. The
+                // proceed-or-fail decision uses it to discriminate a
+                // legitimate all-skipped empty drain (success) from a
+                // genuinely never-injected non-leaf phase (fail loud). Same
+                // grow-only-MAX map / accessor as Completed/Failed.
+                let skipped = self.cluster_state.phase_event_tally_for(&(
+                    p.clone(),
+                    crate::cluster_state::PhaseTally::SkippedExisting,
+                ));
                 // Gather the just-completed phase's PUBLISHED task outputs
                 // BEFORE taking the `&mut self.on_phase_end` borrow (the
                 // gather is an immutable `&self.cluster_state` read). The
@@ -3792,7 +3876,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // emit is a pure signal; the phase layer never drives
                 // shutdown directly (decoupling law). See
                 // `phase_can_proceed` for the exact policy.
-                if self.phase_can_proceed(p, completed, failed) {
+                if self.phase_can_proceed(p, completed, failed, skipped) {
                     self.pool_mut().mark_phase_done(p);
                 } else {
                     self.cluster_state
@@ -3800,7 +3884,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             reason: format!(
                                 "phase {p} reached drain with no terminal \
                                  outcome ({completed} completed, {failed} \
-                                 failed) yet still owns residual work"
+                                 failed, {skipped} skipped-as-existing) — \
+                                 either it still owns unresolved residual work, \
+                                 or it is a non-leaf phase that was never \
+                                 injected / discovered (advancing would strand \
+                                 its dependents on inputs that were never \
+                                 produced)"
                             ),
                         });
                 }

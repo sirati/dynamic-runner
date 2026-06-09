@@ -211,12 +211,27 @@ class PhaseSpec:
     drain of dependencies before any item of this phase dispatches.
     The ``barrier=False`` path is reserved for future pipelined work
     and is not used today.
+
+    ``may_be_empty`` (default ``False``) is the empty-drain honesty
+    opt-out. By default the framework FAILS THE RUN LOUD if an activated
+    phase drains with zero dispatched items, zero terminal outcomes, and
+    zero items skipped-as-existing — that is the silent-partial-success
+    signature of a phase whose planned work was never injected (e.g. an
+    ``on_phase_end``-driven lazy-injection or discovery step was
+    suppressed), which would otherwise complete the run clean ``rc=0``
+    with that work dropped. Set ``may_be_empty=True`` on a phase that
+    LEGITIMATELY may have no work of its own — a pure sequencing
+    gate/barrier, or a terminal phase that only fans out conditionally —
+    to declare that intent and let it drain through. (An all-skipped
+    ``--skip-existing`` phase is always treated as success and needs no
+    opt-out; ``may_be_empty`` is for genuinely-zero-item phases.)
     """
 
     phase_id: PhaseId
     types: tuple[TaskTypeSpec, ...]
     depends_on: tuple[PhaseId, ...] = ()
     barrier: bool = True
+    may_be_empty: bool = False
 
 
 @runtime_checkable

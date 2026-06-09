@@ -109,6 +109,7 @@ impl PyDistributedManager {
             distributed_config: distributed_config.unwrap_or_default(),
             types: task.types,
             phase_deps: task.phase_deps,
+            phase_may_be_empty: task.phase_may_be_empty,
             skip_existing,
             uses_file_based_items: task.uses_file_based_items,
             max_concurrent_per_type: task.max_concurrent_per_type,

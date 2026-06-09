@@ -125,6 +125,11 @@ struct TypeSpecRaw {
 pub(crate) struct LoadedTopology {
     pub(crate) estimator: PyMemoryEstimatorBridge,
     pub(crate) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Phases the consumer declared `PhaseSpec.may_be_empty` — the
+    /// empty-drain proceed-or-fail opt-out. Registered on the primary
+    /// (`register_phase_may_be_empty`) and replicated via
+    /// `ClusterMutation::PhaseMayBeEmptySet`. Empty on the common run.
+    pub(crate) phase_may_be_empty: Vec<PhaseId>,
     /// Per-type concurrency caps from `TaskTypeSpec.max_concurrent`.
     /// Absent type → unconstrained. Propagated into
     /// `PrimaryConfig.max_concurrent_per_type`.
@@ -140,6 +145,7 @@ impl LoadedTopology {
         let mut raw_types: Vec<TypeSpecRaw> = Vec::new();
         let mut seen_type_ids: HashSet<TypeId> = HashSet::new();
         let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+        let mut phase_may_be_empty: Vec<PhaseId> = Vec::new();
         let mut estimator_specs: Vec<(TypeId, String)> = Vec::new();
         let mut max_concurrent_per_type: HashMap<TypeId, u32> = HashMap::new();
 
@@ -151,6 +157,14 @@ impl LoadedTopology {
                 phase_id.clone(),
                 depends_on.into_iter().map(PhaseId::from).collect(),
             );
+            // Optional per-phase empty-drain opt-out. Missing attr (older
+            // task definitions) or `False` → not opted out; `True` records
+            // the phase as one that may legitimately drain with zero items.
+            if let Ok(mbe) = phase_spec.getattr("may_be_empty")
+                && mbe.extract::<bool>().unwrap_or(false)
+            {
+                phase_may_be_empty.push(phase_id.clone());
+            }
 
             let types_tuple: Vec<Bound<'_, PyAny>> = phase_spec.getattr("types")?.extract()?;
             for tts in &types_tuple {
@@ -199,6 +213,7 @@ impl LoadedTopology {
         Ok(Self {
             estimator,
             phase_deps,
+            phase_may_be_empty,
             max_concurrent_per_type,
             raw_types,
         })
@@ -228,6 +243,10 @@ pub(crate) struct LoadedTaskDefinition {
     pub(crate) estimator: PyMemoryEstimatorBridge,
     pub(crate) types: TypeRegistry,
     pub(crate) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Phases declared `PhaseSpec.may_be_empty` — carried from
+    /// `LoadedTopology` to the manager constructors that register it on the
+    /// primary (the empty-drain proceed-or-fail opt-out).
+    pub(crate) phase_may_be_empty: Vec<PhaseId>,
     pub(crate) source_path: PathBuf,
     pub(crate) output_path: PathBuf,
     pub(crate) log_path: PathBuf,
@@ -338,6 +357,7 @@ impl LoadedTaskDefinition {
             estimator: topology.estimator,
             types: TypeRegistry { types, index_by_id },
             phase_deps: topology.phase_deps,
+            phase_may_be_empty: topology.phase_may_be_empty,
             source_path,
             output_path,
             log_path,
