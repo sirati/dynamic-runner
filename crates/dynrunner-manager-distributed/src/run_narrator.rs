@@ -94,6 +94,45 @@ pub struct RunNarrator {
     /// The two are mutually exclusive and share this single latch so at
     /// most one terminal line is ever emitted.
     completion_emitted: bool,
+    /// Whether the first [`Self::observe`] has run and SEEDED the
+    /// membership / primary baseline. The cold fleet forming — and, on a
+    /// relocation, the already-converged roster the observer inherits — is
+    /// NOT a wake event, so the FIRST observe records the current
+    /// remote-secondary roster and the current primary identity WITHOUT
+    /// emitting; only genuine POST-establishment transitions (a departure, a
+    /// rejoin, a primary CHANGE, a primary leaving the mesh) narrate. The
+    /// phase / retry / completion blocks above are deliberately NOT gated on
+    /// this latch — a phase starting or a retry pass opening IS a wake event
+    /// on first appearance; only the failover / degradation block below is
+    /// baseline-seeded.
+    failover_seeded: bool,
+    /// The currently-known-live REMOTE worker-secondary roster — every
+    /// [`ClusterState::alive_secondary_members`] id that is NOT the recognised
+    /// primary (the same `id != current_primary` cut
+    /// [`ClusterState::alive_remote_secondary_count`] applies, so the
+    /// primary's OWN co-located worker-secondary is never narrated as a peer:
+    /// its departure is the primary-left event below, not a secondary
+    /// departure). Maintained across observes so a set-difference against the
+    /// freshly-read live set yields the departures (peer-lost) and the
+    /// post-establishment joins (peer-rejoined). The membership ledger is
+    /// STICKY (a `PeerRemoved` id is `Dead` forever and can never re-`Alive`),
+    /// so a departed id never re-enters this set under the same id — the
+    /// set-difference therefore narrates each transition exactly once with no
+    /// flicker-damping needed.
+    live_remote_secondaries: HashSet<String>,
+    /// The last observed recognised primary as `(id, epoch)`. Seeded silently
+    /// on the first observe (the initial establishment is not a wake event);
+    /// thereafter a differing `(id, epoch)` is a genuine failover and emits
+    /// the "primary failed over" line exactly once per new `(id, epoch)`.
+    /// `None` means no primary has been recognised yet (pre-`PrimaryChanged`).
+    last_primary: Option<(String, u64)>,
+    /// Recognised-primary ids for which the "primary left the mesh — failover
+    /// in progress" line has been emitted, keyed by the departed primary's
+    /// id. Idempotent per departed-primary-id: the line fires the moment the
+    /// recognised `current_primary` is no longer a live member
+    /// ([`ClusterState::is_peer_alive`] false) and never again for that id.
+    /// A dead id is sticky-`Dead` (never resurrects), so once-per-id is exact.
+    primary_lost_emitted: HashSet<String>,
 }
 
 impl RunNarrator {
@@ -110,6 +149,10 @@ impl RunNarrator {
             done_phases: HashSet::new(),
             retry_passes_emitted: HashSet::new(),
             completion_emitted: false,
+            failover_seeded: false,
+            live_remote_secondaries: HashSet::new(),
+            last_primary: None,
+            primary_lost_emitted: HashSet::new(),
         }
     }
 
@@ -200,6 +243,17 @@ impl RunNarrator {
             }
         }
 
+        // Failover / degradation transitions, derived off the replicated
+        // membership + primary CRDT facts. Like the phase/retry milestones
+        // these are pure CRDT projections — narrated HERE, in the observer's
+        // process, so a relocated primary's failover reaches the operator's
+        // `--important-stdio-only` stdout regardless of which node now hosts
+        // the primary (the primary-side promotion / relocation emit goes to
+        // the PROMOTING node's stdout, never the operator's). Placed BEFORE
+        // the one-shot terminal summary: a failover is a mid-run transition,
+        // the summary is the run's end.
+        self.narrate_failover(state);
+
         // One-shot run summary, gated on the sticky run-complete /
         // run-aborted latches AND the local `completion_emitted` bool so
         // it fires exactly once across the entire observer tail. The two
@@ -247,6 +301,152 @@ impl RunNarrator {
             }
         }
     }
+
+    /// Narrate the failover / degradation transitions derived from the
+    /// replicated membership + primary CRDT facts. Single concern: turn the
+    /// "who is primary" and "which remote worker-secondaries are live"
+    /// projections into the operator's wake-worthy failover narrative,
+    /// idempotently per transition, with NO wall-clock (the narrator holds
+    /// none by design — see its struct doc).
+    ///
+    /// # Two-stage noise avoidance (baseline seed + operational gate)
+    ///
+    /// The FIRST call records the current remote-secondary roster and the
+    /// current primary `(id, epoch)` WITHOUT emitting and returns — the
+    /// already-converged roster the production observer inherits (it begins
+    /// observing only AFTER the bootstrap relocation, so its first observe is
+    /// post-establishment) is not a wake event. On TOP of the seed, every
+    /// emission is gated on the run being OPERATIONAL — at least one phase has
+    /// reached its start edge (`!started_phases.is_empty()`, populated by the
+    /// phase block that runs BEFORE this in [`Self::observe`]). The two
+    /// together make BOTH the converged-first-observe case AND a slow
+    /// multi-observe formation (an early cold-join observer watching the fleet
+    /// grow before any work dispatches) silent: a join / departure / primary
+    /// change that happens while the run is still forming is absorbed into the
+    /// tracked baseline (the live set + `last_primary` are kept current every
+    /// call) but never narrated; only once work is dispatching does a genuine
+    /// transition of the RUNNING fleet narrate.
+    ///
+    /// The baseline (live set, `last_primary`) is advanced on EVERY call so it
+    /// tracks the truth across the gated window; the once-per-edge sets
+    /// (`primary_lost_emitted`) advance ONLY when a line is actually emitted,
+    /// so a primary loss that began while gated still narrates once work
+    /// starts if it is still unresolved.
+    ///
+    /// # No wall-clock / implicit "election stuck"
+    ///
+    /// A wedged failover needs no timer here: a primary leaving the mesh emits
+    /// the "failover in progress" line and a resolved failover emits the
+    /// "primary failed over" line, so an UNRESOLVED failover is visible as a
+    /// primary-left line with no following primary-changed line.
+    fn narrate_failover<I: Identifier>(&mut self, state: &ClusterState<I>) {
+        // The recognised primary, identity-only (epoch carried separately).
+        let current_primary = state.current_primary().map(str::to_owned);
+
+        // The REMOTE worker-secondary live set: every alive worker-secondary
+        // EXCEPT the recognised primary's own co-located secondary capability
+        // (the `id != current_primary` cut `alive_remote_secondary_count`
+        // applies). So the primary's own departure is the primary-left event,
+        // and a secondary's PROMOTION (it leaves this set because it became
+        // the primary) is the primary-changed event — neither is ever a
+        // secondary departure.
+        let live_remote: HashSet<String> = state
+            .alive_secondary_members()
+            .filter(|id| Some(*id) != current_primary.as_deref())
+            .map(str::to_owned)
+            .collect();
+
+        // Baseline seed: capture the inherited roster + primary silently and
+        // return. The post-relocation converged fleet the production observer
+        // begins from is not a wake event.
+        if !self.failover_seeded {
+            self.live_remote_secondaries = live_remote;
+            self.last_primary = current_primary.map(|id| (id, state.primary_epoch()));
+            self.failover_seeded = true;
+            return;
+        }
+
+        // Operational gate: a transition narrates only once the run is
+        // dispatching work (at least one phase started). The phase block in
+        // `observe` runs FIRST, so `started_phases` already reflects this
+        // iteration. While not operational, formation churn is absorbed into
+        // the tracked baseline below but never emitted.
+        let operational = !self.started_phases.is_empty();
+
+        // PEER-LOST: a remote secondary that was live and is now absent from
+        // the live set departed. A secondary that became the primary is NOT a
+        // departure (it left the remote set by promotion, narrated as
+        // primary-changed) — exclude `current_primary`. The membership 2P-set
+        // is sticky, so each id departs at most once — once-per-id, no
+        // flicker.
+        let live_count = live_remote.len();
+        for departed in self.live_remote_secondaries.difference(&live_remote) {
+            if operational && Some(departed.as_str()) != current_primary.as_deref() {
+                tracing::warn!(
+                    target: IMPORTANT_TARGET,
+                    secondary = %departed,
+                    live = live_count,
+                    "secondary left the cluster",
+                );
+            }
+        }
+        // PEER-REJOINED: a remote secondary live now but not in the prior set
+        // joined AFTER the run was operational (a never-before-seen id — the
+        // sticky-Dead ledger means a departed id cannot reappear).
+        for joined in live_remote.difference(&self.live_remote_secondaries) {
+            if operational {
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    secondary = %joined,
+                    "secondary joined the cluster",
+                );
+            }
+        }
+        self.live_remote_secondaries = live_remote;
+
+        // PRIMARY-LOST / failover-in-progress: the recognised primary is no
+        // longer a live member (it left the mesh) but no new primary has been
+        // named yet. Read off `is_peer_alive` — the capacity-INDEPENDENT
+        // membership signal — NOT `alive_secondary_members`: a primary-only
+        // host (no worker capacity) is structurally ABSENT from the secondary
+        // roster even while perfectly alive, so the secondary roster would
+        // false-positive on it. Idempotent once-per-departed-primary-id; the
+        // edge-set advances only on a real emit, so a loss that began while
+        // gated still narrates once work starts if still unresolved.
+        if operational
+            && let Some(primary) = current_primary.as_deref()
+            && !state.is_peer_alive(primary)
+            && self.primary_lost_emitted.insert(primary.to_owned())
+        {
+            tracing::warn!(
+                target: IMPORTANT_TARGET,
+                primary = %primary,
+                "primary left the mesh — failover in progress",
+            );
+        }
+
+        // PRIMARY-CHANGED / failover-resolved: the recognised `(id, epoch)`
+        // differs from the seeded/last-observed baseline — a genuine failover
+        // result. Emit once per new `(id, epoch)` when operational; the
+        // baseline `last_primary` is advanced on the change either way, so a
+        // pre-operational change (the bootstrap relocation) is absorbed
+        // silently. Epoch is part of the key so a re-election back onto the
+        // same id (different epoch) still narrates.
+        let current = current_primary.map(|id| (id, state.primary_epoch()));
+        if current.is_some() && current != self.last_primary {
+            if operational
+                && let Some((id, epoch)) = current.as_ref()
+            {
+                tracing::warn!(
+                    target: IMPORTANT_TARGET,
+                    primary = %id,
+                    epoch = *epoch,
+                    "primary failed over to {id} (epoch {epoch})",
+                );
+            }
+            self.last_primary = current;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +455,10 @@ mod tests {
     use crate::primary::retry_bucket::BucketKind;
     use crate::test_capture::{ImportantCapture, important_only};
     use dynrunner_core::{ErrorType, PhaseId, RunnerIdentifier, TaskDep, TaskInfo, TypeId};
-    use dynrunner_protocol_primary_secondary::cluster_mutation::ClusterMutation;
+    use dynrunner_protocol_primary_secondary::cluster_mutation::{
+        ClusterMutation, PrimaryChangeReason,
+    };
+    use dynrunner_protocol_primary_secondary::removal_cause::RemovalCause;
     use tracing::subscriber::with_default;
     use tracing_subscriber::Layer;
     use tracing_subscriber::Registry;
@@ -314,6 +517,55 @@ mod tests {
         used: u32,
     ) {
         state.record_retry_pass_used((PhaseId::from(phase), bucket), used);
+    }
+
+    /// Bring `id` into the cluster as a LIVE worker-secondary: a `PeerJoined`
+    /// (membership `Alive`) plus a `SecondaryCapacity` with `> 0` worker slots
+    /// — the same pair the primary originates on `SecondaryWelcome`, the only
+    /// shape that lands an id in `alive_secondary_members`.
+    fn join_secondary(state: &mut ClusterState<RunnerIdentifier>, id: &str) {
+        state.apply(ClusterMutation::PeerJoined {
+            peer_id: id.to_string(),
+            is_observer: false,
+            can_be_primary: true,
+            cap_version: Default::default(),
+        });
+        state.apply(ClusterMutation::SecondaryCapacity {
+            secondary: id.to_string(),
+            worker_count: 1,
+            resources: Vec::new(),
+        });
+    }
+
+    /// Authoritatively remove `id` from membership (`peer_state` → sticky
+    /// `Dead`), the same `PeerRemoved` a membership-drop / fatal observation
+    /// originates. Drops the id out of `alive_secondary_members` AND flips
+    /// `is_peer_alive(id)` false.
+    fn remove_peer(state: &mut ClusterState<RunnerIdentifier>, id: &str) {
+        state.apply(ClusterMutation::PeerRemoved {
+            id: id.to_string(),
+            cause: RemovalCause::KeepaliveMiss,
+        });
+    }
+
+    /// Name `id` the primary at `epoch` — the replicated `PrimaryChanged`
+    /// register adopt the failover / bootstrap originates.
+    fn set_primary(state: &mut ClusterState<RunnerIdentifier>, id: &str, epoch: u64) {
+        state.apply(ClusterMutation::PrimaryChanged {
+            new: id.to_string(),
+            epoch,
+            reason: PrimaryChangeReason::Election,
+        });
+    }
+
+    /// Make the run OPERATIONAL by dispatching work: add one zero-dep task so
+    /// its phase reaches the `has_any && dispatchable` start edge — the same
+    /// signal the narrator's operational gate reads (`started_phases`
+    /// non-empty after the phase block). Failover / degradation lines narrate
+    /// only once the run is operational; this is the formation→running cutover
+    /// the gate keys on.
+    fn start_work(state: &mut ClusterState<RunnerIdentifier>) {
+        add(state, &task("run", "w", &[]));
     }
 
     /// Run a closure with an `ImportantCapture` installed as the default
@@ -751,6 +1003,323 @@ mod tests {
         assert_eq!(
             oom[0].fields.get("phase").map(String::as_str),
             Some("remote-phase")
+        );
+    }
+
+    // ── Failover / degradation narration ──
+
+    /// Initial fleet formation — the primary being named and the secondaries
+    /// trickling in across SEVERAL observe() calls before any work dispatches
+    /// — narrates NO failover/degradation line. The first observe seeds the
+    /// baseline; the operational gate keeps every later formation join silent
+    /// until work starts. Models an early cold-join observer watching the
+    /// fleet grow during setup.
+    #[test]
+    fn initial_formation_seeds_silently() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            let mut narrator = RunNarrator::new();
+
+            // Fleet forms incrementally; each step is observed. NO work has
+            // started, so the run is not operational.
+            set_primary(&mut state, "n1", 1);
+            narrator.observe(&state);
+            join_secondary(&mut state, "n1");
+            join_secondary(&mut state, "n2");
+            narrator.observe(&state);
+            join_secondary(&mut state, "n3");
+            narrator.observe(&state);
+            // Re-observe the formed, stable (still-setup) fleet.
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| {
+                let m = &e.message;
+                !m.contains("left the cluster")
+                    && !m.contains("joined the cluster")
+                    && !m.contains("failed over")
+                    && !m.contains("failover in progress")
+            }),
+            "formation (pre-operational) must narrate NO failover/degradation line: {events:?}"
+        );
+    }
+
+    /// Production shape: the observer's FIRST observe already sees the
+    /// converged, operational fleet (work dispatching, full roster, primary
+    /// established post-relocation). That first observe seeds silently, and a
+    /// stable re-observe narrates nothing — no spurious "joined" / "primary
+    /// failed over" for the inherited roster.
+    #[test]
+    fn converged_operational_first_observe_seeds_silently() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // Operational, fully-formed fleet at construction (the relocated /
+            // cold-join observer inherits this converged state).
+            start_work(&mut state);
+            set_primary(&mut state, "n1", 1);
+            join_secondary(&mut state, "n1");
+            join_secondary(&mut state, "n2");
+            join_secondary(&mut state, "n3");
+
+            let mut narrator = RunNarrator::new();
+            // First observe of the converged, operational state: seed only.
+            narrator.observe(&state);
+            // Stable re-observe: idempotent.
+            narrator.observe(&state);
+        });
+
+        assert!(
+            events.iter().all(|e| {
+                let m = &e.message;
+                !m.contains("left the cluster")
+                    && !m.contains("joined the cluster")
+                    && !m.contains("failed over")
+                    && !m.contains("failover in progress")
+            }),
+            "a converged operational first-observe seeds the roster silently: {events:?}"
+        );
+    }
+
+    /// A remote secondary that departs the live membership AFTER the fleet was
+    /// seeded narrates exactly one "secondary left the cluster" line carrying
+    /// the post-departure live count; a re-observe is idempotent.
+    #[test]
+    fn peer_lost_on_post_seed_departure() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "n1", 1);
+            join_secondary(&mut state, "n1");
+            join_secondary(&mut state, "n2");
+            join_secondary(&mut state, "n3");
+
+            let mut narrator = RunNarrator::new();
+            // Seed the formed fleet (n2, n3 are remote; n1 is the primary's
+            // own co-located secondary, excluded from the remote roster).
+            narrator.observe(&state);
+            // n2 dies.
+            remove_peer(&mut state, "n2");
+            narrator.observe(&state);
+            // Stable → idempotent.
+            narrator.observe(&state);
+        });
+
+        let lost: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("secondary left the cluster"))
+            .collect();
+        assert_eq!(lost.len(), 1, "exactly one peer-lost line: {events:?}");
+        assert_eq!(lost[0].fields.get("secondary").map(String::as_str), Some("n2"));
+        // One remote secondary (n3) remains live after n2's departure.
+        assert_eq!(lost[0].fields.get("live").map(String::as_str), Some("1"));
+    }
+
+    /// A brand-new remote secondary appearing AFTER the seed narrates exactly
+    /// one "secondary joined the cluster" line; the seeded ones do not.
+    #[test]
+    fn peer_rejoined_on_post_seed_join() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "n1", 1);
+            join_secondary(&mut state, "n1");
+            join_secondary(&mut state, "n2");
+
+            let mut narrator = RunNarrator::new();
+            // Seed: n2 is the only remote secondary.
+            narrator.observe(&state);
+            // A new worker-secondary joins post-establishment.
+            join_secondary(&mut state, "n3");
+            narrator.observe(&state);
+            // Stable → idempotent.
+            narrator.observe(&state);
+        });
+
+        let joined: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("secondary joined the cluster"))
+            .collect();
+        assert_eq!(
+            joined.len(),
+            1,
+            "exactly one peer-rejoined line for the post-seed joiner: {events:?}"
+        );
+        assert_eq!(
+            joined[0].fields.get("secondary").map(String::as_str),
+            Some("n3")
+        );
+    }
+
+    /// PRIMARY-LOST: when the recognised primary is no longer a live member
+    /// (its `PeerRemoved` landed but no new `PrimaryChanged` has yet) the
+    /// "primary left the mesh — failover in progress" line fires once. This
+    /// holds for a PRIMARY-ONLY host (no worker capacity): the detection reads
+    /// `is_peer_alive`, NOT the worker-secondary roster, so a healthy
+    /// primary-only host never false-positives and a dead one is caught.
+    #[test]
+    fn primary_lost_when_primary_leaves_membership() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            // Primary-only host (PeerJoined, but NO SecondaryCapacity → absent
+            // from alive_secondary_members even while alive).
+            state.apply(ClusterMutation::PeerJoined {
+                peer_id: "p".to_string(),
+                is_observer: false,
+                can_be_primary: true,
+                cap_version: Default::default(),
+            });
+            set_primary(&mut state, "p", 1);
+            join_secondary(&mut state, "w1");
+
+            let mut narrator = RunNarrator::new();
+            // Seed: healthy primary-only host must NOT narrate primary-lost.
+            narrator.observe(&state);
+            // The primary node dies; no new primary named yet.
+            remove_peer(&mut state, "p");
+            narrator.observe(&state);
+            // Stable → idempotent.
+            narrator.observe(&state);
+        });
+
+        let lost: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("failover in progress"))
+            .collect();
+        assert_eq!(lost.len(), 1, "exactly one primary-lost line: {events:?}");
+        assert_eq!(lost[0].fields.get("primary").map(String::as_str), Some("p"));
+    }
+
+    /// PRIMARY-CHANGED: a differing `(id, epoch)` after the seed narrates the
+    /// "primary failed over" line once per new primary; the initial
+    /// establishment is silent and a stable re-observe is idempotent.
+    #[test]
+    fn primary_changed_on_failover_once() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            // Seed the initial primary (p1, epoch 1) silently.
+            narrator.observe(&state);
+            // Failover: p1 dies, p2 promoted at a higher epoch.
+            remove_peer(&mut state, "p1");
+            set_primary(&mut state, "p2", 2);
+            narrator.observe(&state);
+            // Stable → idempotent.
+            narrator.observe(&state);
+        });
+
+        let changed: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("failed over to"))
+            .collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "exactly one primary-changed line, not on the initial seed: {events:?}"
+        );
+        assert_eq!(
+            changed[0].fields.get("primary").map(String::as_str),
+            Some("p2")
+        );
+        assert_eq!(changed[0].fields.get("epoch").map(String::as_str), Some("2"));
+    }
+
+    /// No-wall-clock implicit "election stuck": a primary that leaves the mesh
+    /// with NO following `PrimaryChanged` stays visible as a primary-lost line
+    /// with no primary-changed line — a wedged failover is NOT silent.
+    #[test]
+    fn wedged_failover_visible_without_resolution() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed
+            // p1 dies, election never completes (no new PrimaryChanged).
+            remove_peer(&mut state, "p1");
+            narrator.observe(&state);
+            // Time passes (more observes), still no resolution.
+            narrator.observe(&state);
+            narrator.observe(&state);
+        });
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.message.contains("failover in progress"))
+                .count(),
+            1,
+            "the wedged failover is visible: one primary-lost line: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| !e.message.contains("failed over to")),
+            "an unresolved failover narrates NO primary-changed line: {events:?}"
+        );
+    }
+
+    /// A multi-hop failover (p1 → p2 → p3) narrates each transition once. The
+    /// first hop is WEDGED — the observer catches the dead-primary-with-no-
+    /// replacement window (a primary-lost line), then sees it resolve (a
+    /// primary-changed line). The second hop is FAST — the removal and the new
+    /// `PrimaryChanged` land in the same observe, so the observer never sees a
+    /// dead recognised primary and only the resolution (primary-changed)
+    /// narrates. primary-lost is keyed per departed-primary-id and
+    /// primary-changed per new `(id, epoch)`, so nothing re-emits.
+    #[test]
+    fn second_failover_narrates_each_transition_once() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            start_work(&mut state); // run operational
+            set_primary(&mut state, "p1", 1);
+            join_secondary(&mut state, "p1");
+            join_secondary(&mut state, "p2");
+            join_secondary(&mut state, "p3");
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state); // seed at p1
+            // First failover (WEDGED then resolved): p1 dies, election lags.
+            remove_peer(&mut state, "p1");
+            narrator.observe(&state); // catches p1 dead, no replacement
+            set_primary(&mut state, "p2", 2);
+            narrator.observe(&state); // resolved → p2
+            // Second failover (FAST): removal + promotion in one window.
+            remove_peer(&mut state, "p2");
+            set_primary(&mut state, "p3", 3);
+            narrator.observe(&state); // only the resolution is observable
+            narrator.observe(&state); // stable → idempotent
+        });
+
+        // p1's death was caught wedged → one primary-lost line. p2 never had a
+        // dead-recognised-primary window (fast hop) → no primary-lost for p2.
+        let lost: Vec<&str> = events
+            .iter()
+            .filter(|e| e.message.contains("failover in progress"))
+            .filter_map(|e| e.fields.get("primary").map(String::as_str))
+            .collect();
+        assert_eq!(
+            lost,
+            vec!["p1"],
+            "only the wedged hop's departed primary narrates a lost line: {events:?}"
+        );
+        // BOTH resolutions narrate, once each, in order.
+        let changed: Vec<&str> = events
+            .iter()
+            .filter(|e| e.message.contains("failed over to"))
+            .filter_map(|e| e.fields.get("primary").map(String::as_str))
+            .collect();
+        assert_eq!(
+            changed,
+            vec!["p2", "p3"],
+            "each new primary narrates a changed line once, in order: {events:?}"
         );
     }
 }
