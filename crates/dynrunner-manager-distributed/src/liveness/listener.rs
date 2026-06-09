@@ -14,13 +14,22 @@
 //!
 //! # Boundary
 //!
-//! The listener knows nothing about `PrimaryCoordinator` internals. Its
-//! only output is a decoded node-id pushed onto an
-//! [`tokio::sync::mpsc`] channel; the operational loop drains it and calls
-//! `record_keepalive`. This keeps the death-clock the coordinator's
-//! concern and the socket-plumbing the listener's, with one channel as the
-//! seam — mirroring every other external signal that reaches the loop
-//! (panik, fatal-exit, respawn-request).
+//! The listener knows nothing about `PrimaryCoordinator` /
+//! `SecondaryCoordinator` internals. It decodes each beacon and feeds TWO
+//! independent subscription styles, both pure outputs of the one decode:
+//!
+//!  - a PUSH stream: the decoded node-id on an [`tokio::sync::mpsc`]
+//!    channel, drained per-datagram by the primary's reaper
+//!    (`record_keepalive`) — the secondary→primary direction (#323);
+//!  - a POLL view: a [`super::BeaconLiveness`] freshness cell, sampled on
+//!    its own cadence by the secondary's failover-detector tick — the
+//!    primary→secondaries direction. The listener records every decoded
+//!    beacon's receipt time; the reader unions that freshness with its
+//!    mesh-frame view of the same node.
+//!
+//! Each subscriber reads only what it needs and neither knows about the
+//! other; the death-clock / election semantics stay the coordinators'
+//! concern and the socket-plumbing the listener's.
 //!
 //! # Run-token filter
 //!
@@ -34,6 +43,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::BeaconLiveness;
 use super::datagram;
 
 /// Fixed recv buffer. A liveness datagram is the small header plus a short
@@ -50,8 +60,10 @@ pub struct LivenessListener {
 impl LivenessListener {
     /// Bind the liveness UDP socket on `bind_addr` and spawn the recv
     /// task. Returns the bound local port (so the caller can advertise it
-    /// in its `PeerConnectionInfo.liveness_port`) and the receiver end of
-    /// the decoded-node-id channel (so the operational loop can drain it).
+    /// in its `PeerConnectionInfo.liveness_port`), the receiver end of the
+    /// decoded-node-id PUSH channel (drained by the primary's reaper), and
+    /// the [`BeaconLiveness`] POLL view (sampled by the secondary's
+    /// failover-detector tick). Both are fed from the same decode.
     ///
     /// `expected_token`:
     /// - `Some(t)` enforces the run-token filter — datagrams carrying a
@@ -64,18 +76,22 @@ impl LivenessListener {
     ///   threaded through the boot path today. The token field stays on the
     ///   wire for a future run-wide token without a wire change.
     ///
-    /// Must be called on a tokio runtime (the primary's healthy runtime).
+    /// Must be called on a tokio runtime (the node's healthy runtime — the
+    /// primary owns no worker pool, and the secondary's failover-detector
+    /// only consults the view, never the build-starved emit path).
     pub async fn bind(
         bind_addr: std::net::SocketAddr,
         expected_token: Option<u64>,
-    ) -> std::io::Result<(Self, u16, mpsc::UnboundedReceiver<String>)> {
+    ) -> std::io::Result<(Self, u16, mpsc::UnboundedReceiver<String>, BeaconLiveness)> {
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_port = socket.local_addr()?.port();
         let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let liveness = BeaconLiveness::new();
+        let listener_liveness = liveness.clone();
         let task = tokio::task::spawn_local(async move {
-            run_listener(socket, expected_token, tx).await;
+            run_listener(socket, expected_token, tx, listener_liveness).await;
         });
-        Ok((Self { task }, local_port, rx))
+        Ok((Self { task }, local_port, rx, liveness))
     }
 }
 
@@ -92,6 +108,7 @@ async fn run_listener(
     socket: UdpSocket,
     expected_token: Option<u64>,
     tx: mpsc::UnboundedSender<String>,
+    liveness: BeaconLiveness,
 ) {
     let mut buf = [0u8; RECV_BUF];
     loop {
@@ -114,11 +131,18 @@ async fn run_listener(
             // `None`: the ephemeral per-run port already isolates runs.)
             continue;
         }
-        // A send failure means the operational loop dropped its receiver
-        // (the run is winding down); stop listening.
-        if tx.send(d.node_id).is_err() {
-            break;
-        }
+        // POLL view: record this node's beacon-receipt freshness (the
+        // secondary's failover-detector polls it). Always updated, even
+        // after the PUSH receiver drops — the secondary may still consult
+        // the view while no primary drains the channel.
+        liveness.record(&d.node_id);
+        // PUSH stream: forward the node-id to the primary's reaper. A send
+        // failure means no reaper is draining (a pure secondary that never
+        // promoted, or a run winding down). That is NOT a reason to stop
+        // recording the POLL view, so do not break — only the unused PUSH
+        // half is dropped. Stop entirely only if BOTH sinks are gone, which
+        // is the listener-handle drop (`task.abort()`).
+        let _ = tx.send(d.node_id);
     }
 }
 
@@ -135,7 +159,7 @@ mod tests {
         local
             .run_until(async {
                 let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-                let (_listener, port, mut rx) =
+                let (_listener, port, mut rx, view) =
                     LivenessListener::bind(bind, Some(0x1234)).await.unwrap();
 
                 let sender = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
@@ -157,6 +181,49 @@ mod tests {
                     .expect("a forwarded id arrives")
                     .expect("channel open");
                 assert_eq!(got, "secondary-3");
+                // The POLL view recorded the SAME accepted beacon (so the
+                // secondary's failover-detector can consult it) and never
+                // the stale-token one.
+                assert!(view.last_seen("secondary-3").is_some());
+                assert!(view.last_seen("secondary-9").is_none());
+            })
+            .await;
+    }
+
+    /// The POLL view keeps recording even after the PUSH receiver is
+    /// dropped: a pure secondary that never promoted has no reaper draining
+    /// the channel, yet its failover-detector must still see the primary's
+    /// beacon freshness. (Pre-fix the listener `break`-ed on the first
+    /// failed `tx.send`, which would have stopped recording the view.)
+    #[tokio::test]
+    async fn poll_view_records_after_push_receiver_dropped() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let (_listener, port, rx, view) =
+                    LivenessListener::bind(bind, None).await.unwrap();
+                // Drop the PUSH receiver — no primary reaper on this node.
+                drop(rx);
+
+                let sender = StdUdpSocket::bind(("127.0.0.1", 0)).unwrap();
+                let dst: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+                sender
+                    .send_to(&datagram::encode("primary-0", 1), dst)
+                    .unwrap();
+
+                // The view must still record the primary's beacon.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    if view.last_seen("primary-0").is_some() {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the POLL view must record despite the dropped PUSH receiver"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             })
             .await;
     }

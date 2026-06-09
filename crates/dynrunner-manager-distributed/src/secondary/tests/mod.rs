@@ -49,6 +49,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod failover_beacon_union;
 mod failover_membership;
 mod honest_liveness;
 mod keepalive_emission;

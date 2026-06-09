@@ -91,7 +91,8 @@ where
             peer_cert_info: None,
             liveness_port: None,
             beacon_target: crate::liveness::BeaconTarget::new(),
-            peer_liveness_addrs: std::collections::HashMap::new(),
+            beacon_liveness: crate::liveness::BeaconLiveness::new(),
+            peer_liveness_addrs: crate::liveness::PeerLivenessAddrs::new(),
             #[cfg(test)]
             local_tasks_run: 0,
             extraction_cache,
@@ -623,6 +624,18 @@ where
     /// publishes into it.
     pub fn beacon_target(&self) -> crate::liveness::BeaconTarget {
         self.beacon_target.clone()
+    }
+
+    /// Install the node's [`crate::liveness::BeaconLiveness`] POLL view
+    /// (a clone of the one the [`crate::liveness::LivenessListener`]
+    /// publishes into). Called by the run boundary after it binds the
+    /// listener, BEFORE `run()`. The failover-detector consults this view's
+    /// entry for the current primary as the UNION counterpart of the
+    /// mesh-frame liveness legs, so a CPU-starved-but-beaconing primary is
+    /// not false-elected against. Absent this call the view stays empty and
+    /// the union degrades to mesh-frame-only (the prior behaviour).
+    pub fn set_beacon_liveness(&mut self, view: crate::liveness::BeaconLiveness) {
+        self.beacon_liveness = view;
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers

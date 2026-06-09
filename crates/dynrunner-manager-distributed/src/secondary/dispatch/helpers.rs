@@ -254,8 +254,8 @@ where
         let addr = self
             .cluster_state
             .current_primary()
-            .and_then(|primary_id| self.peer_liveness_addrs.get(primary_id).copied());
-        self.beacon_target.publish(addr);
+            .and_then(|primary_id| self.peer_liveness_addrs.get(primary_id));
+        self.beacon_target.publish_one(addr);
     }
 
     /// Rebuild the id→liveness-`SocketAddr` view from a `PeerInfo` roster
@@ -271,16 +271,22 @@ where
         &mut self,
         peers: &[dynrunner_protocol_primary_secondary::PeerConnectionInfo],
     ) {
-        self.peer_liveness_addrs = peers
-            .iter()
-            .filter_map(|p| {
-                let port = p.liveness_port?;
-                let ipv4 = p.ipv4.as_deref()?;
-                let addr: std::net::SocketAddr = format!("{ipv4}:{port}").parse().ok()?;
-                Some((p.secondary_id.clone(), addr))
-            })
-            .collect();
+        // The address-book owns the `PeerInfo` → `ipv4:port` parse + filter
+        // (a peer missing either field is absent — strictly better than a
+        // bogus address). Writing the SHARED cell makes the same book
+        // readable by the co-located promoted primary's beacon-target
+        // builder, not just this secondary's `republish_beacon_target`.
+        self.peer_liveness_addrs.ingest(peers);
         self.republish_beacon_target();
+    }
+
+    /// A clone of the node-scoped peer→liveness-address book. The run
+    /// boundary hands this to the promoted-primary recipe so the primary's
+    /// beacon-target builder can resolve its secondaries' beacon addresses
+    /// (the promoted primary observes no `PeerInfo` of its own). Mirrors
+    /// `beacon_target()` / `set_beacon_liveness` as a shared-cell accessor.
+    pub fn peer_liveness_addrs(&self) -> crate::liveness::PeerLivenessAddrs {
+        self.peer_liveness_addrs.clone()
     }
 
     /// Reset the failover election to `Normal` iff this node has reached

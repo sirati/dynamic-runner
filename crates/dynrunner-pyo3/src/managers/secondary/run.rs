@@ -539,8 +539,14 @@ impl PySecondaryCoordinator {
                 )
                 .await
                 {
-                    Ok((listener, port, ping_rx)) => {
+                    Ok((listener, port, ping_rx, beacon_liveness)) => {
                         secondary.set_liveness_port(port);
+                        // Install the listener's POLL view on the secondary so
+                        // its failover-detector consults the CURRENT PRIMARY's
+                        // beacon as the UNION counterpart of the mesh-frame
+                        // legs (the primary→secondaries direction): a
+                        // CPU-starved-but-beaconing primary is NOT false-elected.
+                        secondary.set_beacon_liveness(beacon_liveness);
                         liveness_ping_rx_for_recipe = Some(ping_rx);
                         // Keep the listener alive for the whole run: its recv
                         // task is already spawned inside `bind`, but the
@@ -731,6 +737,15 @@ impl PySecondaryCoordinator {
                     ),
                     phase_deps: discovery_phase_deps,
                 };
+                // Capture a clone of the node's peer→liveness-address book
+                // (populated by THIS secondary from PeerInfo) BEFORE the
+                // secondary is moved into the node, so the promoted primary's
+                // beacon can resolve its secondaries' raw beacon addresses.
+                // Gated on the listener binding (same condition as the ping
+                // receiver): no listener ⇒ no beacon infrastructure this run.
+                let promote_peer_liveness_addrs = liveness_ping_rx_for_recipe
+                    .as_ref()
+                    .map(|_| secondary.peer_liveness_addrs());
                 let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                     secondary_id: secondary_id.clone(),
                     keepalive_interval: dist_keepalive,
@@ -766,6 +781,10 @@ impl PySecondaryCoordinator {
                     // promoted primary folds beacon datagrams into the
                     // death-clock (union). `None` if the listener didn't bind.
                     liveness_ping_rx: liveness_ping_rx_for_recipe,
+                    // The node's peer→liveness-address book (captured above):
+                    // the promoted primary's own beacon resolves its
+                    // secondaries' addresses from it (primary→secondaries).
+                    peer_liveness_addrs: promote_peer_liveness_addrs,
                 });
 
                 let node = node.with_secondary(secondary, sec_slot);
@@ -1021,6 +1040,17 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// channel + phase callbacks. `None` when no listener was bound.
     pub liveness_ping_rx:
         Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    /// The node-scoped peer→liveness-address book (a clone of the one the
+    /// co-located `SecondaryCoordinator` populated from `PeerInfo`). The
+    /// promoted primary reads it to resolve its secondaries' raw beacon
+    /// addresses for its OWN dedicated-thread liveness beacon (the
+    /// PRIMARY→secondaries direction): a CPU-starved promoted primary keeps
+    /// beaconing its secondaries so they do not false-elect a successor.
+    /// Shared (not single-use): the recipe READS it to seed the primary's
+    /// `set_peer_liveness_addrs`, leaving the secondary's copy intact.
+    /// `None` for callers without a listener (no beacon emitted).
+    pub peer_liveness_addrs:
+        Option<dynrunner_manager_distributed::liveness::PeerLivenessAddrs>,
 }
 
 /// Read the run's two staging-dispatch flags from this node's OWN LOCAL
@@ -1105,12 +1135,17 @@ pub(crate) fn build_promoted_primary_recipe(
         source_dir,
         setup_discovery,
         liveness_ping_rx,
+        peer_liveness_addrs,
     } = inputs;
     // Single-use: an `mpsc::UnboundedReceiver` is one-owner, so capture it
     // in an `Option` and `take` on the recipe's single fire (a node
     // promotes at most once per lifetime — same discipline as the command
     // channel / phase callbacks).
     let mut liveness_ping_rx = liveness_ping_rx;
+    // Single-use on the one recipe fire (a node promotes at most once): the
+    // promoted primary spawns its OWN dedicated-thread liveness beacon from
+    // this book. `take`-n in the closure like `liveness_ping_rx`.
+    let mut peer_liveness_addrs = peer_liveness_addrs;
     // Single-use pieces captured in Options so the FnMut can take them on its
     // one invocation (a node promotes at most once per lifetime). The command
     // channel is already an `Option` (it is `None` on the in-process path,
@@ -1199,6 +1234,49 @@ pub(crate) fn build_promoted_primary_recipe(
         // receiver moves to whichever primary is active.
         if let Some(rx) = liveness_ping_rx.take() {
             primary.set_liveness_ping_rx(rx);
+        }
+        // Spawn the PROMOTED primary's OWN dedicated-thread liveness beacon
+        // (the PRIMARY→secondaries direction). The promoted primary's NODE
+        // keeps its co-located worker-secondary running builds, so its
+        // single-threaded tokio runtime is CPU-starved exactly like any
+        // compute node — its OUTBOUND mesh keepalive freezes, and its
+        // secondaries would false-elect a successor against a still-alive
+        // primary. This off-runtime beacon (its own OS thread + UdpSocket)
+        // keeps asserting the primary's liveness through the starvation. The
+        // book (populated by the co-located secondary from PeerInfo) is the
+        // promoted primary's only source of its secondaries' beacon
+        // addresses; the coordinator publishes the live-secondary subset into
+        // its `beacon_target` each heartbeat tick (`publish_beacon_targets`).
+        // Best-effort: a bind failure leaves the secondaries on the
+        // mesh-frame liveness legs alone — logged, not fatal.
+        if let Some(book) = peer_liveness_addrs.take() {
+            primary.set_peer_liveness_addrs(book);
+            match dynrunner_manager_distributed::liveness::LivenessBeacon::spawn(
+                secondary_id.clone(),
+                // Per-process breadcrumb token (the listener accepts any
+                // token — the ephemeral per-run port isolates stale runs).
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0),
+                keepalive_interval,
+                primary.beacon_target(),
+            ) {
+                Ok(beacon) => {
+                    primary.set_primary_beacon(beacon);
+                    tracing::info!(
+                        "promoted primary liveness beacon active (transport-independent \
+                         primary→secondaries keepalive; survives runtime CPU-starvation)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "promoted primary liveness beacon spawn failed; secondaries fall \
+                         back to mesh-frame liveness legs alone for this primary"
+                    );
+                }
+            }
         }
         // Install the phase-hook raise-latch BEFORE `run` enters (pre-run
         // setter contract, mirroring the submitter `primary/run.rs:444`) so a
@@ -2229,6 +2307,7 @@ task = Task()
                 source_dir: None,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                peer_liveness_addrs: None,
             });
 
             let mut built = recipe(client, inbox, demote_rx, snapshot);
@@ -2326,6 +2405,7 @@ task = Task()
                 source_dir: None,
                 setup_discovery: None,
                 liveness_ping_rx: None,
+                peer_liveness_addrs: None,
             });
 
             let built = recipe(client, inbox, demote_rx, snapshot);

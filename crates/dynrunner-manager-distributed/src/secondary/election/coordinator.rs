@@ -115,6 +115,32 @@ where
         }
     }
 
+    /// Is `primary_id`'s transport-INDEPENDENT liveness beacon still fresh?
+    ///
+    /// The UNION counterpart to the mesh-frame liveness legs. Reads this
+    /// node's [`crate::liveness::BeaconLiveness`] POLL view (published by the
+    /// `LivenessListener` per decoded beacon datagram) and judges its
+    /// staleness on the SAME death deadline the mesh-frame quorum gates use
+    /// (`keepalive_interval × keepalive_miss_threshold`), so the beacon and
+    /// the frame are weighed on one yardstick. A never-seen beacon (`None`)
+    /// is NOT fresh — it must never spuriously suppress a genuine election
+    /// (#317): before the primary has proven liveness on the beacon path the
+    /// union degrades to the mesh-frame view alone. The beacon fires on
+    /// `keepalive_interval`, so `keepalive_miss_threshold` consecutive
+    /// missed beacons is the same "the primary went silent" bound as for
+    /// frames — a starved-but-alive primary keeps its dedicated-thread
+    /// beacon flowing well inside it.
+    pub(in crate::secondary) fn primary_beacon_fresh(&self, primary_id: &str) -> bool {
+        let deadline = self
+            .config
+            .keepalive_interval
+            .saturating_mul(self.config.keepalive_miss_threshold);
+        self.beacon_liveness
+            .last_seen(primary_id)
+            .map(|t| Instant::now().duration_since(t) <= deadline)
+            .unwrap_or(false)
+    }
+
     /// The live mesh peers for failover quorum/candidate reasoning: the
     /// keys of `peer_keepalives` MINUS the current primary's host id.
     ///
@@ -263,6 +289,21 @@ where
                 )
             })
             .unwrap_or(false);
+        // UNION counterpart of the mesh-frame death legs: is the current
+        // primary's transport-INDEPENDENT beacon still flowing? Snapshotted
+        // here as a `&self` read of `beacon_liveness` (alongside
+        // `current_primary_id` / `primary_left_membership`), before the
+        // `&mut op` borrow below. A CPU-starved-but-alive primary (its
+        // single-threaded runtime pegged by a co-located build) freezes its
+        // OUTBOUND mesh keepalive AND lets its QUIC connection idle-timeout —
+        // tripping legs (A)/(C) — yet its dedicated-thread beacon keeps
+        // asserting liveness. `true` here suppresses the spurious election;
+        // a GENUINE primary death (no beacon AND no frame) leaves this
+        // `false`, so the election still arms promptly (the #317 path).
+        let primary_beacon_fresh = current_primary_id
+            .as_deref()
+            .map(|id| self.primary_beacon_fresh(id))
+            .unwrap_or(false);
         let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
         let observers: std::collections::HashSet<String> = self
             .cluster_state
@@ -378,8 +419,16 @@ where
         let primary_left_membership_after_seen =
             primary_left_membership && op.primary_last_seen.is_some();
 
-        let need_election =
+        // The UNION death-clock (mirroring the primary-side reaper, where a
+        // secondary is reaped iff BOTH its beacon and its frames are silent):
+        // the mesh-frame disjunction declares the primary suspect, but the
+        // election arms only when the primary's BEACON is ALSO silent. A
+        // primary whose runtime is starved by a co-located build still emits
+        // its dedicated-thread beacon, so `primary_beacon_fresh` short-circuits
+        // the spurious failover; a genuine death (beacon also silent) arms it.
+        let mesh_says_dead =
             link_dead || primary_silence_exceeded || primary_left_membership_after_seen;
+        let need_election = mesh_says_dead && !primary_beacon_fresh;
 
         match &op.election {
             ElectionState::Normal if need_election => {
@@ -633,11 +682,24 @@ where
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
-        let primary_silent = self
+        let frame_silent = self
             .op_ref()
             .and_then(|op| op.primary_last_seen)
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(true);
+        // UNION with the beacon (mirror the arm-side `need_election`): a peer
+        // that armed an election against a CPU-starved-but-alive primary
+        // would otherwise pull our confirm on the frame-silence alone. The
+        // primary's beacon proves it is alive, so refuse to confirm while the
+        // beacon flows — a peer's spurious election cannot reach quorum
+        // through us. A genuine death (beacon also silent) leaves
+        // `primary_silent` true, so #317 convergence is intact.
+        let current_primary = self.cluster_state.current_primary().map(str::to_owned);
+        let beacon_fresh = current_primary
+            .as_deref()
+            .map(|id| self.primary_beacon_fresh(id))
+            .unwrap_or(false);
+        let primary_silent = frame_silent && !beacon_fresh;
         if !primary_silent {
             return None;
         }
