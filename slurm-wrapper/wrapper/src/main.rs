@@ -11,6 +11,7 @@
 //!   2. resolve podman/rm absolute paths               (`bin_resolve`)
 //!   3. install signalfd-based signal provenance       (`signals`)
 //!   4. spawn the out-of-cgroup shutdown manager        (`shutdown_spawn`)
+//!      (then: decouple workers from the login session  (`linger`))
 //!   5. pre-flight orphan-container sweep               (`preflight`)
 //!   6. detect the container memory cap                 (`memcap`)
 //!   7. resolve peer IPs + allocate ports + peer-info   (`network`)
@@ -34,6 +35,7 @@ mod bin_resolve;
 mod cgroup;
 mod dirs;
 mod image;
+mod linger;
 mod memcap;
 mod network;
 mod podman_run;
@@ -139,6 +141,38 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
     // --- 4. spawn out-of-cgroup shutdown manager (generate.rs:214-296) ---
     let wrapper_pid = std::process::id();
     let mode = shutdown_spawn::spawn(&cfg, &layout, &bins, wrapper_pid);
+
+    // --- 4.5 decouple the workers from the submitter login session ---
+    // FAIL-FAST gate: linger must be ON before any process lands in
+    // `user@<uid>.service`, otherwise a dropped submitter ssh session reaps
+    // the user manager and fan-kills this secondary. Run AFTER the shutdown
+    // manager spawn (so its bus probe sees the unmodified runtime) and
+    // BEFORE the container launch; on `Failed` we never start in a
+    // fan-kill-exposed state.
+    match linger::ensure_linger() {
+        linger::LingerState::AlreadyOn => {
+            tracing::info!(
+                target: LOG_TARGET,
+                "linger already enabled; workers decoupled from the submitter login session"
+            );
+        }
+        linger::LingerState::Enabled => {
+            tracing::info!(
+                target: LOG_TARGET,
+                "enabled linger for the run user; workers decoupled from the submitter login session"
+            );
+        }
+        linger::LingerState::Failed { reason } => {
+            tracing::error!(
+                target: LOG_TARGET,
+                %reason,
+                "FATAL: linger NOT enabled — workers are NOT decoupled from the submitter login \
+                 session; a submitter ssh drop will fan-kill this secondary. Set `loginctl \
+                 enable-linger <user>` for the run user and resubmit. Aborting before container launch."
+            );
+            return ExitCode::from(3);
+        }
+    }
 
     // --- 5. pre-flight orphan sweep (generate.rs:452-489) ---
     preflight::run(&bins.podman);
