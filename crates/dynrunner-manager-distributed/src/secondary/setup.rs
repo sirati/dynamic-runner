@@ -331,7 +331,7 @@ where
     pub(super) async fn wait_for_setup(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<super::RunOutcome>, String> {
         tracing::debug!("waiting for setup messages from primary");
 
         let mut got_peer_info = false;
@@ -339,6 +339,49 @@ where
         let mut got_transfer = false;
 
         while !got_peer_info || !got_assignment || !got_transfer {
+            // Terminal-exit backstop. A terminal CRDT flag set DURING setup
+            // (RunComplete / RunAborted) means the RUN IS OVER — even though
+            // the setup trio never completed and this secondary did no (or
+            // only partial) work. Tearing down is correct: the run-over cue
+            // SUPERSEDES the unfinished setup. The flag self-heals via
+            // anti-entropy (`cluster_state/digest.rs`,
+            // `state_digest.rs::is_behind`), so it lands here even if the
+            // live broadcast was missed. Without this check, a secondary
+            // still wedged in the trio-wait (never-connecting peer, transient
+            // stall) lingers to the `unconfigured_deadline` (600s) holding
+            // its SLURM job slot post-run-complete — the straggler symptom.
+            //
+            // The terminal recording + routing exactly MIRRORS the
+            // operational loop's flag-to-terminal mapping
+            // (`process_tasks.rs`): `run_aborted()` is checked BEFORE
+            // `run_complete()` because an abort is a hard cluster shutdown,
+            // both record the SAME lifecycle terminal the operational loop
+            // records (`enter_terminal_aborted` / `enter_terminal_done`), and
+            // `Some(RunOutcome::Terminal)` routes to the SAME line-1192
+            // teardown match the operational `process_tasks` return uses. The
+            // operational side additionally gates `run_complete` on
+            // `active_tasks.is_empty()`; here there are no active tasks (no
+            // dispatch happens pre-`Operational`), so the gate is vacuously
+            // satisfied and omitted. The trio-completion success exit
+            // (`Ok(None)` below) is untouched.
+            if let Some(reason) = self.cluster_state.run_aborted() {
+                let reason = reason.to_string();
+                tracing::error!(
+                    reason = %reason,
+                    "RunAborted observed during setup; tearing down without \
+                     waiting for setup to complete"
+                );
+                self.enter_terminal_aborted(reason);
+                return Ok(Some(super::RunOutcome::Terminal));
+            }
+            if self.cluster_state.run_complete() {
+                tracing::info!(
+                    "RunComplete observed during setup; tearing down without \
+                     waiting for setup to complete"
+                );
+                self.enter_terminal_done();
+                return Ok(Some(super::RunOutcome::Terminal));
+            }
             // Opaque inbound: the role inbound stream. During setup the
             // mesh is still forming, so the mesh-pump demuxes the primary's
             // setup frames onto this secondary's slot inbox as the primary
@@ -513,6 +556,18 @@ where
                             {
                                 self.apply_cluster_mutations(mutations);
                             }
+                            // A terminal flag (RunComplete / RunAborted) may
+                            // have JUST landed in the mirror above. Re-loop to
+                            // the single terminal-exit check at the loop head
+                            // INSTEAD of blocking on the next `recv_setup_frame`
+                            // — the run-over batch is frequently the primary's
+                            // last act before it drops the link, so waiting for
+                            // a further frame would fall through to the
+                            // `None => Err("primary disconnected")` arm instead
+                            // of the clean Done/Aborted teardown. The flag-check
+                            // logic lives in exactly one place (the loop head);
+                            // this `continue` just re-evaluates it eagerly.
+                            continue;
                         }
                         // `MessageType::RunConfig` is handled BEFORE the
                         // `enter_configuring` trigger above (pre-announce
@@ -527,7 +582,11 @@ where
             }
         }
 
-        Ok(())
+        // Trio completed: the NORMAL success exit. `Ok(None)` signals the
+        // orchestration to proceed to the operational handoff
+        // (`process_tasks`) — this path is unchanged by the terminal-exit
+        // backstop above.
+        Ok(None)
     }
 
     /// `AwaitingPrimary → Configuring` entry action, fired on the FIRST
