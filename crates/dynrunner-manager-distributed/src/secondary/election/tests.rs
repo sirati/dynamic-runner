@@ -118,7 +118,9 @@ async fn no_route_enters_election_and_never_aborts_a_voter() {
 #[tokio::test(flavor = "current_thread")]
 async fn two_survivor_fleet_reaches_quorum_and_promotes() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut sec = make_secondary(election_config("sec-a"));
+    // The one surviving peer is BOTH keepalive-tracked AND a transport member.
+    let (mut sec, _members) =
+        make_secondary_membership(election_config("sec-a"), vec![PeerId::from("sec-b")]);
     sec.enter_operational_for_test();
     // Exactly ONE surviving peer → live-fleet of two (self + sec-b).
     sec.op_mut()
@@ -295,7 +297,13 @@ fn failover_quorum_formula_is_single_source() {
 #[tokio::test(flavor = "current_thread")]
 async fn primary_dies_lowest_id_promotes() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Live peers are BOTH keepalive-tracked AND transport members (the
+    // production invariant `live_peer_ids` now enforces: a peer counts toward
+    // quorum only while it is a connected mesh member).
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("sec-b"), PeerId::from("sec-c")],
+    );
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
@@ -362,7 +370,18 @@ async fn primary_dies_lowest_id_promotes() {
 /// the remaining three live secondaries.
 #[tokio::test(flavor = "current_thread")]
 async fn double_failure_election_still_succeeds() {
-    let mut sec = make_secondary(election_config("sec-a"));
+    // All three peers are still connected mesh MEMBERS; sec-d is
+    // application-silent (won't answer the TimeoutQuery) but remains a
+    // member, so it stays in the quorum denominator (the slow-reaper backstop
+    // case, NOT a membership departure) — peer_count = 3, quorum = 3.
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![
+            PeerId::from("sec-b"),
+            PeerId::from("sec-c"),
+            PeerId::from("sec-d"),
+        ],
+    );
     sec.enter_operational_for_test();
     sec.op_mut()
         .peer_keepalives
@@ -721,7 +740,11 @@ async fn primary_changed_applies_with_epoch_lww() {
 /// instead of becoming Candidate.
 #[tokio::test(flavor = "current_thread")]
 async fn split_brain_lowest_id_wins() {
-    let mut sec_a = make_secondary(election_config("sec-a"));
+    // Each survivor's peers are BOTH keepalive-tracked AND transport members.
+    let (mut sec_a, _members_a) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("sec-b"), PeerId::from("sec-c")],
+    );
     sec_a.enter_operational_for_test();
     sec_a
         .op_mut()
@@ -733,7 +756,10 @@ async fn split_brain_lowest_id_wins() {
         .insert("sec-c".into(), std::time::Instant::now());
     sec_a.record_primary_message();
 
-    let mut sec_b = make_secondary(election_config("sec-b"));
+    let (mut sec_b, _members_b) = make_secondary_membership(
+        election_config("sec-b"),
+        vec![PeerId::from("sec-a"), PeerId::from("sec-c")],
+    );
     sec_b.enter_operational_for_test();
     sec_b
         .op_mut()
@@ -993,7 +1019,9 @@ async fn check_peer_timeouts_keys_on_receipt_not_wire_timestamp() {
     // monotonic receipt keying, a just-received keepalive is fresh.
     let mut cfg = election_config("sec-a");
     cfg.peer_timeout = Duration::from_secs(120);
-    let mut sec = make_secondary(cfg);
+    // sec-b is a connected mesh member (the live peer); sec-z is genuinely
+    // dead (departed) so it is NOT a member and must reap.
+    let (mut sec, _members) = make_secondary_membership(cfg, vec![PeerId::from("sec-b")]);
     sec.enter_operational_for_test();
 
     // A live peer (sec-b) whose pre-suspend keepalive carries an ANCIENT
@@ -1057,7 +1085,11 @@ async fn check_peer_timeouts_keys_on_receipt_not_wire_timestamp() {
 #[tokio::test(flavor = "current_thread")]
 async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut sec = make_secondary(election_config("sec-a"));
+    // Two peers (both connected members) so peer_count = 2 → quorum = 2.
+    let (mut sec, _members) = make_secondary_membership(
+        election_config("sec-a"),
+        vec![PeerId::from("sec-b"), PeerId::from("sec-c")],
+    );
     sec.enter_operational_for_test();
     // Two peers so peer_count = 2 → quorum = 2 (self + one agreeing peer).
     sec.op_mut()
@@ -1101,7 +1133,8 @@ async fn suspecting_tally_keys_on_relative_age_not_wall_clock() {
 
     // Now the contrast in isolation: a fresh age alone must NOT reach
     // quorum. Re-arm a clean Suspecting with ONLY a fresh-age responder.
-    let mut sec2 = make_secondary(election_config("sec-a"));
+    let (mut sec2, _members2) =
+        make_secondary_membership(election_config("sec-a"), vec![PeerId::from("sec-b")]);
     sec2.enter_operational_for_test();
     sec2.op_mut()
         .peer_keepalives
