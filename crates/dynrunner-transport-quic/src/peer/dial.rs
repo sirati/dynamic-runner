@@ -199,6 +199,7 @@ mod tests {
             ipv6: ipv6.map(|s| s.into()),
             port,
             is_observer: false,
+            liveness_port: None,
         }
     }
 

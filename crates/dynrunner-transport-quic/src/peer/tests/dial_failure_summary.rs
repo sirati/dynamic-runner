@@ -54,6 +54,7 @@ fn unreachable_peer_info() -> PeerConnectionInfo {
         ipv6: None,
         port: UNROUTABLE_PORT,
         is_observer: false,
+        liveness_port: None,
     }
 }
 

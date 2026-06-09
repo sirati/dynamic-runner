@@ -69,6 +69,10 @@ pub enum SetupBootstrapMessage {
         ipv4_address: Option<String>,
         ipv6_address: Option<String>,
         quic_port: u16,
+        /// UDP port this node's liveness-beacon listener is bound on (the
+        /// "primary on ANY peer" beacon target advert). Mirrors
+        /// [`DistributedMessage::CertExchange::liveness_port`].
+        liveness_port: Option<u16>,
     },
     /// Primary → all secondaries (broadcast): "Here is the full peer
     /// list — every secondary's id + cert + addresses + observer
@@ -122,6 +126,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 ipv4_address,
                 ipv6_address,
                 quic_port,
+                liveness_port,
             } => DistributedMessage::CertExchange {
                 target: None,
                 sender_id,
@@ -131,6 +136,7 @@ impl<I> From<SetupBootstrapMessage> for DistributedMessage<I> {
                 ipv4_address,
                 ipv6_address,
                 quic_port,
+                liveness_port,
             },
             SetupBootstrapMessage::PeerInfo {
                 sender_id,
@@ -191,6 +197,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 ipv4_address,
                 ipv6_address,
                 quic_port,
+                liveness_port,
                 target: _,
             } => Ok(SetupBootstrapMessage::CertExchange {
                 sender_id,
@@ -200,6 +207,7 @@ impl<I> TryFrom<DistributedMessage<I>> for SetupBootstrapMessage {
                 ipv4_address,
                 ipv6_address,
                 quic_port,
+                liveness_port,
             }),
             DistributedMessage::PeerInfo {
                 sender_id,

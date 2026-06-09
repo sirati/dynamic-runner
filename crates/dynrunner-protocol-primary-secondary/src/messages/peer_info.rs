@@ -36,4 +36,21 @@ pub struct PeerConnectionInfo {
     /// change.
     #[serde(default)]
     pub is_observer: bool,
+
+    /// UDP port this peer's liveness beacon is reachable on, paired with
+    /// [`Self::ipv4`] / [`Self::ipv6`]. The liveness beacon is a
+    /// transport-INDEPENDENT keepalive path: the primary binds a dedicated
+    /// `UdpSocket` on this port and a busy secondary's dedicated beacon
+    /// thread sends to `(ipv4, liveness_port)` on a cadence the secondary's
+    /// tokio runtime cannot starve (the runtime-CPU-starvation false-death
+    /// fix). It is a SEPARATE UDP socket from [`Self::port`] (the QUIC mesh
+    /// port quinn owns), reached over the SAME advertised LAN address the
+    /// mesh dials — never the bootstrap tunnel.
+    ///
+    /// `None` when the peer advertises no beacon (an older sender, or a
+    /// role that runs no listener); receivers simply skip beaconing to it.
+    /// `#[serde(default)]` keeps pre-beacon wire-senders compatible: the
+    /// omitted field deserializes to `None`.
+    #[serde(default)]
+    pub liveness_port: Option<u16>,
 }

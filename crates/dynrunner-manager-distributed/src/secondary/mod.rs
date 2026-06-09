@@ -187,6 +187,29 @@ where
     // Certificate info for peer connections (set before run)
     peer_cert_info: Option<PeerCertInfo>,
 
+    /// This node's OWN liveness-beacon listener UDP port, set by the run
+    /// boundary after it binds the listener (`set_liveness_port`).
+    /// Advertised in this node's `CertExchange.liveness_port` so peers
+    /// know where to beacon it once it becomes primary. `None` when no
+    /// listener was bound (channel-only fixtures, or a deployment without
+    /// the beacon).
+    liveness_port: Option<u16>,
+
+    /// The runtime→beacon-thread bridge: the current primary's liveness
+    /// `SocketAddr`. The coordinator PUBLISHES into it (whenever the
+    /// resolved primary or the peer-address view changes); the dedicated
+    /// beacon thread READS it each tick. Decouples the beacon (which must
+    /// survive runtime CPU-starvation) from the coordinator's mesh/role
+    /// state. A clone is handed to `LivenessBeacon::spawn` at the run
+    /// boundary; default (empty) until the first publish.
+    beacon_target: crate::liveness::BeaconTarget,
+
+    /// Per-peer liveness `SocketAddr`, captured from `PeerInfo`
+    /// (`PeerConnectionInfo.ipv4`/`liveness_port`). The sole input to
+    /// resolving `current_primary()` → a beacon target; rebuilt on each
+    /// `PeerInfo` and read when republishing `beacon_target`.
+    peer_liveness_addrs: std::collections::HashMap<String, std::net::SocketAddr>,
+
     /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
     /// this secondary's OWN workers fired (i.e. tasks actually
     /// dispatched to and executed by this node's worker pool). Distinct

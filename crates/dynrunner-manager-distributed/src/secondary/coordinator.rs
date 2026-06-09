@@ -89,6 +89,9 @@ where
             scheduler,
             estimator,
             peer_cert_info: None,
+            liveness_port: None,
+            beacon_target: crate::liveness::BeaconTarget::new(),
+            peer_liveness_addrs: std::collections::HashMap::new(),
             #[cfg(test)]
             local_tasks_run: 0,
             extraction_cache,
@@ -603,6 +606,23 @@ where
     /// if peer-to-peer QUIC is enabled.
     pub fn set_peer_cert_info(&mut self, info: PeerCertInfo) {
         self.peer_cert_info = Some(info);
+    }
+
+    /// Record this node's OWN liveness-beacon listener UDP port. Called by
+    /// the run boundary after it binds the [`crate::liveness::LivenessListener`],
+    /// BEFORE `run()` (so the value is on hand when `send_cert_exchange`
+    /// advertises it). Advertised in this node's
+    /// `CertExchange.liveness_port`.
+    pub fn set_liveness_port(&mut self, port: u16) {
+        self.liveness_port = Some(port);
+    }
+
+    /// A clone of the beacon-target cell. The run boundary hands this to
+    /// [`crate::liveness::LivenessBeacon::spawn`] so the dedicated beacon
+    /// thread reads the current primary's liveness address the coordinator
+    /// publishes into it.
+    pub fn beacon_target(&self) -> crate::liveness::BeaconTarget {
+        self.beacon_target.clone()
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers

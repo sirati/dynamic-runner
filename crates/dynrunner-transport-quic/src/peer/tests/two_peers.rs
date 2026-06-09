@@ -35,6 +35,7 @@ async fn two_peers_exchange_messages() {
                     ipv6: None,
                     port: port_a,
                     is_observer: false,
+                    liveness_port: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -43,6 +44,7 @@ async fn two_peers_exchange_messages() {
                     ipv6: None,
                     port: port_b,
                     is_observer: false,
+                    liveness_port: None,
                 },
             ];
 
@@ -114,6 +116,7 @@ async fn higher_id_does_not_dial_lower_id() {
                     ipv6: None,
                     port: port_low,
                     is_observer: false,
+                    liveness_port: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -122,6 +125,7 @@ async fn higher_id_does_not_dial_lower_id() {
                     ipv6: None,
                     port: port_high,
                     is_observer: false,
+                    liveness_port: None,
                 },
             ];
 

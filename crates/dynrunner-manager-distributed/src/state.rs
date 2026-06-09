@@ -44,6 +44,12 @@ pub struct SecondaryConnection<S> {
     /// welcome-advertised capability (`num_workers`, `resources`,
     /// `is_observer`, `can_be_primary`).
     pub can_be_primary: bool,
+    /// UDP port this peer's liveness-beacon listener is bound on, received
+    /// in `CertExchange`. Fanned out via
+    /// `peer_setup::send_peer_lists`'s `PeerConnectionInfo.liveness_port`
+    /// so every node can beacon this peer once it becomes primary (the
+    /// "primary on ANY peer" invariant). `None` for a pre-beacon sender.
+    pub liveness_port: Option<u16>,
     _state: PhantomData<S>,
 }
 
@@ -62,6 +68,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             transport: None,
             is_observer: false,
             can_be_primary: false,
+            liveness_port: None,
             _state: PhantomData,
         }
     }
@@ -102,6 +109,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -115,11 +123,13 @@ impl SecondaryConnection<Handshaking> {
         ipv4: Option<String>,
         ipv6: Option<String>,
         quic_port: u16,
+        liveness_port: Option<u16>,
     ) -> SecondaryConnection<CertExchanging> {
         self.cert_pem = Some(cert_pem);
         self.ipv4 = ipv4;
         self.ipv6 = ipv6;
         self.quic_port = quic_port;
+        self.liveness_port = liveness_port;
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
@@ -132,6 +142,7 @@ impl SecondaryConnection<Handshaking> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -152,6 +163,7 @@ impl SecondaryConnection<CertExchanging> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -172,6 +184,7 @@ impl SecondaryConnection<PeerDiscovery> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -192,6 +205,7 @@ impl SecondaryConnection<InitialAssigning> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -212,6 +226,7 @@ impl SecondaryConnection<Operational> {
             transport: self.transport,
             is_observer: self.is_observer,
             can_be_primary: self.can_be_primary,
+            liveness_port: self.liveness_port,
             _state: PhantomData,
         }
     }
@@ -327,6 +342,22 @@ impl SecondaryConnectionState {
         }
     }
 
+    /// Liveness-beacon UDP port this peer advertised in its
+    /// `CertExchange`. `None` until cert-exchange lands (or a pre-beacon
+    /// sender). Fanned out via `PeerConnectionInfo.liveness_port` so peers
+    /// know where to beacon this node once it becomes primary.
+    pub fn liveness_port(&self) -> Option<u16> {
+        match self {
+            Self::AwaitingWelcome(c) => c.liveness_port,
+            Self::Handshaking(c) => c.liveness_port,
+            Self::CertExchanging(c) => c.liveness_port,
+            Self::PeerDiscovery(c) => c.liveness_port,
+            Self::InitialAssigning(c) => c.liveness_port,
+            Self::Operational(c) => c.liveness_port,
+            Self::ShuttingDown(c) => c.liveness_port,
+        }
+    }
+
     /// Observer mode (task #36). False until receive_welcome carries
     /// the flag — pre-welcome states default to false, which matches
     /// the "regular secondary" wire-compat default.
@@ -417,8 +448,10 @@ mod tests {
             Some("10.0.0.1".into()),
             Some("2001:db8::1".into()),
             5001,
+            Some(5002),
         );
         assert_eq!(conn.quic_port, 5001);
+        assert_eq!(conn.liveness_port, Some(5002));
         // Both address families round-trip the typestate transition
         // unchanged — the dialer needs both to populate its
         // happy-eyeballs candidate set. Regression test for the
@@ -457,6 +490,7 @@ mod tests {
             Some("10.0.0.2".into()),
             Some("2001:db8::2".into()),
             5000,
+            None,
         );
 
         let state = SecondaryConnectionState::CertExchanging(conn);

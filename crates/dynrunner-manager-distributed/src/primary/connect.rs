@@ -368,6 +368,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             ipv4_address,
             ipv6_address,
             quic_port,
+            liveness_port,
             ..
         } = msg
             && let Some(state) = self.secondaries.remove(&secondary_id)
@@ -380,6 +381,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     ipv4_address,
                     ipv6_address,
                     quic_port,
+                    liveness_port,
                 );
                 self.secondaries.insert(
                     secondary_id.clone(),

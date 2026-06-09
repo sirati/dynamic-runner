@@ -72,6 +72,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv6: None,
                     port: peer_a.port(),
                     is_observer: false,
+                    liveness_port: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -80,6 +81,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv6: None,
                     port: peer_b.port(),
                     is_observer: false,
+                    liveness_port: None,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-c".into(),
@@ -88,6 +90,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv6: None,
                     port: peer_c.port(),
                     is_observer: false,
+                    liveness_port: None,
                 },
             ];
 

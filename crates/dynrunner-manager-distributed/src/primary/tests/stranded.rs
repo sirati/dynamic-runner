@@ -108,6 +108,7 @@ async fn fake_secondary_dies_post_mesh_ready(
             ipv4_address: Some("127.0.0.1".into()),
             ipv6_address: None,
             quic_port: 5000,
+            liveness_port: None,
         })
         .unwrap();
     outgoing_to_primary
@@ -180,6 +181,7 @@ async fn fake_secondary_dies_at_transfer_complete(
             ipv4_address: Some("127.0.0.1".into()),
             ipv6_address: None,
             quic_port: 5000,
+            liveness_port: None,
         })
         .unwrap();
     outgoing_to_primary

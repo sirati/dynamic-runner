@@ -693,6 +693,15 @@ impl PyDistributedManager {
                             source_pre_staged_root: promote_pre_staged_root,
                             source_dir: promote_source_dir,
                             setup_discovery: sec_setup_discovery,
+                            // In-process `--multi-computer local`: the
+                            // liveness-beacon UDP path is wired only on the
+                            // separate-process SLURM secondary today (the
+                            // confirmed CPU-starvation-false-death case). The
+                            // in-process path keeps the frame-only death-clock
+                            // (its pre-existing behaviour) — flagged as a
+                            // follow-up (loopback beacon between in-process
+                            // threads). No regression: `None` = no beacon rx.
+                            liveness_ping_rx: None,
                         });
 
                         let node = node.with_secondary(secondary, sec_slot);

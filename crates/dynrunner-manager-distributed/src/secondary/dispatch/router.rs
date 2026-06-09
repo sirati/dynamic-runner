@@ -629,7 +629,7 @@ where
                 }
                 Ok(())
             }
-            DistributedMessage::PeerInfo { peers: _, .. } => {
+            DistributedMessage::PeerInfo { peers, .. } => {
                 // Observer-set replication no longer rides PeerInfo:
                 // the primary originates one
                 // `ClusterMutation::PeerJoined { is_observer: true }`
@@ -644,6 +644,13 @@ where
                 // paths. The `PeerConnectionInfo.is_observer` field
                 // remains on the wire frame for backwards
                 // compatibility but is not consumed here.
+                //
+                // The liveness-beacon path DOES consume PeerInfo: rebuild
+                // the id→liveness-address view + re-point the beacon, so a
+                // mid-run roster update (a peer's liveness port changed /
+                // newly advertised) is reflected. Single concern: address
+                // capture for the beacon; no role/CRDT side effect.
+                self.ingest_peer_liveness_addrs(&peers);
                 Ok(())
             }
             DistributedMessage::RunConfig { forwarded_argv, .. } => {

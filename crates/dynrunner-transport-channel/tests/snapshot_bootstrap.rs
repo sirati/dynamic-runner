@@ -241,6 +241,7 @@ async fn join_running_cluster_returns_snapshot_with_capabilities() {
             ipv6: None,
             port: 0,
             is_observer: *id == "observer-peer",
+            liveness_port: None,
         })
         .collect();
 
@@ -389,6 +390,7 @@ async fn join_running_cluster_collects_all_responders_for_union() {
             ipv6: None,
             port: 0,
             is_observer: false,
+            liveness_port: None,
         })
         .collect();
 
@@ -457,6 +459,7 @@ async fn join_running_cluster_empty_seed_errors_fast() {
         ipv6: None,
         port: 0,
         is_observer: false,
+        liveness_port: None,
     }];
 
     // Short timeout: with no candidates the connect-loop's

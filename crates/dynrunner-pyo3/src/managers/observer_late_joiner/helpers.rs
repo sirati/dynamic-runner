@@ -78,6 +78,12 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
                 ipv6: r.ipv6.clone(),
                 port: quic_port,
                 is_observer: r.is_observer.unwrap_or(false),
+                // These reconstructed records seed the late-joiner's QUIC
+                // DIAL set, not a liveness beacon: the late joiner is an
+                // observer (no workers → never reaped → emits no beacon).
+                // The on-disk peer-info-dir record carries no liveness port,
+                // and the observer needs none, so `None`.
+                liveness_port: None,
             })
         })
         .collect()

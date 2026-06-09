@@ -758,6 +758,16 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// when the respawn policy is disabled).
     pub(super) respawn_request_rx: Option<tokio::sync::mpsc::UnboundedReceiver<RespawnRequest>>,
 
+    /// Receiver side of the liveness-beacon listener → operational-loop
+    /// channel. The [`crate::liveness::LivenessListener`] (bound on this
+    /// node's runtime by the run boundary) forwards each decoded beacon's
+    /// node-id here; the operational loop drains it and calls
+    /// `record_keepalive` — the UNION half of the death-clock (a secondary
+    /// is reaped iff its beacon AND its mesh frames are both absent for the
+    /// threshold). `None` when no listener was wired (channel-only
+    /// fixtures), in which case the loop arm parks on `pending()`.
+    pub(super) liveness_ping_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
     /// Construction-time primary endpoint and pubkey snapshot used
     /// to build [`SecondarySpawnSpec`]. The per-provider spawner
     /// adapters cache their own copies (see
@@ -1031,6 +1041,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             tunnel_reconnector: None,
             respawn_request_tx: None,
             respawn_request_rx: None,
+            liveness_ping_rx: None,
             respawn_primary_endpoint: String::new(),
             respawn_primary_pubkey_pem: String::new(),
             preferred_secondaries_validator:
@@ -1431,6 +1442,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // `register_lifecycle_listener` (which this call delegates
         // to under the hood).
         self.register_lifecycle_listener(respawn_dispatcher_listener(tx));
+    }
+
+    /// Install the liveness-beacon ping receiver (from a
+    /// [`crate::liveness::LivenessListener`] the run boundary bound on
+    /// this node's runtime). Must be called BEFORE `run()` enters — the
+    /// operational loop takes it out at run start, mirroring
+    /// `respawn_request_rx`. Each forwarded node-id refreshes that
+    /// secondary's death-clock as the UNION half (beacon OR mesh frame).
+    pub fn set_liveness_ping_rx(&mut self, rx: tokio::sync::mpsc::UnboundedReceiver<String>) {
+        self.liveness_ping_rx = Some(rx);
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers

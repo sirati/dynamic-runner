@@ -155,6 +155,10 @@ where
             ipv4_address: ipv4,
             ipv6_address: ipv6,
             quic_port: port,
+            // Advertise this node's liveness-beacon listener port so peers
+            // can beacon it once it becomes primary (the "primary on ANY
+            // peer" invariant). `None` when no listener was bound.
+            liveness_port: self.liveness_port,
         };
         self.send_setup_frame(msg).await
     }
@@ -488,7 +492,15 @@ where
                                 // (it operates on this coordinator's own
                                 // `MeshFormation` sub-concern, which the
                                 // coordinator still owns).
-                                let _ = peers;
+                                //
+                                // The liveness-beacon path DOES consume the
+                                // roster here: capture each peer's
+                                // id→liveness-address so the beacon can target
+                                // whichever peer is/becomes primary, and
+                                // re-point it. Address capture only — no
+                                // role/CRDT/membership decision (those stay
+                                // the Node/CRDT concerns above).
+                                self.ingest_peer_liveness_addrs(peers);
                                 // Arm the peer-mesh watchdog. 30s = 10s
                                 // QUIC timeout + 10s WSS fallback timeout
                                 // + 10s slack for the accept side to

@@ -96,7 +96,7 @@ fn register_secondary_with_workers(
             false,
             false,
         )
-        .receive_cert_exchange(String::new(), None, None, 0)
+        .receive_cert_exchange(String::new(), None, None, 0, None)
         .begin_peer_discovery()
         .peers_ready()
         .assignments_sent();

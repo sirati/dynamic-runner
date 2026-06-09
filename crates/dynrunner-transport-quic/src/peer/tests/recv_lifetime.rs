@@ -59,6 +59,7 @@ async fn recv_peer_tick_survives_outer_drop() {
                     ipv6: None,
                     port: 1,
                     is_observer: false,
+                    liveness_port: None,
                 },
             );
             assert_eq!(peer.reconnect_tracker.tracked_count(), 0);
