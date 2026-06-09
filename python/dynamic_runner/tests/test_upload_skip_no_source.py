@@ -7,18 +7,69 @@ such items, not blindly ``scp`` a path that does not exist (which OSErrored
 the whole SLURM dispatch before any job ran). Mirrors the Rust
 ``crates/dynrunner-slurm/tests/upload.rs::skip_in_tree_nonexistent``.
 
-Drives the real production method (``SlurmJobManager.upload_source_binaries``)
-with a recording gateway; constructs the manager via ``__new__`` so the
-``__init__`` Rust delegate (which needs a real gateway/config) is bypassed —
-the method only reads ``self.gateway`` / ``self.slurm_config``.
+Direct-file module loading (mirroring `test_cli_validation.py`) so the suite
+runs in a bare `nix develop` shell without the compiled `_native` extension:
+``job_manager`` imports ``_native`` / ``deployment_spec`` / ``packaging.podman``
+at module load, so those are stubbed before the target is loaded. The tested
+method (``upload_source_binaries``) touches none of them — it reads only
+``self.gateway`` / ``self.slurm_config`` — and the manager is built via
+``__new__`` to bypass the ``__init__`` Rust delegate.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+import importlib.util
+import pathlib
+import sys
+import tempfile
+import types
+import unittest
 from types import SimpleNamespace
 
-from dynamic_runner.packaging.job_manager import SlurmJobManager
+
+def _setup_stubs() -> pathlib.Path:
+    here = pathlib.Path(__file__).resolve()
+    package_root = here.parent.parent  # python/dynamic_runner
+    pkg_stubs = {
+        "dynamic_runner": str(package_root),
+        "dynamic_runner.packaging": str(package_root / "packaging"),
+    }
+    for name, path in pkg_stubs.items():
+        if name not in sys.modules:
+            pkg = types.ModuleType(name)
+            pkg.__path__ = [path]
+            sys.modules[name] = pkg
+    # job_manager's module-level relative imports — stubbed (only referenced
+    # in __init__ / non-tested methods, which this suite does not exercise).
+    leaf_stubs = {
+        "dynamic_runner._native": {"RustSlurmJobManager": object},
+        "dynamic_runner.deployment_spec": {"TaskDeploymentSpec": object},
+        "dynamic_runner.packaging.podman": {"PodmanImageMetadata": object},
+    }
+    for name, attrs in leaf_stubs.items():
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            for attr, val in attrs.items():
+                setattr(mod, attr, val)
+            sys.modules[name] = mod
+    return package_root
+
+
+def _load_job_manager():
+    package_root = _setup_stubs()
+    fullname = "dynamic_runner.packaging.job_manager"
+    if fullname in sys.modules:
+        return sys.modules[fullname]
+    target = package_root / "packaging" / "job_manager.py"
+    spec = importlib.util.spec_from_file_location(fullname, target)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fullname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+SlurmJobManager = _load_job_manager().SlurmJobManager
 
 
 class _RecordingGateway:
@@ -45,30 +96,37 @@ def _manager(gateway: _RecordingGateway) -> SlurmJobManager:
     return mgr
 
 
-def test_skip_in_tree_nonexistent(tmp_path: Path) -> None:
-    """A computed/producer item (no backing file under --source) is skipped,
-    not stat+scp'd."""
-    gw = _RecordingGateway()
-    mgr = _manager(gw)
-    binaries = [SimpleNamespace(path="matrix_eval__bzip2.json")]
+class UploadSkipNoSourceTests(unittest.TestCase):
+    def test_skip_in_tree_nonexistent(self) -> None:
+        """A computed/producer item (no backing file under --source) is
+        skipped, not stat+scp'd."""
+        gw = _RecordingGateway()
+        mgr = _manager(gw)
+        with tempfile.TemporaryDirectory() as tmp:
+            mgr.upload_source_binaries(
+                [SimpleNamespace(path="matrix_eval__bzip2.json")],
+                pathlib.Path(tmp),
+            )
+        self.assertEqual(gw.transfers, [], "nonexistent in-tree item must be skipped")
 
-    mgr.upload_source_binaries(binaries, tmp_path)
+    def test_existing_uploads_nonexistent_skipped(self) -> None:
+        """Selective skip: an existing in-tree file uploads while a
+        nonexistent sibling in the same call is skipped and the loop
+        continues."""
+        gw = _RecordingGateway()
+        mgr = _manager(gw)
+        with tempfile.TemporaryDirectory() as tmp:
+            (pathlib.Path(tmp) / "real.bin").write_bytes(b"x")
+            mgr.upload_source_binaries(
+                [
+                    SimpleNamespace(path="real.bin"),
+                    SimpleNamespace(path="matrix_eval__bzip2.json"),
+                ],
+                pathlib.Path(tmp),
+            )
+        self.assertEqual(len(gw.transfers), 1, "only the existing in-tree file uploads")
+        self.assertEqual(gw.transfers[0][1], "/remote/srcbins/real.bin")
 
-    assert gw.transfers == [], "nonexistent in-tree item must be skipped"
 
-
-def test_existing_uploads_nonexistent_skipped(tmp_path: Path) -> None:
-    """Selective skip: an existing in-tree file uploads while a nonexistent
-    sibling in the same call is skipped and the loop continues."""
-    (tmp_path / "real.bin").write_bytes(b"x")
-    gw = _RecordingGateway()
-    mgr = _manager(gw)
-    binaries = [
-        SimpleNamespace(path="real.bin"),
-        SimpleNamespace(path="matrix_eval__bzip2.json"),
-    ]
-
-    mgr.upload_source_binaries(binaries, tmp_path)
-
-    assert len(gw.transfers) == 1, "only the existing in-tree file uploads"
-    assert gw.transfers[0][1] == "/remote/srcbins/real.bin"
+if __name__ == "__main__":
+    unittest.main()
