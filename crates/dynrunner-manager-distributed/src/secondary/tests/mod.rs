@@ -31,6 +31,13 @@
 //!   gated on `primary_last_seen.is_some()` (no relocation-window false-arm),
 //!   self-cancelling on a flicker, and a gap-closure control proving the
 //!   election is membership-armed.
+//! - [`failover_lone_survivor`] — lone-survivor failover convergence: the
+//!   failover-quorum denominator (`live_peer_ids`) intersects `peer_keepalives`
+//!   with the live transport `MembershipView`, so a peer that DEPARTED
+//!   membership on a simultaneous kill stops inflating the quorum within one
+//!   pump cycle (the fast signal) instead of lingering the full `peer_timeout`
+//!   (300s) reaper window — the lone survivor's quorum shrinks to 1 and it
+//!   self-promotes; a still-present peer is NOT over-shrunk (split-brain safe).
 //! - [`failover_multi_survivor`] — multi-survivor failover convergence under
 //!   abrupt-crash membership-eviction divergence: the lex-lowest survivor
 //!   re-polls (`TimeoutQuery` re-emitted each waiting Suspecting tick) so a
@@ -57,6 +64,7 @@
 
 mod anti_entropy_heal;
 mod failover_beacon_union;
+mod failover_lone_survivor;
 mod failover_membership;
 mod failover_multi_survivor;
 mod honest_liveness;

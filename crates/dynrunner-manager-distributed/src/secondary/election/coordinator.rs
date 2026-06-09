@@ -142,7 +142,10 @@ where
     }
 
     /// The live mesh peers for failover quorum/candidate reasoning: the
-    /// keys of `peer_keepalives` MINUS the current primary's host id.
+    /// keys of `peer_keepalives`, MINUS the current primary's host id, AND
+    /// INTERSECTED with the live transport `MembershipView` — a peer counts
+    /// toward quorum only if it is BOTH keepalive-tracked AND a currently
+    /// connected mesh member.
     ///
     /// A host that runs primary+secondary under one peer-id emits a
     /// `Secondary` keepalive that lands in `peer_keepalives` even though its
@@ -154,8 +157,37 @@ where
     /// is the single quorum-side counterpart to the peer-timeout sweep's
     /// own current-primary skip (`check_peer_timeouts`), both keyed on the
     /// single source of "who is primary now" (`current_primary()`).
+    ///
+    /// TWO honest death signals, mirroring the primary-side union legs the
+    /// arm path uses (`run_election_tick`): a peer is dropped from this
+    /// quorum denominator the instant EITHER signal says it is gone —
+    ///   - the FAST `MembershipView` departure (`client.has_peer`): when a
+    ///     peer's QUIC connection tears down the mesh-pump's
+    ///     `handle_peer_disconnect` republishes the view WITHOUT it within
+    ///     one pump cycle — the SAME idle-independent signal leg (C) reads
+    ///     for the primary. This is what lets a lone survivor's quorum shrink
+    ///     to the truly-live fleet PROMPTLY on a simultaneous peer loss,
+    ///     instead of waiting out the slow `peer_timeout` (300s prod) reaper
+    ///     — the lone-survivor wedge fix. In the supported topology
+    ///     (reliable, non-firewalled inter-compute networking) a peer absent
+    ///     from membership is DEAD, not partitioned, so dropping it is
+    ///     correct; a TRULY-lone (never-meshed) secondary is still stopped
+    ///     UPSTREAM by the formation-time `mesh_degraded` guard, which is
+    ///     about never-having-meshed, not meshed-then-departed.
+    ///   - the SLOW `peer_keepalives` reaper (`check_peer_timeouts`): the
+    ///     backstop for a peer still nominally a transport member but
+    ///     application-silent past `peer_timeout`.
+    ///
+    /// The intersection means a freshly-departed-but-not-yet-reaped peer
+    /// (the live wedge: gone from membership, still in `peer_keepalives`
+    /// because the 300s reaper has not fired) is correctly excluded NOW.
     pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
         let current_primary = self.cluster_state.current_primary();
+        // The live transport membership view is read off the same
+        // `MeshClient` leg (C) uses for the primary. A disjoint `&self`
+        // field from `cluster_state` / the operational state, so all three
+        // shared borrows coexist.
+        let client = &self.client;
         // `peer_keepalives` now lives in `OperationalState`; outside
         // `Operational` there are no peer keepalives to enumerate (the
         // election that calls this only runs `Operational`), so an empty
@@ -166,6 +198,11 @@ where
             .into_iter()
             .flat_map(|op| op.peer_keepalives.keys())
             .filter(move |id| Some(id.as_str()) != current_primary)
+            .filter(move |id| {
+                client.has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(
+                    id.as_str(),
+                ))
+            })
     }
 
     /// The role-aware "alive secondaries" set — the single coordinator

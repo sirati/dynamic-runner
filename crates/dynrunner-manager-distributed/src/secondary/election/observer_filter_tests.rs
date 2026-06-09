@@ -1,7 +1,10 @@
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, election_config, make_secondary};
+use super::super::test_helpers::{
+    FakeWorkerFactory, election_config, make_secondary, make_secondary_membership,
+};
 use super::*;
+use dynrunner_protocol_primary_secondary::address::PeerId;
 use std::time::Duration;
 
 const PAST_DEATH: Duration = Duration::from_millis(110);
@@ -21,7 +24,10 @@ const ONE_INTERVAL: Duration = Duration::from_millis(60);
 #[tokio::test(flavor = "current_thread")]
 async fn non_observer_filters_observer_from_lowest_alive() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
-    let mut sec = make_secondary(election_config("sec-b"));
+    // obs-a is a connected mesh member (a live observer peer that answers the
+    // TimeoutQuery), so it is in the quorum denominator (peer_count = 1).
+    let (mut sec, _members) =
+        make_secondary_membership(election_config("sec-b"), vec![PeerId::from("obs-a")]);
     sec.enter_operational_for_test();
     // obs-a is registered as a peer AND marked observer.
     sec.op_mut()
@@ -149,7 +155,9 @@ async fn primary_changed_naming_observer_is_rejected() {
 async fn role_table_observers_drives_filter_and_promote_rejection() {
     use dynrunner_protocol_primary_secondary::ClusterMutation;
 
-    let mut sec = make_secondary(election_config("sec-b"));
+    // obs-a is a connected mesh member (live observer peer in the denominator).
+    let (mut sec, _members) =
+        make_secondary_membership(election_config("sec-b"), vec![PeerId::from("obs-a")]);
     sec.enter_operational_for_test();
     // Production path: `PeerJoined { is_observer: true }` apply
     // populates the role table.
