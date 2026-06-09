@@ -16,19 +16,17 @@ use tokio::process::{Child, Command};
 
 use super::options::{PrepError, PreparationOptions};
 
-/// Build the argv for `ssh -N -R <tunnel_port>:localhost:<primary> ...`
-/// per the Python implementation's shape — including the auth-options-
-/// aware ProxyCommand workaround for OpenSSH 7.3+.
+/// Push the shared ssh-invocation prologue — `ssh`, the gateway
+/// auth options, and the ProxyJump (`-J` / `ProxyCommand`) hop — onto
+/// `argv`. Every per-compute ssh invocation (the reverse tunnel AND
+/// the pre-rebind port release) jumps through the gateway identically;
+/// centralising the prologue here is the single source of truth for
+/// the OpenSSH 7.3+ ProxyCommand workaround so the two call sites can
+/// never drift.
 ///
-/// Pure (no I/O), so the argv shape is unit-testable without spawning
-/// a real subprocess.
-pub(super) fn build_ssh_argv(
-    remote_host: &str,
-    tunnel_port: u16,
-    primary_quic_port: u16,
-    opts: &PreparationOptions,
-) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["ssh".into()];
+/// Pure (no I/O).
+fn push_jump_prologue(argv: &mut Vec<String>, opts: &PreparationOptions) {
+    argv.push("ssh".into());
     argv.extend(opts.auth_options.iter().cloned());
 
     let jump_target = match &opts.gateway_user {
@@ -62,6 +60,31 @@ pub(super) fn build_ssh_argv(
         argv.push("-J".into());
         argv.push(jump_with_port);
     }
+}
+
+/// The `<user>@<host>` ssh target for the compute node. Remote user
+/// defaults to gateway_user, then "root" — matches Python; the actual
+/// SLURM compute node typically isn't logged into so this is the
+/// master tunnel hop's user.
+fn remote_target(remote_host: &str, opts: &PreparationOptions) -> String {
+    let remote_user = opts.gateway_user.as_deref().unwrap_or("root");
+    format!("{remote_user}@{remote_host}")
+}
+
+/// Build the argv for `ssh -N -R <tunnel_port>:localhost:<primary> ...`
+/// per the Python implementation's shape — including the auth-options-
+/// aware ProxyCommand workaround for OpenSSH 7.3+.
+///
+/// Pure (no I/O), so the argv shape is unit-testable without spawning
+/// a real subprocess.
+pub(super) fn build_ssh_argv(
+    remote_host: &str,
+    tunnel_port: u16,
+    primary_quic_port: u16,
+    opts: &PreparationOptions,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    push_jump_prologue(&mut argv, opts);
 
     argv.push("-R".into());
     argv.push(format!("{tunnel_port}:localhost:{primary_quic_port}"));
@@ -71,11 +94,7 @@ pub(super) fn build_ssh_argv(
         argv.push(format!("{gateway_port}:localhost:{local_port}"));
     }
 
-    // Remote user defaults to gateway_user, then "root" — matches
-    // Python; the actual SLURM compute node typically isn't
-    // logged into so this is the master tunnel hop's user.
-    let remote_user = opts.gateway_user.as_deref().unwrap_or("root");
-    argv.push(format!("{remote_user}@{remote_host}"));
+    argv.push(remote_target(remote_host, opts));
     argv.extend([
         "-N".into(),
         "-o".into(),
@@ -111,6 +130,116 @@ pub(super) fn build_ssh_argv(
     argv
 }
 
+/// The targeted remote command that releases a single stale reverse-
+/// tunnel listener on the compute node. Kills ONLY the process bound
+/// to `tunnel_port/tcp` — the worker-side sshd session that still
+/// holds the `-R <tunnel_port>` forwarding from a dropped tunnel.
+///
+/// This is the worker-side mirror of the local teardown's targeted
+/// kill (`pkill 'ssh.*-R [0-9]+:localhost'` in
+/// [`crate::pipeline::pkill_residual_reverse_tunnels`]): both kill
+/// exactly the per-secondary reverse-tunnel holder for one port, never
+/// a broad sweep that could hit a live tunnel. `fuser -k` is preferred
+/// (one syscall-precise kill of the socket owner); the `ss`+`kill`
+/// fallback covers nodes without psmisc. `:= true` keeps the overall
+/// command exit-0 when the port is ALREADY free (the graceful-close
+/// case — nothing to release), so the release step is a harmless no-op
+/// there rather than a spurious failure.
+fn build_release_remote_cmd(tunnel_port: u16) -> String {
+    format!(
+        "fuser -k {port}/tcp 2>/dev/null \
+         || (ss -tlnpH 'sport = :{port}' 2>/dev/null \
+             | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u \
+             | xargs -r kill 2>/dev/null) \
+         ; true",
+        port = tunnel_port
+    )
+}
+
+/// Build the argv for the pre-rebind port-release ssh command: the
+/// same gateway jump + compute-node target as the reverse tunnel, but
+/// running [`build_release_remote_cmd`] instead of holding a `-N -R`
+/// forward. No `ExitOnForwardFailure` / keepalive — this is a short
+/// one-shot remote command, not a long-lived tunnel.
+///
+/// Pure (no I/O), so the argv shape is unit-testable without spawning
+/// a real subprocess.
+pub(super) fn build_release_argv(
+    remote_host: &str,
+    tunnel_port: u16,
+    opts: &PreparationOptions,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    push_jump_prologue(&mut argv, opts);
+    argv.push(remote_target(remote_host, opts));
+    argv.extend([
+        "-o".into(),
+        "StrictHostKeyChecking=no".into(),
+        "-o".into(),
+        "UserKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        // Short bounded handshake — don't let a wedged release soak
+        // the per-tunnel budget; the rebind retry will try again.
+        "ConnectTimeout=10".into(),
+    ]);
+    argv.push(build_release_remote_cmd(tunnel_port));
+    argv
+}
+
+/// Force-release a stale worker-side `-R <tunnel_port>` binding before
+/// a rebind, then return.
+///
+/// Best-effort by contract: a failure here (release-ssh couldn't reach
+/// the node, kill tool missing, …) is logged and swallowed — the
+/// subsequent rebind still runs, and if the port was genuinely free
+/// the rebind succeeds regardless. The release exists so that the
+/// UNGRACEFUL-drop case (where the worker's sshd still holds the
+/// listener, with no FIN/RST to prompt-release it) stops failing the
+/// same-port rebind with rc=255 "remote port forwarding failed".
+async fn release_stale_reverse_port(
+    secondary_id: &str,
+    remote_host: &str,
+    tunnel_port: u16,
+    opts: &PreparationOptions,
+) {
+    let argv = build_release_argv(remote_host, tunnel_port, opts);
+    tracing::info!(
+        secondary_id,
+        tunnel_port,
+        "releasing stale worker-side reverse-tunnel binding before rebind"
+    );
+    tracing::debug!(secondary_id, cmd = %shell_join(&argv), "release argv");
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    match cmd.output().await {
+        Ok(out) => {
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::warn!(
+                    secondary_id,
+                    tunnel_port,
+                    rc = ?out.status.code(),
+                    stderr = %stderr.trim(),
+                    "stale-port release command returned non-zero; proceeding with rebind anyway"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                secondary_id,
+                tunnel_port,
+                error = %e,
+                "stale-port release ssh failed to spawn; proceeding with rebind anyway"
+            );
+        }
+    }
+}
+
 /// Build the production spawner closure passed into
 /// [`establish_one_tunnel_inner`]. Captures `(secondary_id, opts,
 /// primary_quic_port)` by move so the returned closure is `'static`
@@ -127,6 +256,40 @@ pub(super) fn production_spawner(
         let secondary_id = secondary_id.clone();
         let opts = opts.clone();
         Box::pin(async move {
+            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
+        })
+    }
+}
+
+/// Build the OBSERVER-RECONNECT spawner closure: identical to
+/// [`production_spawner`] except it FIRST force-releases any stale
+/// worker-side `-R <tunnel_port>` binding (the listener an ungraceful
+/// drop left bound on the worker's sshd) before re-spawning the
+/// reverse tunnel on the SAME port.
+///
+/// Why the release belongs in the spawner (not the establishment
+/// policy): the policy engine ([`establish_tunnel`]) is concern-blind
+/// — it owns retry/rate-limit/timeout and calls the spawner opaquely.
+/// "Free the remote port before this handshake" is an ssh-wire-up
+/// concern, so it lives here in the ssh module and rides the same
+/// spawner DI seam the tests use. The release runs once per spawn
+/// attempt: on the rare case where the first release races the worker
+/// sshd's own teardown, a retry attempt re-releases and rebinds.
+///
+/// `tunnel_port` is unchanged (option-A "same port"): it is the
+/// worker's own fixed listen port written into the info file at worker
+/// startup, which the worker's mesh dials as `localhost:<tunnel_port>`
+/// — a fresh port would break that dial with no re-coordination path.
+pub(super) fn reconnect_spawner(
+    secondary_id: String,
+    opts: PreparationOptions,
+    primary_quic_port: u16,
+) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
+    move |host: String, tunnel_port: u16| {
+        let secondary_id = secondary_id.clone();
+        let opts = opts.clone();
+        Box::pin(async move {
+            release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
             spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
         })
     }

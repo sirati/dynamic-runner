@@ -18,7 +18,7 @@ use tokio::task::JoinSet;
 
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
-use super::ssh::{production_spawner, terminate_child};
+use super::ssh::{production_spawner, reconnect_spawner, terminate_child};
 
 /// Lifecycle for the SLURM preparation phase. Owns spawned `ssh -N -R`
 /// subprocess handles and tears them down on cleanup().
@@ -267,6 +267,74 @@ impl SlurmPreparation {
         let id_owned = secondary_id.to_owned();
 
         let spawner = production_spawner(id_owned.clone(), opts.clone(), primary_quic_port);
+        let _port = establish_one_tunnel_inner(
+            &id_owned,
+            &info_path,
+            primary_quic_port,
+            &opts,
+            reader,
+            &tunnels,
+            &port_map,
+            &establish_pool,
+            spawner,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// REBUILD a dropped reverse tunnel for an EXISTING secondary whose
+    /// `-R` link the (passive, zero-authority) observer lost — the
+    /// observer-reconnect path. Identical to [`Self::establish_one_tunnel`]
+    /// (re-poll the info file, re-spawn `ssh -N -R`, verify, join the
+    /// shared cleanup set) EXCEPT the injected spawner first force-
+    /// releases the stale worker-side `-R <tunnel_port>` binding before
+    /// rebinding the SAME port.
+    ///
+    /// Why a distinct entry point rather than a flag on
+    /// `establish_one_tunnel`: the two paths cross the SAME
+    /// establishment seam ([`establish_one_tunnel_inner`]) and differ
+    /// in exactly ONE injected dependency — the spawner. The respawn
+    /// path establishes a tunnel for a node the primary just spawned
+    /// (no prior binding can exist on a fresh node), so it must NOT pay
+    /// the release round-trip; the observer-reconnect path rebuilds an
+    /// EXISTING node's dropped tunnel, where an ungraceful drop leaves
+    /// the worker's sshd holding the old listener and the same-port
+    /// rebind collides (rc=255) unless the stale binding is released
+    /// first. Same inner, different spawner — no duplicated control
+    /// flow, no `if reconnecting { … }` special-casing inside the
+    /// inner.
+    ///
+    /// Precondition + caller cleanup: identical to
+    /// [`Self::establish_one_tunnel`].
+    pub async fn reestablish_one_tunnel<R: InfoFileReader>(
+        &self,
+        secondary_id: &str,
+        reader: R,
+    ) -> Result<(), PrepError> {
+        let primary_quic_port = self
+            .primary_quic_port
+            .lock()
+            .expect("primary_quic_port mutex poisoned")
+            .ok_or_else(|| PrepError::TunnelFailed {
+                secondary_id: secondary_id.to_owned(),
+                rc: None,
+                stderr:
+                    "primary QUIC port not yet known — call setup_ssh_tunnels at least once first"
+                        .to_owned(),
+            })?;
+
+        let info_path = format!(
+            "{}/connection_info/{secondary_id}.info",
+            self.opts.run_log_dir
+        );
+
+        let opts = self.opts.clone();
+        let tunnels = Arc::clone(&self.ssh_tunnels);
+        let establish_pool = Arc::clone(&self.establish_pool);
+        let port_map = Arc::clone(&self.secondary_port_map);
+        let id_owned = secondary_id.to_owned();
+
+        let spawner = reconnect_spawner(id_owned.clone(), opts.clone(), primary_quic_port);
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,

@@ -7,7 +7,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
-use crate::preparation::ssh::{build_ssh_argv, verify_tunnel_alive};
+use crate::preparation::ssh::{build_release_argv, build_ssh_argv, verify_tunnel_alive};
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
 /// extra_port_forwards fan out, ExitOnForwardFailure present.
@@ -78,6 +78,88 @@ fn argv_with_auth_uses_proxycommand() {
     assert!(proxy_cmd.contains("'-p' '2222'"));
     assert!(proxy_cmd.contains("'-W' '%h:%p'"));
     assert!(proxy_cmd.contains("'alice@gw.example'"));
+}
+
+/// The observer-reconnect pre-rebind RELEASE argv must:
+///   1. reach the compute node over the SAME gateway jump as the
+///      reverse tunnel (so it can release the binding the tunnel left),
+///   2. target the SAME `tunnel_port` (option-A "same port" — the
+///      worker's fixed dial target is preserved; a fresh port would
+///      break `localhost:<tunnel_port>` with no re-coordination), and
+///   3. run a TARGETED kill of only that port's owner — never a `-N`
+///      reverse-forward and never a broad sweep.
+///
+/// This pins the topology decision behind the fix: the release reuses
+/// the same hop + same port, it does not re-coordinate a new one.
+#[test]
+fn release_argv_reuses_jump_and_targets_same_port() {
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        22,
+        vec![],
+        // extra_port_forwards must NOT leak into the release command —
+        // it only frees the one stale tunnel port.
+        vec![(2222, 9090)],
+    );
+    let argv = build_release_argv("compute01", 40000, &o);
+    // Same gateway jump as the tunnel (-J alice@gw.example).
+    let j_idx = argv.iter().position(|s| s == "-J").expect("has -J");
+    assert_eq!(argv[j_idx + 1], "alice@gw.example");
+    // Same compute-node target.
+    assert!(argv.iter().any(|s| s == "alice@compute01"));
+    // It is NOT a reverse tunnel: no -R, no -N, no ExitOnForwardFailure.
+    assert!(!argv.iter().any(|s| s == "-R"), "release must not forward");
+    assert!(!argv.iter().any(|s| s == "-N"), "release must run a command");
+    assert!(!argv.iter().any(|s| s == "ExitOnForwardFailure=yes"));
+    // The trailing remote command is a targeted release of EXACTLY
+    // port 40000 (the same tunnel_port), via fuser then an ss/kill
+    // fallback — both scoped to :40000, no other port mentioned.
+    let remote_cmd = argv.last().expect("has a trailing remote command");
+    assert!(
+        remote_cmd.contains("fuser -k 40000/tcp"),
+        "release must fuser-kill the exact port: {remote_cmd:?}"
+    );
+    assert!(
+        remote_cmd.contains(":40000"),
+        "ss fallback must scope to the exact port: {remote_cmd:?}"
+    );
+    // No collateral: neither the live primary QUIC port (51000) nor
+    // an extra-forward port (9090/2222) may appear in the release cmd.
+    assert!(!remote_cmd.contains("51000"));
+    assert!(!remote_cmd.contains("9090"));
+    assert!(!remote_cmd.contains("2222"));
+}
+
+/// With auth_options set, the release command MUST jump via
+/// ProxyCommand (same OpenSSH-7.3+ workaround as the tunnel) — never
+/// `-J` — so it inherits the auth flags into the inner hop.
+#[test]
+fn release_argv_with_auth_uses_proxycommand() {
+    let auth = vec![
+        "-i".to_string(),
+        "/tmp/key".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+    ];
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        2222,
+        auth,
+        vec![],
+    );
+    let argv = build_release_argv("compute01", 40000, &o);
+    assert!(!argv.iter().any(|s| s == "-J"));
+    let proxy_cmd = argv
+        .iter()
+        .find(|s| s.starts_with("ProxyCommand="))
+        .expect("has ProxyCommand=");
+    assert!(proxy_cmd.contains("'-i' '/tmp/key'"));
+    assert!(proxy_cmd.contains("'-p' '2222'"));
+    assert!(proxy_cmd.contains("'-W' '%h:%p'"));
 }
 
 /// Multi-watcher race regression: with ≥2 watchers calling
