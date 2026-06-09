@@ -19,7 +19,7 @@ use crate::preparation::SlurmPreparation;
 use crate::preparation::establish::establish_one_tunnel_inner;
 use crate::preparation::options::{InfoFileReader, PrepError};
 
-use super::establish::alive_child;
+use super::establish::{alive_child, fail_child};
 use super::opts_for;
 
 /// Stubbed `InfoFileReader` returning a fixed URI immediately.
@@ -174,6 +174,138 @@ fn establish_one_tunnel_applies_rate_limiter() {
     // Sanity: at least one spawner ran (proves the test actually
     // exercised the spawn path, not a no-op).
     assert!(peak >= 1, "expected at least one in-flight spawn, got 0");
+}
+
+/// Observer-reconnect SEAM: release-then-rebind-same-port SUCCEEDS,
+/// whereas the pre-fix reuse-the-same-port-without-release FAILS.
+///
+/// This is the unit pin of the BUG-fix DECISION, driven through the
+/// SAME [`establish_one_tunnel_inner`] seam the production
+/// `reestablish_one_tunnel` uses, with the spawner shaped exactly like
+/// the production `reconnect_spawner` (a release-action followed by a
+/// spawn-action). It models the worker-side state directly — no real
+/// ssh — via a shared `port_in_use` flag:
+///
+///   * The worker's sshd still holds the stale `-R <tunnel_port>`
+///     listener after an ungraceful drop (`port_in_use = true`).
+///   * A spawn while the port is in use returns rc=255 "remote port
+///     forwarding failed (port in use)" — exactly the production
+///     `ExitOnForwardFailure=yes` rc=255 the bug reports.
+///   * A RELEASE clears the binding (`port_in_use = false`); the next
+///     spawn (same port) then survives the 3s verify gate.
+///
+/// The two arms below share the worker-state fixture and the
+/// establishment policy. The ONLY difference is whether the spawner
+/// performs the release first — proving the fix is the release step,
+/// not anything else in the establishment path.
+#[test]
+fn reconnect_release_then_rebind_same_port_succeeds_vs_reuse_fails() {
+    use std::sync::atomic::AtomicBool;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+
+    // A spawn-action that consults the shared worker-side port state.
+    // While the port is still bound it fails with the SAME rc=255
+    // "port in use" the production tunnel hits; once released it
+    // returns a long-lived child that passes the verify gate. The
+    // `release` flag, when set by the spawner, models the production
+    // `reconnect_spawner` clearing the stale binding before the spawn.
+    fn spawn_for(port_in_use: &Arc<AtomicBool>) -> Child {
+        if port_in_use.load(Ordering::SeqCst) {
+            fail_child("Warning: remote port forwarding failed for listen port", 255)
+        } else {
+            alive_child()
+        }
+    }
+
+    let (with_fix, without_fix): (Result<u16, PrepError>, Result<u16, PrepError>) =
+        rt.block_on(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let opts = opts_for(&tmp);
+
+            // ---- ARM 1: reconnect spawner (release THEN rebind) ----
+            let port_in_use = Arc::new(AtomicBool::new(true)); // stale binding present
+            let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let port_map: Arc<StdMutex<HashMap<String, u16>>> =
+                Arc::new(StdMutex::new(HashMap::new()));
+            let pool = Arc::new(Semaphore::new(1));
+            let reader = CannedUriReader {
+                uri: "tcp://compute-9:40000".into(),
+            };
+            let piu = Arc::clone(&port_in_use);
+            let with_fix = establish_one_tunnel_inner(
+                "secondary-0",
+                "/unused",
+                51000,
+                &opts,
+                reader,
+                &tunnels,
+                &port_map,
+                &pool,
+                move |_host, _port| {
+                    let piu = Arc::clone(&piu);
+                    async move {
+                        // reconnect_spawner shape: RELEASE the stale
+                        // binding, then spawn the SAME-port rebind.
+                        piu.store(false, Ordering::SeqCst);
+                        Ok(spawn_for(&piu))
+                    }
+                },
+            )
+            .await;
+
+            // ---- ARM 2: plain spawner (reuse, NO release) ----
+            let port_in_use2 = Arc::new(AtomicBool::new(true)); // stale binding present
+            let tunnels2: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let port_map2: Arc<StdMutex<HashMap<String, u16>>> =
+                Arc::new(StdMutex::new(HashMap::new()));
+            let pool2 = Arc::new(Semaphore::new(1));
+            let reader2 = CannedUriReader {
+                uri: "tcp://compute-9:40000".into(),
+            };
+            let piu2 = Arc::clone(&port_in_use2);
+            let without_fix = establish_one_tunnel_inner(
+                "secondary-0",
+                "/unused",
+                51000,
+                &opts,
+                reader2,
+                &tunnels2,
+                &port_map2,
+                &pool2,
+                move |_host, _port| {
+                    let piu2 = Arc::clone(&piu2);
+                    // production_spawner shape: no release — the stale
+                    // binding stays, every attempt collides.
+                    async move { Ok(spawn_for(&piu2)) }
+                },
+            )
+            .await;
+
+            (with_fix, without_fix)
+        }));
+
+    // With the fix (release-then-rebind), the SAME port re-establishes.
+    let port = with_fix.expect("release-then-rebind on the same port must succeed");
+    assert_eq!(port, 40000, "the rebind reuses the worker's fixed port");
+
+    // Without the release (the pre-fix reuse path), every attempt hits
+    // rc=255 "port in use" and the rebuild fails — the exact symptom
+    // the bug reports (lost_secs monotonic, never recovers).
+    match without_fix {
+        Err(PrepError::TunnelFailed { rc, stderr, .. }) => {
+            assert_eq!(rc, Some(255), "reuse-without-release fails with rc=255");
+            assert!(
+                stderr.contains("remote port forwarding failed"),
+                "expected the port-in-use failure, got {stderr:?}"
+            );
+        }
+        other => panic!("expected reuse-without-release to fail rc=255, got {other:?}"),
+    }
 }
 
 /// Calling `establish_one_tunnel` on a fresh manager (before

@@ -18,8 +18,10 @@ use crate::preparation::policy::EstablishmentPolicy;
 /// Build a `/bin/sh` child whose stderr emits `marker` and whose
 /// exit code is `rc`. Returns a `Child` that mirrors what
 /// `verify_tunnel_alive` will observe — fast-exit (≪ 3s) ensures
-/// the failure branch trips immediately.
-fn fail_child(marker: &str, rc: i32) -> Child {
+/// the failure branch trips immediately. `pub(super)` so the
+/// `respawn` test file can model the worker-side "port still in use"
+/// rc=255 failure without duplicating the helper.
+pub(super) fn fail_child(marker: &str, rc: i32) -> Child {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(format!("printf '%s' '{marker}' >&2; exit {rc}"));

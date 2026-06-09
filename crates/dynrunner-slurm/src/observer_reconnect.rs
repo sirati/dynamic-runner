@@ -71,10 +71,22 @@ impl<R: InfoFileReader + Send + Sync + 'static> TunnelReconnector
         // retries on the next ~60s cadence tick if any fail). Per-id
         // failures are logged, never propagated — an observer carries zero
         // authority and a tunnel rebuild is never a run error.
+        //
+        // `reestablish_one_tunnel` (NOT `establish_one_tunnel`): on an
+        // UNGRACEFUL drop (SIGKILL / NIC blip / crash) the worker's sshd
+        // still holds the old `-R <tunnel_port>` listener with no
+        // FIN/RST to release it, so re-spawning `ssh -R <same_port>`
+        // fails every attempt with rc=255 "remote port forwarding failed
+        // (port in use)". The reestablish path first force-releases that
+        // stale worker-side binding, then rebinds the SAME port (the
+        // port is the worker's fixed listen port — a fresh port would
+        // break the worker's `localhost:<tunnel_port>` dial with no
+        // re-coordination path). The graceful-close path already has the
+        // port free, so the release is a harmless no-op there.
         for peer_id in peer_ids {
             match self
                 .preparation
-                .establish_one_tunnel(peer_id, self.info_reader.clone())
+                .reestablish_one_tunnel(peer_id, self.info_reader.clone())
                 .await
             {
                 Ok(()) => {
