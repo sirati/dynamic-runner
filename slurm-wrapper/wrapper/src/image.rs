@@ -48,6 +48,19 @@ const LOAD_FAILED_STDOUT: &str =
 /// The terser STDERR companion (generate.rs:708).
 const LOAD_FAILED_STDERR: &str = "ERROR: image load failed; secondary cannot start.";
 
+/// Hard cap on the number of node-local cache entries (digest-named
+/// `*.tar` files) kept after a fresh populate. Each entry is a full
+/// ~1.6 GB image tar (one per build/rev), so an unbounded cache on a
+/// long-lived node accumulates one tar per rev until the host hits
+/// ENOSPC. Keeping the newest few covers the realistic working set — the
+/// current rev plus the immediately prior one(s) a still-draining older
+/// run on the same node may be mid-load on — while bounding total cache
+/// footprint to `KEEP_LAST_N` tars per consumer prefix. The current image
+/// always occupies one of these slots and is never evicted, so the cap
+/// holds regardless of the current entry's mtime rank (see
+/// [`evict_stale_cache_entries`]).
+const KEEP_LAST_N: usize = 3;
+
 /// Node-local content-addressed cache entry for the image tarball,
 /// keyed by `cfg.image_digest`. `None` when the digest is empty
 /// (back-compat / test callers) — those fall back to the per-job copy.
@@ -67,6 +80,92 @@ fn cache_path(cfg: &WrapperConfig, layout: &Layout) -> Option<PathBuf> {
             .image_cache_root
             .join(format!("{}.tar", cfg.image_digest)),
     )
+}
+
+/// Bound the node-local cache to a HARD cap of `KEEP_LAST_N` digest-named
+/// `*.tar` entries, evicting the oldest non-current ones by explicit
+/// per-file `remove_file`. The cache is content-addressed and only ever
+/// grows on a fresh populate (a new digest = a new file that is never
+/// overwritten), so without this it accumulates one ~1.6 GB tar per
+/// build/rev forever until the node hits ENOSPC. Run after publishing a
+/// new entry so the just-written file is on disk and counted.
+///
+/// `keep_digest` is the content hash of the image THIS job is loading. Its
+/// `<digest>.tar` is NEVER an eviction candidate — it reserves one of the
+/// `KEEP_LAST_N` slots, and the newest `KEEP_LAST_N - 1` non-current
+/// entries fill the rest; everything older is evicted. So the total is a
+/// hard cap of `KEEP_LAST_N` regardless of the current entry's mtime rank.
+/// This protects the live image against eviction by a racing same-node
+/// secondary that just populated newer digests (the cache root is shared
+/// per `name_prefix` across all secondaries on the node — see
+/// `dirs.rs::Layout::image_cache_root`).
+///
+/// Eviction is best-effort: a failure to stat or unlink any single entry
+/// is logged and skipped, never propagated — a leaked tar is a disk-space
+/// concern, not a reason to fail an otherwise-loadable image. Only files
+/// directly under `cache_dir` ending in `.tar` are considered; the
+/// dot-prefixed `.<digest>.<suffix>.<pid>.tmp` in-flight populate temps
+/// are ignored (they are not `*.tar` and are owned by a live writer).
+fn evict_stale_cache_entries(cache_dir: &Path, keep_digest: &str) {
+    let keep_name = format!("{keep_digest}.tar");
+    // Collect (mtime, path) for every committed cache entry.
+    let read = match std::fs::read_dir(cache_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "WARNING: cannot scan image cache {} for eviction ({e}); skipping",
+                cache_dir.display()
+            );
+            return;
+        }
+    };
+    // Collect only NON-current committed tars as eviction candidates; the
+    // current image is unconditionally retained and reserves one slot of
+    // the KEEP_LAST_N budget, so the total cache size is a HARD cap of
+    // KEEP_LAST_N regardless of the current entry's mtime rank.
+    let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for ent in read.flatten() {
+        let path = ent.path();
+        // Only committed digest tars; skip dirs, temps, anything non-`.tar`.
+        let is_tar = path.extension().is_some_and(|e| e == "tar");
+        if !is_tar {
+            continue;
+        }
+        // Never an eviction candidate: the live image this job is loading.
+        if path.file_name().is_some_and(|n| n == keep_name.as_str()) {
+            continue;
+        }
+        match ent.metadata() {
+            Ok(meta) if meta.is_file() => {
+                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                candidates.push((mtime, path));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!(
+                    "WARNING: cannot stat cache entry {} for eviction ({e}); skipping",
+                    path.display()
+                );
+            }
+        }
+    }
+    // Reserve one slot for the current image; keep the newest (N-1) of the
+    // remaining non-current entries, evict the rest.
+    let keep_non_current = KEEP_LAST_N.saturating_sub(1);
+    if candidates.len() <= keep_non_current {
+        return; // Within bound; nothing to evict.
+    }
+    // Newest mtime first, so the first `keep_non_current` are retained.
+    candidates.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+    for (_, path) in candidates.into_iter().skip(keep_non_current) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => println!("Evicted stale image cache entry: {}", path.display()),
+            Err(e) => eprintln!(
+                "WARNING: failed to evict stale cache entry {} ({e}); skipping",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// Ensure a node-local copy of the image tar exists and return the path
@@ -148,6 +247,9 @@ fn provide_local_image(cfg: &WrapperConfig, layout: &Layout) -> Result<PathBuf, 
         return Ok(tmp);
     }
     println!("Image cached at: {}", cache.display());
+    // A fresh digest was just published — bound the cache so an old rev's
+    // tar doesn't linger forever. Protect the digest we just loaded.
+    evict_stale_cache_entries(cache_dir, &cfg.image_digest);
     Ok(cache)
 }
 
@@ -409,5 +511,168 @@ mod tests {
         copy_and_load(&cfg, &layout, &bins).expect("cache hit must not need the source");
 
         assert_eq!(std::fs::read(&probe).unwrap(), cached_bytes);
+    }
+
+    // ---- bounded eviction (the resource-leak fix) ----
+
+    /// Helper: write a digest-named cache tar and stamp its mtime so the
+    /// eviction sort order is deterministic (higher `age_secs` = older).
+    fn seed_entry(cache_root: &std::path::Path, digest: &str, age_secs: u64) -> PathBuf {
+        std::fs::create_dir_all(cache_root).unwrap();
+        let path = cache_root.join(format!("{digest}.tar"));
+        std::fs::write(&path, format!("layers-of-{digest}")).unwrap();
+        let mtime = filetime_from_age(age_secs);
+        set_mtime(&path, mtime);
+        path
+    }
+
+    fn filetime_from_age(age_secs: u64) -> std::time::SystemTime {
+        // A fixed recent base so all stamps are well-ordered and positive.
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 - age_secs)
+    }
+
+    /// Set a file's mtime via libc `utimensat` (no extra crate; the
+    /// wrapper already links libc). Atime is left at "now"/UTIME_OMIT.
+    fn set_mtime(path: &std::path::Path, t: std::time::SystemTime) {
+        use std::os::unix::ffi::OsStrExt;
+        let secs = t
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            },
+        ];
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(rc, 0, "utimensat failed for {}", path.display());
+    }
+
+    /// Populating an (N+1)-th distinct digest evicts the cache down to a
+    /// hard cap of `KEEP_LAST_N`: the just-loaded current digest plus the
+    /// `KEEP_LAST_N - 1` next-newest survive; everything older is unlinked.
+    ///
+    /// Revert-check: with the `evict_stale_cache_entries` call removed
+    /// from `provide_local_image`, ALL pre-seeded entries persist and the
+    /// `== KEEP_LAST_N` assertion fails — i.e. this test catches the leak.
+    #[test]
+    fn populate_evicts_down_to_keep_last_n() {
+        let dir = tempdir().unwrap();
+        let current = "ffffffffffff"; // the rev THIS job loads (cache miss)
+        let (cfg, layout, bins, _) = fixture(dir.path(), "true", current);
+        let root = &layout.image_cache_root;
+
+        // Pre-seed KEEP_LAST_N + 2 OLDER distinct entries (all older than
+        // the soon-to-be-published current one). seeded[0] is the newest
+        // non-current; ages strictly increase with index.
+        let mut seeded = Vec::new();
+        for i in 0..(KEEP_LAST_N + 2) {
+            let digest = format!("old{i:04x}");
+            seeded.push(seed_entry(root, &digest, (i as u64 + 1) * 100));
+        }
+
+        // Cache miss on `current` → populate → eviction runs.
+        copy_and_load(&cfg, &layout, &bins).expect("load should succeed");
+
+        // Exactly KEEP_LAST_N committed entries remain (hard cap).
+        let remaining: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "tar"))
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            KEEP_LAST_N,
+            "cache must be bounded to KEEP_LAST_N after populate; got {remaining:?}"
+        );
+
+        // The current (just-loaded) entry is always retained.
+        let current_entry = root.join(format!("{current}.tar"));
+        assert!(
+            current_entry.exists(),
+            "the current image must never be evicted"
+        );
+
+        // Current reserves one slot, so only the newest KEEP_LAST_N - 1
+        // non-current entries survive; the rest are evicted.
+        let keep_non_current = KEEP_LAST_N - 1;
+        for kept in seeded.iter().take(keep_non_current) {
+            assert!(kept.exists(), "newest non-current entries survive: {kept:?}");
+        }
+        for evicted in seeded.iter().skip(keep_non_current) {
+            assert!(!evicted.exists(), "older non-current entries evicted: {evicted:?}");
+        }
+    }
+
+    /// The live digest is protected even when its mtime is the OLDEST in
+    /// the cache: it must survive while newer-but-not-current entries are
+    /// evicted. This is the load-bearing concurrency guard — a racing
+    /// same-node secondary that just touched newer digests must not evict
+    /// the image this job is mid-load on.
+    #[test]
+    fn current_image_retained_even_when_oldest() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("imgcache");
+        let current = "cccccccccccc";
+
+        // Current entry is the OLDEST (largest age).
+        seed_entry(&root, current, 9_000);
+        // KEEP_LAST_N newer non-current entries; newer[0] is the newest,
+        // newer[KEEP_LAST_N - 1] the oldest non-current.
+        let mut newer = Vec::new();
+        for i in 0..KEEP_LAST_N {
+            newer.push(seed_entry(&root, &format!("new{i:04x}"), (i as u64 + 1) * 10));
+        }
+
+        evict_stale_cache_entries(&root, current);
+
+        // Current survives despite being oldest.
+        assert!(
+            root.join(format!("{current}.tar")).exists(),
+            "oldest-but-current entry must be retained"
+        );
+        // Hard cap holds: current + (KEEP_LAST_N - 1) newest non-current.
+        let count = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "tar"))
+            .count();
+        assert_eq!(
+            count, KEEP_LAST_N,
+            "protecting the current image must not inflate the bound"
+        );
+        // The oldest NON-current entry was the eviction victim, NOT the
+        // older current one — the current-image guard reordered priority.
+        assert!(
+            !newer[KEEP_LAST_N - 1].exists(),
+            "the oldest non-current entry must be evicted"
+        );
+    }
+
+    /// In-flight populate temps (`.<digest>.<suffix>.<pid>.tmp`) and the
+    /// current image are both untouched by eviction; only committed
+    /// non-current `*.tar` over the bound are removed.
+    #[test]
+    fn eviction_ignores_temp_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("imgcache");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = "aaaaaaaaaaaa";
+        seed_entry(&root, current, 1);
+        // A live populate temp for some other digest, freshly stamped.
+        let temp = root.join(".bbbbbbbbbbbb.2f1d4e89.4242.tmp");
+        std::fs::write(&temp, b"half-written").unwrap();
+
+        evict_stale_cache_entries(&root, current);
+
+        assert!(temp.exists(), "in-flight .tmp must never be evicted");
+        assert!(root.join(format!("{current}.tar")).exists());
     }
 }
