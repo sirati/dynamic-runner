@@ -331,7 +331,9 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
 ///   1. `run_until_setup_or_done` STILL returns `RunOutcome::Terminal`
 ///      (projecting to `SecondaryTerminal::Panik`; the local-teardown side
 ///      of the panik contract is unchanged), with `matched_path == <SIGTERM>`
-///      and the per-host reason string `"panik SIGTERM (per-host)"`.
+///      and the host-signal reason string
+///      `"host SIGTERM, per-host (sender_pid=12345)"` (the captured sender
+///      pid is surfaced so the operator sees a HOST signal, not a policy abort).
 ///   2. NO self-authored `ClusterMutation::PeerRemoved { SelfDeparture }`
 ///      appears on the primary wire — `handle_panik_signal` skips
 ///      `apply_and_broadcast_mutations` on the SIGTERM branch. A
@@ -521,10 +523,11 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_terminal_panik() {
                          matched_path verbatim to the caller"
                     );
                     assert_eq!(
-                        reason, "panik SIGTERM (per-host)",
-                        "SIGTERM panik reason should use the per-host \
-                         phrasing (NOT \"panik file: <SIGTERM>\" which \
-                         conflated source type with file path)"
+                        reason, "host SIGTERM, per-host (sender_pid=12345)",
+                        "SIGTERM panik reason must attribute the HOST signal AND \
+                         name the captured sender pid (NOT \"panik file: <SIGTERM>\" \
+                         which conflated source type with file path, and NOT a \
+                         pid-less phrasing that hides WHO sent the SIGTERM)"
                     );
                 }
                 other => panic!("expected SecondaryTerminal::Panik, got: {other:?}"),

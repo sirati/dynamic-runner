@@ -100,7 +100,7 @@ async fn peer_departure_does_not_touch_task_ledger() {
 
     let outcome = s.apply(ClusterMutation::PeerRemoved {
         id: "departing".into(),
-        cause: RemovalCause::SelfDeparture(BoundedString::from("panik SIGTERM (per-host)")),
+        cause: RemovalCause::SelfDeparture(BoundedString::from("panik file: /var/run/panik")),
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
 
