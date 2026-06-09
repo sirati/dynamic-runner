@@ -1460,20 +1460,24 @@ pub(crate) fn build_setup_discovery_fn(
             // keeps the keepalives flowing during discovery (§14/§15).
             tokio::task::spawn_blocking(move || {
                 let _role_guard = role_span.enter();
-                Python::attach(|py| -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
-                    discover_items_under_gil(
-                        py,
-                        &task_definition_py,
-                        &run_config,
-                        setup_discover_root.as_ref(),
-                    )
-                })
+                Python::attach(
+                    |py| -> Result<Vec<(TaskInfo<RunnerIdentifier>, bool)>, String> {
+                        discover_items_under_gil(
+                            py,
+                            &task_definition_py,
+                            &run_config,
+                            setup_discover_root.as_ref(),
+                        )
+                    },
+                )
             })
             .await
             .map_err(|e| format!("setup-discovery blocking task panicked/aborted: {e}"))?
         };
         Box::pin(fut)
-            as Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<RunnerIdentifier>>, String>>>>
+            as Pin<
+                Box<dyn Future<Output = Result<Vec<(TaskInfo<RunnerIdentifier>, bool)>, String>>>,
+            >
     })
 }
 
@@ -1749,7 +1753,7 @@ fn discover_items_under_gil(
     task_definition_py: &Py<PyAny>,
     run_config: &crate::managers::run_config::SharedRunConfig,
     setup_discover_root: Option<&std::path::PathBuf>,
-) -> Result<Vec<TaskInfo<RunnerIdentifier>>, String> {
+) -> Result<Vec<(TaskInfo<RunnerIdentifier>, bool)>, String> {
     let root = setup_discover_root.ok_or_else(|| {
         "setup discovery invoked but src_network is None — the wrapper has no \
          root to pass to task.discover_items; this is a programmer error \

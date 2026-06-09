@@ -324,7 +324,16 @@ impl PyLocalManager {
 
     /// Process a list of PyTaskInfo objects.
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
-        let mut rust_binaries = extract_binaries(binaries)?;
+        // The single-process dispatch path does not yet honour the
+        // discovery `skipped_already_done` marker (that partition is a
+        // later wave); strip the bit at this call site so the
+        // already-done items dispatch exactly as today. The marker ride
+        // alongside the task is the extract boundary's uniform contract —
+        // each consumer decides whether the bit matters here.
+        let mut rust_binaries: Vec<_> = extract_binaries(binaries)?
+            .into_iter()
+            .map(|(task, _skipped)| task)
+            .collect();
 
         // Normalise each `binary.path` to the worker-facing wire id
         // (relative-to-`source_dir`). Out-of-tree paths are left

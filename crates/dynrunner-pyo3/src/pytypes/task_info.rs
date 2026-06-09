@@ -67,6 +67,17 @@ pub(crate) struct PyTaskInfo {
     /// Empty list == no preference (free pool).
     #[pyo3(get)]
     pub(super) preferred_secondaries: Vec<String>,
+    /// Discovery-time "already-done" marker. `True` ⇒ the producer
+    /// determined this item's outputs already exist, so the framework
+    /// materialises it DIRECTLY as a terminal `SkippedAlreadyDone`
+    /// ledger entry (never dispatched) instead of as `Pending`. Default
+    /// `false` ⇒ today's behaviour. This is a discovery-BOUNDARY routing
+    /// signal — it rides alongside the task at the
+    /// `crate::pytypes::extract_binaries` boundary and is NOT carried on
+    /// the core Rust `TaskInfo<I>` (nor folded into the content hash):
+    /// the `From`/`task_to_pytask` conversions deliberately drop it.
+    #[pyo3(get)]
+    pub(super) skipped_already_done: bool,
 }
 
 #[pymethods]
@@ -90,6 +101,7 @@ impl PyTaskInfo {
         payload_json = "null".to_string(),
         task_depends_on = Vec::new(),
         preferred_secondaries = Vec::new(),
+        skipped_already_done = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -105,6 +117,7 @@ impl PyTaskInfo {
         payload_json: String,
         task_depends_on: Vec<String>,
         preferred_secondaries: Vec<String>,
+        skipped_already_done: bool,
     ) -> PyResult<Self> {
         if task_id.is_empty() {
             return Err(PyValueError::new_err(
@@ -124,6 +137,7 @@ impl PyTaskInfo {
             task_id,
             task_depends_on,
             preferred_secondaries,
+            skipped_already_done,
         })
     }
 }
@@ -205,6 +219,12 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
                 .map(|dep| dep.task_id.clone())
                 .collect(),
             preferred_secondaries: bi.preferred_secondaries.as_slice().to_vec(),
+            // The already-done marker is a discovery-INPUT signal only —
+            // it is not carried on the core `TaskInfo<I>`, so the
+            // round-trip-back direction reconstitutes the default. By the
+            // time a task is in the ledger, its skip status is encoded in
+            // its `TaskState` variant, not in this discovery-time field.
+            skipped_already_done: false,
         }
     }
 }
@@ -236,6 +256,7 @@ mod tests {
             task_id: "test-task".into(),
             task_depends_on: Vec::new(),
             preferred_secondaries: preferred,
+            skipped_already_done: false,
         }
     }
 
@@ -300,6 +321,7 @@ mod tests {
             "null".into(),
             Vec::new(),
             Vec::new(),
+            false,
         )
         .expect_err("empty task_id must fail");
         // We assert against the rendered message (no Python
@@ -326,6 +348,7 @@ mod tests {
             "null".into(),
             Vec::new(),
             Vec::new(),
+            false,
         )
         .expect("non-empty task_id must succeed");
         assert_eq!(ok.task_id, "stable-id");

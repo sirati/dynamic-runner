@@ -1096,7 +1096,7 @@ async fn hydrate_cold_seed_does_not_seed_any_phase_done() {
             let a = dep_binary("a", "build", &[]);
             let b = dep_binary("b", "ship", &[]);
             primary
-                .originate_cold_seed(vec![a, b], HashMap::new())
+                .originate_cold_seed(vec![(a, false), (b, false)], HashMap::new())
                 .expect("cold seed");
             primary.hydrate_from_cluster_state();
 

@@ -378,7 +378,9 @@ async fn run_relocate_with_dispatch_target(facet: RelocateStagingFacet) -> (usiz
     let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
         primary_run_args: Some(PrimaryRunArgs {
             seed: SeedSource::ColdStart {
-                binaries,
+                // Unmarked cold-seed (no already-done items) — preserves
+                // the pre-marker all-`Pending` behaviour this test asserts.
+                binaries: binaries.into_iter().map(|b| (b, false)).collect(),
                 phase_deps: HashMap::new(),
             },
             on_phase_start: Box::new(|_| {}),

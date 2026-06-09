@@ -55,8 +55,14 @@ use crate::process::{MeshClient, RoleInbox};
 pub enum SeedSource<I: Identifier> {
     /// Bootstrap: this primary originates the run's task set into the CRDT.
     ColdStart {
-        /// The task binaries to seed.
-        binaries: Vec<TaskInfo<I>>,
+        /// The task binaries to seed, each paired with its discovery-time
+        /// `skipped_already_done` marker. An entry marked `true` is
+        /// materialised DIRECTLY as a terminal `SkippedAlreadyDone`
+        /// ledger entry (never dispatched); `false` ⇒ a normal `Pending`
+        /// task. The marker rides alongside the task at the discovery
+        /// boundary, NOT on `TaskInfo<I>` — see
+        /// `cluster_mutation::TaskSkippedAlreadyDone`.
+        binaries: Vec<(TaskInfo<I>, bool)>,
         /// The phase dependency graph.
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     },

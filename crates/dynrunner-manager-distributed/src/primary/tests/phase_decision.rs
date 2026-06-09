@@ -88,8 +88,8 @@ fn cold_seed_cross_phase_same_task_id_is_not_a_duplicate() {
     let (mut primary, _mesh) = make_primary();
 
     let batch = vec![
-        cross_binary("phaseA", "shared", &[]),
-        cross_binary("phaseB", "shared", &[]),
+        (cross_binary("phaseA", "shared", &[]), false),
+        (cross_binary("phaseB", "shared", &[]), false),
     ];
     primary
         .originate_cold_seed(batch, HashMap::new())

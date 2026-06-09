@@ -263,6 +263,203 @@ async fn discover_on_promotion_owed_empty_settles_and_run_completes() {
         .await;
 }
 
+/// R5 end-to-end marker thread (discovery seam): a discovered item carrying
+/// the `skipped_already_done` marker must land in the ledger as a TERMINAL
+/// `SkippedAlreadyDone`, while an UNMARKED sibling lands `Pending`. This is
+/// the plumbing-e2e guard — per-layer unit tests can each pass while one
+/// layer silently drops the bit, so this asserts the bit survives the WHOLE
+/// thread from the discovery batch through `skip_transitions` into the ledger
+/// state.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_marked_item_lands_skipped_unmarked_lands_pending() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            let skipped = make_binary("already-done", 100);
+            let to_run = make_binary("needs-run", 100);
+            let skipped_hash = compute_task_hash(&skipped);
+            let to_run_hash = compute_task_hash(&to_run);
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            // The marked item rides through the SetupDiscoveryFn as
+            // `(task, true)` — exactly the shape `extract_binaries` yields
+            // for a Python item with `skipped_already_done=True`.
+            primary.register_setup_discovery(fixed_discovery_marked(
+                vec![(skipped, true), (to_run, false)],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Owed + non-empty (mixed marked) → Ok");
+
+            // Both items are real tasks of the phase — task_count counts them.
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                2,
+                "EVERY discovered item is seeded (the marked one is a real \
+                 task with a terminal state, not dropped)"
+            );
+            // The marked item is TERMINAL SkippedAlreadyDone — never dispatched.
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&skipped_hash),
+                    Some(crate::cluster_state::TaskState::SkippedAlreadyDone { .. })
+                ),
+                "the marked item must land SkippedAlreadyDone (NOT Pending / \
+                 dispatched); got {:?}",
+                primary.cluster_state_for_test().task_state(&skipped_hash)
+            );
+            // The unmarked sibling is a normal Pending task.
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&to_run_hash),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                ),
+                "the unmarked item must land Pending; got {:?}",
+                primary.cluster_state_for_test().task_state(&to_run_hash)
+            );
+            // One real to-run task remains, so the run is NOT complete.
+            assert!(
+                !primary.cluster_state_for_test().run_complete(),
+                "a corpus with ANY to-run work must NOT originate RunComplete"
+            );
+        })
+        .await;
+}
+
+/// `discover_on_promotion` on `Owed` + a 100%-already-done corpus: every item
+/// is marked skipped, so there is NO to-run work and NO `TaskCompleted` will
+/// ever drive the counter finalize — the seam must originate `RunComplete`
+/// exactly like the empty-corpus case (the all-skipped finalize, design §6
+/// item 5). The skipped items are still seeded as terminal ledger entries.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_all_skipped_settles_and_run_completes() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            let s1 = make_binary("done-1", 100);
+            let s2 = make_binary("done-2", 100);
+            let h1 = compute_task_hash(&s1);
+            let h2 = compute_task_hash(&s2);
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery_marked(
+                vec![(s1, true), (s2, true)],
+                HashMap::new(),
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Owed + all-skipped → Ok");
+
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "discovery must settle even when every item is skipped"
+            );
+            // Both items are seeded as real tasks, both terminal.
+            assert_eq!(
+                primary.cluster_state_for_test().task_count(),
+                2,
+                "all-skipped corpus still seeds every item as a real task"
+            );
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&h1),
+                    Some(crate::cluster_state::TaskState::SkippedAlreadyDone { .. })
+                ) && matches!(
+                    primary.cluster_state_for_test().task_state(&h2),
+                    Some(crate::cluster_state::TaskState::SkippedAlreadyDone { .. })
+                ),
+                "every item in an all-skipped corpus is terminal SkippedAlreadyDone"
+            );
+            assert!(
+                primary.cluster_state_for_test().run_complete(),
+                "a 100%-already-done corpus has no to-run work, so the seam must \
+                 originate RunComplete (no TaskCompleted will drive the finalize)"
+            );
+        })
+        .await;
+}
+
+/// R5 end-to-end marker thread (cold-seed seam): the same marker contract on
+/// the `originate_cold_seed` path. A marked item lands terminal
+/// `SkippedAlreadyDone`; an unmarked sibling lands `Pending`. The cold-seed
+/// path needs NO explicit RunComplete (hydrate seeds the skip into
+/// `completed_tasks`, so the operational loop's counter exit trips) — this
+/// test pins the per-task ledger landing, the part the seed seam owns.
+#[test]
+fn cold_seed_marked_item_lands_skipped_unmarked_lands_pending() {
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        test_primary_config(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let skipped = make_binary("cs-already-done", 100);
+    let to_run = make_binary("cs-needs-run", 100);
+    let skipped_hash = compute_task_hash(&skipped);
+    let to_run_hash = compute_task_hash(&to_run);
+
+    primary
+        .originate_cold_seed(vec![(skipped, true), (to_run, false)], HashMap::new())
+        .expect("mixed marked cold seed");
+    primary.hydrate_from_cluster_state();
+
+    assert_eq!(
+        primary.cluster_state_for_test().task_count(),
+        2,
+        "every cold-seeded item is a real task (marked or not)"
+    );
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&skipped_hash),
+            Some(crate::cluster_state::TaskState::SkippedAlreadyDone { .. })
+        ),
+        "the marked cold-seed item must land SkippedAlreadyDone; got {:?}",
+        primary.cluster_state_for_test().task_state(&skipped_hash)
+    );
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&to_run_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "the unmarked cold-seed item must land Pending; got {:?}",
+        primary.cluster_state_for_test().task_state(&to_run_hash)
+    );
+    // hydrate seeds the skip into the completed projection, so the
+    // counter-exit denominator accounts for it (no explicit RunComplete on
+    // this path).
+    assert!(
+        primary.completed_tasks.contains(&skipped_hash),
+        "the skipped hash must be in the completed projection so the \
+         operational loop's counter exit accounts for it"
+    );
+}
+
 /// `discover_on_promotion` on `Owed` with NO policy registered is a hard
 /// `RunError` — a primary that owes discovery MUST carry the policy; silently
 /// stranding would never exit (the counter arm is gated on `Owed`).

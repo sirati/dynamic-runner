@@ -214,17 +214,21 @@ class PhaseSpec:
 
     ``may_be_empty`` (default ``False``) is the empty-drain honesty
     opt-out. By default the framework FAILS THE RUN LOUD if an activated
-    phase drains with zero dispatched items, zero terminal outcomes, and
-    zero items skipped-as-existing — that is the silent-partial-success
-    signature of a phase whose planned work was never injected (e.g. an
-    ``on_phase_end``-driven lazy-injection or discovery step was
-    suppressed), which would otherwise complete the run clean ``rc=0``
-    with that work dropped. Set ``may_be_empty=True`` on a phase that
-    LEGITIMATELY may have no work of its own — a pure sequencing
-    gate/barrier, or a terminal phase that only fans out conditionally —
-    to declare that intent and let it drain through. (An all-skipped
-    ``--skip-existing`` phase is always treated as success and needs no
-    opt-out; ``may_be_empty`` is for genuinely-zero-item phases.)
+    phase drains with zero tasks of any kind — that is the
+    silent-partial-success signature of a phase whose planned work was
+    never injected (e.g. an ``on_phase_end``-driven lazy-injection or
+    discovery step was suppressed), which would otherwise complete the
+    run clean ``rc=0`` with that work dropped. Set ``may_be_empty=True``
+    on a phase that LEGITIMATELY may have no work of its own — a pure
+    sequencing gate/barrier, or a terminal phase that only fans out
+    conditionally — to declare that intent and let it drain through.
+
+    (An all-already-done phase needs NO opt-out: a producer that finds an
+    item's outputs already exist yields it with
+    ``TaskInfo.skipped_already_done=True`` rather than dropping it, so the
+    phase still HAS tasks — they land as terminal ``SkippedAlreadyDone``
+    ledger entries and the phase proceeds as a phase WITH work, treated as
+    success. ``may_be_empty`` is for genuinely-zero-item phases.)
     """
 
     phase_id: PhaseId

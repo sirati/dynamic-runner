@@ -40,8 +40,16 @@ use dynrunner_core::{Identifier, TaskInfo};
 ///
 /// `FnMut` because the driver takes it on the one fire; the boxed future
 /// need not be `Send` — it is awaited on the node's own `!Send` task.
-pub type SetupDiscoveryFn<I> =
-    Box<dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<TaskInfo<I>>, String>>>>>;
+///
+/// Each discovered task is PAIRED with its discovery-time
+/// `skipped_already_done` marker (`true` ⇒ the producer found the item's
+/// outputs already exist; the driver materialises it terminal
+/// `SkippedAlreadyDone` rather than dispatching it). The marker rides the
+/// discovery boundary, NOT `TaskInfo<I>` — `discover_on_promotion`
+/// partitions on it via the shared `skip_transitions` helper.
+pub type SetupDiscoveryFn<I> = Box<
+    dyn FnMut() -> Pin<Box<dyn Future<Output = Result<Vec<(TaskInfo<I>, bool)>, String>>>>,
+>;
 
 /// The consumer's setup-discovery policy plus the phase-dependency graph
 /// fed alongside the discovered binaries when seeding the replicated

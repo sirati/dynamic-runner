@@ -72,7 +72,7 @@ async fn promoted_populated_crdt_does_not_redo_discovery_phase_start_or_reassign
                     let fires = fires.clone();
                     Box::new(move || {
                         fires.set(fires.get() + 1);
-                        Box::pin(async { Ok(vec![make_binary("SHOULD-NOT-RUN", 1)]) })
+                        Box::pin(async { Ok(vec![(make_binary("SHOULD-NOT-RUN", 1), false)]) })
                     })
                 },
                 phase_deps: HashMap::new(),
@@ -1157,7 +1157,7 @@ async fn cold_seed_hydrate_leaves_phase_started_emitted_empty() {
             b.phase_id = dynrunner_core::PhaseId::from("ship");
             b.task_depends_on = vec![];
             primary
-                .originate_cold_seed(vec![a, b], HashMap::new())
+                .originate_cold_seed(vec![(a, false), (b, false)], HashMap::new())
                 .expect("cold seed");
             primary.hydrate_from_cluster_state();
 

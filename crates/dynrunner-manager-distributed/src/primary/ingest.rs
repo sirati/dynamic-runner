@@ -44,6 +44,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         ClusterMutation::PhaseMayBeEmptySet { phases }
     }
 
+    /// Build the `TaskSkippedAlreadyDone` transitions for the marked
+    /// subset of a discovered batch — the ONE place both seed seams
+    /// (`originate_cold_seed` cold-start + `discover_on_promotion`
+    /// relocate/pre-staged) partition the already-done items off the
+    /// freshly-seeded `Pending` set.
+    ///
+    /// Each entry marked `true` gets a `TaskSkippedAlreadyDone { hash }`
+    /// keyed on its content hash; the prior `TaskAdded` in the same batch
+    /// has already seeded that hash as `Pending`, and this transition
+    /// materialises it terminal `SkippedAlreadyDone`. The apply rule
+    /// gates on `Pending` (a skip is the WEAKEST terminal), so emitting it
+    /// for a hash that some earlier transition already moved off `Pending`
+    /// (e.g. a missing-dep `InvalidTask`) is a harmless NoOp — no
+    /// special-casing here.
+    ///
+    /// Unmarked entries contribute nothing (they stay `Pending`).
+    pub(crate) fn skip_transitions(
+        &self,
+        marked: &[(TaskInfo<I>, bool)],
+    ) -> Vec<ClusterMutation<I>> {
+        marked
+            .iter()
+            .filter(|(_, skipped)| *skipped)
+            .map(|(task, _)| ClusterMutation::TaskSkippedAlreadyDone {
+                hash: compute_task_hash(task),
+            })
+            .collect()
+    }
+
     /// Cold-start CRDT origination: turn the bootstrap task batch into the
     /// freshly-seeded replicated ledger `hydrate_from_cluster_state` then
     /// builds the pool from.
@@ -52,11 +81,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `self.phase_deps`, classifies the batch, seeds EVERY surviving binary
     /// into the LOCAL `cluster_state` (as `Pending` via `TaskAdded` +
     /// `PhaseDepsSet`, then transitioning the #2 missing-dep set to
-    /// `InvalidTask`), and stages the version-stamped frames for the
+    /// `InvalidTask` and the discovery-marked already-done subset to
+    /// `SkippedAlreadyDone`), and stages the version-stamped frames for the
     /// post-connection fleet broadcast. It does NOT build the pool or set
     /// `total_tasks` — those are outputs of the subsequent hydrate (the SOLE
     /// pool builder after F1). The promotion path skips this entirely (its
     /// CRDT was restored by `seed_from_promotion_snapshot`).
+    ///
+    /// `marked_batch` pairs every discovered task with its discovery-time
+    /// `skipped_already_done` bit. The bit rides alongside the task (not on
+    /// `TaskInfo<I>`): the pool partition / validation consumes the bare
+    /// tasks, and the marked subset is materialised terminal via
+    /// `skip_transitions` (shared with `discover_on_promotion`). An
+    /// all-already-done cold corpus needs NO explicit `RunComplete`: every
+    /// skip is seeded into hydrate's `completed_tasks` projection, so the
+    /// operational loop's `completed + failed >= total_tasks` counter exit
+    /// trips exactly as a fully-completed run — unlike the
+    /// `discover_on_promotion` seam, which originates the terminal directly
+    /// because it runs its empty/all-skipped check before hydrate.
     ///
     /// Routing of `PendingPool::partition_ingest`'s three partitions:
     ///   * **duplicates** (#3a) → record the abort directive in
@@ -83,7 +125,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// constraint 4).
     pub(crate) fn originate_cold_seed(
         &mut self,
-        batch: Vec<TaskInfo<I>>,
+        marked_batch: Vec<(TaskInfo<I>, bool)>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     ) -> Result<(), RunError> {
         // NB: `phase_started_emitted` is NOT cleared here (V3). Seeding it is
@@ -99,10 +141,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // side-effect). hydrate runs AFTER this in `run_pipeline`, so the
         // derived seed reflects the just-applied cold ledger.
 
+        // The discovery `skipped_already_done` markers ride alongside the
+        // tasks. The pool partition / validation below works on the bare
+        // scheduling units, so project them out here; `marked_batch` is
+        // retained intact and consulted once at the end by
+        // `skip_transitions` to materialise the already-done subset
+        // terminal (keyed by content hash, so the projected-out order
+        // does not matter).
+        let mut batch: Vec<TaskInfo<I>> =
+            marked_batch.iter().map(|(task, _)| task.clone()).collect();
+
         // Sort by size descending for better packing — same intent as
         // pre-Phase-4b. The pool preserves insertion order within a bucket,
         // so we pre-sort here and seed once.
-        let mut batch = batch;
         batch.sort_by_key(|b| std::cmp::Reverse(b.size));
 
         // Phase set: union of (1) every phase referenced by an item, (2)
@@ -220,6 +271,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     task: b.clone(),
                 }),
         );
+        // Discovery already-done partition: materialise the marked subset
+        // `Pending → SkippedAlreadyDone` in the SAME local-apply pass, so
+        // hydrate sees them terminal (out of pool, NEVER dispatched) — the
+        // already-done items are real tasks of their phase with a special
+        // terminal state. The transition keys on the content hash that the
+        // `TaskAdded` fan-out above already seeded as `Pending`; a marked
+        // entry that is ALSO a missing-dep gets its `InvalidTask`
+        // transition below and the skip NoOps (the apply rule's
+        // weakest-terminal lockout). One shared helper with
+        // `discover_on_promotion` — no duplicated partition logic.
+        seed.extend(self.skip_transitions(&marked_batch));
         // #2: transition each missing-dep task `Pending → InvalidTask` in the
         // SAME local-apply pass, so hydrate sees them terminal (dep-seed, out
         // of pool) — the faithful equivalent of the pre-F1 pool pre-fail. The

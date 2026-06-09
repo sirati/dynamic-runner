@@ -396,7 +396,8 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_cold() {
             let pri_inputs: NodeRunInputs<FakeWorkerFactory, _, _, TestId> = NodeRunInputs {
                 primary_run_args: Some(PrimaryRunArgs {
                     seed: SeedSource::ColdStart {
-                        binaries,
+                        // Unmarked cold-seed (all `Pending`).
+                        binaries: binaries.into_iter().map(|b| (b, false)).collect(),
                         phase_deps: HashMap::new(),
                     },
                     on_phase_start: Box::new(|_| {}),
@@ -530,10 +531,11 @@ async fn node_run_e2e_setup_peer_relocates_to_compute_secondary_pre_staged() {
             let setup_discovery = crate::discovery::SetupDiscovery {
                 discover: Box::new(move || {
                     fires_for_policy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Unmarked discovery batch (no already-done items).
                     let out = vec![
-                        make_binary("disc-a", 50),
-                        make_binary("disc-b", 60),
-                        make_binary("disc-c", 70),
+                        (make_binary("disc-a", 50), false),
+                        (make_binary("disc-b", 60), false),
+                        (make_binary("disc-c", 70), false),
                     ];
                     Box::pin(async move { Ok(out) })
                 }),
