@@ -54,7 +54,50 @@ pub(crate) enum SlotState<I: Identifier> {
         task_hash: String,
         task: TaskInfo<I>,
         estimated: ResourceMap,
+        /// How this slot came to hold the task — the discriminator the
+        /// promoted-primary occupancy reconciliation keys on. See
+        /// [`SlotProvenance`].
+        provenance: SlotProvenance,
     },
+}
+
+/// How an `Assigned` slot's occupancy was established — the failover-
+/// resume reconciliation discriminator.
+///
+/// On a routine live dispatch this primary itself sent the
+/// `TaskAssignment`, so the occupancy is KNOWN-LIVE: the worker is
+/// genuinely running the task and a stray `TaskRequest` for that slot
+/// must NOT free it (the R1 invariant — a delayed/duplicate request is a
+/// no-op on a busy slot).
+///
+/// On a PROMOTION the new primary reconstructs the slot from the
+/// replicated `TaskState::InFlight` occupancy
+/// ([`PrimaryCoordinator::reconstruct_workers_from_cluster_state`]). That
+/// occupancy is a STALE GUESS, not a live observation: a survivor worker
+/// may have FINISHED its pre-kill task during the primary-less election
+/// window, so its completion landed on no primary and was LOST — the CRDT
+/// still says `InFlight` but the worker is idle. Such a slot is
+/// `Inherited`: its live occupancy is UNCONFIRMED. The worker's own
+/// post-`PrimaryChanged` `TaskRequest` (driven by the secondary's
+/// `repoll_idle_workers`, gated on the worker being idle) is the
+/// ground-truth re-confirmation that it is idle, so a request landing on
+/// an `Inherited` slot RECONCILES it: free the slot + return the task to
+/// `Pending` for re-dispatch (re-run is idempotent/acceptable — the
+/// alternative is a permanent deadlock). A worker that was genuinely
+/// still running its inherited task never requests for that slot (its
+/// secondary's pool reports it busy); when it finishes, the broadcast
+/// `TaskComplete` frees the slot through the normal terminal path. Either
+/// way the `Inherited` state is transient and resolved by the worker's
+/// own next signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotProvenance {
+    /// This primary committed the assignment via `commit_assignment`
+    /// (it sent the `TaskAssignment`) — occupancy is known-live.
+    Dispatched,
+    /// Reconstructed from replicated `TaskState::InFlight` at hydration
+    /// (a promoted primary) — occupancy is an unconfirmed CRDT guess
+    /// awaiting the worker's live re-confirmation.
+    Inherited,
 }
 
 impl<I: Identifier> SlotState<I> {
@@ -67,6 +110,17 @@ impl<I: Identifier> SlotState<I> {
         match self {
             SlotState::Idle => None,
             SlotState::Assigned { task, .. } => Some(task),
+        }
+    }
+
+    /// The provenance of an `Assigned` slot; `None` for an `Idle` slot.
+    /// The discriminator the failover-resume occupancy reconciliation
+    /// reads to tell a live-dispatched slot from an unconfirmed
+    /// inherited one.
+    fn provenance(&self) -> Option<SlotProvenance> {
+        match self {
+            SlotState::Idle => None,
+            SlotState::Assigned { provenance, .. } => Some(*provenance),
         }
     }
 
@@ -109,13 +163,25 @@ impl<I: Identifier> RemoteWorkerState<I> {
         self.state.task()
     }
 
-    /// Move the slot `Idle -> Assigned`. The slot MUST be `Idle`; the
-    /// `debug_assert` makes a reassign-before-terminal bug a test-time
-    /// panic, while production faithfully overwrites (the caller has
-    /// already gated on idleness through the dispatch view / scheduler
-    /// decision). Mirrors `WorkerHandle::assign_task`'s
-    /// `take_idle().ok_or(...)` contract on the worker-process side.
-    pub(super) fn assign(&mut self, task_hash: String, task: TaskInfo<I>, estimated: ResourceMap) {
+    /// Move the slot `Idle -> Assigned` with explicit `provenance`. The
+    /// slot MUST be `Idle`; the `debug_assert` makes a reassign-before-
+    /// terminal bug a test-time panic, while production faithfully
+    /// overwrites (the caller has already gated on idleness through the
+    /// dispatch view / scheduler decision). Mirrors
+    /// `WorkerHandle::assign_task`'s `take_idle().ok_or(...)` contract on
+    /// the worker-process side.
+    ///
+    /// `provenance` is [`SlotProvenance::Dispatched`] at every live
+    /// dispatch site (this primary sent the `TaskAssignment`) and
+    /// [`SlotProvenance::Inherited`] only at the failover-resume occupancy
+    /// crossing (reconstructed from replicated `InFlight`).
+    pub(super) fn assign(
+        &mut self,
+        task_hash: String,
+        task: TaskInfo<I>,
+        estimated: ResourceMap,
+        provenance: SlotProvenance,
+    ) {
         debug_assert!(
             self.state.is_idle(),
             "slot assigned while not Idle (reassignment-before-terminal)"
@@ -124,13 +190,27 @@ impl<I: Identifier> RemoteWorkerState<I> {
             task_hash,
             task,
             estimated,
+            provenance,
         };
     }
 
+    /// True iff the slot holds an `Inherited` (unconfirmed-occupancy)
+    /// assignment reconstructed from replicated `InFlight` at promotion —
+    /// the slot the failover-resume reconciliation may free on a survivor
+    /// worker's live idle re-confirmation. `false` for `Idle` and for a
+    /// live `Dispatched` slot (whose occupancy is known and must never be
+    /// freed by a bare `TaskRequest`).
+    pub(super) fn is_inherited(&self) -> bool {
+        self.state.provenance() == Some(SlotProvenance::Inherited)
+    }
+
     /// Force the slot back to `Idle`, returning the previously-held
-    /// task (if any). Used only by the dead-secondary requeue path
-    /// (the worker is being dropped) and the dispatch-send rollback;
-    /// the routine terminal path goes through
+    /// task (if any). Used by the dead-secondary requeue path (the worker
+    /// is being dropped), the dispatch-send rollback, and the failover-
+    /// resume occupancy reconciliation
+    /// ([`PrimaryCoordinator::reconcile_inherited_slot`], which frees an
+    /// unconfirmed inherited slot on the worker's live idle
+    /// re-confirmation); the routine terminal path goes through
     /// [`PrimaryCoordinator::free_slot_on_terminal`] which gates on the
     /// hash.
     pub(super) fn vacate(&mut self) -> Option<TaskInfo<I>> {
@@ -1814,7 +1894,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
         let phase = task.phase_id.clone();
         self.reserve_type_slot(&task.type_id);
-        self.workers[worker_idx].assign(task_hash.clone(), task.clone(), estimated);
+        // Live dispatch: THIS primary just sent the `TaskAssignment`, so
+        // the occupancy is known-live — `Dispatched` provenance. The
+        // failover-resume reconciliation never touches such a slot.
+        self.workers[worker_idx].assign(
+            task_hash.clone(),
+            task.clone(),
+            estimated,
+            crate::primary::SlotProvenance::Dispatched,
+        );
         self.in_flight.insert(
             task_hash,
             InFlightEntry {
@@ -2045,6 +2133,67 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
         requeue_mutations
+    }
+
+    /// Reconcile ONE survivor worker's stale `Inherited` slot when its
+    /// own live `TaskRequest` re-confirms it is idle: free the slot back
+    /// to `Idle`, drop the inherited `in_flight` ledger entry, release the
+    /// per-type concurrency slot, and requeue the task into the pool.
+    /// Returns the `TaskRequeued` mutation (`InFlight → Pending`) for the
+    /// caller to broadcast in lockstep with the local pool requeue (a
+    /// stale CRDT `InFlight` would otherwise re-strand the task on a
+    /// subsequent failover), or `None` when the addressed slot is not an
+    /// inherited-occupancy slot (so the caller leaves it untouched).
+    ///
+    /// Single concern: the per-worker failover-resume occupancy
+    /// reconciliation. The sibling of
+    /// [`Self::recover_inflight_for_dead_secondary`] — same ledger +
+    /// type-slot + pool-requeue + `TaskRequeued`-origination shape — but
+    /// scoped to a SINGLE live worker whose hydrated occupancy proved
+    /// stale, and it returns the slot to `Idle` (the worker is alive and
+    /// about to take work) rather than dropping it (the dead-secondary
+    /// path drops the whole worker). The hash is read from the slot's
+    /// `Assigned` state, so the ledger entry and the slot can never
+    /// disagree about WHICH task is being reconciled.
+    ///
+    /// Gated on [`RemoteWorkerState::is_inherited`]: a live `Dispatched`
+    /// slot (this primary sent the assignment) is NEVER freed by a bare
+    /// `TaskRequest` — the R1 invariant stays intact for the steady-state
+    /// / relocated / rc-G2 paths, where a request for a busy slot is a
+    /// delayed/duplicate no-op. Only an unconfirmed inherited slot, whose
+    /// worker is now positively reporting idle, reconciles.
+    pub(super) fn reconcile_inherited_slot(&mut self, worker_idx: usize) -> Option<ClusterMutation<I>> {
+        if !self.workers[worker_idx].is_inherited() {
+            return None;
+        }
+        // Vacate the slot to `Idle`, recovering the held task and its
+        // hash from the `Assigned` state. `vacate` returns the task; the
+        // hash is the ledger key the inherited entry was seeded under.
+        let task_hash = match &self.workers[worker_idx].state {
+            SlotState::Assigned { task_hash, .. } => task_hash.clone(),
+            SlotState::Idle => return None,
+        };
+        let task = self.workers[worker_idx].vacate()?;
+        // Drop the inherited ledger entry + release the type slot + pool
+        // requeue, mirroring `recover_inflight_for_dead_secondary`'s
+        // symmetric inverse of a dispatch so the ledger, the type budget,
+        // and the phase in-flight counter stay consistent.
+        self.in_flight.remove(&task_hash);
+        self.release_type_slot(&task.type_id);
+        tracing::info!(
+            secondary = %self.workers[worker_idx].secondary_id,
+            worker = self.workers[worker_idx].worker_id,
+            task_hash = %task_hash,
+            "reconciled stale inherited worker occupancy on live idle \
+             re-confirmation: freeing slot and requeueing task (completion \
+             was lost during the primary-less failover window)"
+        );
+        self.pool_mut().requeue(task);
+        Some(ClusterMutation::TaskRequeued {
+            hash: task_hash,
+            // Stamped at the origination choke point (apply_locally_for_broadcast).
+            version: Default::default(),
+        })
     }
 
     /// Starvation oracle for the lazy on-demand dead-secondary requeue.
@@ -2365,6 +2514,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     pub fn slot_is_idle_for_test(&self, secondary_id: &str, worker_id: u32) -> bool {
         self.worker_idx_for(secondary_id, worker_id)
             .map(|idx| self.workers[idx].is_idle())
+            .unwrap_or(false)
+    }
+
+    /// Test-only inspector: is the `(secondary_id, worker_id)` slot an
+    /// `Inherited`-provenance assignment (reconstructed from replicated
+    /// `InFlight` at promotion, occupancy unconfirmed)? Lets the
+    /// failover-resume reconciliation tests assert that hydrate marks a
+    /// reconstructed slot inherited (vs a live `Dispatched` slot).
+    #[cfg(test)]
+    pub fn slot_is_inherited_for_test(&self, secondary_id: &str, worker_id: u32) -> bool {
+        self.worker_idx_for(secondary_id, worker_id)
+            .map(|idx| self.workers[idx].is_inherited())
             .unwrap_or(false)
     }
 

@@ -50,21 +50,40 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
-        // The expected set is the known-secondary roster captured
+        // The expected set is the LIVE PEER-secondary roster captured
         // AT this moment (post-quorum, post-cert-exchange). It is
         // not `config.num_secondaries` because the connect phase
         // may have dropped no-show secondaries on its own
         // timeout — we only wait for who's actually here.
         //
-        // V5: the roster READ routes through the replicated
-        // `cluster_state.known_secondaries()` (the CRDT-derived known set)
-        // rather than `self.secondaries` (transport-handle metadata only).
-        // Each connected secondary has a `SecondaryCapacity` record (the
-        // mesh-ready signal source) so the two sets coincide on the cold
-        // path; reading the CRDT keeps the roster reads uniform with the
-        // assignment-site read (assignment.rs).
-        let expected: HashSet<String> =
-            self.cluster_state.known_secondaries().map(String::from).collect();
+        // Two ids that `known_secondaries()` (the raw capacity-record
+        // roster) carries must NOT be in the expected set, because neither
+        // can ever satisfy the `MeshReady` this wait blocks on:
+        //   * SELF. The promoted primary is itself a worker-secondary, so
+        //     it holds a `SecondaryCapacity` record and appears in
+        //     `known_secondaries()` — but a node never emits `MeshReady`
+        //     ABOUT ITSELF to itself. Waiting on it always burns the full
+        //     `mesh_ready_timeout`.
+        //   * The DEPARTED ex-primary. `PeerRemoved` marks a dead node
+        //     `peer_state = Dead` but LEAVES its `SecondaryCapacity`
+        //     record in place (the record is sticky; see
+        //     `apply_peer_removed`), so the just-scancelled ex-primary that
+        //     triggered this election still appears in
+        //     `known_secondaries()` — yet it is dead and will never report.
+        // `alive_secondary_members()` is the authoritative live-membership
+        // roster (worker_count > 0 ∧ `is_peer_alive`), which structurally
+        // excludes the dead ex-primary; the `id != node_id` filter excludes
+        // self. So the expected set is exactly the LIVE PEER secondaries —
+        // the only nodes that can emit a `MeshReady` this wait can observe.
+        // (On the cold path this is a strict no-op-or-improvement: it can
+        // only remove ids that would never have reported anyway.)
+        let own_id = self.config.node_id.as_str();
+        let expected: HashSet<String> = self
+            .cluster_state
+            .alive_secondary_members()
+            .filter(|id| *id != own_id)
+            .map(String::from)
+            .collect();
         if expected.is_empty() {
             tracing::debug!("no secondaries connected; skipping wait_for_mesh_ready");
             return Ok(());

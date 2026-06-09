@@ -82,16 +82,37 @@ impl IdleDetector {
     pub fn tick(&mut self, snapshot: &StatsSnapshot, now: Instant) -> Vec<String> {
         let ready_work = snapshot.ready_in_queue > 0;
 
+        // 0. Prune gates for secondaries that have DEPARTED the cluster.
+        //    The accumulate-forever roster (this detector has no clean CRDT
+        //    roster accessor for a never-seen-busy secondary) must still
+        //    honour the ONE authoritative liveness fact a zero-authority
+        //    observer holds: `alive_secondaries` (the snapshot's projection
+        //    of `alive_secondary_members()` — `is_peer_alive` filtered). A
+        //    secondary that has been `PeerRemoved` (e.g. a scancelled
+        //    ex-primary) drops out of that set even though its sticky
+        //    `SecondaryCapacity` record keeps it in `known_secondaries()`;
+        //    without this prune it would be reported as a perpetually-idle
+        //    GHOST. A secondary still carrying in-flight work is never
+        //    pruned (it is alive by construction), so an in-progress holder
+        //    is never dropped mid-flight.
+        self.gates
+            .retain(|id, _| snapshot.alive_secondaries.contains(id));
+
         // 1. Learn any newly-observed secondaries (accumulate the
         //    roster) and update every gate's idle/busy transition.
         //    Iterating over the union of (already-known) ∪ (currently
         //    in-flight) keeps a secondary that has fallen out of the
         //    in-flight map (all its tasks finished) under observation.
+        //    The union is then restricted to LIVE members so a departed
+        //    node carrying a lingering phantom `InFlight` (e.g. a
+        //    scancelled ex-primary whose completion was lost) is neither
+        //    re-added here nor resurrected after the step-0 prune.
         let observed: Vec<String> = self
             .gates
             .keys()
             .cloned()
             .chain(snapshot.per_secondary_in_flight.keys().cloned())
+            .filter(|id| snapshot.alive_secondaries.contains(id))
             .collect();
         for id in observed {
             let in_flight = snapshot

@@ -519,7 +519,23 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             match self.worker_idx_for(&secondary, worker) {
                 Some(idx) => {
                     let estimated = self.estimator.estimate(&task);
-                    self.workers[idx].assign(hash, task, estimated);
+                    // `Inherited` provenance: this occupancy is a STALE
+                    // GUESS reconstructed from the replicated `InFlight`
+                    // ledger, NOT a live observation. A survivor worker
+                    // whose pre-kill task completed during the primary-
+                    // less window is reconstructed `Assigned` here even
+                    // though it is idle; marking the slot `Inherited` lets
+                    // the worker's own post-`PrimaryChanged` `TaskRequest`
+                    // reconcile it (free + requeue) rather than wedging on
+                    // a phantom-busy slot. A slot whose worker is genuinely
+                    // still running resolves normally when the broadcast
+                    // `TaskComplete` lands.
+                    self.workers[idx].assign(
+                        hash,
+                        task,
+                        estimated,
+                        crate::primary::SlotProvenance::Inherited,
+                    );
                 }
                 None => {
                     tracing::warn!(
