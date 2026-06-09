@@ -59,6 +59,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // `on_phase_end` fires off any TaskComplete
                         // that arrives during connect — both producers
                         // converge on the same channel here.
+                        // A `SecondaryWelcome` handled here originates the
+                        // secondary's `SecondaryCapacity`, which (via
+                        // `react_to_capacity_growth`) rebuilds the roster and
+                        // queues a `TasksAdded` on the bus. Deliberately do
+                        // NOT drain+dispatch inline at THIS wait: connect runs
+                        // BEFORE `perform_initial_assignment`, which is the
+                        // designated first-dispatch (a deterministic
+                        // round-robin over the full roster). A live dispatch
+                        // here would drain the pool ahead of it and break the
+                        // initial-assignment shape. The queued `TasksAdded`
+                        // stays on the bus and is serviced by the
+                        // post-assignment `wait_for_mesh_ready` drain / the
+                        // operational-loop entry sweep — the roster is current,
+                        // dispatch is just ordered after initial assignment.
                         Some(m) => self.dispatch_message(m, command_rx).await?,
                         None => return Err("transport closed".into()),
                     }

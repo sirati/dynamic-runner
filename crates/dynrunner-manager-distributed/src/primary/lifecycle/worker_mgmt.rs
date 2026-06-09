@@ -104,6 +104,95 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         }
     }
 
+    /// React to a worker-roster GROWTH: a previously-unknown secondary's
+    /// `SecondaryCapacity` was just applied (a worker became ready), so a
+    /// new idle slot now exists in the replicated ledger but NOT yet in
+    /// the primary-local `self.workers` cache.
+    ///
+    /// Single concern: keep the worker-roster derived cache + the dispatch
+    /// recheck coherent with a capacity-record growth, exactly as the
+    /// task-ledger growth surfaces (`TasksAdded`) keep the pool + recheck
+    /// coherent. The two coupled steps:
+    ///   1. REBUILD `self.workers` via the SOLE roster builder
+    ///      [`Self::reconstruct_workers_from_cluster_state`] — idempotent,
+    ///      name-sorted round-robin, and re-crosses every replicated
+    ///      `TaskState::InFlight` back onto its slot, so a rebuild
+    ///      mid-bringup never zeroes a committed-and-originated slot (the
+    ///      live dispatch sites originate `TaskAssigned` immediately after
+    ///      a successful send, so every committed slot is `InFlight` in the
+    ///      CRDT by the time any capacity record can interleave).
+    ///   2. EMIT [`WorkerMgmtSignal::TasksAdded`] so the existing dispatch
+    ///      recheck (`dispatch_to_idle_workers`) re-evaluates EVERY free
+    ///      worker — now including the freshly-rostered idle slot — against
+    ///      the ready pool. Decoupled emit, never a direct dispatch call
+    ///      (the dispatch-decoupling law): the operational loop's
+    ///      worker-management arm (or a pre-loop wait's inline drain) runs
+    ///      the recheck off the bus.
+    ///
+    /// This is the worker-ready half of "dispatch is a pure function of
+    /// (ready-tasks ∩ idle-worker-capacity), re-evaluated on every event
+    /// that can create a match": `TasksAdded` covers a new task arriving at
+    /// an idle worker; this covers a new idle worker arriving at a ready
+    /// task. Both startup (a secondary whose capacity lands AFTER
+    /// `perform_initial_assignment`) and mid-run (a type-shift-respawned
+    /// worker becoming ready after its phase's assignment) converge here.
+    pub(crate) fn react_to_capacity_growth(&mut self) {
+        self.reconstruct_workers_from_cluster_state();
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
+    }
+
+    /// Drain whatever worker-management signals are CURRENTLY queued on
+    /// the bus (non-blocking) and run the same reaction the operational
+    /// loop's parked worker-management arm runs. Returns `true` iff a
+    /// batch was drained (at least one signal was queued).
+    ///
+    /// Single concern: let a caller OUTSIDE the operational loop service
+    /// the worker-management bus synchronously at a point where leaving a
+    /// queued `TasksAdded` unserviced would stall. The two callers are the
+    /// pre-loop waits (`wait_for_connections` / `wait_for_mesh_ready`) and
+    /// the operational-loop entry sweep:
+    ///
+    ///   - PRE-LOOP SELF-RECOVERY. A late `SecondaryCapacity` applied
+    ///     DURING a wait emits `TasksAdded` (via `react_to_capacity_growth`)
+    ///     onto the bus, but the operational loop — the usual drain — has
+    ///     not started yet, so the dispatch would be deferred past the
+    ///     wait. `wait_for_mesh_ready` would then block its full timeout on
+    ///     that late secondary's `MeshReady`, which it can only emit AFTER
+    ///     receiving an assignment. Draining + reacting inline dispatches
+    ///     the ready work to the freshly-rostered idle worker NOW, so the
+    ///     secondary gets a `TaskAssignment` → goes operational → emits
+    ///     `MeshReady` → unblocks the wait. The circular deadlock
+    ///     (assigned=0 ⇒ no operational remotes ⇒ no `MeshReady` ⇒ wait
+    ///     blocks) self-recovers without reverting rc-C's decoupling or
+    ///     moving the wait before assignment.
+    ///
+    ///   - ENTRY SWEEP. Any `TasksAdded` emitted across the pre-loop chain
+    ///     (initial empty-phase cascade, a late capacity, an `on_phase_end`
+    ///     spawn) is serviced once at loop entry so the steady state is
+    ///     reached with dispatch already a pure function of
+    ///     (ready-tasks ∩ idle-worker-capacity), never waiting for the
+    ///     next bus event to first act on a backlog.
+    ///
+    /// Take-drain-react-putback the receiver, mirroring the operational
+    /// loop's own borrow discipline (`react_to_worker_signal_batch` needs
+    /// `&mut self`; the drain needs `&mut rx`). A `None` receiver (already
+    /// consumed by a prior loop entry) is a no-op.
+    pub(crate) async fn drain_and_react_to_pending_worker_signals(&mut self) -> bool {
+        let Some(mut rx) = self.worker_mgmt_rx.take() else {
+            return false;
+        };
+        let drained = crate::worker_signal::try_collect_worker_signal_batch(&mut rx);
+        self.worker_mgmt_rx = Some(rx);
+        match drained {
+            Some(batch) => {
+                self.react_to_worker_signal_batch(batch).await;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The dispatch-altitude consult of the starvation oracle + command.
     /// Single concern: translate "only silent-held work remains" into a
     /// dead-secondary declaration. Pure consumer of the liveness module's
