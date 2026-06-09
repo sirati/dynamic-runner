@@ -250,6 +250,7 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
         | TaskState::Failed { task, .. }
         | TaskState::Unfulfillable { task, .. }
         | TaskState::Blocked { task, .. }
-        | TaskState::InvalidTask { task, .. } => task,
+        | TaskState::InvalidTask { task, .. }
+        | TaskState::SkippedAlreadyDone { task, .. } => task,
     }
 }

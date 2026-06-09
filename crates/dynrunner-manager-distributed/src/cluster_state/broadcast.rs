@@ -153,6 +153,10 @@ fn stamp_versions<I: Identifier>(
             // attempt-stamped above.)
             ClusterMutation::TaskAdded { .. }
             | ClusterMutation::TaskBlocked { .. }
+            // `TaskSkippedAlreadyDone` is version-LESS and attempt-LESS: the
+            // apply arm preserves the `attempt` from the `Pending` source
+            // (a skip is a spawn-time terminal, not a stamped transition).
+            | ClusterMutation::TaskSkippedAlreadyDone { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }

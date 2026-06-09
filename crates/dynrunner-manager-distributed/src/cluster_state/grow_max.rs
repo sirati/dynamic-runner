@@ -132,10 +132,10 @@ impl<I: Identifier> ClusterState<I> {
     // === phase_event_tallies (F4) ===
 
     /// The replicated per-phase EVENT tally for `(phase, tally)`, or 0 for a
-    /// never-incremented key (F4). Read by `on_phase_end` and the
-    /// `phase_can_proceed` / `RunShouldFail` gate — identical numbers to the
-    /// old node-local maps on the live path, CORRECT on the promoted path
-    /// (the events were replicated).
+    /// never-incremented key (F4). Read by the `on_phase_end` hook (the
+    /// `completed` / `failed` numbers it hands the consumer) — identical
+    /// numbers to the old node-local maps on the live path, CORRECT on the
+    /// promoted path (the events were replicated).
     pub fn phase_event_tally_for(&self, key: &(PhaseId, PhaseTally)) -> u32 {
         read_grow_max(&self.phase_event_tallies, key)
     }

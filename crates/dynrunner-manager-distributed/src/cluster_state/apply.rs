@@ -473,6 +473,10 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Failed { .. }
                     | TaskState::Unfulfillable { .. }
                     | TaskState::InvalidTask { .. }
+                    // A skip is terminal: it locks out a late cascade-pause
+                    // exactly like the other terminals (a TaskBlocked must
+                    // not regress an already-done item to Blocked).
+                    | TaskState::SkippedAlreadyDone { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
                     TaskState::Blocked { .. } => {
                         // Already blocked: idempotent on a matching `on`,
@@ -490,6 +494,29 @@ impl<I: Identifier> ClusterState<I> {
                         *state = TaskState::Blocked { task, on, attempt };
                         ApplyOutcome::Applied
                     }
+                }
+            }
+            ClusterMutation::TaskSkippedAlreadyDone { hash } => {
+                // Discovery-time skip: materialize the ledger entry DIRECTLY
+                // terminal. Authoritative spawn-time transition (like the
+                // resets, NOT a monotone join), so it keeps its explicit
+                // precondition arm and does NOT route through
+                // `merge_task_state`. Gate on `Pending` ONLY: an in-flight
+                // assignment or a real terminal (the weakest-terminal lockout)
+                // wins, so a late/out-of-order skip can never overwrite real
+                // progress. Idempotent — a re-applied skip against an
+                // already-`SkippedAlreadyDone` entry is the `_ => NoOp` arm.
+                // The `attempt` is preserved from the `Pending` source.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                match state {
+                    TaskState::Pending { task, attempt, .. } => {
+                        let (task, attempt) = (task.clone(), *attempt);
+                        *state = TaskState::SkippedAlreadyDone { task, attempt };
+                        ApplyOutcome::Applied
+                    }
+                    _ => ApplyOutcome::NoOp,
                 }
             }
             ClusterMutation::TaskPreferredSecondariesUpdated {

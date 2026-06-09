@@ -420,7 +420,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 TaskState::Completed { .. }
                 | TaskState::Failed { .. }
                 | TaskState::Unfulfillable { .. }
-                | TaskState::InvalidTask { .. } => None,
+                | TaskState::InvalidTask { .. }
+                // Already terminal: a #3b run-wide invalidation must not
+                // overwrite a skip (the apply rule's weakest-terminal lockout
+                // would NoOp it anyway; skipping it here keeps the broadcast
+                // minimal).
+                | TaskState::SkippedAlreadyDone { .. } => None,
             })
             .collect();
         if targets.is_empty() {

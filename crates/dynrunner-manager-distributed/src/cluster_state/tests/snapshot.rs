@@ -118,6 +118,54 @@ fn snapshot_round_trip_preserves_invalid_task() {
     );
 }
 
+/// A terminal `SkippedAlreadyDone` entry survives a snapshot → restore
+/// cycle onto a fresh joiner: it rides the snapshot's `tasks` map
+/// automatically (no new snapshot field), restore routes it through the
+/// shared `merge_task_state` join, and it lands as `SkippedAlreadyDone`
+/// (its `to_completed_event → None` so restore fires no spurious
+/// completion). A stale peer's later Pending snapshot must NOT overwrite it
+/// (a skip is terminal — it out-ranks any non-terminal in the join band).
+#[test]
+fn snapshot_round_trip_preserves_skipped_already_done() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "skip".into(),
+        task: mk_task("skip"),
+    });
+    s.apply(ClusterMutation::TaskSkippedAlreadyDone {
+        hash: "skip".into(),
+    });
+
+    let snap = s.snapshot();
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.restore(snap);
+
+    assert!(
+        matches!(
+            joiner.task_state("skip"),
+            Some(TaskState::SkippedAlreadyDone { .. })
+        ),
+        "the skip survives snapshot/restore"
+    );
+    assert_eq!(joiner.counts(), s.counts());
+    assert_eq!(joiner.counts().skipped_already_done, 1);
+
+    // A stale Pending snapshot must NOT overwrite the terminal skip.
+    let mut stale = ClusterState::<RunnerIdentifier>::new();
+    stale.apply(ClusterMutation::TaskAdded {
+        hash: "skip".into(),
+        task: mk_task("skip"),
+    });
+    joiner.restore(stale.snapshot());
+    assert!(
+        matches!(
+            joiner.task_state("skip"),
+            Some(TaskState::SkippedAlreadyDone { .. })
+        ),
+        "terminal SkippedAlreadyDone must win over a stale Pending snapshot"
+    );
+}
+
 /// Pins the Step 8 contract that `ClusterStateSnapshot` carries
 /// the replicated observer set so a late-joiner's first restore
 /// populates `RoleTable.observers` before any `PeerJoined`

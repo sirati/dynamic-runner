@@ -3810,31 +3810,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     /// Per-phase proceed-or-fail policy, evaluated once a phase has
     /// drained AND its retry buckets are exhausted, immediately before
-    /// `mark_phase_done`. A pure, synchronous predicate on the phase's
-    /// terminal counters — no I/O, no mutation, no worker-management call
-    /// (the caller routes a FAIL through the decoupled signal bus).
+    /// `mark_phase_done`. A pure, synchronous predicate DERIVED FROM THE
+    /// REPLICATED LEDGER (`phase_rollups`) — no I/O, no mutation, no
+    /// worker-management call (the caller routes a FAIL through the
+    /// decoupled signal bus).
     ///
     /// Default policy:
-    /// - PROCEED when `completed > 0` — the phase produced output its
-    ///   dependents can consume.
-    /// - PROCEED when the phase's items reached a terminal FAILED outcome
-    ///   (`failed > 0`). This is load-bearing and is NOT a "fail the run"
-    ///   case: by the time control reaches this point the per-phase retry
-    ///   buckets (Recoverable then OOM) have already run and exhausted
-    ///   every reinjection path, so any surviving failure is PERMANENT and
-    ///   already recorded. The canonical contract for an exhausted bucket
-    ///   is "the phase advances; the fail_* count in the run's outcome
-    ///   summary surfaces these to the operator" (see
-    ///   [`crate::primary::retry_bucket`] — the budget-exhausted branch).
-    ///   Aborting the whole run on a permanently-failed task would defeat
-    ///   the retry-bucket machinery and regress
-    ///   `sequential_phase_advance_after_oom_bucket_exhausts`.
-    /// - PROCEED when the phase recorded a SKIPPED-AS-EXISTING count
-    ///   (`skipped > 0`) — the legitimate `--skip-existing` "nothing left
-    ///   to do" case the owner directive carves out: the phase's items
-    ///   ARE there (their outputs already exist on the shared fs), so
-    ///   skipping them all VALIDATES that the phase has nothing left to
-    ///   produce. Its dependents read present outputs, not absent ones.
+    /// - PROCEED when the phase owns tasks and every one of them is terminal
+    ///   (`has_any && !has_live`). This subsumes the former completed /
+    ///   failed / skipped-as-existing accounting because skipped items are
+    ///   now REAL terminal tasks (`TaskState::SkippedAlreadyDone`):
+    ///     * a phase with ≥1 Completed terminal produced output its
+    ///       dependents consume;
+    ///     * a phase whose items reached a terminal FAILED outcome advances
+    ///       per the canonical retry-bucket-exhaustion contract (the retry
+    ///       buckets have already run; surviving failures are PERMANENT and
+    ///       recorded, surfaced in the outcome summary, NOT aborted — see
+    ///       [`crate::primary::retry_bucket`]);
+    ///     * an ALL-SKIPPED phase (the `--skip-existing` "nothing left to do"
+    ///       case) is STRUCTURALLY indistinguishable here from any other
+    ///       all-terminal phase — its items ARE in the ledger (their outputs
+    ///       already exist on the shared fs), so it proceeds without a
+    ///       special skip-count branch.
     /// - PROCEED when the consumer DECLARED the phase `may_be_empty`
     ///   (`PhaseSpec.may_be_empty`, replicated via
     ///   `ClusterMutation::PhaseMayBeEmptySet`) — the explicit opt-out for
@@ -3843,98 +3840,91 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   an explicit opt-out exists; this is it.
     ///
     /// The FAIL branch (`RunShouldFail`) is reserved for the genuine
-    /// wedges:
-    /// - a phase that reached the drain having owned items yet recorded NO
-    ///   terminal outcome of any kind for them (residual unresolved work),
-    ///   surfaced by `phase_min_workers` observing residual work; and
+    /// wedges, both reached only via the `_` fallback (no terminal-drained
+    /// tasks for this phase):
+    /// - a phase that reached the drain still owning LIVE residual work
+    ///   (`phase_min_workers > 0`) — advancing would strand its dependents
+    ///   on never-resolved inputs; and
     /// - (F-honesty) an activated phase that drained GENUINELY EMPTY — zero
-    ///   completed, zero failed, zero skipped, zero residual — that the
-    ///   consumer did NOT declare `may_be_empty`, AND that leaves the pool
-    ///   with NO outstanding real work (`is_empty()`). This is the
-    ///   silent-partial-success the consumers hit when `on_phase_end`-driven
-    ///   lazy injection (or discovery) was suppressed: the phase's planned
-    ///   work was never injected, so with nothing else outstanding the run
-    ///   would complete clean rc=0 having produced nothing. The topology
-    ///   (leaf vs non-leaf) is NOT the discriminator — the suppressed phase is
-    ///   a LEAF in one asm-dataset chain and NON-LEAF in the asm-tokenizer
-    ///   chain (`tokenize→unify_vocab→memmap`); both are the same bug. The
-    ///   discriminators are the explicit `may_be_empty` declaration AND the
-    ///   outstanding-work probe: an empty drain that leaves real work in the
-    ///   pool (queued, in-flight, OR blocked — the dependents this phase's
-    ///   `Done` is about to UNBLOCK) stranded NOTHING and PROCEEDS; only an
-    ///   empty drain that empties the run is the wedge. The framework cannot
-    ///   otherwise distinguish an intentional empty barrier from a
-    ///   suppressed-injection bug.
+    ///   ledger tasks of its own, not declared `may_be_empty`, AND that
+    ///   leaves the pool with NO outstanding real work (`is_empty()`). This
+    ///   is the silent-partial-success the consumers hit when
+    ///   `on_phase_end`-driven lazy injection (or discovery) was suppressed:
+    ///   the phase's planned work was never injected, so with nothing else
+    ///   outstanding the run would complete clean rc=0 having produced
+    ///   nothing. The topology (leaf vs non-leaf) is NOT the discriminator —
+    ///   the suppressed phase is a LEAF in one asm-dataset chain and NON-LEAF
+    ///   in the asm-tokenizer chain (`tokenize→unify_vocab→memmap`); both are
+    ///   the same bug. The discriminators are the explicit `may_be_empty`
+    ///   declaration AND the outstanding-work probe: an empty drain that
+    ///   leaves real work in the pool (queued, in-flight, OR blocked — the
+    ///   dependents this phase's `Done` is about to UNBLOCK) stranded NOTHING
+    ///   and PROCEEDS; only an empty drain that empties the run is the wedge.
     ///
     /// The phase-layer veto here is the structural backstop; the live
     /// no-progress decision (a phase that started, needs workers, and has
     /// none) is the worker arm's, reached via `PhaseStartedNeedsWorkers`.
     ///
-    /// `phase` is consulted for the residual-work probe (`phase_min_workers`)
-    /// and the `may_be_empty` opt-out lookup; the policy is otherwise
-    /// phase-agnostic.
-    pub(super) fn phase_can_proceed(
-        &self,
-        phase: &PhaseId,
-        completed: u32,
-        failed: u32,
-        skipped: u32,
-    ) -> bool {
-        // Any terminal accounting (success OR recorded permanent failure)
-        // means the phase resolved its work — advance per the canonical
-        // retry-bucket-exhaustion contract.
-        if completed > 0 || failed > 0 {
-            return true;
+    /// `phase` is the only input: the ledger rollup, the residual-work probe
+    /// (`phase_min_workers`), and the `may_be_empty` opt-out lookup are all
+    /// keyed on it.
+    pub(super) fn phase_can_proceed(&self, phase: &PhaseId) -> bool {
+        // The decision is derived from the replicated ledger, not from an
+        // event tally. Skipped-as-existing items are now REAL terminal tasks
+        // (`TaskState::SkippedAlreadyDone`), so any phase that had ANY
+        // discovered item has a `PhaseRollup` entry — and a phase that
+        // drained with tasks (every task reached a terminal state) reads
+        // `has_any && !has_live`. That single condition subsumes the former
+        // completed/failed/skipped accounting:
+        //   * a phase with ≥1 Completed/Failed terminal → has_any, !has_live;
+        //   * an all-skipped phase (the `--skip-existing` "nothing left to
+        //     do" case) → has_any, !has_live (a skip IS terminal) — STRUCTURAL
+        //     proceed, no special skip-count branch;
+        //   * a genuinely-empty phase (zero discovered items) → no rollup
+        //     entry (or has_any == false) → the `_` fallback below.
+        let rollups = self.cluster_state.phase_rollups();
+        match rollups.get(phase) {
+            // The phase owns tasks and every one of them is terminal — it
+            // resolved its work, advance (the canonical retry-bucket-
+            // exhaustion contract: surviving failures are permanent-and-
+            // recorded and surfaced in the outcome summary, not aborted).
+            Some(r) if r.has_any && !r.has_live => true,
+            // No terminal-drained tasks for this phase. Either it owns LIVE
+            // work (a residual not-yet-terminal task) or it owns no tasks at
+            // all. Three discriminators, in the same priority order the
+            // pre-ledger policy used:
+            _ => {
+                // The consumer explicitly declared this phase MAY drain empty
+                // (a pure sequencing gate / terminal-empty phase) — the "fail
+                // loud by default" opt-out. Advance.
+                if self.cluster_state.phase_may_be_empty(phase) {
+                    return true;
+                }
+                // Residual unresolved work for THIS phase is a wedge
+                // (advancing strands its dependents on never-resolved
+                // inputs) — veto. `phase_min_workers` reads the pool's
+                // pending/in-flight floor for this phase.
+                if self.phase_min_workers(phase) > 0 {
+                    return false;
+                }
+                // The phase drained genuinely empty and is NOT declared
+                // `may_be_empty`. The F-honesty wedge is a SILENT PARTIAL
+                // SUCCESS — the run would complete clean rc=0 having produced
+                // nothing because a phase that should have injected work
+                // didn't. But "empty" alone does not prove that wedge: the
+                // COMMON multi-phase shape is an empty EARLY phase that owns
+                // no work of its own while its dependents own the real work,
+                // BLOCKED only on this phase reaching `Done` — exactly what
+                // `mark_phase_done` delivers. There the empty drain stranded
+                // NOTHING. The discriminator is whether the run still owns ANY
+                // outstanding real work (`!pool().is_empty()` — queued +
+                // in-flight + blocked, all phases; the #312 cross-phase
+                // discriminator). Outstanding work remains ⇒ PROCEED; pool
+                // genuinely empty ⇒ the run would finish having done nothing
+                // ⇒ veto, fail loud.
+                !self.pool().is_empty()
+            }
         }
-        // All items skipped-as-existing (outputs already present): the
-        // legitimate `--skip-existing` "nothing left to do" case. The phase
-        // validated it has nothing left to produce — advance.
-        if skipped > 0 {
-            return true;
-        }
-        // The consumer explicitly declared this phase MAY drain empty (a
-        // pure sequencing gate / terminal-empty phase). The "fail loud by
-        // default" opt-out — advance.
-        if self.cluster_state.phase_may_be_empty(phase) {
-            return true;
-        }
-        // No terminal accounting, no skip, not opted-out. Residual
-        // unresolved work for a drained phase is a wedge (advancing strands
-        // dependents) — veto.
-        if self.phase_min_workers(phase) > 0 {
-            return false;
-        }
-        // Zero completed, zero failed, zero skipped, zero residual, and NOT
-        // declared `may_be_empty`: the phase drained genuinely empty. The
-        // F-honesty wedge is a SILENT PARTIAL SUCCESS — the run would now
-        // complete clean rc=0 having produced nothing because a phase that
-        // should have injected work didn't. But "empty" alone does not prove
-        // that wedge. The COMMON multi-phase shape is an empty EARLY phase
-        // that legitimately owns no work of its own while its dependents own
-        // the real work, BLOCKED only on this phase reaching `Done` — exactly
-        // what `mark_phase_done` (the PROCEED branch) delivers. There the
-        // empty drain stranded NOTHING: marking it done UNBLOCKS the
-        // dependents. (asm-dataset `build_compilers` with `--build-compilers`
-        // omitted: phase 1 drains 0/0/0 by design while the 4 `matrix_eval` +
-        // 1 `dependency_graph` tasks sit pending-but-phase-blocked on it.)
-        //
-        // The discriminator is therefore whether the run still owns ANY
-        // outstanding real work after this phase drains. `is_empty()` reads
-        // the canonical outstanding-work total — queued + in-flight + blocked,
-        // all phases (the just-drained empty phase contributes 0). Blocked is
-        // INCLUDED here, unlike the starvation oracle which excludes it: that
-        // oracle asks "can an idle worker dispatch right now?" (a
-        // queued-side-only read), whereas this guard asks "would advancing
-        // this phase complete the run having done nothing?" — for which a
-        // blocked task is real outstanding work the empty phase's `Done` may
-        // be the very gate that releases. A genuine suppressed-injection wedge
-        // leaves NO such work in the pool (the dropped phase's tasks never
-        // entered it), so `is_empty()` is true and the guard fires.
-        //
-        // Outstanding real work remains ⇒ the empty phase did not end the run
-        // ⇒ PROCEED. Pool genuinely empty ⇒ the run would complete having
-        // produced nothing ⇒ veto, fail loud.
-        !self.pool().is_empty()
     }
 
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
@@ -4050,17 +4040,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 let failed = self
                     .cluster_state
                     .phase_event_tally_for(&(p.clone(), crate::cluster_state::PhaseTally::Failed));
-                // Read the replicated SKIPPED-AS-EXISTING tally (F-honesty):
-                // the count the discovery originator recorded for items it
-                // omitted because their outputs already exist. The
-                // proceed-or-fail decision uses it to discriminate a
-                // legitimate all-skipped empty drain (success) from a
-                // genuinely never-injected non-leaf phase (fail loud). Same
-                // grow-only-MAX map / accessor as Completed/Failed.
-                let skipped = self.cluster_state.phase_event_tally_for(&(
-                    p.clone(),
-                    crate::cluster_state::PhaseTally::SkippedExisting,
-                ));
                 // Gather the just-completed phase's PUBLISHED task outputs
                 // BEFORE taking the `&mut self.on_phase_end` borrow (the
                 // gather is an immutable `&self.cluster_state` read). The
@@ -4155,7 +4134,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // emit is a pure signal; the phase layer never drives
                 // shutdown directly (decoupling law). See
                 // `phase_can_proceed` for the exact policy.
-                if self.phase_can_proceed(p, completed, failed, skipped) {
+                if self.phase_can_proceed(p) {
                     self.pool_mut().mark_phase_done(p);
                 } else {
                     self.cluster_state
@@ -4163,12 +4142,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                             reason: format!(
                                 "phase {p} reached drain with no terminal \
                                  outcome ({completed} completed, {failed} \
-                                 failed, {skipped} skipped-as-existing) — \
-                                 either it still owns unresolved residual work, \
-                                 or it is a non-leaf phase that was never \
-                                 injected / discovered (advancing would strand \
-                                 its dependents on inputs that were never \
-                                 produced)"
+                                 failed) — either it still owns unresolved \
+                                 residual work, or it is a non-leaf phase that \
+                                 was never injected / discovered (advancing \
+                                 would strand its dependents on inputs that \
+                                 were never produced)"
                             ),
                         });
                 }
