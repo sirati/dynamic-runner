@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dynrunner_core::{Identifier, TaskInfo, TypeId};
+use dynrunner_core::{Identifier, TaskInfo, TypeId, resolve_against_root};
 use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -94,16 +94,26 @@ pub type StagingEntry = (String, String, String, String, String);
 /// `binaries` is fanned out across every id; ordering of `entries`
 /// is `(binary_0 × ids_0..n) ++ (binary_1 × ids_0..n) ++ …`.
 ///
-/// `source_root` interprets `binary.path` shapes uniformly:
+/// `source_root` interprets `binary.path` shapes uniformly via the
+/// shared [`resolve_against_root`] predicate — the SAME
+/// "is this binary stageable into `<srcbins>/<rel>`?" question the
+/// SLURM upload (`SlurmJobManager::upload_source_binaries`) asks:
 ///
 /// * absolute under `source_root` — `<rel>` is the strip-prefixed
 ///   tail (the legacy shape, e.g. when discovery emits
-///   `source_root.join(rel)` directly);
-/// * absolute out-of-tree — `<rel>` keeps the full path and the
-///   secondary's `stage_file` handler treats it as out-of-band
-///   staged (must already exist by some other means);
+///   `source_root.join(rel)` directly); stageable;
 /// * relative — resolved against `source_root` for the on-disk
-///   read; `<rel>` is the original relative path verbatim.
+///   read; `<rel>` is the original relative path verbatim; stageable;
+/// * absolute out-of-tree — NOT stageable: there is no `<rel>` tail,
+///   so the srcbins layout `<srcbins>/<rel>` cannot place it. The
+///   upload SKIPS such a binary (`images.rs` strip-prefix-`Err`
+///   branch → `continue` + warn), so emitting a staging entry here
+///   would tell the secondary about a file the upload never staged
+///   — a silent `stage_file` "source not found" / empty-srcbins
+///   strand. We therefore MIRROR the upload: skip + warn, never
+///   emit an entry. The two functions agree on EXACTLY which
+///   binaries are stageable (the [`resolve_against_root`] predicate
+///   == strip-prefix succeeds under `source_root`).
 ///
 /// Reads each binary file once on the primary side to compute the
 /// content SHA256. Errors out on the first unreadable file rather
@@ -124,22 +134,36 @@ pub fn compute_initial_staging_entries<I: Identifier>(
 ) -> Result<Vec<StagingEntry>, StagingError> {
     let mut entries = Vec::with_capacity(binaries.len() * secondary_ids.len());
     for binary in binaries {
-        // Resolve the on-disk read location: relative paths join
-        // against `source_root` (post-Bug-B wire-id shape);
-        // absolute paths are used verbatim. `rel` (the wire form
-        // shipped to secondaries) is then derived from the
-        // resolved path so the strip-prefix branch covers both
-        // legacy `source_root.join(rel)` shapes and new relative
-        // emissions uniformly.
-        let resolved = if binary.path.is_absolute() {
-            binary.path.clone()
-        } else {
-            source_root.join(&binary.path)
+        // Shared stageability predicate (mirrors the SLURM upload):
+        // `resolve_against_root` joins relative paths against
+        // `source_root` for the on-disk read and derives the
+        // wire-relative `<rel>` tail. `relative == Some(rel)` means
+        // the binary is stageable into `<srcbins>/<rel>`; `None` is
+        // the absolute-out-of-tree shape that has no `<rel>` tail.
+        let resolved_path = resolve_against_root(&binary.path, source_root);
+        let resolved = resolved_path.absolute;
+        let Some(rel) = resolved_path.relative else {
+            // Out-of-tree: NOT stageable. The upload skips this
+            // binary (it cannot place it under `<srcbins>/<rel>`),
+            // so we MUST NOT emit a staging entry — doing so would
+            // promise the secondary a file the upload never staged,
+            // surfacing as a swallowed `stage_file` "source not
+            // found" / empty-srcbins strand. Skip + warn so an
+            // absolute-path consumer SEES why their file wasn't
+            // staged rather than hitting a silent File-not-found.
+            // Kept in lock-step with
+            // `SlurmJobManager::upload_source_binaries` (images.rs).
+            tracing::warn!(
+                raw = %binary.path.display(),
+                resolved = %resolved.display(),
+                source_root = %source_root.display(),
+                "binary is not under --source root; skipping staging \
+                 entry (the upload also skips it; the secondary will \
+                 not be told about a file that was never staged).",
+            );
+            continue;
         };
-        let rel = match resolved.strip_prefix(source_root) {
-            Ok(p) => p.to_string_lossy().into_owned(),
-            Err(_) => binary.path.to_string_lossy().into_owned(),
-        };
+        let rel = rel.to_string_lossy().into_owned();
         let file_hash = compute_task_hash(binary);
         let Some(content_hash) = compute_file_hash(&resolved) else {
             return Err(StagingError::SourceUnreadable {
@@ -295,5 +319,265 @@ where
         };
         self.send_to(Destination::Secondary(PeerId::from(secondary_id)), msg)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for [`compute_initial_staging_entries`]'s stageability
+    //! predicate — specifically that it agrees with the SLURM upload
+    //! (`SlurmJobManager::upload_source_binaries`) on which binaries
+    //! are stageable into `<srcbins>/<rel>`:
+    //!
+    //! * in-tree (relative / absolute-under-root) → entry emitted;
+    //! * out-of-tree (absolute, not under `--source`) → NO entry +
+    //!   a warn (the upload also skips it, so promising the secondary
+    //!   such a file would be a silent strand).
+    //!
+    //! The pre-fix behaviour fell back to keeping the entry with the
+    //! full absolute path as `rel`; the revert-check (`revert_check_*`)
+    //! pins the corrected skip so a regression to fallback-keep fails
+    //! loudly here.
+
+    use std::sync::{Arc, Mutex};
+
+    use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId, resolve_against_root};
+    use serde::{Deserialize, Serialize};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Registry;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    use super::{StagingEntry, compute_initial_staging_entries};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    /// Build a `TaskInfo` with an arbitrary `path` shape.
+    fn make_binary(path: impl Into<std::path::PathBuf>) -> TaskInfo<TestId> {
+        let path = path.into();
+        let id = path.display().to_string();
+        TaskInfo {
+            path,
+            size: 0,
+            identifier: TestId(id.clone()),
+            phase_id: PhaseId::from("default"),
+            type_id: TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: id,
+            task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
+            preferred_version: Default::default(),
+            resolved_path: None,
+        }
+    }
+
+    /// Minimal WARN-level capture layer: records every WARN event's
+    /// message so a test can assert the skip-warn actually fired
+    /// (no false-green). The level discrimination happens INSIDE
+    /// `on_event` rather than via a global `LevelFilter` layer: a
+    /// global filter would cache `Interest` in the PROCESS-GLOBAL
+    /// per-callsite table and poison the info-level
+    /// `IMPORTANT_TARGET` callsites that a concurrently-running
+    /// importance-capture test (`primary::important_events`) depends
+    /// on (see `test_capture.rs`). A bare-`Registry` + unfiltered
+    /// layer caches `Interest::always`, which never suppresses a
+    /// sibling test's emission.
+    #[derive(Clone, Default)]
+    struct WarnCapture(Arc<Mutex<Vec<String>>>);
+
+    impl WarnCapture {
+        fn messages(&self) -> Vec<String> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for WarnCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            struct V<'a>(&'a mut String);
+            impl Visit for V<'_> {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        *self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut msg = String::new();
+            event.record(&mut V(&mut msg));
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+        }
+    }
+
+    /// Run `body` with a WARN capture installed as the thread-local
+    /// default subscriber. `body` must emit synchronously (no
+    /// `.await`) for the per-callsite interest cache to be reliable —
+    /// `compute_initial_staging_entries` is a pure sync function, so
+    /// this holds. No global filter layer (the `WarnCapture` layer
+    /// self-filters in `on_event`) so the install caches
+    /// `Interest::always` and never poisons a sibling test's
+    /// callsites.
+    fn with_warn_capture<R>(body: impl FnOnce() -> R) -> (R, Vec<String>) {
+        let cap = WarnCapture::default();
+        let subscriber = Registry::default().with(cap.clone());
+        let out = tracing::subscriber::with_default(subscriber, body);
+        (out, cap.messages())
+    }
+
+    /// Write a real file at `<root>/<rel>` so the in-tree content-hash
+    /// read in `compute_initial_staging_entries` succeeds.
+    fn write_in_tree(root: &std::path::Path, rel: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// Out-of-tree (absolute, NOT under `--source`): no staging entry
+    /// is emitted (matches the upload skip) and a warn fires.
+    ///
+    /// The out-of-tree file is a REAL readable file in a second
+    /// tempdir outside `--source` — the faithful silent-strand shape:
+    /// the file exists on the primary (so the pre-fix fallback-keep
+    /// would happily read it and emit an entry) but is absent on the
+    /// secondary, since the upload never staged it. The fix must skip
+    /// it on the read-succeeds path, not merely error on a missing
+    /// file.
+    #[test]
+    fn out_of_tree_emits_no_entry_and_warns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Readable file OUTSIDE the --source root.
+        let outside = tempfile::tempdir().unwrap();
+        let out_file = outside.path().join("out_of_tree.bin");
+        std::fs::write(&out_file, b"x").unwrap();
+
+        let binaries = vec![make_binary(&out_file)];
+        let ids = vec!["secondary-0".to_string()];
+
+        let (entries, warns) =
+            with_warn_capture(|| compute_initial_staging_entries(&binaries, &ids, root).unwrap());
+
+        assert!(
+            entries.is_empty(),
+            "out-of-tree binary must NOT yield a staging entry (got {entries:?})"
+        );
+        assert!(
+            warns.iter().any(|m| m.contains("not under --source root")),
+            "a skip warn must fire for the out-of-tree binary (got {warns:?})"
+        );
+    }
+
+    /// In-tree (relative + absolute-under-root): both still yield one
+    /// entry per (binary × secondary), proving no regression to the
+    /// working path. The wire `src_path`/`dest_path` is the
+    /// `<rel>` tail (verbatim relative, or stripped tail for absolute).
+    #[test]
+    fn in_tree_still_emits_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_in_tree(root, "a/rel.bin", b"r");
+        let abs = write_in_tree(root, "abs.bin", b"a");
+
+        let binaries = vec![make_binary("a/rel.bin"), make_binary(&abs)];
+        let ids = vec!["secondary-0".to_string()];
+
+        let entries = compute_initial_staging_entries(&binaries, &ids, root).unwrap();
+
+        assert_eq!(entries.len(), 2, "both in-tree binaries must stage");
+        let rels: Vec<&str> = entries.iter().map(|(_, _, _, src, _)| src.as_str()).collect();
+        assert!(rels.contains(&"a/rel.bin"), "relative tail preserved (got {rels:?})");
+        assert!(rels.contains(&"abs.bin"), "absolute-under-root strips to tail (got {rels:?})");
+    }
+
+    /// Mixed input: staging emits an entry for EXACTLY the binaries
+    /// the stageability predicate (`resolve_against_root(...).relative
+    /// .is_some()`) accepts — i.e. exactly the set the upload uploads.
+    /// This locks the two sibling functions' agreement at the shared
+    /// predicate so they can't silently diverge again.
+    #[test]
+    fn staging_stageable_set_matches_predicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_in_tree(root, "in/rel.bin", b"r");
+        let in_abs = write_in_tree(root, "in_abs.bin", b"a");
+        // Two REAL readable out-of-tree files in a second dir, so the
+        // only reason they're excluded is the stageability predicate,
+        // not an unreadable-file error.
+        let outside = tempfile::tempdir().unwrap();
+        let out_x = outside.path().join("x.bin");
+        let out_y = outside.path().join("y.bin");
+        std::fs::write(&out_x, b"x").unwrap();
+        std::fs::write(&out_y, b"y").unwrap();
+
+        let binaries = vec![
+            make_binary("in/rel.bin"), // relative, in-tree
+            make_binary(&in_abs),      // absolute, in-tree
+            make_binary(&out_x),       // absolute, out-of-tree (readable)
+            make_binary(&out_y),       // absolute, out-of-tree (readable)
+        ];
+        let ids = vec!["secondary-0".to_string()];
+
+        // The shared predicate's verdict for each binary.
+        let stageable_by_predicate: Vec<bool> = binaries
+            .iter()
+            .map(|b| resolve_against_root(&b.path, root).relative.is_some())
+            .collect();
+        let expected_stageable = stageable_by_predicate.iter().filter(|s| **s).count();
+
+        let entries = compute_initial_staging_entries(&binaries, &ids, root).unwrap();
+        // One id, so #entries == #stageable binaries.
+        assert_eq!(
+            entries.len(),
+            expected_stageable,
+            "staging must emit an entry for exactly the predicate-stageable binaries \
+             (predicate={stageable_by_predicate:?}, entries={entries:?})"
+        );
+        // And specifically: the two in-tree binaries staged, neither
+        // out-of-tree one did.
+        let out_prefix = outside.path().to_string_lossy().into_owned();
+        let staged_srcs: Vec<&str> = entries.iter().map(|(_, _, _, s, _)| s.as_str()).collect();
+        assert!(staged_srcs.contains(&"in/rel.bin"));
+        assert!(staged_srcs.contains(&"in_abs.bin"));
+        assert!(
+            !staged_srcs.iter().any(|s| s.starts_with(&out_prefix)),
+            "no out-of-tree binary may appear as a staging entry (got {staged_srcs:?})"
+        );
+    }
+
+    /// Revert-check: pin the corrected skip so a regression to the
+    /// pre-fix fallback-keep (which DID emit an entry carrying the
+    /// full absolute path as `rel`) fails here. The out-of-tree file
+    /// is REAL+readable, so under fallback-keep the content-hash read
+    /// succeeds and an entry IS emitted with the absolute path as
+    /// src/dest — exactly the silent-strand shape this test forbids.
+    #[test]
+    fn revert_check_no_fallback_keep_of_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let outside = tempfile::tempdir().unwrap();
+        let out_file = outside.path().join("foo.bin");
+        std::fs::write(&out_file, b"z").unwrap();
+        let out_str = out_file.to_string_lossy().into_owned();
+
+        let binaries = vec![make_binary(&out_file)];
+        let ids = vec!["secondary-0".to_string()];
+
+        let entries: Vec<StagingEntry> =
+            compute_initial_staging_entries(&binaries, &ids, root).unwrap();
+
+        assert!(
+            !entries
+                .iter()
+                .any(|(_, _, _, src, dest)| src == &out_str || dest == &out_str),
+            "pre-fix fallback-keep would have emitted an entry with the absolute \
+             path as src/dest; the fix must skip it (got {entries:?})"
+        );
+        assert!(
+            entries.is_empty(),
+            "out-of-tree binary yields zero entries post-fix (got {entries:?})"
+        );
     }
 }

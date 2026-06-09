@@ -68,10 +68,14 @@ impl<G: Gateway> SlurmJobManager<G> {
     ///
     /// * absolute under `source_root` — uploaded to `<srcbins>/<rel>`
     ///   where `<rel>` is the strip-prefixed tail (legacy shape);
-    /// * absolute out-of-tree — skipped; the StageFile record ships
-    ///   the absolute path which the secondary's `stage_file` handler
-    ///   treats as out-of-band-staged (must already exist on the
-    ///   secondary by some other means);
+    /// * absolute out-of-tree — NOT stageable: there is no `<rel>`
+    ///   tail, so `<srcbins>/<rel>` cannot place it. Skipped + warned.
+    ///   The primary's staging
+    ///   (`compute_initial_staging_entries`) applies the SAME
+    ///   stageability predicate and likewise emits no staging entry,
+    ///   so the secondary is never promised a file this upload never
+    ///   staged (the two functions agree on exactly which binaries
+    ///   are stageable);
     /// * relative — joined with `source_root` for the on-disk read;
     ///   uploaded to `<srcbins>/<binary.path>` verbatim. This is the
     ///   wire-identifier shape consumers should prefer post-Bug-B
@@ -112,6 +116,15 @@ impl<G: Gateway> SlurmJobManager<G> {
             } else {
                 source_root.join(&binary.path)
             };
+            // Stageability predicate: strip-prefix succeeds ⟺ the
+            // binary has a `<rel>` tail and can be placed at
+            // `<srcbins>/<rel>`. Out-of-tree paths have no such tail
+            // and are skipped. The primary's staging
+            // (`compute_initial_staging_entries` in
+            // `crates/dynrunner-manager-distributed/src/primary/staging.rs`)
+            // asks the SAME question via `resolve_against_root` and
+            // MUST skip exactly the same binaries — otherwise it would
+            // tell a secondary about a file this upload never staged.
             let rel = match local.strip_prefix(source_root) {
                 Ok(p) => p.to_path_buf(),
                 Err(_) => {
@@ -120,8 +133,8 @@ impl<G: Gateway> SlurmJobManager<G> {
                         resolved = %local.display(),
                         source_root = %source_root.display(),
                         "binary is not under --source root; skipping upload \
-                         (absolute path will ship as out-of-band; secondary \
-                         must already see it).",
+                         (no <rel> tail under srcbins; staging skips it too, \
+                         so the secondary is never told about it).",
                     );
                     continue;
                 }
