@@ -1053,6 +1053,15 @@ where
         self.lifecycle = std::mem::replace(&mut self.lifecycle, SecondaryLifecycle::connecting())
             .enter_awaiting_primary();
 
+        // Terminal-during-setup signal. `Some(RunOutcome::Terminal)` means
+        // a RunComplete / RunAborted CRDT flag landed while `wait_for_setup`
+        // was still waiting on the trio — the run is over, so the operational
+        // handoff (`process_tasks`) is skipped and control routes straight to
+        // the terminal-match teardown below (which the lifecycle terminal,
+        // already recorded by `wait_for_setup`, selects). Stays `None` on the
+        // normal trio-completion path.
+        let mut setup_terminal: Option<RunOutcome> = None;
+
         // Skip the per-secondary setup phase once the lifecycle has
         // reached `Operational` (or terminal) — the `setup_phase_completed`
         // projection replaces the old flat bool latch. This gates the
@@ -1099,11 +1108,26 @@ where
                     self.send_welcome().await?;
                     self.send_cert_exchange().await?;
                 }
-                self.wait_for_setup(factory).await?;
-                Ok::<(), String>(())
+                // `wait_for_setup` returns `Some(RunOutcome::Terminal)` when a
+                // terminal CRDT flag (RunComplete / RunAborted) landed DURING
+                // setup before the trio completed — it has already recorded
+                // the matching lifecycle terminal. `None` is the normal
+                // trio-completion success (proceed to the operational
+                // handoff). Propagate the signal so the orchestration can
+                // skip `process_tasks` and route straight to teardown.
+                let setup_terminal = self.wait_for_setup(factory).await?;
+                Ok::<Option<RunOutcome>, String>(setup_terminal)
             };
             match tokio::time::timeout(deadline, setup).await {
-                Ok(Ok(())) => {}
+                // Trio completed normally: fall through to `process_tasks`.
+                Ok(Ok(None)) => {}
+                // A terminal CRDT flag was observed DURING setup. The
+                // lifecycle terminal is already recorded; skip the operational
+                // handoff and route straight to the SAME terminal-match
+                // teardown the operational `process_tasks` return uses.
+                Ok(Ok(Some(RunOutcome::Terminal))) => {
+                    setup_terminal = Some(RunOutcome::Terminal);
+                }
                 Ok(Err(e)) => {
                     // Drain the sampler BEFORE `stop_all_workers`
                     // so the last tick reads still see the
@@ -1183,12 +1207,20 @@ where
 
         // Phase 5: Process tasks. The first thing it does is drive the
         // `Configuring → Operational` transition (consuming the take-once
-        // latches), then runs to a terminal.
-        let RunOutcome::Terminal = self.process_tasks(factory).await?;
+        // latches), then runs to a terminal. SKIPPED when a terminal CRDT
+        // flag was already observed during setup (`setup_terminal`): the run
+        // is over and the lifecycle terminal is already recorded, so entering
+        // the operational loop would be wrong (no `Operational` handoff for a
+        // run that has already completed). Either way the lifecycle terminal
+        // is the single source of truth for the teardown match below.
+        if setup_terminal.is_none() {
+            let RunOutcome::Terminal = self.process_tasks(factory).await?;
+        }
 
-        // `process_tasks` already recorded the per-secondary terminal on the
-        // lifecycle (the single source of truth); read it back to choose the
-        // matching teardown.
+        // The terminal was recorded on the lifecycle (the single source of
+        // truth) — by `process_tasks` on the operational path, or by
+        // `wait_for_setup` on the terminal-during-setup path. Read it back to
+        // choose the matching teardown; both paths converge here.
         match self.lifecycle.terminal() {
             Some(super::SecondaryTerminal::Done) | None => {
                 // Normal termination — drain the sampler BEFORE
