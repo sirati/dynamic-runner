@@ -31,6 +31,13 @@
 //!   gated on `primary_last_seen.is_some()` (no relocation-window false-arm),
 //!   self-cancelling on a flicker, and a gap-closure control proving the
 //!   election is membership-armed.
+//! - [`failover_multi_survivor`] — multi-survivor failover convergence under
+//!   abrupt-crash membership-eviction divergence: the lex-lowest survivor
+//!   re-polls (`TimeoutQuery` re-emitted each waiting Suspecting tick) so a
+//!   peer that observes the dead primary AFTER the first query still gets
+//!   counted, and a peer that has NOT yet observed the death correctly refuses
+//!   to confirm (split-brain safety) until it does — the candidate never
+//!   wedges on a cached stale "primary still alive" answer.
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
@@ -51,6 +58,7 @@
 mod anti_entropy_heal;
 mod failover_beacon_union;
 mod failover_membership;
+mod failover_multi_survivor;
 mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;

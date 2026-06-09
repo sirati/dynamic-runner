@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::wire::timestamp_now;
-use super::{ElectionState, ElectionTickActions, failover_quorum, next_round};
+use super::{ElectionState, ElectionTickActions, failover_quorum, next_round, push_timeout_query};
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
@@ -284,9 +284,9 @@ where
             .as_deref()
             .filter(|id| *id != self.config.secondary_id.as_str())
             .map(|id| {
-                !self.client.has_peer(
-                    &dynrunner_protocol_primary_secondary::address::PeerId::from(id),
-                )
+                !self
+                    .client
+                    .has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(id))
             })
             .unwrap_or(false);
         // UNION counterpart of the mesh-frame death legs: is the current
@@ -488,14 +488,7 @@ where
                     since: Instant::now(),
                     responses: HashMap::new(),
                 };
-                if let Some(query_node_id) = current_primary_id {
-                    actions.broadcast.push(DistributedMessage::TimeoutQuery {
-                        target: None,
-                        sender_id: secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        query_node_id,
-                    });
-                }
+                push_timeout_query(&mut actions.broadcast, &secondary_id, current_primary_id);
             }
             ElectionState::Suspecting { since, responses } => {
                 // Wait at least `keepalive_interval` to gather peer responses
@@ -532,7 +525,36 @@ where
                 // `peer_count` by construction (no `Secondary` keepalive).
                 let quorum = failover_quorum(peer_count);
                 if agreeing < quorum {
-                    tracing::info!(agreeing, quorum, "no quorum on primary death; waiting");
+                    // RE-POLL while waiting for quorum. The `TimeoutQuery` is
+                    // a CONTINUOUS liveness question, not a one-shot: under an
+                    // abrupt (non-graceful) primary crash the survivors evict
+                    // the dead primary from their views at DIFFERENT instants,
+                    // so a peer queried before IT has observed the death
+                    // answers "primary still fresh" (age < deadline) — a
+                    // disagreeing response. Pre-fix the query fired exactly
+                    // once on entering Suspecting, so that single stale answer
+                    // was cached forever (`record_timeout_response` only
+                    // overwrites a peer's entry when a NEW response arrives,
+                    // and none ever would): `agreeing` stayed pinned below
+                    // quorum and the candidate wedged in Suspecting at round 1
+                    // — never advancing, never self-promoting. Re-emitting the
+                    // query each waiting tick makes every peer re-answer with
+                    // its CURRENT view, so once a peer observes the death its
+                    // refreshed (agreeing) response replaces the stale one and
+                    // quorum converges — no dependence on all survivors
+                    // observing the departure at the same instant. The target
+                    // is the same silent primary the entering-Suspecting query
+                    // named (`current_primary_id`, snapshotted above). Cheap:
+                    // one broadcast per keepalive tick only while a genuine
+                    // election is unresolved. Shares the SINGLE query-builder
+                    // (`push_timeout_query`) the entering-Suspecting emit uses
+                    // so the two sites cannot drift.
+                    push_timeout_query(&mut actions.broadcast, &secondary_id, current_primary_id);
+                    tracing::info!(
+                        agreeing,
+                        quorum,
+                        "no quorum on primary death; re-polling peers"
+                    );
                     return actions;
                 }
                 // Filter observer peers from candidate selection. An
