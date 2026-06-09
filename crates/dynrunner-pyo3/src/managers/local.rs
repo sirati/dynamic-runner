@@ -324,16 +324,17 @@ impl PyLocalManager {
 
     /// Process a list of PyTaskInfo objects.
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
-        // The single-process dispatch path does not yet honour the
-        // discovery `skipped_already_done` marker (that partition is a
-        // later wave); strip the bit at this call site so the
-        // already-done items dispatch exactly as today. The marker ride
-        // alongside the task is the extract boundary's uniform contract —
-        // each consumer decides whether the bit matters here.
-        let mut rust_binaries: Vec<_> = extract_binaries(binaries)?
-            .into_iter()
-            .map(|(task, _skipped)| task)
-            .collect();
+        // Honour the discovery `skipped_already_done` marker (the uniform
+        // discovery-boundary contract — every dispatch path now respects
+        // it: the distributed path materialises terminal `SkippedAlreadyDone`
+        // ledger entries, the single-process path here filters + counts).
+        // A marked item's outputs already exist, so dispatching it would
+        // re-run completed work — a correctness regression versus the old
+        // consumer-side drop. The marker is a discovery-time routing signal
+        // the dispatch entry consumes, NOT a property of the scheduling unit,
+        // so the bit never rides into the manager.
+        let (mut rust_binaries, already_done_skipped) =
+            partition_already_done(extract_binaries(binaries)?);
 
         // Normalise each `binary.path` to the worker-facing wire id
         // (relative-to-`source_dir`). Out-of-tree paths are left
@@ -623,7 +624,16 @@ impl PyLocalManager {
                 // `&mut factory`.
                 match race {
                     RaceOutcome::ManagerDone(result) => {
-                        self.stats = Some(manager.stats().clone());
+                        // Fold the discovery-time already-done skips into the
+                        // manager's own `skipped` tally so `ProcessingStats`
+                        // is the single accounting sink the operator reads —
+                        // the manager never saw these items (they were
+                        // partitioned out before dispatch), so the count is
+                        // added here, at the one place the discovery partition
+                        // is known.
+                        let mut stats = manager.stats().clone();
+                        stats.skipped += already_done_skipped;
+                        self.stats = Some(stats);
                         self.failed_tasks = manager.failed_tasks().to_vec();
                         self.oom_tasks = manager.resource_pressure_tasks().to_vec();
                         self.task_payloads = manager.task_payloads().to_vec();
@@ -700,6 +710,110 @@ impl PyLocalManager {
                 error_message: t.error_message.clone(),
             })
             .collect()
+    }
+}
+
+/// Partition the marked discovery batch the extract boundary yields into the
+/// items the single-process path DISPATCHES (unmarked) and a count of the
+/// items it SKIPS (marked `skipped_already_done` — outputs already exist).
+///
+/// Single concern: the single-process dispatch path's honoring of the uniform
+/// `skipped_already_done` discovery-boundary contract. A marked item is NOT
+/// returned for dispatch — re-running already-done work is a correctness
+/// regression — and is instead tallied into the returned `skipped` count,
+/// which the caller folds into the run's `ProcessingStats.skipped`. The bit
+/// is consumed HERE and never rides into the manager (it is a discovery-time
+/// routing signal, not a property of the scheduling unit).
+fn partition_already_done(
+    extracted: Vec<(TaskInfo<RunnerIdentifier>, bool)>,
+) -> (Vec<TaskInfo<RunnerIdentifier>>, u32) {
+    let mut to_dispatch = Vec::with_capacity(extracted.len());
+    let mut already_done_skipped: u32 = 0;
+    for (task, skipped) in extracted {
+        if skipped {
+            already_done_skipped += 1;
+        } else {
+            to_dispatch.push(task);
+        }
+    }
+    (to_dispatch, already_done_skipped)
+}
+
+#[cfg(test)]
+mod partition_tests {
+    //! Pure-Rust unit tests for the single-process `skipped_already_done`
+    //! honoring (orchestrator refinement R3). No CPython needed — the
+    //! partition operates on the already-extracted `(TaskInfo, bool)` pairs,
+    //! so it is tested directly without the `test-with-python` feature.
+    use super::*;
+    use dynrunner_core::PhaseId;
+    use std::path::PathBuf;
+
+    /// A minimal `TaskInfo<RunnerIdentifier>` with id `id`. Only the fields the
+    /// partition touches matter; the rest are defaults.
+    fn task(id: &str) -> TaskInfo<RunnerIdentifier> {
+        TaskInfo {
+            path: PathBuf::from(format!("/tmp/{id}")),
+            size: 1,
+            identifier: RunnerIdentifier::from(id),
+            phase_id: PhaseId::from("p"),
+            type_id: dynrunner_core::TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: id.to_string(),
+            task_depends_on: Vec::new(),
+            preferred_secondaries: Default::default(),
+            preferred_version: Default::default(),
+            resolved_path: None,
+        }
+    }
+
+    /// A marked (`skipped_already_done=true`) item is NOT returned for
+    /// dispatch — dispatching it would re-run already-done work — and is
+    /// counted in the skipped tally; unmarked items pass through to dispatch
+    /// in order.
+    #[test]
+    fn marked_items_are_skipped_unmarked_dispatched() {
+        let extracted = vec![
+            (task("a"), false),
+            (task("done-1"), true),
+            (task("b"), false),
+            (task("done-2"), true),
+        ];
+
+        let (to_dispatch, skipped) = partition_already_done(extracted);
+
+        assert_eq!(skipped, 2, "two marked items are tallied as skipped");
+        let dispatched_ids: Vec<&str> =
+            to_dispatch.iter().map(|t| t.task_id.as_str()).collect();
+        assert_eq!(
+            dispatched_ids,
+            vec!["a", "b"],
+            "only unmarked items dispatch, in order; marked items are dropped from dispatch"
+        );
+    }
+
+    /// An all-unmarked batch dispatches everything and skips nothing
+    /// (back-compat default — today's behaviour for a producer that never
+    /// marks a skip).
+    #[test]
+    fn all_unmarked_dispatches_all() {
+        let extracted = vec![(task("a"), false), (task("b"), false)];
+        let (to_dispatch, skipped) = partition_already_done(extracted);
+        assert_eq!(skipped, 0);
+        assert_eq!(to_dispatch.len(), 2);
+    }
+
+    /// An all-marked batch dispatches nothing and skips every item.
+    #[test]
+    fn all_marked_dispatches_none() {
+        let extracted = vec![(task("done-1"), true), (task("done-2"), true)];
+        let (to_dispatch, skipped) = partition_already_done(extracted);
+        assert_eq!(skipped, 2);
+        assert!(
+            to_dispatch.is_empty(),
+            "a fully-already-done batch dispatches no work"
+        );
     }
 }
 
