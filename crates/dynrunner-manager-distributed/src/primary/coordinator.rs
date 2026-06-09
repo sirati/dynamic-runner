@@ -3599,17 +3599,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///   surfaced by `phase_min_workers` observing residual work; and
     /// - (F-honesty) an activated phase that drained GENUINELY EMPTY — zero
     ///   completed, zero failed, zero skipped, zero residual — that the
-    ///   consumer did NOT declare `may_be_empty`. This is the
+    ///   consumer did NOT declare `may_be_empty`, AND that leaves the pool
+    ///   with NO outstanding real work (`is_empty()`). This is the
     ///   silent-partial-success the consumers hit when `on_phase_end`-driven
     ///   lazy injection (or discovery) was suppressed: the phase's planned
-    ///   work was never injected, yet the run completes clean rc=0. It is
-    ///   caught REGARDLESS of leaf/non-leaf — the suppressed phase is a LEAF
-    ///   in the asm-dataset chain (`…→dependency_graph→build_variant`) and
-    ///   NON-LEAF in the asm-tokenizer chain
-    ///   (`tokenize→unify_vocab→memmap`); both are the same bug, so the
-    ///   discriminator is the explicit `may_be_empty` declaration, NOT phase
-    ///   topology. The framework cannot otherwise distinguish an intentional
-    ///   empty barrier from a suppressed-injection bug.
+    ///   work was never injected, so with nothing else outstanding the run
+    ///   would complete clean rc=0 having produced nothing. The topology
+    ///   (leaf vs non-leaf) is NOT the discriminator — the suppressed phase is
+    ///   a LEAF in one asm-dataset chain and NON-LEAF in the asm-tokenizer
+    ///   chain (`tokenize→unify_vocab→memmap`); both are the same bug. The
+    ///   discriminators are the explicit `may_be_empty` declaration AND the
+    ///   outstanding-work probe: an empty drain that leaves real work in the
+    ///   pool (queued, in-flight, OR blocked — the dependents this phase's
+    ///   `Done` is about to UNBLOCK) stranded NOTHING and PROCEEDS; only an
+    ///   empty drain that empties the run is the wedge. The framework cannot
+    ///   otherwise distinguish an intentional empty barrier from a
+    ///   suppressed-injection bug.
     ///
     /// The phase-layer veto here is the structural backstop; the live
     /// no-progress decision (a phase that started, needs workers, and has
@@ -3650,12 +3655,36 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return false;
         }
         // Zero completed, zero failed, zero skipped, zero residual, and NOT
-        // declared `may_be_empty`: the phase drained genuinely empty — its
-        // planned work was never injected / discovered (the F-honesty
-        // false-green). Advancing it completes the run clean rc=0 with that
-        // work silently dropped — veto, fail loud by default, regardless of
-        // leaf/non-leaf.
-        false
+        // declared `may_be_empty`: the phase drained genuinely empty. The
+        // F-honesty wedge is a SILENT PARTIAL SUCCESS — the run would now
+        // complete clean rc=0 having produced nothing because a phase that
+        // should have injected work didn't. But "empty" alone does not prove
+        // that wedge. The COMMON multi-phase shape is an empty EARLY phase
+        // that legitimately owns no work of its own while its dependents own
+        // the real work, BLOCKED only on this phase reaching `Done` — exactly
+        // what `mark_phase_done` (the PROCEED branch) delivers. There the
+        // empty drain stranded NOTHING: marking it done UNBLOCKS the
+        // dependents. (asm-dataset `build_compilers` with `--build-compilers`
+        // omitted: phase 1 drains 0/0/0 by design while the 4 `matrix_eval` +
+        // 1 `dependency_graph` tasks sit pending-but-phase-blocked on it.)
+        //
+        // The discriminator is therefore whether the run still owns ANY
+        // outstanding real work after this phase drains. `is_empty()` reads
+        // the canonical outstanding-work total — queued + in-flight + blocked,
+        // all phases (the just-drained empty phase contributes 0). Blocked is
+        // INCLUDED here, unlike the starvation oracle which excludes it: that
+        // oracle asks "can an idle worker dispatch right now?" (a
+        // queued-side-only read), whereas this guard asks "would advancing
+        // this phase complete the run having done nothing?" — for which a
+        // blocked task is real outstanding work the empty phase's `Done` may
+        // be the very gate that releases. A genuine suppressed-injection wedge
+        // leaves NO such work in the pool (the dropped phase's tasks never
+        // entered it), so `is_empty()` is true and the guard fires.
+        //
+        // Outstanding real work remains ⇒ the empty phase did not end the run
+        // ⇒ PROCEED. Pool genuinely empty ⇒ the run would complete having
+        // produced nothing ⇒ veto, fail loud.
+        !self.pool().is_empty()
     }
 
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`

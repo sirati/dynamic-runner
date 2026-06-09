@@ -6,10 +6,13 @@
 //! loop, no wall-clock waits):
 //! - [`phase_can_proceed`] decides advance-vs-fail from the phase's
 //!   terminal counters (completed / failed / skipped-as-existing), its
-//!   residual-work probe, and the replicated `may_be_empty` opt-out —
-//!   exercised directly across every policy branch (proceed on
-//!   completion/failure/skip/may_be_empty; fail on residual-work and on a
-//!   genuinely-empty undeclared phase, leaf or non-leaf).
+//!   residual-work probe, the replicated `may_be_empty` opt-out, AND the
+//!   outstanding-work probe (`pool.is_empty()`) for the genuinely-empty
+//!   case — exercised directly across every policy branch (proceed on
+//!   completion/failure/skip/may_be_empty; proceed on a genuinely-empty
+//!   undeclared phase that still leaves real work in the pool — leaf or
+//!   upstream; fail on residual-work and on a genuinely-empty undeclared
+//!   phase that empties the run).
 //! - `fire_initial_phase_starts` EMITs `PhaseStartedNeedsWorkers` for
 //!   each newly-started phase that carries work; the emit is asserted by
 //!   installing a worker-management sender and draining the channel
@@ -160,76 +163,123 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
     assert!(!primary.phase_can_proceed(&p, 0, 0, 0));
 }
 
-/// F-honesty FAIL — NON-LEAF empty (asm-tokenizer class): an activated
-/// phase that drained genuinely empty — zero completed, zero failed, zero
-/// skipped, zero residual — and was NOT declared `may_be_empty`. Its
-/// planned work was never injected / discovered (the silent
-/// partial-success the consumers hit when `on_phase_end`-driven lazy
-/// injection was suppressed). MUST veto, regardless of topology. Here
-/// `build` is NON-LEAF (`compile` depends on it).
+/// F-honesty PROCEED — empty UPSTREAM phase with a blocked dependent (the
+/// asm-dataset `build_compilers` shape): an activated phase that drained
+/// genuinely empty — zero completed, zero failed, zero skipped, zero
+/// residual — and was NOT declared `may_be_empty`, BUT the pool still owns
+/// real work blocked on this phase reaching `Done`. Here `build_compilers`
+/// is empty (the producer omitted `--build-compilers`; toolchains are
+/// pre-staged) while `matrix_eval` carries a real item BLOCKED on it. The
+/// empty drain stranded NOTHING — marking `build_compilers` done is the very
+/// gate that unblocks `matrix_eval` — so the guard must PROCEED.
+///
+/// REVERT-CHECK: under the prior unconditional `false` for a genuinely-empty
+/// undeclared phase, this asserted VETO and aborted the run at phase 1 (the
+/// consumer-confirmed over-fire, e1721c5c / run_20260609_055517). The pool
+/// being non-empty (a blocked dependent) is the discriminator that flips it
+/// to proceed.
 #[test]
-fn non_leaf_phase_drained_genuinely_empty_fails_loud() {
+fn empty_upstream_phase_with_blocked_dependent_proceeds() {
     let (mut primary, _mesh) = make_primary();
 
-    // Phase graph: compile depends on build. Seed ONE pending `compile`
-    // item so the pool exists and carries the dep edge — but seed NO
-    // `build` item, so `build` is a non-leaf phase that was never injected.
-    let dep = dep_binary("dep", "compile", &[]);
+    // Phase graph: matrix_eval depends on build_compilers. Seed ONE pending
+    // `matrix_eval` item so the pool carries real work BLOCKED on the empty
+    // `build_compilers` phase — but seed NO `build_compilers` item (the
+    // legitimate pre-staged-toolchain case, not a suppressed-injection bug).
+    let dep = dep_binary("eval-item", "matrix_eval", &[]);
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+            deps: HashMap::from([(
+                PhaseId::from("matrix_eval"),
+                vec![PhaseId::from("build_compilers")],
+            )]),
         });
         cs.apply(ClusterMutation::TaskAdded {
-            hash: "dep".into(),
+            hash: "eval-item".into(),
             task: dep,
         });
     }
     primary.hydrate_from_cluster_state();
 
-    let build = PhaseId::from("build");
-    // No `build` item ⇒ zero residual (`phase_min_workers == 0`). Zero
-    // accounting, zero skip, not declared may_be_empty ⇒ genuinely-empty
-    // wedge ⇒ veto.
-    assert_eq!(primary.pool().in_flight(&build), 0);
-    assert!(!primary.phase_can_proceed(&build, 0, 0, 0));
+    let build_compilers = PhaseId::from("build_compilers");
+    // No `build_compilers` item ⇒ zero residual (`phase_min_workers == 0`),
+    // zero accounting, zero skip, not declared may_be_empty ⇒ genuinely-empty.
+    // BUT the pool is non-empty (the blocked `matrix_eval` item) ⇒ the run
+    // still owns real work this phase's `Done` will unblock ⇒ PROCEED.
+    assert_eq!(primary.pool().in_flight(&build_compilers), 0);
+    assert!(
+        !primary.pool().is_empty(),
+        "the blocked matrix_eval dependent is real outstanding work"
+    );
+    assert!(primary.phase_can_proceed(&build_compilers, 0, 0, 0));
 }
 
-/// F-honesty FAIL — LEAF empty (asm-dataset class): the SAME genuinely-empty
-/// wedge where the suppressed phase is a LEAF (`…→dependency_graph→build`,
-/// nothing depends on `build`). This is the case the prior "leaf empties
-/// always proceed" rule MISSED — the discriminator is the absence of a
-/// `may_be_empty` declaration, NOT topology, so a leaf empty undeclared
-/// phase MUST veto too.
+/// F-honesty PROCEED — empty LEAF phase while real work remains elsewhere:
+/// the same outstanding-work discriminator with the empty phase a LEAF
+/// (nothing depends on it). `tail` drains empty and undeclared, but another
+/// phase still owns a pending item, so the run is not completing-having-done-
+/// nothing → PROCEED. Pins that the discriminator is outstanding work, not
+/// topology: a leaf empty phase is no more a wedge than an upstream one when
+/// real work remains.
 #[test]
-fn leaf_phase_drained_genuinely_empty_fails_loud() {
+fn empty_leaf_phase_proceeds_when_work_remains_elsewhere() {
     let (mut primary, _mesh) = make_primary();
 
-    // Phase graph: build depends on dependency_graph. `build` is a LEAF
-    // (nothing depends on it). Seed ONE pending `dependency_graph` item so
-    // the pool exists — but seed NO `build` item (the suppressed-injection
-    // bug: on_phase_end was supposed to spawn `build`'s items and didn't).
-    let dg = dep_binary("dg", "dependency_graph", &[]);
+    // `tail` is a LEAF (nothing depends on it) and drains empty. An
+    // independent `work` phase owns a pending item, so the pool is non-empty.
+    let work_item = dep_binary("work_item", "work", &[]);
     {
         let cs = primary.cluster_state_mut_for_test();
         cs.apply(ClusterMutation::PhaseDepsSet {
-            deps: HashMap::from([(
-                PhaseId::from("build"),
-                vec![PhaseId::from("dependency_graph")],
-            )]),
+            deps: HashMap::from([(PhaseId::from("tail"), vec![PhaseId::from("work")])]),
         });
         cs.apply(ClusterMutation::TaskAdded {
-            hash: "dg".into(),
-            task: dg,
+            hash: "work_item".into(),
+            task: work_item,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    let tail = PhaseId::from("tail");
+    assert!(
+        !primary.pool().is_empty(),
+        "the pending `work` item is real outstanding work"
+    );
+    assert!(primary.phase_can_proceed(&tail, 0, 0, 0));
+}
+
+/// F-honesty FAIL — the genuine SILENT PARTIAL SUCCESS: an activated phase
+/// drains genuinely empty (zero completed/failed/skipped/residual), is NOT
+/// declared `may_be_empty`, AND leaves the pool with NO outstanding real work
+/// anywhere. The run would complete clean rc=0 having produced nothing — the
+/// `on_phase_end`-driven injection (or discovery) that should have populated
+/// this phase was suppressed, so its planned tasks never entered the pool.
+/// MUST veto. This is the original catch the discriminator preserves;
+/// REVERT-CHECK against the proceed tests above is the non-empty pool.
+#[test]
+fn empty_phase_with_no_work_remaining_fails_loud() {
+    let (mut primary, _mesh) = make_primary();
+
+    // Declare a single zero-dep phase and seed NO items: the suppressed-
+    // injection bug where the phase's planned work never entered the pool and
+    // nothing else is outstanding. Hydrate builds an empty pool with `build`
+    // Active-and-empty.
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("build"), vec![])]),
         });
     }
     primary.hydrate_from_cluster_state();
 
     let build = PhaseId::from("build");
-    // LEAF, zero residual, zero accounting, zero skip, not may_be_empty ⇒
-    // genuinely-empty wedge ⇒ veto (the asm-dataset class the old leaf-proceed
-    // rule false-greened).
-    assert_eq!(primary.pool().in_flight(&build), 0);
+    // Empty pool, zero accounting, zero skip, not may_be_empty ⇒ the run
+    // would finish having done nothing ⇒ veto, fail loud.
+    assert!(
+        primary.pool().is_empty(),
+        "no real work anywhere — the genuine silent-partial-success"
+    );
     assert!(!primary.phase_can_proceed(&build, 0, 0, 0));
 }
 
