@@ -26,7 +26,7 @@ use crate::config::scheduler::SchedulerConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::RunnerIdentifier;
 use crate::managers::transport_factory;
-use crate::network::{detect_ipv4, detect_ipv6, gethostname};
+use crate::network::{detect_ipv4_with_source, detect_ipv6_with_source, gethostname};
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
@@ -330,6 +330,32 @@ impl PySecondaryCoordinator {
                 // cold. The matching `set_bootstrap_primary_id` below tells
                 // the egress edge to resolve `Destination::Primary` to it
                 // (pre-`PrimaryChanged`).
+                // Resolve the addresses this node will advertise to peers
+                // for them to dial it ON, and emit them — with their
+                // resolution source — at startup. This is the operator's
+                // one-glance check that the node advertises a peer-routable
+                // LAN address: a `source=hostname-probe` or
+                // `source=localhost-fallback` IPv4 on a clustered node is
+                // the classic "QUIC mesh never forms" cause (the node hands
+                // peers a container-internal / bridge / loopback address no
+                // other host can reach). Observability only — the resolved
+                // values are passed through to the dial params unchanged.
+                let (advertised_ipv4, ipv4_source) = detect_ipv4_with_source(None);
+                let advertised_ipv6 = detect_ipv6_with_source(None);
+                tracing::info!(
+                    secondary_id = %secondary_id,
+                    advertised_ipv4 = %advertised_ipv4,
+                    ipv4_source = ipv4_source.as_str(),
+                    advertised_ipv6 = advertised_ipv6
+                        .as_ref()
+                        .map(|(addr, _)| addr.as_str())
+                        .unwrap_or("<none>"),
+                    ipv6_source = advertised_ipv6
+                        .as_ref()
+                        .map(|(_, src)| src.as_str())
+                        .unwrap_or("<none>"),
+                    "resolved advertised peer-mesh address for this node"
+                );
                 let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
                     transport_factory::SecondaryDialParams {
                         addr,
@@ -337,8 +363,8 @@ impl PySecondaryCoordinator {
                         retry_delay: dist_connect_retry_delay,
                         secondary_id: &secondary_id,
                         bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
-                        ipv4_address: Some(detect_ipv4(None)),
-                        ipv6_address: detect_ipv6(None),
+                        ipv4_address: Some(advertised_ipv4),
+                        ipv6_address: advertised_ipv6.map(|(addr, _)| addr),
                     },
                 )
                 .await
@@ -467,9 +493,12 @@ impl PySecondaryCoordinator {
                 // Set peer cert info so the CertExchange message includes
                 // our connection details. The `PeerCertInfo` was built by
                 // the transport factory from the backend's cert PEM + port
-                // plus both detected address families (`network::detect_ipv4`
-                // / `detect_ipv6` — env-var hint first, `hostname -I`
-                // fallback). It is what the `send_cert_exchange` step ships
+                // plus both detected address families
+                // (`network::detect_ipv4_with_source` /
+                // `detect_ipv6_with_source` — env-var hint first,
+                // `hostname -I` fallback; the resolved address + source was
+                // logged at startup just before the mesh dial). It is what
+                // the `send_cert_exchange` step ships
                 // on the wire and the primary then re-broadcasts via
                 // `PeerInfo`. The dialer (peer/dial.rs) consumes both
                 // families and happy-eyeballs-races them, so a host that has

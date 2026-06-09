@@ -27,25 +27,74 @@ use tracing_subscriber::layer::{Context, Layer};
 pub(crate) struct CapturedEvent {
     pub(crate) target: String,
     pub(crate) message: String,
+    /// Space-joined `name=value` renderings of every structured
+    /// field OTHER than `message` (e.g. `peer=…`, `addr=…`,
+    /// `consecutive_failed_dials=…`). The relay-path assertions match
+    /// on [`Self::message`]; tests that need to inspect structured
+    /// fields (the dial-failure summary carries the dialed address as
+    /// a field, not in the format string) match here.
+    pub(crate) fields: String,
 }
 
 /// `tracing` field visitor: extract the formatted message body of
-/// an event into a `String`. The macros render the message field
+/// an event into a `String`, and accumulate every other field's
+/// `name=value` rendering. The macros render the message field
 /// via `record_debug`; `record_str` is wired up too for forward
 /// compatibility with future tracing versions that prefer it.
-struct MessageVisitor(String);
+struct MessageVisitor {
+    message: String,
+    fields: String,
+}
+
+impl MessageVisitor {
+    fn new() -> Self {
+        Self {
+            message: String::new(),
+            fields: String::new(),
+        }
+    }
+
+    fn push_field(&mut self, name: &str, rendered: &str) {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        self.fields.push_str(name);
+        self.fields.push('=');
+        self.fields.push_str(rendered);
+    }
+}
 
 impl Visit for MessageVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            self.0 = value.to_string();
+            self.message = value.to_string();
+        } else {
+            self.push_field(field.name(), value);
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0 = format!("{value:?}");
+            self.message = format!("{value:?}");
+        } else {
+            self.push_field(field.name(), &format!("{value:?}"));
         }
+    }
+
+    // Numeric / bool fields don't go through `record_debug` — the
+    // tracing macros call the typed hooks. The dial-failure summary's
+    // `consecutive_failed_dials` count arrives via `record_u64`, so
+    // capture all of them.
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.push_field(field.name(), &value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.push_field(field.name(), &value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.push_field(field.name(), &value.to_string());
     }
 }
 
@@ -64,7 +113,7 @@ pub(crate) struct CaptureLayer {
 impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let target = event.metadata().target().to_string();
-        let mut visitor = MessageVisitor(String::new());
+        let mut visitor = MessageVisitor::new();
         event.record(&mut visitor);
         // Lock can poison if a concurrent test panics, but this
         // layer is only ever installed via `set_default` for the
@@ -74,7 +123,8 @@ impl<S: tracing::Subscriber> Layer<S> for CaptureLayer {
         if let Ok(mut buf) = self.records.lock() {
             buf.push(CapturedEvent {
                 target,
-                message: visitor.0,
+                message: visitor.message,
+                fields: visitor.fields,
             });
         }
     }

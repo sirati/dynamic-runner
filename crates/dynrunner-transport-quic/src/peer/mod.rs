@@ -501,8 +501,35 @@ impl<I: Identifier> PeerNetwork<I> {
                 self.reconnect_tracker.observe_disconnect(peer_id);
             }
         }
-        let to_dial = self.reconnect_tracker.tick();
-        for peer_id in to_dial {
+        let outcome = self.reconnect_tracker.tick();
+
+        // Address-carrying dial-failure summary: the tracker owns the
+        // count-throttle (which peers crossed a summary boundary this
+        // tick); THIS edge owns the dialed address, resolved from the
+        // authoritative `peer_dial_info`. Emitting here — not in the
+        // tracker — keeps the timing tracker free of any dial-address
+        // knowledge. The WARN surfaces the address an operator must
+        // sanity-check (a container-internal / bridge addr that no peer
+        // can route to is the canonical mesh-never-forms cause).
+        for summary in outcome.dial_summaries {
+            let dialed = self
+                .peer_dial_info
+                .get(&summary.peer_id)
+                .map(|info| dial::format_dial_targets(&dial::candidate_addrs(info)))
+                // A summary for a peer dropped from the authoritative
+                // list between tick start and here is vanishingly rare
+                // (membership churn) and not worth suppressing the WARN
+                // over — the count alone is still operator-useful.
+                .unwrap_or_else(|| "<unknown>".to_string());
+            tracing::warn!(
+                peer = %summary.peer_id,
+                addr = %dialed,
+                consecutive_failed_dials = summary.attempts,
+                "peer unreachable; dialing address — verify it is peer-routable"
+            );
+        }
+
+        for peer_id in outcome.to_dial {
             self.spawn_redial(&peer_id);
         }
     }

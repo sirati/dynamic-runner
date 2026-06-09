@@ -67,6 +67,19 @@ pub(super) fn candidate_addrs(peer_info: &PeerConnectionInfo) -> Vec<SocketAddr>
     addrs
 }
 
+/// Render a peer's candidate `SocketAddr` list into a compact, stable
+/// operator string (e.g. `"10.0.0.1:7000, [fe80::1]:7000"`). Used only
+/// by the dial-failure summary WARN so an operator can eyeball whether
+/// the node is dialing a peer-routable address or a container-internal
+/// one. Pure formatting — no behavior, no dialing.
+pub(super) fn format_dial_targets(addrs: &[SocketAddr]) -> String {
+    addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Race a connection attempt across every `addr` in parallel using
 /// `attempt`. Returns the first successful connection along with the
 /// address it was made to; returns `None` if every attempt fails or the

@@ -1,6 +1,7 @@
 //! Local-host network helpers (hostname, IPv4/IPv6 detection).
 //!
-//! Both `detect_ipv4` and `detect_ipv6` share the same primitive: parsing
+//! Both `detect_ipv4_with_source` and `detect_ipv6_with_source` share the
+//! same primitive: parsing
 //! the space-separated address list from `hostname -I`. On Linux that
 //! command emits every non-loopback address configured on every
 //! non-loopback interface, both families intermixed — so the only
@@ -22,13 +23,48 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 /// Env var the SLURM wrapper sets to the host's peer-routable IPv4.
-/// Consumed by [`detect_ipv4`] when no explicit `override_ip` argument
-/// is passed.
+/// Consumed by [`detect_ipv4_with_source`] when no explicit `override_ip`
+/// argument is passed.
 const ENV_HOST_IPV4: &str = "PRIMARY_NODE_IPV4";
 
 /// Env var the SLURM wrapper sets to the host's peer-routable IPv6.
-/// Consumed by [`detect_ipv6`].
+/// Consumed by [`detect_ipv6_with_source`].
 const ENV_HOST_IPV6: &str = "PRIMARY_NODE_IPV6";
+
+/// Which resolution rung produced a detected address. Surfaced
+/// alongside the address by [`detect_ipv4_with_source`] /
+/// [`detect_ipv6_with_source`] so a node can log, at startup, not just
+/// the address it will advertise to peers but WHERE that address came
+/// from — the operator-facing datum that distinguishes "the SLURM
+/// wrapper handed me a routable LAN IP" from "I fell back to whatever
+/// `hostname -I` printed first (possibly a podman/CNI bridge addr no
+/// peer can reach)" from "I have no external address at all".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddrSource {
+    /// The explicit Python-side `local_ip` override argument.
+    Override,
+    /// The `PRIMARY_NODE_IPV4` / `PRIMARY_NODE_IPV6` env-var hint
+    /// (set, non-empty) — the SLURM wrapper's host-IP probe.
+    EnvHint,
+    /// First acceptable address parsed from `hostname -I`.
+    HostnameProbe,
+    /// IPv4-only: neither hint nor probe yielded an address, so the
+    /// localhost fallback (`127.0.0.1`) was used. A node advertising
+    /// this to peers is unreachable from any other host.
+    LocalhostFallback,
+}
+
+impl AddrSource {
+    /// Stable lower-case token for the structured `source=` log field.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AddrSource::Override => "override",
+            AddrSource::EnvHint => "env-hint",
+            AddrSource::HostnameProbe => "hostname-probe",
+            AddrSource::LocalhostFallback => "localhost-fallback",
+        }
+    }
+}
 
 pub(crate) fn gethostname() -> String {
     std::process::Command::new("hostname")
@@ -76,65 +112,77 @@ fn env_addr_hint(var: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Detect the local IPv4 address.
+/// Detect the local IPv4 address AND the resolution rung it came from
+/// (see [`AddrSource`]) so the caller can log both at startup.
 ///
 /// Resolution order:
-///   1. If `override_ip` is `Some`, use it verbatim. This is the explicit
-///      Python-side `local_ip` config knob (wired in via PrimaryConfig /
-///      SecondaryConfig once those typed configs exist).
-///   2. The `PRIMARY_NODE_IPV4` env-var hint, if set and non-empty.
-///   3. Otherwise, parse the first non-loopback IPv4 from `hostname -I`.
-///   4. Otherwise, fall back to "127.0.0.1".
+///   1. If `override_ip` is `Some`, use it verbatim ([`AddrSource::Override`]).
+///      This is the explicit Python-side `local_ip` config knob (wired in
+///      via PrimaryConfig / SecondaryConfig once those typed configs exist).
+///   2. The `PRIMARY_NODE_IPV4` env-var hint, if set and non-empty
+///      ([`AddrSource::EnvHint`]).
+///   3. Otherwise, parse the first non-loopback IPv4 from `hostname -I`
+///      ([`AddrSource::HostnameProbe`]).
+///   4. Otherwise, fall back to "127.0.0.1" ([`AddrSource::LocalhostFallback`]).
 ///
-/// Returns `String` (never `Option`): the localhost fallback preserves
-/// single-host integration-test behaviour where the secondary's peer
-/// dialer must still produce a candidate `SocketAddr` even on a host
+/// The address is `String` (never `Option`): the localhost fallback
+/// preserves single-host integration-test behaviour where the secondary's
+/// peer dialer must still produce a candidate `SocketAddr` even on a host
 /// that has no external IPv4 configured.
-pub(crate) fn detect_ipv4(override_ip: Option<&str>) -> String {
+pub(crate) fn detect_ipv4_with_source(override_ip: Option<&str>) -> (String, AddrSource) {
     if let Some(ip) = override_ip {
-        return ip.to_string();
+        return (ip.to_string(), AddrSource::Override);
     }
 
-    env_addr_hint(ENV_HOST_IPV4)
-        .or_else(|| {
-            first_hostname_addr::<Ipv4Addr, _>(|addr| !addr.is_loopback() && !addr.is_unspecified())
-                .map(|a| a.to_string())
-        })
-        .unwrap_or_else(|| "127.0.0.1".into())
+    if let Some(hint) = env_addr_hint(ENV_HOST_IPV4) {
+        return (hint, AddrSource::EnvHint);
+    }
+
+    if let Some(addr) =
+        first_hostname_addr::<Ipv4Addr, _>(|addr| !addr.is_loopback() && !addr.is_unspecified())
+    {
+        return (addr.to_string(), AddrSource::HostnameProbe);
+    }
+
+    ("127.0.0.1".into(), AddrSource::LocalhostFallback)
 }
 
 /// Detect the local IPv6 address, if any externally-reachable one is
-/// configured.
+/// configured, AND the resolution rung it came from (see [`AddrSource`]).
 ///
 /// Resolution order:
-///   1. If `override_ip` is `Some`, use it verbatim.
-///   2. The `PRIMARY_NODE_IPV6` env-var hint, if set and non-empty.
+///   1. If `override_ip` is `Some`, use it verbatim ([`AddrSource::Override`]).
+///   2. The `PRIMARY_NODE_IPV6` env-var hint, if set and non-empty
+///      ([`AddrSource::EnvHint`]).
 ///   3. Otherwise, parse the first non-loopback / non-unspecified /
-///      non-link-local IPv6 from `hostname -I`.
+///      non-link-local IPv6 from `hostname -I` ([`AddrSource::HostnameProbe`]).
 ///   4. Otherwise, return `None`.
 ///
-/// Unlike [`detect_ipv4`] this returns `Option<String>` rather than a
-/// localhost fallback: a real cluster host without any IPv6 NIC should
-/// advertise no IPv6, so the peer dialer doesn't waste an attempt
-/// racing `[::1]:port` (which always fails to reach a different node).
-/// Single-host tests already get an IPv4 candidate from `detect_ipv4`'s
-/// fallback, so they don't need an IPv6 loopback.
+/// Returns `Option` rather than a localhost fallback: a real cluster host
+/// without any IPv6 NIC should advertise no IPv6, so the peer dialer
+/// doesn't waste an attempt racing `[::1]:port` (which always fails to
+/// reach a different node). There is therefore no `LocalhostFallback`
+/// source for v6. Single-host tests already get an IPv4 candidate from
+/// [`detect_ipv4_with_source`]'s fallback, so they don't need an IPv6
+/// loopback.
 ///
 /// Link-local (`fe80::/10`) is excluded because it's only routable
 /// when paired with a `%scope_id` interface qualifier — we don't carry
 /// that on the wire and a peer on a different host can't dial a bare
 /// link-local.
-pub(crate) fn detect_ipv6(override_ip: Option<&str>) -> Option<String> {
+pub(crate) fn detect_ipv6_with_source(override_ip: Option<&str>) -> Option<(String, AddrSource)> {
     if let Some(ip) = override_ip {
-        return Some(ip.to_string());
+        return Some((ip.to_string(), AddrSource::Override));
     }
 
-    env_addr_hint(ENV_HOST_IPV6).or_else(|| {
-        first_hostname_addr::<Ipv6Addr, _>(|addr| {
-            !addr.is_loopback() && !addr.is_unspecified() && !is_unicast_link_local(addr)
-        })
-        .map(|a| a.to_string())
+    if let Some(hint) = env_addr_hint(ENV_HOST_IPV6) {
+        return Some((hint, AddrSource::EnvHint));
+    }
+
+    first_hostname_addr::<Ipv6Addr, _>(|addr| {
+        !addr.is_loopback() && !addr.is_unspecified() && !is_unicast_link_local(addr)
     })
+    .map(|a| (a.to_string(), AddrSource::HostnameProbe))
 }
 
 /// `Ipv6Addr::is_unicast_link_local` is unstable on stable Rust; mirror
@@ -203,8 +251,11 @@ mod tests {
 
     #[test]
     fn override_short_circuits() {
-        assert_eq!(detect_ipv4(Some("10.0.0.99")), "10.0.0.99");
-        assert_eq!(detect_ipv6(Some("2001:db8::1")), Some("2001:db8::1".into()));
+        assert_eq!(detect_ipv4_with_source(Some("10.0.0.99")).0, "10.0.0.99");
+        assert_eq!(
+            detect_ipv6_with_source(Some("2001:db8::1")).map(|(a, _)| a),
+            Some("2001:db8::1".into())
+        );
     }
 
     #[test]
@@ -213,14 +264,17 @@ mod tests {
         let _guard = EnvVarGuard::set(ENV_HOST_IPV4, "10.0.0.5");
         // No `override_ip` argument: env hint must beat `hostname -I`,
         // which is the whole point of the hint.
-        assert_eq!(detect_ipv4(None), "10.0.0.5");
+        assert_eq!(detect_ipv4_with_source(None).0, "10.0.0.5");
     }
 
     #[test]
     fn env_hint_overrides_hostname_probe_ipv6() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvVarGuard::set(ENV_HOST_IPV6, "2001:db8::42");
-        assert_eq!(detect_ipv6(None), Some("2001:db8::42".into()));
+        assert_eq!(
+            detect_ipv6_with_source(None).map(|(a, _)| a),
+            Some("2001:db8::42".into())
+        );
     }
 
     #[test]
@@ -233,10 +287,10 @@ mod tests {
         let _guard6 = EnvVarGuard::set(ENV_HOST_IPV6, "   ");
         // Can't assert the exact returned value (depends on the test
         // host's NICs) but it must not be the empty string.
-        assert!(!detect_ipv4(None).is_empty());
+        assert!(!detect_ipv4_with_source(None).0.is_empty());
         // IPv6 may legitimately be None on hosts without IPv6, but if
         // Some it must not be empty/whitespace.
-        if let Some(v6) = detect_ipv6(None) {
+        if let Some((v6, _)) = detect_ipv6_with_source(None) {
             assert!(!v6.trim().is_empty());
         }
     }
@@ -247,6 +301,72 @@ mod tests {
         let _guard = EnvVarGuard::set(ENV_HOST_IPV4, "10.0.0.5");
         // `override_ip` is the explicit Python-side knob; it must
         // out-rank any env hint so a user can force a value.
-        assert_eq!(detect_ipv4(Some("192.168.1.1")), "192.168.1.1");
+        assert_eq!(detect_ipv4_with_source(Some("192.168.1.1")).0, "192.168.1.1");
+    }
+
+    #[test]
+    fn source_override_classified() {
+        // Override short-circuits before any env / probe and is
+        // reported as `Override`.
+        let (addr, src) = detect_ipv4_with_source(Some("10.0.0.99"));
+        assert_eq!(addr, "10.0.0.99");
+        assert_eq!(src, AddrSource::Override);
+
+        let (addr6, src6) = detect_ipv6_with_source(Some("2001:db8::1")).unwrap();
+        assert_eq!(addr6, "2001:db8::1");
+        assert_eq!(src6, AddrSource::Override);
+    }
+
+    #[test]
+    fn source_env_hint_classified() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g4 = EnvVarGuard::set(ENV_HOST_IPV4, "10.0.0.5");
+        let _g6 = EnvVarGuard::set(ENV_HOST_IPV6, "2001:db8::42");
+        // No override arg: the env hint wins and is reported as
+        // `EnvHint` — the SLURM-wrapper-supplied routable address.
+        let (addr, src) = detect_ipv4_with_source(None);
+        assert_eq!(addr, "10.0.0.5");
+        assert_eq!(src, AddrSource::EnvHint);
+
+        let (addr6, src6) = detect_ipv6_with_source(None).unwrap();
+        assert_eq!(addr6, "2001:db8::42");
+        assert_eq!(src6, AddrSource::EnvHint);
+    }
+
+    #[test]
+    fn source_falls_past_empty_env_hint() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Wrapper sets the var to empty when its probe found nothing;
+        // the empty hint must NOT be reported as `EnvHint` — resolution
+        // falls through to the probe (or the localhost fallback for v4).
+        let _g4 = EnvVarGuard::set(ENV_HOST_IPV4, "");
+        let _g6 = EnvVarGuard::set(ENV_HOST_IPV6, "   ");
+        let (_addr, src) = detect_ipv4_with_source(None);
+        assert_ne!(
+            src,
+            AddrSource::EnvHint,
+            "empty env hint must not be classified as an env-hint source"
+        );
+        assert!(matches!(
+            src,
+            AddrSource::HostnameProbe | AddrSource::LocalhostFallback
+        ));
+        // v6 either resolves via the probe or is None — never EnvHint.
+        if let Some((_a6, src6)) = detect_ipv6_with_source(None) {
+            assert_eq!(src6, AddrSource::HostnameProbe);
+        }
+    }
+
+    #[test]
+    fn source_token_strings_stable() {
+        // The `source=` log field tokens are an operator-facing
+        // contract; pin them.
+        assert_eq!(AddrSource::Override.as_str(), "override");
+        assert_eq!(AddrSource::EnvHint.as_str(), "env-hint");
+        assert_eq!(AddrSource::HostnameProbe.as_str(), "hostname-probe");
+        assert_eq!(
+            AddrSource::LocalhostFallback.as_str(),
+            "localhost-fallback"
+        );
     }
 }

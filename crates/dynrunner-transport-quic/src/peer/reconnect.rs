@@ -47,6 +47,22 @@ pub(super) const MILESTONES: &[Duration] = &[
 /// 20m after the 20m mark" — 40m, 60m, 80m, ...
 pub(super) const MILESTONE_RECURRENCE: Duration = Duration::from_secs(20 * 60);
 
+/// Consecutive-failed-dial count at which the FIRST address-carrying
+/// dial-failure summary fires (see [`PeerReconnectState::dial_summary_due`]).
+/// At [`RECONNECT_TICK`] cadence (5s) this is ~15s — past the one-or-two-
+/// tick window a transient blip heals in, so a flapped peer stays silent
+/// (mirrors the milestone schedule's "no WARN on a fast heal" intent)
+/// while a genuinely-unreachable peer surfaces its dialed address once,
+/// promptly.
+pub(super) const DIAL_SUMMARY_THRESHOLD: u32 = 3;
+
+/// After the first summary at [`DIAL_SUMMARY_THRESHOLD`], the
+/// address-carrying summary recurs every this-many further consecutive
+/// failed dials. At [`RECONNECT_TICK`] cadence (5s) that is ~60s — the
+/// operator keeps seeing "peer X unreachable, dialing addr Y" roughly
+/// once a minute, never per-tick.
+pub(super) const DIAL_SUMMARY_RECURRENCE: u32 = 12;
+
 #[derive(Debug)]
 pub(super) struct PeerReconnectState {
     /// Wall-time when the disconnect was first observed. All
@@ -60,6 +76,53 @@ pub(super) struct PeerReconnectState {
     /// [`MILESTONE_RECURRENCE`] schedule (idx ==
     /// `MILESTONES.len() + N` ⇒ N+1 recurrences emitted).
     pub(super) next_milestone_idx: usize,
+}
+
+impl PeerReconnectState {
+    /// Count-based throttle gate for the address-carrying dial-failure
+    /// summary. Returns `true` on exactly the consecutive-attempt counts
+    /// `{THRESHOLD, THRESHOLD + RECURRENCE, THRESHOLD + 2·RECURRENCE, …}`
+    /// and `false` everywhere else — so the caller emits the summary once
+    /// at the threshold and then once per recurrence window, never on
+    /// every tick.
+    ///
+    /// This throttle is intentionally COUNT-based (consecutive failed
+    /// dials), orthogonal to the TIME-based [`MILESTONES`] WARNs in
+    /// [`ReconnectTracker::tick`]: the milestone line answers "how long
+    /// has this peer been gone", the summary line answers "what address
+    /// are we even dialing" — the operator-facing datum the missing-
+    /// `%addr` incident needed. The tracker owns this gate (the count);
+    /// the address itself is resolved by the transport caller from its
+    /// own `peer_dial_info`, so the timing tracker never learns about
+    /// dial addresses.
+    fn dial_summary_due(&self) -> bool {
+        match self.attempts.checked_sub(DIAL_SUMMARY_THRESHOLD) {
+            None => false,                                // below the first threshold
+            Some(0) => true,                             // exactly the first threshold
+            Some(over) => over % DIAL_SUMMARY_RECURRENCE == 0, // recurrence windows
+        }
+    }
+}
+
+/// A peer whose consecutive failed-dial count just crossed a
+/// [`PeerReconnectState::dial_summary_due`] boundary this tick. Carries
+/// only what the timing tracker owns — the peer id and the running
+/// attempt count. The transport caller pairs this with the dialed
+/// address (from its `peer_dial_info`) to emit the operator WARN; the
+/// tracker itself never touches dial-address state.
+pub(crate) struct DialSummary {
+    pub(super) peer_id: String,
+    pub(super) attempts: u32,
+}
+
+/// Result of one [`ReconnectTracker::tick`]: the peers to redial this
+/// tick (unchanged contract) plus any address-carrying dial-failure
+/// summaries whose count-throttle boundary was crossed. Bundling both in
+/// one return keeps the tracker the single owner of per-peer attempt
+/// state — the caller never re-derives the count.
+pub(crate) struct TickOutcome {
+    pub(super) to_dial: Vec<String>,
+    pub(super) dial_summaries: Vec<DialSummary>,
 }
 
 /// Per-peer reconnect state machine. Owned by `PeerNetwork`; the
@@ -119,13 +182,27 @@ impl ReconnectTracker {
 
     /// One tick of the reconnect loop. Bumps attempt counters,
     /// emits any milestone WARNs that just tripped, and returns
-    /// the list of peer ids the caller should redial.
-    pub fn tick(&mut self) -> Vec<String> {
+    /// the [`TickOutcome`]: the peer ids the caller should redial
+    /// plus any address-carrying dial-failure summaries whose
+    /// count-throttle boundary was crossed this tick.
+    pub fn tick(&mut self) -> TickOutcome {
         let now = Instant::now();
         let mut peers = Vec::with_capacity(self.state.len());
+        let mut dial_summaries = Vec::new();
         for (peer_id, state) in &mut self.state {
             state.attempts += 1;
             peers.push(peer_id.clone());
+
+            // Count-based dial-failure summary gate (orthogonal to the
+            // time-based milestones below): when the consecutive-failure
+            // count hits the throttle boundary, hand the peer + count
+            // back to the caller, which owns the dialed address.
+            if state.dial_summary_due() {
+                dial_summaries.push(DialSummary {
+                    peer_id: peer_id.clone(),
+                    attempts: state.attempts,
+                });
+            }
 
             let elapsed = now.duration_since(state.disconnect_at);
 
@@ -180,7 +257,10 @@ impl ReconnectTracker {
                 }
             }
         }
-        peers
+        TickOutcome {
+            to_dial: peers,
+            dial_summaries,
+        }
     }
 
     /// Tracker size. Used in tests + the existing `peer_count`
@@ -227,7 +307,7 @@ mod tests {
         let mut t = ReconnectTracker::new();
         t.observe_disconnect("peer-a");
         t.observe_disconnect("peer-b");
-        let peers = t.tick();
+        let peers = t.tick().to_dial;
         assert_eq!(peers.len(), 2);
         assert!(peers.contains(&"peer-a".to_string()));
         assert!(peers.contains(&"peer-b".to_string()));
@@ -242,6 +322,93 @@ mod tests {
         t.tick();
         let state = t.state.get("peer-1").expect("peer tracked");
         assert_eq!(state.attempts, 3);
+    }
+
+    #[test]
+    fn dial_summary_fires_at_threshold_not_before() {
+        // The address-carrying dial-failure summary is count-throttled:
+        // SILENT for the first THRESHOLD-1 consecutive failed dials
+        // (suppresses a transient blip that heals in one or two ticks),
+        // then fires EXACTLY on the THRESHOLD-th tick — the boundary.
+        let mut t = ReconnectTracker::new();
+        t.observe_disconnect("peer-1");
+
+        // Ticks 1..THRESHOLD-1: no summary yet.
+        for n in 1..DIAL_SUMMARY_THRESHOLD {
+            let out = t.tick();
+            assert!(
+                out.dial_summaries.is_empty(),
+                "summary must stay silent before the threshold (tick {n})"
+            );
+        }
+
+        // Tick == THRESHOLD: exactly one summary for peer-1, carrying the
+        // running consecutive-failure count.
+        let out = t.tick();
+        assert_eq!(
+            out.dial_summaries.len(),
+            1,
+            "summary must fire on the THRESHOLD-th consecutive failed dial"
+        );
+        assert_eq!(out.dial_summaries[0].peer_id, "peer-1");
+        assert_eq!(out.dial_summaries[0].attempts, DIAL_SUMMARY_THRESHOLD);
+    }
+
+    #[test]
+    fn dial_summary_throttles_to_recurrence_not_every_tick() {
+        // Past the first threshold the summary must recur only once per
+        // RECURRENCE window — NOT on every tick. Revert-check for the
+        // throttle: counting summaries across a long failing window must
+        // be small (1 + #recurrences), not one-per-tick.
+        let mut t = ReconnectTracker::new();
+        t.observe_disconnect("peer-1");
+
+        let total_ticks = DIAL_SUMMARY_THRESHOLD + 2 * DIAL_SUMMARY_RECURRENCE;
+        let mut summary_ticks = Vec::new();
+        for n in 1..=total_ticks {
+            if !t.tick().dial_summaries.is_empty() {
+                summary_ticks.push(n);
+            }
+        }
+
+        // Exactly the boundary set {THRESHOLD, THRESHOLD+RECURRENCE,
+        // THRESHOLD+2·RECURRENCE} — three emissions across a window that
+        // saw `total_ticks` ticks. A removed throttle would fire on
+        // every tick (total_ticks emissions).
+        assert_eq!(
+            summary_ticks,
+            vec![
+                DIAL_SUMMARY_THRESHOLD,
+                DIAL_SUMMARY_THRESHOLD + DIAL_SUMMARY_RECURRENCE,
+                DIAL_SUMMARY_THRESHOLD + 2 * DIAL_SUMMARY_RECURRENCE,
+            ],
+            "summary must fire only at threshold + recurrence boundaries, \
+             not every tick"
+        );
+        assert!(
+            summary_ticks.len() < total_ticks as usize,
+            "throttle must suppress the vast majority of ticks"
+        );
+    }
+
+    #[test]
+    fn dial_summary_clears_on_reconnect() {
+        // A heal before the threshold leaves no pending summary, and a
+        // fresh disconnect restarts the count from zero — the summary
+        // never fires for a peer that flapped quickly.
+        let mut t = ReconnectTracker::new();
+        t.observe_disconnect("peer-1");
+        t.tick(); // attempt 1
+        t.observe_reconnect("peer-1");
+        assert_eq!(t.tracked_count(), 0);
+
+        // Re-disconnect: the count starts over, so the first tick after
+        // is attempt 1 again — still below the threshold, still silent.
+        t.observe_disconnect("peer-1");
+        let out = t.tick();
+        assert!(out.dial_summaries.is_empty());
+        let state = t.state.get("peer-1").expect("peer tracked");
+        assert_eq!(state.attempts, 1);
     }
 
     #[test]
