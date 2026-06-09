@@ -3077,13 +3077,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
                 // Pre-loop collapse gate (transfer-complete window): a
                 // secondary dying AFTER its initial assignment send succeeded
-                // but before/at `send_transfer_complete` makes that broadcast's
-                // `send_to` hit the now-gone local mesh-pump — latched on
-                // `mesh_pump_gone`. Route it through the SAME finalize tail as
-                // the assignment-time collapse (rather than the warn-swallow
-                // letting the doomed run proceed into the operational loop over
-                // a dead mesh): the assigned-but-unconfirmed pool surfaces as
-                // stranded with the honest `RunAborted` terminal. Mirror of the
+                // but before/at `send_transfer_complete` makes that fan-out's
+                // per-secondary `send_to` hit the now-gone local mesh-pump —
+                // latched on `mesh_pump_gone`. (`send_transfer_complete` now
+                // fans the gate-release per CRDT-known secondary over the
+                // directed router path, but its `Err` arm is still uniformly the
+                // mesh-pump-gone collapse — the per-peer no-route outcome is
+                // resolved asynchronously inside the pump and never sets the
+                // latch.) Route it through the SAME finalize tail as the
+                // assignment-time collapse (rather than the warn-swallow letting
+                // the doomed run proceed into the operational loop over a dead
+                // mesh): the assigned-but-unconfirmed pool surfaces as stranded
+                // with the honest `RunAborted` terminal. Mirror of the
                 // operational loop's break-then-finalize, observed from the
                 // send side.
                 if self.mesh_pump_gone {
