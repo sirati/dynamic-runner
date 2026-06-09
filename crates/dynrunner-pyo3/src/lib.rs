@@ -64,6 +64,12 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // here so it lands in the per-role full-log file via the role span (see
     // `crate::logging::py_log`).
     m.add_function(wrap_pyfunction!(logging::py_log, m)?)?;
+    // The FATAL-error surfacing primitive: a Python fatal/uncaught error
+    // (process about to exit non-zero) is forwarded here so it reaches stdio
+    // even under `--important-stdio-only` — it emits at the IMPORTANT target,
+    // the one the importance gate admits (see `crate::logging::py_log_important`
+    // and `logging_setup.surface_fatal_errors`).
+    m.add_function(wrap_pyfunction!(logging::py_log_important, m)?)?;
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;

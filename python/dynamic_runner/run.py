@@ -20,7 +20,7 @@ from ._shared import (
 )
 
 from .deployment_spec import TaskDeploymentSpec
-from .logging_setup import setup_logging
+from .logging_setup import setup_logging, surface_fatal_errors
 from .spawn_secondary import build_subprocess_spawn
 from .task_protocol import TaskDefinition
 
@@ -271,7 +271,27 @@ def dispatch(
     already parsed ``args``, set ``args.forwarded_argv``, and configured
     logging; this function owns only the secondary / observer /
     multi-computer / local mode selection.
+
+    The routing body runs inside :func:`logging_setup.surface_fatal_errors` so
+    a FATAL dispatch error (an exception about to exit the process non-zero)
+    ALWAYS surfaces to stdout AND the full log — even under
+    ``--important-stdio-only`` — and is flushed before exit, then re-raised
+    unchanged. This is the single chokepoint both framework entry points pass
+    through after logging is configured, so the guarantee is composed once
+    here, not special-cased per mode.
     """
+    with surface_fatal_errors():
+        _dispatch_route(task, args, deployment)
+
+
+def _dispatch_route(
+    task: TaskDefinition,
+    args: argparse.Namespace,
+    deployment: TaskDeploymentSpec | None,
+) -> None:
+    """The mode-selection body of :func:`dispatch` (secondary / observer /
+    multi-computer / local). Owns ONLY the routing; the fatal-surfacing guard
+    is composed by :func:`dispatch`."""
     logger = logging.getLogger()
 
     if args.secondary:

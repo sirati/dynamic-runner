@@ -112,18 +112,16 @@ class ImportantStdioFlagShapeTests(unittest.TestCase):
             )
 
     def test_submitter_only_filehandler_redirect_retired(self) -> None:
-        # The submitter-only Python full-log FileHandler redirect is replaced
-        # by the general per-role Python->tracing bridge; its symbols must be
-        # gone so no caller resurrects the special-case.
-        for retired in (
-            "resolve_full_log_file",
-            "_redirect_python_logs_to_full_log",
-            "DEFAULT_FULL_LOG_FILE",
-        ):
-            self.assertFalse(
-                hasattr(logging_setup, retired),
-                f"retired submitter-only redirect symbol still present: {retired}",
-            )
+        # The submitter-only Python full-log FileHandler *redirect* is replaced
+        # by the general per-role Python->tracing bridge; the redirect symbol
+        # must stay gone so no caller resurrects the Python-side special-case.
+        # (`resolve_full_log_file` / `DEFAULT_FULL_LOG_FILE` are reinstated for
+        # the NATIVE full sink default — exercised in
+        # `ResolveFullLogFileTests` — which is NOT a Python FileHandler.)
+        self.assertFalse(
+            hasattr(logging_setup, "_redirect_python_logs_to_full_log"),
+            "retired submitter-only Python FileHandler redirect still present",
+        )
 
 
 class ResolveFullLogDirTests(unittest.TestCase):
@@ -189,6 +187,52 @@ class ResolveFullLogDirTests(unittest.TestCase):
         )
 
 
+class ResolveFullLogFileTests(unittest.TestCase):
+    """The NATIVE full-sink single-file path resolution. The documented
+    ``./dynrunner-full.log`` default under importance mode must feed the Rust
+    full sink so a fatal dispatch error is captured to a file rather than lost
+    to the importance-gated stdout (the on-cluster diagnosability defect)."""
+
+    def test_explicit_file_always_wins(self) -> None:
+        self.assertEqual(
+            logging_setup.resolve_full_log_file(True, "/tmp/x.log", None),
+            "/tmp/x.log",
+        )
+        # Even with importance mode OFF an explicit file is honoured.
+        self.assertEqual(
+            logging_setup.resolve_full_log_file(False, "/tmp/x.log", None),
+            "/tmp/x.log",
+        )
+
+    def test_importance_on_no_knobs_defaults_to_dynrunner_full_log(self) -> None:
+        # The headline fix: with importance mode on and neither file nor dir
+        # set, the native full sink defaults to ./dynrunner-full.log so the
+        # full record (and a fatal error) is durably captured.
+        self.assertEqual(
+            logging_setup.resolve_full_log_file(True, None, None),
+            logging_setup.DEFAULT_FULL_LOG_FILE,
+        )
+        self.assertEqual(logging_setup.DEFAULT_FULL_LOG_FILE, "dynrunner-full.log")
+
+    def test_importance_off_yields_none_single_stream(self) -> None:
+        # Off importance mode stdout already carries everything → no implicit
+        # file (today's single-stream behaviour preserved).
+        self.assertIsNone(logging_setup.resolve_full_log_file(False, None, None))
+
+    def test_dir_sink_suppresses_the_file_default(self) -> None:
+        # The per-node --full-log-dir is its own higher-precedence sink; the
+        # single-file default must NOT also kick in (no duplicate sink).
+        self.assertIsNone(
+            logging_setup.resolve_full_log_file(True, None, "/app/log/setup")
+        )
+
+    def test_blank_explicit_file_falls_through_to_default(self) -> None:
+        self.assertEqual(
+            logging_setup.resolve_full_log_file(True, "  ", None),
+            logging_setup.DEFAULT_FULL_LOG_FILE,
+        )
+
+
 class _RootLoggerSandbox(unittest.TestCase):
     """Save/restore the root logger's handlers + level so logging-setup
     tests do not corrupt the shared root logger for the rest of the suite.
@@ -213,6 +257,11 @@ class _RootLoggerSandbox(unittest.TestCase):
         self.py_log_calls: list[tuple] = []
         self._saved_py_log = getattr(pkg, "py_log", None)
         pkg.py_log = lambda *a: self.py_log_calls.append(a)
+        # Stub the native py_log_important the fatal-surfacing path reaches
+        # (`surface_fatal_errors` does `from . import py_log_important`).
+        self.py_log_important_calls: list[str] = []
+        self._saved_py_log_important = getattr(pkg, "py_log_important", None)
+        pkg.py_log_important = lambda m: self.py_log_important_calls.append(m)
 
     def tearDown(self) -> None:
         root = logging.getLogger()
@@ -236,6 +285,11 @@ class _RootLoggerSandbox(unittest.TestCase):
                 del pkg.py_log
         else:
             pkg.py_log = self._saved_py_log
+        if self._saved_py_log_important is None:
+            if hasattr(pkg, "py_log_important"):
+                del pkg.py_log_important
+        else:
+            pkg.py_log_important = self._saved_py_log_important
 
 
 class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
@@ -278,6 +332,22 @@ class InitLoggingParamPassthroughTests(_RootLoggerSandbox):
         self.assertEqual(
             new_dynrunner, set(), f"setup_logging leaked env vars: {new_dynrunner}"
         )
+
+    def test_importance_on_defaults_full_log_file_into_init_logging(self) -> None:
+        # The native full sink must default to ./dynrunner-full.log under
+        # importance mode when no file/dir knob is set, so the full record
+        # (and a fatal error) is captured to a file — not the gated stdout.
+        logging_setup.setup_logging(_parse(["--important-stdio-only"]))
+        self.assertEqual(len(self.init_calls), 1)
+        self.assertEqual(
+            self.init_calls[0]["full_log_file"], logging_setup.DEFAULT_FULL_LOG_FILE
+        )
+
+    def test_importance_off_passes_no_implicit_full_log_file(self) -> None:
+        # Off importance mode the native full sink stays stdout (None) — the
+        # single-stream default is unchanged.
+        logging_setup.setup_logging(_parse([]))
+        self.assertIsNone(self.init_calls[0]["full_log_file"])
 
     def test_full_log_dir_forwarded_to_init_logging(self) -> None:
         # The per-role-log feature is wired via the forwarded --full-log-dir
@@ -371,6 +441,55 @@ class PythonLoggingReconfigTests(_RootLoggerSandbox):
             1,
             "re-running setup_logging stacked duplicate bridge handlers",
         )
+
+
+class SurfaceFatalErrorsTests(_RootLoggerSandbox):
+    """A FATAL error reaching the dispatch boundary must ALWAYS surface — via
+    the native IMPORTANT-target primitive (so the importance-mode stdio gate
+    admits it) — be flushed, and re-raise unchanged. This is the on-cluster
+    diagnosability defect: under ``--important-stdio-only`` a fatal dispatch
+    error was logged through the ordinary Python bridge, gated OUT of stdio,
+    and lost. The guard closes that gap without weakening the normal filter."""
+
+    def test_clean_block_does_not_emit_fatal(self) -> None:
+        # No exception → no fatal emit (the guard is inert on the happy path).
+        with logging_setup.surface_fatal_errors():
+            pass
+        self.assertEqual(self.py_log_important_calls, [])
+
+    def test_exception_routes_through_important_and_reraises(self) -> None:
+        # REVERT-CHECK: remove the guard (or route the error through the plain
+        # bridge instead of py_log_important) and the fatal error never reaches
+        # the IMPORTANT target → undiagnosable under importance mode.
+        with self.assertRaises(RuntimeError):
+            with logging_setup.surface_fatal_errors():
+                raise RuntimeError("SLURM dispatch failed: boom")
+
+        self.assertEqual(
+            len(self.py_log_important_calls),
+            1,
+            "fatal error did not reach the IMPORTANT-target primitive",
+        )
+        message = self.py_log_important_calls[0]
+        # The message carries the exception text AND its traceback, so an
+        # operator (or LLM) woken on stdio can diagnose the hard failure.
+        self.assertIn("SLURM dispatch failed: boom", message)
+        self.assertIn("RuntimeError", message)
+        self.assertIn("Traceback", message)
+
+    def test_surfacing_never_masks_original_with_secondary_failure(self) -> None:
+        # If the native primitive itself raises, the ORIGINAL fatal error must
+        # still propagate (surfacing is best-effort; it never replaces the
+        # real error with a secondary one).
+        pkg = sys.modules["dynamic_runner"]
+
+        def _boom(_m: str) -> None:
+            raise OSError("stdout gone")
+
+        pkg.py_log_important = _boom
+        with self.assertRaises(ValueError):
+            with logging_setup.surface_fatal_errors():
+                raise ValueError("the real fatal error")
 
 
 if __name__ == "__main__":
