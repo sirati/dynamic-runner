@@ -10,9 +10,13 @@
 //!   authoritative disconnect detector + the `same_channel`
 //!   generation check that keeps a stale signal from pruning a
 //!   freshly-reconnected entry.
+//! - [`dial_failure_summary`]: the operator-visible per-peer
+//!   dial-failure summary emitted from `process_reconnect_tick` —
+//!   carries the dialed address + consecutive-failure count, throttled
+//!   to the summary threshold/recurrence boundaries.
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
-//!   used only by the silent-reconnect scenario; kept here because
-//!   no other scenario observes the relay log trace.
+//!   used by the silent-reconnect + dial-failure-summary scenarios;
+//!   kept here because they observe the framework log trace.
 //! - [`silent_reconnect`]: the canonical 3-peer partition→heal
 //!   scenario (~450 lines, intentionally one file: the multi-phase
 //!   setup/partition/drain/heal pump cannot be cleanly chopped
@@ -27,6 +31,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct TestId(pub(crate) String);
 
 mod cert_parsing;
+mod dial_failure_summary;
 mod log_capture;
 mod primary_link;
 mod reader_exit_disconnect;
