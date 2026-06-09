@@ -1887,3 +1887,124 @@ async fn promoted_inherited_failed_not_double_counted_against_pending() {
         })
         .await;
 }
+
+/// (SMELL 1/2) The promoted primary's `wait_for_mesh_ready` expected set
+/// must be the LIVE PEER secondaries only — EXCLUDING self and the
+/// departed ex-primary. Pre-fix it read the raw `known_secondaries()`
+/// capacity roster, which carries (a) self (the promoted host is itself a
+/// worker-secondary) and (b) the just-scancelled ex-primary (whose
+/// `SecondaryCapacity` record survives `PeerRemoved`). Neither can ever
+/// emit a `MeshReady` this wait observes, so the wait burned the full
+/// `mesh_ready_timeout` (the ~2-min resume latency).
+///
+/// Modelled like `setup_promote`'s BUG-C pin: an ABSURDLY HIGH
+/// `mesh_ready_timeout` (1 hour) with a tight outer `timeout(2s)`. With
+/// the fix the expected set is exactly the one LIVE PEER (which HAS
+/// reported `MeshReady`), so the fast-path subset check returns `Ok`
+/// instantly. With the bug, self + the dead ex-primary are in the
+/// expected set, never report, and the wait blocks the full hour — the
+/// outer timeout trips and the test fails.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            // The promoted host IS `secondary-1` (a worker-secondary that
+            // won the election), with an absurd mesh-ready timeout so a
+            // wrongly-included id would block for an hour.
+            let config = PrimaryConfig {
+                node_id: "secondary-1".into(),
+                mesh_ready_timeout: Duration::from_secs(3600),
+                ..PrimaryConfig::default()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mem8 = || vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 8 * 1024 * 1024 * 1024,
+            }];
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                // SELF (secondary-1): alive worker-secondary — must be
+                // EXCLUDED (never reports MeshReady to itself).
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "secondary-1".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "secondary-1".into(),
+                    worker_count: 2,
+                    resources: mem8(),
+                });
+                // LIVE PEER (secondary-2): the only id the wait should
+                // expect — and it HAS reported MeshReady (below).
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "secondary-2".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "secondary-2".into(),
+                    worker_count: 2,
+                    resources: mem8(),
+                });
+                // DEPARTED ex-primary (secondary-0): joined then REMOVED
+                // (the scancelled primary that triggered the election). Its
+                // capacity record survives `PeerRemoved`, so the raw roster
+                // still lists it — must be EXCLUDED by the alive filter.
+                cs.apply(ClusterMutation::PeerJoined {
+                    peer_id: "secondary-0".into(),
+                    is_observer: false,
+                    can_be_primary: true,
+                    cap_version: Default::default(),
+                });
+                cs.apply(ClusterMutation::SecondaryCapacity {
+                    secondary: "secondary-0".into(),
+                    worker_count: 2,
+                    resources: mem8(),
+                });
+                cs.apply(ClusterMutation::PeerRemoved {
+                    id: "secondary-0".into(),
+                    cause:
+                        dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                });
+            }
+
+            // Only the live PEER reports MeshReady. Self + the dead
+            // ex-primary do NOT — and must not be waited on.
+            primary.handle_mesh_ready(DistributedMessage::MeshReady {
+                target: None,
+                sender_id: "secondary-2".into(),
+                timestamp: 0.0,
+                secondary_id: "secondary-2".into(),
+                peer_count: 1,
+            });
+
+            // With the fix the expected set = {secondary-2} ⊆ reported, so
+            // the fast path returns Ok immediately. The tight 2s timeout
+            // (virtual clock) would trip if self/secondary-0 were wrongly
+            // expected (1-hour block).
+            let waited = tokio::time::timeout(
+                Duration::from_secs(2),
+                primary.wait_for_mesh_ready(&mut None),
+            )
+            .await;
+            assert!(
+                matches!(waited, Ok(Ok(()))),
+                "wait_for_mesh_ready must return promptly: the expected set is \
+                 the live peer (which reported), NOT self or the departed \
+                 ex-primary (which never report). A timeout means the buggy \
+                 expected-set is back. got: {waited:?}"
+            );
+        })
+        .await;
+}

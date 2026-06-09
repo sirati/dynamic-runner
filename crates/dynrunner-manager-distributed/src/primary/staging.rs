@@ -247,6 +247,37 @@ where
     /// caller forgot to thread `source_dir` is visible without
     /// silently losing staging.
     pub(super) fn maybe_auto_stage_initial(&mut self) -> Result<(), String> {
+        // Resume detection (failover-promotion). A promoted primary that
+        // INHERITED a populated CRDT is RESUMING an already-running run —
+        // the corpus was staged once by the run's original primary and
+        // replicated as `InFlight`/terminal task state. Re-running the
+        // full staging walk on resume re-copies every binary needlessly
+        // (the "auto-staging initial entries binaries=320" smell on a
+        // hydrated resume). A run is RESUMING iff ≥1 task has PROGRESSED
+        // past `Pending`/`Blocked` — i.e. it holds an `InFlight` or
+        // terminal (`Completed`/`Failed`/`Unfulfillable`/`InvalidTask`)
+        // entry. The same "has any progressed task" signal hydrate uses to
+        // seed `started_phases`. A genuinely FRESH promoted destination (a
+        // setup-peer relocate, or a `--source-already-staged` local
+        // primary) hydrates an all-`Pending` (or empty pre-discovery) CRDT,
+        // so this gate is open and the first-ever staging proceeds.
+        let counts = self.cluster_state.counts();
+        let progressed = counts.in_flight
+            + counts.completed
+            + counts.failed
+            + counts.unfulfillable
+            + counts.invalid_task;
+        if progressed > 0 {
+            tracing::debug!(
+                in_flight = counts.in_flight,
+                completed = counts.completed,
+                failed = counts.failed,
+                "auto-stage skipped: populated CRDT indicates a resume \
+                 (failover-promotion) — the corpus was staged by the \
+                 original primary; not re-staging on resume"
+            );
+            return Ok(());
+        }
         if !self.pending_stage_files.is_empty() {
             tracing::debug!(
                 pre_queued = self.pending_stage_files.len(),
