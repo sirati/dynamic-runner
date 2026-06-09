@@ -57,15 +57,27 @@ pub(super) enum ElectionState {
 }
 
 /// Output of one election tick: messages the caller should flush onto the
-/// peer transport before the next iteration.
+/// peer transport before the next iteration, plus whether the tick committed
+/// THIS node's promotion (the lone-survivor self-quorum path).
 pub(super) struct ElectionTickActions<I: Identifier> {
     pub(super) broadcast: Vec<DistributedMessage<I>>,
+    /// Set when the tick transitioned the election to [`ElectionState::Promoted`]
+    /// because this candidate ALREADY met quorum at the moment it self-promoted
+    /// — i.e. a lone survivor whose `failover_quorum(0) == 1` is satisfied by
+    /// its own single confirm, with no peer `PromotionConfirm` ever arriving to
+    /// drive `record_promotion_confirm`. The caller drives the SAME terminal
+    /// action the peer-confirm path uses (`fire_local_promotion`): originate +
+    /// locally apply + broadcast `PrimaryChanged { new = self }`. The terminal
+    /// action lives with the caller (it is async; the tick is sync), exactly
+    /// as the broadcast flush does.
+    pub(super) promoted: bool,
 }
 
 impl<I: Identifier> Default for ElectionTickActions<I> {
     fn default() -> Self {
         Self {
             broadcast: Vec::new(),
+            promoted: false,
         }
     }
 }

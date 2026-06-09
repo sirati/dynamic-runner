@@ -359,6 +359,16 @@ where
                     for msg in actions.broadcast {
                         let _ = self.send_to(Destination::All, msg).await;
                     }
+                    // Lone-survivor self-quorum commit: the tick transitioned
+                    // the election to `Promoted` because this candidate already
+                    // met quorum with its own single confirm (no peer
+                    // `PromotionConfirm` will ever arrive). Drive the SAME
+                    // terminal action the peer-confirm path drives off
+                    // `record_promotion_confirm` — originate + locally apply +
+                    // broadcast `PrimaryChanged { new = self }`.
+                    if actions.promoted {
+                        self.fire_local_promotion().await;
+                    }
                 }
                 _ = oom_sample_interval.tick() => {
                     // Fast sample tick: refresh per-worker RSS, read

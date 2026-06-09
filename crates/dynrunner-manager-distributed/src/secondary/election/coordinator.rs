@@ -78,6 +78,43 @@ where
         }
     }
 
+    /// Identity-gated wrapper over [`Self::record_primary_message`]: refresh
+    /// the primary-liveness anchor and cancel a false-alarm election ONLY
+    /// when the inbound frame's `sender_id` IS the current primary
+    /// (`cluster_state.current_primary()`, the single source of "who is
+    /// primary now").
+    ///
+    /// THE GATE — single source. "This frame proves the current primary is
+    /// alive" is true iff its origin is the current primary; a frame from any
+    /// OTHER mesh member (a peer secondary's anti-entropy `StateDigest`, the
+    /// submitter's `RequestClusterSnapshot` / `RequestRunConfig`, a relayed
+    /// `ClusterMutation`) is NOT a primary-liveness signal and must NEVER
+    /// reset the election. Pre-fix, the operational dispatch path called the
+    /// un-gated [`Self::record_primary_message`] for EVERY inbound frame — a
+    /// stale assumption from the pre-mesh model, where the primary uplink was
+    /// a physically primary-only transport so "any frame on it" was genuine
+    /// primary traffic. After the one-mesh cutover the same dispatcher is
+    /// reached for frames from ANY peer, so the un-gated reset let a lone
+    /// survivor's own in-flight self-promotion be cancelled by a peer/submitter
+    /// frame — the single-survivor election never converged (it flapped
+    /// Suspecting/Candidate↔Normal forever). This is the identity-keyed
+    /// counterpart to leg (C)'s remote-primary self-skip and the quorum side's
+    /// `live_peer_ids` current-primary exclusion: every "is this the primary"
+    /// decision keys on `current_primary()`, never on which transport delivered
+    /// the frame.
+    ///
+    /// A frame whose `sender_id` names THIS node (a same-peer / self-promoted
+    /// primary's own keepalive, recognized because `current_primary()` names
+    /// self) still resets via this gate — exactly the
+    /// `self_named_primary_resets_election_to_normal` contract — because the
+    /// predicate is "origin == current primary", and a self-named primary IS
+    /// the current primary.
+    pub(in crate::secondary) fn record_primary_message_if_from_primary(&mut self, sender_id: &str) {
+        if self.cluster_state.current_primary() == Some(sender_id) {
+            self.record_primary_message();
+        }
+    }
+
     /// The live mesh peers for failover quorum/candidate reasoning: the
     /// keys of `peer_keepalives` MINUS the current primary's host id.
     ///
@@ -481,28 +518,59 @@ where
                     .unwrap_or(false);
                 let round = next_round(&op.election);
                 if we_lead {
-                    tracing::info!(round, "self-promoting");
-                    op.election = ElectionState::Candidate {
-                        round,
-                        confirms: HashSet::from([secondary_id.clone()]),
-                        started: Instant::now(),
-                    };
-                    // No transitional self-as-primary routing target —
-                    // authority is committed only once this candidate
-                    // wins quorum (`record_promotion_confirm` reaches
-                    // `Promoted`). The failover re-point — broadcasting +
-                    // applying `PrimaryChanged { new = self }` so surviving
-                    // secondaries' `cluster_state.current_primary()` moves
-                    // onto this winner's mesh peer-id — is the composed
-                    // runtime's terminal action on that transition, not a
-                    // transitional Voting-time hint.
-                    actions.broadcast.push(DistributedMessage::PromotionVote {
-                        target: None,
-                        sender_id: secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        candidate_id: secondary_id.clone(),
-                        vote_round: round,
-                    });
+                    // The candidate counts ITSELF as one confirm. When the
+                    // live-peer fleet is empty (`peer_count == 0`, so
+                    // `quorum == failover_quorum(0) == 1`) that single self-
+                    // confirm ALREADY meets quorum: there is no peer whose
+                    // `PromotionConfirm` could ever arrive to drive
+                    // `record_promotion_confirm`, so awaiting one would wedge
+                    // the candidate at round 1 (timeout → retry round+1
+                    // forever) and the lone survivor would never converge.
+                    // Commit the promotion in-tick using the SAME terminal
+                    // transition (`Promoted` + caller-driven
+                    // `fire_local_promotion`) the peer-confirm path reaches,
+                    // keyed on the SAME single-source `failover_quorum` rule.
+                    // This is NOT the split-brain `quorum == 1` case the
+                    // `mesh_degraded` guard above blocks — that guard already
+                    // fatal-exited a TRULY lone (never-meshed) secondary before
+                    // any tally; reaching here means the mesh DID form (this
+                    // survivor was failover-capable) and its peers have since
+                    // departed, which is exactly the relocation-completeness
+                    // case a single survivor must win.
+                    let self_confirm: HashSet<String> = HashSet::from([secondary_id.clone()]);
+                    if self_confirm.len() >= quorum {
+                        tracing::info!(
+                            round,
+                            quorum,
+                            "self-promoting: single-survivor self-quorum already met — \
+                             committing promotion (no peer confirm to await)"
+                        );
+                        op.election = ElectionState::Promoted;
+                        actions.promoted = true;
+                    } else {
+                        tracing::info!(round, "self-promoting");
+                        op.election = ElectionState::Candidate {
+                            round,
+                            confirms: self_confirm,
+                            started: Instant::now(),
+                        };
+                        // No transitional self-as-primary routing target —
+                        // authority is committed only once this candidate
+                        // wins quorum (`record_promotion_confirm` reaches
+                        // `Promoted`). The failover re-point — broadcasting +
+                        // applying `PrimaryChanged { new = self }` so surviving
+                        // secondaries' `cluster_state.current_primary()` moves
+                        // onto this winner's mesh peer-id — is the composed
+                        // runtime's terminal action on that transition, not a
+                        // transitional Voting-time hint.
+                        actions.broadcast.push(DistributedMessage::PromotionVote {
+                            target: None,
+                            sender_id: secondary_id.clone(),
+                            timestamp: timestamp_now(),
+                            candidate_id: secondary_id.clone(),
+                            vote_round: round,
+                        });
+                    }
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
                     // No transitional routing target (see above).
