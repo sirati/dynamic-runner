@@ -806,3 +806,263 @@ async fn run_aborted_yields_terminal_aborted() {
         })
         .await;
 }
+
+/// A fake primary that completes the welcome / cert handshake but DELIBERATELY
+/// never sends the setup trio (PeerInfo / InitialAssignment / TransferComplete)
+/// — so the secondary stays wedged in `wait_for_setup`'s trio-wait — and then
+/// broadcasts a single terminal CRDT mutation (`RunComplete` or `RunAborted`).
+/// The uplink is held OPEN afterwards (draining the secondary's outbound) so
+/// the secondary exits on the terminal-flag check rather than a channel-closed
+/// recv — the production-faithful run-over cue is the CRDT flag, not the link
+/// drop. Models a late / never-fully-configured secondary when the run ends.
+async fn fake_primary_setup_terminal(
+    terminal: dynrunner_protocol_primary_secondary::ClusterMutation<TestId>,
+    mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    // Welcome + cert exchange — the only pre-trio handshake.
+    let (mut got_welcome, mut got_cert) = (false, false);
+    while !got_welcome || !got_cert {
+        if let Some(msg) = from_secondary.recv().await {
+            match msg.msg_type() {
+                MessageType::SecondaryWelcome => got_welcome = true,
+                MessageType::CertExchange => got_cert = true,
+                _ => {}
+            }
+        } else {
+            return;
+        }
+    }
+    // NO trio frames. Straight to the terminal CRDT broadcast — the run ended
+    // while this secondary was still mid-setup.
+    to_secondary
+        .send(DistributedMessage::ClusterMutation {
+            target: None,
+            sender_id: "setup".into(),
+            timestamp: 0.0,
+            mutations: vec![terminal],
+        })
+        .unwrap();
+    // Hold the uplink open, draining the secondary's outbound, until it drops
+    // its end (it has exited on the terminal flag).
+    while from_secondary.recv().await.is_some() {}
+}
+
+fn setup_terminal_config() -> SecondaryConfig {
+    SecondaryConfig {
+        secondary_id: "sec-0".into(),
+        num_workers: 1,
+        max_resources: dynrunner_core::ResourceMap::from([(
+            dynrunner_core::ResourceKind::memory(),
+            1024 * 1024 * 1024,
+        )]),
+        hostname: "test-host".into(),
+        keepalive_interval: Duration::from_secs(60),
+        src_network: None,
+        src_tmp: None,
+        peer_timeout: Duration::from_secs(120),
+        keepalive_miss_threshold: 3,
+        retry_max_passes: 1,
+        oom_retry_max_passes: 1,
+        primary_link_failure_threshold: 5,
+        primary_link_failure_window: Duration::from_secs(30),
+        primary_silence_backstop: Duration::from_secs(120),
+        // Deliberately LONG so a test that wrongly fell through to the deadline
+        // (the pre-fix straggler symptom) would hang well past the test
+        // harness's tolerance instead of passing — a real revert-check.
+        unconfigured_deadline: Duration::from_secs(600),
+        can_be_primary: false,
+        resource_check_interval: Duration::from_millis(100),
+        log_oom_watcher: false,
+        promoted_primary_quiesce_grace: Duration::from_millis(100),
+        unfulfillable_reinject_max_per_task: None,
+        mem_manager_reserved_bytes: None,
+        output_dir: None,
+        memuse_log_path: None,
+        forwarded_argv: Vec::new(),
+    }
+}
+
+/// A `RunComplete` flag landing while the secondary is STILL wedged in
+/// `wait_for_setup` (trio never satisfied) makes the setup wait exit PROMPTLY
+/// with `RunOutcome::Terminal` projecting to `SecondaryTerminal::Done` — NOT
+/// waiting for the trio, NOT waiting the 600s `unconfigured_deadline`. This is
+/// the setup-side backstop for the straggler symptom: a not-yet-Operational
+/// secondary that would otherwise linger ~9 min holding its SLURM slot.
+///
+/// REVERT-CHECK: without the loop-head terminal-exit in `wait_for_setup`, the
+/// loop never breaks on the flag (the trio is never satisfied), so the test
+/// would block until the 600s deadline elapsed — far past the harness's
+/// patience. A pass here therefore proves the eager exit, not a deadline-fall.
+#[tokio::test(flavor = "current_thread")]
+async fn run_complete_during_setup_yields_terminal_done() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = setup_terminal_config();
+            let primary_handle = tokio::task::spawn_local(fake_primary_setup_terminal(
+                dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut secondary = make_secondary_channel(config, unified);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
+
+            let mut factory = FakeWorkerFactory;
+            let outcome = secondary
+                .run_until_setup_or_done(&mut factory)
+                .await
+                .expect("run_until_setup_or_done returns Ok(RunOutcome::Terminal)");
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal, got {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Done) => {}
+                other => panic!("expected SecondaryTerminal::Done, got {other:?}"),
+            }
+            assert!(
+                secondary.cluster_state().run_complete(),
+                "run_complete() is latched after the RunComplete apply"
+            );
+
+            primary_handle.abort();
+        })
+        .await;
+}
+
+/// A `RunAborted` flag landing while the secondary is STILL wedged in
+/// `wait_for_setup` (trio never satisfied) makes the setup wait exit PROMPTLY
+/// with `RunOutcome::Terminal` projecting to `SecondaryTerminal::Aborted`
+/// (carrying the broadcast reason) — the hard-shutdown twin of the RunComplete
+/// case, checked BEFORE `run_complete()` exactly as the operational loop does.
+///
+/// REVERT-CHECK: same as the RunComplete case — without the terminal-exit the
+/// wait blocks to the 600s deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn run_aborted_during_setup_yields_terminal_aborted() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = setup_terminal_config();
+            let primary_handle = tokio::task::spawn_local(fake_primary_setup_terminal(
+                dynrunner_protocol_primary_secondary::ClusterMutation::RunAborted {
+                    reason: "duplicate task identity in the initial batch".into(),
+                },
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut secondary = make_secondary_channel(config, unified);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
+
+            let mut factory = FakeWorkerFactory;
+            let outcome = secondary
+                .run_until_setup_or_done(&mut factory)
+                .await
+                .expect("run_until_setup_or_done returns Ok(RunOutcome::Terminal)");
+            assert!(
+                matches!(outcome, RunOutcome::Terminal),
+                "expected RunOutcome::Terminal, got {outcome:?}"
+            );
+            match secondary.terminal() {
+                Some(SecondaryTerminal::Aborted { reason }) => {
+                    assert!(
+                        reason.contains("duplicate task identity"),
+                        "Aborted carries the broadcast reason: {reason}"
+                    );
+                }
+                other => panic!("expected SecondaryTerminal::Aborted, got {other:?}"),
+            }
+            assert!(
+                secondary.cluster_state().run_aborted().is_some(),
+                "run_aborted() is latched after the RunAborted apply"
+            );
+
+            primary_handle.abort();
+        })
+        .await;
+}
+
+/// NORMAL-PATH PRESERVED: with NEITHER the setup trio NOR a terminal flag, the
+/// secondary keeps WAITING in `wait_for_setup` — no premature exit. A fake
+/// primary that only does welcome / cert and then goes silent (no trio, no
+/// terminal) leaves `run_until_setup_or_done` pending; we assert it has NOT
+/// resolved within a short window. (The complementary assertion — that the
+/// trio-completion DOES hand off to the operational loop — is already covered
+/// by `secondary_with_real_workers_processes_tasks`, which drives the full
+/// trio + per-task dispatch to a clean `Done`.)
+#[tokio::test(flavor = "current_thread")]
+async fn setup_without_trio_or_terminal_keeps_waiting() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = setup_terminal_config();
+
+            // Fake primary: complete welcome / cert, then go silent — no trio,
+            // no terminal flag. Holds the uplink open by parking forever.
+            let mut from_secondary: tokio_mpsc::UnboundedReceiver<
+                DistributedMessage<TestId>,
+            > = sec_to_pri_rx;
+            let to_secondary = pri_to_sec_tx;
+            let primary_handle = tokio::task::spawn_local(async move {
+                let (mut got_welcome, mut got_cert) = (false, false);
+                while !got_welcome || !got_cert {
+                    match from_secondary.recv().await {
+                        Some(msg) => match msg.msg_type() {
+                            MessageType::SecondaryWelcome => got_welcome = true,
+                            MessageType::CertExchange => got_cert = true,
+                            _ => {}
+                        },
+                        None => return,
+                    }
+                }
+                // Keep the link alive but send nothing further.
+                while from_secondary.recv().await.is_some() {}
+                // Keep `to_secondary` owned so the link never closes.
+                drop(to_secondary);
+            });
+
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut secondary = make_secondary_channel(config, unified);
+            secondary.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(secondary);
+
+            let mut factory = FakeWorkerFactory;
+            // The run must NOT resolve: neither the trio nor a terminal flag is
+            // ever delivered. A short timeout that ELAPSES (the run future
+            // still pending) is the assertion. If the terminal-exit fired
+            // spuriously — or the trio gate were weakened — the run would
+            // resolve and `timeout` would return `Ok`, failing the test.
+            let pending = tokio::time::timeout(
+                Duration::from_millis(300),
+                secondary.run_until_setup_or_done(&mut factory),
+            )
+            .await;
+            assert!(
+                pending.is_err(),
+                "wait_for_setup must keep waiting with neither trio nor terminal \
+                 flag; instead it resolved: {pending:?}"
+            );
+
+            primary_handle.abort();
+        })
+        .await;
+}
