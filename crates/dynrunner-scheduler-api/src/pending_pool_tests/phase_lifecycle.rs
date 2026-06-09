@@ -72,6 +72,48 @@ fn mark_phase_done_activates_dependents() {
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Active));
 }
 
+/// `seed_completed_phases` (the failover-promotion hydration seeder) marks a
+/// SET of phases `Done` at construction time WITHOUT a `Drained` edge, and
+/// activates a live dependent whose deps are ALL in that set — regardless of
+/// iteration order. Pins the two properties that distinguish it from a
+/// per-phase `mark_phase_done` loop:
+///   (1) NO `poll_drain_transitions` edge ever fires for the seeded phases
+///       (a phase that starts `Done` is never `Drained`, so the manager's
+///       cascade never re-fires `on_phase_end` for it); and
+///   (2) the convergent activation pass flips a multi-dep dependent even
+///       when the set is iterated worst-case (the dep marked last).
+#[test]
+fn seed_completed_phases_marks_done_without_drain_edge_and_activates_dependent() {
+    // A,B,C complete; D (live) depends on BOTH B and C — the multi-dep case
+    // a single ordering-naive `mark_phase_done` per phase could leave Blocked.
+    let mut p = pool_with(&["A", "B", "C", "D"], &[("D", &["B", "C"])]);
+    assert_eq!(p.phase_state(&phase("D")), Some(PhaseState::Blocked));
+
+    // Seed completed phases in an order where D's deps are split (C last).
+    p.seed_completed_phases([phase("A"), phase("B"), phase("C")]);
+
+    for ph in ["A", "B", "C"] {
+        assert_eq!(
+            p.phase_state(&phase(ph)),
+            Some(PhaseState::Done),
+            "seeded phase {ph} must be Done"
+        );
+    }
+    // D's deps (B, C) are both Done → convergent activation flips it Active.
+    assert_eq!(
+        p.phase_state(&phase("D")),
+        Some(PhaseState::Active),
+        "a live dependent whose ALL deps were seeded Done must activate"
+    );
+    // NO drain edge was ever recorded for the seeded phases — the manager's
+    // cascade would never observe them via poll_drain_transitions, so
+    // on_phase_end does NOT re-fire.
+    assert!(
+        p.poll_drain_transitions().is_empty(),
+        "seeding Done must NOT push a Drained transition (no on_phase_end re-fire)"
+    );
+}
+
 /// Empty `Active` phase transitions to `Drained` after
 /// `drain_empty_active_phases`, and `poll_drain_transitions` reports
 /// it. Without this, an empty phase-0 in a multi-phase chain would

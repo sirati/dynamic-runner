@@ -61,11 +61,30 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnError {
     /// The task's wire-canonical content hash collides with an entry
-    /// already present in the receiver's ledger. The originator-side
-    /// pre-validation catches this; the apply rule itself is also
-    /// idempotent (a duplicate is silently NoOp'd) so the wire layer
-    /// never regresses prior state.
+    /// ALREADY PRESENT in the receiver's ledger (from a PRIOR spawn /
+    /// the initial seed). The originator-side pre-validation catches
+    /// this; the apply rule itself is also idempotent (a duplicate is
+    /// silently NoOp'd) so the wire layer never regresses prior state.
+    ///
+    /// This is an IDEMPOTENT re-spawn, NOT a fresh-batch consumer bug:
+    /// the canonical case is a FAILOVER replay where a promoted primary's
+    /// consumer `on_phase_end` hook re-fires and re-spawns the same
+    /// deterministic identities it spawned before the failover. The
+    /// receiver dedups it (drops the already-present entry from the batch)
+    /// and surfaces this as a per-task error WITHOUT a run-wide
+    /// invalidation — the prior entry is the authoritative copy. Contrast
+    /// [`SpawnError::DuplicateInBatch`].
     DuplicateTaskHash(String),
+    /// Two tasks in the SAME `SpawnTasks` batch share a wire-canonical
+    /// content hash (i.e. the same `(phase_id, task_id)` identity appears
+    /// twice in one fresh spawn-set). This is a GENUINE consumer bug — the
+    /// producer minted an ambiguous task set in a single call — and is NOT
+    /// idempotent: there is no authoritative prior copy to dedup against.
+    /// The distributed primary escalates this to a run-wide invalidation
+    /// (the task set is ambiguous); the local backend surfaces it per-task.
+    /// The `String` is the colliding content hash. Contrast
+    /// [`SpawnError::DuplicateTaskHash`] (already-in-ledger → idempotent).
+    DuplicateInBatch(String),
     /// The task's `task_depends_on` references a task_id that does
     /// not resolve to any entry in the receiver's ledger.
     /// `task_hash` is the wire-canonical hash of the task that
@@ -147,6 +166,15 @@ where
         .iter()
         .map(|t| (t.phase_id.clone(), t.task_id.clone()))
         .collect();
+    // Within-batch duplicate detection: the FIRST occurrence of a hash
+    // not already in the ledger is valid; a SECOND occurrence of that
+    // same hash earlier in THIS batch is a `DuplicateInBatch` (a genuine
+    // consumer bug — an ambiguous fresh spawn-set with no authoritative
+    // prior copy). Tracked separately from the ledger check so the two
+    // duplicate classes stay distinct: `DuplicateTaskHash`
+    // (already-in-ledger → idempotent re-spawn / failover replay) vs
+    // `DuplicateInBatch` (within this call → fatal).
+    let mut seen_in_batch: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Per-task validation pass. A task can fail multiple checks
     // (duplicate hash AND unknown dep); we surface the FIRST failure
     // per index so the caller sees one error per rejected task.
@@ -156,8 +184,21 @@ where
     // existing entry would be redundant.
     for (idx, task) in tasks.into_iter().enumerate() {
         let hash = compute_task_hash(&task);
+        // Ledger collision FIRST: an identity already present from a prior
+        // spawn / the initial seed is an idempotent re-spawn (the prior
+        // entry is authoritative). Dropped from `valid`; surfaced per-task;
+        // never escalates. This is the failover-replay case.
         if is_task_present_by_hash(&hash) {
             errors.push((idx, SpawnError::DuplicateTaskHash(hash)));
+            continue;
+        }
+        // Within-this-batch collision: the same hash already appeared
+        // earlier in THIS fresh spawn-set (and was NOT in the ledger, or it
+        // would have been caught above). No authoritative prior copy — a
+        // genuine ambiguous producer batch. The FIRST occurrence proceeded
+        // to `valid`; this second one is the fatal `DuplicateInBatch`.
+        if !seen_in_batch.insert(hash.clone()) {
+            errors.push((idx, SpawnError::DuplicateInBatch(hash)));
             continue;
         }
         let mut bad_dep: Option<String> = None;

@@ -1072,16 +1072,21 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
         .await;
 }
 
-/// Vec with 3 tasks, 1 with a hash that already exists in the
-/// ledger: the duplicate surfaces as a per-index error
-/// `SpawnError::DuplicateTaskHash`; the other 2 land normally.
+/// Vec with 3 tasks, 1 with a hash that ALREADY EXISTS in the ledger
+/// (an idempotent re-spawn — the failover-replay class): the duplicate
+/// surfaces as a per-index `SpawnError::DuplicateTaskHash` and is
+/// DROPPED (no-op dedup); the run is NOT invalidated and the other 2
+/// fresh tasks DO land. Revert-check companion:
+/// `spawn_tasks_within_batch_duplicate_invalidates_run_wide` covers the
+/// genuine-bug case that DOES still invalidate.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
+async fn spawn_tasks_already_in_ledger_dedups_no_run_wide_invalidation() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
             let (mut coordinator, _mesh) = make_coordinator();
-            // Pre-seed `dup` so the second input clashes.
+            // Pre-seed `dup` so the second input is an already-in-ledger
+            // re-spawn (the failover replay class).
             let mut dup = make_binary("dup", 100);
             dup.task_id = "dup_id".into();
             let dup_hash = compute_task_hash(&dup);
@@ -1107,49 +1112,50 @@ async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
                 super::SpawnError::DuplicateTaskHash(h) => assert_eq!(h, &dup_hash),
                 other => panic!("expected DuplicateTaskHash, got {other:?}"),
             }
-            // #3b: a duplicate `(phase_id, task_id)` in a RUNTIME spawn
-            // invalidates the run-wide not-yet-terminal set (the cluster
-            // CONTINUES — no RunAborted) and does NOT apply the batch. The
-            // pre-seeded `dup` (Pending) is now InvalidTask; the fresh
-            // a / c were never applied (the run's task set is ambiguous, so
-            // adding survivors only to immediately invalidate them is
-            // pointless).
+            // An already-in-ledger duplicate is an IDEMPOTENT re-spawn, NOT a
+            // run-killer: the cluster continues, the pre-existing `dup` stays
+            // exactly as it was (Pending — the prior entry is authoritative),
+            // and the fresh a / c DO dispatch (the batch is no longer
+            // dropped). This is the failover-replay dedup.
             assert!(
                 coordinator.cluster_state.run_aborted().is_none(),
-                "3b does not abort the run — the cluster continues"
+                "an idempotent re-spawn does not abort the run"
             );
             assert!(
                 matches!(
                     coordinator.cluster_state.task_state(&dup_hash),
-                    Some(TaskState::InvalidTask { .. })
+                    Some(TaskState::Pending { .. })
                 ),
-                "the pre-existing Pending task is invalidated run-wide"
+                "the pre-existing entry is the authoritative copy and is untouched"
             );
             assert!(
-                coordinator
-                    .cluster_state
-                    .task_state(&compute_task_hash(&a))
-                    .is_none(),
-                "fresh task a was NOT applied (batch dropped on 3b)"
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&a)),
+                    Some(TaskState::Pending { .. })
+                ),
+                "fresh task a IS applied (the batch survivors still dispatch)"
             );
             assert!(
-                coordinator
-                    .cluster_state
-                    .task_state(&compute_task_hash(&c))
-                    .is_none(),
-                "fresh task c was NOT applied (batch dropped on 3b)"
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&c)),
+                    Some(TaskState::Pending { .. })
+                ),
+                "fresh task c IS applied (the batch survivors still dispatch)"
             );
         })
         .await;
 }
 
-/// #3b: a runtime duplicate invalidates EVERY not-yet-terminal task
-/// run-wide. Seed three tasks — one already `Completed` (terminal,
-/// must survive), two `Pending` (must flip to InvalidTask) — then
-/// spawn a batch re-using one of the Pending ids. The run continues
-/// (`run_aborted()` stays `None`).
+/// (b) HEADLINE: a runtime spawn of identities that ALL already exist in
+/// the CRDT (the failover-replay re-fire — a promoted primary's
+/// `on_phase_end` hook re-spawning every child it spawned pre-failover)
+/// is a NO-OP DEDUP: no new duplicate tasks, NO run-wide invalidation, NO
+/// `RunError::SpawnRejected`. Seed three tasks (one `Completed`, two
+/// `Pending`) then re-spawn ALL THREE identities. Pre-fix this nets
+/// `valid_tasks.is_empty()` and either invalidates run-wide or records a
+/// loud `spawn_rejected` over not-actually-lost work.
 #[tokio::test(flavor = "current_thread")]
-async fn spawn_tasks_runtime_duplicate_invalidates_all_pending_run_wide() {
+async fn spawn_tasks_all_already_in_ledger_is_noop_dedup() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -1178,49 +1184,125 @@ async fn spawn_tasks_runtime_duplicate_invalidates_all_pending_run_wide() {
                 task: p1.clone(),
             });
 
-            let mut dup = make_binary("dup", 100);
-            dup.task_id = "dup_id".into();
-            let dup_hash = compute_task_hash(&dup);
+            let mut p2 = make_binary("p2", 100);
+            p2.task_id = "p2_id".into();
+            let p2_hash = compute_task_hash(&p2);
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
-                hash: dup_hash.clone(),
-                task: dup.clone(),
+                hash: p2_hash.clone(),
+                task: p2.clone(),
             });
 
-            seed_pool(&mut coordinator, &[&dup.phase_id]);
+            seed_pool(&mut coordinator, &[&p1.phase_id]);
 
-            // Spawn a batch re-using `dup`'s identity → runtime duplicate.
-            let errors = spawn_via_handler(&mut coordinator, vec![dup.clone()])
-                .await
-                .expect("spawn_tasks succeeds (per-task failures are not vec-level)");
-            assert_eq!(errors.len(), 1, "the duplicate surfaces a per-index error");
-
-            // Cluster continues — no RunAborted on the 3b path.
+            // Re-spawn ALL three already-present identities (failover replay).
+            let errors =
+                spawn_via_handler(&mut coordinator, vec![done.clone(), p1.clone(), p2.clone()])
+                    .await
+                    .expect("spawn_tasks succeeds (per-task failures are not vec-level)");
+            assert_eq!(errors.len(), 3, "all three surface per-index DuplicateTaskHash");
+            for (_, err) in &errors {
+                assert!(
+                    matches!(err, super::SpawnError::DuplicateTaskHash(_)),
+                    "every re-spawn is an idempotent already-in-ledger dup, got {err:?}"
+                );
+            }
+            // No run-wide invalidation: every entry keeps its prior state.
             assert!(
                 coordinator.cluster_state.run_aborted().is_none(),
-                "3b does not abort the run"
+                "the failover-replay re-spawn does not abort the run"
             );
-            // Every not-yet-terminal entry is now InvalidTask…
-            assert!(
-                matches!(
-                    coordinator.cluster_state.task_state(&p1_hash),
-                    Some(TaskState::InvalidTask { .. })
-                ),
-                "pending p1 invalidated run-wide"
-            );
-            assert!(
-                matches!(
-                    coordinator.cluster_state.task_state(&dup_hash),
-                    Some(TaskState::InvalidTask { .. })
-                ),
-                "pending dup invalidated run-wide"
-            );
-            // …but the already-Completed task is untouched (terminal wins).
             assert!(
                 matches!(
                     coordinator.cluster_state.task_state(&done_hash),
                     Some(TaskState::Completed { .. })
                 ),
-                "completed task is terminal and must survive run-wide invalidation"
+                "completed stays completed"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&p1_hash),
+                    Some(TaskState::Pending { .. })
+                ),
+                "p1 NOT invalidated run-wide (idempotent dedup)"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&p2_hash),
+                    Some(TaskState::Pending { .. })
+                ),
+                "p2 NOT invalidated run-wide (idempotent dedup)"
+            );
+            // The loud-fail backstop must NOT have recorded these as lost
+            // work: an all-already-in-ledger batch drops no work (the prior
+            // copies are authoritative + counted in total_tasks).
+            assert!(
+                coordinator.spawn_rejected_task_ids.is_empty(),
+                "an all-idempotent-re-spawn nets ZERO spawn_rejected (no work lost)"
+            );
+        })
+        .await;
+}
+
+/// (b) WITHIN-BATCH still caught: two tasks in ONE fresh spawn batch
+/// share an identity (a genuine ambiguous producer batch — no
+/// authoritative prior copy). This DOES escalate to a run-wide
+/// invalidation (every not-yet-terminal task → InvalidTask), the cluster
+/// continues, and the within-batch dup surfaces as
+/// `SpawnError::DuplicateInBatch`. Guards against fix (b) weakening the
+/// genuine-bug detection.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_within_batch_duplicate_invalidates_run_wide() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+
+            // A pre-existing Pending task that must flip to InvalidTask when
+            // the within-batch dup escalates run-wide.
+            let mut p1 = make_binary("p1", 100);
+            p1.task_id = "p1_id".into();
+            let p1_hash = compute_task_hash(&p1);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: p1_hash.clone(),
+                task: p1.clone(),
+            });
+            seed_pool(&mut coordinator, &[&p1.phase_id]);
+
+            // A brand-new identity that is NOT in the ledger, sent TWICE in
+            // the same batch — the within-batch duplicate.
+            let mut fresh = make_binary("fresh", 100);
+            fresh.task_id = "fresh_id".into();
+            let fresh_hash = compute_task_hash(&fresh);
+
+            let errors =
+                spawn_via_handler(&mut coordinator, vec![fresh.clone(), fresh.clone()])
+                    .await
+                    .expect("spawn_tasks succeeds (per-task failures are not vec-level)");
+            // The SECOND occurrence is the within-batch dup; the first was
+            // valid-then-dropped because the batch escalates run-wide.
+            assert_eq!(errors.len(), 1, "the within-batch dup surfaces once: {errors:?}");
+            let (idx, err) = &errors[0];
+            assert_eq!(*idx, 1, "the duplicate is the 2nd batch item");
+            match err {
+                super::SpawnError::DuplicateInBatch(h) => assert_eq!(h, &fresh_hash),
+                other => panic!("expected DuplicateInBatch, got {other:?}"),
+            }
+            // Run-wide invalidation (cluster continues, no RunAborted).
+            assert!(
+                coordinator.cluster_state.run_aborted().is_none(),
+                "3b does not abort the run"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&p1_hash),
+                    Some(TaskState::InvalidTask { .. })
+                ),
+                "the pre-existing Pending task is invalidated run-wide"
+            );
+            // The fresh duplicated identity is NOT applied (batch dropped).
+            assert!(
+                coordinator.cluster_state.task_state(&fresh_hash).is_none(),
+                "the within-batch-dup batch is dropped, not applied"
             );
         })
         .await;

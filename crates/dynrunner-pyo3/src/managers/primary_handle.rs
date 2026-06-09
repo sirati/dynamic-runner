@@ -462,6 +462,10 @@ impl PyPrimaryHandle {
                     dict.set_item("kind", "duplicate_task_hash")?;
                     dict.set_item("task_hash", hash)?;
                 }
+                SpawnError::DuplicateInBatch(hash) => {
+                    dict.set_item("kind", "duplicate_in_batch")?;
+                    dict.set_item("task_hash", hash)?;
+                }
                 SpawnError::UnknownDependency {
                     task_hash,
                     dep_task_id,

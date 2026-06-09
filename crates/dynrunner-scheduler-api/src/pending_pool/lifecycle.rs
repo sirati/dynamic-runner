@@ -331,12 +331,75 @@ impl<I: Identifier> PendingPool<I> {
         // becomes Active. We do not recurse — a phase can only be
         // Done by an explicit `mark_phase_done` call, which the
         // manager will issue per phase.
+        self.activate_phases_with_all_deps_done();
+    }
+
+    /// Seed a set of phases as already-`Done` at HYDRATION time, with NO
+    /// `on_phase_end` re-fire. Sibling of [`Self::mark_phase_done`] for the
+    /// failover-promotion resume path: a phase whose tasks are all terminal
+    /// in the inherited CRDT was already drained AND had its `on_phase_end`
+    /// fired by the run's original primary. The promoted primary's freshly
+    /// built pool ([`Self::new`]) initialises every phase `Active`/`Blocked`
+    /// from the dep graph alone — it cannot tell "completed-and-ended" from
+    /// "never started" — so without this seed those completed phases
+    /// re-`(0,0,0)`-drain through `maybe_transition_drain → poll_drain_transitions`
+    /// and the manager RE-fires `on_phase_end` (re-spawning a consumer hook's
+    /// children with the same deterministic identities → run-wide
+    /// invalidation). Seeding them straight to `Done` keeps them out of
+    /// `poll_drain_transitions` entirely (the `Drained → Done` edge the manager
+    /// observes never occurs for a phase that starts `Done`).
+    ///
+    /// Distinct from `mark_phase_done` in PURPOSE and shape, not just timing:
+    /// `mark_phase_done` is the RUNTIME acknowledgment "the manager just fired
+    /// `on_phase_end` for this one drained phase"; this is the CONSTRUCTION
+    /// seed "these phases already ended on a prior primary — do NOT fire it
+    /// again." It takes the whole completed set at once and runs ONE
+    /// convergent activation pass after marking them all `Done`, so a
+    /// multi-level chain (A→B→C all complete, plus a live D depending on C)
+    /// resolves regardless of iteration order — calling `mark_phase_done` per
+    /// phase would leave a dependent un-activated if its other (also-done) dep
+    /// hadn't been marked yet.
+    ///
+    /// Idempotent: a phase already `Done` stays `Done`; a phase not in the
+    /// pool's `phase_state` is ignored.
+    pub fn seed_completed_phases(&mut self, phases: impl IntoIterator<Item = PhaseId>) {
+        for phase_id in phases {
+            // Only seed phases the pool actually tracks; an inherited CRDT
+            // phase absent from the dep-graph-derived phase set is not a pool
+            // concern (defensive — the hydrate caller derives both from the
+            // same CRDT, so this is a no-op in practice).
+            if self.phase_state.contains_key(&phase_id) {
+                self.phase_state.insert(phase_id, PhaseState::Done);
+            }
+        }
+        // Single convergent activation pass: re-run until no further phase
+        // flips, so a `Blocked` phase whose deps span SEVERAL just-seeded
+        // `Done` phases activates even if the seed set was iterated in an
+        // order that marked one of its deps last.
+        loop {
+            let flipped = self.activate_phases_with_all_deps_done();
+            if !flipped {
+                break;
+            }
+        }
+    }
+
+    /// Flip every `Blocked` phase whose `depends_on` set is now fully `Done`
+    /// to `Active`. Returns `true` iff at least one phase flipped, so a
+    /// convergence loop can re-run until the fixpoint. Shared by
+    /// [`Self::mark_phase_done`] (one pass — a single phase just went `Done`)
+    /// and [`Self::seed_completed_phases`] (looped — a whole set went `Done`
+    /// at once). A phase with no recorded `depends_on` (`unwrap_or(true)`)
+    /// activates immediately, matching the original `mark_phase_done`
+    /// semantics.
+    fn activate_phases_with_all_deps_done(&mut self) -> bool {
         let candidates: Vec<PhaseId> = self
             .phase_state
             .iter()
             .filter(|(_, s)| **s == PhaseState::Blocked)
             .map(|(p, _)| p.clone())
             .collect();
+        let mut flipped = false;
         for p in candidates {
             let all_done = self
                 .phase_deps
@@ -348,8 +411,10 @@ impl<I: Identifier> PendingPool<I> {
                 .unwrap_or(true);
             if all_done {
                 self.phase_state.insert(p, PhaseState::Active);
+                flipped = true;
             }
         }
+        flipped
     }
 
     /// Mark every currently-`Active` or `Draining` phase that has no

@@ -232,3 +232,45 @@ fn first_failure_short_circuits_per_task_checks() {
     let (_, err) = &errors[0];
     assert!(matches!(err, SpawnError::DuplicateTaskHash(_)));
 }
+
+#[test]
+fn within_batch_duplicate_is_distinct_from_already_in_ledger() {
+    // Two copies of the SAME fresh identity in ONE batch (neither in the
+    // ledger): the FIRST is valid, the SECOND is the fatal
+    // `DuplicateInBatch` (a genuine ambiguous producer batch). This is the
+    // class fix (b) keeps invalidating run-wide.
+    let (present, known) = empty_receiver();
+    let dup = task("dup", vec![]);
+    let dup_hash = compute_task_hash(&dup);
+    let (valid, errors) = validate_spawn_tasks(present, known, vec![dup.clone(), dup.clone()]);
+    assert_eq!(valid.len(), 1, "the first occurrence validates");
+    assert_eq!(valid[0].task_id, "dup");
+    assert_eq!(errors.len(), 1);
+    let (idx, err) = &errors[0];
+    assert_eq!(*idx, 1, "the SECOND occurrence is the within-batch dup");
+    match err {
+        SpawnError::DuplicateInBatch(h) => assert_eq!(h, &dup_hash),
+        other => panic!("expected DuplicateInBatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn already_in_ledger_is_duplicate_task_hash_not_in_batch() {
+    // A SINGLE occurrence whose hash is already in the ledger (a failover
+    // re-spawn): the idempotent `DuplicateTaskHash`, NOT `DuplicateInBatch`.
+    // Pins that the two classes do not collapse — the within-batch tracker
+    // only fires on a SECOND in-batch occurrence, never on a first-and-only
+    // item that merely collides with the ledger.
+    let a = task("a", vec![]);
+    let a_hash = compute_task_hash(&a);
+    let present_hash = a_hash.clone();
+    let is_present = move |h: &str| h == present_hash;
+    let is_known = |_p: &PhaseId, _id: &str| false;
+    let (valid, errors) = validate_spawn_tasks(is_present, is_known, vec![a]);
+    assert!(valid.is_empty());
+    assert_eq!(errors.len(), 1);
+    match &errors[0].1 {
+        SpawnError::DuplicateTaskHash(h) => assert_eq!(h, &a_hash),
+        other => panic!("expected DuplicateTaskHash, got {other:?}"),
+    }
+}
