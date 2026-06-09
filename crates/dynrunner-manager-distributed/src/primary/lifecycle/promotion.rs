@@ -130,7 +130,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // inline, refreshing `total_tasks` BEFORE
                         // `operational_loop`'s entry-time exit check
                         // sees the post-spawn ledger.
-                        Some(m) => self.dispatch_message(m, command_rx).await?,
+                        Some(m) => {
+                            self.dispatch_message(m, command_rx).await?;
+                            // Self-recovery against the assigned=0 deadlock:
+                            // a `SecondaryCapacity` that lands DURING this
+                            // wait (a worker that became ready after
+                            // `perform_initial_assignment`'s snapshot, so it
+                            // got no `InitialAssignment` and cannot emit
+                            // `MeshReady` on its own) emits `TasksAdded` via
+                            // `react_to_capacity_growth`. Service that bus
+                            // signal inline NOW — the operational loop hasn't
+                            // started — so the ready work is dispatched to
+                            // the freshly-rostered idle worker, the secondary
+                            // receives a `TaskAssignment`, goes operational,
+                            // and emits the `MeshReady` this very wait is
+                            // blocked on. The wait unblocks via real
+                            // dispatch, never by burning the full
+                            // `mesh_ready_timeout`. (rc-C's decoupling and
+                            // the post-assignment placement of this wait stay
+                            // intact — the recovery dispatches, it does not
+                            // move the wait.)
+                            self.drain_and_react_to_pending_worker_signals().await;
+                        }
                         None => return Err("transport closed during wait_for_mesh_ready".into()),
                     }
                 }

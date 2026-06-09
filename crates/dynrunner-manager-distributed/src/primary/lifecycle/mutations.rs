@@ -75,8 +75,27 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             self.cluster_state
                 .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
+        // Worker-roster growth edge — the symmetric twin of the
+        // pool-entry edge above. A `SecondaryCapacity` this batch ACTUALLY
+        // applied (in `applied`, so the set-once CRDT record was vacant —
+        // a genuinely new secondary, not a redundant re-emit) means a
+        // worker became ready: a new idle slot now exists in the
+        // replicated ledger but not yet in `self.workers`. Rebuild the
+        // roster from the now-grown capacity set and emit `TasksAdded` so
+        // the dispatch recheck re-evaluates the new idle slot against the
+        // ready pool. Owns the same originator-side derived-cache coherence
+        // this method already does for resumed pool entries. The
+        // `applied`-gated detection makes it one-shot: the set-once
+        // capacity apply NoOps on every re-emit, so a re-delivered
+        // `SecondaryCapacity` never re-triggers a rebuild.
+        let capacity_grew = applied
+            .iter()
+            .any(|m| matches!(m, ClusterMutation::SecondaryCapacity { .. }));
         if applied.is_empty() {
             return;
+        }
+        if capacity_grew {
+            self.react_to_capacity_growth();
         }
         let msg = DistributedMessage::ClusterMutation {
             target: None,

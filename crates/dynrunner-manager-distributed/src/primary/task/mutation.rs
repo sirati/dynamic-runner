@@ -337,9 +337,26 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // the prereq's `on_item_finished` event.
             let mut resumed: Vec<TaskInfo<I>> = Vec::new();
             let mut newly_pending: Vec<TaskInfo<I>> = Vec::new();
+            // Worker-roster growth surface (wire-receive twin of the
+            // originator-side detection in
+            // `apply_and_broadcast_cluster_mutations`): track whether THIS
+            // batch genuinely applied a `SecondaryCapacity` — i.e. a
+            // worker became ready and a new idle slot now exists in the
+            // ledger. Read the per-mutation `ApplyOutcome` inline (the
+            // set-once capacity apply returns `Applied` only on the first
+            // record for an id, `NoOp` on every redundant re-emit /
+            // snapshot replay), so the rebuild fires exactly once per new
+            // secondary. Acted on post-loop, after the roster source
+            // (`cluster_state.secondary_capacities`) has grown.
+            let mut capacity_grew = false;
             for m in mutations {
-                self.cluster_state
-                    .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
+                let is_capacity = matches!(m, ClusterMutation::SecondaryCapacity { .. });
+                let outcome =
+                    self.cluster_state
+                        .apply_with_resumed_blocked(m, &mut resumed, &mut newly_pending);
+                if is_capacity && outcome == crate::cluster_state::ApplyOutcome::Applied {
+                    capacity_grew = true;
+                }
             }
             // Pool-coherence after a ledger-growing apply. Two
             // mutually-exclusive surfaces, both gated on this node still
@@ -456,6 +473,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // for a hash already in the ledger leaves `task_count`
                 // unchanged.
                 self.total_tasks = self.cluster_state.task_count();
+            }
+            if capacity_grew {
+                // A worker became ready: a `SecondaryCapacity` this batch
+                // genuinely applied grew the replicated roster. Rebuild the
+                // local worker cache from the now-grown capacity set and
+                // emit `TasksAdded` so the dispatch recheck re-evaluates the
+                // new idle slot against the ready pool — the worker-ready
+                // half of state-based dispatch (the wire-receive twin of the
+                // originator-side reaction). Owned by worker management; the
+                // apply path here only DETECTS the growth.
+                self.react_to_capacity_growth();
             }
         }
     }

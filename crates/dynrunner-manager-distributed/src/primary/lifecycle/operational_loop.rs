@@ -231,6 +231,25 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // secondary's panik arm.
         let mut panik_signal_rx = self.panik_signal_rx.take();
 
+        // Entry sweep — dispatch is a pure function of state, asserted
+        // ONCE the moment the loop is entered. The pre-loop chain may have
+        // left a ready-task ∩ idle-worker match unfilled: a secondary
+        // whose `SecondaryCapacity` landed AFTER `perform_initial_assignment`
+        // is now in the reconstructed roster as an idle slot (the pre-loop
+        // waits' inline reaction rebuilt it), but if its `TasksAdded` was
+        // already consumed by a wait's drain — or the worker freed with no
+        // pending signal — nothing has re-dispatched against the live
+        // (pool ∩ idle-worker) state since. Run the same idempotent recheck
+        // the worker-management arm runs, so steady state is reached with
+        // every dispatchable task already placed on a free worker rather
+        // than waiting for the next bus event to first act on a backlog.
+        // `bypass_backpressure = true`: this is a circumstances-changed
+        // recheck (the run just transitioned into the operational loop),
+        // the same class as a genuine `TasksAdded`. Send failures are
+        // logged + rolled back inside the recheck; `.ok()` swallows the
+        // transient so the sweep can't abort loop entry.
+        self.dispatch_to_idle_workers(true).await.ok();
+
         loop {
             // Run-completion exit decision. The counter exit, the
             // pool-drain exit, and the replicated-ledger RunComplete

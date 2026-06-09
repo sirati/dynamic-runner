@@ -18,6 +18,7 @@
 //!   is_idle-advisory + coalesce.
 
 mod basic;
+mod capacity_dispatch;
 mod coordinator_setup;
 mod crdt_convergence;
 mod dispatch_decoupling;
