@@ -34,7 +34,10 @@ observer reading the CRDT.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
+import sys
+import traceback
 from pathlib import Path
 
 from ._shared.logging_utils import remove_stream_handlers
@@ -43,6 +46,19 @@ from ._shared.logging_utils import remove_stream_handlers
 #: classification in `_framework_flags.SUBMITTER_LOCAL_FLAGS` and any other
 #: reference share one literal.
 IMPORTANT_STDIO_ONLY_FLAG = "--important-stdio-only"
+
+#: Default destination for the full (unfiltered) log under importance mode
+#: when the operator passed neither ``--full-log-file`` nor a per-node
+#: ``--full-log-dir`` (and the submitter's per-setup ``<log-dir>/setup`` split
+#: did not resolve). Relative on purpose: it lands wherever the run was
+#: launched, matching the historical shell-redirection capture point and the
+#: ``--full-log-file`` help text. Fed to the NATIVE full sink (the Rust
+#: ``init_logging`` ``full_log_file`` knob) — NOT a Python-side FileHandler —
+#: so BOTH framework (Rust-emitted) events and bridged Python records land in
+#: it. Without this default the importance-mode full sink fell back to
+#: ``FullSink::Stdout`` (gated to the important target), so a fatal dispatch
+#: error logged via the Python bridge reached no durable sink at all.
+DEFAULT_FULL_LOG_FILE = "dynrunner-full.log"
 
 #: Per-node subdirectory the SUBMITTER's full role-split logs land under,
 #: anchored on ``--log-dir`` — the gateway-shared mount compute nodes use
@@ -86,6 +102,93 @@ def resolve_full_log_dir(
     if not (log_dir and str(log_dir).strip()):
         return None
     return str(Path(log_dir) / SETUP_FULL_LOG_SUBDIR)
+
+
+def resolve_full_log_file(
+    important_stdio_only: bool,
+    full_log_file: str | None,
+    full_log_dir: str | None,
+) -> str | None:
+    """The NATIVE full-sink single-file path, or ``None``.
+
+    Single concern: pick the path the Rust full sink's :class:`FullSink::File`
+    writes to. An explicit ``--full-log-file`` always wins. Otherwise, when
+    importance mode is on AND no per-node ``--full-log-dir`` sink was resolved
+    (the dir sink takes precedence in Rust and is the durable per-role record),
+    default to :data:`DEFAULT_FULL_LOG_FILE` so the full (unfiltered) record —
+    framework events AND bridged Python records, including a FATAL dispatch
+    error — is still captured to a file rather than the importance-gated
+    stdout. With importance mode off, stdout already carries everything, so
+    there is no implicit file (``None`` → ``FullSink::Stdout``, today's
+    single-stream behaviour). The ``--full-log-dir`` path is never overridden
+    here: it is its own (higher-precedence) sink.
+    """
+    if full_log_file and full_log_file.strip():
+        return full_log_file
+    if not important_stdio_only:
+        return None
+    if full_log_dir and full_log_dir.strip():
+        return None
+    return DEFAULT_FULL_LOG_FILE
+
+
+@contextlib.contextmanager
+def surface_fatal_errors():
+    """Guarantee a FATAL error reaching this boundary surfaces + is flushed.
+
+    Single concern: a fatal/uncaught error (the process is about to exit
+    non-zero) MUST always be diagnosable, REGARDLESS of
+    ``--important-stdio-only``. The importance-mode stdio sink admits ONLY the
+    Rust IMPORTANT target, so a fatal error logged through the ordinary
+    Python→tracing bridge (``BRIDGE_TARGET``) is dropped from stdout. This
+    context manager closes that gap WITHOUT weakening the normal importance
+    filter for non-fatal logs: on an exception it routes the error+traceback
+    through the dedicated native ``py_log_important`` primitive (which emits at
+    the IMPORTANT target, so the importance gate admits it to stdio and the
+    full sink keeps it as always), FLUSHES every logging handler plus
+    stdout/stderr so nothing is lost on the crash-exit, then RE-RAISES so the
+    caller's exit code / handling is unchanged.
+
+    Composed once around the body of :func:`dynamic_runner.run.dispatch` — the
+    single chokepoint both framework entry points (``run`` / ``cli_main``) go
+    through after logging is configured — so no dispatch call site needs to
+    know anything about the importance gate.
+    """
+    try:
+        yield
+    except BaseException as exc:  # noqa: BLE001 — surface ANY fatal, then re-raise
+        # Local import: the native primitive lives on the package's re-exported
+        # surface (same rationale as `init_logging` / `py_log`) — importing at
+        # module top would pull `_native` into modules that import this one in
+        # isolation (the test harness).
+        from . import py_log_important
+
+        message = "FATAL: uncaught error reached the dispatch boundary:\n" + "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        # Best-effort: surfacing must never mask the original error with a
+        # secondary failure in the surfacing path itself.
+        with contextlib.suppress(Exception):
+            py_log_important(message)
+        _flush_all_logging()
+        raise
+
+
+def _flush_all_logging() -> None:
+    """Flush every root-logger handler plus stdout/stderr.
+
+    Single concern: make the fatal surfacing durable before a crash-exit. The
+    native importance/full sinks write synchronously, but the Python console
+    handler (importance mode off) and the process stdio streams are buffered,
+    so flush them so a fatal error is on the wire regardless of how the process
+    exits next.
+    """
+    for handler in logging.getLogger().handlers:
+        with contextlib.suppress(Exception):
+            handler.flush()
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
 
 
 class _TracingBridgeHandler(logging.Handler):
@@ -160,12 +263,20 @@ def setup_logging(args: argparse.Namespace) -> logging.Logger:
     distributed primary, none for plain local mode.
     """
     important_stdio_only = bool(getattr(args, "important_stdio_only", False))
-    full_log_file = getattr(args, "full_log_file", None)
     # The submitter defaults to a per-setup `<log-dir>/setup` role-split dir
     # when no explicit `--full-log-dir` was passed, so its bootstrap-primary
     # (`primary.log`) and post-relocation observer (`observer.log`) actions
     # are captured for debugging — independent of `--important-stdio-only`.
     full_log_dir = resolve_full_log_dir(args, getattr(args, "full_log_dir", None))
+    # When importance mode is on and no `--full-log-file`/`--full-log-dir` sink
+    # was chosen, default the NATIVE full sink to `./dynrunner-full.log` so the
+    # full (unfiltered) record — and crucially a FATAL dispatch error — is
+    # still captured to a file, never lost to the importance-gated stdout. Off
+    # importance mode this stays whatever `--full-log-file` was (default None →
+    # stdout single-stream).
+    full_log_file = resolve_full_log_file(
+        important_stdio_only, getattr(args, "full_log_file", None), full_log_dir
+    )
     debug = bool(getattr(args, "debug", False))
 
     # Deferred native subscriber install — explicit params, after argparse.

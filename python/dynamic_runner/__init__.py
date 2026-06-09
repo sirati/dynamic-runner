@@ -67,6 +67,7 @@ from ._native import (
     parse_memory,
     pick_free_port,
     py_log,
+    py_log_important,
     run_distributed,
     run_local,
     run_observer_late_joiner,

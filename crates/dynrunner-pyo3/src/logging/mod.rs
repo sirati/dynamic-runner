@@ -585,6 +585,31 @@ pub(crate) fn py_log(level: &str, record_target: &str, message: &str) {
     }
 }
 
+/// Forward ONE fatal Python error message to the IMPORTANT target so it
+/// reaches stdio even under `--important-stdio-only`, and the full sink as
+/// always.
+///
+/// Single concern: be the Python end of the FATAL-error surfacing path. A
+/// fatal/uncaught error (the process is about to exit non-zero) MUST always
+/// be diagnosable, so it is emitted at [`IMPORTANT_TARGET`] — the one target
+/// the importance-mode stdio gate ([`important_stdio_filter`]) admits — at the
+/// ERROR level. This is deliberately SEPARATE from the regular Python→tracing
+/// bridge ([`py_log`], which emits at [`BRIDGE_TARGET`] and is gated OUT of the
+/// important-stdio sink): the bridge stays importance-agnostic; only this
+/// dedicated primitive routes to the important target. The Python side
+/// (`logging_setup.surface_fatal_errors`) is the only caller, on the
+/// exit-non-zero path.
+///
+/// The `fmt` layers write synchronously to their (unbuffered `std::fs::File`
+/// or line-buffered `io::stdout`) writers, so a single newline-terminated
+/// emit is durable before the process exits — no separate Rust-side flush is
+/// needed.
+#[pyfunction]
+#[pyo3(name = "py_log_important", signature = (message))]
+pub(crate) fn py_log_important(message: &str) {
+    tracing::event!(target: IMPORTANT_TARGET, tracing::Level::ERROR, "{message}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1302,6 +1327,61 @@ mod tests {
             !stdio.contains("routine-debug"),
             "non-important DEBUG event leaked into the important-stdio sink \
              — raising the level widened the gate: {stdio}"
+        );
+    }
+
+    /// FATAL-PATH GUARANTEE: a fatal Python error forwarded through
+    /// [`py_log_important`] reaches the important-stdio sink AND the full sink
+    /// under `--important-stdio-only`, whereas the regular Python→tracing
+    /// bridge ([`py_log`]) is gated OUT of the important-stdio sink. This is
+    /// the diagnosability invariant the on-cluster defect violated: a fatal
+    /// dispatch error logged through the bridge vanished from stdio under
+    /// importance mode. Driven over the production importance-mode stack (the
+    /// stdio gate + a `File` full sink) so both halves are observed together.
+    #[test]
+    fn fatal_important_emit_reaches_stdio_and_full_under_importance_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let full_file = dir.path().join("dynrunner-full.log");
+        let stdio_buf = BufWriter::default();
+        // Importance-mode stdio gate + a `File` full sink, exactly as the
+        // submitter's `--important-stdio-only --full-log-file=...` stack.
+        let layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![
+            full_layer::<Registry, _>(open_append_create(&full_file)),
+            stdio_layer::<Registry, _>(stdio_buf.clone(), true),
+        ];
+        let subscriber = Registry::default().with(layers).with(LevelFilter::INFO);
+        with_default(subscriber, || {
+            // The fatal-error primitive — emits at the IMPORTANT target.
+            py_log_important("SLURM dispatch failed: boom");
+            // A regular bridged Python record — emits at BRIDGE_TARGET.
+            py_log("ERROR", "consumer.cli", "routine-bridge-error");
+        });
+
+        let full = std::fs::read_to_string(&full_file).expect("full log should exist");
+        let stdio = stdio_buf.contents();
+
+        // The fatal message MUST surface on the gated stdio (it is the whole
+        // point — a hard failure must always be diagnosable).
+        assert!(
+            stdio.contains("SLURM dispatch failed: boom"),
+            "fatal error did not reach the important-stdio sink under \
+             importance mode — the defect: {stdio:?}"
+        );
+        // And it is captured in the full log.
+        assert!(
+            full.contains("SLURM dispatch failed: boom"),
+            "fatal error missing from the full sink: {full:?}"
+        );
+        // A regular bridged record stays gated OUT of the important-stdio sink
+        // (the importance filter is NOT weakened for non-fatal logs)...
+        assert!(
+            !stdio.contains("routine-bridge-error"),
+            "the importance gate leaked a non-fatal bridge record onto stdio: {stdio:?}"
+        );
+        // ...while still landing in the full log.
+        assert!(
+            full.contains("routine-bridge-error"),
+            "non-fatal bridge record missing from the full sink: {full:?}"
         );
     }
 
