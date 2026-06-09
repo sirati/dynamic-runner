@@ -203,6 +203,39 @@ impl RunNarrator {
                     phase = %phase,
                     "phase preparation / task spawning",
                 );
+                // #337: per-phase work partition — how many of this phase's
+                // tasks are real work vs already-done skips. Counts come from
+                // the SHARED `phase_task_partition` ClusterState accessor (the
+                // single owner of this projection), NOT a narrator-local
+                // ledger re-walk. On the same once-per-phase `started_phases`
+                // edge, so it fires exactly once per phase.
+                let (to_run, skipped) = state.phase_task_partition(phase);
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    phase = %phase,
+                    to_run = to_run,
+                    skipped = skipped,
+                    "phase {phase}: {to_run} to run, {skipped} skipped (already done)",
+                );
+                // Running OVERALL across every phase started so far. DERIVED
+                // by summing `phase_task_partition` over the started-phases
+                // edge-set rather than accumulating into a mutable field, so
+                // it is failover-consistent and re-derivable on a narrator
+                // restart (a mutable accumulator would be observer-only state
+                // that could desync from the ledger — the exact antipattern
+                // this feature avoids). Emitted on the same once-per-phase
+                // edge; each newly-started phase advances the running total.
+                let (overall_to_run, overall_skipped) = self
+                    .started_phases
+                    .iter()
+                    .map(|p| state.phase_task_partition(p))
+                    .fold((0usize, 0usize), |(tr, sk), (t, s)| (tr + t, sk + s));
+                tracing::info!(
+                    target: IMPORTANT_TARGET,
+                    to_run = overall_to_run,
+                    skipped = overall_skipped,
+                    "overall: {overall_to_run} to run, {overall_skipped} skipped (already done)",
+                );
             }
             if rollup.has_any && !rollup.has_live && self.done_phases.insert(phase.clone()) {
                 tracing::info!(
@@ -502,6 +535,16 @@ mod tests {
             attempt: 0,
             hash: hash.to_string(),
             result_data: None,
+        });
+    }
+
+    /// Materialise an already-done skip the way the discovery seed seam does:
+    /// the task is first `TaskAdded` (Pending), then transitioned to the
+    /// terminal `SkippedAlreadyDone` state via `TaskSkippedAlreadyDone`. The
+    /// caller adds the task with `add` first; this applies the skip transition.
+    fn skip(state: &mut ClusterState<RunnerIdentifier>, hash: &str) {
+        state.apply(ClusterMutation::TaskSkippedAlreadyDone {
+            hash: hash.to_string(),
         });
     }
 
@@ -814,6 +857,102 @@ mod tests {
         assert_eq!(
             spawn[0].fields.get("phase").map(String::as_str),
             Some("compile")
+        );
+    }
+
+    /// #337: a phase with N to-run tasks and M `SkippedAlreadyDone` ledger
+    /// entries emits, on the same dispatchable edge, one
+    /// "<N> to run, <M> skipped (already done)" per-phase line AND an
+    /// "overall: <N> to run, <M> skipped" running total — the overall derived
+    /// from summing `phase_task_partition` over the started phases (no mutable
+    /// accumulator). A re-observe of the stable ledger emits nothing further.
+    #[test]
+    fn phase_skip_partition_emits_per_phase_and_overall() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // 2 to-run (Pending) + 3 already-done skips in one phase.
+            for id in ["r1", "r2"] {
+                add(&mut state, &task("build", id, &[]));
+            }
+            for id in ["s1", "s2", "s3"] {
+                add(&mut state, &task("build", id, &[]));
+                skip(&mut state, id);
+            }
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+            // Re-observe the unchanged ledger: idempotent.
+            narrator.observe(&state);
+        });
+
+        let per_phase: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("2 to run, 3 skipped (already done)"))
+            .filter(|e| e.fields.get("phase").map(String::as_str) == Some("build"))
+            .collect();
+        assert_eq!(
+            per_phase.len(),
+            1,
+            "exactly one per-phase skip-partition line for the build phase: {events:?}"
+        );
+        assert_eq!(per_phase[0].fields.get("to_run").map(String::as_str), Some("2"));
+        assert_eq!(per_phase[0].fields.get("skipped").map(String::as_str), Some("3"));
+
+        let overall: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("overall:"))
+            .collect();
+        assert_eq!(
+            overall.len(),
+            1,
+            "exactly one overall line for the single started phase: {events:?}"
+        );
+        assert!(
+            overall[0]
+                .message
+                .contains("2 to run, 3 skipped (already done)"),
+            "overall reflects the single phase's partition: {:?}",
+            overall[0].message
+        );
+        assert_eq!(overall[0].fields.get("to_run").map(String::as_str), Some("2"));
+        assert_eq!(overall[0].fields.get("skipped").map(String::as_str), Some("3"));
+    }
+
+    /// #337: a phase with no already-done skips emits "<N> to run, 0 skipped"
+    /// — the all-unmarked back-compat shape — and the overall mirrors it.
+    #[test]
+    fn phase_skip_partition_all_unmarked_emits_zero_skipped() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            add(&mut state, &task("compile", "a", &[]));
+            add(&mut state, &task("compile", "b", &[]));
+
+            let mut narrator = RunNarrator::new();
+            narrator.observe(&state);
+        });
+
+        let per_phase: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("2 to run, 0 skipped (already done)"))
+            .filter(|e| e.fields.get("phase").map(String::as_str) == Some("compile"))
+            .collect();
+        assert_eq!(
+            per_phase.len(),
+            1,
+            "an all-unmarked phase emits '2 to run, 0 skipped': {events:?}"
+        );
+
+        let overall: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("overall:"))
+            .collect();
+        assert_eq!(overall.len(), 1, "one overall line: {events:?}");
+        assert!(
+            overall[0]
+                .message
+                .contains("2 to run, 0 skipped (already done)"),
+            "overall mirrors the all-unmarked phase: {:?}",
+            overall[0].message
         );
     }
 
