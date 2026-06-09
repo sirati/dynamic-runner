@@ -155,6 +155,7 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::TaskBlocked { .. }
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
+            | ClusterMutation::PhaseMayBeEmptySet { .. }
             | ClusterMutation::RunComplete
             | ClusterMutation::RunAborted { .. }
             | ClusterMutation::DiscoveryDebtDeclared

@@ -4,8 +4,12 @@
 //!
 //! Two concerns, both synchronous and deterministic (no operational
 //! loop, no wall-clock waits):
-//! - [`phase_can_proceed`] is a pure predicate on the phase's terminal
-//!   counters — exercised directly for the three policy branches.
+//! - [`phase_can_proceed`] decides advance-vs-fail from the phase's
+//!   terminal counters (completed / failed / skipped-as-existing), its
+//!   residual-work probe, and the replicated `may_be_empty` opt-out —
+//!   exercised directly across every policy branch (proceed on
+//!   completion/failure/skip/may_be_empty; fail on residual-work and on a
+//!   genuinely-empty undeclared phase, leaf or non-leaf).
 //! - `fire_initial_phase_starts` EMITs `PhaseStartedNeedsWorkers` for
 //!   each newly-started phase that carries work; the emit is asserted by
 //!   installing a worker-management sender and draining the channel
@@ -112,20 +116,8 @@ fn cold_seed_cross_phase_same_task_id_is_not_a_duplicate() {
 fn phase_can_proceed_when_some_completed() {
     let (primary, _mesh) = make_primary();
     let p = PhaseId::from("compile");
-    assert!(primary.phase_can_proceed(&p, 3, 0));
-    assert!(primary.phase_can_proceed(&p, 1, 2));
-}
-
-/// PROCEED when the phase had zero items (empty / cascade-through phase):
-/// `completed == 0 && failed == 0` and no residual work. It makes no
-/// worker demand and blocks nothing.
-#[test]
-fn phase_can_proceed_when_zero_items() {
-    let (primary, _mesh) = make_primary();
-    let p = PhaseId::from("empty");
-    // No pool item carries phase "empty" and no in-flight counter ⇒
-    // phase_min_workers == 0 ⇒ proceed.
-    assert!(primary.phase_can_proceed(&p, 0, 0));
+    assert!(primary.phase_can_proceed(&p, 3, 0, 0));
+    assert!(primary.phase_can_proceed(&p, 1, 2, 0));
 }
 
 /// PROCEED when the phase's items reached a terminal FAILED outcome with
@@ -137,12 +129,12 @@ fn phase_can_proceed_when_zero_items() {
 fn phase_can_proceed_when_all_items_failed_terminally() {
     let (primary, _mesh) = make_primary();
     let p = PhaseId::from("compile");
-    assert!(primary.phase_can_proceed(&p, 0, 1));
-    assert!(primary.phase_can_proceed(&p, 0, 5));
+    assert!(primary.phase_can_proceed(&p, 0, 1, 0));
+    assert!(primary.phase_can_proceed(&p, 0, 5, 0));
 }
 
-/// FAIL only the genuine wedge: a phase that produced NO terminal
-/// accounting (zero completed, zero failed) yet still owns residual
+/// FAIL the genuine wedge: a phase that produced NO terminal accounting
+/// (zero completed, zero failed, zero skipped) yet still owns residual
 /// pending work — advancing would strand dependents on never-resolved
 /// inputs. We seed a single Pending item for the phase so
 /// `phase_min_workers` reports residual work, then assert the veto.
@@ -165,7 +157,169 @@ fn phase_cannot_proceed_with_residual_unresolved_work() {
     let p = PhaseId::from("compile");
     // Residual pending item ⇒ phase_min_workers > 0 ⇒ with zero terminal
     // accounting the phase cannot proceed.
-    assert!(!primary.phase_can_proceed(&p, 0, 0));
+    assert!(!primary.phase_can_proceed(&p, 0, 0, 0));
+}
+
+/// F-honesty FAIL — NON-LEAF empty (asm-tokenizer class): an activated
+/// phase that drained genuinely empty — zero completed, zero failed, zero
+/// skipped, zero residual — and was NOT declared `may_be_empty`. Its
+/// planned work was never injected / discovered (the silent
+/// partial-success the consumers hit when `on_phase_end`-driven lazy
+/// injection was suppressed). MUST veto, regardless of topology. Here
+/// `build` is NON-LEAF (`compile` depends on it).
+#[test]
+fn non_leaf_phase_drained_genuinely_empty_fails_loud() {
+    let (mut primary, _mesh) = make_primary();
+
+    // Phase graph: compile depends on build. Seed ONE pending `compile`
+    // item so the pool exists and carries the dep edge — but seed NO
+    // `build` item, so `build` is a non-leaf phase that was never injected.
+    let dep = dep_binary("dep", "compile", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep".into(),
+            task: dep,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    let build = PhaseId::from("build");
+    // No `build` item ⇒ zero residual (`phase_min_workers == 0`). Zero
+    // accounting, zero skip, not declared may_be_empty ⇒ genuinely-empty
+    // wedge ⇒ veto.
+    assert_eq!(primary.pool().in_flight(&build), 0);
+    assert!(!primary.phase_can_proceed(&build, 0, 0, 0));
+}
+
+/// F-honesty FAIL — LEAF empty (asm-dataset class): the SAME genuinely-empty
+/// wedge where the suppressed phase is a LEAF (`…→dependency_graph→build`,
+/// nothing depends on `build`). This is the case the prior "leaf empties
+/// always proceed" rule MISSED — the discriminator is the absence of a
+/// `may_be_empty` declaration, NOT topology, so a leaf empty undeclared
+/// phase MUST veto too.
+#[test]
+fn leaf_phase_drained_genuinely_empty_fails_loud() {
+    let (mut primary, _mesh) = make_primary();
+
+    // Phase graph: build depends on dependency_graph. `build` is a LEAF
+    // (nothing depends on it). Seed ONE pending `dependency_graph` item so
+    // the pool exists — but seed NO `build` item (the suppressed-injection
+    // bug: on_phase_end was supposed to spawn `build`'s items and didn't).
+    let dg = dep_binary("dg", "dependency_graph", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                PhaseId::from("build"),
+                vec![PhaseId::from("dependency_graph")],
+            )]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dg".into(),
+            task: dg,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    let build = PhaseId::from("build");
+    // LEAF, zero residual, zero accounting, zero skip, not may_be_empty ⇒
+    // genuinely-empty wedge ⇒ veto (the asm-dataset class the old leaf-proceed
+    // rule false-greened).
+    assert_eq!(primary.pool().in_flight(&build), 0);
+    assert!(!primary.phase_can_proceed(&build, 0, 0, 0));
+}
+
+/// F-honesty PROCEED — declared `may_be_empty`: an activated phase that
+/// drained genuinely empty (zero completed/failed/skipped/residual) but the
+/// consumer DECLARED it `PhaseSpec.may_be_empty` (a pure sequencing gate /
+/// terminal-empty phase). The explicit opt-out the owner's "fail loud BY
+/// DEFAULT" implies — proceed, NOT fail. Asserted for BOTH a non-leaf and a
+/// leaf empty phase to pin that the opt-out is topology-independent.
+#[test]
+fn declared_may_be_empty_phase_proceeds_when_empty() {
+    let (mut primary, _mesh) = make_primary();
+
+    // `gate` is non-leaf (`work` depends on it); `tail` is a leaf. Both are
+    // declared may_be_empty and seeded with no items. Seed one `work` item
+    // so the pool hydrates.
+    let work_item = dep_binary("work_item", "work", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([
+                (PhaseId::from("work"), vec![PhaseId::from("gate")]),
+                (PhaseId::from("tail"), vec![PhaseId::from("work")]),
+            ]),
+        });
+        cs.apply(ClusterMutation::PhaseMayBeEmptySet {
+            phases: vec![PhaseId::from("gate"), PhaseId::from("tail")],
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "work_item".into(),
+            task: work_item,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    let gate = PhaseId::from("gate");
+    let tail = PhaseId::from("tail");
+    assert!(primary.cluster_state_for_test().phase_may_be_empty(&gate));
+    assert!(primary.cluster_state_for_test().phase_may_be_empty(&tail));
+    // Both empty + declared may_be_empty ⇒ proceed (non-leaf gate AND leaf
+    // tail), even though an UNDECLARED empty phase in the same position fails.
+    assert!(primary.phase_can_proceed(&gate, 0, 0, 0));
+    assert!(primary.phase_can_proceed(&tail, 0, 0, 0));
+}
+
+/// F-honesty PROCEED — all items SKIPPED-AS-EXISTING: a phase that drained
+/// empty because ALL its items were skipped because their outputs already
+/// exist (the `--skip-existing` "nothing left to do" case) is SUCCESS, not a
+/// failure — distinct from the never-injected wedge. The recorded
+/// `PhaseTally::SkippedExisting` count is the discriminator; with
+/// `skipped > 0` the phase proceeds even though it is empty, undeclared, and
+/// non-leaf.
+#[test]
+fn phase_all_skipped_as_existing_proceeds() {
+    let (mut primary, _mesh) = make_primary();
+
+    // Non-leaf topology (compile depends on build), build seeded with no
+    // items but a recorded skipped-as-existing count — and NOT declared
+    // may_be_empty, so success here is owed purely to the skip count.
+    let dep = dep_binary("dep", "compile", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("compile"), vec![PhaseId::from("build")])]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep".into(),
+            task: dep,
+        });
+    }
+    primary.hydrate_from_cluster_state();
+
+    let build = PhaseId::from("build");
+    // Record the skipped-as-existing count via the same grow-only-MAX
+    // accessor the discovery originator uses.
+    primary.cluster_state_mut_for_test().record_phase_event_tally(
+        (build.clone(), crate::cluster_state::PhaseTally::SkippedExisting),
+        3,
+    );
+
+    let skipped = primary
+        .cluster_state_for_test()
+        .phase_event_tally_for(&(build.clone(), crate::cluster_state::PhaseTally::SkippedExisting));
+    assert_eq!(skipped, 3, "skipped-as-existing count recorded");
+    assert!(
+        !primary.cluster_state_for_test().phase_may_be_empty(&build),
+        "success owed to the skip count, NOT a may_be_empty declaration"
+    );
+    // Zero accounting, zero residual, undeclared — but skipped > 0 ⇒ proceed.
+    assert!(primary.phase_can_proceed(&build, 0, 0, skipped));
 }
 
 /// `fire_initial_phase_starts` emits `PhaseStartedNeedsWorkers { min: 1 }`

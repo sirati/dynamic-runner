@@ -135,6 +135,10 @@ impl PyDistributedManager {
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         let phase_deps = self.phase_deps.clone();
+        // The consumer's `may_be_empty` phase opt-out, captured for
+        // registration on the in-process primary (the empty-drain
+        // proceed-or-fail discriminator).
+        let phase_may_be_empty = self.phase_may_be_empty.clone();
         // The shared node-local run-config (the operator's
         // `args.forwarded_argv`). One copy seeds the in-process primary's
         // `PrimaryConfig` and a per-secondary clone seeds each in-process
@@ -816,6 +820,11 @@ impl PyDistributedManager {
                 // coordinator so a consumer-hook raise surfaces
                 // `FatalPolicyExit`. Same pre-`run()` setter contract.
                 primary.set_phase_hook_raise_latch(phase_hook_raise_latch);
+
+                // Register the consumer's `may_be_empty` phase opt-out BEFORE
+                // `run()` enters, so the cold-/relocated-seed originator emits
+                // it paired with the phase graph (the empty-drain opt-out).
+                primary.register_phase_may_be_empty(phase_may_be_empty.iter().cloned());
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE the primary's `run()` enters — the

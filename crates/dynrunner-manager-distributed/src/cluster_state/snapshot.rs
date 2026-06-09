@@ -120,6 +120,13 @@ pub struct ClusterStateSnapshot<I> {
     pub current_primary: Option<String>,
     pub primary_epoch: u64,
     pub phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Replicated `may_be_empty` phase set (same static-graph lifecycle as
+    /// `phase_deps`): carried so a late-joiner / promoted node restores the
+    /// consumer's empty-drain opt-out and its proceed-or-fail policy matches
+    /// the live primary's. `#[serde(default)]` so a snapshot from a peer
+    /// predating this field restores as "no phase opted out" — wire-safe.
+    #[serde(default)]
+    pub phase_may_be_empty: std::collections::HashSet<PhaseId>,
     /// Replicated role-capability 2P-set (C6) — the SINGLE source of
     /// `is_observer` / `can_be_primary`, carried so a late-joiner /
     /// reconnecting node converges the full capability roster (including
@@ -305,6 +312,7 @@ impl<I: Identifier> ClusterState<I> {
             current_primary,
             primary_epoch,
             phase_deps,
+            phase_may_be_empty,
             run_complete,
             run_aborted,
             discovery_debt,
@@ -343,6 +351,10 @@ impl<I: Identifier> ClusterState<I> {
             current_primary: current_primary.clone(),
             primary_epoch: *primary_epoch,
             phase_deps: phase_deps.clone(),
+            // Replicated static phase-graph metadata — carried so a
+            // promoted / late-joining node restores the consumer's
+            // empty-drain opt-out (same contract as `phase_deps`).
+            phase_may_be_empty: phase_may_be_empty.clone(),
             // Carry the replicated role-capability 2P-set (the SINGLE
             // source of `is_observer`/`can_be_primary`) through the
             // snapshot so a late-joiner / promoted primary converges the
@@ -462,6 +474,7 @@ impl<I: Identifier> ClusterState<I> {
             current_primary,
             primary_epoch,
             phase_deps,
+            phase_may_be_empty,
             capabilities,
             peer_holdings,
             task_outputs,
@@ -553,6 +566,16 @@ impl<I: Identifier> ClusterState<I> {
             if inc_hash < local_hash {
                 self.phase_deps = phase_deps;
             }
+        }
+        // `may_be_empty` set: same static-graph lifecycle as `phase_deps` —
+        // adopt on first-bootstrap (local empty). It is the consumer's
+        // set-once declaration, so a non-empty local is already the run's
+        // graph; a divergent incoming set is the same contract violation
+        // `phase_deps` guards, and keeping local is the conservative
+        // first-write-wins choice (the empty-drain policy fails loud on the
+        // safe side if a gate's opt-out were ever dropped).
+        if self.phase_may_be_empty.is_empty() {
+            self.phase_may_be_empty = phase_may_be_empty;
         }
         // Capabilities: per-id 2P-set merge (C6). Monotone — `Departed`
         // sticks, `Advertised` ratchets `is_observer` and follows the

@@ -810,6 +810,20 @@ async fn connected_event_precedes_first_phase_start_with_empty_phase_and_lazy_sp
             // Operational primary (mesh-always): seed the inherited ledger +
             // run as `PromotionSnapshot` (a `ColdStart` would relocate away).
             seed_operational_ledger(&mut primary, binaries, phase_deps);
+            // `pre` is an INTENTIONALLY-EMPTY phase (a pure sequencing gate:
+            // `work` depends on it but `pre` owns no work of its own). Under
+            // the F-honesty contract a phase that drains genuinely empty
+            // fails loud BY DEFAULT — the consumer declares the intentional
+            // gate via `PhaseSpec.may_be_empty`. Seed that opt-out
+            // (`PhaseMayBeEmptySet`) so `phase_can_proceed` advances `pre`
+            // through the cascade instead of vetoing it. This pins the
+            // empty-phase cascade-drain ordering AND the may_be_empty opt-out
+            // end-to-end.
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::PhaseMayBeEmptySet {
+                    phases: vec![PhaseId::from("pre")],
+                });
             primary
                 .run(SeedSource::PromotionSnapshot, on_start, on_end)
                 .await

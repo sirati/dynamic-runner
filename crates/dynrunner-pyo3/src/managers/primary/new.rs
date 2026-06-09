@@ -75,6 +75,7 @@ impl PyPrimaryCoordinator {
             num_secondaries,
             estimator: topology.estimator,
             phase_deps: topology.phase_deps,
+            phase_may_be_empty: topology.phase_may_be_empty,
             spawn_secondary: spawn_secondary.clone_ref(py),
             distributed_config: distributed_config.unwrap_or_default(),
             listen_port,

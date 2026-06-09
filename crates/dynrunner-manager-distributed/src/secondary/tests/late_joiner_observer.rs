@@ -76,6 +76,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         current_primary: Some("primary-peer".to_string()),
         primary_epoch: 7,
         phase_deps: HashMap::new(),
+        phase_may_be_empty: std::collections::HashSet::new(),
         capabilities,
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),

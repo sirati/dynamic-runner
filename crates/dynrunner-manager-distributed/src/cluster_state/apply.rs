@@ -271,6 +271,23 @@ impl<I: Identifier> ClusterState<I> {
                 self.phase_deps = deps;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::PhaseMayBeEmptySet { phases } => {
+                // Static config, set-once (mirrors `PhaseDepsSet`): a
+                // re-application once the local set is seeded is a no-op
+                // (idempotent re-origination / at-least-once replication).
+                // An empty incoming set on the common no-opt-out run is the
+                // degenerate seed — applying it is harmless (the set stays
+                // empty) and keeps the "primary always pairs this with
+                // PhaseDepsSet" origination uniform.
+                if !self.phase_may_be_empty.is_empty() {
+                    return ApplyOutcome::NoOp;
+                }
+                if phases.is_empty() {
+                    return ApplyOutcome::NoOp;
+                }
+                self.phase_may_be_empty = phases.into_iter().collect();
+                ApplyOutcome::Applied
+            }
             ClusterMutation::RunComplete => {
                 if self.run_complete {
                     return ApplyOutcome::NoOp;

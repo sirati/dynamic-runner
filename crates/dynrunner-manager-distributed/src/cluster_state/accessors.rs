@@ -203,6 +203,15 @@ impl<I: Identifier> ClusterState<I> {
         &self.phase_deps
     }
 
+    /// True iff `phase` was declared `may_be_empty` by the consumer
+    /// (`PhaseSpec.may_be_empty`, replicated via
+    /// `ClusterMutation::PhaseMayBeEmptySet`). Read by the empty-drain
+    /// proceed-or-fail policy to let an intentional pure-sequencing gate
+    /// drain through with zero dispatched items instead of failing loud.
+    pub fn phase_may_be_empty(&self, phase: &PhaseId) -> bool {
+        self.phase_may_be_empty.contains(phase)
+    }
+
     /// Per-phase derived view recomputed from the CRDT: for every phase
     /// that owns at least one task, the [`PhaseRollup`] of `has_any`,
     /// `has_live`, and `dispatchable`.

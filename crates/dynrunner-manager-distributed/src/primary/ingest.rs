@@ -31,6 +31,19 @@ use crate::primary::wire::{compute_task_hash, timestamp_now};
 use crate::primary::{PrimaryCoordinator, RunError};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// Build the `ClusterMutation::PhaseMayBeEmptySet` carrying the
+    /// consumer's registered `may_be_empty` opt-out set, for emission
+    /// paired with `PhaseDepsSet` from every seed originator. Single place
+    /// the wire shape (sorted `Vec` for deterministic frames) is built, so
+    /// the cold-seed and relocated-seed originators don't each re-spell it.
+    /// An empty set yields an empty-`Vec` mutation that the apply arm treats
+    /// as a NoOp — harmless on the common no-opt-out run.
+    pub(crate) fn phase_may_be_empty_mutation(&self) -> ClusterMutation<I> {
+        let mut phases: Vec<PhaseId> = self.phase_may_be_empty_decl.iter().cloned().collect();
+        phases.sort();
+        ClusterMutation::PhaseMayBeEmptySet { phases }
+    }
+
     /// Cold-start CRDT origination: turn the bootstrap task batch into the
     /// freshly-seeded replicated ledger `hydrate_from_cluster_state` then
     /// builds the pool from.
@@ -190,10 +203,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // for the post-connection broadcast (a pre-connection broadcast is
         // dropped, so the local-apply and the broadcast are split across the
         // connect boundary — C-3 constraints 1+2).
-        let mut seed: Vec<ClusterMutation<I>> = Vec::with_capacity(self.all_binaries.len() + 1);
+        let mut seed: Vec<ClusterMutation<I>> = Vec::with_capacity(self.all_binaries.len() + 2);
         seed.push(ClusterMutation::PhaseDepsSet {
             deps: self.phase_deps.clone(),
         });
+        // Pair the static phase graph with the consumer's `may_be_empty`
+        // opt-out set (the empty-drain proceed-or-fail discriminator), so a
+        // promoted primary inherits the same opt-out. NoOp on apply when the
+        // set is empty (the common no-opt-out run).
+        seed.push(self.phase_may_be_empty_mutation());
         seed.extend(
             self.all_binaries
                 .iter()
@@ -284,6 +302,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         let seed: Vec<ClusterMutation<I>> = vec![
             ClusterMutation::PhaseDepsSet { deps: phase_deps },
+            // Pair the `may_be_empty` opt-out with the phase graph (same
+            // static-graph lifecycle) so the relocated/promoted primary's
+            // empty-drain policy inherits it. NoOp on apply when empty.
+            self.phase_may_be_empty_mutation(),
             ClusterMutation::DiscoveryDebtDeclared,
         ];
         // Apply locally (stamps versions, filters NoOps) and STAGE the
