@@ -250,6 +250,29 @@ class SlurmJobManager:
             # the Rust queue_initial_staging fix); absolute paths use
             # binary.path verbatim.
             local = raw if raw.is_absolute() else src_root / raw
+            # A discovered item with no backing file on disk is a
+            # computed/producer item: a ``uses_file_based_items=False``
+            # task discovers items it will PRODUCE, not files to upload.
+            # Skip it — the per-item authority for upload-stageability is
+            # "does this binary resolve to a real file under --source?",
+            # and the task-class flag cannot discriminate (a pure producer
+            # and a mixed composite are both ``uses_file_based_items=False``),
+            # so the walk itself must honour the no-backing-file case rather
+            # than stat+scp blindly (which OSErrors the whole dispatch).
+            # Mirrors the Rust upload (images.rs). The StageFile/staging path
+            # stays strict — it is gated to file-based tasks, whose files
+            # exist, and a genuinely-missing file-based source SHOULD surface
+            # there as ``SourceUnreadable``.
+            if not local.exists():
+                logger.warning(
+                    "Binary %s (resolved %s) has no backing source file "
+                    "under --source %s; skipping upload (computed/producer "
+                    "item — nothing to stage).",
+                    raw,
+                    local,
+                    src_root,
+                )
+                continue
             try:
                 rel = local.resolve().relative_to(src_root)
             except ValueError:

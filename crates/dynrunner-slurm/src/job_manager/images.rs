@@ -116,6 +116,33 @@ impl<G: Gateway> SlurmJobManager<G> {
             } else {
                 source_root.join(&binary.path)
             };
+            // A binary with no backing file on disk is a computed/producer
+            // item: a `uses_file_based_items=False` task discovers items it
+            // PRODUCES, not files to upload. Skip it — the per-item
+            // stageability authority is "does this resolve to a real file
+            // under --source?", and the task-class flag cannot discriminate
+            // (a pure producer and a mixed composite are both
+            // `uses_file_based_items=False`), so the walk honours the
+            // no-backing-file case rather than handing the gateway a path it
+            // cannot stat (which fails the whole dispatch). Mirrors the
+            // Python upload. NOTE the staging walk
+            // (`compute_initial_staging_entries`) intentionally does NOT
+            // skip-on-missing — on the EXISTENCE axis the two walks diverge:
+            // staging is reached only by file-based tasks (gated by the
+            // StageFile pass), whose files exist, so a genuinely-missing
+            // file-based source SHOULD surface there as `SourceUnreadable`.
+            // They still agree on the OUT-OF-TREE axis below.
+            if !local.exists() {
+                tracing::warn!(
+                    raw = %binary.path.display(),
+                    resolved = %local.display(),
+                    source_root = %source_root.display(),
+                    "binary has no backing source file under --source; \
+                     skipping upload (computed/producer item — nothing to \
+                     stage).",
+                );
+                continue;
+            }
             // Stageability predicate: strip-prefix succeeds ⟺ the
             // binary has a `<rel>` tail and can be placed at
             // `<srcbins>/<rel>`. Out-of-tree paths have no such tail
