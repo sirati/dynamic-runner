@@ -139,6 +139,14 @@ pub fn adopt_into_self_cgroup(job_cgroup: &CgroupPath, pid: u32) -> bool {
             true
         }
         Err(e) => {
+            // An adopt miss here is the tolerable best-effort backstop, NOT
+            // the root of the teardown failure: the login-session decoupling
+            // (the actual chain-breaker) is now handled by the linger gate at
+            // launch (see `linger::ensure_linger`). This adopt only adds
+            // coverage for the orphan reap and is environmentally locked
+            // (cgroup-v2 common-ancestor EPERM on non-delegated clusters), so
+            // it is expected to miss on Krater; the in-band reap is the hard
+            // guarantee.
             tracing::warn!(
                 target: LOG_TARGET,
                 pid,

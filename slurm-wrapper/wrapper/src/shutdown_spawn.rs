@@ -161,6 +161,13 @@ pub fn spawn(
     // out-of-cgroup delegate; the systemd survivor only adds coverage for
     // the wrapper-dies-without-grace cases. Log that the in-band path is
     // now authoritative and carry on.
+    //
+    // NB: an unreachable user-systemd bus here does NOT leave the workers
+    // exposed to the submitter-ssh-drop fan-kill — that login-session
+    // decoupling is handled by the launch-time linger gate
+    // (`linger::ensure_linger`), which talks to the SYSTEM bus (independent
+    // of this unreachable user@ bus) and fail-fasts the wrapper if linger
+    // cannot be confirmed on.
     eprintln!(
         "NOTE: out-of-cgroup shutdown manager not started (user-systemd bus \
          unreachable or systemd-run unavailable); the wrapper's in-band reap \
