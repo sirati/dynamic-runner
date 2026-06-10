@@ -18,21 +18,83 @@ use tokio::process::{Child, Command};
 
 use super::options::{PrepError, PreparationOptions};
 
-/// Shared `host -> was_linger` map recording each compute node's ORIGINAL
-/// logind linger state at tunnel-establish time. `true` ⇒ the node was
-/// ALREADY lingering before this run touched it (the run-end restore leaves
-/// it untouched); `false` ⇒ the run enabled it (the restore disables it).
+/// Shared per-host linger bookkeeping: each compute node's ORIGINAL
+/// logind linger state at tunnel-establish time (for the run-end
+/// restore) plus the enable VERDICT (for the post-cohort summary).
 ///
-/// First-writer-wins per host (`entry().or_insert`): a node hosting more
-/// than one secondary is probed first by the earliest watcher, capturing
-/// the genuine pre-run state; later secondaries on the same node read the
-/// (now-enabled-by-us) `yes` but must NOT overwrite the recorded original,
-/// so the restore still disables correctly.
+/// Original state: `true` ⇒ the node was ALREADY lingering before this
+/// run touched it (the run-end restore leaves it untouched); `false` ⇒
+/// the run enabled it (the restore disables it). First-writer-wins per
+/// host: a node hosting more than one secondary is probed first by the
+/// earliest watcher, capturing the genuine pre-run state; later
+/// secondaries on the same node read the (now-enabled-by-us) `yes` but
+/// must NOT overwrite the recorded original, so the restore still
+/// disables correctly.
+///
+/// Enable verdict: `true` ⇒ at least one enable attempt on the host
+/// reported `ENABLE=ok` (any-success-wins: a retried attempt that
+/// eventually lands clears an earlier failure). Consumed by
+/// [`summarize_linger_enables`], which emits the per-cohort verdict
+/// line — at the IMPORTANT target only when something failed.
 ///
 /// Owned by [`SlurmPreparation`](super::pipeline::SlurmPreparation),
-/// populated through the spawner DI seam, drained by [`restore_linger`] at
-/// teardown. Whole-run-scoped ⇒ one restore per node, race-free.
-pub(super) type LingerRestoreMap = Arc<StdMutex<HashMap<String, bool>>>;
+/// populated through the spawner DI seam, drained by [`restore_linger`]
+/// at teardown / [`summarize_linger_enables`] after the cohort gather.
+/// Whole-run-scoped ⇒ one restore + one summary per run, race-free.
+#[derive(Clone, Default)]
+pub(super) struct LingerLedger(Arc<StdMutex<LingerLedgerInner>>);
+
+#[derive(Default)]
+struct LingerLedgerInner {
+    /// host -> ORIGINAL linger state (first-writer-wins).
+    original: HashMap<String, bool>,
+    /// host -> enable verdict (any-success-wins).
+    enable_ok: HashMap<String, bool>,
+}
+
+impl LingerLedger {
+    /// Record one enable attempt's outcome for `host`: the probed
+    /// original state (first-writer-wins) and the enable verdict
+    /// (any-success-wins).
+    pub(super) fn record_enable(&self, host: &str, was_linger: bool, enabled: bool) {
+        let mut inner = self.0.lock().expect("linger ledger mutex poisoned");
+        inner.original.entry(host.to_owned()).or_insert(was_linger);
+        let verdict = inner.enable_ok.entry(host.to_owned()).or_insert(enabled);
+        *verdict = *verdict || enabled;
+    }
+
+    /// The hosts whose linger this run ENABLED (original state `false`)
+    /// — the restore-disable set. Drains the original-state map so a
+    /// second call is a harmless no-op (idempotent teardown).
+    pub(super) fn drain_restore_hosts(&self) -> Vec<String> {
+        let mut inner = self.0.lock().expect("linger ledger mutex poisoned");
+        let hosts = inner
+            .original
+            .iter()
+            .filter(|&(_, &was_on)| !was_on)
+            .map(|(host, _)| host.clone())
+            .collect();
+        inner.original.clear();
+        hosts
+    }
+
+    /// The cohort enable verdict: `(ok_count, sorted failed hosts)`.
+    /// Drains the verdict map so a later cohort (re-entry) summarises
+    /// only its own attempts.
+    pub(super) fn drain_enable_verdicts(&self) -> (usize, Vec<String>) {
+        let mut inner = self.0.lock().expect("linger ledger mutex poisoned");
+        let ok = inner.enable_ok.values().filter(|&&v| v).count();
+        let mut failed: Vec<String> = inner
+            .enable_ok
+            .iter()
+            .filter(|&(_, &v)| !v)
+            .map(|(host, _)| host.clone())
+            .collect();
+        failed.sort();
+        inner.enable_ok.clear();
+        (ok, failed)
+    }
+}
 
 /// Push the shared ssh-invocation prologue — `ssh`, the gateway
 /// auth options, and the ProxyJump (`-J` / `ProxyCommand`) hop — onto
@@ -449,15 +511,17 @@ pub(super) fn linger_fail_reason(stdout: &str, verb: LingerVerb) -> Option<Strin
 /// submitter-ssh-drop protection, which the operator must then pre-set or
 /// delegate. The reverse tunnel + worker container launch regardless.
 ///
-/// Returns the captured `was_linger` boolean (`true` ⇒ the user was ALREADY
-/// lingering before this run, so the restore leaves it untouched). On a
-/// failed/unparsable probe, returns `true` defensively: "assume already on"
-/// means the restore will NOT disable a state this run may not have created.
+/// Returns `(was_linger, enabled)`: the captured original state
+/// (`was_linger == true` ⇒ the user was ALREADY lingering before this run,
+/// so the restore leaves it untouched) and the enable VERDICT (`enabled ==
+/// true` ⇒ the remote reported `ENABLE=ok`). On a failed/unparsable probe,
+/// `was_linger` is `true` defensively: "assume already on" means the
+/// restore will NOT disable a state this run may not have created.
 async fn enable_linger_for_node(
     secondary_id: &str,
     remote_host: &str,
     opts: &PreparationOptions,
-) -> bool {
+) -> (bool, bool) {
     let argv = build_linger_argv(remote_host, LingerVerb::Enable, opts);
     tracing::info!(
         secondary_id,
@@ -480,7 +544,8 @@ async fn enable_linger_for_node(
             // was_linger_from_probe; never disable a state the run cannot
             // prove it set).
             let was_linger = was_linger_from_probe(&stdout);
-            if linger_succeeded(&stdout, LingerVerb::Enable) {
+            let enabled = linger_succeeded(&stdout, LingerVerb::Enable);
+            if enabled {
                 tracing::info!(
                     secondary_id,
                     remote_host,
@@ -509,7 +574,7 @@ async fn enable_linger_for_node(
                      the run user (or delegate it via polkit). Proceeding (linger is best-effort)."
                 );
             }
-            was_linger
+            (was_linger, enabled)
         }
         Err(e) => {
             tracing::warn!(
@@ -519,7 +584,7 @@ async fn enable_linger_for_node(
                 "linger-enable ssh failed to spawn; workers NOT decoupled (best-effort). Proceeding."
             );
             // Could not run the probe ⇒ assume already on (skip restore).
-            true
+            (true, false)
         }
     }
 }
@@ -572,27 +637,24 @@ async fn disable_linger_for_node(remote_host: &str, opts: &PreparationOptions) {
     }
 }
 
-/// Per-node linger ENABLE + original-state capture, invoked from the
-/// spawner before the reverse tunnel is spawned.
+/// Per-node linger ENABLE + bookkeeping, invoked from the spawner before
+/// the reverse tunnel is spawned.
 ///
-/// Records the node's ORIGINAL linger state into `linger_restore`
+/// Records the node's ORIGINAL linger state into the ledger
 /// (first-writer-wins per host, so a multi-secondary node restores to its
 /// genuine pre-run state) so [`restore_linger`] knows whether to disable it
-/// at teardown. The enable itself is best-effort (see
-/// [`enable_linger_for_node`]); the recorded state drives the restore
-/// regardless of whether this particular enable succeeded.
+/// at teardown, and the enable VERDICT (any-success-wins) for the
+/// post-cohort [`summarize_linger_enables`]. The enable itself is
+/// best-effort (see [`enable_linger_for_node`]); the recorded state drives
+/// the restore regardless of whether this particular enable succeeded.
 async fn ensure_node_linger(
     secondary_id: &str,
     remote_host: &str,
     opts: &PreparationOptions,
-    linger_restore: &LingerRestoreMap,
+    ledger: &LingerLedger,
 ) {
-    let was_linger = enable_linger_for_node(secondary_id, remote_host, opts).await;
-    linger_restore
-        .lock()
-        .expect("linger_restore mutex poisoned")
-        .entry(remote_host.to_owned())
-        .or_insert(was_linger);
+    let (was_linger, enabled) = enable_linger_for_node(secondary_id, remote_host, opts).await;
+    ledger.record_enable(remote_host, was_linger, enabled);
 }
 
 /// Run-end linger RESTORE: for every node the run enabled linger on (its
@@ -605,22 +667,43 @@ async fn ensure_node_linger(
 /// [`SlurmPreparation::cleanup`](super::pipeline::SlurmPreparation::cleanup)
 /// alongside the tunnel teardown. Best-effort per node (see
 /// [`disable_linger_for_node`]).
-pub(super) async fn restore_linger(linger_restore: &LingerRestoreMap, opts: &PreparationOptions) {
-    // Snapshot + clear under the std mutex (not held across the awaits below).
-    let to_restore: Vec<String> = {
-        let mut guard = linger_restore
-            .lock()
-            .expect("linger_restore mutex poisoned");
-        let hosts: Vec<String> = guard
-            .iter()
-            .filter(|&(_, &was_on)| !was_on)
-            .map(|(host, _)| host.clone())
-            .collect();
-        guard.clear();
-        hosts
-    };
-    for host in to_restore {
+pub(super) async fn restore_linger(ledger: &LingerLedger, opts: &PreparationOptions) {
+    // Snapshot + clear under the ledger's std mutex (not held across the
+    // awaits below).
+    for host in ledger.drain_restore_hosts() {
         disable_linger_for_node(&host, opts).await;
+    }
+}
+
+/// Emit the per-cohort linger-enable VERDICT line from the ledger's
+/// recorded outcomes, draining them.
+///
+/// Routing is the point (the per-node WARNs in
+/// [`enable_linger_for_node`] carry the detail but are routine prep
+/// tracing): when EVERY recorded node enabled OK the summary is a
+/// regular `info!` (durable in the full log, never on the
+/// `--important-stdio-only` stdout — routine prep must not wake the
+/// operator); when ANY node failed, the summary is wake-worthy and goes
+/// to the IMPORTANT target — reduced fan-kill resilience on named nodes
+/// is exactly the class of condition that stream exists for.
+pub(super) fn summarize_linger_enables(ledger: &LingerLedger) {
+    let (ok, failed) = ledger.drain_enable_verdicts();
+    if failed.is_empty() {
+        if ok > 0 {
+            tracing::info!(ok, "linger enable: {ok} node(s) ok, 0 failed");
+        }
+    } else {
+        tracing::warn!(
+            target: crate::IMPORTANT_TARGET,
+            ok,
+            failed = failed.len(),
+            "linger enable: {ok} node(s) ok, {} failed [{}] — workers on the failed nodes are \
+             NOT decoupled from the submitter -R login session (a session drop may fan-kill \
+             them). Remediation: pre-set `loginctl enable-linger` for the run user on those \
+             nodes or delegate it via polkit.",
+            failed.len(),
+            failed.join(", "),
+        );
     }
 }
 
@@ -636,26 +719,27 @@ pub(super) async fn restore_linger(linger_restore: &LingerRestoreMap, opts: &Pre
 /// linger is enabled on the target node (decoupling the worker's
 /// `user@<uid>.service` from the submitter's `-R` login session BEFORE that
 /// session exists, so a later session drop can't fan-kill the worker). The
-/// node's ORIGINAL linger state is recorded into `linger_restore` (keyed by
+/// node's ORIGINAL linger state is recorded into the linger ledger (keyed by
 /// host, first-writer-wins so a node hosting multiple secondaries restores
 /// to its genuine pre-run state) for the run-end restore in
-/// [`restore_linger`]. The enable rides this SAME spawner DI seam as the
-/// reverse tunnel itself — it is the per-node ssh-wire-up that must happen
-/// around this node's tunnel — so the concern-blind establishment policy
-/// ([`establish_tunnel`]) never sees it. Best-effort: a failure WARNs and
-/// the tunnel + worker proceed.
+/// [`restore_linger`], alongside the enable verdict for
+/// [`summarize_linger_enables`]. The enable rides this SAME spawner DI seam
+/// as the reverse tunnel itself — it is the per-node ssh-wire-up that must
+/// happen around this node's tunnel — so the concern-blind establishment
+/// policy ([`establish_tunnel`]) never sees it. Best-effort: a failure
+/// WARNs and the tunnel + worker proceed.
 pub(super) fn production_spawner(
     secondary_id: String,
     opts: PreparationOptions,
     primary_quic_port: u16,
-    linger_restore: LingerRestoreMap,
+    linger_ledger: LingerLedger,
 ) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
     move |host: String, tunnel_port: u16| {
         let secondary_id = secondary_id.clone();
         let opts = opts.clone();
-        let linger_restore = Arc::clone(&linger_restore);
+        let linger_ledger = linger_ledger.clone();
         Box::pin(async move {
-            ensure_node_linger(&secondary_id, &host, &opts, &linger_restore).await;
+            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
             spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
         })
     }
@@ -682,7 +766,7 @@ pub(super) fn production_spawner(
 /// — a fresh port would break that dial with no re-coordination path.
 ///
 /// Linger: like [`production_spawner`], the run user's linger is enabled on
-/// the target node (recording the original state into `linger_restore`)
+/// the target node (recording the original state into the ledger)
 /// before the rebind. A reconnect rebuilds an EXISTING node's dropped
 /// tunnel; re-enabling is idempotent and the first-writer-wins restore map
 /// preserves the node's genuine pre-run state.
@@ -690,14 +774,14 @@ pub(super) fn reconnect_spawner(
     secondary_id: String,
     opts: PreparationOptions,
     primary_quic_port: u16,
-    linger_restore: LingerRestoreMap,
+    linger_ledger: LingerLedger,
 ) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
     move |host: String, tunnel_port: u16| {
         let secondary_id = secondary_id.clone();
         let opts = opts.clone();
-        let linger_restore = Arc::clone(&linger_restore);
+        let linger_ledger = linger_ledger.clone();
         Box::pin(async move {
-            ensure_node_linger(&secondary_id, &host, &opts, &linger_restore).await;
+            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
             release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
             spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
         })

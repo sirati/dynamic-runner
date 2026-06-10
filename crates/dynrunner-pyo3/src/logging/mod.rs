@@ -28,7 +28,10 @@
 //!     gateway-shared `--log-dir` mount. When set, the framework's own
 //!     runner log is persisted under it, SPLIT BY ROLE: primary-role
 //!     events to `<dir>/primary.log`, secondary-role events to
-//!     `<dir>/secondary.log`, observer-role events to `<dir>/observer.log`.
+//!     `<dir>/secondary.log`, observer-role events to `<dir>/observer.log`,
+//!     and events under NO role span — the submitter's preparation phase
+//!     and any other un-attributed emit — to `<dir>/setup.log` (the
+//!     catch-all complement; see [`SETUP_LOG_FILENAME`]).
 //!     So the log of a relocated same-host primary (and the observer it
 //!     becomes after handing its role to a compute peer) is isolated from
 //!     its host secondary's, and all land host-readably. The submitter
@@ -129,11 +132,30 @@ const SECONDARY_LOG_FILENAME: &str = "secondary.log";
 /// keeping the relocated submitter debuggable.
 const OBSERVER_LOG_FILENAME: &str = "observer.log";
 
+/// Filename for events under NO role span — the per-node dir's
+/// catch-all complement of the three role files. The role files are
+/// scope-GATED, so without this complement every event emitted outside
+/// a coordinator's run future reached no file at all: on the submitter
+/// that silently dropped the ENTIRE preparation phase (tunnel build,
+/// linger enable/restore, binary staging) from the durable record —
+/// and under `--important-stdio-only` from stdout too (proven
+/// on-cluster: zero linger-enable lines anywhere, krater 2026-06-10).
+/// "setup" because pre-role events are bootstrap/preparation by
+/// nature; the same file also catches any later unattributed emit, so
+/// the four files are jointly LOSSLESS (every event lands in exactly
+/// one).
+const SETUP_LOG_FILENAME: &str = "setup.log";
+
 /// Cross-crate role-span names, the routing keys for the per-role
 /// full-log layers. Defined once in `dynrunner-core`; the coordinators
 /// enter spans of these names at their run entry, this layer reads the
 /// names off the event scope. See [`role_full_layer`].
 use dynrunner_core::{OBSERVER_ROLE_SPAN, PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN};
+
+/// All role-span names, in one place, so the catch-all complement
+/// ([`UnattributedFilter`]) and the per-role gates can never disagree
+/// about what counts as "attributed".
+const ROLE_SPAN_NAMES: [&str; 3] = [PRIMARY_ROLE_SPAN, SECONDARY_ROLE_SPAN, OBSERVER_ROLE_SPAN];
 
 /// Where the full (everything) sink writes.
 #[derive(Debug)]
@@ -320,6 +342,47 @@ where
         .boxed()
 }
 
+/// The complement gate of the per-role files: admit an event iff NO span
+/// in its scope is a role span ([`ROLE_SPAN_NAMES`]). Together with the
+/// three [`RoleFilter`]-gated layers this partitions the event stream —
+/// every event lands in exactly one per-node file. Same `enabled`-stays-
+/// true discipline as [`RoleFilter`] so spans are never disabled for the
+/// sibling layers.
+struct UnattributedFilter;
+
+impl<S> Filter<S> for UnattributedFilter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn enabled(&self, _meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
+        true
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
+        !cx.event_scope(event)
+            .into_iter()
+            .flatten()
+            .any(|span| ROLE_SPAN_NAMES.contains(&span.name()))
+    }
+}
+
+/// Build the catch-all full `fmt` layer over `writer` for events under NO
+/// role span — the per-node dir's `setup.log` (see [`SETUP_LOG_FILENAME`]
+/// for why it must exist). Same compact format and ANSI policy as the
+/// role files; the only difference is the complement gate.
+fn unattributed_full_layer<S, W>(make_writer: W) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_writer(make_writer)
+        .event_format(CompactRoleFormat)
+        .with_ansi(false)
+        .with_filter(UnattributedFilter)
+        .boxed()
+}
+
 /// Local-timezone `HH:MM` timer for the operator-facing important-stdio
 /// sink. Replaces the default RFC3339-UTC stamp with a compact local
 /// clock (e.g. a 19:07Z event prints `21:07` at UTC+2).
@@ -427,7 +490,10 @@ fn open_append_create(path: &std::path::Path) -> std::fs::File {
 /// THREE role-routed verbose file layers (`primary.log` / `secondary.log` /
 /// `observer.log`), each gated on the run future's role span — so a
 /// relocated submitter's post-relocation observer events land in
-/// `observer.log`, isolated from the promoted peer's `primary.log`. The
+/// `observer.log`, isolated from the promoted peer's `primary.log` — PLUS
+/// the catch-all complement (`setup.log`) for events under no role span,
+/// so the per-node record is jointly lossless (the role trio alone
+/// silently dropped the submitter's whole preparation phase). The
 /// stdio layer is always present (mode off → ungated stdout; mode on →
 /// only the important target to stdout). This is one rule per sink shape,
 /// not a per-event branch.
@@ -459,6 +525,14 @@ where
                 open_append_create(&dir.join(OBSERVER_LOG_FILENAME)),
                 OBSERVER_ROLE_SPAN,
             ));
+            // The complement: events under NO role span (the submitter's
+            // entire preparation phase — tunnel build, linger enable,
+            // binary staging — plus any other pre-/un-attributed emit).
+            // Without it the role-gated trio silently DROPPED those from
+            // the durable record (see SETUP_LOG_FILENAME).
+            layers.push(unattributed_full_layer(open_append_create(
+                &dir.join(SETUP_LOG_FILENAME),
+            )));
         }
     }
     layers.push(stdio_layer(io::stdout, config.important_stdio_only));
@@ -942,11 +1016,12 @@ mod tests {
     }
 
     #[test]
-    fn per_node_dir_adds_three_role_layers_and_creates_missing_dir() {
+    fn per_node_dir_adds_four_file_layers_and_creates_missing_dir() {
         // The per-node mount subdir is composed lazily, so the dir may not
         // exist when logging installs. Building the per-node-dir layers must
-        // materialise it and open ALL THREE role files (append-create), plus
-        // the stdio layer — four layers total.
+        // materialise it and open all THREE role files plus the catch-all
+        // setup.log (append-create), plus the stdio layer — five layers
+        // total.
         let dir = tempfile::tempdir().unwrap();
         let node_dir = dir.path().join("sec-0");
         assert!(!node_dir.exists(), "precondition: per-node dir absent");
@@ -954,8 +1029,8 @@ mod tests {
         let layers = build_layers::<Registry>(&config);
         assert_eq!(
             layers.len(),
-            4,
-            "expected primary.log + secondary.log + observer.log + stdio layers"
+            5,
+            "expected primary.log + secondary.log + observer.log + setup.log + stdio layers"
         );
         assert!(
             node_dir.join(PRIMARY_LOG_FILENAME).exists(),
@@ -969,6 +1044,70 @@ mod tests {
             node_dir.join(OBSERVER_LOG_FILENAME).exists(),
             "observer.log not created under fresh per-node dir"
         );
+        assert!(
+            node_dir.join(SETUP_LOG_FILENAME).exists(),
+            "setup.log not created under fresh per-node dir"
+        );
+    }
+
+    /// REPRODUCTION (the on-cluster observability gap): under the
+    /// SUBMITTER's production stack — per-node-dir full sink +
+    /// `--important-stdio-only` — an event emitted OUTSIDE any role span
+    /// (exactly what the whole preparation pipeline emits: linger
+    /// enable/restore, tunnel build, binary staging) must land in the
+    /// per-node `setup.log`. Before the catch-all complement existed it
+    /// reached NO sink at all: the three role files are scope-gated and
+    /// the importance-mode stdio gate dropped it from stdout — zero hits
+    /// anywhere (krater 2026-06-10). Also pins the partition: the
+    /// pre-role event stays OUT of the role files, and a role-scoped
+    /// event stays OUT of setup.log.
+    #[test]
+    fn preparation_events_outside_role_spans_land_in_setup_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let node_dir = dir.path().join("setup");
+        let config = LogConfig::new(
+            true, // --important-stdio-only: the consumer's flag
+            None,
+            Some(node_dir.display().to_string()),
+            false,
+        );
+        let layers = build_layers::<Registry>(&config);
+        // Layers first, then the global level gate (order-independent for a
+        // global filter; keeps the boxed `Layer<Registry>` set's base type).
+        let subscriber = Registry::default().with(layers).with(config.level);
+
+        with_default(subscriber, || {
+            // The preparation pipeline emits with NO role span entered.
+            tracing::info!("enabling logind linger for the run user");
+            // A role-scoped event for the partition assertion.
+            tracing::info_span!(PRIMARY_ROLE_SPAN, kind = "primary")
+                .in_scope(|| tracing::info!("primary-scoped-event"));
+        });
+
+        let setup = std::fs::read_to_string(node_dir.join(SETUP_LOG_FILENAME))
+            .expect("setup.log should exist");
+        assert!(
+            setup.contains("enabling logind linger"),
+            "preparation-phase event missing from setup.log — the \
+             observability gap regressed: {setup:?}"
+        );
+        assert!(
+            !setup.contains("primary-scoped-event"),
+            "role-scoped event leaked into setup.log — the partition broke: {setup:?}"
+        );
+
+        for role_file in [
+            PRIMARY_LOG_FILENAME,
+            SECONDARY_LOG_FILENAME,
+            OBSERVER_LOG_FILENAME,
+        ] {
+            let contents = std::fs::read_to_string(node_dir.join(role_file))
+                .unwrap_or_else(|_| panic!("{role_file} should exist"));
+            assert!(
+                !contents.contains("enabling logind linger"),
+                "pre-role event leaked into {role_file}: {contents:?}"
+            );
+        }
     }
 
     #[test]
@@ -1266,6 +1405,16 @@ mod tests {
                  role routing is not scope-gated: {contents:?}"
             );
         }
+
+        // ...but the record is NOT lost: the catch-all complement keeps it
+        // durable in setup.log (jointly-lossless per-node record).
+        let setup = std::fs::read_to_string(node_dir.join(SETUP_LOG_FILENAME))
+            .expect("setup.log should exist");
+        assert!(
+            setup.contains("orphan-bridge-record"),
+            "role-span-less bridge record missing from the setup.log \
+             catch-all: {setup:?}"
+        );
     }
 
     /// The `py_log` level NAME maps to the tracing level: a Python `WARNING`

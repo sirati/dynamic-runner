@@ -19,7 +19,9 @@ use tokio::task::JoinSet;
 use super::escalation::{EscalationVerdict, ReconnectEscalation};
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
-use super::ssh::{LingerRestoreMap, production_spawner, reconnect_spawner, restore_linger};
+use super::ssh::{
+    LingerLedger, production_spawner, reconnect_spawner, restore_linger, summarize_linger_enables,
+};
 use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
 use super::summary::{TunnelSetupSummary, secondary_id};
 
@@ -77,13 +79,14 @@ pub struct SlurmPreparation {
     /// without re-threading the value through their call site. `None`
     /// until the first `setup_ssh_tunnels` call records it.
     primary_quic_port: StdMutex<Option<u16>>,
-    /// `host -> was_linger`: each compute node's ORIGINAL logind linger
-    /// state, captured at tunnel-establish time (through the spawner) and
-    /// drained at [`Self::cleanup`] to restore nodes the run enabled linger
-    /// on. Shared into every spawner (initial cohort + respawn + reconnect)
-    /// so the whole run's linger lifecycle is one map. See
-    /// [`LingerRestoreMap`].
-    linger_restore: LingerRestoreMap,
+    /// Per-host linger bookkeeping: each compute node's ORIGINAL logind
+    /// linger state (captured at tunnel-establish time through the
+    /// spawner, drained at [`Self::cleanup`] to restore nodes the run
+    /// enabled linger on) plus the enable verdicts (drained by the
+    /// post-cohort summary in [`Self::setup_ssh_tunnels`]). Shared into
+    /// every spawner (initial cohort + respawn + reconnect) so the whole
+    /// run's linger lifecycle is one ledger. See [`LingerLedger`].
+    linger_ledger: LingerLedger,
     /// Half-dead-tunnel escalation (#342): per-secondary consecutive
     /// alive-noop reconnect-tick streaks. Consulted by
     /// [`Self::reestablish_one_tunnel`] whenever the liveness gate
@@ -103,7 +106,7 @@ impl SlurmPreparation {
             secondary_port_map: Arc::new(StdMutex::new(HashMap::new())),
             establish_pool,
             primary_quic_port: StdMutex::new(None),
-            linger_restore: Arc::new(StdMutex::new(HashMap::new())),
+            linger_ledger: LingerLedger::default(),
             reconnect_escalation: StdMutex::new(ReconnectEscalation::default()),
         }
     }
@@ -200,14 +203,14 @@ impl SlurmPreparation {
             // the persistent port map without borrowing `self` (they
             // live on the JoinSet past the borrow).
             let port_map = Arc::clone(&self.secondary_port_map);
-            let linger_restore = Arc::clone(&self.linger_restore);
+            let linger_ledger = self.linger_ledger.clone();
             let id_for_task = secondary_id.clone();
             watchers.spawn_local(async move {
                 let spawner = production_spawner(
                     id_for_task.clone(),
                     opts.clone(),
                     primary_quic_port,
-                    linger_restore,
+                    linger_ledger,
                 );
                 let res = establish_one_tunnel_inner(
                     &id_for_task,
@@ -242,6 +245,12 @@ impl SlurmPreparation {
 
         // Drop the JoinSet — aborts any in-flight watchers.
         drop(watchers);
+
+        // Cohort linger-enable VERDICT: one summary line from the
+        // ledger's recorded outcomes (IMPORTANT only when a node
+        // failed). Emitted here — after the gather — so it covers every
+        // watcher that got as far as its enable attempt.
+        summarize_linger_enables(&self.linger_ledger);
 
         match &result {
             Ok(map) => {
@@ -330,14 +339,14 @@ impl SlurmPreparation {
         let store = SharedTunnelVec::new(Arc::clone(&self.ssh_tunnels));
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
-        let linger_restore = Arc::clone(&self.linger_restore);
+        let linger_ledger = self.linger_ledger.clone();
         let id_owned = secondary_id.to_owned();
 
         let spawner = production_spawner(
             id_owned.clone(),
             opts.clone(),
             primary_quic_port,
-            linger_restore,
+            linger_ledger,
         );
         let _port = establish_one_tunnel_inner(
             &id_owned,
@@ -477,14 +486,14 @@ impl SlurmPreparation {
         let opts = self.opts.clone();
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
-        let linger_restore = Arc::clone(&self.linger_restore);
+        let linger_ledger = self.linger_ledger.clone();
         let id_owned = secondary_id.to_owned();
 
         let spawner = reconnect_spawner(
             id_owned.clone(),
             opts.clone(),
             primary_quic_port,
-            linger_restore,
+            linger_ledger,
         );
         let _port = establish_one_tunnel_inner(
             &id_owned,
@@ -533,7 +542,7 @@ impl SlurmPreparation {
         PerSecondaryTunnelRegistry::new(Arc::clone(&self.reconnect_tunnels))
             .drain_and_terminate()
             .await;
-        restore_linger(&self.linger_restore, &self.opts).await;
+        restore_linger(&self.linger_ledger, &self.opts).await;
         tracing::info!("SLURM preparation cleanup complete");
     }
 }

@@ -34,6 +34,27 @@
 //! re-hashing the real file catches a corrupted/partial remote and
 //! forces a re-upload. A missing remote makes `sha256sum` exit
 //! non-zero, which the gate reads as "absent" → upload.
+//!
+//! ## Provably fresh: verify-after-upload
+//!
+//! Both branches of the gate end with a PROVEN hash match between the
+//! local source and the remote bytes:
+//!
+//! * the **skip** branch is taken only when the freshly computed local
+//!   SHA-256 equals the freshly computed remote SHA-256 (no recorded
+//!   state is ever consulted, so there is nothing that can go stale);
+//! * the **upload** branch re-hashes the remote AFTER the transfer and
+//!   hard-errors on a mismatch (a truncated/corrupted transfer must
+//!   never let a run dispatch against wrong bytes).
+//!
+//! Every decision line logs BOTH hashes, so an operator can compare
+//! the deployed binary against a locally built artifact with one
+//! `sha256sum`. This keeps the #241 bandwidth win (no transfer on a
+//! genuine cache hit) with zero staleness window: a stale REMOTE is
+//! impossible by construction. A stale LOCAL source (e.g. an outdated
+//! `DYNRUNNER_SLURM_WRAPPER_BIN_SOURCE` override) is outside this
+//! primitive's reach — the logged local hash is the audit hook for
+//! that case.
 
 use std::path::Path;
 
@@ -63,8 +84,13 @@ impl<G: Gateway> SlurmJobManager<G> {
     ///   bytes); the `chmod` still runs so a remote whose mode bits
     ///   drifted is corrected idempotently and cheaply.
     /// * On a mismatch or an absent remote, transfers the binary via
-    ///   `transfer_file` and `chmod 755`s it.
-    /// * Returns the resolved remote path.
+    ///   `transfer_file`, then RE-HASHES the remote and requires it to
+    ///   equal the local hash —
+    ///   [`SlurmError::StagedBinaryHashMismatch`] on any divergence —
+    ///   and `chmod 755`s it.
+    /// * Returns the resolved remote path. On `Ok`, the remote bytes
+    ///   provably equal the local bytes (hash-verified on BOTH
+    ///   branches; see the module doc's "Provably fresh" section).
     ///
     /// Remote layout mirrors `submit_job`'s `job_<name>.sh` placement:
     /// directly under `root_folder`, no nested subfolder, keeping the
@@ -89,24 +115,63 @@ impl<G: Gateway> SlurmJobManager<G> {
         // unreadable between the two calls. Treat that as "cannot vouch
         // for the local bytes" and fall through to an unconditional
         // upload (`transfer_file` then surfaces the real I/O error if
-        // the source is genuinely gone).
+        // the source is genuinely gone, and the post-upload
+        // verification below re-attempts the local hash).
         let local_hash = compute_file_hash(local);
         let remote_hash = self.gateway_file_sha256(&remote_path).await?;
 
-        if let Some(local_hash) = &local_hash
-            && remote_hash.as_deref() == Some(local_hash.as_str())
-        {
+        let up_to_date = match (&local_hash, &remote_hash) {
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        };
+        if up_to_date {
             tracing::info!(
                 local = %local.display(),
                 remote = %remote_path,
-                "binary up-to-date on gateway, skipping upload",
+                hash = local_hash.as_deref().unwrap_or("<unhashable>"),
+                "binary up-to-date on gateway (local and remote SHA-256 match), skipping upload",
             );
         } else {
-            self.gateway.transfer_file(local, &remote_path).await?;
             tracing::info!(
                 local = %local.display(),
                 remote = %remote_path,
-                "uploaded binary to gateway",
+                local_hash = local_hash.as_deref().unwrap_or("<unhashable>"),
+                remote_hash = remote_hash.as_deref().unwrap_or("<absent>"),
+                "no byte-identical copy on gateway, uploading binary",
+            );
+            self.gateway.transfer_file(local, &remote_path).await?;
+
+            // Freshness proof: re-hash the REMOTE after the transfer and
+            // require it to equal the local hash. A truncated/corrupted
+            // transfer (or a gateway-side clobber racing the upload) must
+            // surface as a hard error at dispatch time, never as a fleet
+            // exec'ing wrong bytes. The local hash is re-attempted here
+            // for the (`exists()`-raced) case where the pre-gate hash
+            // failed: a transfer that just succeeded read the source, so
+            // a still-unhashable local is itself a verification failure.
+            let local_hash = match local_hash.or_else(|| compute_file_hash(local)) {
+                Some(h) => h,
+                None => {
+                    return Err(SlurmError::StagedBinaryHashMismatch {
+                        remote: remote_path,
+                        local_hash: "<unhashable local source>".into(),
+                        remote_hash: None,
+                    });
+                }
+            };
+            let uploaded_hash = self.gateway_file_sha256(&remote_path).await?;
+            if uploaded_hash.as_deref() != Some(local_hash.as_str()) {
+                return Err(SlurmError::StagedBinaryHashMismatch {
+                    remote: remote_path,
+                    local_hash,
+                    remote_hash: uploaded_hash,
+                });
+            }
+            tracing::info!(
+                local = %local.display(),
+                remote = %remote_path,
+                hash = %local_hash,
+                "uploaded binary to gateway (remote SHA-256 verified against local)",
             );
         }
 

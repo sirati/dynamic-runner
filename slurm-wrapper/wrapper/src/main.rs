@@ -157,21 +157,30 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
     // state and WARN if it reads as not set — a safety net surfacing a
     // setup-enable that silently failed. Linger is a resilience property,
     // NEVER a launch gate: the container always proceeds.
-    if linger::check_linger() {
-        tracing::info!(
+    match linger::check_linger() {
+        linger::LingerCheck::Enabled { user } => tracing::info!(
             target: LOG_TARGET,
+            user,
             "linger is enabled for the run user; workers are decoupled from the submitter login session"
-        );
-    } else {
-        tracing::warn!(
+        ),
+        linger::LingerCheck::NotEnabled { user } => tracing::warn!(
             target: LOG_TARGET,
+            user,
             "linger is NOT enabled for the run user — workers are NOT decoupled from the \
              submitter -R login session; a session drop may fan-kill this secondary. The \
              submitter setup is expected to enable it at tunnel-build time; surface this if it \
              persists (e.g. polkit-restricted node: pre-set `loginctl enable-linger` for the run \
              user or delegate it). Proceeding with container launch (linger is best-effort, not \
              a launch gate)."
-        );
+        ),
+        linger::LingerCheck::UserUnresolved => tracing::warn!(
+            target: LOG_TARGET,
+            "cannot CHECK linger: the run user's name did not resolve — no passwd entry \
+             (this static-musl binary reads only /etc/passwd, never LDAP/sssd) and no \
+             SLURM_JOB_USER/USER/LOGNAME in the environment. The linger marker may well be \
+             present; this says nothing about the actual linger state. Proceeding with \
+             container launch (linger is best-effort, not a launch gate)."
+        ),
     }
 
     // --- 5. pre-flight orphan sweep (generate.rs:452-489) ---

@@ -20,11 +20,15 @@ use dynrunner_gateway::traits::{CommandResult, Gateway, GatewayError};
 
 /// Records every gateway call the upload primitive makes so each
 /// test can assert (a) the operations issued and (b) their order.
-/// Single concern: capture-for-assertion; no behaviour beyond
-/// returning `success: 0` on every operation.
+/// Single concern: capture-for-assertion, plus the minimum stateful
+/// behaviour a faithful gateway shows: `sha256sum` reports "no such
+/// file" until a `transfer_file` lands the bytes, after which it
+/// reports their real hash (the post-upload verification reads it).
 #[derive(Default)]
 struct ShutdownBinaryRecordingGateway {
     events: Mutex<Vec<GatewayEvent>>,
+    /// Hash of the transferred bytes, `None` until a transfer happens.
+    remote_hash: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +59,21 @@ impl Gateway for ShutdownBinaryRecordingGateway {
             .lock()
             .unwrap()
             .push(GatewayEvent::Command(cmd.to_string()));
+        if cmd.starts_with("sha256sum ") {
+            return Ok(match &*self.remote_hash.lock().unwrap() {
+                Some(hash) => CommandResult {
+                    return_code: 0,
+                    // `sha256sum` prints `<hex>␣␣<path>`.
+                    stdout: format!("{hash}  /remote/path\n"),
+                    stderr: String::new(),
+                },
+                None => CommandResult {
+                    return_code: 1,
+                    stdout: String::new(),
+                    stderr: "sha256sum: No such file or directory".into(),
+                },
+            });
+        }
         Ok(CommandResult {
             return_code: 0,
             stdout: String::new(),
@@ -69,6 +88,10 @@ impl Gateway for ShutdownBinaryRecordingGateway {
                 local: local.to_path_buf(),
                 remote: remote.to_string(),
             });
+        // The remote now holds the source bytes; the post-upload
+        // verification probe must see their hash, as on a real gateway.
+        *self.remote_hash.lock().unwrap() =
+            dynrunner_manager_distributed::compute_file_hash(local);
         Ok(())
     }
     async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
@@ -85,13 +108,13 @@ impl Gateway for ShutdownBinaryRecordingGateway {
     }
 }
 
-/// Local source exists and the gateway has no usable remote copy
-/// (this recording gateway returns empty `sha256sum` output → "no
-/// remote hash") → upload probes the remote hash, then issues exactly
-/// one `transfer_file(local, root/dynrunner-slurm-shutdown)` followed
-/// by one `chmod 755 root/dynrunner-slurm-shutdown` (in that order),
-/// returns `Ok(remote_path)`, and records the resolved path on the
-/// manager so subsequent wrapper renders pick it up via
+/// Local source exists and the gateway has no remote copy yet → upload
+/// probes the remote hash, issues exactly one
+/// `transfer_file(local, root/dynrunner-slurm-shutdown)`, re-probes the
+/// remote hash (the post-upload freshness verification), then one
+/// `chmod 755 root/dynrunner-slurm-shutdown` (in that order), returns
+/// `Ok(remote_path)`, and records the resolved path on the manager so
+/// subsequent wrapper renders pick it up via
 /// `shutdown_manager_remote_path`.
 #[tokio::test(flavor = "current_thread")]
 async fn upload_shutdown_manager_binary_uploads_and_chmods() {
@@ -125,9 +148,9 @@ async fn upload_shutdown_manager_binary_uploads_and_chmods() {
     let events = mgr.gateway().events();
     assert_eq!(
         events.len(),
-        3,
+        4,
         "upload must issue exactly one sha256sum probe + one transfer_file \
-         + one chmod; got: {events:?}",
+         + one verification sha256sum + one chmod; got: {events:?}",
     );
     match &events[0] {
         GatewayEvent::Command(cmd) => {
@@ -144,9 +167,19 @@ async fn upload_shutdown_manager_binary_uploads_and_chmods() {
     }
     match &events[2] {
         GatewayEvent::Command(cmd) => {
+            assert_eq!(
+                cmd,
+                &format!("sha256sum {expected_remote}"),
+                "third event must be the post-upload verification probe"
+            );
+        }
+        other => panic!("expected third event to be the verification probe, got {other:?}"),
+    }
+    match &events[3] {
+        GatewayEvent::Command(cmd) => {
             assert_eq!(cmd, &format!("chmod 755 {expected_remote}"));
         }
-        other => panic!("expected third event to be Command(chmod), got {other:?}"),
+        other => panic!("expected fourth event to be Command(chmod), got {other:?}"),
     }
 }
 

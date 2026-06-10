@@ -12,7 +12,12 @@
 //! caller-supplied "remote bytes" fixture so the test asserts genuine
 //! hash equality rather than a hard-coded digest: the *same* bytes on
 //! both sides must skip, *different* bytes (or no remote at all) must
-//! transfer.
+//! transfer — and a transfer must end in a PASSING post-upload hash
+//! verification (the gate re-hashes the remote after `transfer_file`).
+//! The mock is therefore stateful: a FAITHFUL transfer updates the
+//! reply to the transferred bytes' hash, while the corrupted-transfer
+//! fixture leaves the stale reply in place so the verification's
+//! hard-error branch is observable.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -32,15 +37,27 @@ enum GatewayEvent {
 }
 
 /// Records every gateway call and answers a `sha256sum <remote>`
-/// probe with the SHA-256 of `remote_contents` (or a `success: false`
-/// result — mimicking `test -f`/`sha256sum` on a missing file — when
-/// `remote_contents` is `None`). Single concern: capture-for-assertion
-/// plus a controllable remote-hash reply.
+/// probe with the SHA-256 of the CURRENT remote bytes (or a
+/// `success: false` result — mimicking `test -f`/`sha256sum` on a
+/// missing file — when there is no remote copy). Single concern:
+/// capture-for-assertion plus a controllable remote-hash reply.
+///
+/// Stateful like the real gateway: a `transfer_file` on a
+/// `faithful_transfer` gateway updates the reply to the hash of the
+/// transferred local bytes (so the post-upload verification sees what
+/// a successful transfer produces); with `faithful_transfer == false`
+/// the reply stays whatever it was (a truncated/corrupted transfer
+/// whose remote bytes do NOT match the source).
 struct HashProbingGateway {
     events: Mutex<Vec<GatewayEvent>>,
     /// Hex SHA-256 the `sha256sum` probe reports, or `None` to report
-    /// "no such file" (probe exits non-zero).
-    remote_hash: Option<String>,
+    /// "no such file" (probe exits non-zero). Updated by a faithful
+    /// `transfer_file`.
+    remote_hash: Mutex<Option<String>>,
+    /// Whether `transfer_file` lands the source bytes intact (updates
+    /// `remote_hash` from the local file) or corrupts them (leaves the
+    /// stale `remote_hash` in place).
+    faithful_transfer: bool,
 }
 
 impl HashProbingGateway {
@@ -50,13 +67,10 @@ impl HashProbingGateway {
     /// Hashes the bytes through a per-call [`TempDir`] so concurrent
     /// tests in the same process never race on a shared scratch file.
     fn with_remote_bytes(remote_contents: &[u8]) -> Self {
-        let dir = TempDir::new().expect("tmpdir");
-        let staged = dir.path().join("remote.bin");
-        std::fs::write(&staged, remote_contents).unwrap();
-        let hash = compute_file_hash(&staged);
         Self {
             events: Mutex::new(Vec::new()),
-            remote_hash: hash,
+            remote_hash: Mutex::new(Some(hash_of_bytes(remote_contents))),
+            faithful_transfer: true,
         }
     }
 
@@ -65,7 +79,21 @@ impl HashProbingGateway {
     fn absent() -> Self {
         Self {
             events: Mutex::new(Vec::new()),
-            remote_hash: None,
+            remote_hash: Mutex::new(None),
+            faithful_transfer: true,
+        }
+    }
+
+    /// Gateway whose `transfer_file` CORRUPTS the payload: the probe
+    /// keeps reporting the pre-transfer remote state (here: stale
+    /// `remote_contents`), exactly what a truncated transfer or an
+    /// out-of-band clobber racing the upload looks like to the
+    /// post-upload verification.
+    fn with_corrupting_transfer(remote_contents: &[u8]) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            remote_hash: Mutex::new(Some(hash_of_bytes(remote_contents))),
+            faithful_transfer: false,
         }
     }
 
@@ -91,7 +119,7 @@ impl Gateway for HashProbingGateway {
             .unwrap()
             .push(GatewayEvent::Command(cmd.to_string()));
         if cmd.starts_with("sha256sum ") {
-            return Ok(match &self.remote_hash {
+            return Ok(match &*self.remote_hash.lock().unwrap() {
                 Some(hash) => CommandResult {
                     return_code: 0,
                     // `sha256sum` prints `<hex>␣␣<path>`.
@@ -119,6 +147,12 @@ impl Gateway for HashProbingGateway {
                 local: local.to_path_buf(),
                 remote: remote.to_string(),
             });
+        if self.faithful_transfer {
+            // The remote now holds the source bytes — the subsequent
+            // `sha256sum` probe must see their hash, as on a real
+            // gateway.
+            *self.remote_hash.lock().unwrap() = compute_file_hash(local);
+        }
         Ok(())
     }
     async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
@@ -148,6 +182,16 @@ fn write_local(bytes: &[u8]) -> (TempDir, PathBuf) {
     let local = tmp.path().join("dynrunner-slurm-wrapper");
     std::fs::write(&local, bytes).expect("write fake binary");
     (tmp, local)
+}
+
+/// SHA-256 (hex) of `bytes` through the SAME helper production uses
+/// (`compute_file_hash` is file-based), staged via a per-call
+/// [`TempDir`] so concurrent tests never race on a shared scratch file.
+fn hash_of_bytes(bytes: &[u8]) -> String {
+    let dir = TempDir::new().expect("tmpdir");
+    let staged = dir.path().join("remote.bin");
+    std::fs::write(&staged, bytes).unwrap();
+    compute_file_hash(&staged).expect("hash scratch file")
 }
 
 /// Gateway already holds a byte-identical copy (same SHA-256) → the
@@ -191,11 +235,13 @@ async fn same_hash_skips_transfer() {
     );
 }
 
-/// Gateway holds a DIFFERENT binary (different SHA-256) → the binary
-/// is re-transferred (probe → transfer → chmod, in order). Pins the
-/// "changed binary MUST be re-uploaded" correctness requirement.
+/// Gateway holds a DIFFERENT (stale) binary → the binary is
+/// re-transferred and the remote is RE-HASHED to prove the upload
+/// landed intact (probe → transfer → verify-probe → chmod, in order).
+/// Pins the "changed binary MUST be re-uploaded" correctness
+/// requirement plus the post-upload freshness verification.
 #[tokio::test(flavor = "current_thread")]
-async fn different_hash_transfers() {
+async fn different_hash_transfers_and_verifies() {
     let (_tmp, local) = write_local(b"musl-static binary bytes v2");
 
     let gw = HashProbingGateway::with_remote_bytes(b"stale binary bytes v1");
@@ -205,7 +251,7 @@ async fn different_hash_transfers() {
     let resolved = mgr
         .upload_wrapper_binary_from(local.clone())
         .await
-        .expect("hash mismatch re-uploads and resolves the path");
+        .expect("hash mismatch re-uploads, verifies, and resolves the path");
     assert_eq!(resolved, expected_remote);
 
     let events = mgr.gateway().events();
@@ -217,17 +263,18 @@ async fn different_hash_transfers() {
                 local,
                 remote: expected_remote.clone(),
             },
+            GatewayEvent::Command(format!("sha256sum {expected_remote}")),
             GatewayEvent::Command(format!("chmod 755 {expected_remote}")),
         ],
-        "hash mismatch must re-transfer; got: {events:?}",
+        "hash mismatch must re-transfer and re-verify; got: {events:?}",
     );
 }
 
 /// Gateway has no remote copy at all (`sha256sum` exits non-zero) →
-/// the binary is transferred. Pins the "absent remote → upload"
-/// branch.
+/// the binary is transferred and the post-upload verification re-hashes
+/// the now-present remote. Pins the "absent remote → upload" branch.
 #[tokio::test(flavor = "current_thread")]
-async fn absent_remote_transfers() {
+async fn absent_remote_transfers_and_verifies() {
     let (_tmp, local) = write_local(b"musl-static binary bytes");
 
     let gw = HashProbingGateway::absent();
@@ -236,7 +283,7 @@ async fn absent_remote_transfers() {
     let expected_remote = format!("/srv/slurm/{WRAPPER_BIN_REMOTE_BASENAME}");
     mgr.upload_wrapper_binary_from(local.clone())
         .await
-        .expect("absent remote uploads");
+        .expect("absent remote uploads and verifies");
 
     let events = mgr.gateway().events();
     assert_eq!(
@@ -247,8 +294,58 @@ async fn absent_remote_transfers() {
                 local,
                 remote: expected_remote.clone(),
             },
+            GatewayEvent::Command(format!("sha256sum {expected_remote}")),
             GatewayEvent::Command(format!("chmod 755 {expected_remote}")),
         ],
-        "absent remote must transfer; got: {events:?}",
+        "absent remote must transfer then verify; got: {events:?}",
+    );
+}
+
+/// A transfer whose remote bytes do NOT end up matching the local
+/// source (truncated/corrupted transfer, or an out-of-band clobber
+/// racing the upload) must surface as a HARD error — the staleness
+/// window the verify-after-upload design closes. The chmod must not
+/// run and no remote path may be recorded: nothing downstream may
+/// treat the corrupt staging as deployable.
+#[tokio::test(flavor = "current_thread")]
+async fn corrupted_transfer_is_a_hard_error() {
+    let (_tmp, local) = write_local(b"musl-static binary bytes v2");
+
+    // Stale remote AND a corrupting transfer: the post-upload probe
+    // keeps reporting the stale hash.
+    let gw = HashProbingGateway::with_corrupting_transfer(b"stale binary bytes v1");
+    let mut mgr = manager_with(gw);
+
+    let expected_remote = format!("/srv/slurm/{WRAPPER_BIN_REMOTE_BASENAME}");
+    let err = mgr
+        .upload_wrapper_binary_from(local.clone())
+        .await
+        .expect_err("post-upload hash mismatch must hard-error");
+    assert!(
+        matches!(
+            &err,
+            crate::job_manager::SlurmError::StagedBinaryHashMismatch { remote, .. }
+                if remote == &expected_remote
+        ),
+        "expected StagedBinaryHashMismatch for {expected_remote}, got: {err:?}",
+    );
+    assert_eq!(
+        mgr.wrapper_bin_remote_path(),
+        None,
+        "a failed verification must not record a deployable remote path",
+    );
+
+    let events = mgr.gateway().events();
+    assert_eq!(
+        events,
+        vec![
+            GatewayEvent::Command(format!("sha256sum {expected_remote}")),
+            GatewayEvent::TransferFile {
+                local,
+                remote: expected_remote.clone(),
+            },
+            GatewayEvent::Command(format!("sha256sum {expected_remote}")),
+        ],
+        "verification failure must abort BEFORE the chmod; got: {events:?}",
     );
 }
