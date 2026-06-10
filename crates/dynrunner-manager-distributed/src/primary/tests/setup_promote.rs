@@ -214,11 +214,15 @@ async fn discover_on_promotion_owed_nonempty_seeds_tasks_and_settles() {
 }
 
 /// `discover_on_promotion` on `Owed` + an EMPTY corpus: originates
-/// `DiscoverySettled` AND `RunComplete` (the empty-corpus terminal — no
-/// `TaskCompleted` will ever drive the counter finalize). The
-/// `ingest_setup_discovery` precedent.
+/// `DiscoverySettled` and NO run-terminal. POST-FIX the empty corpus finalizes
+/// through the SAME counter machinery the all-skipped / mode-1 paths use — the
+/// seam settles the debt + re-hydrates (`total_tasks == 0`, `completed` empty),
+/// and the operational loop's `0 + 0 >= 0` counter exit fires once the debt is
+/// no longer `Owed`. No single-phase-view `RunComplete` is originated, so a
+/// phase-chaining consumer that injects its real first phase via `on_phase_end`
+/// is not contradicted.
 #[tokio::test(flavor = "current_thread")]
-async fn discover_on_promotion_owed_empty_settles_and_run_completes() {
+async fn discover_on_promotion_owed_empty_settles_and_counter_finalizes() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -254,10 +258,23 @@ async fn discover_on_promotion_owed_empty_settles_and_run_completes() {
                 0,
                 "an empty corpus seeds no tasks"
             );
+            // POST-FIX: NO explicit RunComplete — the empty corpus finalizes via
+            // the counter, identical to the all-skipped / mode-1 paths.
             assert!(
-                primary.cluster_state_for_test().run_complete(),
-                "the EMPTY arm must originate RunComplete (no TaskCompleted will \
-                 ever drive the counter finalize)"
+                !primary.cluster_state_for_test().run_complete(),
+                "the empty arm must NOT originate a single-phase-view RunComplete; \
+                 it finalizes through the counter exit"
+            );
+            assert_eq!(
+                primary.total_tasks, 0,
+                "hydrate sets total_tasks from the (empty) seeded ledger"
+            );
+            // ANTI-HANG GUARD: with the debt now Settled the empty-corpus
+            // counter exit (`0 + 0 >= 0`, no active workers) fires.
+            assert!(
+                primary.run_complete_check(),
+                "once the empty discovery settles, the zero-task counter exit fires \
+                 — deleting the explicit RunComplete does not strand the empty corpus"
             );
         })
         .await;
@@ -339,12 +356,21 @@ async fn discover_on_promotion_marked_item_lands_skipped_unmarked_lands_pending(
 }
 
 /// `discover_on_promotion` on `Owed` + a 100%-already-done corpus: every item
-/// is marked skipped, so there is NO to-run work and NO `TaskCompleted` will
-/// ever drive the counter finalize — the seam must originate `RunComplete`
-/// exactly like the empty-corpus case (the all-skipped finalize, design §6
-/// item 5). The skipped items are still seeded as terminal ledger entries.
+/// is marked skipped. POST-FIX the seam originates NO run-terminal — it
+/// finalizes through the SAME counter machinery mode-1 uses. The skips land as
+/// terminal `SkippedAlreadyDone` ledger entries, debt Settles, and the seam's
+/// own trailing `hydrate_from_cluster_state` projects every skip into
+/// `completed_tasks` (with `total_tasks` from the ledger) so the operational
+/// loop's `completed + failed >= total_tasks` counter exit can finalize the
+/// run WITHOUT a single-phase-view `RunComplete` that a phase-chaining
+/// consumer's later `on_phase_end` injection would contradict.
+///
+/// The `run_complete_check()` assertion at the tail is the ANTI-HANG guard: it
+/// proves the deleted explicit `RunComplete` is not load-bearing — the counter
+/// genuinely accounts for the post-hydrate skips, so removing the shortcut
+/// trades the premature complete for a clean counter finalize, not a hang.
 #[tokio::test(flavor = "current_thread")]
-async fn discover_on_promotion_all_skipped_settles_and_run_completes() {
+async fn discover_on_promotion_all_skipped_settles_and_counter_finalizes() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -394,10 +420,113 @@ async fn discover_on_promotion_all_skipped_settles_and_run_completes() {
                 ),
                 "every item in an all-skipped corpus is terminal SkippedAlreadyDone"
             );
+            // POST-FIX: the seam originates NO `RunComplete` of its own — a
+            // single-phase discovery view must NOT decide the run is terminal.
             assert!(
-                primary.cluster_state_for_test().run_complete(),
-                "a 100%-already-done corpus has no to-run work, so the seam must \
-                 originate RunComplete (no TaskCompleted will drive the finalize)"
+                !primary.cluster_state_for_test().run_complete(),
+                "the seam must NOT originate a single-phase-view RunComplete; the \
+                 all-skipped corpus finalizes through the counter exit, like mode-1"
+            );
+            // The seam's trailing hydrate projected BOTH skips into the
+            // completed set (the part that closes the counter gap the deleted
+            // explicit RunComplete used to cover).
+            assert!(
+                primary.completed_tasks.contains(&h1)
+                    && primary.completed_tasks.contains(&h2),
+                "hydrate must project every SkippedAlreadyDone into completed_tasks \
+                 so the counter exit accounts for them; completed_tasks = {:?}",
+                primary.completed_tasks
+            );
+            assert_eq!(
+                primary.total_tasks, 2,
+                "hydrate sets total_tasks from the seeded ledger"
+            );
+            // ANTI-HANG GUARD: the counter exit fires (`2 + 0 >= 2` with no
+            // active workers and debt Settled). Without the post-hydrate skip
+            // projection this would be false → the run would hang, trading a
+            // premature complete for a deadlock.
+            assert!(
+                primary.run_complete_check(),
+                "an all-skipped mode-2 corpus must finalize via the counter exit — \
+                 the post-hydrate skip projection makes `completed >= total` true, \
+                 so deleting the explicit RunComplete does NOT introduce a hang"
+            );
+        })
+        .await;
+}
+
+/// PREMATURE-COMPLETE REGRESSION (the consumer-reproduced bug): a phase-chaining
+/// mode-2 corpus where discovery returns ZERO to-run items but a DEPENDENT phase
+/// is declared in `phase_deps`. The deleted `to_run == 0 → RunComplete` shortcut
+/// would have originated a STICKY `RunComplete` from this single-phase discovery
+/// view — wrong, because the consumer injects the dependent phase's real work
+/// later via `on_phase_end`, and the sticky latch made the observer exit
+/// ("run complete: 0 succeeded") while secondaries still worked and the cascade
+/// ran the next phase in an already-"complete" state.
+///
+/// POST-FIX the seam originates NO `RunComplete`: zero to-run items at discovery
+/// time is NOT a run-terminal when a later phase is still pending injection. The
+/// dependent phase here (`phase2 → phase1`) models that later-injected work — at
+/// the discovery seam it is an empty declared phase, NOT a completion signal.
+#[tokio::test(flavor = "current_thread")]
+async fn discover_on_promotion_zero_to_run_with_dependent_phase_no_run_complete() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            primary.cluster_state_mut_for_test().apply(ClusterMutation::DiscoveryDebtDeclared);
+
+            // The phase-chaining shape: `phase2` depends on `phase1`. Discovery
+            // resolves only `phase1` (all-skipped, zero to-run); `phase2`'s real
+            // work is the consumer's later `on_phase_end` injection. At the
+            // discovery seam `phase2` is an empty declared phase.
+            let mut deps = HashMap::new();
+            deps.insert(
+                dynrunner_core::PhaseId::from("phase2"),
+                vec![dynrunner_core::PhaseId::from("phase1")],
+            );
+
+            let mut s1 = make_binary("p1-done-1", 100);
+            s1.phase_id = dynrunner_core::PhaseId::from("phase1");
+            let mut s2 = make_binary("p1-done-2", 100);
+            s2.phase_id = dynrunner_core::PhaseId::from("phase1");
+
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery_marked(
+                vec![(s1, true), (s2, true)],
+                deps,
+                fires.clone(),
+            ));
+
+            primary
+                .discover_on_promotion()
+                .await
+                .expect("Owed + zero-to-run + dependent phase → Ok");
+
+            assert_eq!(
+                primary.cluster_state_for_test().discovery_debt(),
+                DiscoveryDebt::Settled,
+                "discovery settles even with zero to-run items"
+            );
+            // THE REGRESSION ASSERTION: no single-phase-view RunComplete.
+            assert!(
+                !primary.cluster_state_for_test().run_complete(),
+                "zero to-run items at discovery time MUST NOT originate RunComplete \
+                 when a dependent phase is declared — the consumer injects its real \
+                 work via on_phase_end and the sticky latch would prematurely \
+                 complete the run (the consumer-reproduced bug)"
+            );
+            // The seam grew NO `RunComplete` mutation in the seed batch — the
+            // ledger flag is the load-bearing observable, and it is unset.
+            assert!(
+                !primary.cluster_state_for_test().run_complete(),
+                "the discovery seam must not grow a RunComplete latch in any form"
             );
         })
         .await;

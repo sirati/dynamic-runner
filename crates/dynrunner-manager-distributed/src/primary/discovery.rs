@@ -36,12 +36,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `PhaseDepsSet` + one `TaskAdded` per discovered binary +
     /// one `TaskSkippedAlreadyDone` per discovery-marked already-done item +
     /// `DiscoverySettled`, through the canonical broadcast/apply pipeline.
-    /// When there is NO to-run work — an empty corpus OR a 100%-already-done
-    /// corpus — it additionally originates `RunComplete` (no `TaskCompleted`
-    /// will ever drive the counter finalize; the precedent the deleted
-    /// `ingest_setup_discovery` set for the empty-discovery happy path,
-    /// generalised: a fully-skipped corpus is terminal exactly like an empty
-    /// one).
+    ///
+    /// Originates NO run-terminal of its own. An empty corpus, a
+    /// 100%-already-done corpus, and a corpus with live work ALL finalize
+    /// through the SAME machinery mode-1 (`originate_cold_seed`) uses: the
+    /// seam ends with [`Self::hydrate_from_cluster_state`] (line below), which
+    /// projects EVERY seeded terminal (`SkippedAlreadyDone` included) into the
+    /// `completed_tasks` set and sets `total_tasks` from the ledger — so the
+    /// operational loop's counter exit (`completed + failed >= total_tasks`)
+    /// trips for an all-skipped / empty corpus exactly as for a fully-completed
+    /// run, and a corpus with to-run work finalizes when that work terminates.
+    /// A run-terminal originated HERE, from a single-phase discovery view, was
+    /// premature for a phase-chaining consumer: zero to-run items at discovery
+    /// time does NOT mean the run is complete (later phases are injected via
+    /// `on_phase_end`), and the sticky `RunComplete` latch made the observer
+    /// exit while secondaries still worked and the cascade ran the next phase.
     ///
     /// Idempotent + failover-safe: gated on `discovery_debt() == Owed`,
     /// which a completed prior origination ratcheted to `Settled` (and which
@@ -127,22 +136,24 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // hydrate rebuilds it from `tasks_iter()` below, so we do NOT set it
         // here (single builder).
         //
-        // Finalize on NO to-run work: an empty corpus AND a 100%-already-done
-        // corpus both have ZERO tasks that will ever fire a `TaskCompleted`,
-        // so the counter-based finalize cannot drive the run terminal — the
-        // skipped items are seeded terminal directly (no dispatch, no
-        // completion event). Originate the terminal directly in either case
-        // (the deleted `ingest_setup_discovery` empty-discovery precedent,
-        // generalised to "no to-run work").
-        let to_run = binaries.iter().filter(|(_, skipped)| !skipped).count();
-        if to_run == 0 {
-            self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete])
-                .await;
-        }
+        // NO run-terminal is originated here. The all-skipped / empty corpus
+        // finalizes through the SAME counter machinery mode-1 uses: hydrate
+        // (below) runs AFTER the skip batch landed in `cluster_state`, so its
+        // projection seeds every `SkippedAlreadyDone` into `completed_tasks`
+        // and sets `total_tasks` from the ledger — the operational loop's
+        // `completed + failed >= total_tasks` exit then trips for an
+        // all-skipped corpus exactly as a fully-completed run, with no
+        // single-phase-view run-terminal that a phase-chaining consumer's
+        // later `on_phase_end` injection would contradict.
 
         // Build THIS primary's pool / total_tasks / rosters from the
         // now-seeded CRDT. The SOLE pool builder (idempotent); reused here
-        // rather than duplicating the `task::mutation` discovery-rebuild.
+        // rather than duplicating the `task::mutation` discovery-rebuild. Runs
+        // AFTER the skip batch above, so its `SkippedAlreadyDone → completed`
+        // projection (hydrate.rs) accounts for every skip in the counter exit
+        // — closing the only window where the deleted explicit `RunComplete`
+        // was load-bearing (an all-skipped corpus whose skips fire NO
+        // completion event on the live path).
         self.hydrate_from_cluster_state();
         Ok(())
     }

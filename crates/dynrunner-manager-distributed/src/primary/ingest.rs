@@ -96,9 +96,11 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// all-already-done cold corpus needs NO explicit `RunComplete`: every
     /// skip is seeded into hydrate's `completed_tasks` projection, so the
     /// operational loop's `completed + failed >= total_tasks` counter exit
-    /// trips exactly as a fully-completed run — unlike the
-    /// `discover_on_promotion` seam, which originates the terminal directly
-    /// because it runs its empty/all-skipped check before hydrate.
+    /// trips exactly as a fully-completed run. The `discover_on_promotion`
+    /// seam finalizes through this SAME counter machinery — its own trailing
+    /// `hydrate_from_cluster_state` runs AFTER its skip batch lands, so the
+    /// identical projection accounts for its skips and it likewise originates
+    /// no explicit run-terminal.
     ///
     /// Routing of `PendingPool::partition_ingest`'s three partitions:
     ///   * **duplicates** (#3a) → record the abort directive in
