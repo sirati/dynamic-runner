@@ -100,6 +100,31 @@ pub(crate) enum SlotProvenance {
     Inherited,
 }
 
+/// Outcome of [`PrimaryCoordinator::reconcile_inherited_slot`] — the
+/// failover-resume occupancy reconciliation's three-way verdict.
+///
+/// The terminal-veto arm exists because the lost-completion heuristic and
+/// the late delivery of the lost terminal RACE (the run_20260610_221140
+/// requeue-vs-complete incident): a terminal that already landed in the
+/// replicated ledger must veto the requeue — re-queueing completed work
+/// re-executes it.
+pub(super) enum InheritedSlotReconcile<I> {
+    /// Genuine lost-completion reconciliation: the slot was freed, the
+    /// task returned to `Pending` in the pool, and this `TaskRequeued`
+    /// must be broadcast in lockstep. (Boxed: `ClusterMutation` is a
+    /// large enum and this variant rides a hot-path return value.)
+    Requeued(Box<ClusterMutation<I>>),
+    /// The replicated ledger ALREADY records a terminal for the held
+    /// hash — the requeue is VETOED. Nothing was touched; the caller
+    /// settles the slot/ledger/pool residue through the single
+    /// CRDT-terminal settle path
+    /// ([`PrimaryCoordinator::settle_local_state_on_crdt_terminal`]).
+    VetoedByTerminal { task_hash: String },
+    /// Not an inherited-occupancy slot (live-dispatched or idle) — left
+    /// untouched.
+    NotInherited,
+}
+
 impl<I: Identifier> SlotState<I> {
     fn is_idle(&self) -> bool {
         matches!(self, SlotState::Idle)
@@ -2450,18 +2475,47 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// / relocated / rc-G2 paths, where a request for a busy slot is a
     /// delayed/duplicate no-op. Only an unconfirmed inherited slot, whose
     /// worker is now positively reporting idle, reconciles.
-    pub(super) fn reconcile_inherited_slot(&mut self, worker_idx: usize) -> Option<ClusterMutation<I>> {
+    ///
+    /// TERMINAL VETO (the run_20260610_221140 requeue-vs-complete race):
+    /// the requeue consults the replicated terminal ledger ATOMICALLY with
+    /// its own decision (both run on the coordinator's single-writer
+    /// loop). A hash the CRDT already records terminal — the lost
+    /// completion delivered through a received `TaskCompleted` mutation or
+    /// a snapshot restore, neither of which frees the inherited slot — is
+    /// NEVER requeued: re-queueing completed work re-executes it. The
+    /// veto arm returns the hash untouched so the caller settles the
+    /// residue through the ONE CRDT-terminal settle path.
+    pub(super) fn reconcile_inherited_slot(&mut self, worker_idx: usize) -> InheritedSlotReconcile<I> {
         if !self.workers[worker_idx].is_inherited() {
-            return None;
+            return InheritedSlotReconcile::NotInherited;
         }
-        // Vacate the slot to `Idle`, recovering the held task and its
-        // hash from the `Assigned` state. `vacate` returns the task; the
-        // hash is the ledger key the inherited entry was seeded under.
+        // The held hash from the `Assigned` state — the ledger key the
+        // inherited entry was seeded under.
         let task_hash = match &self.workers[worker_idx].state {
             SlotState::Assigned { task_hash, .. } => task_hash.clone(),
-            SlotState::Idle => return None,
+            SlotState::Idle => return InheritedSlotReconcile::NotInherited,
         };
-        let task = self.workers[worker_idx].vacate()?;
+        // Terminal veto: the requeue heuristic yields to a terminal that
+        // has already landed in the replicated ledger.
+        if self
+            .cluster_state
+            .task_state(&task_hash)
+            .is_some_and(crate::cluster_state::TaskState::is_terminal)
+        {
+            tracing::info!(
+                secondary = %self.workers[worker_idx].secondary_id,
+                worker_id = self.local_worker_id_in_secondary(worker_idx),
+                task_hash = %task_hash,
+                "inherited-occupancy requeue VETOED: the replicated ledger \
+                 already records a terminal for the held hash (the lost \
+                 completion was delivered out-of-band); settling the slot \
+                 instead of re-queueing completed work"
+            );
+            return InheritedSlotReconcile::VetoedByTerminal { task_hash };
+        }
+        let Some(task) = self.workers[worker_idx].vacate() else {
+            return InheritedSlotReconcile::NotInherited;
+        };
         // Drop the inherited ledger entry + release the type slot + pool
         // requeue, mirroring `recover_inflight_for_dead_secondary`'s
         // symmetric inverse of a dispatch so the ledger, the type budget,
@@ -2470,18 +2524,77 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.release_type_slot(&task.type_id);
         tracing::info!(
             secondary = %self.workers[worker_idx].secondary_id,
-            worker = self.workers[worker_idx].worker_id,
+            // The SECONDARY-LOCAL worker id — the same namespace every
+            // wire-side log ("task assigned" / "task complete") uses, so
+            // an operator can correlate this slot with that worker's own
+            // terminals. (The incident's `worker=2` vs `worker_id=0`
+            // confusion was this log printing the GLOBAL roster id.)
+            worker_id = self.local_worker_id_in_secondary(worker_idx),
             task_hash = %task_hash,
             "reconciled stale inherited worker occupancy on live idle \
              re-confirmation: freeing slot and requeueing task (completion \
              was lost during the primary-less failover window)"
         );
         self.pool_mut().requeue(task);
-        Some(ClusterMutation::TaskRequeued {
+        InheritedSlotReconcile::Requeued(Box::new(ClusterMutation::TaskRequeued {
             hash: task_hash,
             // Stamped at the origination choke point (apply_locally_for_broadcast).
             version: Default::default(),
-        })
+        }))
+    }
+
+    /// Hash-only adapter over [`Self::free_slot_on_terminal`] for a
+    /// terminal learned WITHOUT a wire frame (a received `TaskCompleted` /
+    /// `TaskFailed` ClusterMutation, or the reconcile veto's settle): the
+    /// diagnostics identity is read from the ledger entry's own holder
+    /// record rather than a frame's `(secondary_id, worker_id)` fields.
+    pub(super) fn free_slot_on_terminal_by_hash(
+        &mut self,
+        task_hash: &str,
+    ) -> Option<InFlightEntry<I>> {
+        let (holder_secondary, holder_worker) = match self.in_flight.get(task_hash) {
+            Some(e) => (e.secondary_id.clone(), e.local_worker_id.unwrap_or(0)),
+            None => return None,
+        };
+        self.free_slot_on_terminal(&holder_secondary, holder_worker, task_hash)
+    }
+
+    /// Reclaim a hash from the QUEUED pool when its terminal lands — the
+    /// requeue-then-terminal leg of the run_20260610_221140 race. A
+    /// failover-recovery requeue (the inherited-slot reconciliation, or
+    /// the dead-secondary recovery for a not-actually-dead holder)
+    /// legitimately returned the task to `Pending` BEFORE the lost
+    /// terminal's late delivery; the terminal proves the work is done, so
+    /// the queued copy must leave the pool or it is re-dispatched and
+    /// re-executed (production: re-assigned 25 s later, second terminal at
+    /// delivery_seq 2847).
+    ///
+    /// Composition of the pool's documented primitives: `take_first_match`
+    /// removes the queued copy WITHOUT touching counters, and
+    /// `mark_in_flight` re-registers the (already-performed) execution so
+    /// the caller's `note_item_*` cascade — in-flight decrement, per-task
+    /// completion walk, drain transition, phase lifecycle — accounts it
+    /// exactly like a normally-held terminal (the requeue had decremented
+    /// the in-flight counter; the +1/−1 pair keeps it balanced).
+    pub(super) fn reclaim_requeued_on_terminal(&mut self, task_hash: &str) -> Option<TaskInfo<I>> {
+        // No pool, no queued copy to reclaim (a terminal landing before
+        // `run()` built the pool — same gate `handle_cluster_mutation`'s
+        // pool-coherence block uses).
+        self.pending.as_ref()?;
+        let task = self
+            .pool_mut()
+            .take_first_match(|t| super::wire::compute_task_hash(t) == task_hash)?;
+        self.pool_mut().mark_in_flight(&task.phase_id);
+        tracing::info!(
+            task_id = %task.task_id,
+            phase = %task.phase_id,
+            task_hash = %task_hash,
+            "terminal arrived for a task sitting QUEUED in the pool (a \
+             failover-recovery requeue raced the lost terminal's late \
+             delivery): reclaiming it from the queue so the completed work \
+             is never re-executed"
+        );
+        Some(task)
     }
 
     /// Starvation oracle for the lazy on-demand dead-secondary requeue.
@@ -3901,6 +4014,64 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // inbound is already closed, so the drain returns immediately.
         self.drain_pending_messages(Duration::from_millis(500))
             .await?;
+
+        // ── Run-authority verdict gates (zombie split-brain,
+        // run_20260610_221140) ──
+        //
+        // Placed AFTER the drain so the freshest replicated facts — a
+        // RunAborted mutation or a PrimaryChanged announcement still
+        // sitting in the inbox at loop exit — are ingested before any
+        // verdict is authored. Both gates fire BEFORE the broadcast
+        // ladder below: a node that fails either one authors NO verdict
+        // and never reaches the caller's "primary finished" log.
+        //
+        // Gate 1 — verdict adoption: the replicated `run_aborted` latch
+        // is sticky and, at this point, FOREIGN by construction (every
+        // own-abort path — the #3a pre-phase duplicate, the worker-mgmt
+        // fail latch, NoRelocationTarget — returns its structured error
+        // without reaching this finalize; this function's own abort
+        // ladder runs below the gates and returns immediately after
+        // broadcasting). Adopt it: the run is over cluster-wide with the
+        // authoring primary's reason; a second verdict — least of all a
+        // contradictory `RunComplete` — must not be authored.
+        if let Some(reason) = self.cluster_state.run_aborted().map(str::to_owned) {
+            tracing::error!(
+                reason = %reason,
+                "standing down on the cluster's replicated RunAborted \
+                 verdict: adopting it as this node's terminal (no verdict \
+                 of our own is authored)"
+            );
+            return Err(RunError::AbortedByClusterVerdict { reason });
+        }
+        // Gate 2 — primary recognition: the terminal verdict is gated on
+        // holding the CURRENT epoch. A primary the replicated register no
+        // longer names (a higher-epoch holder exists) lost authority; its
+        // local totals are not authoritative and it must not conclude the
+        // run (production: the deposed epoch-2 primary's rc=0 "primary
+        // finished succeeded=165 fail_final=108" against the cluster's
+        // abort verdict). The mid-run stand-down is the BUG-6 demote
+        // signal's jurisdiction (`run_consuming` drops the pipeline);
+        // this gate is the exit-edge backstop for a primary that learned
+        // of its deposition only at (or after) run end — e.g. through the
+        // finalize drain just above. `current_primary() == None` (nobody
+        // ever named) passes: a bootstrap-degenerate lone primary is not
+        // deposed.
+        if let Some(current) = self.cluster_state.current_primary().map(str::to_owned)
+            && current != self.config.node_id
+        {
+            let epoch = self.cluster_state.primary_epoch();
+            tracing::error!(
+                current_primary = %current,
+                epoch,
+                "deposed: the replicated register names another primary — \
+                 authoring NO terminal verdict and exiting without a clean \
+                 finish (this node's totals are not authoritative)"
+            );
+            return Err(RunError::Deposed {
+                current_primary: current,
+                epoch,
+            });
+        }
 
         // Final accounting: any task in `total_tasks` that is neither
         // in `completed_tasks` nor in `failed_tasks` is *stranded* —

@@ -199,7 +199,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
-            MessageType::TaskRequest => self.handle_task_request(msg).await?,
+            MessageType::TaskRequest => self.handle_task_request(msg, command_rx).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
             MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
             // Consumer custom message (F5): droppable → direct handler
@@ -231,7 +231,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // case after promotion); see `handle_cluster_mutation`
             // for the full rationale and the asm-dataset-nix R2 / T3
             // hang it pins.
-            MessageType::ClusterMutation => self.handle_cluster_mutation(msg).await,
+            MessageType::ClusterMutation => self.handle_cluster_mutation(msg, command_rx).await,
             // Snapshot-RPC responder. A late-joiner / re-bootstrapping
             // peer (or a recovering observer) unicasts
             // `RequestClusterSnapshot` to `Destination::Primary`; the
@@ -252,6 +252,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // only if it is somehow behind (almost always a NoOp on the
             // authoritative primary). See `handle_state_digest`.
             MessageType::StateDigest => self.handle_state_digest(msg).await,
+            // Anti-entropy pull-reply arm. The snapshot this primary's own
+            // `handle_state_digest` requested from a proven-ahead peer.
+            // Pre-fix this fell through the catch-all and the pull never
+            // converged — the deposed-zombie starvation (see
+            // `handle_cluster_snapshot`).
+            MessageType::ClusterSnapshot => self.handle_cluster_snapshot(msg),
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

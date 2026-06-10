@@ -241,7 +241,7 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
             primary.mark_member_mesh_unconfirmed_for_test(&id);
 
             primary
-                .handle_task_request(task_request(&id, 0))
+                .handle_task_request(task_request(&id, 0), &mut None)
                 .await
                 .unwrap();
             settle_pump().await;

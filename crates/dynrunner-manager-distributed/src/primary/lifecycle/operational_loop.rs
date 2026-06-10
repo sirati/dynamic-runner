@@ -375,6 +375,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
+            // Replicated run-terminal STAND-DOWN. `run_aborted` is the
+            // CRDT-resident terminal verdict (#313): sticky, carried by
+            // mutation broadcasts, anti-entropy digests, and snapshots. A
+            // latched verdict on THIS node's mirror was authored by
+            // another authority (this primary's own abort paths return
+            // their structured errors without re-entering the loop), so
+            // the run is over cluster-wide and continuing to author —
+            // dispatch, retries, a later contradictory verdict — is the
+            // zombie split-brain (run_20260610_221140: the deposed
+            // epoch-2 primary ran 2 minutes past the epoch-9 RunAborted
+            // and exited rc=0 with divergent totals). Break into the
+            // finalize tail, whose verdict gate adopts the abort as a
+            // structured non-zero exit.
+            if let Some(reason) = self.cluster_state.run_aborted() {
+                tracing::error!(
+                    reason = %reason,
+                    "replicated RunAborted verdict observed: the run is \
+                     over cluster-wide — standing down out of the \
+                     operational loop"
+                );
+                break;
+            }
+
             // Graceful-abort drain decision (ONE seam in the loop; the
             // whole protocol lives in `lifecycle::graceful_abort`). A
             // steady-state run pays one latched-bool read. Under the latch

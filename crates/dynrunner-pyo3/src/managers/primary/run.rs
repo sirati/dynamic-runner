@@ -695,6 +695,19 @@ impl PyPrimaryCoordinator {
                                 // out instead of.
                                 no_relocation_target = Some(e);
                             }
+                            e @ (RunError::AbortedByClusterVerdict { .. }
+                            | RunError::Deposed { .. }) => {
+                                // Run-authority terminals (zombie split-brain
+                                // fix): the cluster's replicated RunAborted
+                                // verdict was adopted, or this primary lost
+                                // primary recognition and authored no verdict.
+                                // BOTH must surface non-zero — never the
+                                // `Other` swallow's false rc=0 "primary
+                                // finished". Routed through the structured-
+                                // raise channel; the variant's own Display
+                                // carries the verdict/deposition story.
+                                fatal_policy_exit = Some(e);
+                            }
                             RunError::GracefulAbort { .. } => {
                                 // Unreachable in practice: `Node::run` maps a
                                 // primary's GracefulAbort onto its OWN
@@ -702,6 +715,7 @@ impl PyPrimaryCoordinator {
                                 // above), never `Failed`. Defensive: treat as
                                 // the graceful verdict (logged above by the
                                 // `error = %error` line), never a raise.
+>>>>>>> handoff/mesh-always
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow

@@ -139,6 +139,40 @@ pub enum RunError {
         /// message; the count is the authoritative signal).
         rejected_task_ids: Vec<String>,
     },
+    /// The replicated ledger carries the cluster's `RunAborted` verdict
+    /// (authored by ANOTHER authority — the live primary's own abort paths
+    /// return their structured variants before this gate is consulted).
+    /// The run is over cluster-wide; this node ADOPTS the verdict and
+    /// stands down — it authors no verdict of its own and never claims
+    /// "primary finished". The zombie split-brain fix's verdict-adoption
+    /// half: a deposed primary that hears ANY peer converges to the
+    /// CRDT-resident terminal fact and exits non-zero with the cluster's
+    /// reason (run_20260610_221140: the deposed epoch-2 primary instead
+    /// ran 2 minutes past the epoch-9 `RunAborted` and exited rc=0 with
+    /// divergent totals).
+    AbortedByClusterVerdict {
+        /// The cluster verdict's own abort reason, verbatim from the
+        /// replicated `run_aborted` latch, so this node's exit and the
+        /// authoring primary's report agree.
+        reason: String,
+    },
+    /// This primary lost primary RECOGNITION: the replicated register
+    /// (`current_primary` at `primary_epoch`) names ANOTHER holder, so
+    /// this node holds no authority to conclude the run. The terminal
+    /// verdict (`RunComplete` / `RunAborted`) is gated on holding the
+    /// CURRENT epoch — a deposed primary authors NO verdict and never
+    /// logs "primary finished"; its local totals are not authoritative
+    /// (the production zombie reported succeeded=165/fail_final=108
+    /// against the cluster's 153/120 abort verdict). The mid-run
+    /// stand-down is the BUG-6 demote signal's jurisdiction; this is the
+    /// exit-edge backstop for a primary that learned of its deposition
+    /// only at (or after) run end.
+    Deposed {
+        /// The holder the replicated register currently names.
+        current_primary: String,
+        /// The epoch that holder is recognized at.
+        epoch: u64,
+    },
     /// The run ended via the operator's GRACEFUL abort — the observer's
     /// `GracefulAbortRequest` latched the replicated dispatch freeze, the
     /// in-flight work ran to completion, the fleet drained, and the
@@ -251,6 +285,24 @@ impl fmt::Display for RunError {
                     shown.join(", ")
                 )
             }
+            Self::AbortedByClusterVerdict { reason } => write!(
+                f,
+                "run aborted by the cluster's replicated verdict: {reason}. \
+                 Another authority broadcast the terminal `RunAborted`; this \
+                 primary adopted the verdict and stood down without authoring \
+                 a verdict of its own."
+            ),
+            Self::Deposed {
+                current_primary,
+                epoch,
+            } => write!(
+                f,
+                "primary deposed: the replicated register names \
+                 '{current_primary}' as the primary at epoch {epoch}, so this \
+                 node holds no authority to conclude the run. No terminal \
+                 verdict was authored; consult the recognized primary's \
+                 verdict for the run's outcome."
+            ),
             Self::GracefulAbort {
                 unscheduled,
                 outcome,
