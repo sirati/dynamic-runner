@@ -790,32 +790,16 @@ async fn producer_backstop_failover_mid_phase2_no_redo() {
                 );
             }
             // on_phase_end(phase2) fired EXACTLY once, on the FAILOVER
-            // winner.
-            //
-            // KNOWN PRODUCTION GAP (found by this test; documented, not
-            // fixed here — tests-only change): the F4 design comment
-            // (`primary/coordinator.rs` — "Per-phase completed/failed EVENT
-            // tallies are now the replicated grow-only-MAX
-            // `ClusterState::phase_event_tallies` (F4) so a promoted primary
-            // reports the SAME event-shaped `on_phase_end` numbers") is not
-            // fully delivered across a FAILOVER promotion: the tally bump in
-            // `note_item_completed` (`primary/coordinator.rs`,
-            // `record_phase_event_tally`) is a LOCAL grow-max write
-            // replicated only via snapshot / anti-entropy merge
-            // (`cluster_state/snapshot.rs` `merge_grow_max`), NOT carried on
-            // the per-completion `ClusterMutation::TaskCompleted` broadcast.
-            // A survivor's mirror therefore holds the completed TASK STATES
-            // (mutation-broadcast, immediate) but a tally lagging by up to
-            // one anti-entropy round — so the failover winner's
-            // `on_phase_end(phase2)` reports `inherited-lagged-tally +
-            // post-promotion observations` (here: 0 + 3 = 3) instead of the
-            // true 6. The honest CURRENT contract this pins: at least every
-            // post-promotion terminal observation is counted (≥ 3, the slow
-            // tasks all terminate under the new primary), never more than
-            // the true event total (≤ 6). When the tally is made
-            // failover-exact (e.g. bumped on the TaskCompleted apply rule, or
-            // floored by the task-state projection at hydrate), tighten this
-            // to `completed == 6`.
+            // winner, with the EXACT event tally (#358): the per-phase F4
+            // tally is bumped by the `merge_task_state` join on every
+            // winning `TaskCompleted` apply (`cluster_state/merge.rs`), so
+            // the survivor's mirror advanced its tally in lockstep with the
+            // per-completion broadcasts — the failover winner inherits an
+            // exact count and reports the true 6 (3 pre-kill fast + 3
+            // post-promotion slow completions), not the pre-#358
+            // `inherited-lagged-tally + post-promotion observations` (0 +
+            // 3 = 3) that the snapshot/anti-entropy-only replication of the
+            // old `note_item_completed`-side bump produced.
             let p2_end = index_of_single(
                 &log,
                 "on_phase_end(phase2)",
@@ -833,12 +817,12 @@ async fn producer_backstop_failover_mid_phase2_no_redo() {
                         "on_phase_end(phase2) must fire on the failover winner; \
                          log: {log:?}"
                     );
-                    assert!(
-                        (3..=6).contains(completed),
-                        "on_phase_end(phase2).completed must cover at least the 3 \
-                         post-promotion terminals and never exceed the true 6 \
-                         (see the F4 failover-lag gap note above); got \
-                         {completed}; log: {log:?}"
+                    assert_eq!(
+                        *completed, 6,
+                        "on_phase_end(phase2).completed must be the EXACT event \
+                         total — 3 pre-kill + 3 post-promotion completions — on \
+                         the failover winner (#358 apply-side tally bump); \
+                         log: {log:?}"
                     );
                     assert_eq!(*failed, 0, "no phase-2 failures; log: {log:?}");
                 }

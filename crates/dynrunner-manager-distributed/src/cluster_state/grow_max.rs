@@ -6,7 +6,11 @@
 //! is commutative / associative / idempotent (MAX is), so the map is
 //! snapshot-healable — it rides the snapshot + anti-entropy digest path
 //! with ZERO wire-protocol surface (no new `ClusterMutation` variant), the
-//! same channel `secondary_capacities` / `task_outputs` use.
+//! same channel `secondary_capacities` / `task_outputs` use. F4
+//! additionally bumps LOCALLY on every winning `TaskCompleted`/`TaskFailed`
+//! apply (`merge_task_state`, #358) — still no wire surface of its own;
+//! the count derives from the task mutations every node already applies,
+//! and the field merge only heals transitions a node never observed.
 //!
 //! **Merge rule (DRAWN ONCE here):** grow-only MAX of a monotone used/event
 //! count. Converges under per-key `max`; NEVER LWW, NEVER decrement. A
@@ -71,9 +75,12 @@ pub(super) fn read_grow_max<K: Eq + Hash>(map: &HashMap<K, u32>, k: &K) -> u32 {
 }
 
 /// Originator: local max-bump of `k` to at least `count`
-/// (`max(existing, count)`). The live primary (sole writer) holds the
-/// authoritative running max; the snapshot / anti-entropy path replicates
-/// it. Idempotent — re-bumping with an equal-or-lower count is a no-op.
+/// (`max(existing, count)`). For the P3 *used* counts the live primary
+/// (sole writer) holds the authoritative running max and the snapshot /
+/// anti-entropy path replicates it; for the F4 *event* tallies EVERY node
+/// bumps locally as it applies the winning task mutation (#358) and the
+/// field merge heals unobserved transitions. Idempotent — re-bumping with
+/// an equal-or-lower count is a no-op.
 pub(super) fn bump_grow_max<K: Eq + Hash>(map: &mut HashMap<K, u32>, k: K, count: u32) {
     let e = map.entry(k).or_insert(0);
     *e = (*e).max(count);
@@ -141,9 +148,13 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// Originate a per-phase EVENT tally (F4): max-bump the local count for
-    /// `key` to at least `count`. Called by `note_item_completed` /
-    /// `note_item_failed` with the new running event count. Grow-only MAX —
-    /// replicated via snapshot + AE.
+    /// `key` to at least `count`. SINGLE caller: the `merge_task_state`
+    /// join, on every winning `Completed` / failure-terminal transition
+    /// (#358) — so the bump lands wherever the replicated event itself
+    /// lands (originator apply-locally, mirror broadcast-apply, snapshot
+    /// restore) and every node's tally is exact in real time. Grow-only
+    /// MAX — the snapshot + AE field merge additionally heals any
+    /// transition a node never observed.
     pub(crate) fn record_phase_event_tally(&mut self, key: (PhaseId, PhaseTally), count: u32) {
         bump_grow_max(&mut self.phase_event_tallies, key, count);
     }

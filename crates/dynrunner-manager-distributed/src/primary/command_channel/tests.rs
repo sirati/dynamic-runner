@@ -1657,6 +1657,14 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
 /// (snapshot → restore) reporting the SAME event-shaped numbers — NOT a
 /// terminal-state projection (the CRDT holds one terminal state, but the
 /// event count of 1 failed + 1 completed is what `on_phase_end` reports).
+///
+/// Post-#358 the bump is owned by the `merge_task_state` join, so the test
+/// drives the SAME `TaskFailed`/`TaskCompleted` applies every node (live
+/// originator AND mirror) runs — `note_item_*` no longer touch the tally.
+/// The restore leg doubles as the no-double-count proof at the coordinator
+/// level: the promoted node's restore both replays the winning terminal
+/// transition (one restore-side bump) and max-merges the snapshot's tally
+/// field carrying the same events — the result is 1/1, not 2/2.
 #[tokio::test(flavor = "current_thread")]
 async fn phase_event_tallies_are_event_shaped_and_survive_promotion() {
     let local = tokio::task::LocalSet::new();
@@ -1664,21 +1672,29 @@ async fn phase_event_tallies_are_event_shaped_and_survive_promotion() {
         .run_until(async {
             let (mut coordinator, _mesh) = make_coordinator();
             let phase = PhaseId::from("default");
-            let mut phase_set = std::collections::HashSet::new();
-            phase_set.insert(phase.clone());
-            coordinator.pending = Some(
-                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
-                    .expect("pool init"),
-            );
 
             // The task fails once, then (after a retry reinject) completes —
-            // the live primary observes BOTH terminal events.
-            coordinator
-                .note_item_failed(&phase, Some("a_id"), &mut None)
-                .await;
-            coordinator
-                .note_item_completed(&phase, Some("a_id"), &mut None)
-                .await;
+            // every node observes BOTH terminal events as winning applies of
+            // the replicated mutations.
+            let task = make_binary("a", 100);
+            let hash = compute_task_hash(&task);
+            let cs = coordinator.cluster_state_mut_for_test();
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task,
+            });
+            cs.apply(ClusterMutation::TaskFailed {
+                hash: hash.clone(),
+                kind: ErrorType::Recoverable,
+                error: "transient".into(),
+                version: Default::default(),
+                attempt: 0,
+            });
+            cs.apply(ClusterMutation::TaskCompleted {
+                hash,
+                result_data: None,
+                attempt: 0,
+            });
 
             // BOTH event tallies are 1 — event-shaped, not a terminal
             // projection (a terminal projection of the single converged
@@ -1691,19 +1707,21 @@ async fn phase_event_tallies_are_event_shaped_and_survive_promotion() {
             assert_eq!(coordinator.phase_completed_for_test(&phase), 1);
 
             // Promotion: a fresh primary restores the live snapshot and
-            // reports the SAME event numbers (the events were replicated).
+            // reports the SAME event numbers (the events were replicated) —
+            // the restore-side transition bump and the snapshot's tally
+            // field alias under grow-MAX instead of summing.
             let snap = coordinator.cluster_state_for_test().snapshot();
             let (mut promoted, _mesh2) = make_coordinator();
             promoted.cluster_state_mut_for_test().restore(snap);
             assert_eq!(
                 promoted.phase_failed_for_test(&phase),
                 1,
-                "the failed EVENT tally survives promotion"
+                "the failed EVENT tally survives promotion without double-count"
             );
             assert_eq!(
                 promoted.phase_completed_for_test(&phase),
                 1,
-                "the completed EVENT tally survives promotion"
+                "the completed EVENT tally survives promotion without double-count"
             );
         })
         .await;

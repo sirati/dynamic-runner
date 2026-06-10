@@ -175,12 +175,6 @@ where
             blocks
         };
 
-        // Phase + lifecycle bookkeeping. Must run AFTER the pool
-        // mutation so `process_phase_lifecycle` observes the post-
-        // cascade pool state.
-        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx)
-            .await;
-
         // Broadcast the terminal state for the originating task plus
         // any cascade-paused dependents (Unfulfillable case only).
         // The CRDT-applied broadcast is the single source of truth
@@ -188,6 +182,14 @@ where
         // first means receivers see the prereq's Unfulfillable state
         // before the dependents' Blocked state — the cascade root is
         // visible whenever a dependent's `on` field is consulted.
+        //
+        // Applied BEFORE the `note_item_failed` lifecycle cascade below —
+        // the uniform apply-then-cascade order the worker-terminal paths
+        // (`handle_task_failed` / `handle_task_complete`) already use, and
+        // load-bearing since #358: the apply's `merge_task_state` join owns
+        // the per-phase Failed EVENT tally bump, so a phase that drains
+        // inside the cascade must fire `on_phase_end` with a tally that
+        // already includes THIS failure.
         let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(1 + cascaded_blocks.len());
         mutations.push(ClusterMutation::TaskFailed {
             hash,
@@ -206,6 +208,12 @@ where
             });
         }
         self.apply_and_broadcast_cluster_mutations(mutations).await;
+
+        // Phase + lifecycle bookkeeping. Must run AFTER the pool
+        // mutation so `process_phase_lifecycle` observes the post-
+        // cascade pool state.
+        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx)
+            .await;
         Ok(())
     }
 

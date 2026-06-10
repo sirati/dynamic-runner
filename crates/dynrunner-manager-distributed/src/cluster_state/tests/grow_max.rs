@@ -146,6 +146,221 @@ fn phase_event_tallies_digest_detect_then_quiesce() {
     assert!(b.digest().is_behind(&a.digest()));
 }
 
+/// #358 real-time mirror exactness: the F4 tally bumps on the WINNING
+/// `TaskCompleted` APPLY itself (the `merge_task_state` join), so a mirror
+/// fed only the per-completion mutation broadcasts — NO snapshot, NO
+/// anti-entropy round — holds the exact event count the moment the task
+/// states land. This is the wire shape of the failover-lag bug: pre-fix
+/// the mirror held N completed STATES but a 0 tally until the next
+/// snapshot merge.
+#[test]
+fn tally_bumps_on_task_completed_apply_in_real_time() {
+    let p = phase("p0"); // mk_task's phase
+    let mut mirror = ClusterState::<RunnerIdentifier>::new();
+    for (hash, name) in [("ha", "a"), ("hb", "b"), ("hc", "c")] {
+        mirror.apply(ClusterMutation::TaskAdded {
+            hash: hash.into(),
+            task: mk_task(name),
+        });
+        assert_eq!(
+            mirror.apply(ClusterMutation::TaskCompleted {
+                hash: hash.into(),
+                result_data: None,
+                attempt: 0,
+            }),
+            ApplyOutcome::Applied
+        );
+    }
+    assert_eq!(
+        mirror.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        3,
+        "the mirror's tally must be exact in real time, from broadcasts alone"
+    );
+    // At-least-once redelivery of an already-won completion NoOps the join
+    // and must NOT re-bump.
+    assert_eq!(
+        mirror.apply(ClusterMutation::TaskCompleted {
+            hash: "ha".into(),
+            result_data: None,
+            attempt: 0,
+        }),
+        ApplyOutcome::NoOp
+    );
+    assert_eq!(
+        mirror.phase_event_tally_for(&(p, PhaseTally::Completed)),
+        3,
+        "an idempotent redelivery must not double-count"
+    );
+}
+
+/// #358 convergence proof (the apply ∘ snapshot idempotence): a replica
+/// that already applied N `TaskCompleted` broadcasts (apply-side bumps →
+/// tally N) and THEN merges the originator's snapshot carrying the SAME N
+/// events (its task states AND its tally field) converges to N, not 2N —
+/// the in-snapshot state transitions NoOp the join (no re-bump) and the
+/// grow-MAX field merge aliases the already-counted events.
+#[test]
+fn tally_apply_then_snapshot_merge_converges_without_double_count() {
+    let p = phase("p0");
+    let mutations = |state: &mut ClusterState<RunnerIdentifier>| {
+        for (hash, name) in [("ha", "a"), ("hb", "b"), ("hc", "c")] {
+            state.apply(ClusterMutation::TaskAdded {
+                hash: hash.into(),
+                task: mk_task(name),
+            });
+            state.apply(ClusterMutation::TaskCompleted {
+                hash: hash.into(),
+                result_data: None,
+                attempt: 0,
+            });
+        }
+    };
+    let mut originator = ClusterState::<RunnerIdentifier>::new();
+    mutations(&mut originator);
+    assert_eq!(
+        originator.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        3
+    );
+
+    let mut replica = ClusterState::<RunnerIdentifier>::new();
+    mutations(&mut replica); // saw every broadcast → tally already 3
+    replica.restore(originator.snapshot());
+    assert_eq!(
+        replica.phase_event_tally_for(&(p, PhaseTally::Completed)),
+        3,
+        "apply-side bumps + the snapshot's tally must alias under grow-MAX \
+         (3), never sum (6)"
+    );
+}
+
+/// #358 restore-side exactness, cold + partial-knowledge:
+///   * a COLD replica restoring a snapshot with N completed states + tally
+///     N lands on N (the restore-side transition bumps and the co-present
+///     field max-merge alias, states-before-fields order);
+///   * a replica that observed a DIFFERENT event via broadcast (task b)
+///     and restores a snapshot covering only task a converges to the
+///     UNION coverage (2) — the field merge alone (max(1, 1) = 1) could
+///     not express it; the restore-side bump is what makes the tally
+///     exact.
+#[test]
+fn tally_restore_covers_cold_and_partial_knowledge_union() {
+    let p = phase("p0");
+    // Originator saw ONLY task a complete.
+    let mut originator = ClusterState::<RunnerIdentifier>::new();
+    for (hash, name) in [("ha", "a"), ("hb", "b")] {
+        originator.apply(ClusterMutation::TaskAdded {
+            hash: hash.into(),
+            task: mk_task(name),
+        });
+    }
+    originator.apply(ClusterMutation::TaskCompleted {
+        hash: "ha".into(),
+        result_data: None,
+        attempt: 0,
+    });
+
+    // Cold replica: restore alone yields the exact count, not 2x.
+    let mut cold = ClusterState::<RunnerIdentifier>::new();
+    cold.restore(originator.snapshot());
+    assert_eq!(
+        cold.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        1,
+        "cold restore: the state-merge bump and the snapshot tally alias"
+    );
+
+    // Partial-knowledge replica: saw ONLY task b's completion broadcast.
+    let mut partial = ClusterState::<RunnerIdentifier>::new();
+    for (hash, name) in [("ha", "a"), ("hb", "b")] {
+        partial.apply(ClusterMutation::TaskAdded {
+            hash: hash.into(),
+            task: mk_task(name),
+        });
+    }
+    partial.apply(ClusterMutation::TaskCompleted {
+        hash: "hb".into(),
+        result_data: None,
+        attempt: 0,
+    });
+    partial.restore(originator.snapshot());
+    assert_eq!(
+        partial.phase_event_tally_for(&(p, PhaseTally::Completed)),
+        2,
+        "restore must add the snapshot's UNSEEN event (a) on top of the \
+         locally-observed one (b) — union coverage, not per-replica max"
+    );
+}
+
+/// #358 failed-side twin, EVENT-shaped on the apply path: each WINNING
+/// failure-terminal apply bumps the Failed tally (a higher-attempt
+/// re-failure counts again — B1 cadence), an idempotent redelivery NoOps
+/// (no double-count), and the eventual retry-success bumps Completed — a
+/// fail → retry → fail → retry → succeed task reports failed=2,
+/// completed=1 on EVERY node that applied the broadcasts.
+#[test]
+fn tally_failed_twin_is_event_shaped_on_apply() {
+    let p = phase("p0");
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "ha".into(),
+        task: mk_task("a"),
+    });
+    let fail = |attempt: u32, seq: u32| ClusterMutation::TaskFailed {
+        hash: "ha".into(),
+        kind: ErrorType::Recoverable,
+        error: "transient".into(),
+        version: TaskVersion {
+            primary_epoch: 0,
+            seq,
+        },
+        attempt,
+    };
+    // First failure (attempt 0) wins → Failed = 1.
+    assert_eq!(s.apply(fail(0, 1)), ApplyOutcome::Applied);
+    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 1);
+    // At-least-once redelivery of the SAME failure NoOps → still 1.
+    assert_eq!(s.apply(fail(0, 1)), ApplyOutcome::NoOp);
+    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 1);
+    // Retry reset (rank-DROP arm, not a join) — no tally movement.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRetried {
+            hash: "ha".into(),
+            attempt: 1,
+            version: TaskVersion {
+                primary_epoch: 0,
+                seq: 2,
+            },
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 1);
+    // Re-failure under the new generation wins → Failed = 2.
+    assert_eq!(s.apply(fail(1, 3)), ApplyOutcome::Applied);
+    assert_eq!(s.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 2);
+    // Second retry + eventual success: Completed = 1, Failed stays 2 —
+    // event counts, not a projection of the single terminal state.
+    s.apply(ClusterMutation::TaskRetried {
+        hash: "ha".into(),
+        attempt: 2,
+        version: TaskVersion {
+            primary_epoch: 0,
+            seq: 4,
+        },
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "ha".into(),
+            result_data: None,
+            attempt: 2,
+        }),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(
+        s.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        1
+    );
+    assert_eq!(s.phase_event_tally_for(&(p, PhaseTally::Failed)), 2);
+}
+
 // === retry_passes_used (P3-pass) ===
 
 /// The retry-pass used counter originates + reads + round-trips; the

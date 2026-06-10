@@ -21,6 +21,44 @@ use super::grow_max::{merge_grow_max, merge_grow_set};
 use super::merge::merge_capability;
 use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally, RespawnEventRecord};
 
+/// Wire adapter for the TUPLE-keyed grow-only-MAX maps (F4
+/// `phase_event_tallies`, P3 `retry_passes_used`): the snapshot rides the
+/// wire as JSON (`DistributedMessage::ClusterSnapshot { snapshot_json }`),
+/// and serde_json REJECTS a map whose key is not a string — so a plain
+/// `HashMap<(K1, K2), u32>` field serialized fine while EMPTY and errored
+/// ("key must be a string") the moment it held an entry, making every
+/// snapshot responder silently warn-and-DROP its reply (the late-joiner /
+/// anti-entropy heal path) once a tally existed. Encoding the map as a
+/// `Vec<((K1, K2), u32)>` pair list keeps the in-memory type unchanged and
+/// makes the wire shape key-type-agnostic. Entry order is not significant
+/// (the restore merge is per-key MAX, order-independent); `#[serde(
+/// default)]` on the fields still covers a pre-field sender.
+mod tuple_keyed_map {
+    use std::collections::HashMap;
+    use std::hash::Hash;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<K, V, S>(map: &HashMap<K, V>, ser: S) -> Result<S::Ok, S::Error>
+    where
+        K: Serialize,
+        V: Serialize,
+        S: Serializer,
+    {
+        ser.collect_seq(map.iter())
+    }
+
+    pub(super) fn deserialize<'de, K, V, D>(de: D) -> Result<HashMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Eq + Hash,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        let pairs: Vec<(K, V)> = Vec::deserialize(de)?;
+        Ok(pairs.into_iter().collect())
+    }
+}
+
 /// Serializable snapshot of an entire `ClusterState`. Used by the
 /// snapshot RPC (`RequestClusterSnapshot` → `ClusterSnapshot`) so a
 /// late-joining or reconnecting node can bootstrap its replicated
@@ -249,15 +287,19 @@ pub struct ClusterStateSnapshot<I> {
     /// `on_phase_end` numbers. Merge rule on `restore`: per-key grow-only
     /// MAX (a stale peer can never resurrect a lower count). `#[serde(default)]`
     /// keeps wire compat with a pre-field sender (missing field decodes as an
-    /// empty map, the accessor's `unwrap_or(0)` covers it).
-    #[serde(default)]
+    /// empty map, the accessor's `unwrap_or(0)` covers it). Tuple-keyed, so
+    /// the wire shape is the `tuple_keyed_map` pair list (serde_json rejects
+    /// non-string map keys).
+    #[serde(default, with = "tuple_keyed_map")]
     pub phase_event_tallies: HashMap<(PhaseId, PhaseTally), u32>,
     /// Replicated per-(phase, bucket) retry-pass USED counter (P3) —
     /// grow-only MAX of a monotone used count. Carried so a promoted primary
     /// inherits the retry budget already consumed (the budget is NOT
     /// re-granted on failover). Merge rule on `restore`: per-key grow-only
     /// MAX. `#[serde(default)]` keeps wire compat with a pre-field sender.
-    #[serde(default)]
+    /// Tuple-keyed, so the wire shape is the `tuple_keyed_map` pair list
+    /// (serde_json rejects non-string map keys).
+    #[serde(default, with = "tuple_keyed_map")]
     pub retry_passes_used: HashMap<(PhaseId, BucketKind), u32>,
     /// Replicated per-hash unfulfillable-reinject USED counter (P3) —
     /// grow-only MAX of a monotone used count. Carried so a promoted primary
@@ -713,6 +755,15 @@ impl<I: Identifier> ClusterState<I> {
         // max regardless of (live-broadcast, snapshot) arrival order — the
         // exact property that makes the run-start `clear()` unnecessary AND
         // safe. The merge rule is spelled once in `grow_max::merge_grow_max`.
+        //
+        // ORDER IS LOAD-BEARING for F4 (#358): this field merge must run
+        // AFTER the per-task `merge_task_state` loop at the top of this fn.
+        // The join bumps the tally on each winning terminal transition; a
+        // snapshot's tally count covers exactly the events its own task
+        // states reflect, so merging states FIRST lets each in-snapshot
+        // transition bump once and the `max` here then aliases (never adds)
+        // those same events. Field-first would max-import the count and
+        // THEN bump again for the same snapshot's transitions = overshoot.
         merge_grow_max(&mut self.phase_event_tallies, phase_event_tallies);
         merge_grow_max(&mut self.retry_passes_used, retry_passes_used);
         merge_grow_max(

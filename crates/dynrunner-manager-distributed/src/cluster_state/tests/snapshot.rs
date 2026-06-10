@@ -663,6 +663,62 @@ fn snapshot_wire_round_trips_capabilities_2p_set() {
     );
 }
 
+/// #358 wire regression: a snapshot whose TUPLE-keyed grow-MAX maps (F4
+/// `phase_event_tallies`, P3 `retry_passes_used`) are NON-EMPTY must
+/// serialize to JSON and round-trip. Pre-fix the plain `HashMap<(K1, K2),
+/// u32>` fields made `serde_json::to_string(&snapshot)` ERROR ("key must
+/// be a string") the moment a tally / used-count existed — every snapshot
+/// responder then warn-and-DROPPED its reply, silently breaking the
+/// late-joiner / anti-entropy heal path on any run past its first
+/// terminal event. The `tuple_keyed_map` pair-list encoding is the fix;
+/// this pins encode → decode → restore end-to-end.
+#[test]
+fn snapshot_wire_round_trips_non_empty_tuple_keyed_grow_max_maps() {
+    use crate::cluster_state::PhaseTally;
+    use crate::primary::retry_bucket::BucketKind;
+
+    let mut origin = ClusterState::<RunnerIdentifier>::new();
+    let p = PhaseId::from("p0");
+    origin.record_phase_event_tally((p.clone(), PhaseTally::Completed), 6);
+    origin.record_phase_event_tally((p.clone(), PhaseTally::Failed), 2);
+    origin.record_retry_pass_used((p.clone(), BucketKind::Recoverable), 1);
+
+    // Encode → decode the snapshot exactly as the wire path does.
+    let snap = origin.snapshot();
+    let json = serde_json::to_string(&snap)
+        .expect("a snapshot with non-empty tuple-keyed maps must serialize");
+    let decoded: crate::cluster_state::ClusterStateSnapshot<RunnerIdentifier> =
+        serde_json::from_str(&json).expect("wire snapshot decodes");
+    assert_eq!(
+        decoded
+            .phase_event_tallies
+            .get(&(p.clone(), PhaseTally::Completed)),
+        Some(&6)
+    );
+    assert_eq!(
+        decoded
+            .phase_event_tallies
+            .get(&(p.clone(), PhaseTally::Failed)),
+        Some(&2)
+    );
+    assert_eq!(
+        decoded
+            .retry_passes_used
+            .get(&(p.clone(), BucketKind::Recoverable)),
+        Some(&1)
+    );
+
+    // And the decoded snapshot restores (max-merge) into a cold replica.
+    let mut cold = ClusterState::<RunnerIdentifier>::new();
+    cold.restore(decoded);
+    assert_eq!(
+        cold.phase_event_tally_for(&(p.clone(), PhaseTally::Completed)),
+        6
+    );
+    assert_eq!(cold.phase_event_tally_for(&(p.clone(), PhaseTally::Failed)), 2);
+    assert_eq!(cold.retry_pass_used_for(&(p, BucketKind::Recoverable)), 1);
+}
+
 /// Backward-compat: a snapshot from a sender that PREDATES the
 /// `capabilities` field (its JSON omits the key entirely) must decode with
 /// an EMPTY capability map (`#[serde(default)]`), not a missing-field

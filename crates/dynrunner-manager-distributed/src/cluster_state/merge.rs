@@ -39,7 +39,8 @@ use dynrunner_core::{Identifier, PhaseId, TaskOutputs, TaskVersion};
 use super::ClusterState;
 use super::TaskState;
 use super::types::{
-    CapabilityEntry, FailedLikeRank, JoinBand, NonTerminalRank, TaskJoinKey, TerminalRank,
+    CapabilityEntry, FailedLikeRank, JoinBand, NonTerminalRank, PhaseTally, TaskJoinKey,
+    TerminalRank,
 };
 use crate::task_completed::TaskCompletedEvent;
 
@@ -302,6 +303,51 @@ impl<I: Identifier> ClusterState<I> {
         } else {
             None
         };
+        // F4 per-phase EVENT tally bump (#358) — the SINGLE owner of the
+        // bump, exactly here because this join is the one place a terminal
+        // OBSERVATION lands on ANY node (originator apply-locally, mirror
+        // apply of the per-completion broadcast, and snapshot restore all
+        // route through this fn). Bumping with the replicated event itself
+        // keeps every mirror's tally exact in REAL TIME — pre-fix the bump
+        // lived in the live primary's `note_item_*` and rode only the
+        // snapshot/anti-entropy field merge, so a failover winner's
+        // `on_phase_end` read a tally lagging its own completed task
+        // states by up to one anti-entropy round.
+        //
+        // Convergence (never double-counts, never overshoots):
+        //   * a given winning join key wins AT MOST ONCE per node (an
+        //     idempotent redelivery / re-restore NoOps above), so each
+        //     locally-observed event bumps exactly once;
+        //   * the snapshot's `phase_event_tallies` field max-merges AFTER
+        //     restore's per-task merge loop (states-before-fields in
+        //     `restore_collecting_resumed` — load-bearing order), so a
+        //     count the field merge imports always covers state
+        //     transitions already merged, never transitions still to come
+        //     in the same snapshot — `max(local_bumps, snapshot_count)`
+        //     is then exactly the union coverage, not a double-count;
+        //   * a node that missed intermediate events (e.g. restored
+        //     `Failed { attempt: 1 }` straight over `Pending`, skipping
+        //     the attempt-0 failure) transiently UNDERSHOOTS and the
+        //     grow-MAX field merge heals it from the originator's exact
+        //     count.
+        //
+        // EVENT-shaped, mirroring the join's own cadence: `newly_completed`
+        // fires at most once per hash; `failure_won` fires per winning
+        // failure-terminal observation (a higher-attempt re-failure counts
+        // again — B1 re-failure cadence), so a fail → retry → succeed task
+        // increments BOTH Failed and Completed. A `SkippedAlreadyDone` is a
+        // terminal LEDGER state, not a completion EVENT — no bump (it never
+        // routes here as `Completed`/failure-terminal).
+        if newly_completed || failure_won {
+            let kind = if newly_completed {
+                PhaseTally::Completed
+            } else {
+                PhaseTally::Failed
+            };
+            let key = (incoming.task().phase_id.clone(), kind);
+            let next = self.phase_event_tally_for(&key) + 1;
+            self.record_phase_event_tally(key, next);
+        }
         self.tasks.insert(hash.to_string(), incoming);
         // 4. Newly-completed cross-task side-effects.
         if newly_completed {
