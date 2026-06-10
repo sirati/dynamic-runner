@@ -219,6 +219,18 @@ impl PyObserverLateJoiner {
                     let completed = node_outcome.completed as u32;
                     match node_outcome.terminal {
                         RunTerminal::Done => Ok(ObserverRunOutcome::Done(completed)),
+                        RunTerminal::GracefulAbort { reason } => {
+                            // The composed graceful-abort verdict the
+                            // observer derived (`run_complete ∧
+                            // graceful_abort`). A deliberate clean
+                            // wind-down: reported loudly (the narrator
+                            // already emitted the counts summary on the
+                            // important channel), exits 0 — distinct from
+                            // the silent `Done` and from the hard-abort
+                            // exit(1) below.
+                            tracing::warn!(verdict = %reason, "run gracefully aborted");
+                            Ok(ObserverRunOutcome::Done(completed))
+                        }
                         RunTerminal::Aborted { reason } => {
                             // The primary broadcast `RunAborted` (#3a
                             // pre-phase duplicate). Propagate to the PyO3

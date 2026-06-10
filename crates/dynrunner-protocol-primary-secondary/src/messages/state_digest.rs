@@ -103,6 +103,13 @@ pub struct StateDigest {
     /// reason string is not needed to detect divergence).
     #[serde(default)]
     pub run_aborted: bool,
+    /// Sticky-monotone graceful-abort latch (the dispatch freeze —
+    /// `ClusterMutation::GracefulAbortRequested`). Same `false → true`
+    /// ratchet shape as `run_complete` / `run_aborted`; `#[serde(default)]`
+    /// decodes a pre-field peer as un-latched (the conservative
+    /// never-claims-ahead shape).
+    #[serde(default)]
+    pub graceful_abort: bool,
     /// Sticky-monotone discovery-debt lattice height, carried VERBATIM (the
     /// full three-state [`DiscoveryDebt`], NOT a bool). A bool is provably
     /// insufficient for a 3-state lattice: it would map both `Undeclared`
@@ -218,9 +225,9 @@ impl StateDigest {
     ///   Restore's deterministic lower-id-wins converges both replicas in
     ///   one round; both sides pulling on the equal-epoch divergence is the
     ///   intended bilateral convergence (C5).
-    /// - `run_complete` / `run_aborted`: ahead iff the peer's latch is set
-    ///   while ours is not (`false → true` ratchet; the reason string is
-    ///   irrelevant to the detector).
+    /// - `run_complete` / `run_aborted` / `graceful_abort`: ahead iff the
+    ///   peer's latch is set while ours is not (`false → true` ratchet; the
+    ///   reason string is irrelevant to the detector).
     /// - `discovery_debt`: the peer is ahead iff it is STRICTLY HIGHER in the
     ///   three-state lattice `Undeclared < Owed < Settled` —
     ///   `self.discovery_debt < other.discovery_debt`. This is a direct
@@ -287,6 +294,12 @@ impl StateDigest {
                 && other.current_primary_hash != self.current_primary_hash)
             || (other.run_complete && !self.run_complete)
             || (other.run_aborted && !self.run_aborted)
+            // graceful_abort: the same false→true ratchet as the two run
+            // latches above — a peer that latched the dispatch freeze
+            // makes an un-latched replica behind, so the snapshot pull's
+            // sticky `|=` merge propagates the freeze (a promoted primary
+            // must inherit it — the no-redo law).
+            || (other.graceful_abort && !self.graceful_abort)
             // discovery_debt: behind iff the peer is STRICTLY HIGHER in the
             // lattice `Undeclared < Owed < Settled` (a direct lattice-height
             // compare on the full enum). Covers ALL three states: an
@@ -430,6 +443,22 @@ mod tests {
         assert!(local.is_behind(&peer));
         // Latch ratchet is one-directional: a set-local vs unset-peer is
         // NOT behind.
+        assert!(!peer.is_behind(&local));
+    }
+
+    /// The graceful-abort latch follows the same one-directional
+    /// false→true ratchet as the two run latches: a peer that latched the
+    /// dispatch freeze makes an un-latched replica behind (so the snapshot
+    /// pull propagates the freeze to a promoted primary), never the
+    /// reverse.
+    #[test]
+    fn graceful_abort_latch_is_behind_one_directionally() {
+        let local = StateDigest::default();
+        let peer = StateDigest {
+            graceful_abort: true,
+            ..Default::default()
+        };
+        assert!(local.is_behind(&peer));
         assert!(!peer.is_behind(&local));
     }
 

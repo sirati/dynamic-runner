@@ -40,6 +40,24 @@ where
     /// (`respawn_budget == None`) early-returns BEFORE any ledger write, so
     /// the replicated set is never touched when respawn is off.
     pub(crate) fn dispatch_respawn_request(&mut self, request: RespawnRequest) {
+        // Graceful-abort admission gate: under the replicated
+        // `graceful_abort_requested` freeze the fleet is draining DOWN by
+        // design — every secondary departure (the drain self-departures
+        // especially) is deliberate, so no replacement may ever be spawned.
+        // Checked BEFORE the budget so a drain departure never consumes
+        // ledger budget either. A primary decision consuming the CRDT fact,
+        // sibling to the dispatch-view freeze.
+        if self.cluster_state.graceful_abort_requested() {
+            tracing::info!(
+                target: "dynrunner_respawn",
+                peer_id = %request.original_id,
+                cause = ?request.cause,
+                event = "respawn_suppressed_graceful_abort",
+                "graceful abort active; not spawning a replacement for a \
+                 departing secondary (the fleet is draining down)",
+            );
+            return;
+        }
         let (spawner, budget) = match (self.respawn_spawner.as_ref(), self.respawn_budget.as_ref())
         {
             (Some(s), Some(b)) => (Arc::clone(s), b.clone()),

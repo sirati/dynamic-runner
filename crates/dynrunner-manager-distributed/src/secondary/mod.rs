@@ -671,12 +671,20 @@ where
     /// kind flows through unchanged.
     ///
     /// Drained FIFO, retrying FOREVER until acked, on TWO triggers: the
-    /// top of the operational loop tick (`process_tasks`, beside the
-    /// deferred-peer-message flush) AND the primary-link-recovery edge
+    /// operational loop's replay WAKE arm (`process_tasks` parks on
+    /// `next_report_replay_due`, the buffer-wide minimum of the
+    /// per-entry `next_due` deadlines — it fires when an entry is due,
+    /// never per tick) AND the primary-link-recovery edge
     /// (`record_primary_message`, where Suspecting/Voting/Candidate →
-    /// Normal). A drain re-sends the DUE entries only (`NoRoute` always;
-    /// `AwaitingAck` once `sent_at` ages past `delivery_ack_timeout` —
-    /// the no-route-equivalent edge); the ONLY drop site is
+    /// Normal; drains via `drain_report_replays_now`, overriding the
+    /// schedule for a prompt route-restored retry). A drain re-sends
+    /// the DUE entries only — due-ness is each entry's own capped
+    /// exponential backoff schedule (`resource::replay_backoff_delay`):
+    /// a fresh no-route retention is due immediately, a sent entry one
+    /// `delivery_ack_timeout` after its send, and every replay pushes
+    /// the slot out (`ack_timeout` → 2× → 4× … capped) so a
+    /// never-acking destination costs one frame per cap, not one per
+    /// loop tick (the production replay flood). The ONLY drop site is
     /// `ack_delivery` (an inbound `TerminalAck` matching the entry's
     /// `delivery_seq` exactly).
     ///
@@ -699,26 +707,22 @@ where
     /// no lifecycle gating.
     pub(in crate::secondary) pending_report_replays: Vec<resource::RetainedReport<I>>,
 
-    /// Replay-attempt tally per retained confirmable report (`delivery_seq` →
-    /// count of timed-out-and-replayed sends), the reporting concern's
-    /// PERMANENT-failure detector (#366). The replay loop retries
-    /// forever by design — correct for a transient outage, but a
-    /// deterministic per-message failure (the canonical case: a frame
-    /// over the mesh wire limit, which the transport's egress gate
-    /// drops LOUDLY but can never deliver) would otherwise churn every
-    /// `delivery_ack_timeout` with only per-attempt WARNs that never
-    /// say "this specific report is never going to make it". Once a
-    /// seq's tally reaches
-    /// [`resource::REPORT_REPLAY_ESCALATION_ATTEMPTS`] the drain
-    /// escalates to ERROR naming the task and the likely causes (and
-    /// re-escalates on every further multiple, so a long-stuck report
-    /// stays visible). Counting keys on the seq because the drain
-    /// round-trips each entry through `send_to_primary`'s re-retention
-    /// (a FRESH `RetainedReport` each time) — the seq is the one
-    /// sticky identity. Entries are dropped on `ack_delivery` (the
-    /// only delivery-confirmed site). Diagnostic bookkeeping only:
-    /// never read by routing, liveness, or the replay decision itself.
-    pub(in crate::secondary) report_replay_attempts: std::collections::HashMap<u64, u32>,
+    /// Rate-limit anchor for the replay drain's aggregated "re-sent"
+    /// INFO line (`resource::note_replays_for_log`): the instant of the
+    /// last emit, `None` before the first. Together with
+    /// `replay_log_suppressed` this caps the line at one per
+    /// [`resource::REPORT_REPLAY_LOG_WINDOW`] — the production replay
+    /// flood logged the per-pass variant 19,437 times in ~5 minutes.
+    /// (The per-seq replay-attempt tally for the #366 permanent-failure
+    /// escalation lives ON each `resource::RetainedReport` entry, which
+    /// is updated in place across replays — no side table.)
+    pub(in crate::secondary) replay_log_last_emit: Option<std::time::Instant>,
+
+    /// Re-sends tallied since the last aggregated drain-log emit (the
+    /// suppressed count the next emitted line carries). Diagnostic
+    /// bookkeeping only — never read by routing, liveness, or the
+    /// replay decision itself.
+    pub(in crate::secondary) replay_log_suppressed: usize,
 
     /// Per-secondary monotonic `delivery_seq` counter (#352), owned by
     /// the `send_to_primary` stamping chokepoint: every confirmable

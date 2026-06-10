@@ -40,6 +40,12 @@ pub enum MessageType {
     /// only — carries no task payloads and triggers no merge by itself.
     StateDigest,
     MeshReady,
+    /// Observer -> Primary: "gracefully abort the run" — the ONE
+    /// management command a zero-authority observer may send. The
+    /// primary originates `ClusterMutation::GracefulAbortRequested`
+    /// (the replicated sticky dispatch-freeze latch) on receipt;
+    /// idempotent under re-sends.
+    GracefulAbortRequest,
     // Secondary <-> Secondary (peer-to-peer)
     TaskComplete,
     TaskFailed,

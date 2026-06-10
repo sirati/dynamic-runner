@@ -126,10 +126,12 @@ where
     /// failover election (the "primary message resumed" edge that
     /// [`Self::record_primary_message`] returns `true` on), the route to the
     /// primary is most likely back, so any terminal-bearing report retained
-    /// during the outage is re-delivered RIGHT NOW (ahead of the periodic
-    /// loop-tick drain). The drain is FIFO + retry-forever; a frame that
-    /// re-absorbs (route not actually back yet) simply re-buffers and the
-    /// next trigger retries it.
+    /// during the outage is re-delivered RIGHT NOW — schedule-overriding
+    /// (`drain_report_replays_now`), ahead of the entry's next backoff slot
+    /// and of the operational loop's replay wake arm. The drain is FIFO +
+    /// retry-forever; a frame that re-absorbs (route not actually back yet)
+    /// simply re-buffers on its advanced backoff slot and the next trigger
+    /// retries it.
     pub(in crate::secondary) async fn record_primary_message_if_from_primary(
         &mut self,
         sender_id: &str,
@@ -138,9 +140,12 @@ where
             let link_recovered = self.record_primary_message();
             if link_recovered {
                 // Primary-link-recovery edge: re-deliver any retained
-                // terminal reports immediately. No-op when nothing was
-                // buffered (the steady-state case).
-                self.drain_report_replays().await;
+                // terminal reports immediately — schedule-overriding
+                // (`_now`), because the route just provably came back
+                // and a retained report may be sitting deep inside a
+                // capped backoff slot. No-op when nothing was buffered
+                // (the steady-state case).
+                self.drain_report_replays_now().await;
             }
         }
     }

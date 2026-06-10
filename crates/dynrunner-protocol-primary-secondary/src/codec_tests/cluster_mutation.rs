@@ -223,6 +223,34 @@ fn roundtrip_run_aborted() {
     }
 }
 
+/// `GracefulAbortRequested` (the payload-free dispatch-freeze latch, the
+/// graceful sibling of `RunComplete`'s wire shape) round-trips through
+/// serde — the variant discriminant survives encode→decode so the
+/// primary's freeze broadcast reaches every replica.
+#[test]
+fn roundtrip_graceful_abort_requested() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::GracefulAbortRequested;
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    assert!(matches!(decoded, ClusterMutation::GracefulAbortRequested));
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes a sender emits for the payload-free latch — the externally-
+/// tagged unit variant is the BARE string `"GracefulAbortRequested"` on
+/// the wire (same shape as `RunComplete`) — rather than re-encoding our
+/// own value, so a tagging-shape change that still round-trips against
+/// itself is caught against the other side's actual bytes.
+#[test]
+fn graceful_abort_requested_decodes_literal_sender_bytes() {
+    let bytes = r#""GracefulAbortRequested""#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    assert!(matches!(decoded, ClusterMutation::GracefulAbortRequested));
+}
+
 /// `DiscoveryDebtDeclared` (the payload-free debt-declare latch, twin of
 /// `RunComplete`'s wire shape) round-trips through serde — the variant
 /// discriminant survives encode→decode so a relocated submitter's debt
