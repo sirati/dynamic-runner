@@ -39,6 +39,7 @@ mod ingest;
 mod lifecycle;
 mod peer_setup;
 pub mod preferred_secondaries;
+mod reconciliation_probe;
 pub mod respawn;
 pub(crate) mod retry_bucket;
 mod secondary_id;
@@ -55,7 +56,10 @@ mod tests;
 pub use command_channel::{
     COMMAND_CHANNEL_CAPACITY, PrimaryCommand, SpawnError, validate_spawn_tasks,
 };
-pub use config::{OnCustomMessage, OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
+pub use config::{
+    DEFAULT_TASK_RECONCILIATION_TIMEOUT, OnCustomMessage, OnPhaseEnd, OnPhaseStart,
+    PhaseHookRaiseLatch, PrimaryConfig,
+};
 pub use coordinator::{PrimaryCoordinator, PrimaryRunOutcome};
 pub use error::RunError;
 

@@ -596,7 +596,7 @@ where
     /// before reporting) but never reached the authority, so the
     /// primary's in-flight entry strands forever (phantom-busy; the phase
     /// barrier wedges). This buffer is that fix: every TERMINAL-bearing
-    /// (`DistributedMessage::is_terminal_bearing`) report is RETAINED
+    /// (`DistributedMessage::requires_delivery_ack`) report is RETAINED
     /// here from the send until its ack.
     ///
     /// Scope: ONLY terminal-bearing reports are buffered — keepalives /
@@ -634,6 +634,27 @@ where
     /// operational run (no terminal can be produced there), so it needs
     /// no lifecycle gating.
     pub(in crate::secondary) pending_report_replays: Vec<resource::RetainedReport<I>>,
+
+    /// Replay-attempt tally per retained confirmable report (`delivery_seq` →
+    /// count of timed-out-and-replayed sends), the reporting concern's
+    /// PERMANENT-failure detector (#366). The replay loop retries
+    /// forever by design — correct for a transient outage, but a
+    /// deterministic per-message failure (the canonical case: a frame
+    /// over the mesh wire limit, which the transport's egress gate
+    /// drops LOUDLY but can never deliver) would otherwise churn every
+    /// `delivery_ack_timeout` with only per-attempt WARNs that never
+    /// say "this specific report is never going to make it". Once a
+    /// seq's tally reaches
+    /// [`resource::REPORT_REPLAY_ESCALATION_ATTEMPTS`] the drain
+    /// escalates to ERROR naming the task and the likely causes (and
+    /// re-escalates on every further multiple, so a long-stuck report
+    /// stays visible). Counting keys on the seq because the drain
+    /// round-trips each entry through `send_to_primary`'s re-retention
+    /// (a FRESH `RetainedReport` each time) — the seq is the one
+    /// sticky identity. Entries are dropped on `ack_delivery` (the
+    /// only delivery-confirmed site). Diagnostic bookkeeping only:
+    /// never read by routing, liveness, or the replay decision itself.
+    pub(in crate::secondary) report_replay_attempts: std::collections::HashMap<u64, u32>,
 
     /// Per-secondary monotonic `delivery_seq` counter (#352), owned by
     /// the `send_to_primary` stamping chokepoint: every confirmable

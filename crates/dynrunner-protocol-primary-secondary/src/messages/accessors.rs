@@ -37,6 +37,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
             | Self::CustomMessage { target, .. }
+            | Self::TaskHoldQuery { target, .. }
+            | Self::TaskHoldResponse { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -77,6 +79,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
             | Self::CustomMessage { target, .. }
+            | Self::TaskHoldQuery { target, .. }
+            | Self::TaskHoldResponse { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -131,6 +135,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
             | Self::CustomMessage { target, .. }
+            | Self::TaskHoldQuery { target, .. }
+            | Self::TaskHoldResponse { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -166,6 +172,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskFailed { sender_id, .. }
             | Self::TerminalAck { sender_id, .. }
             | Self::CustomMessage { sender_id, .. }
+            | Self::TaskHoldQuery { sender_id, .. }
+            | Self::TaskHoldResponse { sender_id, .. }
             | Self::Keepalive { sender_id, .. }
             | Self::TimeoutDetected { sender_id, .. }
             | Self::TimeoutQuery { sender_id, .. }
@@ -200,6 +208,8 @@ impl<I> DistributedMessage<I> {
             | Self::TaskFailed { timestamp, .. }
             | Self::TerminalAck { timestamp, .. }
             | Self::CustomMessage { timestamp, .. }
+            | Self::TaskHoldQuery { timestamp, .. }
+            | Self::TaskHoldResponse { timestamp, .. }
             | Self::Keepalive { timestamp, .. }
             | Self::TimeoutDetected { timestamp, .. }
             | Self::TimeoutQuery { timestamp, .. }
@@ -353,6 +363,8 @@ impl<I> DistributedMessage<I> {
             Self::TaskFailed { .. } => MessageType::TaskFailed,
             Self::TerminalAck { .. } => MessageType::TerminalAck,
             Self::CustomMessage { .. } => MessageType::CustomMessage,
+            Self::TaskHoldQuery { .. } => MessageType::TaskHoldQuery,
+            Self::TaskHoldResponse { .. } => MessageType::TaskHoldResponse,
             Self::Keepalive { .. } => MessageType::Keepalive,
             Self::TimeoutDetected { .. } => MessageType::TimeoutDetected,
             Self::TimeoutQuery { .. } => MessageType::TimeoutQuery,

@@ -17,6 +17,9 @@
 //!   dial-failure summary emitted from `process_reconnect_tick` —
 //!   carries the dialed address + consecutive-failure count, throttled
 //!   to the summary threshold/recurrence boundaries.
+//! - [`broadcast_miss`]: broadcast honesty (#363) — a known
+//!   (`peer_dial_info`) but unconnected peer that misses a broadcast
+//!   is named by a WARN, once per peer per outage.
 //! - [`dial_sweep`]: the `connect_to_peers` sweep-summary dispositions
 //!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
 //!   rule) / dropped-from-list — plus the higher-id side's truthful
@@ -39,6 +42,7 @@ pub(crate) struct TestId(pub(crate) String);
 
 mod bind_port;
 mod bootstrap_redial;
+mod broadcast_miss;
 mod cert_parsing;
 mod dial_failure_summary;
 mod dial_sweep;

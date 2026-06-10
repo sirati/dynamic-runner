@@ -65,6 +65,38 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         for (peer_id, dead_tx) in &dead {
             self.handle_peer_disconnect(peer_id, dead_tx);
         }
+        // Broadcast honesty (#363): a KNOWN peer — present in the
+        // authoritative dial roster (`peer_dial_info`, the same list
+        // the reconnect sweep reconciles against) — that has no live
+        // `connections` entry misses this broadcast entirely, and
+        // nothing retransmits it on reconnect (#352's terminal-ACK
+        // replay covers terminals; everything else is fire-and-forget).
+        // Name the gap instead of returning a silent Ok. Rate limit:
+        // once per peer per OUTAGE — the reconnect tracker owns the
+        // outage lifecycle, so its `first_broadcast_miss` latch (reset
+        // by the heal that removes the tracked entry) is the gate; a
+        // persistently-down peer warns on the first missed broadcast
+        // of the outage and is then silent until it heals. Computed
+        // AFTER the dead-send prune above so a peer whose send failed
+        // DURING this broadcast (message lost, entry pruned, outage
+        // now tracked) is named immediately, not on the next call.
+        // Untracked known-but-unconnected peers (mesh-forming dial
+        // window, ≤ one reconnect tick) stay silent by the gate's
+        // contract. The return type is unchanged: callers don't
+        // branch on partial delivery.
+        for peer_id in self.peer_dial_info.keys() {
+            if !self.connections.contains_key(peer_id)
+                && self.reconnect_tracker.first_broadcast_miss(peer_id)
+            {
+                tracing::warn!(
+                    peer = %peer_id,
+                    "broadcast missed known peer: in the authoritative \
+                     cluster list but not currently connected — this and \
+                     every further broadcast of this outage will not reach \
+                     it (no retransmit on reconnect); warned once per outage"
+                );
+            }
+        }
         Ok(())
     }
 

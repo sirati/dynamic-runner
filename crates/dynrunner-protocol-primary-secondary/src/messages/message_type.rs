@@ -56,6 +56,16 @@ pub enum MessageType {
     /// (`important = true`, #352-retained + acked via `TerminalAck` +
     /// CRDT-resident until the primary's handler consumes it).
     CustomMessage,
+    /// Primary -> holder secondary: per-task reconciliation probe
+    /// (#308) — "do you still hold task X?". Emitted once a task has
+    /// been in flight past the reconciliation deadline with no
+    /// terminal. Accounting reconciliation only, never liveness.
+    TaskHoldQuery,
+    /// Holder secondary -> primary: the probe's answer. `held = true`
+    /// re-arms the primary's per-task deadline; `held = false` is the
+    /// holder's positive denial, on which the primary fails + requeues
+    /// the task via the backpressure-shaped path.
+    TaskHoldResponse,
     Keepalive,
     TimeoutDetected,
     TimeoutQuery,

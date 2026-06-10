@@ -37,6 +37,7 @@ mod phase_ordering;
 mod preferred_secondaries;
 mod producer_backstop;
 mod promotion;
+mod reconciliation_probe;
 mod relocate_staging;
 mod result_data_plumbing;
 mod retry;
@@ -58,8 +59,9 @@ pub(super) use super::test_helpers::{
     PromoteHooksFactory, ScriptedWorkerFactory, SlowFakeWorkerFactory, TestId, WorkerScript,
     build_test_primary, build_test_promote_recipe, build_test_promote_recipe_from_producer,
     build_test_promote_recipe_with_config, build_test_promote_recipe_with_config_and_hooks,
-    fake_secondary, fake_secondary_transport_only_no_meshready, fake_secondary_with_addrs,
-    make_binary, make_relative_binary, seed_operational_ledger, setup_test,
+    fake_amnesiac_secondary, fake_secondary, fake_secondary_transport_only_no_meshready,
+    fake_secondary_with_addrs, make_binary, make_relative_binary, seed_operational_ledger,
+    setup_test,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;

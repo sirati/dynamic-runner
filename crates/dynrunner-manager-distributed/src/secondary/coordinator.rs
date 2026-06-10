@@ -147,6 +147,10 @@ where
             // app-level TerminalAck (#352 — see the field doc on
             // `SecondaryCoordinator`).
             pending_report_replays: Vec::new(),
+            // Permanent-failure detector beside it (#366): replay
+            // attempts per delivery_seq, escalated to ERROR past the
+            // threshold in `drain_report_replays`.
+            report_replay_attempts: std::collections::HashMap::new(),
             // Per-secondary monotonic delivery-confirmation counter; 1 so
             // a zero seq never appears on the wire.
             next_delivery_seq: 1,

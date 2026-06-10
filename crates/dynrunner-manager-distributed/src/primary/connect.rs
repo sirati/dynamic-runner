@@ -209,6 +209,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `delivery_seq`-stamped landing, including dedup-dropped
             // duplicates).
             MessageType::CustomMessage => self.handle_custom_message(msg, command_rx).await,
+            // Reconciliation-probe verdict arm (#308): a holder
+            // secondary's answer to this primary's `TaskHoldQuery`.
+            // `held` re-arms the per-task deadline; `not held` fails +
+            // requeues the lost task through the backpressure-shaped
+            // `handle_task_failed` path. See
+            // `primary::reconciliation_probe`.
+            MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,

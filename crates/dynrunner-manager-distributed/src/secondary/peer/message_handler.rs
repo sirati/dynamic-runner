@@ -184,6 +184,58 @@ where
                     "observed peer TaskFailed"
                 );
             }
+            DistributedMessage::TaskHoldQuery { task_hash, .. } => {
+                // Reconciliation probe (#308): the primary's per-task
+                // deadline elapsed with no terminal for `task_hash` and
+                // it asks whether WE still hold it. Answer from this
+                // node's own live bookkeeping (the generation-aware
+                // `active_tasks` + the `pending_first_bind` deferrals —
+                // `SecondaryLifecycle::holds_task` owns the read). Pure
+                // own-worker observation: no CRDT write, no liveness
+                // input, no pool mutation.
+                //
+                // The answer rides `send_to_primary` (`Destination::
+                // Primary`) — NOT a by-id peer send to the asker — so it
+                // demuxes to the PRIMARY role slot of whichever node
+                // holds the role at send time; across a failover the
+                // new authority (which inherited the in-flight ledger)
+                // adjudicates, and an answer it never asked for is
+                // dropped by its prober as unmatched. The frame is
+                // droppable (non-confirmable: `requires_delivery_ack`
+                // is false, so no retention): a lost answer just
+                // means the primary's response window expires and it
+                // re-probes a full window later.
+                let held = self.lifecycle.holds_task(&task_hash);
+                if held {
+                    tracing::debug!(
+                        task_hash = %task_hash,
+                        "reconciliation probe: task is held in live \
+                         bookkeeping; answering held=true"
+                    );
+                } else {
+                    tracing::warn!(
+                        task_hash = %task_hash,
+                        "reconciliation probe: the primary believes this \
+                         node holds a task that is NOT in any live local \
+                         bookkeeping; answering held=false (the primary \
+                         will fail + requeue it)"
+                    );
+                }
+                let response = DistributedMessage::TaskHoldResponse {
+                    target: None,
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    task_hash,
+                    held,
+                };
+                if let Err(e) = self.send_to_primary(response).await {
+                    tracing::debug!(
+                        error = %e,
+                        "TaskHoldResponse send failed (best-effort; the \
+                         primary's response window expires and it re-probes)"
+                    );
+                }
+            }
             DistributedMessage::TerminalAck { seq, .. } => {
                 // App-level delivery confirmation (#352): the primary's
                 // ingest acked one terminal-bearing report landing; drop

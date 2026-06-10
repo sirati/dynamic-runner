@@ -218,6 +218,19 @@ fn roundtrip_all_message_types() {
             important: true,
             delivery_seq: Some(9),
         },
+        DistributedMessage::TaskHoldQuery {
+            target: None,
+            sender_id: "p".into(),
+            timestamp: 0.0,
+            task_hash: "h".into(),
+        },
+        DistributedMessage::TaskHoldResponse {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            task_hash: "h".into(),
+            held: false,
+        },
         DistributedMessage::Keepalive {
             target: None,
             sender_id: "s".into(),

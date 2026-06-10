@@ -97,6 +97,7 @@ mod failover_multi_survivor;
 mod failover_second_round;
 mod firstbind_orphan;
 mod generation_gate;
+mod hold_probe_responder;
 mod honest_liveness;
 mod keepalive_emission;
 mod keepalive_recognition;

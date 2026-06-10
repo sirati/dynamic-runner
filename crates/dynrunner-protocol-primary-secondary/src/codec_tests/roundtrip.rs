@@ -543,6 +543,107 @@ fn terminal_ack_decodes_literal_sender_bytes() {
     }
 }
 
+/// The reconciliation-probe pair (#308) round-trips through the
+/// length-prefixed codec with `task_hash` (and the response's `held`
+/// polarity) preserved verbatim.
+#[test]
+fn roundtrip_task_hold_query_and_response() {
+    let query: DistributedMessage<TestId> = DistributedMessage::TaskHoldQuery {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 42.0,
+        task_hash: "h-probe".into(),
+    };
+    let bytes = serialize_message(&query).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        DistributedMessage::TaskHoldQuery {
+            sender_id,
+            task_hash,
+            ..
+        } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(task_hash, "h-probe");
+        }
+        _ => panic!("expected TaskHoldQuery"),
+    }
+
+    // BOTH polarities of `held` round-trip — the `false` (positive
+    // denial) is the load-bearing verdict and must never decode as the
+    // benign `true`.
+    for held in [true, false] {
+        let response: DistributedMessage<TestId> = DistributedMessage::TaskHoldResponse {
+            target: None,
+            sender_id: "sec-1".into(),
+            timestamp: 43.0,
+            task_hash: "h-probe".into(),
+            held,
+        };
+        let bytes = serialize_message(&response).unwrap();
+        let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+        assert_eq!(consumed, bytes.len());
+        match decoded {
+            DistributedMessage::TaskHoldResponse {
+                sender_id,
+                task_hash,
+                held: decoded_held,
+                ..
+            } => {
+                assert_eq!(sender_id, "sec-1");
+                assert_eq!(task_hash, "h-probe");
+                assert_eq!(decoded_held, held);
+            }
+            _ => panic!("expected TaskHoldResponse"),
+        }
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the
+/// EXACT JSON bytes a probing primary emits for a `TaskHoldQuery` —
+/// `{"msg_type":"task_hold_query",...,"task_hash":"..."}` (internally
+/// tagged, snake_case) — rather than re-encoding our own value, so a
+/// tag/field rename that still round-trips against itself is caught
+/// against the other side's actual bytes.
+#[test]
+fn task_hold_query_decodes_literal_sender_bytes() {
+    let bytes = r#"{"msg_type":"task_hold_query","sender_id":"primary","timestamp":7.5,"task_hash":"h-lit"}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::TaskHoldQuery {
+            sender_id,
+            task_hash,
+            ..
+        } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(task_hash, "h-lit");
+        }
+        _ => panic!("expected TaskHoldQuery"),
+    }
+}
+
+/// Wire-shape mirror for the answer: the EXACT JSON bytes a holder
+/// secondary emits for a `TaskHoldResponse` carrying the load-bearing
+/// `held:false` denial.
+#[test]
+fn task_hold_response_decodes_literal_sender_bytes() {
+    let bytes = r#"{"msg_type":"task_hold_response","sender_id":"sec-2","timestamp":1.0,"task_hash":"h-lit","held":false}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::TaskHoldResponse {
+            sender_id,
+            task_hash,
+            held,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-2");
+            assert_eq!(task_hash, "h-lit");
+            assert!(!held, "the positive denial must decode as held=false");
+        }
+        _ => panic!("expected TaskHoldResponse"),
+    }
+}
+
 /// A `delivery_seq`-stamped terminal report round-trips with the seq
 /// preserved — what lets a replay re-send the SAME seq and the primary
 /// echo the matching ack.
