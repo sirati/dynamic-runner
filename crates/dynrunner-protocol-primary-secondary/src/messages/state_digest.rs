@@ -164,6 +164,25 @@ pub struct StateDigest {
     /// admission budget / cooldown converge cluster-wide).
     #[serde(default)]
     pub respawn_events_hash: u64,
+    /// Number of live custom-message inbox entries (F5 — `Unhandled`
+    /// payloads + not-yet-compacted `Handled` tombstones).
+    #[serde(default)]
+    pub custom_messages_count: u64,
+    /// XOR-fold over the custom-message inbox `((origin, seq), state)`
+    /// pairs (F5): folds the VALUE too, so an `Unhandled → Handled`
+    /// transition at an equal count is detected and the snapshot pull's
+    /// lattice merge heals it (the sticky `Handled` latch wins).
+    #[serde(default)]
+    pub custom_messages_hash: u64,
+    /// Number of per-origin handled watermarks (F5 compaction).
+    #[serde(default)]
+    pub custom_handled_watermarks_count: u64,
+    /// XOR-fold over the per-origin `(origin, watermark)` pairs (F5): a
+    /// peer whose watermark advanced past this replica's makes the
+    /// replica behind; the snapshot pull's grow-max merge heals it and
+    /// prunes the subsumed local tombstones.
+    #[serde(default)]
+    pub custom_handled_watermarks_hash: u64,
 }
 
 impl StateDigest {
@@ -315,6 +334,29 @@ impl StateDigest {
                 self.respawn_events_hash,
                 other.respawn_events_count,
                 other.respawn_events_hash,
+            )
+            // F5 custom-message inbox: count-OR-hash compare. NOTE the
+            // count here is NOT monotone (compaction physically drops
+            // handled tombstones), so a compacted peer can hold FEWER
+            // entries than a lagging local — that direction is healed by
+            // the WATERMARK compare below (the watermark is the monotone
+            // summary of what compaction consumed), not by this field;
+            // this field detects a missing/lagging entry among the LIVE
+            // (uncompacted) keys, where the equal-watermark count IS
+            // monotone-comparable.
+            || field_behind(
+                self.custom_messages_count,
+                self.custom_messages_hash,
+                other.custom_messages_count,
+                other.custom_messages_hash,
+            )
+            // F5 per-origin handled watermarks: grow-max map —
+            // count-OR-hash compare like the other grow-max fields.
+            || field_behind(
+                self.custom_handled_watermarks_count,
+                self.custom_handled_watermarks_hash,
+                other.custom_handled_watermarks_count,
+                other.custom_handled_watermarks_hash,
             )
     }
 }

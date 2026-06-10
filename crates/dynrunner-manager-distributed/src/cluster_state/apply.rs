@@ -583,6 +583,15 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
             }
+            ClusterMutation::CustomMessagePosted {
+                origin,
+                seq,
+                topic,
+                data,
+            } => self.apply_custom_message_posted(origin, seq, topic, data),
+            ClusterMutation::CustomMessageHandled { origin, seq } => {
+                self.apply_custom_message_handled(origin, seq)
+            }
         }
     }
 

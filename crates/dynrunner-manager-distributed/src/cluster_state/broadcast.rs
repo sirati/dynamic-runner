@@ -171,7 +171,15 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::SecondaryCapacity { .. }
-            | ClusterMutation::TasksSpawned { .. } => {}
+            | ClusterMutation::TasksSpawned { .. }
+            // The F5 custom-message inbox mutations are version-LESS:
+            // the `(origin, seq)` key is the originating secondary's
+            // per-origin monotone (the idempotency arbiter), and the
+            // `Unhandled ⊑ Handled` sticky lattice needs no version —
+            // there is exactly one originator (the primary) and the
+            // latch join is order-free.
+            | ClusterMutation::CustomMessagePosted { .. }
+            | ClusterMutation::CustomMessageHandled { .. } => {}
         }
     }
 }

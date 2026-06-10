@@ -1,5 +1,14 @@
 pub mod address;
 pub mod cluster_mutation;
+
+/// Maximum `data` payload of a consumer custom message (F5 / F2),
+/// secondary→primary AND worker↔secondary alike: 100 KiB. Enforced at
+/// the SEND entry points (the Python APIs raise `ValueError` naming the
+/// size and the limit; the Rust send seams reject before framing) and
+/// comfortably tolerated by the wire. The framework never interprets the
+/// payload — the limit exists so a consumer stream stays signal-sized
+/// (the #364 wedged-IPC class is structurally impossible at 100 KiB).
+pub const CUSTOM_MESSAGE_MAX_BYTES: usize = 100 * 1024;
 pub mod codec;
 pub mod messages;
 pub mod relay;

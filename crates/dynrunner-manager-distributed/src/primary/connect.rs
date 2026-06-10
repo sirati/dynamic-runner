@@ -188,12 +188,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.record_keepalive(msg.sender_id());
 
         // App-level delivery confirmation (#352): echo a `TerminalAck`
-        // for EVERY `delivery_seq`-stamped terminal-bearing landing,
-        // BEFORE the handlers run — including landings their dedup gates
-        // will drop (a duplicate means the original ack was lost or the
-        // replay raced it; not re-acking would replay forever). A no-op
-        // for every other frame, so the handlers stay seq-oblivious.
-        self.ack_terminal_report(&msg).await;
+        // for EVERY `delivery_seq`-stamped confirmable landing (a
+        // terminal, or an important custom message — F5), BEFORE the
+        // handlers run — including landings their dedup gates will drop
+        // (a duplicate means the original ack was lost or the replay
+        // raced it; not re-acking would replay forever). A no-op for
+        // every other frame, so the handlers stay seq-oblivious.
+        self.ack_delivery_report(&msg).await;
 
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
@@ -201,6 +202,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
             MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
+            // Consumer custom message (F5): droppable → direct handler
+            // dispatch; important → CRDT-post + the handler-dispatch
+            // decision. The ack echo for an important landing already
+            // ran above (`ack_delivery_report` — every
+            // `delivery_seq`-stamped landing, including dedup-dropped
+            // duplicates).
+            MessageType::CustomMessage => self.handle_custom_message(msg, command_rx).await,
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
@@ -239,14 +247,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// Echo the app-level delivery confirmation (#352) for one
-    /// terminal-bearing report landing: a `TerminalAck { seq }` unicast
-    /// back to the report's ORIGINATING secondary.
+    /// confirmable report landing — a terminal, or an IMPORTANT custom
+    /// message (F5): a `TerminalAck { seq }` unicast back to the
+    /// report's ORIGINATING secondary.
     ///
     /// Gated on the frame carrying BOTH a `delivery_seq` (a pre-field /
     /// unstamped sender gets no ack and keeps the pre-#352 no-route-only
-    /// replay behaviour) and a `terminal_reporter` (non-terminal frames
-    /// have neither) — i.e. a no-op for everything but a stamped
-    /// `TaskComplete` / `TaskFailed`.
+    /// replay behaviour; a DROPPABLE custom is never stamped) and a
+    /// `delivery_reporter` (non-confirmable frames have neither) — i.e.
+    /// a no-op for everything but a stamped `TaskComplete` /
+    /// `TaskFailed` / important `CustomMessage`.
     ///
     /// Addressed to the frame's `secondary_id` (the originator holding
     /// the retention buffer), NOT the wire `sender_id`: a relayed or
@@ -262,8 +272,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// A send failure is best-effort (DEBUG): the reporter's ack-timeout
     /// replay re-lands the report and this site re-acks it.
-    pub(super) async fn ack_terminal_report(&mut self, msg: &DistributedMessage<I>) {
-        let (Some(seq), Some(reporter)) = (msg.delivery_seq(), msg.terminal_reporter()) else {
+    pub(super) async fn ack_delivery_report(&mut self, msg: &DistributedMessage<I>) {
+        let (Some(seq), Some(reporter)) = (msg.delivery_seq(), msg.delivery_reporter()) else {
             return;
         };
         let reporter = reporter.to_string();

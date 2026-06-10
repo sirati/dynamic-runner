@@ -657,6 +657,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 _ = heartbeat_tick.tick() => {
                     arm_stats.record(ARM_HEARTBEAT);
+                    // F5 backoff-retry driver: re-run the custom-message
+                    // handler-dispatch decision so a raise-deferred
+                    // `Unhandled` entry retries once its backoff window
+                    // elapses. A PERSISTENT interval (never reset by
+                    // sibling arms — the watchdog law), and a cheap
+                    // no-op when the inbox holds no `Unhandled` entry
+                    // (the steady-state hot path) or nothing is due.
+                    self.dispatch_unhandled_custom_messages(&mut command_rx).await;
                     self.broadcast_primary_keepalive().await;
                     // Refresh the PRIMARY→secondaries liveness-beacon target
                     // set on the SAME cadence as the mesh keepalive — the

@@ -19,7 +19,9 @@ use super::ClusterState;
 use super::TaskState;
 use super::grow_max::{merge_grow_max, merge_grow_set};
 use super::merge::merge_capability;
-use super::types::{CapabilityEntry, PeerEntry, PeerState, PhaseTally, RespawnEventRecord};
+use super::types::{
+    CapabilityEntry, CustomMsgState, PeerEntry, PeerState, PhaseTally, RespawnEventRecord,
+};
 
 /// Wire adapter for the TUPLE-keyed grow-only-MAX maps (F4
 /// `phase_event_tallies`, P3 `retry_passes_used`): the snapshot rides the
@@ -330,6 +332,30 @@ pub struct ClusterStateSnapshot<I> {
     /// to have fired", the conservative replay-the-edge shape).
     #[serde(default)]
     pub phases_ended: HashSet<PhaseId>,
+    /// Replicated custom-message inbox (F5) — the IMPORTANT
+    /// secondary→primary consumer messages, keyed by `(origin, seq)`.
+    /// Carried so a promoted primary inherits every `Unhandled` entry
+    /// and its hydrate replays them to the local handler (the
+    /// failover-safety the feature exists for), and so a late-joiner's
+    /// mirror converges. Merge rule on `restore`: per-key sticky-latch
+    /// join (`Unhandled ⊑ Handled` — a `Handled` wins; an `Unhandled`
+    /// vacant-inserts; watermark-subsumed keys are skipped), then the
+    /// per-origin watermark compaction prunes newly-complete prefixes.
+    /// Tuple-keyed, so the wire shape is the `tuple_keyed_map` pair
+    /// list (the #358 lesson — serde_json REJECTS non-string map keys,
+    /// and a plain map field would serialize fine while empty then
+    /// error on the first real entry, silently dropping every snapshot
+    /// reply). `#[serde(default)]` keeps wire compat with a pre-field
+    /// sender (missing field decodes as an empty inbox).
+    #[serde(default, with = "tuple_keyed_map")]
+    pub custom_messages: HashMap<(String, u64), CustomMsgState>,
+    /// Per-origin contiguous-prefix handled watermark (F5 compaction).
+    /// Merge rule on `restore`: per-origin grow-only MAX, then every
+    /// local entry the merged watermark subsumes is pruned (a peer's
+    /// higher watermark PROVES those seqs were handled cluster-wide).
+    /// `#[serde(default)]` keeps wire compat with a pre-field sender.
+    #[serde(default)]
+    pub custom_handled_watermarks: HashMap<String, u64>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -384,6 +410,9 @@ impl<I: Identifier> ClusterState<I> {
             respawn_events,
             // Replicated grow-only SET (#343).
             phases_ended,
+            // Replicated custom-message inbox + watermarks (F5).
+            custom_messages,
+            custom_handled_watermarks,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -461,6 +490,11 @@ impl<I: Identifier> ClusterState<I> {
             // primary inherits which phases already fired `on_phase_end`
             // (the no-redo decision input) via union-merge on restore.
             phases_ended: phases_ended.clone(),
+            // Replicated custom-message inbox + watermarks (F5) — carried
+            // so a promoted primary inherits every `Unhandled` entry for
+            // the hydrate replay, and the compaction state converges.
+            custom_messages: custom_messages.clone(),
+            custom_handled_watermarks: custom_handled_watermarks.clone(),
         }
     }
 
@@ -548,6 +582,8 @@ impl<I: Identifier> ClusterState<I> {
             unfulfillable_reinject_used,
             respawn_events,
             phases_ended,
+            custom_messages,
+            custom_handled_watermarks,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -783,5 +819,51 @@ impl<I: Identifier> ClusterState<I> {
         // peer's snapshot can never un-end a phase. Idempotent +
         // order-insensitive (set insert), the OR-join the fact declares.
         self.phases_ended.extend(phases_ended);
+        // F5 custom-message inbox: per-origin watermark grow-MAX first
+        // (a peer's higher watermark PROVES every subsumed seq was
+        // handled cluster-wide — prune the newly-covered local entries),
+        // then the per-key sticky-latch join over the incoming entries
+        // (`Handled` wins over `Unhandled`; an absent key vacant-inserts;
+        // watermark-covered keys are skipped), then the apply-side
+        // compaction re-runs per touched origin so a restore that
+        // completes a handled prefix compacts exactly like the live
+        // apply path would (apply == restore by construction).
+        let watermark_origins: Vec<String> = custom_handled_watermarks.keys().cloned().collect();
+        merge_grow_max(
+            &mut self.custom_handled_watermarks,
+            custom_handled_watermarks,
+        );
+        for origin in &watermark_origins {
+            self.prune_below_custom_watermark(origin);
+        }
+        let mut touched_origins: HashSet<String> = HashSet::new();
+        for ((origin, seq), incoming) in custom_messages {
+            if self
+                .custom_handled_watermarks
+                .get(&origin)
+                .is_some_and(|w| seq <= *w)
+            {
+                continue;
+            }
+            match self.custom_messages.entry((origin.clone(), seq)) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    if matches!(incoming, CustomMsgState::Handled) {
+                        touched_origins.insert(origin);
+                    }
+                    e.insert(incoming);
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if matches!(incoming, CustomMsgState::Handled)
+                        && matches!(e.get(), CustomMsgState::Unhandled { .. })
+                    {
+                        e.insert(CustomMsgState::Handled);
+                        touched_origins.insert(origin);
+                    }
+                }
+            }
+        }
+        for origin in &touched_origins {
+            self.compact_custom_watermark(origin);
+        }
     }
 }

@@ -106,6 +106,14 @@ impl<I: Identifier> ClusterState<I> {
             // key-set identity detects a missing entry, same shape as
             // `secondary_capacities_hash`).
             phases_ended,
+            // Replicated custom-message inbox + watermarks (F5) —
+            // summarised: count + KEY+VALUE XOR-fold each (the inbox
+            // value changes on `Unhandled → Handled` at an equal count,
+            // and the watermark value advances at an equal origin
+            // count, so both folds must see the value — the grow-max /
+            // grow-set shape).
+            custom_messages,
+            custom_handled_watermarks,
             // Replicated static phase-graph metadata, but EXCLUDED from the
             // digest: `phase_may_be_empty` is originated in the SAME seed
             // batch as `phase_deps` (both set-once at run start, paired in
@@ -220,6 +228,14 @@ impl<I: Identifier> ClusterState<I> {
             phases_ended_hash ^= hash_one(phase);
         }
 
+        // F5 custom-message inbox: count + KEY+VALUE fold (an
+        // `Unhandled → Handled` transition at an equal count changes the
+        // fold; the snapshot pull's sticky-latch merge heals the lagging
+        // side). Watermarks: the grow-max KEY+VALUE fold.
+        let custom_messages_hash = super::grow_max::fold_grow_set(custom_messages);
+        let custom_handled_watermarks_hash =
+            super::grow_max::fold_grow_max(custom_handled_watermarks);
+
         StateDigest {
             tasks_count: tasks.len() as u64,
             tasks_hash,
@@ -262,6 +278,10 @@ impl<I: Identifier> ClusterState<I> {
             respawn_events_hash,
             phases_ended_count: phases_ended.len() as u64,
             phases_ended_hash,
+            custom_messages_count: custom_messages.len() as u64,
+            custom_messages_hash,
+            custom_handled_watermarks_count: custom_handled_watermarks.len() as u64,
+            custom_handled_watermarks_hash,
         }
     }
 }

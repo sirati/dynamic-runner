@@ -13,7 +13,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use super::assignment::InitialAssignmentOutcome;
 use super::command_channel::{COMMAND_CHANNEL_CAPACITY, PrimaryCommand};
-use super::config::{OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
+use super::config::{OnCustomMessage, OnPhaseEnd, OnPhaseStart, PhaseHookRaiseLatch, PrimaryConfig};
 use super::error::RunError;
 use super::preferred_secondaries;
 use super::respawn::{
@@ -571,6 +571,26 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// secondary, tests) leave this default in place and keep the legacy
     /// warn-and-continue.
     pub(super) phase_hook_raise_latch: PhaseHookRaiseLatch,
+    /// Consumer custom-message hook (F5). `None` when the consumer's
+    /// `TaskDefinition` exposes no `custom_message_handler` attribute —
+    /// the dispatch decision then consumes important messages unhandled
+    /// (WARN + `Handled`, so the replicated inbox never grows
+    /// unboundedly on a hook-less consumer). Installed pre-run via
+    /// [`Self::set_custom_message_handler`].
+    pub(super) on_custom_message: Option<OnCustomMessage>,
+    /// Node-local per-message handler-raise bookkeeping (F5 poison
+    /// policy): consecutive raise count + the backoff deadline for the
+    /// next retry, keyed by the `(origin, seq)` inbox key. NOT
+    /// replicated by design (fork F5-c): a failover resets strikes,
+    /// which is fail-safe — the new primary's handler may well succeed.
+    /// Entries are dropped on a clean handler return and at the poison
+    /// cap.
+    pub(super) custom_handler_strikes:
+        HashMap<(String, u64), crate::primary::custom_message::CustomHandlerBackoff>,
+    /// Backoff base for handler-raise retries (F5): retry `n` waits
+    /// `base × 2^(n-1)`. A field (not a const) so tests drive
+    /// sub-second schedules; production keeps the default.
+    pub(super) custom_handler_backoff_base: std::time::Duration,
     /// The consumer's discovery policy for a relocated (mode-2) primary or
     /// an in-process `--source-already-staged` local primary, plus the
     /// phase graph it seeds alongside the discovered tasks. `None` on every
@@ -1172,6 +1192,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // cascade's `take()` is always `None` until a caller wires a
             // real latch via `set_phase_hook_raise_latch`.
             phase_hook_raise_latch: PhaseHookRaiseLatch::detached(),
+            on_custom_message: None,
+            custom_handler_strikes: HashMap::new(),
+            custom_handler_backoff_base:
+                crate::primary::custom_message::CUSTOM_HANDLER_BACKOFF_BASE,
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
@@ -1739,6 +1763,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// [`on_phase_end`]: Self::on_phase_end
     pub fn set_phase_hook_raise_latch(&mut self, latch: PhaseHookRaiseLatch) {
         self.phase_hook_raise_latch = latch;
+    }
+
+    /// Install the consumer custom-message hook (F5) BEFORE `run` (the
+    /// same pre-run-setter contract as the other `register_*` / `set_*`
+    /// installers). The pyo3 layer builds the closure off the duck-typed
+    /// `TaskDefinition.custom_message_handler` attribute — and only
+    /// installs one when the attribute exists, so a `None` field is the
+    /// "consumer has no handler" signal the dispatch decision consumes.
+    pub fn set_custom_message_handler(&mut self, handler: OnCustomMessage) {
+        self.on_custom_message = Some(handler);
     }
 
     /// Register the consumer's discovery policy + phase graph on a
@@ -3442,6 +3476,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.pool_mut().drain_empty_active_phases();
                     self.process_phase_lifecycle(&mut command_rx).await;
                 }
+
+                // PROMOTION REPLAY (F5): dispatch every `Unhandled`
+                // custom-message inbox entry the inherited CRDT carries
+                // to the local handler — a primary that died between an
+                // important landing and its handler invocation leaves
+                // the entry `Unhandled` in every replica, and THIS host
+                // (any peer can be primary) holds the consumer's
+                // TaskDefinition to consume it. Runs AFTER the
+                // hydrate + initial cascade above (the pool is live, so
+                // a handler's spawn_tasks lands dispatchable work) and
+                // BEFORE `perform_initial_assignment` (the replayed
+                // spawns join the initial assignment). A no-op on a
+                // cold start (empty inbox) and on a hook-less consumer
+                // (consume-unhandled WARN path).
+                self.dispatch_unhandled_custom_messages(&mut command_rx)
+                    .await;
 
                 // Phase 2.5: Auto-stage. Run the staging walk on behalf of
                 // callers that didn't pre-queue via `queue_stage_file` /

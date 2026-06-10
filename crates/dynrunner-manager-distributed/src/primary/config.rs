@@ -31,6 +31,22 @@ pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
 /// fires it. It is empty for a phase whose tasks published nothing.
 pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &BTreeMap<String, TaskOutputs>) + Send>;
 
+/// Consumer custom-message hook (F5), invoked by the primary's
+/// handler-dispatch decision once per delivered message:
+/// `(origin_secondary_id, topic, data, important)`. The pyo3 layer wires
+/// this to the duck-typed `TaskDefinition.custom_message_handler`
+/// attribute (passing the live `PrimaryHandle` it captured, so the
+/// handler IS the streamed-spawn site).
+///
+/// The `Result` return is the dispatch decision's input: `Ok(())` =
+/// the consumer consumed the message (an IMPORTANT message is then
+/// latched `Handled` in the replicated inbox); `Err(reason)` = the
+/// consumer hook RAISED — an important message stays `Unhandled` and is
+/// retried with backoff up to the poison cap (see
+/// `primary/custom_message.rs`); a droppable one is lost (at-most-once
+/// by contract).
+pub type OnCustomMessage = Box<dyn FnMut(&str, &str, &[u8], bool) -> Result<(), String> + Send>;
+
 /// A shared side-channel by which an [`OnPhaseEnd`] closure records that
 /// the consumer's phase-end hook RAISED, without changing the closure's
 /// `()` return.

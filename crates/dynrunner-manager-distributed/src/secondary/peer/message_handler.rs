@@ -196,7 +196,7 @@ where
                 // flowing through the keepalive / dispatch preambles
                 // unchanged, so the failover-arming inputs are untouched
                 // by this feature.
-                self.ack_terminal(seq);
+                self.ack_delivery(seq);
             }
             DistributedMessage::TimeoutDetected {
                 sender_id,

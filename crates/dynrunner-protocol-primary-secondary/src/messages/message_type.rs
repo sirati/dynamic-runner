@@ -49,6 +49,13 @@ pub enum MessageType {
     /// secondary drops the matching retention-buffer entry. Delivery
     /// bookkeeping only — never a liveness signal.
     TerminalAck,
+    /// Secondary -> Primary consumer-defined message (F5): an opaque
+    /// `(topic, data)` payload keyed by the per-origin
+    /// `(origin_secondary_id, msg_seq)` idempotency pair. Droppable
+    /// (`important = false`, fire-and-forget) or important
+    /// (`important = true`, #352-retained + acked via `TerminalAck` +
+    /// CRDT-resident until the primary's handler consumes it).
+    CustomMessage,
     Keepalive,
     TimeoutDetected,
     TimeoutQuery,

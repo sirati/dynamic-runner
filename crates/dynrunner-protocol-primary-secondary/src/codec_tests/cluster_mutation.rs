@@ -736,3 +736,79 @@ fn legacy_reset_mutations_decode_version_as_default() {
         );
     }
 }
+
+/// F5 `CustomMessagePosted` round-trips with the full `(origin, seq)`
+/// key + the opaque payload preserved verbatim.
+#[test]
+fn roundtrip_custom_message_posted() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::CustomMessagePosted {
+        origin: "sec-1".into(),
+        seq: 11,
+        topic: "phase4-batch".into(),
+        data: b"batch payload".to_vec(),
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessagePosted {
+            origin,
+            seq,
+            topic,
+            data,
+        } => {
+            assert_eq!(origin, "sec-1");
+            assert_eq!(seq, 11);
+            assert_eq!(topic, "phase4-batch");
+            assert_eq!(data, b"batch payload".to_vec());
+        }
+        _ => panic!("expected CustomMessagePosted"),
+    }
+}
+
+/// F5 `CustomMessageHandled` round-trips with its `(origin, seq)` key.
+#[test]
+fn roundtrip_custom_message_handled() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::CustomMessageHandled {
+        origin: "sec-1".into(),
+        seq: 11,
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageHandled { origin, seq } => {
+            assert_eq!(origin, "sec-1");
+            assert_eq!(seq, 11);
+        }
+        _ => panic!("expected CustomMessageHandled"),
+    }
+}
+
+/// Literal-bytes pins for both F5 mutations (the externally-tagged
+/// `ClusterMutation` shape every current originator emits). Pinning the
+/// sender bytes catches a tag / field-name divergence a symmetric
+/// round-trip cannot see.
+#[test]
+fn custom_message_mutations_decode_literal_sender_bytes() {
+    let posted = r#"{"CustomMessagePosted":{"origin":"sec-1","seq":3,"topic":"t","data":[1,2]}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(posted).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessagePosted {
+            origin,
+            seq,
+            topic,
+            data,
+        } => {
+            assert_eq!((origin.as_str(), seq, topic.as_str()), ("sec-1", 3, "t"));
+            assert_eq!(data, vec![1, 2]);
+        }
+        _ => panic!("expected CustomMessagePosted"),
+    }
+    let handled = r#"{"CustomMessageHandled":{"origin":"sec-1","seq":3}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(handled).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageHandled { origin, seq } => {
+            assert_eq!((origin.as_str(), seq), ("sec-1", 3));
+        }
+        _ => panic!("expected CustomMessageHandled"),
+    }
+}

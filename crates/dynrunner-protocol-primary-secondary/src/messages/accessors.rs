@@ -36,6 +36,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
+            | Self::CustomMessage { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -75,6 +76,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
+            | Self::CustomMessage { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -128,6 +130,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
             | Self::TerminalAck { target, .. }
+            | Self::CustomMessage { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -162,6 +165,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
             | Self::TerminalAck { sender_id, .. }
+            | Self::CustomMessage { sender_id, .. }
             | Self::Keepalive { sender_id, .. }
             | Self::TimeoutDetected { sender_id, .. }
             | Self::TimeoutQuery { sender_id, .. }
@@ -195,6 +199,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
             | Self::TerminalAck { timestamp, .. }
+            | Self::CustomMessage { timestamp, .. }
             | Self::Keepalive { timestamp, .. }
             | Self::TimeoutDetected { timestamp, .. }
             | Self::TimeoutQuery { timestamp, .. }
@@ -208,38 +213,56 @@ impl<I> DistributedMessage<I> {
         }
     }
 
-    /// Whether this frame carries a per-task TERMINAL report
+    /// Whether this primary-bound frame must be RETAINED by the
+    /// reporting secondary until the primary's app-level
+    /// [`DistributedMessage::TerminalAck`] confirms its landing (#352):
+    /// the per-task TERMINAL reports
     /// ([`DistributedMessage::TaskComplete`] /
-    /// [`DistributedMessage::TaskFailed`]).
+    /// [`DistributedMessage::TaskFailed`]) and an IMPORTANT
+    /// [`DistributedMessage::CustomMessage`] (F5).
     ///
-    /// "Terminal-bearing" is the classifier the secondary's reporting
-    /// concern uses to decide whether a primary-bound send is REPLAYABLE
-    /// on a no-route absorb: a `TaskComplete` / `TaskFailed` resolves a
-    /// task's in-flight entry at the authority, so losing it strands the
-    /// task forever (phantom-busy). It is the SINGLE source of that
-    /// classification, owned by the enum so every site that gates by
-    /// "does this report resolve a task?" reads one predicate. The
-    /// backpressure-shaped `TaskFailed` (the deferred-lost reinject) IS
-    /// terminal-bearing here — it too resolves an in-flight slot at the
-    /// authority (a requeue), so it must replay across a no-route.
+    /// This is the classifier the secondary's reporting concern uses to
+    /// decide whether a primary-bound send is REPLAYABLE on a no-route
+    /// absorb / unacked timeout: a `TaskComplete` / `TaskFailed`
+    /// resolves a task's in-flight entry at the authority, so losing it
+    /// strands the task forever (phantom-busy); an important custom
+    /// message is the consumer's must-not-lose payload (the streamed-
+    /// spawn batch), so it shares the same retention/ack contract. It
+    /// is the SINGLE source of that classification, owned by the enum
+    /// so every site that gates by "must this report provably reach the
+    /// authority?" reads one predicate. The backpressure-shaped
+    /// `TaskFailed` (the deferred-lost reinject) IS confirmable here —
+    /// it too resolves an in-flight slot at the authority (a requeue),
+    /// so it must replay across a no-route.
     ///
     /// Everything else through the primary-bound send chokepoint
-    /// (`TaskRequest` capacity hints, `Keepalive`, `MeshReady`) is
-    /// legitimately DROPPABLE — a missed one is re-emitted on the next
-    /// tick — so it is NOT terminal-bearing. Nor is
-    /// [`DistributedMessage::TerminalAck`]: it CONFIRMS a terminal
-    /// landing, it does not carry one (and it never flows through the
-    /// primary-bound chokepoint anyway — it is primary→secondary).
-    pub fn is_terminal_bearing(&self) -> bool {
-        matches!(self, Self::TaskComplete { .. } | Self::TaskFailed { .. })
+    /// (`TaskRequest` capacity hints, `Keepalive`, `MeshReady`, a
+    /// DROPPABLE `CustomMessage { important: false }`) is legitimately
+    /// droppable — a missed periodic frame is re-emitted on the next
+    /// tick; a droppable custom is at-most-once by contract — so it
+    /// does NOT require the ack. Nor does
+    /// [`DistributedMessage::TerminalAck`]: it CONFIRMS a landing, it
+    /// does not carry one (and it never flows through the primary-bound
+    /// chokepoint anyway — it is primary→secondary).
+    pub fn requires_delivery_ack(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskComplete { .. }
+                | Self::TaskFailed { .. }
+                | Self::CustomMessage {
+                    important: true,
+                    ..
+                }
+        )
     }
 
     /// The per-task hash this frame resolves, for the
     /// [`DistributedMessage::TaskComplete`] /
     /// [`DistributedMessage::TaskFailed`] terminal variants; `None` for
-    /// every other variant.
+    /// every other variant (a `CustomMessage` carries no task — its
+    /// retention forensics log the `(origin, msg_seq)` key instead).
     ///
-    /// Pairs with [`Self::is_terminal_bearing`]: the reporting concern
+    /// Pairs with [`Self::requires_delivery_ack`]: the reporting concern
     /// reads it to LOG which task a retained / re-delivered terminal
     /// carries (the strand-diagnostic the no-route absorb was previously
     /// silent about).
@@ -253,50 +276,58 @@ impl<I> DistributedMessage<I> {
     }
 
     /// The app-level delivery-confirmation sequence id (#352) stamped on
-    /// a terminal-bearing report, if any. `None` for every non-terminal
-    /// variant AND for a terminal frame that was never routed through the
+    /// a confirmable report (a terminal, or an important custom
+    /// message), if any. `None` for every non-confirmable variant AND
+    /// for a confirmable frame that was never routed through the
     /// stamping chokepoint (a pre-field wire sender, or a frame the
     /// secondary has constructed but not yet sent).
     ///
-    /// Pairs with [`Self::is_terminal_bearing`]: the secondary's
+    /// Pairs with [`Self::requires_delivery_ack`]: the secondary's
     /// reporting concern stamps it once per report
     /// ([`Self::set_delivery_seq`]) and matches inbound
     /// [`DistributedMessage::TerminalAck`]s against it; the primary's
     /// ingest reads it to echo the ack.
     pub fn delivery_seq(&self) -> Option<u64> {
         match self {
-            Self::TaskComplete { delivery_seq, .. } | Self::TaskFailed { delivery_seq, .. } => {
-                *delivery_seq
-            }
+            Self::TaskComplete { delivery_seq, .. }
+            | Self::TaskFailed { delivery_seq, .. }
+            | Self::CustomMessage { delivery_seq, .. } => *delivery_seq,
             _ => None,
         }
     }
 
     /// Stamp the app-level delivery-confirmation `seq` (#352) on a
-    /// terminal-bearing frame IN PLACE. A no-op on every other variant —
-    /// the stamping chokepoint gates on [`Self::is_terminal_bearing`]
-    /// first, so a non-terminal frame never reaches this.
+    /// confirmable frame IN PLACE. A no-op on every other variant — the
+    /// stamping chokepoint gates on [`Self::requires_delivery_ack`]
+    /// first, so a non-confirmable frame (including a droppable
+    /// `CustomMessage`) never reaches this.
     pub fn set_delivery_seq(&mut self, seq: u64) {
-        if let Self::TaskComplete { delivery_seq, .. } | Self::TaskFailed { delivery_seq, .. } =
-            self
+        if let Self::TaskComplete { delivery_seq, .. }
+        | Self::TaskFailed { delivery_seq, .. }
+        | Self::CustomMessage { delivery_seq, .. } = self
         {
             *delivery_seq = Some(seq);
         }
     }
 
-    /// The ORIGINATING reporter of a terminal-bearing frame (its
-    /// `secondary_id` field); `None` for every other variant.
+    /// The ORIGINATING reporter of a confirmable frame (the terminal
+    /// variants' `secondary_id`; a custom message's
+    /// `origin_secondary_id`); `None` for every other variant.
     ///
     /// This — NOT the wire `sender_id` — is where a
     /// [`DistributedMessage::TerminalAck`] must be addressed: the
     /// retention buffer awaiting the ack lives on the originator, and a
     /// landing that travelled a relay / peer-forwarded path carries a
     /// forwarder's `sender_id` while the originator still waits.
-    pub fn terminal_reporter(&self) -> Option<&str> {
+    pub fn delivery_reporter(&self) -> Option<&str> {
         match self {
             Self::TaskComplete { secondary_id, .. } | Self::TaskFailed { secondary_id, .. } => {
                 Some(secondary_id)
             }
+            Self::CustomMessage {
+                origin_secondary_id,
+                ..
+            } => Some(origin_secondary_id),
             _ => None,
         }
     }
@@ -321,6 +352,7 @@ impl<I> DistributedMessage<I> {
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,
             Self::TerminalAck { .. } => MessageType::TerminalAck,
+            Self::CustomMessage { .. } => MessageType::CustomMessage,
             Self::Keepalive { .. } => MessageType::Keepalive,
             Self::TimeoutDetected { .. } => MessageType::TimeoutDetected,
             Self::TimeoutQuery { .. } => MessageType::TimeoutQuery,

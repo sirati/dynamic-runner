@@ -391,6 +391,35 @@ pub struct RespawnEventRecord {
     pub at: std::time::SystemTime,
 }
 
+/// Per-message state in the replicated custom-message inbox (F5),
+/// keyed by the per-origin `(origin, seq)` idempotency pair.
+///
+/// A two-state sticky lattice `Unhandled ⊑ Handled` (the third,
+/// implicit BOTTOM — "unposted" — is map ABSENCE; the `DiscoveryDebt`
+/// precedent's `Unposted ⊑ Unhandled ⊑ Handled` with the bottom erased
+/// to absence because, unlike `DiscoveryDebt`, the key space is
+/// unbounded and an explicit bottom would never be stored). `Handled`
+/// is a LATCH that wins regardless of arrival order — the
+/// `CustomMessageHandled` apply rule inserts it directly into an
+/// absent slot so a late `Posted` NoOps. The payload lives ONLY on
+/// `Unhandled`; the transition to `Handled` DROPS it (tombstone, a few
+/// bytes), and the per-origin contiguous-prefix watermark
+/// (`custom_handled_watermarks`) physically prunes handled tombstones
+/// (the GC story — the ≤100 KB bodies never accumulate).
+///
+/// Derives `Serialize`/`Deserialize` because it crosses the wire as the
+/// snapshot map VALUE; `Hash`/`Eq` so the digest can fold the
+/// `((origin, seq), state)` PAIR.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CustomMsgState {
+    /// Posted at the authority but not yet consumed by a
+    /// `custom_message_handler` — the promoted-primary hydrate replays
+    /// every entry in this state.
+    Unhandled { topic: String, data: Vec<u8> },
+    /// Consumed (or poison-capped) — payload dropped; sticky.
+    Handled,
+}
+
 /// Coarse convergence band. The band dominates FIRST in the
 /// [`TaskJoinKey`] ordering, so any terminal beats any non-terminal
 /// regardless of version (C3 req-a: a worker outcome that raced a reset

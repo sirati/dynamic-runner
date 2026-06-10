@@ -37,6 +37,7 @@ use crate::zip_extract::ExtractionCache;
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
 mod coordinator;
+pub(crate) mod custom_message;
 mod dispatch;
 mod election;
 mod lifecycle;
@@ -577,7 +578,7 @@ where
     /// Buffered-terminal-replay queue — the reporting concern's retain
     /// buffer for a terminal-bearing primary-bound report that has not
     /// yet been CONFIRMED delivered at the authority, for either of two
-    /// retention reasons ([`resource::TerminalSendState`]):
+    /// retention reasons ([`resource::RetainedSendState`]):
     ///   * `NoRoute` — the send was ABSORBED on a transient no-route
     ///     (nothing was ever queued);
     ///   * `AwaitingAck` — the send returned `Ok` but the primary's
@@ -610,9 +611,9 @@ where
     /// deferred-peer-message flush) AND the primary-link-recovery edge
     /// (`record_primary_message`, where Suspecting/Voting/Candidate →
     /// Normal). A drain re-sends the DUE entries only (`NoRoute` always;
-    /// `AwaitingAck` once `sent_at` ages past `terminal_ack_timeout` —
+    /// `AwaitingAck` once `sent_at` ages past `delivery_ack_timeout` —
     /// the no-route-equivalent edge); the ONLY drop site is
-    /// `ack_terminal` (an inbound `TerminalAck` matching the entry's
+    /// `ack_delivery` (an inbound `TerminalAck` matching the entry's
     /// `delivery_seq` exactly).
     ///
     /// Each re-send carries the SAME `delivery_seq` and re-retains at
@@ -632,26 +633,42 @@ where
     /// buffer is its private mechanism — a drain is a no-op outside an
     /// operational run (no terminal can be produced there), so it needs
     /// no lifecycle gating.
-    pub(in crate::secondary) pending_terminal_replays: Vec<resource::PendingTerminal<I>>,
+    pub(in crate::secondary) pending_report_replays: Vec<resource::RetainedReport<I>>,
 
     /// Per-secondary monotonic `delivery_seq` counter (#352), owned by
-    /// the `send_to_primary` stamping chokepoint: every terminal-bearing
-    /// primary-bound report is stamped with the next value on its first
+    /// the `send_to_primary` stamping chokepoint: every confirmable
+    /// primary-bound report (terminal-bearing, or an IMPORTANT custom
+    /// message — F5) is stamped with the next value on its first
     /// send (replays keep their original stamp). Matched by the
     /// primary's echoed `TerminalAck { seq }` to drop the corresponding
-    /// `pending_terminal_replays` entry. Starts at 1 so a `0` never
+    /// `pending_report_replays` entry. Starts at 1 so a `0` never
     /// appears on the wire (`Some(0)` would be valid but a non-zero
     /// floor makes a default-initialised stamp visibly distinct in
     /// logs).
-    pub(in crate::secondary) next_terminal_seq: u64,
+    pub(in crate::secondary) next_delivery_seq: u64,
+
+    /// Per-origin monotonic custom-message sequence (F5), owned by the
+    /// [`custom_message`] send seam: every consumer custom message this
+    /// secondary ORIGINATES — droppable and important alike — is stamped
+    /// with the next value, so `(secondary_id, msg_seq)` is the
+    /// cluster-wide idempotency key the primary's CRDT inbox dedups
+    /// transport replays by. Distinct from `next_delivery_seq` (the
+    /// #352 retention/ack key): `msg_seq` identifies the MESSAGE,
+    /// `delivery_seq` one retention-buffer entry. Starts at 1 so the
+    /// per-origin handled watermark's "all of `1..=w` handled"
+    /// contiguous-prefix walk has a fixed base.
+    // F2-merge seam twin of `custom_message::send_custom_to_primary`
+    // (its sole reader/writer besides the constructor).
+    #[allow(dead_code)]
+    pub(in crate::secondary) next_custom_msg_seq: u64,
 
     /// How long a sent terminal waits for its `TerminalAck` before the
     /// drain treats it as no-route-equivalent and replays it. Seeded
-    /// from [`resource::DEFAULT_TERMINAL_ACK_TIMEOUT`] (see its doc for
+    /// from [`resource::DEFAULT_DELIVERY_ACK_TIMEOUT`] (see its doc for
     /// the 15s justification against the 60s QUIC idle timeout); tests
     /// drive it sub-second directly. Delivery bookkeeping only — never
     /// an input to the failover-health probe.
-    pub(in crate::secondary) terminal_ack_timeout: std::time::Duration,
+    pub(in crate::secondary) delivery_ack_timeout: std::time::Duration,
 
     /// Per-iteration `select!`-arm accounting for the secondary's
     /// `process_tasks` operational loop. The co-located topology runs the

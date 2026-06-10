@@ -174,6 +174,10 @@ fn roundtrip_all_message_types() {
                 respawn_events_hash: 0xBB,
                 phases_ended_count: 1,
                 phases_ended_hash: 0xCC,
+                custom_messages_count: 2,
+                custom_messages_hash: 0xDD,
+                custom_handled_watermarks_count: 1,
+                custom_handled_watermarks_hash: 0xEE,
             },
         },
         DistributedMessage::TaskComplete {
@@ -202,6 +206,17 @@ fn roundtrip_all_message_types() {
             sender_id: "p".into(),
             timestamp: 0.0,
             seq: 7,
+        },
+        DistributedMessage::CustomMessage {
+            target: None,
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            origin_secondary_id: "s".into(),
+            msg_seq: 3,
+            topic: "phase4-batch".into(),
+            data: vec![1, 2, 3],
+            important: true,
+            delivery_seq: Some(9),
         },
         DistributedMessage::Keepalive {
             target: None,

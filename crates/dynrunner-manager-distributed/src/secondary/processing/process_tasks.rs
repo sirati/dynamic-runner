@@ -557,7 +557,7 @@ where
             // Re-deliver any terminal-bearing report not yet CONFIRMED at
             // the authority (the buffered-terminal-replay edge): a no-route
             // absorb re-sends every tick, and a sent-but-unacked report
-            // replays once its `terminal_ack_timeout` elapses (#352 — the
+            // replays once its `delivery_ack_timeout` elapses (#352 — the
             // blackholed-but-live-leg detection); only the primary's
             // `TerminalAck` drops an entry. FIFO, retrying forever; a
             // still-no-route re-absorb re-buffers. No-op when the buffer is
@@ -566,7 +566,7 @@ where
             // trigger; the `record_primary_message` primary-link-recovery
             // edge is the fast complement (drains the instant a primary
             // message resumes, ahead of the next tick).
-            self.drain_terminal_replays().await;
+            self.drain_report_replays().await;
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh
             // watchdog) detected an unrecoverable fault, queued the

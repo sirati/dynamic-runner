@@ -146,11 +146,12 @@ where
             // absorbed on a transient no-route OR sent and awaiting its
             // app-level TerminalAck (#352 — see the field doc on
             // `SecondaryCoordinator`).
-            pending_terminal_replays: Vec::new(),
+            pending_report_replays: Vec::new(),
             // Per-secondary monotonic delivery-confirmation counter; 1 so
             // a zero seq never appears on the wire.
-            next_terminal_seq: 1,
-            terminal_ack_timeout: resource::DEFAULT_TERMINAL_ACK_TIMEOUT,
+            next_delivery_seq: 1,
+            next_custom_msg_seq: 1,
+            delivery_ack_timeout: resource::DEFAULT_DELIVERY_ACK_TIMEOUT,
             op_loop_arm_stats: None,
             op_loop_arm_stats_cell: None,
         };
