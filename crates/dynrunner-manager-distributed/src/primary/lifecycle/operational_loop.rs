@@ -442,6 +442,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 self.fleet_dead_since = None;
             }
 
+            // Per-task reconciliation-probe tick (#308). Polled at the
+            // top of the loop — the same ≤keepalive-interval cadence
+            // the fleet-dead check above rides — because the prober's
+            // deadlines are PERSISTENT stored `Instant`s on its own
+            // clock (the 1e914505 lesson: a `select!`-arm sleep is
+            // rebuilt every iteration and never elapses on a live
+            // cluster). The prober internally throttles full polls to
+            // its 1s cadence, so a hot mesh iteration pays one
+            // `Instant` compare. Probes that fire ask the holder
+            // secondary "do you still hold task X?"; the verdict
+            // arrives through the inbox arm's `TaskHoldResponse`
+            // handler. Accounting reconciliation only — no liveness
+            // input is touched here.
+            self.reconciliation_probe_tick().await;
+
             // Inbound closed: no further mutations can arrive, so this
             // node's view is frozen. The pre-collapse behaviour
             // (transport-closed → break) is preserved for the

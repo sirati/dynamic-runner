@@ -113,6 +113,22 @@ impl Default for PhaseHookRaiseLatch {
     }
 }
 
+/// Default for [`PrimaryConfig::task_reconciliation_timeout`].
+///
+/// Deliberately GENEROUS (10 minutes): the probe is a backstop against
+/// lost terminals, not a progress watchdog — the cost of a long timeout
+/// is only how late a genuinely-lost task is recovered, while a short
+/// one merely produces more (harmless, but noisy) probe round-trips for
+/// long-running tasks. No existing knob is a coherent source: the
+/// keepalive family measures CONNECTION silence (a holder running a
+/// 20-minute nix build keepalives the whole time), and
+/// `connect_timeout`/`peer_timeout` are setup/link budgets — none of
+/// them measures "how long may one task legitimately stay quiet", so
+/// the probe gets its own knob. Its own constant (rather than a bare
+/// literal in `Default`) so the pyo3 config sites, which construct
+/// `PrimaryConfig` exhaustively, name the same default.
+pub const DEFAULT_TASK_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {
     pub node_id: String,
@@ -327,6 +343,22 @@ pub struct PrimaryConfig {
     /// answers a requesting peer with this verbatim. Default empty (a
     /// run with no forwarded args).
     pub forwarded_argv: Vec<String>,
+
+    /// Per-task reconciliation-probe deadline (#308): how long a task
+    /// may be in flight with NO terminal before the primary asks its
+    /// holder secondary "do you still hold task X?"
+    /// (`TaskHoldQuery`/`TaskHoldResponse`). A `held` answer re-arms
+    /// the deadline — a task may legitimately run for many multiples
+    /// of this value (long nix builds) and is simply re-confirmed once
+    /// per window, so the timeout bounds RECOVERY LATENCY for a lost
+    /// task, never task runtime. A `not held` answer fails + requeues
+    /// the task through the backpressure-shaped path. No response
+    /// inside the bounded window re-arms with NO action (the silent
+    /// holder is the keepalive machinery's concern). Default
+    /// [`DEFAULT_TASK_RECONCILIATION_TIMEOUT`] (600s) — see that
+    /// constant for why this is its own knob rather than derived from
+    /// the keepalive/connect families.
+    pub task_reconciliation_timeout: Duration,
 }
 
 impl Default for PrimaryConfig {
@@ -356,6 +388,7 @@ impl Default for PrimaryConfig {
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
             forwarded_argv: Vec::new(),
+            task_reconciliation_timeout: DEFAULT_TASK_RECONCILIATION_TIMEOUT,
         }
     }
 }
