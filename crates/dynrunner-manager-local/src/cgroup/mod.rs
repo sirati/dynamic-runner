@@ -31,22 +31,22 @@
 //!   enabled on it. [`SubcgroupHandle::attach_pid`] is the equivalent
 //!   parent-side convenience (not async-signal-safe).
 //!
-//! Graceful fallback contract: any of (a) not cgroup-v2, (b) no
-//! `memory` controller exposed on the leaf, (c) leaf not writable,
-//! (d) a permission/delegation refusal (`EACCES`/`EPERM`/`EROFS`)
-//! surfacing from the subgroup writes themselves (the probe in (c)
-//! can pass on a plain desktop session — the leaf's files are
-//! user-owned under `user@.service` — while the kernel still refuses
-//! the later mkdir / migration / controller writes without
-//! `Delegate=yes`) returns `Ok(None)` plus a single-line
-//! `tracing::warn!` so an operator running outside a delegated
-//! cgroup environment (host development, CI, non-Linux) sees one log
-//! line and the flat (pre-nested) layout proceeds unchanged.
-//! Classification for (d) lives on
-//! [`CgroupSetupError::is_permission_class`] — ONE owner; callers
-//! never re-classify. `Err(_)` is reserved for genuinely unexpected
-//! I/O failures (corrupted `/proc`, transient sysfs read errors);
-//! the caller treats it as fatal.
+//! Graceful fallback contract: [`setup_worker_cgroup`] is
+//! INFALLIBLE. The flat (pre-nested) layout always exists and is
+//! functionally sufficient — the nested subgroup only adds the
+//! kernel-OOM isolation + per-worker observability — so ANY failure
+//! during setup (probe-stage: not cgroup-v2, no `memory` controller,
+//! leaf not writable; write-stage: whatever errno the kernel returns
+//! — `EACCES`/`EPERM` without `Delegate=yes`, `EOPNOTSUPP` /
+//! `EBUSY` on `subtree_control` writes, read-only mounts, ...)
+//! degrades to `None` plus a single-line `tracing::warn!` carrying
+//! the failed operation, path, and OS error, and the run proceeds on
+//! the flat layout unchanged. There is deliberately NO errno
+//! classification: enumerating "recoverable" errno families proved
+//! to be whack-a-mole (EACCES first, then EOPNOTSUPP, then EBUSY
+//! ...), and no setup failure is worth aborting a run the flat
+//! layout can serve. The degrade policy has ONE owner,
+//! [`degrade_setup_failure_to_flat`].
 
 use std::path::{Path, PathBuf};
 
@@ -107,9 +107,7 @@ impl NestedCgroupHandle {
 /// scratch + per-secondary HashMaps etc.) so a worker memory blowup
 /// never reaches the parent leaf's cap and so never OOM-kills the
 /// secondary.
-pub fn setup_worker_cgroup_default(
-    reserved_bytes: u64,
-) -> Result<Option<NestedCgroupHandle>, CgroupSetupError> {
+pub fn setup_worker_cgroup_default(reserved_bytes: u64) -> Option<NestedCgroupHandle> {
     setup_worker_cgroup(Path::new(CGROUP_V2_ROOT), reserved_bytes)
 }
 
@@ -129,43 +127,49 @@ pub fn setup_worker_cgroup_default(
 ///      which does the idempotent directory + memory.max + swap
 ///      writes and returns the absolute `workers/` path.
 ///
-/// Returns `Ok(Some(handle))` on success, `Ok(None)` on the
-/// graceful-fallback conditions (each accompanied by a single
-/// `tracing::warn!` line), and `Err(_)` on truly unexpected I/O
-/// errors.
-///
-/// On top of [`try_setup_worker_cgroup`]'s probe-stage fallbacks,
-/// this wrapper owns the permission/delegation classification of the
-/// write phase: an `EACCES`/`EPERM`/`EROFS` escaping the flow (see
-/// [`CgroupSetupError::is_permission_class`]) degrades to `Ok(None)`
-/// plus one warn line instead of propagating — the identical condition the
-/// SLURM-wrapper path already survives via the probe, hit later on a
-/// plain desktop session where the probe passes but the kernel
-/// refuses the writes without `Delegate=yes`.
-pub fn setup_worker_cgroup(
-    cgroup_root: &Path,
-    reserved_bytes: u64,
-) -> Result<Option<NestedCgroupHandle>, CgroupSetupError> {
-    match try_setup_worker_cgroup(cgroup_root, reserved_bytes) {
-        Err(e) if e.is_permission_class() => {
+/// Returns `Some(handle)` on success, `None` on EVERY failure (each
+/// accompanied by a single `tracing::warn!` line) — see the module
+/// docs for the infallibility contract and
+/// [`degrade_setup_failure_to_flat`] for the policy owner.
+pub fn setup_worker_cgroup(cgroup_root: &Path, reserved_bytes: u64) -> Option<NestedCgroupHandle> {
+    degrade_setup_failure_to_flat(try_setup_worker_cgroup(cgroup_root, reserved_bytes))
+}
+
+/// SINGLE owner of the degrade-on-error policy: ANY `Err` from the
+/// setup flow becomes `None` (flat layout) plus one warn line — no
+/// errno inspection, deliberately (see the module docs for why an
+/// enumerated errno family is the wrong shape here). The warn
+/// mirrors the probe-stage fallbacks' wording family ("...; workers
+/// will share the flat cgroup. Operator hint: ...") so the SLURM
+/// wrapper path and `--multi-computer local` report consistently;
+/// the error Display carries the failed operation + path + OS error
+/// so a real environment misconfiguration stays diagnosable from
+/// the one line.
+fn degrade_setup_failure_to_flat(
+    outcome: Result<Option<NestedCgroupHandle>, CgroupSetupError>,
+) -> Option<NestedCgroupHandle> {
+    match outcome {
+        Ok(handle) => handle,
+        Err(e) => {
             tracing::warn!(
                 error = %e,
-                "cgroup-v2 workers subgroup writes were refused (permission/delegation); workers will share the flat cgroup. \
-                 Operator hint: the cgroup tree must be delegated to the runtime user — \
-                 run under a delegated scope (`systemd-run --user --scope -p Delegate=yes ...`), \
-                 or rootless podman with `Delegate=yes` on the user@.service."
+                "nested workers cgroup setup failed; workers will share the flat cgroup. \
+                 Operator hint: the error detail names the operation that was refused — the most \
+                 common cause is a cgroup tree not delegated to the runtime user (run under a \
+                 delegated scope, `systemd-run --user --scope -p Delegate=yes ...`, or rootless \
+                 podman with `Delegate=yes` on the user@.service)."
             );
-            Ok(None)
+            None
         }
-        other => other,
     }
 }
 
 /// Fallible setup flow behind [`setup_worker_cgroup`]'s
-/// permission-classification wrapper. Probe-stage degradations
-/// return `Ok(None)` directly; every other failure propagates as
-/// `Err(_)` UNCLASSIFIED — the public wrapper is the single place
-/// that decides which `Err` shapes degrade.
+/// degrade-on-error wrapper. Probe-stage degradations return
+/// `Ok(None)` directly (each with its condition-specific operator
+/// hint); every other failure propagates as `Err(_)` to
+/// [`degrade_setup_failure_to_flat`] — the single place that decides
+/// what `Err` means (always: flat layout).
 fn try_setup_worker_cgroup(
     cgroup_root: &Path,
     reserved_bytes: u64,
@@ -376,13 +380,13 @@ fn cgroup_v2_leaf(cgroup_root: &Path) -> Option<PathBuf> {
 /// `<leaf>/cgroup.controllers` is a whitespace-delimited list of
 /// controllers the parent has delegated into this subtree. Returns
 /// `Ok(false)` when `memory` is absent so the orchestrator can fall
-/// back gracefully. Read failures (the file should exist on every
-/// cgroup-v2 dir) propagate as `Err(_)` — those are kernel /
-/// mountpoint anomalies, not the gracefully-handled "no memory
-/// controller" condition.
+/// back gracefully with the controller-specific operator hint. Read
+/// failures (the file should exist on every cgroup-v2 dir) propagate
+/// as `Err(_)` — kernel / mountpoint anomalies — which the public
+/// wrapper degrades to the flat layout like every other failure.
 fn leaf_has_memory_controller(leaf: &Path) -> Result<bool, CgroupSetupError> {
-    let content =
-        std::fs::read_to_string(leaf.join("cgroup.controllers")).map_err(CgroupSetupError::Io)?;
+    let path = leaf.join("cgroup.controllers");
+    let content = std::fs::read_to_string(&path).map_err(CgroupSetupError::io_at("read", &path))?;
     Ok(content.split_whitespace().any(|c| c == "memory"))
 }
 
