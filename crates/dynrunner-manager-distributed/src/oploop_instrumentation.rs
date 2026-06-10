@@ -61,9 +61,13 @@ const STARVATION_WARN_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Cadence of the periodic INFO stats line (the "stats emission" twin). Long
 /// enough to be near-free on the hot path (one wall-clock read + compare per
-/// iteration, an actual emit only every interval), short enough that a manual
-/// post-mortem of a stuck run has a fresh arm breakdown to read.
-const STATS_LINE_INTERVAL: Duration = Duration::from_secs(600);
+/// iteration, an actual emit only every interval), short enough that a
+/// SHORT-LIVED run (a minutes-scale validation nano) emits at least one line
+/// and a manual sample window sees a fresh arm breakdown — the original 600s
+/// first-emit was invisible to a 4-minute run, which defeats the line's
+/// diagnostic purpose. One compact line per 2 minutes per loop is noise-free
+/// at any run length.
+const STATS_LINE_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Wall-clock unix milliseconds, saturating to 0 before the epoch. The same
 /// unit the [`crate::runtime_watchdog`] heartbeat uses, so the two components'
