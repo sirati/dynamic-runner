@@ -1,20 +1,21 @@
 //! Half-A strand prevention: the PROACTIVE dispatch path
 //! (`dispatch_to_idle_workers`) must NOT push work to a half-joined
-//! member — one that already received a task but never confirmed its
-//! peer-mesh leg (`MeshReady`). In run_20260610_105906 the primary
-//! proactively assigned two post-Ready first-binds to `secondary-2`
-//! while it was `missing` from the mesh-ready set; that member's
-//! terminals then swallowed on its half-formed mesh egress leg, so the
-//! tasks stranded and wedged the phase barrier.
+//! member — one that never confirmed its peer-mesh leg (`MeshReady`).
+//! In run_20260610_105906 the primary proactively assigned two
+//! post-Ready first-binds to `secondary-2` while it was `missing` from
+//! the mesh-ready set; that member's terminals then swallowed on its
+//! half-formed mesh egress leg, so the tasks stranded and wedged the
+//! phase barrier. In run_20260610_144905 (#360) the then-extant
+//! FIRST-DISPATCH EXEMPTION admitted the original work onto the same
+//! unconfirmed shape — so the gate now keys on confirmation alone.
 //!
 //! The gate (`should_skip_worker_for_dispatch` → `member_mesh_confirmed`)
 //! withholds proactive work from such a member until a `MeshReady` lands
-//! (late-join recovery), while:
-//!   - a member's FIRST/bootstrap dispatch is never gated (otherwise the
-//!     bring-up recovery deadlocks — the assigned=0 hang), and
-//!   - the REACTIVE path (`handle_task_request`) is never gated: a request
-//!     that arrived is its own proof the member's uplink delivers (the
-//!     strand member could not send requests — they swallowed too).
+//! (late-join recovery, which also WAKES dispatch via a `TasksAdded` on
+//! the worker-management bus), while the REACTIVE path
+//! (`handle_task_request`) is never gated: a request that arrived is its
+//! own proof the member's uplink delivers (the strand member could not
+//! send requests — they swallowed too).
 //!
 //! These are deterministic direct-handler tests: drive the exact
 //! dispatch-shape at the member and assert what reaches its wire.
@@ -138,13 +139,11 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
             primary.register_idle_worker_for_test(good_id.clone(), 0, budget.clone());
             primary.register_idle_worker_for_test(half_id.clone(), 0, budget);
 
-            // Make `sec-half` the half-joined strand member: it already
-            // received work (mark dispatched-to so the first-dispatch
-            // exemption does NOT apply) but its `MeshReady` never landed
-            // (drop it from the confirmation set).
+            // Make `sec-half` the half-joined strand member: its
+            // `MeshReady` never landed (drop it from the confirmation
+            // set — the only fact the gate keys on).
             primary.confirm_member_mesh_for_test(&good_id);
             primary.mark_member_mesh_unconfirmed_for_test(&half_id);
-            primary.mark_member_dispatched_for_test(&half_id);
 
             // PROACTIVE recheck: exactly ONE task goes to `sec-good`
             // (one idle worker), and NOTHING to the half-joined `sec-half`.
@@ -202,61 +201,10 @@ async fn proactive_dispatch_skips_half_joined_member_until_mesh_ready_lands() {
         .await;
 }
 
-/// First/bootstrap dispatch is NEVER gated: a member that has NOT yet
-/// received any task is assignable even without `MeshReady` — that very
-/// dispatch is what drives it operational so it CAN emit `MeshReady`.
-/// Gating it would re-create the assigned=0 bring-up deadlock.
-#[tokio::test(flavor = "current_thread")]
-async fn first_dispatch_to_unconfirmed_member_is_not_gated() {
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(async {
-            let (transport, mut ends) = setup_test(1);
-            let (mut primary, _mesh) = build_test_primary(
-                test_primary_config(),
-                transport,
-                ResourceStealingScheduler::memory(),
-                FixedEstimator(100),
-            );
-            let id = ends[0].0.clone();
-
-            let t0 = one_task("boot");
-            let hash = compute_task_hash(&t0);
-            {
-                let cs = primary.cluster_state_mut_for_test();
-                cs.apply(ClusterMutation::PhaseDepsSet {
-                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
-                });
-                cs.apply(ClusterMutation::TaskAdded {
-                    hash: hash.clone(),
-                    task: t0,
-                });
-            }
-            primary.hydrate_from_cluster_state();
-            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
-            primary.register_idle_worker_for_test(id.clone(), 0, budget);
-
-            // Unconfirmed AND never-dispatched: a true late-joiner awaiting
-            // its bring-up push.
-            primary.mark_member_mesh_unconfirmed_for_test(&id);
-
-            run_dispatch_recheck(&mut primary).await;
-            settle_pump().await;
-
-            assert_eq!(
-                assigned_ids(&mut ends[0].1),
-                vec!["boot".to_string()],
-                "a member's first/bootstrap dispatch must NOT be gated on MeshReady — \
-                 it is what drives the member operational so it can emit MeshReady"
-            );
-        })
-        .await;
-}
-
 /// The REACTIVE path is never gated: a `TaskRequest` that ARRIVED is its
 /// own proof the member's uplink delivers, so honouring it can never
 /// strand on an unreachable member — even if the member never sent
-/// `MeshReady` and already had work.
+/// `MeshReady`.
 #[tokio::test(flavor = "current_thread")]
 async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
     let local = tokio::task::LocalSet::new();
@@ -287,11 +235,10 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
             let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
             primary.register_idle_worker_for_test(id.clone(), 0, budget);
 
-            // Half-joined shape: already dispatched-to + unconfirmed. The
-            // proactive gate WOULD withhold work, but a request it sends
-            // (which demonstrably reached us) is honoured anyway.
+            // Half-joined shape: unconfirmed. The proactive gate WOULD
+            // withhold work, but a request it sends (which demonstrably
+            // reached us) is honoured anyway.
             primary.mark_member_mesh_unconfirmed_for_test(&id);
-            primary.mark_member_dispatched_for_test(&id);
 
             primary
                 .handle_task_request(task_request(&id, 0))
@@ -304,6 +251,107 @@ async fn reactive_task_request_is_honored_even_when_member_unconfirmed() {
                 vec!["reactive".to_string()],
                 "a TaskRequest that arrived is proof of a working uplink — the reactive \
                  path is never withheld by the mesh-confirmation gate"
+            );
+        })
+        .await;
+}
+
+/// #360 — the first-dispatch exemption is GONE: a member that has never
+/// been dispatched to AND has not confirmed its mesh leg gets NOTHING from
+/// the proactive path. In run_20260610_144905 the exemption admitted the
+/// first work onto unconfirmed `secondary-2`; its first-bind continuation
+/// then ran the task and the terminal vanished on the half-formed leg.
+/// "Never dispatched" is not proof of a working leg — only `MeshReady` is.
+///
+/// Bring-up cannot deadlock on this: the cold-start fan-out
+/// (`perform_initial_assignment`) does not consult the gate, MeshReady
+/// emission on a member is dispatch-independent (operational-entry hook +
+/// mesh watchdog + keepalive tick), and the pull path (`TaskRequest`,
+/// request-driven) stays exempt as its own delivery proof.
+///
+/// The recovery half pins the new confirmation→dispatch wakeup: a landing
+/// `MeshReady` emits `TasksAdded` on the worker-management bus (a member
+/// becoming confirmed enlarges the assignable set — dispatch re-evaluates
+/// on every event that can create a match), so the withheld work flows at
+/// the confirmation edge with no unrelated event needed.
+#[tokio::test(flavor = "current_thread")]
+async fn first_dispatch_to_unconfirmed_member_is_withheld_until_mesh_ready() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, mut ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                test_primary_config(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let id = ends[0].0.clone();
+
+            let t0 = one_task("boot");
+            let hash = compute_task_hash(&t0);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("p"), vec![])]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: t0,
+                });
+            }
+            primary.hydrate_from_cluster_state();
+            let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+            primary.register_idle_worker_for_test(id.clone(), 0, budget);
+
+            // Never dispatched to, never confirmed: the exact member the
+            // deleted exemption used to admit.
+            primary.mark_member_mesh_unconfirmed_for_test(&id);
+
+            run_dispatch_recheck(&mut primary).await;
+            settle_pump().await;
+
+            assert!(
+                assigned_ids(&mut ends[0].1).is_empty(),
+                "NO work may be pushed to a member whose mesh leg is \
+                 unconfirmed — not even its first dispatch (the #360 bypass: \
+                 the first task's terminal swallows on the half-formed leg \
+                 exactly like any later one)"
+            );
+            assert!(
+                primary.slot_is_idle_for_test(&id, 0),
+                "the unconfirmed member's worker stays idle"
+            );
+
+            // CONFIRMATION EDGE: the member's MeshReady lands. It must both
+            // recover the member into the assignable set AND wake dispatch
+            // via the worker-management bus — no manual recheck, no
+            // unrelated event.
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
+            primary.handle_mesh_ready(DistributedMessage::MeshReady {
+                target: None,
+                sender_id: id.clone(),
+                timestamp: 0.0,
+                secondary_id: id.clone(),
+                peer_count: 1,
+            });
+            let batch = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recv_worker_signal_batch(&mut wm_rx),
+            )
+            .await
+            .expect("a landing MeshReady must wake dispatch (TasksAdded on the bus)")
+            .expect("emit must produce a batch");
+            primary.react_to_worker_signal_batch(batch).await;
+            settle_pump().await;
+
+            assert_eq!(
+                assigned_ids(&mut ends[0].1),
+                vec!["boot".to_string()],
+                "the withheld work flows at the confirmation edge"
             );
         })
         .await;

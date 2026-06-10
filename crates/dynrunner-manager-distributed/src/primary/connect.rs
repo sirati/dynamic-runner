@@ -333,47 +333,77 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     secondary = %secondary_id,
                     "member mesh leg confirmed; it is now assignable to proactive dispatch"
                 );
+                // Re-arm the gate's once-per-spell veto WARN: if this
+                // member ever regresses to unconfirmed (a promoted
+                // primary's empty set), the next veto names it again.
+                self.mesh_gate_veto_warned.remove(&secondary_id);
+                // CONFIRMATION-EDGE DISPATCH WAKEUP. A member becoming
+                // confirmed enlarges the assignable set — the exact dual
+                // of `react_to_capacity_growth`'s worker-ready signal —
+                // so dispatch must re-evaluate NOW, not on the next
+                // unrelated event. Emit `TasksAdded` on the
+                // worker-management bus: the operational loop's
+                // worker-management arm (or the pre-loop inline drain
+                // during `wait_for_mesh_ready`) runs the recheck and the
+                // work the gate withheld flows at this edge. Decoupling
+                // law: bus signal only, never a direct dispatch call.
+                self.cluster_state
+                    .emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
             }
         }
     }
 
     /// THE single dispatch-readiness predicate every assignment path
-    /// consults: may proactive dispatch assign MORE work to
-    /// `secondary_id`, or is it a half-joined member whose mesh leg never
-    /// confirmed?
+    /// consults: may proactive dispatch push work to `secondary_id`, or
+    /// is it a half-joined member whose mesh leg never confirmed?
     ///
-    /// Returns `true` (assignable) unless the member is BOTH:
-    ///   1. already dispatched-to ([`Self::members_dispatched_to`] — it
-    ///      got at least one task, so its first/bootstrap dispatch already
-    ///      happened), AND
-    ///   2. has NOT confirmed its peer-mesh leg formed
-    ///      (`mesh_ready_secondaries` — no `MeshReady` received).
+    /// Returns `true` (assignable) iff the member has confirmed its
+    /// peer-mesh leg formed (`mesh_ready_secondaries` — a `MeshReady`
+    /// was received from it). Nothing else counts: keepalives are
+    /// liveness, not leg confirmation, and "never dispatched to" is not
+    /// proof of a working leg.
     ///
     /// # Single owner of the dispatch readiness gate
     ///
-    /// A member that got work but never confirmed its mesh leg is
-    /// half-joined: its terminals ride a half-formed mesh egress leg that
-    /// silently swallows them (route present at the transport `has_peer`
-    /// view, send returns `Ok`, but the frame never reaches the authority
-    /// — the run_20260610_105906 strand). Piling MORE work on it strands
-    /// each task and wedges the phase barrier. So it is withheld from
-    /// EVERY operational path until a `MeshReady` lands.
+    /// A member that never confirmed its mesh leg is half-joined: its
+    /// terminals ride a half-formed mesh egress leg that silently
+    /// swallows them (route present at the transport `has_peer` view,
+    /// send returns `Ok`, but the frame never reaches the authority —
+    /// the run_20260610_105906 strand). Pushing work to it strands each
+    /// task and wedges the phase barrier. So it is withheld from EVERY
+    /// proactive path until a `MeshReady` lands.
     ///
-    /// The first/bootstrap dispatch is NEVER gated (condition 1): the
-    /// bring-up recovery during `wait_for_mesh_ready`
-    /// (`drain_and_react_to_pending_worker_signals`) dispatches to a member
-    /// that joined after the initial-assignment snapshot, and that dispatch
-    /// is precisely what drives it operational so it CAN emit the
-    /// `MeshReady` the wait blocks on — gating it would re-create the
-    /// assigned=0 deadlock. The terminal of that first dispatch, if the leg
-    /// IS half-formed, is caught by the secondary-side
-    /// buffered-terminal-replay (the Half-B honesty fix), so the
-    /// first-dispatch exemption never loses a terminal.
+    /// # No first-dispatch exemption (#360)
+    ///
+    /// This predicate originally exempted a member's FIRST dispatch
+    /// (tracked in a `members_dispatched_to` set), on the theory that
+    /// the bring-up dispatch is what drives a late member operational so
+    /// it can emit `MeshReady`. That theory was stale: a member reaches
+    /// its operational loop by consuming the setup trio — and the
+    /// `InitialAssignment` half of the trio is sent by
+    /// `perform_initial_assignment` to EVERY known secondary (empty
+    /// batches included), a direct fan-out that never consults this
+    /// gate. Once operational, `MeshReady` emission is fully
+    /// dispatch-independent (operational-entry hook, mesh watchdog,
+    /// keepalive tick). A `TaskAssignment` pushed at a member still
+    /// stuck in `wait_for_setup`, by contrast, is DROPPED by its setup
+    /// loop ("unexpected message during setup") while the primary
+    /// records the task `InFlight` — the exemption could only strand,
+    /// never recover. In production (run_20260610_144905) it admitted
+    /// the first work onto unconfirmed secondary-2; the type-shift
+    /// first-bind continuation kept serving it and the terminal
+    /// swallowed on the half-formed leg, in the same second this gate
+    /// was vetoing further pushes. There is no residual window that
+    /// needs it: a healthy-uplink member that somehow never confirmed
+    /// still PULLS work through the request-driven path (its
+    /// `TaskRequest`'s arrival is its own delivery proof), and the
+    /// assigned=0 bring-up recovery is the confirmation-edge wakeup in
+    /// [`Self::handle_mesh_ready`] — the withheld work flows the moment
+    /// the member's `MeshReady` lands, with no unrelated event needed.
     ///
     /// The SOLE writer of `mesh_ready_secondaries` is
     /// [`Self::handle_mesh_ready`] (unconditional, so a late `MeshReady`
-    /// recovers the member into the assignable set). The SOLE writer of
-    /// `members_dispatched_to` is `originate_task_assigned`.
+    /// recovers the member into the assignable set).
     ///
     /// Read by [`Self::should_skip_worker_for_dispatch`] — the single
     /// owner of the per-worker dispatch-skip decision — so BOTH
@@ -381,12 +411,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// `handle_task_request`) gate on this ONE predicate without either
     /// site knowing the mesh-readiness rule.
     pub(super) fn member_mesh_confirmed(&self, secondary_id: &str) -> bool {
-        // Not-yet-dispatched member: its first (bootstrap) dispatch is
-        // always allowed.
-        if !self.members_dispatched_to.contains(secondary_id) {
-            return true;
-        }
-        // Already got work: must have confirmed its mesh leg to get more.
         self.mesh_ready_secondaries.contains(secondary_id)
     }
 

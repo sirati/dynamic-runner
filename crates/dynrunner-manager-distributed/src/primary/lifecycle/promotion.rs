@@ -151,24 +151,35 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         // sees the post-spawn ledger.
                         Some(m) => {
                             self.dispatch_message(m, command_rx).await?;
-                            // Self-recovery against the assigned=0 deadlock:
-                            // a `SecondaryCapacity` that lands DURING this
-                            // wait (a worker that became ready after
-                            // `perform_initial_assignment`'s snapshot, so it
-                            // got no `InitialAssignment` and cannot emit
-                            // `MeshReady` on its own) emits `TasksAdded` via
-                            // `react_to_capacity_growth`. Service that bus
-                            // signal inline NOW — the operational loop hasn't
-                            // started — so the ready work is dispatched to
-                            // the freshly-rostered idle worker, the secondary
-                            // receives a `TaskAssignment`, goes operational,
-                            // and emits the `MeshReady` this very wait is
-                            // blocked on. The wait unblocks via real
-                            // dispatch, never by burning the full
-                            // `mesh_ready_timeout`. (rc-C's decoupling and
-                            // the post-assignment placement of this wait stay
-                            // intact — the recovery dispatches, it does not
-                            // move the wait.)
+                            // In-wait dispatch servicing: `TasksAdded`
+                            // signals queued DURING this wait would
+                            // otherwise park until the operational loop
+                            // starts (it hasn't). Two emitters fire here:
+                            //
+                            //   * a `SecondaryCapacity` landing mid-wait
+                            //     (`react_to_capacity_growth`) grows the
+                            //     roster with fresh idle slots;
+                            //   * a `MeshReady` landing mid-wait
+                            //     (`handle_mesh_ready`) confirms its member
+                            //     into the assignable set — the
+                            //     confirmation-edge wakeup.
+                            //
+                            // Servicing the bus inline runs the dispatch
+                            // recheck NOW, so ready work flows to every
+                            // member the readiness gate
+                            // (`member_mesh_confirmed`) admits, as each
+                            // confirmation arrives — instead of pooling
+                            // until after the wait. The `MeshReady` this
+                            // wait blocks on is NOT dispatch-driven: a
+                            // secondary reaches its operational loop by
+                            // consuming the setup trio (whose
+                            // `InitialAssignment` fan-out is ungated and
+                            // already ran above) and reports from there
+                            // (entry hook / watchdog / keepalive tick).
+                            // (rc-C's decoupling and the post-assignment
+                            // placement of this wait stay intact — the
+                            // recovery dispatches, it does not move the
+                            // wait.)
                             self.drain_and_react_to_pending_worker_signals().await;
                         }
                         None => return Err("transport closed during wait_for_mesh_ready".into()),

@@ -293,6 +293,38 @@ where
         self.mesh.mesh_ready_sent = true;
     }
 
+    /// Member-side half of the pairwise dispatch-readiness predicate
+    /// (#360): may THIS member bind deferred work onto one of its own
+    /// workers, or is its mesh leg to the CURRENT primary still
+    /// unconfirmed?
+    ///
+    /// Gives the reporter its chance first — the same "now's a moment
+    /// the mesh state may have changed; report if anything to report"
+    /// contract the keepalive tick and the operational-entry hook use —
+    /// so a mesh that settled since the work was deferred reports and
+    /// confirms in one step. The answer is then exactly the
+    /// `mesh_ready_sent` latch:
+    ///
+    ///   * `true` — the current primary has been told this member's leg
+    ///     settled (or the settled report was attempted; the latch is
+    ///     best-effort by design, see `report_mesh_ready_if_needed`).
+    ///     Terminals originated here have a settled leg to ride.
+    ///   * `false` — the leg is UNSETTLED (peers expected, none alive,
+    ///     watchdog pending) or the latch was re-armed for a new primary
+    ///     identity that has not been confirmed to yet. This is the
+    ///     production #360 member shape: the primary's own gate
+    ///     (`member_mesh_confirmed`) is withholding work from it, and a
+    ///     bind here would run a task whose terminal swallows on the
+    ///     half-formed egress leg.
+    ///
+    /// Owned by the mesh-formation module so callers (the post-Ready
+    /// deferred-first-bind continuation) never read mesh fields or know
+    /// the settled rules — they ask one question at the bind decision.
+    pub(in crate::secondary) async fn mesh_leg_confirmed_for_bind(&mut self) -> bool {
+        self.report_mesh_ready_if_needed().await;
+        self.mesh.mesh_ready_sent
+    }
+
     /// Re-arm the one-shot reporter for a NEW primary identity and
     /// re-announce immediately if the mesh state is reportable.
     ///
