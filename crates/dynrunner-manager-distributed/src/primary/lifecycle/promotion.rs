@@ -7,6 +7,22 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
 
+/// The final-pick rule [`PrimaryCoordinator::select_relocation_target`]
+/// applies within the shared eligibility set (alive ∩ can_be_primary −
+/// observers − self). One selection function, policy-keyed — never a
+/// forked second selector. See the method doc for the per-policy
+/// semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelocationPolicy {
+    /// Deterministic lowest-id pick — the bootstrap handoff's original
+    /// behaviour.
+    LowestId,
+    /// Highest CRDT-derived `InFlight` occupancy, ties lex-lowest id,
+    /// zero-occupancy candidates excluded — the graceful-abort drain
+    /// relocation ("the secondary with the most active workers").
+    MostActiveWorkers,
+}
+
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
     /// Block on every connected secondary reporting `MeshReady`
     /// before this operational primary asserts authority
@@ -277,33 +293,61 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         Ok(())
     }
 
-    /// Choose the compute peer this bootstrap primary relocates its role to.
+    /// Choose the compute peer this primary relocates its role to.
     ///
-    /// Single concern: the deterministic selection — the LOWEST-id member of
-    /// `alive_secondary_members() ∩ can_be_primary − observers`, computed off
-    /// this primary's replicated `cluster_state`, with this primary's own id
-    /// excluded defensively (the submitter advertises no worker capacity /
-    /// `can_be_primary = false`, so it is absent from the set anyway). A
-    /// peer is eligible iff it is an alive worker-secondary (worker_count > 0,
-    /// the structural exclusion of observers in `alive_secondary_members`)
-    /// that carries the explicit `RoleTable.can_be_primary` capability and is
-    /// NOT in the observers set. The `observers` filter is belt-and-suspenders
-    /// over the worker-capacity exclusion.
+    /// Single concern: the deterministic selection over the ONE shared
+    /// eligibility set — `alive_secondary_members() ∩ can_be_primary −
+    /// observers`, computed off this primary's replicated `cluster_state`,
+    /// with this primary's own id excluded (defensively on the bootstrap
+    /// path — the submitter advertises no worker capacity; load-bearing on
+    /// the graceful-abort path — a compute-peer primary IS in the set). A
+    /// peer is eligible iff it is an alive worker-secondary
+    /// (worker_count > 0, the structural exclusion of observers in
+    /// `alive_secondary_members`) that carries the explicit
+    /// `RoleTable.can_be_primary` capability and is NOT in the observers
+    /// set. The `observers` filter is belt-and-suspenders over the
+    /// worker-capacity exclusion.
     ///
-    /// `None` when there is no promotable compute peer; the caller
-    /// ([`Self::bootstrap_tail_dispatch`]'s relocate arm) maps that to a hard
+    /// The FINAL pick within the eligible set is the caller-supplied
+    /// [`RelocationPolicy`] — one selection function, two policies, never a
+    /// forked sibling:
+    ///
+    ///   * [`RelocationPolicy::LowestId`] — the bootstrap handoff's
+    ///     deterministic `.min()` (byte-identical to the pre-policy
+    ///     behaviour).
+    ///   * [`RelocationPolicy::MostActiveWorkers`] — the graceful-abort
+    ///     drain relocation: the eligible secondary with the MOST
+    ///     replicated `InFlight` assignments (CRDT-derived occupancy, so
+    ///     every replica agrees), ties broken lex-lowest id for
+    ///     determinism; candidates with ZERO active work are excluded (a
+    ///     drained secondary is about to tear itself down — relocating
+    ///     onto it would strand the role).
+    ///
+    /// `None` when no eligible peer satisfies the policy; the bootstrap
+    /// caller maps that to a hard
     /// [`crate::primary::RunError::NoRelocationTarget`] (pillar 2: the
-    /// submitter must never stay the run's primary).
-    pub(crate) fn select_relocation_target(&self) -> Option<String> {
+    /// submitter must never stay the run's primary), the graceful-abort
+    /// caller simply stays put and drains in place.
+    pub(crate) fn select_relocation_target(&self, policy: RelocationPolicy) -> Option<String> {
         let observers = &self.cluster_state.role_table().observers;
         let own_id = self.config.node_id.as_str();
-        self.cluster_state
+        let eligible = self
+            .cluster_state
             .alive_secondary_members()
             .filter(|id| *id != own_id)
             .filter(|id| !observers.contains(*id))
-            .filter(|id| self.cluster_state.can_be_primary(id))
-            .min()
-            .map(|id| id.to_string())
+            .filter(|id| self.cluster_state.can_be_primary(id));
+        match policy {
+            RelocationPolicy::LowestId => eligible.min().map(str::to_string),
+            RelocationPolicy::MostActiveWorkers => eligible
+                .map(|id| (self.cluster_state.inflight_count_for_secondary(id), id))
+                .filter(|(active, _)| *active > 0)
+                // Max by active count; ties go to the LEX-LOWEST id (the
+                // reversed id compare makes the lower id the `max_by`
+                // winner), so the pick is deterministic across replicas.
+                .max_by(|(na, ia), (nb, ib)| na.cmp(nb).then_with(|| ib.cmp(ia)))
+                .map(|(_, id)| id.to_string()),
+        }
     }
 
     /// Hand the primary role to `chosen` by originating

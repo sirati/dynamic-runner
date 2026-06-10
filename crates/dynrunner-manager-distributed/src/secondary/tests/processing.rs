@@ -848,7 +848,7 @@ async fn fake_primary_setup_terminal(
     while from_secondary.recv().await.is_some() {}
 }
 
-fn setup_terminal_config() -> SecondaryConfig {
+pub(super) fn setup_terminal_config() -> SecondaryConfig {
     SecondaryConfig {
         secondary_id: "sec-0".into(),
         num_workers: 1,

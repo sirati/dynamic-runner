@@ -398,6 +398,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 break;
             }
 
+            // Graceful-abort drain decision (ONE seam in the loop; the
+            // whole protocol lives in `lifecycle::graceful_abort`). A
+            // steady-state run pays one latched-bool read. Under the latch
+            // it breaks on full fleet drain (→ the finalize tail's
+            // graceful-abort verdict) or relocates the primary role to the
+            // busiest secondary when this node's own work has drained
+            // while others still run (the demote arm then cancels this
+            // loop). Placed BEFORE the fleet-dead arming below: a frozen
+            // pool with a drained fleet is the graceful terminal, never a
+            // strand.
+            if self.graceful_abort_tick().await {
+                break;
+            }
+
             // Fleet-dead detection. The arming quantity is the count of
             // alive worker-secondaries OTHER than the host this node
             // recognizes as primary
@@ -426,7 +440,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // Tokenizer surfaced the original failure on cohort-3 where
             // SSH-tunnel blips killed all 5 secondaries at once and the
             // run sat idle until manually killed.
-            if self.cluster_state.alive_remote_secondary_count() == 0 && !self.pool().is_empty() {
+            // Gated on the graceful-abort latch: under the freeze the
+            // queued pool is DELIBERATELY un-dispatchable (nothing will
+            // ever dispatch it again, by design) and the remote
+            // secondaries legitimately drain away one by one, so the
+            // "no living secondary can dispatch the queued tasks" premise
+            // is vacuous — arming fleet-dead here would misclassify the
+            // graceful tail as a strand. The graceful tick above owns the
+            // drain terminal.
+            if !self.cluster_state.graceful_abort_requested()
+                && self.cluster_state.alive_remote_secondary_count() == 0
+                && !self.pool().is_empty()
+            {
                 let now = Instant::now();
                 let since = *self.fleet_dead_since.get_or_insert(now);
                 let elapsed = now.duration_since(since);

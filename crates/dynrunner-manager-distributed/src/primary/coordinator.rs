@@ -2107,6 +2107,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// Build the dispatch-shape worker view for the worker at
     /// `worker_idx`. The pipeline is:
     ///
+    ///   0. The GRACEFUL-ABORT scheduling gate — under the replicated
+    ///      `graceful_abort_requested` freeze the view is EMPTIED, so no
+    ///      scheduler ever sees a candidate and no work leaves the ready
+    ///      pool toward any worker.
     ///   1. `pool.view_for_worker(global_wid, Some(&soft_pred))` —
     ///      priority-ordered eligible items with soft
     ///      `preferred_secondaries` tie-break.
@@ -2118,9 +2122,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     ///
     /// Single concern: the dispatch-pipeline's view-construction
     /// shape. Outside the OOM bucket step (2) is a no-op; inside
-    /// it is load-bearing. Both call sites
-    /// (`dispatch_to_idle_workers` and `handle_task_request`) call
-    /// this once and consume the returned view directly.
+    /// it is load-bearing. ALL THREE dispatch sites
+    /// (`dispatch_to_idle_workers`, `handle_task_request`, and
+    /// `perform_initial_assignment`) call this once and consume the
+    /// returned view directly — which is what makes step 0 THE single
+    /// seam where new work stops under a graceful abort: every path
+    /// from the ready pool to a worker constructs its view here, so the
+    /// freeze needs no per-call-site checks. In-flight bookkeeping
+    /// (completions, retries entering the pool, phase cascades) is
+    /// untouched — only DISPATCH is frozen.
     pub(super) fn dispatch_view_for_worker(
         &self,
         worker_idx: usize,
@@ -2132,6 +2142,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let view = self
             .pool()
             .view_for_worker(global_wid, Some(&soft_predicate));
+        // Step 0 — the graceful-abort freeze. Emptying the TYPED view
+        // (rather than branching at the call sites) keeps every consumer
+        // shape-oblivious: the scheduler sees zero candidates and the
+        // dispatch loops fall through their existing `is_empty()` skips.
+        // A promoted primary inherits the latch via its snapshot, so the
+        // freeze survives failover with no extra plumbing (no-redo law).
+        if self.cluster_state.graceful_abort_requested() {
+            return view.filter(|_| false);
+        }
         let view = self.apply_strict_preferred_secondaries(view, secondary_id);
         self.cap_filter_view(view)
     }
@@ -3506,7 +3525,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // silently staying local. NOW A LIVE error path on EVERY
                 // backend (in-process mpsc AND SLURM QUIC) — no longer
                 // "unreachable" for any topology.
-                let Some(chosen) = self.select_relocation_target() else {
+                let Some(chosen) =
+                    self.select_relocation_target(super::lifecycle::RelocationPolicy::LowestId)
+                else {
                     // #313 — terminal RUN VERDICT before exiting. The fleet
                     // `wait_for_connections` registered is CONNECTED but NO
                     // peer advertised `can_be_primary`, so an election can
@@ -4069,6 +4090,42 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let outcome = self.outcome_summary();
         self.stranded_count = total.saturating_sub(outcome.total_terminal());
         let stranded = self.stranded_count;
+
+        // Graceful-abort verdict — checked BEFORE the strand
+        // classification. Under the replicated `graceful_abort_requested`
+        // latch the non-terminal residue is the DELIBERATELY-frozen ready
+        // pool, not a routing-collapse strand, so classifying it as
+        // `ClusterCollapsed` (and broadcasting `RunAborted`) would
+        // mis-diagnose an operator-requested wind-down as a fault. The
+        // honest terminal is `RunComplete` WITH the latch set: every
+        // remaining secondary exits through its normal run-complete drain
+        // break, and every node (observer included) derives the composed
+        // graceful-abort verdict `run_complete ∧ graceful_abort` from the
+        // two sticky facts. The local return is the structured
+        // `RunError::GracefulAbort` so this primary's own boundary reports
+        // the SAME verdict the observer narrates (distinct from success
+        // AND from a hard abort), whether or not any task was left
+        // unscheduled.
+        if self.cluster_state.graceful_abort_requested() {
+            self.broadcast_terminal_verdict(ClusterMutation::RunComplete)
+                .await;
+            tracing::warn!(
+                target: super::important_events::IMPORTANT_TARGET,
+                succeeded = outcome.succeeded,
+                fail_retry = outcome.fail_retry,
+                fail_oom = outcome.fail_oom,
+                fail_final = outcome.fail_final,
+                skipped = outcome.skipped,
+                unscheduled = stranded,
+                total,
+                "run gracefully aborted — fleet drained; {stranded} task(s) \
+                 deliberately left unscheduled"
+            );
+            return Err(RunError::GracefulAbort {
+                unscheduled: stranded,
+                outcome,
+            });
+        }
 
         // Terminal broadcast so non-promoted secondaries / the connected
         // observer on the peer mesh know the run is over and can exit.

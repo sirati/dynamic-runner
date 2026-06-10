@@ -907,7 +907,7 @@ async fn select_relocation_target_picks_lowest_eligible_compute_peer() {
             seed_member(&mut primary, "sec-3", 2, false, false);
 
             assert_eq!(
-                primary.select_relocation_target().as_deref(),
+                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId).as_deref(),
                 Some("sec-1"),
                 "must pick the LOWEST-id eligible compute peer — sec-0 is an \
                  observer (excluded), sec-3 lacks can_be_primary (excluded), so \
@@ -935,7 +935,7 @@ async fn select_relocation_target_none_when_no_eligible_peer() {
             seed_member(&mut primary, "obs-0", 0, true, false);
             seed_member(&mut primary, "sec-0", 2, false, false);
             assert_eq!(
-                primary.select_relocation_target(),
+                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId),
                 None,
                 "an observer + a can_be_primary=false worker leave NO promotable \
                  compute peer; selection must be None so the bootstrap errors \
@@ -968,7 +968,7 @@ async fn select_relocation_target_excludes_self() {
             seed_member(&mut primary, &own_id, 2, false, true);
             seed_member(&mut primary, "sec-9", 2, false, true);
             assert_eq!(
-                primary.select_relocation_target().as_deref(),
+                primary.select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId).as_deref(),
                 Some("sec-9"),
                 "selection must exclude this primary's OWN id even when it \
                  advertises an eligible-looking worker-secondary capability — \
@@ -1002,7 +1002,7 @@ async fn relocate_primary_to_originates_transferred_to_chosen_not_self() {
             // The chosen peer is the lowest-id eligible compute peer.
             seed_member(&mut primary, "sec-0", 2, false, true);
             let chosen = primary
-                .select_relocation_target()
+                .select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId)
                 .expect("an eligible compute peer was seeded");
             assert_eq!(chosen, "sec-0");
 
@@ -1263,7 +1263,7 @@ async fn bootstrap_tail_activates_local_primary() {
 /// a CONNECTED secondary that is NOT promotion-eligible (`fake_secondary`
 /// advertises `can_be_primary:false`): `wait_for_connections` + mesh formation
 /// succeed (so the pipeline reaches the `SetupPeer` arm), but
-/// `select_relocation_target()` finds no eligible compute peer ⇒ the run errors
+/// `select_relocation_target(crate::primary::lifecycle::RelocationPolicy::LowestId)` finds no eligible compute peer ⇒ the run errors
 /// rather than silently staying local.
 #[tokio::test(flavor = "current_thread")]
 async fn setup_peer_empty_candidate_set_is_no_relocation_target() {

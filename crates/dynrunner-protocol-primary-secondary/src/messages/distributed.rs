@@ -316,6 +316,26 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         peer_count: u32,
     },
+    /// Observer -> Primary: "gracefully abort the run". The ONE
+    /// management command a zero-authority observer may send: the
+    /// primary reacts by originating
+    /// `ClusterMutation::GracefulAbortRequested` (the replicated sticky
+    /// freeze latch — see that variant's doc for the full drain
+    /// protocol). The request itself carries no authority: a primary
+    /// that already latched the freeze NoOps it (idempotent under
+    /// operator re-triggering / at-least-once delivery), and a request
+    /// that never reaches a live primary simply has no effect until the
+    /// operator re-sends it. A typed wire variant (NOT a string-topic
+    /// custom message), so receivers dispatch on the discriminant.
+    GracefulAbortRequest {
+        /// Mesh routing target (Phase-C C3): same contract as every
+        /// other variant's `target` field — `None` on a freshly-
+        /// constructed frame, stamped by the egress edge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+    },
     /// Late-joiner / reconnecting node asks any connected peer for a
     /// full snapshot of the current `ClusterState`. Any peer can
     /// respond — state is replicated, so any responder suffices. The

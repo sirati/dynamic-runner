@@ -1007,6 +1007,9 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
 
             // First drain attempt with the route STILL down: both re-absorb,
             // so the buffer length is preserved and order is unchanged.
+            // (The failed pass consumes each entry's due-now slot — the
+            // per-report backoff schedules the next periodic retry one
+            // ack window out.)
             secondary.drain_report_replays().await;
             assert_eq!(
                 secondary.pending_report_replays.len(),
@@ -1018,12 +1021,15 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
                 "no terminal reaches the wire while the route is still down"
             );
 
-            // Route UP; drain delivers BOTH in arrival order (first then second).
+            // Route UP; the route-restored drain (the production
+            // primary-link-recovery edge is schedule-overriding) delivers
+            // BOTH in arrival order (first then second), without waiting
+            // out the backoff slots the failed pass armed.
             membership
                 .borrow_mut()
                 .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
-            secondary.drain_report_replays().await;
+            secondary.drain_report_replays_now().await;
             secondary.drain_egress().await;
             // Post-#352 both delivered frames stay retained AWAITING ACK
             // (in order); the wire log is the delivery evidence.

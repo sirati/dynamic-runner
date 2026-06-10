@@ -25,6 +25,7 @@ mod custom_messages;
 mod deposed_standdown;
 mod dispatch_decoupling;
 mod e2e;
+mod graceful_abort;
 mod hydrate;
 mod initial_assignment;
 mod injected_spread;

@@ -36,7 +36,9 @@ Module boundary
   ``<full-log-dir>/faulthandler.log`` when a per-node log dir is present, else
   ``sys.stderr`` (captured by conmon, so it survives either way); and, via
   :func:`write_crash_traceback`, ``<full-log-dir>/bootstrap-crash.log`` for a
-  clean Python exception escaping the bootstrap shim. Idempotent and
+  genuine Python exception escaping the bootstrap shim (a deliberate
+  ``SystemExit``/``KeyboardInterrupt`` is never crash-dumped — at most a
+  one-line trace in ``<full-log-dir>/bootstrap-exit.log``). Idempotent and
   best-effort: any failure is swallowed so diagnostics-wiring can never break
   the secondary's cold start.
 """
@@ -63,6 +65,16 @@ _DUMP_BASENAME = "faulthandler.log"
 #: (run_20260610_130030) showed that when it lands only on container stderr
 #: it drowns in podman debug noise while every per-node log file stays empty.
 _CRASH_BASENAME = "bootstrap-crash.log"
+
+#: Basename of the one-line deliberate-exit trace under the per-node
+#: ``--full-log-dir``. ``SystemExit``/``KeyboardInterrupt`` are by definition
+#: intentional interpreter exits (raise-by-design), never crashes — they must
+#: NEVER land in ``bootstrap-crash.log`` (a secondary's deliberate
+#: ``sys.exit(1)`` after the primary's RunAborted was filed as a "bootstrap
+#: crash" and sent the operator hunting a phantom — asm-dataset 2212c136).
+#: A non-zero deliberate exit still gets ONE durable INFO line here so the
+#: operator can correlate the container's exit code.
+_EXIT_BASENAME = "bootstrap-exit.log"
 
 #: Module-level reference to the open dump file. ``faulthandler.register`` /
 #: ``faulthandler.enable`` retain the underlying fd, so the object MUST stay
@@ -190,21 +202,30 @@ def write_crash_traceback(argv: list[str] | None = None) -> None:
     "totally silent" dead secondary (production fire-drill,
     run_20260610_130030).
 
+    Classification is by exception TYPE alone (no state threading):
+      * ``SystemExit`` (ANY code) / ``KeyboardInterrupt`` — a deliberate
+        interpreter exit (raise-by-design), NEVER a crash. Never dumped to
+        ``bootstrap-crash.log``; a non-zero ``SystemExit`` (or an interrupt)
+        leaves one durable INFO line in ``bootstrap-exit.log`` instead, a
+        clean ``SystemExit`` (code 0/None) records nothing at all.
+      * anything else — a genuine exception: full crash dump.
+
     Strictly best-effort and side-effect-only:
       * never raises (any failure here would mask the original error);
       * never swallows — the caller re-raises, so the process exit code and
         the stderr traceback are unchanged;
       * a no-op when there is no current exception, when the exception is a
-        clean ``SystemExit`` (code 0/None — a normal exit, not a crash), or
-        when the argv carries no usable ``--full-log-dir`` (the traceback
-        already reaches stderr via the caller's re-raise; duplicating it
-        there would only add noise).
+        clean ``SystemExit`` (code 0/None — a normal exit), or when the argv
+        carries no usable ``--full-log-dir`` (the traceback already reaches
+        stderr via the caller's re-raise; duplicating it there would only
+        add noise).
     """
     try:
         exc = sys.exception()
         if exc is None:
             return
         if isinstance(exc, SystemExit) and exc.code in (0, None):
+            # Normal shutdown: nothing worth recording.
             return
         raw = list(sys.argv[1:] if argv is None else argv)
         full_log_dir = _full_log_dir_from_argv(raw)
@@ -212,10 +233,24 @@ def write_crash_traceback(argv: list[str] | None = None) -> None:
             return
         dir_path = Path(full_log_dir)
         dir_path.mkdir(parents=True, exist_ok=True)
-        # Append so respawn cycles accumulate instead of clobbering the
-        # previous crash; one timestamped header per entry.
+        stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            # Deliberate exit (raise-by-design), not a crash: one durable
+            # INFO line — never a crash dump (asm-dataset 2212c136: a
+            # post-RunAborted `sys.exit(1)` filed as a "bootstrap crash").
+            detail = (
+                f"rc={exc.code}"
+                if isinstance(exc, SystemExit)
+                else "(KeyboardInterrupt)"
+            )
+            with (dir_path / _EXIT_BASENAME).open("a") as handle:
+                handle.write(f"{stamp} bootstrap exited deliberately {detail}\n")
+                handle.flush()
+            return
+        # Genuine exception: full crash dump. Append so respawn cycles
+        # accumulate instead of clobbering the previous crash; one
+        # timestamped header per entry.
         with (dir_path / _CRASH_BASENAME).open("a") as handle:
-            stamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
             handle.write(f"==== bootstrap crash at {stamp} ====\n")
             traceback.print_exception(exc, file=handle)
             handle.flush()

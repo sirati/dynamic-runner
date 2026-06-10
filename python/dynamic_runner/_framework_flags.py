@@ -51,7 +51,18 @@ from .logging_setup import IMPORTANT_STDIO_ONLY_FLAG
 # the re-derived forward-set byte-identical across nodes (a cold-start
 # secondary re-runs `filter_framework_argv` over its full argv, which carries
 # the wrapper-injected copy) and avoids handing the secondary's argparse the
-# flag twice. NOTE — `--panik-file` is deliberately NOT in this set: the
+# flag twice.
+#
+# `--output-dir` is per-spawn state too: the `--multi-computer local`
+# spawner emits it afresh per secondary (the dispatcher's resolved
+# `--output`, so same-host secondaries publish into the operator's output
+# directory), and inside the SLURM wrapper container the flag is absent on
+# purpose — `SecondaryConfig.__new__` auto-resolves the publish target to
+# the user-visible `/app/out-network` bind-mount. Forwarding a node's own
+# value to OTHER nodes would both duplicate the flag and leak one host's
+# filesystem view across hosts.
+#
+# NOTE — `--panik-file` is deliberately NOT in this set: the
 # wrapper injects a node-local reaper sentinel under that SAME flag, but the
 # operator's cluster-wide `--panik-file` paths legitimately ride
 # `forwarded_argv` (the only channel that reaches secondaries). A string-level
@@ -64,6 +75,7 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
         "--secondary-id",
         "--secondary-quic-port",
         "--src-network",
+        "--output-dir",
         "--cores",
         "--max-memory",
         "--mem-manager-reserved",
@@ -73,10 +85,16 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
 )
 
 
-# Value-less `store_true` framework flags that are SUBMITTER-LOCAL: they
-# steer the submitter process only and must never propagate to a secondary.
-# `--important-stdio-only` arms LLM-wake stdio mode on the submitter; the
-# secondary still gets `--full-log-dir` for its per-role file logs.
+# Value-less `store_true` framework flags that are OPERATOR-STDIO-scoped:
+# they steer the operator-facing stdio and must not ride the GENERIC forward
+# set. `--important-stdio-only` arms LLM-wake stdio mode; whether it reaches
+# a secondary follows the file descriptors, not this set: a SLURM
+# secondary's stdio is a per-node sbatch capture (full logs, no gate), while
+# the `--multi-computer local` spawn path re-emits the flag explicitly
+# (`logging_setup.stdio_mode_argv` via `spawn_secondary`) because its
+# subprocess secondaries INHERIT the operator's stdio. Either way the
+# secondary still gets `--full-log-dir` (SLURM) / the full-log default for
+# its durable record.
 SUBMITTER_LOCAL_FLAGS: frozenset[str] = frozenset(
     {
         IMPORTANT_STDIO_ONLY_FLAG,

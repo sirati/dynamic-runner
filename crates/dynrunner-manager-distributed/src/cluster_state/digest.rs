@@ -63,6 +63,11 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps,
             run_complete,
             run_aborted,
+            // The graceful-abort dispatch-freeze latch IS summarised
+            // (sticky `|=`-healable via snapshot restore), carried as a
+            // presence bit like `run_aborted` — the same false→true
+            // ratchet shape.
+            graceful_abort_requested,
             // The discovery-debt latch IS summarised (it is snapshot-healable
             // via the sticky `max`-join), carried VERBATIM (the full
             // `DiscoveryDebt` value, NOT a bool) into the digest so the
@@ -262,6 +267,7 @@ impl<I: Identifier> ClusterState<I> {
             primary_epoch: *primary_epoch,
             run_complete: *run_complete,
             run_aborted: run_aborted.is_some(),
+            graceful_abort: *graceful_abort_requested,
             // Discovery-debt lattice height, carried VERBATIM (the full
             // three-state enum, not a bool) so the AE detector can compare
             // it in both directions: `is_behind` is "the peer is STRICTLY

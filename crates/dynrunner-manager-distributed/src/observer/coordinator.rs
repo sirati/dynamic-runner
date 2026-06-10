@@ -95,6 +95,14 @@ use crate::task_completed::{
     TaskCompletedEvent, TaskCompletedListener, run_collector, run_task_completed_dispatcher,
     windowed_failure_collector,
 };
+use crate::warn_throttle::WarnThrottle;
+
+/// Minimum spacing between two anti-entropy fault WARNs (empty mesh
+/// registry / failed send). The cadence detects the same outage every
+/// ~20s tick; this gate keeps the fault LOUD (never silent — the
+/// run_20260610 wedge) without one WARN per tick for its duration. The
+/// suppressed-occurrence count rides each emitted WARN.
+const AE_FAULT_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Configuration for a standalone observer. Carries only the values the
 /// observer's own concerns read: the node identity, the lost-visibility
@@ -184,6 +192,14 @@ pub enum ObserverTerminal {
     Done,
     /// `run_aborted()` Some — exit 1 (non-zero).
     Aborted { reason: String },
+    /// `run_complete() ∧ graceful_abort_requested()` — the operator's
+    /// graceful abort ran its drain protocol to the end. The composed
+    /// verdict (two sticky CRDT facts; there is no third terminal
+    /// mutation), DISTINCT from `Done` (work was deliberately left
+    /// unscheduled) and from `Aborted` (nothing failed — the wind-down was
+    /// requested and clean). Exits clean; the narrator's terminal summary
+    /// carries the counts.
+    GracefulAbort,
     /// Panik signal fired — exit 137.
     Panik { matched_path: std::path::PathBuf },
 }
@@ -248,6 +264,16 @@ where
     /// tick that has a candidate, so a malformed-snapshot responder is not
     /// retried on the immediately-following tick.
     recovery_cursor: usize,
+    /// Rate limit for the digest tick's fault WARNs (empty mesh registry /
+    /// failed broadcast). The tick fires every ~20s; during an outage the
+    /// SAME fault recurs every tick, so the gate emits at most once per
+    /// interval (with a suppressed count) instead of one WARN per tick —
+    /// while guaranteeing the fault is never SILENT (the run_20260610
+    /// heal-never-engages wedge was undiagnosable because the
+    /// empty-registry broadcast "succeeded" and the Err arm logged DEBUG).
+    ae_digest_warn: WarnThrottle,
+    /// Same gate for the AE-3 recovery tick's fault WARNs.
+    ae_recovery_warn: WarnThrottle,
     /// The transport-recovery port (BUG-B reconnect). `Some` on the
     /// relocated submitter→observer path, whose
     /// [`dynrunner_transport_tunnel::TunneledPeerTransport`] reaches the
@@ -374,6 +400,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             reconnector,
         }
     }
@@ -428,6 +456,8 @@ where
             task_completed_rx: Some(task_rx),
             peer_digests: std::collections::HashMap::new(),
             recovery_cursor: 0,
+            ae_digest_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
+            ae_recovery_warn: WarnThrottle::new(AE_FAULT_WARN_INTERVAL),
             reconnector,
         }
     }
@@ -544,6 +574,42 @@ where
         // receiver demuxes to a slot. Only the routing send-target carries the
         // resolved host (for a remote, id-less `Destination::Primary`).
         self.client.send(send_target, msg.with_target(dst))
+    }
+
+    /// Send the GRACEFUL-ABORT command to the primary — the ONE
+    /// management command a zero-authority observer may send. Builds the
+    /// typed [`DistributedMessage::GracefulAbortRequest`] and routes it
+    /// through the observer's own `Destination::Primary` egress edge; the
+    /// primary originates the replicated `GracefulAbortRequested` sticky
+    /// latch on receipt (idempotent — re-sends NoOp at the apply).
+    ///
+    /// Best-effort by design: a send failure (no current primary known /
+    /// mesh-pump gone) is WARNed and the operator simply re-triggers once
+    /// visibility returns — the request carries no state of its own, the
+    /// LATCH (primary-originated, CRDT-replicated) is the durable fact.
+    ///
+    /// Triggered by the operator channel (`SIGUSR2` to the observer
+    /// process — see the run loop's graceful-abort arm); `pub` so an
+    /// embedding driver/test can invoke it directly.
+    pub async fn request_graceful_abort(&mut self) {
+        tracing::warn!(
+            target: IMPORTANT_TARGET,
+            "graceful abort triggered on the observer; sending \
+             GracefulAbortRequest to the primary"
+        );
+        let msg = DistributedMessage::GracefulAbortRequest {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+        };
+        if let Err(e) = self.send_to(Destination::Primary, msg).await {
+            tracing::warn!(
+                target: IMPORTANT_TARGET,
+                error = %e,
+                "graceful-abort request could not be sent (no route to the \
+                 primary); re-trigger once visibility returns"
+            );
+        }
     }
 
     /// Drive the observer until it OBSERVES a run terminal (the primary's
@@ -731,6 +797,28 @@ where
             // a never-firing arm.
             let mut panik_rx = self.panik_signal_rx.take();
 
+            // Operator graceful-abort channel: SIGUSR2 to the observer
+            // process (the cleanest existing operator seam — the sibling of
+            // the panik watcher's SIGTERM arm; both ride tokio's unix
+            // signal registry). Each delivery sends one
+            // `GracefulAbortRequest` to the primary; re-sending the signal
+            // re-sends the request (idempotent at the primary's latch), so
+            // a request lost to a failover window is operator-recoverable.
+            // Registration failure (exotic runtimes) degrades to a parked
+            // arm — the embedding driver can still call
+            // `request_graceful_abort` directly.
+            let mut graceful_abort_signal =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "SIGUSR2 graceful-abort trigger could not be \
+                             registered; the signal channel is disabled for \
+                             this observer"
+                        );
+                    })
+                    .ok();
+
             loop {
                 // 1. Narrate (item 9/14): emit pending phase / summary
                 //    BEFORE the terminal early-returns so the completing
@@ -801,6 +889,24 @@ where
                     // self-departure + return the Panik terminal.
                     signal = recv_panik(&mut panik_rx) => {
                         return Ok(self.on_panik(signal).await);
+                    }
+                    // Operator graceful-abort trigger (SIGUSR2). Each
+                    // delivery sends one typed GracefulAbortRequest to the
+                    // primary. `recv() == None` (signal stream closed) parks
+                    // the arm for the rest of the run — never a hot-loop.
+                    // Cancel-safety: `Signal::recv` is cancel-safe (tokio
+                    // docs); a sibling arm winning drops and rebuilds the
+                    // recv future without losing a queued signal.
+                    sig = async {
+                        match graceful_abort_signal.as_mut() {
+                            Some(stream) => stream.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match sig {
+                            Some(()) => self.request_graceful_abort().await,
+                            None => graceful_abort_signal = None,
+                        }
                     }
                     // Announcer outbox drain: the announcer task posts a
                     // ready send; this arm owns the transport `&mut self`.
@@ -880,8 +986,16 @@ where
                 reason: reason.to_string(),
             });
         }
-        // 2. Complete → clean exit 0. Also the PRIMARY's verdict.
+        // 2. Complete → exit. Also the PRIMARY's verdict. With the
+        //    replicated graceful-abort latch set, the composed fact
+        //    `run_complete ∧ graceful_abort` IS the graceful-abort verdict
+        //    (distinct from a clean success — work was deliberately left
+        //    unscheduled — and from the hard abort above); otherwise a
+        //    plain clean exit 0.
         if self.cluster_state.run_complete() {
+            if self.cluster_state.graceful_abort_requested() {
+                return Some(ObserverTerminal::GracefulAbort);
+            }
             return Some(ObserverTerminal::Done);
         }
         // 3. Closed transport with peers present → clean exit 0. Read off
@@ -1212,13 +1326,44 @@ where
     }
 
     /// Anti-entropy tick (item 3): broadcast our digest to the mesh.
+    ///
+    /// FAULTS ARE LOUD (rate-limited via [`Self::ae_digest_warn`]): a
+    /// broadcast over an EMPTY mesh registry returns `Ok` while reaching
+    /// nobody — in the demoted-submitter topology this is exactly the
+    /// heal-never-engages wedge (the secondaries' re-dialed bootstrap
+    /// wires sit unregistered on the accept loop until they speak), and
+    /// it was previously fully silent: no Err, and the Err arm only ever
+    /// logged DEBUG. Both fault shapes now WARN, naming the registry
+    /// state against the replicated roster so the divergence (CRDT knows
+    /// N peers, the wire reaches 0) is visible to the operator.
     async fn on_anti_entropy_tick(&mut self) {
+        if self.client.peer_count() == 0 {
+            // The roster the replicated ledger believes exists — the WARN
+            // names both sides of the divergence.
+            let roster_secondaries = self.cluster_state.alive_secondary_members().count();
+            let roster_primary = self.cluster_state.current_primary().map(str::to_owned);
+            if let Some(suppressed) = self.ae_digest_warn.permit() {
+                tracing::warn!(
+                    roster_secondaries,
+                    roster_primary = ?roster_primary,
+                    suppressed_since_last_warn = suppressed,
+                    "anti-entropy digest has no peers to reach: the mesh \
+                     registry is EMPTY while the replicated roster names the \
+                     peers above — the digest heal cannot engage until a peer \
+                     (re-)registers (a re-dialed bootstrap wire registers on \
+                     its first inbound frame)"
+                );
+            }
+        }
         let digest = self.cluster_state.digest();
         let msg =
             anti_entropy::digest_broadcast::<I>(&self.config.node_id, timestamp_now(), digest);
-        if let Err(e) = self.send_to(Destination::All, msg).await {
-            tracing::debug!(
+        if let Err(e) = self.send_to(Destination::All, msg).await
+            && let Some(suppressed) = self.ae_digest_warn.permit()
+        {
+            tracing::warn!(
                 error = %e,
+                suppressed_since_last_warn = suppressed,
                 "observer anti-entropy digest broadcast failed; next tick retries"
             );
         }
@@ -1271,9 +1416,26 @@ where
             // quiesce, no pull this tick.
             return;
         };
-        if let Err(e) = self.send_to(dst, req).await {
+        // A planned pull over an EMPTY mesh registry can only no-route —
+        // name the registry state (rate-limited; same gate as the Err arm
+        // below, so one tick emits at most one recovery-fault WARN).
+        if self.client.peer_count() == 0
+            && let Some(suppressed) = self.ae_recovery_warn.permit()
+        {
+            tracing::warn!(
+                pull_target = ?dst,
+                suppressed_since_last_warn = suppressed,
+                "AE-3 recovery pull has no peers to reach: the mesh registry \
+                 is EMPTY while a known peer's digest proves this replica \
+                 behind — recovery cannot engage until the peer (re-)registers"
+            );
+        }
+        if let Err(e) = self.send_to(dst, req).await
+            && let Some(suppressed) = self.ae_recovery_warn.permit()
+        {
             tracing::warn!(
                 error = %e,
+                suppressed_since_last_warn = suppressed,
                 "observer AE-3 recovery snapshot pull failed; the next recovery \
                  tick rotates to a different responder"
             );

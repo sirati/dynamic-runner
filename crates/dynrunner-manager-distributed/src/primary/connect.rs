@@ -217,6 +217,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `primary::reconciliation_probe`.
             MessageType::TaskHoldResponse => self.handle_task_hold_response(msg, command_rx).await,
             MessageType::MeshReady => self.handle_mesh_ready(msg),
+            // Observer-requested graceful abort: the ONE management command
+            // a zero-authority observer may send. The handler originates the
+            // replicated `GracefulAbortRequested` sticky latch (idempotent —
+            // a re-sent request against an already-latched freeze NoOps).
+            // See `lifecycle::graceful_abort`.
+            MessageType::GracefulAbortRequest => self.handle_graceful_abort_request(msg).await,
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
             // Replicated cluster ledger maintenance. Without this arm

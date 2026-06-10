@@ -12,6 +12,7 @@ pub mod primary;
 pub mod process;
 pub(crate) mod run_narrator;
 pub mod runtime_watchdog;
+pub(crate) mod warn_throttle;
 pub mod secondary;
 pub mod state;
 pub mod task_completed;

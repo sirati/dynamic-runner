@@ -225,6 +225,15 @@ where
                             outcome = NodeRunOutcome {
                                 terminal: match result {
                                     Ok(()) => RunTerminal::Done,
+                                    // The graceful-abort verdict is its own
+                                    // terminal (distinct from success AND
+                                    // from a failure) — the boundary reports
+                                    // it loudly and exits clean.
+                                    Err(error @ crate::primary::RunError::GracefulAbort {
+                                        ..
+                                    }) => RunTerminal::GracefulAbort {
+                                        reason: error.to_string(),
+                                    },
                                     Err(error) => RunTerminal::Failed { error },
                                 },
                                 completed,

@@ -129,6 +129,7 @@ where
             // (it begins forming on the unconfigured peer).
             mesh: super::lifecycle::MeshFormation::default(),
             fatal_exit: None,
+            deposed_primary: false,
             cluster_state: ClusterState::new(),
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
@@ -165,10 +166,11 @@ where
             // app-level TerminalAck (#352 — see the field doc on
             // `SecondaryCoordinator`).
             pending_report_replays: Vec::new(),
-            // Permanent-failure detector beside it (#366): replay
-            // attempts per delivery_seq, escalated to ERROR past the
-            // threshold in `drain_report_replays`.
-            report_replay_attempts: std::collections::HashMap::new(),
+            // The drain's aggregated-log rate limiter beside it (no
+            // emit yet, nothing suppressed). The #366 per-report
+            // replay-attempt tally lives on each retained entry.
+            replay_log_last_emit: None,
+            replay_log_suppressed: 0,
             // Per-secondary monotonic delivery-confirmation counter; 1 so
             // a zero seq never appears on the wire.
             next_delivery_seq: 1,
