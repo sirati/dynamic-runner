@@ -107,6 +107,82 @@ _CHILD_PROGRAM = textwrap.dedent(
 )
 
 
+class WriteCrashTracebackTests(unittest.TestCase):
+    """`write_crash_traceback`: durable last-gasp record of the in-flight
+    exception under `<full-log-dir>/bootstrap-crash.log`, strictly
+    best-effort (never raises, never masks, no-op on clean exits)."""
+
+    def _crash_file(self, log_dir: str) -> pathlib.Path:
+        return pathlib.Path(log_dir) / fault_dumps._CRASH_BASENAME
+
+    def test_writes_traceback_of_inflight_exception(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise RuntimeError("boom-bootstrap-crash")
+            except RuntimeError:
+                fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            body = self._crash_file(tmp).read_text()
+            self.assertIn("==== bootstrap crash at ", body)
+            self.assertIn("Traceback (most recent call last):", body)
+            self.assertIn("RuntimeError: boom-bootstrap-crash", body)
+
+    def test_appends_across_crashes(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for marker in ("first-crash", "second-crash"):
+                try:
+                    raise RuntimeError(marker)
+                except RuntimeError:
+                    fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            body = self._crash_file(tmp).read_text()
+            self.assertIn("first-crash", body)
+            self.assertIn("second-crash", body)
+
+    def test_noop_without_inflight_exception(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            self.assertFalse(self._crash_file(tmp).exists())
+
+    def test_noop_on_clean_systemexit(self) -> None:
+        # `sys.exit(0)` / bare `sys.exit()` escaping the consumer is a
+        # normal shutdown, not a crash — no file.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for code in (0, None):
+                try:
+                    raise SystemExit(code)
+                except SystemExit:
+                    fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            self.assertFalse(self._crash_file(tmp).exists())
+
+    def test_nonzero_systemexit_is_recorded(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise SystemExit(2)
+            except SystemExit:
+                fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            self.assertIn("SystemExit: 2", self._crash_file(tmp).read_text())
+
+    def test_never_raises_without_log_dir_or_with_bad_dir(self) -> None:
+        # No `--full-log-dir` → silent no-op; an uncreatable dir → swallowed.
+        # Either failure mode raising here would MASK the original error.
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            fault_dumps.write_crash_traceback([])
+            fault_dumps.write_crash_traceback(
+                ["--full-log-dir", "/proc/definitely-not-writable/x"]
+            )
+
+
 @unittest.skipUnless(
     hasattr(signal, "SIGUSR1"), "SIGUSR1 not available on this platform"
 )

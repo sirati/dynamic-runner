@@ -23,6 +23,7 @@ import argparse
 import importlib.util
 import pathlib
 import sys
+import textwrap
 import types
 import unittest
 
@@ -192,6 +193,107 @@ class ColdStartMainTests(unittest.TestCase):
         argv = ["--secondary", "tcp://x:1", "--secondary-id", "sec-0"]
         with self.assertRaises(SystemExit):
             bootstrap.main(argv)
+
+
+# Child program for the crash-visibility end-to-end: load the shim under the
+# package stub (it does relative imports), put a throwaway consumer module on
+# sys.path, and run `main` with a real bootstrap argv. The PARENT asserts on
+# the child's exit code + the durable `bootstrap-crash.log` — i.e. exactly
+# what an operator (and the container runtime) observe.
+_CRASH_CHILD_PROGRAM = textwrap.dedent(
+    """
+    import importlib.util, pathlib, sys, types
+
+    pkg_root = pathlib.Path(sys.argv[1])
+    consumer_dir = sys.argv[2]
+    consumer_name = sys.argv[3]
+    log_dir = sys.argv[4]
+
+    pkg = types.ModuleType("dynamic_runner")
+    pkg.__path__ = [str(pkg_root)]
+    sys.modules["dynamic_runner"] = pkg
+
+    def load(name):
+        spec = importlib.util.spec_from_file_location(
+            f"dynamic_runner.{name}", pkg_root / f"{name}.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"dynamic_runner.{name}"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    load("_fault_dumps")
+    bootstrap = load("_secondary_bootstrap")
+
+    sys.path.insert(0, consumer_dir)
+    bootstrap.main(
+        [
+            "--secondary-module",
+            consumer_name,
+            "--secondary",
+            "tcp://gw.cluster:4433",
+            "--secondary-id",
+            "sec-0",
+            "--full-log-dir",
+            log_dir,
+        ]
+    )
+    """
+)
+
+
+class CrashLogEndToEndTests(unittest.TestCase):
+    """A consumer-module crash escaping the shim lands in
+    `<full-log-dir>/bootstrap-crash.log` AND the process still exits
+    non-zero with the traceback on stderr (the handler records, never
+    swallows). A clean exit writes nothing."""
+
+    def _run_child(self, consumer_body: str) -> tuple:
+        import subprocess
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        tmp = pathlib.Path(self._tmp.name)
+        log_dir = tmp / "sec-0"
+        log_dir.mkdir()
+        consumer_name = "_bootstrap_crash_consumer"
+        (tmp / f"{consumer_name}.py").write_text(consumer_body)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _CRASH_CHILD_PROGRAM,
+                str(_PACKAGE_ROOT),
+                str(tmp),
+                consumer_name,
+                str(log_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return proc, log_dir / "bootstrap-crash.log"
+
+    def test_consumer_crash_writes_crash_log_and_exits_nonzero(self) -> None:
+        proc, crash_log = self._run_child(
+            'raise RuntimeError("boom-from-consumer")\n'
+        )
+        self.assertNotEqual(proc.returncode, 0, "crash must keep a non-zero exit")
+        # The re-raise still reaches stderr unchanged (container-visible).
+        self.assertIn("boom-from-consumer", proc.stderr)
+        # AND the durable per-node record exists with the full traceback.
+        self.assertTrue(
+            crash_log.exists(), f"bootstrap-crash.log not created at {crash_log}"
+        )
+        body = crash_log.read_text()
+        self.assertIn("Traceback (most recent call last):", body)
+        self.assertIn("RuntimeError: boom-from-consumer", body)
+
+    def test_clean_exit_writes_no_crash_log(self) -> None:
+        proc, crash_log = self._run_child("import sys\nsys.exit(0)\n")
+        self.assertEqual(proc.returncode, 0, f"stderr:\n{proc.stderr}")
+        self.assertFalse(crash_log.exists(), "clean exit must not be recorded")
 
 
 if __name__ == "__main__":
