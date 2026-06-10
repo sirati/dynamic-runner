@@ -146,6 +146,7 @@ async fn secondary_control_sender_reaches_loop_receiver() {
                     assert_eq!(topic, "reply");
                     assert_eq!(data, b"pong");
                 }
+                other => panic!("expected the queued SendToWorker back, got {other:?}"),
             }
         })
         .await;
