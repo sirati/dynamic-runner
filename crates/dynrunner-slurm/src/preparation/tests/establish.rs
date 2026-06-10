@@ -14,6 +14,31 @@ use tokio::task::JoinSet;
 use crate::preparation::establish::establish_tunnel;
 use crate::preparation::options::PrepError;
 use crate::preparation::policy::EstablishmentPolicy;
+use crate::preparation::ssh::BindProbe;
+
+/// Canned always-Listening bind verifier (zero-arg shape for
+/// `establish_tunnel`). The pre-existing policy tests use it so their
+/// concern — rate-limit / retry / budget — stays isolated from bind
+/// verification.
+pub(super) fn listening_verifier() -> impl FnMut() -> std::future::Ready<BindProbe> {
+    || {
+        std::future::ready(BindProbe::Listening {
+            listeners: vec!["127.0.0.1:40000".into(), "[::1]:40000".into()],
+        })
+    }
+}
+
+/// Canned always-Listening bind verifier in the `(host, tunnel_port)`
+/// shape `establish_one_tunnel_inner` takes. Shared with the respawn
+/// tests.
+pub(super) fn listening_inner_verifier()
+-> impl FnMut(String, u16) -> std::future::Ready<BindProbe> {
+    |_host, _tunnel_port| {
+        std::future::ready(BindProbe::Listening {
+            listeners: vec!["127.0.0.1:40000".into(), "[::1]:40000".into()],
+        })
+    }
+}
 
 /// Build a `/bin/sh` child whose stderr emits `marker` and whose
 /// exit code is `rc`. Returns a `Child` that mirrors what
@@ -75,7 +100,11 @@ fn establish_tunnel_retries_then_succeeds() {
         let attempt_counter = Arc::new(AtomicUsize::new(0));
         let attempts_ref = Arc::clone(&attempt_counter);
 
-        let res = establish_tunnel("secondary-0", &policy, &pool, move || {
+        let res = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
             let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
             async move {
                 if i == 0 {
@@ -90,7 +119,9 @@ fn establish_tunnel_retries_then_succeeds() {
                     Ok(alive_child())
                 }
             }
-        })
+            },
+            listening_verifier(),
+        )
         .await;
 
         match res {
@@ -124,10 +155,16 @@ fn establish_tunnel_exhausts_attempts_then_fails_loud() {
         let attempt_counter = Arc::new(AtomicUsize::new(0));
         let attempts_ref = Arc::clone(&attempt_counter);
 
-        let res = establish_tunnel("secondary-0", &policy, &pool, move || {
-            let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
-            async move { Ok(fail_child(&format!("ATTEMPT-{i}-FAIL"), 255)) }
-        })
+        let res = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
+                let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(fail_child(&format!("ATTEMPT-{i}-FAIL"), 255)) }
+            },
+            listening_verifier(),
+        )
         .await;
 
         let err = res.expect_err("3 failing attempts must surface TunnelFailed");
@@ -220,7 +257,7 @@ fn establish_tunnel_caps_in_flight_spawns_at_max_concurrent() {
                         // gating, not the verify branch.
                         Ok(alive_child())
                     }
-                })
+                }, listening_verifier())
                 .await;
                 res.map(|_| ())
             });
@@ -265,12 +302,18 @@ fn establish_tunnel_enforces_per_tunnel_wall_clock_budget() {
             per_tunnel_timeout: Duration::from_millis(200),
         };
 
-        establish_tunnel("secondary-0", &policy, &pool, move || async move {
-            // Each attempt fails fast; the long backoff +
-            // 200ms budget means the timeout fires before
-            // attempt 2 even starts.
-            Ok(fail_child("FAIL", 255))
-        })
+        establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || async move {
+                // Each attempt fails fast; the long backoff +
+                // 200ms budget means the timeout fires before
+                // attempt 2 even starts.
+                Ok(fail_child("FAIL", 255))
+            },
+            listening_verifier(),
+        )
         .await
         .expect_err("budget exhaustion must surface error")
     }));
@@ -313,4 +356,171 @@ fn establishment_policy_defaults_match_consumer_contract() {
     assert_eq!(p.backoff_before(1), Some(Duration::from_secs(5)));
     assert_eq!(p.backoff_before(2), Some(Duration::from_secs(15)));
     assert_eq!(p.backoff_before(3), Some(Duration::from_secs(15)));
+}
+
+/// THE partial-`-R`-bind closer (production anatomy: ssh survives the
+/// 3s gate, `ExitOnForwardFailure=yes` never trips, yet the worker's
+/// `127.0.0.1:<tunnel_port>` listener NEVER exists): a definite
+/// `NotListening` bind-probe verdict must (1) TERMINATE the useless
+/// gate-surviving child, (2) consume one attempt and RESPAWN, and
+/// (3) succeed once the respawned tunnel verifies. The dead first
+/// child is asserted via its reaped pid; the returned child is the
+/// second spawn.
+#[test]
+fn bind_verification_failure_kills_child_and_respawns() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let pool = Arc::new(Semaphore::new(1));
+        let policy = fast_policy(1, 3);
+        let pids = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let pids_for_spawner = Arc::clone(&pids);
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let probe_ref = Arc::clone(&probe_count);
+
+        let child = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
+                let pids = Arc::clone(&pids_for_spawner);
+                async move {
+                    // Every spawn survives the gate — the FAILURE in
+                    // this scenario is invisible to the gate (that is
+                    // the bug's whole anatomy).
+                    let child = alive_child();
+                    pids.lock().unwrap().push(child.id().expect("live child has a pid"));
+                    Ok(child)
+                }
+            },
+            move || {
+                let i = probe_ref.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(if i == 0 {
+                    // First tunnel: sshd bound only [::1] elsewhere /
+                    // nothing dialable — definite miss.
+                    BindProbe::NotListening
+                } else {
+                    BindProbe::Listening {
+                        listeners: vec!["127.0.0.1:40000".into()],
+                    }
+                })
+            },
+        )
+        .await
+        .expect("respawn after a bind-verification miss must succeed");
+
+        let pids = pids.lock().unwrap().clone();
+        assert_eq!(pids.len(), 2, "one miss + one verified spawn");
+        assert_eq!(
+            probe_count.load(Ordering::SeqCst),
+            2,
+            "each gate-surviving spawn is bind-verified exactly once"
+        );
+        // The first (unverified) child was terminated AND reaped —
+        // its /proc entry is gone. The returned child is the second.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pids[0])).exists(),
+            "the gate-surviving but unverified child must be killed"
+        );
+        assert_eq!(child.id(), Some(pids[1]), "the verified child is the respawn");
+    }));
+}
+
+/// A PERSISTENT bind-verification miss (the squatter never clears)
+/// exhausts the attempt budget and fails loud with the partial-bind
+/// message — and every gate-surviving child was killed along the way
+/// (no leaked half-tunnels for cleanup() to find uncommitted).
+#[test]
+fn bind_verification_failure_exhausts_attempts_then_fails_loud() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let pool = Arc::new(Semaphore::new(1));
+        let policy = fast_policy(1, 3);
+        let pids = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+        let pids_for_spawner = Arc::clone(&pids);
+
+        let err = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
+                let pids = Arc::clone(&pids_for_spawner);
+                async move {
+                    let child = alive_child();
+                    pids.lock().unwrap().push(child.id().expect("live child has a pid"));
+                    Ok(child)
+                }
+            },
+            || std::future::ready(BindProbe::NotListening),
+        )
+        .await
+        .expect_err("a never-verifying tunnel must fail after the attempt budget");
+
+        let pids = pids.lock().unwrap().clone();
+        assert_eq!(pids.len(), 3, "must spawn exactly `attempts` times");
+        for pid in &pids {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "every unverified child must be killed (pid {pid} survives)"
+            );
+        }
+        match err {
+            PrepError::TunnelFailed { secondary_id, rc, stderr } => {
+                assert_eq!(secondary_id, "secondary-0");
+                assert_eq!(rc, None, "a bind-verification miss has no exit code");
+                assert!(
+                    stderr.contains("worker-side listener never appeared"),
+                    "error must name the partial-bind anatomy, got {stderr:?}"
+                );
+            }
+            other => panic!("expected TunnelFailed, got {other}"),
+        }
+    }));
+}
+
+/// An `Inconclusive` probe (ssh to the worker failed / `ss` missing)
+/// must KEEP the gate-verified tunnel — the probe's own
+/// infrastructure failing must never kill tunnels that met the
+/// pre-probe standard (a node without iproute2 would otherwise lose
+/// every tunnel forever).
+#[test]
+fn bind_probe_inconclusive_keeps_gate_verified_tunnel() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    rt.block_on(local.run_until(async {
+        let pool = Arc::new(Semaphore::new(1));
+        let policy = fast_policy(1, 3);
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let spawns_ref = Arc::clone(&spawns);
+
+        let child = establish_tunnel(
+            "secondary-0",
+            &policy,
+            &pool,
+            move || {
+                spawns_ref.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(alive_child()) }
+            },
+            || {
+                std::future::ready(BindProbe::Inconclusive {
+                    reason: "`ss` unavailable on the worker (iproute2 missing)".into(),
+                })
+            },
+        )
+        .await
+        .expect("an inconclusive probe must not fail the tunnel");
+
+        assert_eq!(spawns.load(Ordering::SeqCst), 1, "no respawn on inconclusive");
+        assert!(child.id().is_some(), "the gate-verified child is kept alive");
+    }));
 }

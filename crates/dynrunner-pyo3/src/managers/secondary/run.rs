@@ -276,27 +276,23 @@ impl PySecondaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                // Resolve the primary URL to a SocketAddr.
+                // Resolve the primary URL to its SocketAddrs.
                 // Supports formats like "tcp://host:port", "ws://host:port", or "host:port"
                 // where `host` may be either a literal IP address or a DNS name —
                 // SLURM gateways generally hand out the FQDN from `hostname -f`,
-                // so the resolver needs to accept both.
+                // so the resolver needs to accept both. ALL resolved addresses
+                // are passed through (not just the first): the factory's dial
+                // sweeps every candidate per attempt, so a partial `-R` bind
+                // that only landed on one loopback family still connects (see
+                // `transport_factory::dial_candidates`).
                 let addr_str = primary_url
                     .strip_prefix("tcp://")
                     .or_else(|| primary_url.strip_prefix("ws://"))
                     .or_else(|| primary_url.strip_prefix("wss://"))
                     .unwrap_or(&primary_url);
 
-                let addr: std::net::SocketAddr = match tokio::net::lookup_host(addr_str).await {
-                    Ok(mut iter) => match iter.next() {
-                        Some(a) => a,
-                        None => {
-                            tracing::error!(url = %primary_url, "DNS lookup returned no addresses for primary URL");
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "DNS lookup returned no addresses for primary URL {primary_url}"
-                            )));
-                        }
-                    },
+                let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(addr_str).await {
+                    Ok(iter) => iter.collect(),
                     Err(e) => {
                         tracing::error!(url = %primary_url, error = %e, "failed to resolve primary URL");
                         return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -304,6 +300,12 @@ impl PySecondaryCoordinator {
                         )));
                     }
                 };
+                if addrs.is_empty() {
+                    tracing::error!(url = %primary_url, "DNS lookup returned no addresses for primary URL");
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "DNS lookup returned no addresses for primary URL {primary_url}"
+                    )));
+                }
 
                 // Stand up the secondary's mesh transport through the
                 // backend-opaque factory. It owns every backend-naming
@@ -358,7 +360,7 @@ impl PySecondaryCoordinator {
                 );
                 let mesh_bundle = transport_factory::dial_secondary_mesh::<RunnerIdentifier>(
                     transport_factory::SecondaryDialParams {
-                        addr,
+                        addrs,
                         connect_timeout: dist_connect_timeout,
                         retry_delay: dist_connect_retry_delay,
                         secondary_id: &secondary_id,

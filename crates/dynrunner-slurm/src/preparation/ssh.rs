@@ -3,7 +3,9 @@
 //! [`production_spawner`] (the closure passed to
 //! [`establish_one_tunnel_inner`](super::establish::establish_one_tunnel_inner)),
 //! [`spawn_reverse_tunnel`] (`Command::spawn` of the ssh subprocess),
-//! [`verify_tunnel_alive`] (3s sanity-check on the spawned child), and
+//! [`verify_tunnel_alive`] (3s sanity-check on the spawned child),
+//! [`probe_tunnel_bind`] / [`production_bind_verifier`] (worker-side
+//! bind verification closing the partial-`-R`-bind hole), and
 //! [`terminate_child`] (SIGTERM, 5s wait, SIGKILL). All consumed by
 //! the establishment policy in [`establish`](super::establish) and
 //! the cleanup path in [`pipeline`](super::pipeline).
@@ -330,6 +332,221 @@ async fn release_stale_reverse_port(
                 "stale-port release ssh failed to spawn; proceeding with rebind anyway"
             );
         }
+    }
+}
+
+/// Verdict of the worker-side BIND-VERIFICATION probe that closes the
+/// partial-`-R`-bind hole: OpenSSH's sshd binds the remote-forward
+/// listener PER ADDRESS FAMILY and replies `SSH2_MSG_REQUEST_SUCCESS`
+/// when at least ONE family binds (`channel_setup_fwd_listener_tcpip`
+/// sets `success = 1` inside the per-`addrinfo` loop; a failed bind
+/// with another candidate remaining is logged only at `verbose`), so a
+/// transient v4 collision on the tunnel port yields a v6-only — or, in
+/// the worst case the probe also covers, a wrong-host — listener while
+/// the submitter-side `ssh -R` survives `ExitOnForwardFailure=yes` and
+/// the 3s alive-gate. The probe asks the WORKER what actually got
+/// bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum BindProbe {
+    /// At least one loopback-dialable listener (`127.x` / `::1` /
+    /// wildcard) exists on the tunnel port. The carried `addr:port`
+    /// strings are the matching `ss` local addresses, for the log.
+    Listening { listeners: Vec<String> },
+    /// The probe RAN on the worker (`TUNNEL_PROBE=done` marker seen)
+    /// and found NO loopback-dialable listener on the tunnel port —
+    /// the definite verification failure.
+    NotListening,
+    /// The probe could not produce a verdict (ssh failed before the
+    /// marker, or `ss` is unavailable on the node). The caller keeps
+    /// the gate-verified tunnel and WARNs — a probe-infrastructure
+    /// failure must never kill tunnels that met the pre-probe
+    /// standard.
+    Inconclusive { reason: String },
+}
+
+/// The remote shell command that reports every TCP listener on
+/// `tunnel_port` as a structured `TUNNEL_LISTEN=<addr>:<port>` line,
+/// then `TUNNEL_PROBE=done` (or `TUNNEL_PROBE=no-ss` when iproute2 is
+/// absent). Mirrors the `WAS_LINGER=` marker pattern: the structured
+/// stdout lines — not the ssh exit code — carry the outcome. Matching
+/// any field that ends in `:<port>` (rather than an `ss` `sport =`
+/// filter or a positional column) keeps the probe robust across
+/// iproute2 versions: only the local-address column of a listener row
+/// can end in the literal port (the peer column of a listener is
+/// always `*`-ported).
+fn build_bind_probe_remote_cmd(tunnel_port: u16) -> String {
+    format!(
+        "if command -v ss >/dev/null 2>&1; \
+         then ss -tln 2>/dev/null \
+              | awk '{{ for (i=1;i<=NF;i++) if ($i ~ /:{port}$/) print \"TUNNEL_LISTEN=\" $i }}'; \
+              printf 'TUNNEL_PROBE=done\\n'; \
+         else printf 'TUNNEL_PROBE=no-ss\\n'; fi",
+        port = tunnel_port
+    )
+}
+
+/// Build the argv for the worker-side bind-verification ssh: the same
+/// gateway jump + compute-node target as the reverse tunnel, running
+/// [`build_bind_probe_remote_cmd`] as a short one-shot command (plain
+/// exec — no PTY needed, the markers go to clean stdout). Same
+/// one-shot ssh policy as the release/linger commands.
+///
+/// Pure (no I/O), so the argv shape is unit-testable without spawning
+/// a real subprocess.
+pub(super) fn build_bind_probe_argv(
+    remote_host: &str,
+    tunnel_port: u16,
+    opts: &PreparationOptions,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    push_jump_prologue(&mut argv, opts);
+    argv.push(remote_target(remote_host, opts));
+    push_oneshot_command_opts(&mut argv);
+    argv.push(build_bind_probe_remote_cmd(tunnel_port));
+    argv
+}
+
+/// PURE: is this `ss` local ADDRESS (the `addr` half of the reported
+/// `addr:port`) reachable through the loopback dial the secondary's
+/// bring-up performs (`127.0.0.1` / `[::1]`)? Loopback and wildcard
+/// binds qualify; a SPECIFIC non-loopback bind does not — e.g. the
+/// colliding squatter itself listening on a LAN address, which must
+/// not be mistaken for the tunnel's listener.
+fn is_loopback_dialable(addr: &str) -> bool {
+    let bare = addr.trim_start_matches('[').trim_end_matches(']');
+    bare == "*"
+        || bare == "::"
+        || bare == "::1"
+        || bare == "0.0.0.0"
+        || bare.starts_with("127.")
+        // v4-mapped loopback (`::ffff:127.0.0.1`).
+        || bare.ends_with(":127.0.0.1")
+}
+
+/// PURE: parse the bind-probe markers out of the probe ssh's stdout
+/// into a [`BindProbe`] verdict. CR-trims for transport safety;
+/// ignores `TUNNEL_LISTEN=` lines whose port is not `tunnel_port`
+/// (defensive — the remote awk already filters) or whose address is
+/// not loopback-dialable (the squatter-on-a-LAN-address case).
+pub(super) fn parse_bind_probe(stdout: &str, tunnel_port: u16) -> BindProbe {
+    let suffix = format!(":{tunnel_port}");
+    let mut probe_ran = false;
+    let mut no_tool = false;
+    let mut listeners: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if let Some(value) = line.strip_prefix("TUNNEL_LISTEN=") {
+            if let Some(addr) = value.strip_suffix(&suffix)
+                && is_loopback_dialable(addr)
+            {
+                listeners.push(value.to_string());
+            }
+        } else if line == "TUNNEL_PROBE=done" {
+            probe_ran = true;
+        } else if line == "TUNNEL_PROBE=no-ss" {
+            no_tool = true;
+        }
+    }
+    if !listeners.is_empty() {
+        BindProbe::Listening { listeners }
+    } else if probe_ran {
+        BindProbe::NotListening
+    } else if no_tool {
+        BindProbe::Inconclusive {
+            reason: "`ss` unavailable on the worker (iproute2 missing)".into(),
+        }
+    } else {
+        BindProbe::Inconclusive {
+            reason: "no probe marker in output (probe ssh failed before the command ran)".into(),
+        }
+    }
+}
+
+/// Run ONE bind-verification ssh round-trip against the worker and
+/// parse the verdict. An ssh spawn/exec failure is `Inconclusive` —
+/// the probe reports on the TUNNEL only when it actually reached the
+/// node.
+async fn run_bind_probe(
+    secondary_id: &str,
+    remote_host: &str,
+    tunnel_port: u16,
+    opts: &PreparationOptions,
+) -> BindProbe {
+    let argv = build_bind_probe_argv(remote_host, tunnel_port, opts);
+    tracing::debug!(secondary_id, tunnel_port, cmd = %shell_join(&argv), "bind-probe argv");
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    match cmd.output().await {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let verdict = parse_bind_probe(&stdout, tunnel_port);
+            if !matches!(verdict, BindProbe::Listening { .. }) {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::debug!(
+                    secondary_id,
+                    tunnel_port,
+                    rc = ?out.status.code(),
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "bind-probe round-trip did not confirm a listener"
+                );
+            }
+            verdict
+        }
+        Err(e) => BindProbe::Inconclusive {
+            reason: format!("bind-probe ssh failed to spawn: {e}"),
+        },
+    }
+}
+
+/// Grace before the single re-probe: the 3s alive-gate can pass while
+/// a slow handshake's `tcpip-forward` request is still in flight, so
+/// the FIRST miss may just be "not bound YET". One bounded re-probe
+/// after this pause separates slightly-slow from never-bound without
+/// letting a flapping probe kill healthy tunnels.
+const BIND_PROBE_GRACE: Duration = Duration::from_secs(2);
+
+/// Verify the worker-side tunnel listener exists, with one grace
+/// re-probe on a first miss (see [`BIND_PROBE_GRACE`]). The verdict
+/// semantics are [`BindProbe`]'s; only a repeated definite miss
+/// returns [`BindProbe::NotListening`].
+pub(super) async fn probe_tunnel_bind(
+    secondary_id: &str,
+    remote_host: &str,
+    tunnel_port: u16,
+    opts: &PreparationOptions,
+) -> BindProbe {
+    let first = run_bind_probe(secondary_id, remote_host, tunnel_port, opts).await;
+    if first != BindProbe::NotListening {
+        return first;
+    }
+    tracing::info!(
+        secondary_id,
+        tunnel_port,
+        "worker-side tunnel listener not visible on first probe; re-probing once after grace"
+    );
+    tokio::time::sleep(BIND_PROBE_GRACE).await;
+    run_bind_probe(secondary_id, remote_host, tunnel_port, opts).await
+}
+
+/// Build the production bind-verifier closure passed into
+/// [`establish_one_tunnel_inner`](super::establish::establish_one_tunnel_inner)
+/// alongside the spawner — the same DI seam shape, so the
+/// establishment policy stays concern-blind to HOW verification talks
+/// to the worker. Tests inject canned verdicts instead.
+pub(super) fn production_bind_verifier(
+    secondary_id: String,
+    opts: PreparationOptions,
+) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = BindProbe>>> {
+    move |host: String, tunnel_port: u16| {
+        let secondary_id = secondary_id.clone();
+        let opts = opts.clone();
+        Box::pin(async move { probe_tunnel_bind(&secondary_id, &host, tunnel_port, &opts).await })
     }
 }
 
@@ -707,6 +924,72 @@ pub(super) fn summarize_linger_enables(ledger: &LingerLedger) {
     }
 }
 
+/// When a spawner invocation force-releases the worker-side
+/// `-R <tunnel_port>` binding (via [`release_stale_reverse_port`])
+/// before spawning the reverse tunnel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReleaseBeforeSpawn {
+    /// Release only on RETRY invocations (the 2nd+ call of the same
+    /// spawner). A first attempt targets a fresh port that no prior
+    /// tunnel of this run has touched — paying the release round-trip
+    /// there would tax every healthy establishment. A retry, by
+    /// contrast, only happens because the PREVIOUS attempt failed
+    /// (rc=255 within the alive-gate, or bind verification found no
+    /// worker-side listener), and in both cases the port may still be
+    /// held on the worker: a leftover partial `-R` bind (sshd binds
+    /// per address family and reports success if EITHER lands — see
+    /// [`build_bind_probe_remote_cmd`]), a stale forward, or the
+    /// colliding squatter itself. The worker's dial target
+    /// (`localhost:<tunnel_port>`) is FIXED at worker startup, so the
+    /// retry cannot move to a fresh port — reclaiming the same one is
+    /// the only honest path.
+    OnRetry,
+    /// Release on EVERY invocation — the observer-reconnect shape,
+    /// where the rebuild only runs once the prior tunnel is known
+    /// dead/half-dead and the stale worker-side binding is the
+    /// expected obstacle.
+    Always,
+}
+
+/// PURE: does invocation number `prior_spawns` (0-based: the number of
+/// spawns this closure performed before the current one) perform the
+/// pre-spawn release under `mode`? Extracted so the retry-release
+/// semantics are unit-testable without spawning ssh.
+pub(super) fn release_before_attempt(mode: ReleaseBeforeSpawn, prior_spawns: usize) -> bool {
+    match mode {
+        ReleaseBeforeSpawn::Always => true,
+        ReleaseBeforeSpawn::OnRetry => prior_spawns > 0,
+    }
+}
+
+/// Shared builder behind [`production_spawner`] / [`reconnect_spawner`]:
+/// the per-attempt ssh wire-up (linger enable → optional worker-side
+/// port release → reverse-tunnel spawn), parameterised ONLY by the
+/// release mode so the two public spawners cannot drift.
+fn tunnel_spawner(
+    secondary_id: String,
+    opts: PreparationOptions,
+    primary_quic_port: u16,
+    linger_ledger: LingerLedger,
+    mode: ReleaseBeforeSpawn,
+) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
+    let mut prior_spawns: usize = 0;
+    move |host: String, tunnel_port: u16| {
+        let release_now = release_before_attempt(mode, prior_spawns);
+        prior_spawns += 1;
+        let secondary_id = secondary_id.clone();
+        let opts = opts.clone();
+        let linger_ledger = linger_ledger.clone();
+        Box::pin(async move {
+            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
+            if release_now {
+                release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
+            }
+            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
+        })
+    }
+}
+
 /// Build the production spawner closure passed into
 /// [`establish_one_tunnel_inner`]. Captures `(secondary_id, opts,
 /// primary_quic_port)` by move so the returned closure is `'static`
@@ -714,6 +997,12 @@ pub(super) fn summarize_linger_enables(ledger: &LingerLedger) {
 /// gymnastics at the call site. Each invocation clones the captured
 /// state into the produced future (retry attempts get a fresh future
 /// each time).
+///
+/// Retry attempts (2nd+ invocation) FIRST force-release the
+/// worker-side `-R <tunnel_port>` binding before respawning — see
+/// [`ReleaseBeforeSpawn::OnRetry`]: a retry only exists because the
+/// prior attempt failed, and the same fixed port (the worker's baked-in
+/// dial target) must be reclaimed, not re-collided with.
 ///
 /// Linger: before the reverse tunnel is spawned, the run user's logind
 /// linger is enabled on the target node (decoupling the worker's
@@ -734,15 +1023,13 @@ pub(super) fn production_spawner(
     primary_quic_port: u16,
     linger_ledger: LingerLedger,
 ) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
-    move |host: String, tunnel_port: u16| {
-        let secondary_id = secondary_id.clone();
-        let opts = opts.clone();
-        let linger_ledger = linger_ledger.clone();
-        Box::pin(async move {
-            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
-            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
-        })
-    }
+    tunnel_spawner(
+        secondary_id,
+        opts,
+        primary_quic_port,
+        linger_ledger,
+        ReleaseBeforeSpawn::OnRetry,
+    )
 }
 
 /// Build the OBSERVER-RECONNECT spawner closure: identical to
@@ -776,16 +1063,13 @@ pub(super) fn reconnect_spawner(
     primary_quic_port: u16,
     linger_ledger: LingerLedger,
 ) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
-    move |host: String, tunnel_port: u16| {
-        let secondary_id = secondary_id.clone();
-        let opts = opts.clone();
-        let linger_ledger = linger_ledger.clone();
-        Box::pin(async move {
-            ensure_node_linger(&secondary_id, &host, &opts, &linger_ledger).await;
-            release_stale_reverse_port(&secondary_id, &host, tunnel_port, &opts).await;
-            spawn_reverse_tunnel(&secondary_id, &host, tunnel_port, primary_quic_port, &opts).await
-        })
-    }
+    tunnel_spawner(
+        secondary_id,
+        opts,
+        primary_quic_port,
+        linger_ledger,
+        ReleaseBeforeSpawn::Always,
+    )
 }
 
 /// Spawn the ssh tunnel subprocess from `build_ssh_argv` output.

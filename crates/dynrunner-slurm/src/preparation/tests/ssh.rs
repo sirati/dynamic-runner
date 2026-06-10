@@ -8,8 +8,9 @@ use tokio::task::JoinSet;
 
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
-    LingerLedger, LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv,
-    linger_fail_reason, linger_succeeded, parse_was_linger, verify_tunnel_alive,
+    BindProbe, LingerLedger, LingerVerb, ReleaseBeforeSpawn, build_bind_probe_argv,
+    build_linger_argv, build_release_argv, build_ssh_argv, linger_fail_reason, linger_succeeded,
+    parse_bind_probe, parse_was_linger, release_before_attempt, verify_tunnel_alive,
     was_linger_from_probe,
 };
 
@@ -579,4 +580,178 @@ fn ledger_enable_verdict_is_any_success_wins_and_drains() {
     );
     // Drained: a later cohort summarises only its own attempts.
     assert_eq!(ledger.drain_enable_verdicts(), (0, Vec::new()));
+}
+
+/// The worker-side BIND-PROBE argv must mirror the one-shot remote-cmd
+/// shape (same gateway jump + compute target as the tunnel, bounded
+/// handshake, NOT a forward) and carry the structured-marker probe
+/// scoped to exactly the tunnel port.
+#[test]
+fn bind_probe_argv_reuses_jump_and_probes_exact_port() {
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        22,
+        vec![],
+        // extra_port_forwards must NOT leak into the probe.
+        vec![(2222, 9090)],
+    );
+    let argv = build_bind_probe_argv("compute01", 40000, &o);
+    // Same gateway jump + compute-node target as the tunnel.
+    let j_idx = argv.iter().position(|s| s == "-J").expect("has -J");
+    assert_eq!(argv[j_idx + 1], "alice@gw.example");
+    assert!(argv.iter().any(|s| s == "alice@compute01"));
+    // Not a tunnel: no -R / -N / ExitOnForwardFailure; bounded handshake.
+    assert!(!argv.iter().any(|s| s == "-R"), "probe must not forward");
+    assert!(!argv.iter().any(|s| s == "-N"), "probe must run a command");
+    assert!(!argv.iter().any(|s| s == "ExitOnForwardFailure=yes"));
+    assert!(argv.iter().any(|s| s == "ConnectTimeout=10"));
+    // The remote command reports listeners on EXACTLY :40000 via the
+    // structured markers (the ssh exit code is not the channel).
+    let remote_cmd = argv.last().expect("has a trailing remote command");
+    assert!(remote_cmd.contains("ss -tln"), "probe uses ss: {remote_cmd:?}");
+    assert!(remote_cmd.contains(":40000"), "probe scopes the port: {remote_cmd:?}");
+    assert!(remote_cmd.contains("TUNNEL_LISTEN="), "structured listener marker");
+    assert!(remote_cmd.contains("TUNNEL_PROBE=done"), "probe-ran marker");
+    assert!(remote_cmd.contains("TUNNEL_PROBE=no-ss"), "tool-missing marker");
+    // No collateral ports.
+    assert!(!remote_cmd.contains("9090"));
+    assert!(!remote_cmd.contains("2222"));
+}
+
+/// With auth_options set, the probe MUST jump via ProxyCommand (same
+/// OpenSSH-7.3+ workaround as every other per-node ssh) — never `-J`.
+#[test]
+fn bind_probe_argv_with_auth_uses_proxycommand() {
+    let auth = vec!["-i".to_string(), "/tmp/key".into()];
+    let o = PreparationOptions::new(
+        "/logs".into(),
+        "gw.example".into(),
+        Some("alice".into()),
+        2222,
+        auth,
+        vec![],
+    );
+    let argv = build_bind_probe_argv("compute01", 40000, &o);
+    assert!(!argv.iter().any(|s| s == "-J"));
+    let proxy_cmd = argv
+        .iter()
+        .find(|s| s.starts_with("ProxyCommand="))
+        .expect("has ProxyCommand=");
+    assert!(proxy_cmd.contains("'-i' '/tmp/key'"));
+    assert!(proxy_cmd.contains("'-p' '2222'"));
+}
+
+/// `parse_bind_probe` verdicts on the healthy shapes: both loopback
+/// families, a single family, and wildcard binds all verify. CR-trims
+/// for transport safety.
+#[test]
+fn parse_bind_probe_accepts_loopback_and_wildcard_listeners() {
+    // Healthy: both families (the healthy-run production anatomy).
+    assert_eq!(
+        parse_bind_probe(
+            "TUNNEL_LISTEN=127.0.0.1:42655\r\nTUNNEL_LISTEN=[::1]:42655\r\nTUNNEL_PROBE=done\r\n",
+            42655
+        ),
+        BindProbe::Listening {
+            listeners: vec!["127.0.0.1:42655".into(), "[::1]:42655".into()],
+        }
+    );
+    // v6-only partial bind STILL verifies: the dual-family dial
+    // (transport_factory) carries the run over [::1].
+    assert_eq!(
+        parse_bind_probe("TUNNEL_LISTEN=[::1]:42655\nTUNNEL_PROBE=done\n", 42655),
+        BindProbe::Listening {
+            listeners: vec!["[::1]:42655".into()],
+        }
+    );
+    // Wildcard binds (GatewayPorts-style) are loopback-dialable too.
+    for addr in ["0.0.0.0:42655", "[::]:42655", "*:42655"] {
+        assert!(
+            matches!(
+                parse_bind_probe(
+                    &format!("TUNNEL_LISTEN={addr}\nTUNNEL_PROBE=done\n"),
+                    42655
+                ),
+                BindProbe::Listening { .. }
+            ),
+            "wildcard listener {addr} must verify"
+        );
+    }
+    // v4-mapped loopback.
+    assert!(matches!(
+        parse_bind_probe(
+            "TUNNEL_LISTEN=[::ffff:127.0.0.1]:42655\nTUNNEL_PROBE=done\n",
+            42655
+        ),
+        BindProbe::Listening { .. }
+    ));
+}
+
+/// `parse_bind_probe` definite-miss + filtering: probe ran with no
+/// listener ⇒ `NotListening`; a NON-loopback listener (the colliding
+/// squatter itself on a LAN address) and wrong-port lines must NOT be
+/// mistaken for the tunnel.
+#[test]
+fn parse_bind_probe_definite_miss_and_squatter_filtering() {
+    // Probe ran, nothing bound — the production flake's worker state.
+    assert_eq!(
+        parse_bind_probe("TUNNEL_PROBE=done\r\n", 42655),
+        BindProbe::NotListening
+    );
+    // A LAN-address squatter on the tunnel port is NOT dialable over
+    // loopback — must stay a definite miss.
+    assert_eq!(
+        parse_bind_probe(
+            "TUNNEL_LISTEN=10.0.0.5:42655\nTUNNEL_PROBE=done\n",
+            42655
+        ),
+        BindProbe::NotListening
+    );
+    // Defensive: a listener on a DIFFERENT port never verifies this one.
+    assert_eq!(
+        parse_bind_probe(
+            "TUNNEL_LISTEN=127.0.0.1:42656\nTUNNEL_PROBE=done\n",
+            42655
+        ),
+        BindProbe::NotListening
+    );
+}
+
+/// `parse_bind_probe` inconclusive shapes: `ss` missing and
+/// marker-less output (probe ssh died first) both refuse a verdict —
+/// the caller keeps the gate-verified tunnel instead of killing it on
+/// probe-infrastructure failure.
+#[test]
+fn parse_bind_probe_inconclusive_on_missing_tool_or_marker() {
+    match parse_bind_probe("TUNNEL_PROBE=no-ss\r\n", 42655) {
+        BindProbe::Inconclusive { reason } => {
+            assert!(reason.contains("ss"), "reason names the missing tool: {reason}")
+        }
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+    match parse_bind_probe("Permission denied\r\n", 42655) {
+        BindProbe::Inconclusive { reason } => assert!(
+            reason.contains("no probe marker"),
+            "reason names the absent marker: {reason}"
+        ),
+        other => panic!("expected Inconclusive, got {other:?}"),
+    }
+}
+
+/// Spawner release semantics: the cohort/respawn spawner
+/// (`OnRetry`) keeps the FIRST attempt release-free (a fresh port,
+/// no round-trip tax on the healthy path) and releases on every
+/// RETRY (the prior attempt failed, so the worker may still hold the
+/// fixed port — partial bind leftover, stale forward, or the
+/// squatter); the observer-reconnect spawner (`Always`) releases on
+/// every attempt.
+#[test]
+fn release_before_attempt_modes() {
+    assert!(!release_before_attempt(ReleaseBeforeSpawn::OnRetry, 0));
+    assert!(release_before_attempt(ReleaseBeforeSpawn::OnRetry, 1));
+    assert!(release_before_attempt(ReleaseBeforeSpawn::OnRetry, 2));
+    assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 0));
+    assert!(release_before_attempt(ReleaseBeforeSpawn::Always, 1));
 }
