@@ -45,6 +45,20 @@ pub enum WorkerEvent<I: Identifier> {
         worker_id: WorkerId,
         generation: u64,
     },
+    /// Worker → manager consumer custom message (a non-terminal
+    /// `Response::Custom` observed mid-task). `topic` is the
+    /// consumer routing key; `data` the opaque payload (≤
+    /// `dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES`,
+    /// enforced at the worker API). Generation-stamped like every
+    /// other event so a buffered custom from a replaced subprocess is
+    /// dropped by the stale-event gate instead of reaching the
+    /// consumer listener.
+    CustomMessage {
+        worker_id: WorkerId,
+        generation: u64,
+        topic: String,
+        data: Vec<u8>,
+    },
 }
 
 impl<I: Identifier> WorkerEvent<I> {
@@ -55,7 +69,8 @@ impl<I: Identifier> WorkerEvent<I> {
             | WorkerEvent::TaskCompleted { worker_id, .. }
             | WorkerEvent::Disconnected { worker_id, .. }
             | WorkerEvent::PhaseUpdate { worker_id, .. }
-            | WorkerEvent::Keepalive { worker_id, .. } => *worker_id,
+            | WorkerEvent::Keepalive { worker_id, .. }
+            | WorkerEvent::CustomMessage { worker_id, .. } => *worker_id,
         }
     }
 
@@ -68,7 +83,8 @@ impl<I: Identifier> WorkerEvent<I> {
             | WorkerEvent::TaskCompleted { generation, .. }
             | WorkerEvent::Disconnected { generation, .. }
             | WorkerEvent::PhaseUpdate { generation, .. }
-            | WorkerEvent::Keepalive { generation, .. } => *generation,
+            | WorkerEvent::Keepalive { generation, .. }
+            | WorkerEvent::CustomMessage { generation, .. } => *generation,
         }
     }
 }
