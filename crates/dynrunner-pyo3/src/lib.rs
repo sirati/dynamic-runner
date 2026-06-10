@@ -20,6 +20,7 @@ mod system_resources;
 mod task_completed_bridge;
 mod task_def;
 mod transport;
+mod worker_message_bridge;
 
 use config::distributed::DistributedConfig;
 use config::local_manager::PyLocalManagerConfig;
@@ -92,6 +93,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PyPrimaryHandle>()?;
+    m.add_class::<managers::secondary_handle::PySecondaryHandle>()?;
     m.add_class::<PyMultiProcessSpawner>()?;
     m.add_class::<PyRustSlurmJobManager>()?;
     m.add_class::<slurm::respawn_bridge::PySlurmSpawner>()?;
@@ -124,6 +126,16 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "PUBLISH_STRING_MAX_BYTES",
         dynrunner_core::INLINE_VALUE_HARD_CAP_BYTES,
+    )?;
+    // API-level hard cap on one worker↔secondary custom-message
+    // payload (100 KiB, both directions). Python `Task.send_message`
+    // and `SecondaryHandle.send_to_worker` reject larger payloads up
+    // front with a ValueError naming this limit; Rust owns the number
+    // (see `dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES`),
+    // Python only reads it. Mirrors PUBLISH_STRING_MAX_BYTES.
+    m.add(
+        "CUSTOM_MESSAGE_MAX_BYTES",
+        dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES,
     )?;
     m.add_function(wrap_pyfunction!(
         slurm::wrapper_script::generate_wrapper_script,
