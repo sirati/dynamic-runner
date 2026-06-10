@@ -641,6 +641,17 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
 
+    /// When the heartbeat tick LAST ran — the tick's own clock, owned by
+    /// the liveness module (`primary::heartbeat`). The dead-secondary
+    /// declaration reads the inter-tick gap as its local-starvation
+    /// guard: a gap far beyond the keepalive cadence means THIS node's
+    /// runtime was frozen/starved for the interim, so every silence age
+    /// it would measure is inflated by its own stall — declaring
+    /// removals off that sweep would author deaths of live peers. One
+    /// lagged tick defers the hard declarations to the NEXT (on-cadence)
+    /// tick, by which time the ingest/processing clocks have refreshed.
+    pub(super) last_heartbeat_tick_at: Option<Instant>,
+
     /// Per-secondary count of staged silence WARN stages already logged
     /// for the secondary's CURRENT silence streak. Owned by the liveness
     /// module (`primary::heartbeat`); the heartbeat tick reads it to fire
@@ -1255,6 +1266,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
+            last_heartbeat_tick_at: None,
             silence_warn_stage: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,

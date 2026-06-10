@@ -297,6 +297,7 @@ async fn panik_file_source_broadcasts_and_returns_terminal_panik() {
                         if let ClusterMutation::PeerRemoved {
                             id,
                             cause: RemovalCause::SelfDeparture(reason),
+                            member_gen: _,
                         } = mutation
                         {
                             assert_eq!(

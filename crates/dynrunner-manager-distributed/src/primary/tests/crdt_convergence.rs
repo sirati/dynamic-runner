@@ -112,6 +112,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                         is_observer: false,
                         can_be_primary: false,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     });
                     cs.apply(ClusterMutation::SecondaryCapacity {
                         secondary: id.into(),
@@ -160,6 +161,7 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
                     is_observer: false,
                     can_be_primary: true,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "sec-0".into(),
@@ -261,16 +263,19 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
                     is_observer: false,
                     can_be_primary: false,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::PeerJoined {
                     peer_id: "sec-gone".into(),
                     is_observer: false,
                     can_be_primary: false,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::PeerRemoved {
                     id: "sec-gone".into(),
                     cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
                 });
             }
             // Precondition: the 2P-set holds sec-gone as the ONLY Departed
@@ -297,6 +302,7 @@ async fn rebroadcast_full_roster_reemits_departed_tombstones() {
                     ClusterMutation::PeerRemoved {
                         id,
                         cause: RemovalCause::RosterReemit,
+                        member_gen: _,
                     } => Some(id.as_str()),
                     _ => None,
                 })

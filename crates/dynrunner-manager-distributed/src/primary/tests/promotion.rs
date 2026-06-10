@@ -1942,6 +1942,7 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                     is_observer: false,
                     can_be_primary: true,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "secondary-1".into(),
@@ -1955,6 +1956,7 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                     is_observer: false,
                     can_be_primary: true,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "secondary-2".into(),
@@ -1970,6 +1972,7 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                     is_observer: false,
                     can_be_primary: true,
                     cap_version: Default::default(),
+                    member_gen: 0,
                 });
                 cs.apply(ClusterMutation::SecondaryCapacity {
                     secondary: "secondary-0".into(),
@@ -1980,6 +1983,7 @@ async fn promoted_mesh_ready_expected_excludes_self_and_departed_primary() {
                     id: "secondary-0".into(),
                     cause:
                         dynrunner_protocol_primary_secondary::RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
                 });
             }
 

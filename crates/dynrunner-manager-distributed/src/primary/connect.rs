@@ -181,6 +181,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         msg: DistributedMessage<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
+        // RE-ADMISSION seam (BEFORE the heartbeat bump, so a re-admitted
+        // sender's triggering frame lands in its restored death clock): a
+        // frame from a member the replicated ledger holds REMOVED is
+        // proof of life — re-admit it at the next membership generation.
+        // No-op for live / never-joined / self senders. See
+        // `primary::readmission`.
+        self.maybe_readmit_sender(&msg).await;
+
         // Every cross-secondary message bumps the per-secondary heartbeat,
         // not just `Keepalive`. A secondary that's actively processing
         // tasks shouldn't be falsely declared dead just because keepalives
@@ -529,6 +537,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     // Stamped at the origination choke point
                     // (`apply_locally_for_broadcast` → `stamp_versions`).
                     cap_version: Default::default(),
+                    // The id's CURRENT membership incarnation (0 for a
+                    // fresh id; a welcome from a just-re-admitted id
+                    // carries the bumped generation the dispatch
+                    // preamble's re-admission seam already applied, so
+                    // this join is the idempotent NoOp echo).
+                    member_gen: self.cluster_state.peer_member_gen(&secondary_id),
                 },
                 ClusterMutation::SecondaryCapacity {
                     secondary: secondary_id.clone(),

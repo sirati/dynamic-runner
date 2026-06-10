@@ -1577,6 +1577,7 @@ async fn peer_digests_pruned_on_peer_removed() {
                 vec![ClusterMutation::PeerRemoved {
                     id: "departing-sec".to_string(),
                     cause: RemovalCause::KeepaliveMiss,
+                    member_gen: 0,
                 }],
                 &mut primary_last_seen,
             );

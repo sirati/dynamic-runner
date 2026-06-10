@@ -872,6 +872,7 @@ fn seed_member<S, E>(
         is_observer,
         can_be_primary,
         cap_version: Default::default(),
+        member_gen: 0,
     });
     cs.apply(ClusterMutation::SecondaryCapacity {
         secondary: id.into(),

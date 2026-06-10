@@ -67,6 +67,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
             is_observer: true,
             can_be_primary: false,
             cap_version: Default::default(),
+            member_gen: 0,
         },
     );
     let mut alive_members = HashSet::new();
@@ -93,6 +94,7 @@ fn make_synthetic_snapshot() -> crate::cluster_state::ClusterStateSnapshot<TestI
         phases_ended: HashSet::new(),
         custom_messages: HashMap::new(),
         custom_terminal_watermarks: HashMap::new(),
+        member_generations: HashMap::new(),
     }
 }
 

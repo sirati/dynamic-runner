@@ -57,8 +57,9 @@ pub(crate) use broadcast::{AppliedBatch, apply_locally_for_broadcast};
 pub use snapshot::ClusterStateSnapshot;
 pub use state::ClusterState;
 pub use types::{
-    ApplyOutcome, CapabilityEntry, CustomMsgState, OutcomeSummary, PhaseRollup, PhaseTally,
-    PhaseTaskPartition, RespawnEventRecord, RoleChangeHook, StateCounts, TaskState,
+    ApplyOutcome, CapabilityEntry, CustomMsgState, OutcomeSummary, PeerMembership,
+    PeerReadmission, PhaseRollup, PhaseTally, PhaseTaskPartition, RespawnEventRecord,
+    RoleChangeHook, StateCounts, TaskState,
 };
 // `DiscoveryDebt` is the wire-format value type for the discovery-debt
 // field; it lives in the protocol crate (it crosses the wire inside

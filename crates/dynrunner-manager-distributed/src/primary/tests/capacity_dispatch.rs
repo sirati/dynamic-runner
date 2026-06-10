@@ -78,6 +78,7 @@ fn capacity_batch(secondary: &str, n: u32) -> DistributedMessage<TestId> {
                 is_observer: false,
                 can_be_primary: true,
                 cap_version: Default::default(),
+                member_gen: 0,
             },
             ClusterMutation::SecondaryCapacity {
                 secondary: secondary.into(),
@@ -306,6 +307,7 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
                         is_observer: false,
                         can_be_primary: true,
                         cap_version: Default::default(),
+                        member_gen: 0,
                     },
                     ClusterMutation::SecondaryCapacity {
                         secondary: "sec-0".into(),

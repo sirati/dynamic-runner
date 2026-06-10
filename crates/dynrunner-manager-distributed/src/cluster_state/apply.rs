@@ -575,13 +575,16 @@ impl<I: Identifier> ClusterState<I> {
                 is_observer,
                 can_be_primary,
                 cap_version,
-            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary, cap_version),
+                member_gen,
+            } => self.apply_peer_joined(peer_id, is_observer, can_be_primary, cap_version, member_gen),
             ClusterMutation::SetCanBePrimary {
                 peer_id,
                 can_be_primary,
                 cap_version,
             } => self.apply_set_can_be_primary(peer_id, can_be_primary, cap_version),
-            ClusterMutation::PeerRemoved { id, cause } => self.apply_peer_removed(id, cause),
+            ClusterMutation::PeerRemoved { id, cause, member_gen } => {
+                self.apply_peer_removed(id, cause, member_gen)
+            }
             ClusterMutation::PeerResourceHoldingsUpdated {
                 peer_id,
                 holdings,
