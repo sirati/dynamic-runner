@@ -222,7 +222,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// - `NoRelocationTarget` → `RunAborted` (`run_pipeline`'s SetupPeer
     ///   arm): NO peer advertised `can_be_primary`, so an election can
     ///   never produce a primary — without the verdict the connected
-    ///   non-promotable fleet idles into its timeouts.
+    ///   non-promotable fleet idles into its timeouts;
+    /// - graceful-abort full drain → `RunComplete` WITH the replicated
+    ///   `graceful_abort_requested` latch already set
+    ///   (`finalize_terminal_accounting`'s graceful branch): the COMPOSED
+    ///   pair of sticky facts is the graceful-abort verdict every node
+    ///   derives — deliberately NO third terminal mutation, and never
+    ///   `RunAborted` (nothing failed; the frozen pool residue is not a
+    ///   strand).
     ///
     /// NO VERDICT (failover's jurisdiction, or unreachable):
     /// - panik (`PanikShutdown`): operator killed THIS node, not the run —

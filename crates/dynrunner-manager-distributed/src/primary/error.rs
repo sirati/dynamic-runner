@@ -139,6 +139,26 @@ pub enum RunError {
         /// message; the count is the authoritative signal).
         rejected_task_ids: Vec<String>,
     },
+    /// The run ended via the operator's GRACEFUL abort — the observer's
+    /// `GracefulAbortRequest` latched the replicated dispatch freeze, the
+    /// in-flight work ran to completion, the fleet drained, and the
+    /// primary broadcast `RunComplete` with the latch set (the composed
+    /// graceful-abort verdict every node derives). NOT a failure in the
+    /// collapse sense — nothing was stranded by a routing fault; the
+    /// `unscheduled` tasks were DELIBERATELY left unrun — and NOT a clean
+    /// success either (planned work was deliberately skipped). A
+    /// structured variant so the boundary maps it to its own
+    /// `RunTerminal::GracefulAbort` (reported distinctly, exits clean)
+    /// rather than the `ClusterCollapsed` mis-diagnosis or a silent
+    /// `Ok`-as-success.
+    GracefulAbort {
+        /// Tasks deliberately left without a terminal when the fleet
+        /// drained (the frozen ready-pool residue). May be 0 when the
+        /// abort landed after the last task had already been dispatched.
+        unscheduled: usize,
+        /// The per-class outcome breakdown at drain time.
+        outcome: OutcomeSummary,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     ///
@@ -231,6 +251,21 @@ impl fmt::Display for RunError {
                     shown.join(", ")
                 )
             }
+            Self::GracefulAbort {
+                unscheduled,
+                outcome,
+            } => write!(
+                f,
+                "run gracefully aborted by operator request: dispatch was \
+                 frozen, running tasks completed, and the fleet drained \
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
+                 skipped={sk} deliberately-unscheduled={unscheduled})",
+                s = outcome.succeeded,
+                r = outcome.fail_retry,
+                o = outcome.fail_oom,
+                fi = outcome.fail_final,
+                sk = outcome.skipped,
+            ),
             Self::Other(msg) => f.write_str(msg),
         }
     }

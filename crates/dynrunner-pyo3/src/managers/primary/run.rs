@@ -644,6 +644,13 @@ impl PyPrimaryCoordinator {
 
                 match outcome.terminal {
                     RunTerminal::Done => {}
+                    RunTerminal::GracefulAbort { reason } => {
+                        // Operator-requested graceful abort ran its drain
+                        // protocol to the end. A DELIBERATE clean wind-down:
+                        // reported loudly (distinct from a silent success),
+                        // exits 0 (distinct from the hard-abort raise).
+                        tracing::warn!(verdict = %reason, "run gracefully aborted");
+                    }
                     RunTerminal::Aborted { reason } => {
                         // Cluster-wide `RunAborted` (#3a pre-phase duplicate),
                         // observed by a relocated submitter-observer tail.
@@ -687,6 +694,14 @@ impl PyPrimaryCoordinator {
                                 // silent stay-local is exactly what this errors
                                 // out instead of.
                                 no_relocation_target = Some(e);
+                            }
+                            RunError::GracefulAbort { .. } => {
+                                // Unreachable in practice: `Node::run` maps a
+                                // primary's GracefulAbort onto its OWN
+                                // `RunTerminal::GracefulAbort` (handled
+                                // above), never `Failed`. Defensive: treat as
+                                // the graceful verdict (logged above by the
+                                // `error = %error` line), never a raise.
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow

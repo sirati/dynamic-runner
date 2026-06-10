@@ -920,6 +920,14 @@ impl PySecondaryCoordinator {
                         tracing::info!("secondary node finished successfully");
                         Ok(SecondaryRunOutcome::Done(completed))
                     }
+                    RunTerminal::GracefulAbort { reason } => {
+                        // A graceful-abort drain terminal can surface here
+                        // only via a same-node PROMOTED primary's verdict
+                        // (a plain draining secondary exits `Done`). A
+                        // deliberate clean wind-down: report loudly, exit 0.
+                        tracing::warn!(verdict = %reason, "run gracefully aborted");
+                        Ok(SecondaryRunOutcome::Done(completed))
+                    }
                     RunTerminal::Panik { matched_path } => {
                         tracing::error!(
                             matched_path = %matched_path.display(),
