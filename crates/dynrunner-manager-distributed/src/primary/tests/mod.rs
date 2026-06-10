@@ -22,6 +22,7 @@ mod capacity_dispatch;
 mod coordinator_setup;
 mod crdt_convergence;
 mod custom_messages;
+mod deposed_standdown;
 mod dispatch_decoupling;
 mod e2e;
 mod hydrate;

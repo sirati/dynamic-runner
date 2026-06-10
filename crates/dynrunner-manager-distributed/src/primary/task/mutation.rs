@@ -371,6 +371,70 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         true
     }
 
+    /// Ingest the anti-entropy `ClusterSnapshot` pull-reply on the
+    /// primary.
+    ///
+    /// Single concern: the snapshot-restore edge of the primary's
+    /// anti-entropy receive side. [`Self::handle_state_digest`] REQUESTS a
+    /// snapshot whenever a peer's digest proves this node behind (a higher
+    /// `primary_epoch`, a latched run verdict, missing task terminals, …);
+    /// this arm ingests the reply. Pre-fix the primary's
+    /// `dispatch_message` had NO arm for it — the reply fell through the
+    /// unhandled-type catch-all, so the pull could never converge: a
+    /// DEPOSED primary starved of direct `PrimaryChanged` announcements
+    /// (the dead-leg topology) kept authoring forever even when a peer's
+    /// digest told it the cluster had moved on (the run_20260610_221140
+    /// zombie split-brain).
+    ///
+    /// `restore` is the idempotent lattice merge: it adopts a
+    /// higher-epoch `(current_primary, primary_epoch)` register (firing
+    /// the role-change hooks — the BUG-6 displaced hook is what demotes a
+    /// zombie out of `run_consuming`), latches the sticky
+    /// `run_complete`/`run_aborted` verdicts (the operational loop's
+    /// stand-down check reads the latter), and union-merges every
+    /// snapshot-healable ledger field. Pool/slot coherence for restored
+    /// task terminals is NOT re-derived here wholesale — the live
+    /// convergence seams (`settle_local_state_on_crdt_terminal` via the
+    /// mutation ingest + the inherited-slot terminal veto) cover the
+    /// per-task residue, and a restore that deposes this primary drops
+    /// the whole pipeline anyway.
+    ///
+    /// Mirrors the secondary's `restore_cluster_snapshot_frame` decode
+    /// shape: a malformed snapshot is WARN-dropped (the next digest round
+    /// re-triggers the pull).
+    pub(crate) fn handle_cluster_snapshot(&mut self, msg: DistributedMessage<I>) {
+        let DistributedMessage::ClusterSnapshot {
+            target: None,
+            sender_id,
+            snapshot_json,
+            ..
+        } = msg
+        else {
+            return;
+        };
+        match serde_json::from_str::<crate::cluster_state::ClusterStateSnapshot<I>>(&snapshot_json)
+        {
+            Ok(snap) => {
+                self.cluster_state.restore(snap);
+                tracing::info!(
+                    peer = %sender_id,
+                    primary_epoch = self.cluster_state.primary_epoch(),
+                    run_aborted = self.cluster_state.run_aborted().is_some(),
+                    "anti-entropy: restored ClusterSnapshot pulled from peer"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    peer = %sender_id,
+                    error = %e,
+                    "ClusterSnapshot decode failed on the primary's \
+                     anti-entropy sink; dropped a malformed snapshot (the \
+                     next digest round re-triggers the pull)"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn handle_cluster_mutation(
         &mut self,
         msg: DistributedMessage<I>,

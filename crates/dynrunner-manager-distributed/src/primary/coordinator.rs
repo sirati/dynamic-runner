@@ -3994,6 +3994,64 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         self.drain_pending_messages(Duration::from_millis(500))
             .await?;
 
+        // ── Run-authority verdict gates (zombie split-brain,
+        // run_20260610_221140) ──
+        //
+        // Placed AFTER the drain so the freshest replicated facts — a
+        // RunAborted mutation or a PrimaryChanged announcement still
+        // sitting in the inbox at loop exit — are ingested before any
+        // verdict is authored. Both gates fire BEFORE the broadcast
+        // ladder below: a node that fails either one authors NO verdict
+        // and never reaches the caller's "primary finished" log.
+        //
+        // Gate 1 — verdict adoption: the replicated `run_aborted` latch
+        // is sticky and, at this point, FOREIGN by construction (every
+        // own-abort path — the #3a pre-phase duplicate, the worker-mgmt
+        // fail latch, NoRelocationTarget — returns its structured error
+        // without reaching this finalize; this function's own abort
+        // ladder runs below the gates and returns immediately after
+        // broadcasting). Adopt it: the run is over cluster-wide with the
+        // authoring primary's reason; a second verdict — least of all a
+        // contradictory `RunComplete` — must not be authored.
+        if let Some(reason) = self.cluster_state.run_aborted().map(str::to_owned) {
+            tracing::error!(
+                reason = %reason,
+                "standing down on the cluster's replicated RunAborted \
+                 verdict: adopting it as this node's terminal (no verdict \
+                 of our own is authored)"
+            );
+            return Err(RunError::AbortedByClusterVerdict { reason });
+        }
+        // Gate 2 — primary recognition: the terminal verdict is gated on
+        // holding the CURRENT epoch. A primary the replicated register no
+        // longer names (a higher-epoch holder exists) lost authority; its
+        // local totals are not authoritative and it must not conclude the
+        // run (production: the deposed epoch-2 primary's rc=0 "primary
+        // finished succeeded=165 fail_final=108" against the cluster's
+        // abort verdict). The mid-run stand-down is the BUG-6 demote
+        // signal's jurisdiction (`run_consuming` drops the pipeline);
+        // this gate is the exit-edge backstop for a primary that learned
+        // of its deposition only at (or after) run end — e.g. through the
+        // finalize drain just above. `current_primary() == None` (nobody
+        // ever named) passes: a bootstrap-degenerate lone primary is not
+        // deposed.
+        if let Some(current) = self.cluster_state.current_primary().map(str::to_owned)
+            && current != self.config.node_id
+        {
+            let epoch = self.cluster_state.primary_epoch();
+            tracing::error!(
+                current_primary = %current,
+                epoch,
+                "deposed: the replicated register names another primary — \
+                 authoring NO terminal verdict and exiting without a clean \
+                 finish (this node's totals are not authoritative)"
+            );
+            return Err(RunError::Deposed {
+                current_primary: current,
+                epoch,
+            });
+        }
+
         // Final accounting: any task in `total_tasks` that is neither
         // in `completed_tasks` nor in `failed_tasks` is *stranded* —
         // the run loop exited (transport closed, all secondaries dead,

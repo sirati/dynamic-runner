@@ -246,6 +246,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // only if it is somehow behind (almost always a NoOp on the
             // authoritative primary). See `handle_state_digest`.
             MessageType::StateDigest => self.handle_state_digest(msg).await,
+            // Anti-entropy pull-reply arm. The snapshot this primary's own
+            // `handle_state_digest` requested from a proven-ahead peer.
+            // Pre-fix this fell through the catch-all and the pull never
+            // converged — the deposed-zombie starvation (see
+            // `handle_cluster_snapshot`).
+            MessageType::ClusterSnapshot => self.handle_cluster_snapshot(msg),
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

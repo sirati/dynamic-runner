@@ -1065,6 +1065,16 @@ impl PyDistributedManager {
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
                             }
+                            e @ (RunError::AbortedByClusterVerdict { .. }
+                            | RunError::Deposed { .. }) => {
+                                // Run-authority terminals (zombie split-brain
+                                // fix): an adopted cluster RunAborted verdict,
+                                // or a deposed primary that authored no
+                                // verdict. RAISE — never the `Other` swallow's
+                                // false rc=0 (uniform with
+                                // `PyPrimaryCoordinator::run`).
+                                fatal_policy_exit = Some(e);
+                            }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
                                 // (exit 0) — see `PyPrimaryCoordinator::run`.
