@@ -859,8 +859,8 @@ impl PySecondaryCoordinator {
                     estimator,
                     // SLURM secondary: each process owns its own Python
                     // `PrimaryHandle` command channel, so the promoted primary
-                    // drains it.
-                    command_channel: Some((command_tx, command_rx)),
+                    // drains it (a fresh single-owner take-once cell).
+                    command_channel: promoted_command_channel_cell(command_tx, command_rx),
                     on_phase_start: sec_on_phase_start,
                     on_phase_end: sec_on_phase_end,
                     phase_hook_raise_latch: sec_phase_hook_raise_latch,
@@ -996,6 +996,35 @@ pub(crate) type PromotedCommandChannel = (
     tokio::sync::mpsc::Receiver<dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>>,
 );
 
+/// Shared take-once cell carrying the process's ONE Python `PrimaryHandle`
+/// command channel to whichever promoted primary fires first.
+///
+/// Single concern: the command channel must be serviced by whichever
+/// coordinator holds primary AUTHORITY. A SLURM secondary process owns its
+/// own channel, so its single recipe gets a cell holding that pair. The
+/// in-process `--multi-computer single-process` manager has N promotable
+/// secondaries but ONE Python handle — every recipe clones the SAME cell and
+/// the one that actually promotes takes the pair (`lock().take()`); the rest
+/// (and any hypothetical later re-promotion) find it empty and keep the
+/// internal channel `PrimaryCoordinator::new` minted, surfacing the handle's
+/// commands as channel-closed once the first promoted primary ends.
+pub(crate) type SharedPromotedCommandChannel =
+    std::sync::Arc<std::sync::Mutex<Option<PromotedCommandChannel>>>;
+
+/// Wrap a freshly-taken `(command_tx, command_rx)` pair into the take-once
+/// cell every promote recipe consumes. The single constructor keeps both
+/// callers (SLURM secondary, in-process distributed manager) on one shape.
+pub(crate) fn promoted_command_channel_cell(
+    tx: tokio::sync::mpsc::Sender<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+    rx: tokio::sync::mpsc::Receiver<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+) -> SharedPromotedCommandChannel {
+    std::sync::Arc::new(std::sync::Mutex::new(Some((tx, rx))))
+}
+
 /// Node-local context for firing `on_run_start` on the PROMOTED primary.
 ///
 /// Single concern: "what does the relocated primary hand the consumer's
@@ -1044,17 +1073,20 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     pub oom_retry_max_passes: u32,
     pub scheduler_config: SchedulerConfig,
     pub estimator: PyMemoryEstimatorBridge,
-    /// The Python `PrimaryHandle`'s command channel ends, iff this node's
-    /// promoted primary should drain externally-issued `spawn_tasks`/`reinject`
-    /// from a Python handle (the SLURM secondary path: each secondary process
-    /// owns its own handle). Moved into the promoted primary via
-    /// `replace_command_channel` on the single recipe fire. `None` on the
-    /// in-process `--multi-computer local` path: the ONE Python handle is held
-    /// by the setup peer (the bootstrap primary), so the promoted in-process
-    /// primary keeps the internal command channel `PrimaryCoordinator::new`
-    /// minted — the run loop is fully driven; only runtime `spawn_tasks` via
-    /// that one Python handle does not re-route to the relocated primary.
-    pub command_channel: Option<PromotedCommandChannel>,
+    /// Take-once cell carrying the Python `PrimaryHandle`'s command channel
+    /// ends so the promoted primary drains externally-issued
+    /// `spawn_tasks`/`reinject` from the Python handle. Taken
+    /// (`lock().take()`) on the single recipe fire and moved into the
+    /// promoted primary via `replace_command_channel`. The SLURM secondary
+    /// path owns its own pair (one cell per process); the in-process
+    /// `--multi-computer single-process` manager clones ONE cell across all
+    /// its promotable secondaries' recipes, so the channel follows whichever
+    /// node actually wins the relocation — the consumer's lazy-injection
+    /// pattern (`on_phase_end → primary_handle.spawn_tasks`) reaches the live
+    /// authority instead of the demoted setup peer's dropped receiver. An
+    /// empty cell (a hypothetical second promotion) keeps the internal
+    /// channel `PrimaryCoordinator::new` minted.
+    pub command_channel: SharedPromotedCommandChannel,
     /// The phase-lifecycle callbacks the PROMOTED primary fires (it owns the
     /// phase machine; the secondary does not — R4 seam). Routed through
     /// `PrimaryRunArgs` (the channel `run_pipeline` actually reads) so they
@@ -1275,11 +1307,12 @@ pub(crate) fn build_promoted_primary_recipe(
     // promoted primary spawns its OWN dedicated-thread liveness beacon from
     // this book. `take`-n in the closure like `liveness_ping_rx`.
     let mut peer_liveness_addrs = peer_liveness_addrs;
-    // Single-use pieces captured in Options so the FnMut can take them on its
-    // one invocation (a node promotes at most once per lifetime). The command
-    // channel is already an `Option` (it is `None` on the in-process path,
-    // where the promoted primary keeps the internal channel `new` minted).
-    let mut command_channel = command_channel;
+    // The command channel rides in a shared take-once cell (see
+    // `SharedPromotedCommandChannel`): the recipe `lock().take()`s it on its
+    // single fire, so the in-process manager can offer ONE Python channel to
+    // every promotable secondary's recipe and the actual relocate winner
+    // claims it.
+    let command_channel = command_channel;
     // The phase callbacks are routed through `PrimaryRunArgs` (the channel
     // `run_pipeline` reads — the bug-D clobber fix) rather than the dead
     // `register_phase_lifecycle_callbacks`. Captured in an `Option` so the
@@ -1356,9 +1389,22 @@ pub(crate) fn build_promoted_primary_recipe(
         );
         // Transfer the Python `PrimaryHandle`'s command channel so an
         // externally-issued `spawn_tasks` / `reinject` (e.g. from a promoted
-        // node's `on_phase_end`) reaches THIS primary's command loop.
-        if let Some((tx, rx)) = command_channel.take() {
-            primary.replace_command_channel(tx, rx);
+        // node's `on_phase_end`) reaches THIS primary's command loop. The
+        // take-once cell is shared across every candidate recipe in the
+        // process; the promotion that fires first claims the pair. Empty ⇒
+        // a second promotion in the same process — keep the internal channel
+        // and say so (the Python handle died with the first promoted primary).
+        match command_channel
+            .lock()
+            .expect("promoted command-channel cell poisoned")
+            .take()
+        {
+            Some((tx, rx)) => primary.replace_command_channel(tx, rx),
+            None => tracing::warn!(
+                "promoted primary: Python command channel already claimed by a \
+                 prior promotion in this process; keeping the internal channel \
+                 (PrimaryHandle commands will surface channel-closed)"
+            ),
         }
         // Hand the node-bound liveness-beacon ping receiver to THIS promoted
         // primary so its operational loop folds beacon datagrams into the
@@ -2461,7 +2507,7 @@ task = Task()
                 oom_retry_max_passes: 0,
                 scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
                 estimator,
-                command_channel: Some((tx, rx)),
+                command_channel: promoted_command_channel_cell(tx, rx),
                 on_phase_start,
                 on_phase_end,
                 phase_hook_raise_latch: raise_latch.clone(),
@@ -2559,7 +2605,7 @@ task = Task()
                 oom_retry_max_passes: 0,
                 scheduler_config: crate::config::scheduler::SchedulerConfig::default(),
                 estimator,
-                command_channel: Some((tx, rx)),
+                command_channel: promoted_command_channel_cell(tx, rx),
                 on_phase_start,
                 on_phase_end,
                 phase_hook_raise_latch: raise_latch,
