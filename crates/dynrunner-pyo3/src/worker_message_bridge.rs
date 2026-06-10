@@ -248,8 +248,8 @@ mod tests {
     }
 
     /// Oversize reply via the handle raises `ValueError` naming size
-    /// + limit (the call-site enforcement contract), and the raise is
-    /// swallowed by the bridge (dispatcher stays alive).
+    /// and limit (the call-site enforcement contract), and the raise
+    /// is swallowed by the bridge (dispatcher stays alive).
     #[test]
     fn handle_send_to_worker_rejects_oversize_with_valueerror() {
         let (handle, mut rx) = make_handle();
@@ -272,18 +272,65 @@ mod tests {
         assert!(rx.try_recv().is_err(), "nothing queued on oversize");
     }
 
-    /// `send_to_primary` is the documented feature-5 stub: it raises
-    /// `NotImplementedError` (fail-loud seam, never a silent drop).
+    /// `send_to_primary` queues a `SendToPrimary` control command for
+    /// the operational loop (default `important=False`; the kwarg is
+    /// forwarded), and oversize raises `ValueError` naming size +
+    /// limit with nothing queued — the same call-site contract as
+    /// `send_to_worker`.
     #[test]
-    fn handle_send_to_primary_is_a_loud_stub() {
-        let (handle, _rx) = make_handle();
+    fn handle_send_to_primary_queues_control_command() {
+        let (handle, mut rx) = make_handle();
         Python::attach(|py| {
             let bound = handle.bind(py);
-            let err = bound
+            bound
                 .call_method1("send_to_primary", ("t", PyBytes::new(py, b"d")))
-                .expect_err("stub must raise");
-            assert!(err.is_instance_of::<pyo3::exceptions::PyNotImplementedError>(py));
+                .expect("droppable send queues");
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("important", true).unwrap();
+            bound
+                .call_method("send_to_primary", ("u", PyBytes::new(py, b"e")), Some(&kwargs))
+                .expect("important send queues");
         });
+        match rx.try_recv().expect("droppable command queued") {
+            SecondaryControlCommand::SendToPrimary {
+                topic,
+                data,
+                important,
+            } => {
+                assert_eq!(topic, "t");
+                assert_eq!(data, b"d");
+                assert!(!important, "default delivery class is droppable");
+            }
+            other => panic!("expected SendToPrimary, got {other:?}"),
+        }
+        match rx.try_recv().expect("important command queued") {
+            SecondaryControlCommand::SendToPrimary {
+                topic, important, ..
+            } => {
+                assert_eq!(topic, "u");
+                assert!(important, "important kwarg forwarded");
+            }
+            other => panic!("expected SendToPrimary, got {other:?}"),
+        }
+
+        let (handle, mut rx) = make_handle();
+        Python::attach(|py| {
+            let bound = handle.bind(py);
+            let oversize = vec![0u8; dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES + 1];
+            let err = bound
+                .call_method1("send_to_primary", ("big", PyBytes::new(py, &oversize)))
+                .expect_err("oversize must raise");
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            let msg = err.to_string();
+            assert!(msg.contains(&(oversize.len()).to_string()), "names size: {msg}");
+            assert!(
+                msg.contains(
+                    &dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES.to_string()
+                ),
+                "names limit: {msg}"
+            );
+        });
+        assert!(rx.try_recv().is_err(), "nothing queued on oversize");
     }
 
     /// A `PyErr` raised inside the listener is swallowed (logged at
