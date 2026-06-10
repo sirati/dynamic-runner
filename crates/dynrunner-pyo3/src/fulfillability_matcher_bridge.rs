@@ -83,6 +83,19 @@ impl FulfillabilityMatcher<RunnerIdentifier> for PyFulfillabilityMatcher {
         // The pipeline's burst-coalescing keeps the call rate
         // bounded by the number of Unfulfillable tasks, not the
         // holdings-update event volume.
+        //
+        // DEADLOCK INVARIANT: this `Python::attach` runs from a runtime
+        // task on the relocated-primary operational loop. Any
+        // Python-facing blocking wait (`PrimaryHandle::*`,
+        // `block_on(reply.await)`) MUST release the GIL (`py.detach`)
+        // for the duration of its wait — otherwise a GIL-holding Python
+        // caller blocks this attach forever and the loop can never
+        // produce the reply that caller is parked on (the
+        // GIL-vs-attach interlock; see `primary_handle::run_command`
+        // and the `run_command_releases_gil_*` repro). This bridge is
+        // on the matcher pipeline (burst-coalesced, not the per-
+        // dispatch hot path), so its attach shape is left as-is; the
+        // invariant it relies on is enforced on the handle side.
         let outcome: PyResult<bool> = Python::attach(|py| {
             let view = PyTaskInfoView::from_task(hash, task, reason);
             let view_obj = Py::new(py, view)?;

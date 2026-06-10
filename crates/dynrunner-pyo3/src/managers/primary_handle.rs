@@ -228,21 +228,37 @@ impl PyPrimaryHandle {
     /// the reply, translate the inner `Result<(), String>` into PyO3
     /// shape. Centralised so the per-method handlers stay one-liners
     /// and the error-translation rules don't drift.
+    ///
+    /// The blocking `block_on(reply_rx.await)` wait RELEASES the GIL
+    /// (`py.detach`) for its whole duration. This is load-bearing for
+    /// correctness, not an optimisation: when this handle is the
+    /// relocated primary's, the reply is produced by the operational
+    /// loop running on its OWN runtime, and that loop re-enters Python
+    /// via synchronous `Python::attach` (the memory-estimator bridge on
+    /// every dispatch decision; the phase-edge bridges) to make
+    /// progress. A Python thread that called this method while HOLDING
+    /// the GIL would block the loop's `attach` forever — the loop can
+    /// never produce the reply this wait is parked on. Releasing the
+    /// GIL across the wait lets the loop attach, progress, and reply.
+    /// See the `run_command_releases_gil_*` repro test.
     fn run_command(
         &self,
+        py: Python<'_>,
         build: impl FnOnce(oneshot::Sender<Result<(), String>>) -> PrimaryCommand<RunnerIdentifier>,
     ) -> PyResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = build(reply_tx);
         let sender = self.sender.clone();
         let rt = self.rt.clone();
-        let outcome: Result<Result<(), String>, String> = rt.block_on(async move {
-            sender.send(cmd).await.map_err(|_| {
-                "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
-            })?;
-            reply_rx
-                .await
-                .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
+        let outcome: Result<Result<(), String>, String> = py.detach(|| {
+            rt.block_on(async move {
+                sender.send(cmd).await.map_err(|_| {
+                    "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
+                })?;
+                reply_rx
+                    .await
+                    .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
+            })
         });
         match outcome {
             Ok(Ok(())) => Ok(()),
@@ -265,6 +281,7 @@ impl PyPrimaryHandle {
     #[pyo3(signature = (hash, error_kind, reason = None))]
     fn fail_permanent(
         &self,
+        py: Python<'_>,
         hash: &Bound<'_, PyBytes>,
         error_kind: &str,
         reason: Option<String>,
@@ -278,7 +295,7 @@ impl PyPrimaryHandle {
             ))
         })?;
         let reason = reason.unwrap_or_else(|| "fail_permanent via PrimaryHandle".into());
-        self.run_command(move |reply| PrimaryCommand::FailPermanent {
+        self.run_command(py, move |reply| PrimaryCommand::FailPermanent {
             hash: hash_str,
             error,
             reason,
@@ -290,9 +307,9 @@ impl PyPrimaryHandle {
     /// failure class. Returns `Ok(None)` on accept; raises
     /// `PyRuntimeError` on budget exhaustion / wrong-state / unknown
     /// hash.
-    fn reinject_task(&self, hash: &Bound<'_, PyBytes>) -> PyResult<()> {
+    fn reinject_task(&self, py: Python<'_>, hash: &Bound<'_, PyBytes>) -> PyResult<()> {
         let hash_str = bytes_to_hash_string(hash)?;
-        self.run_command(move |reply| PrimaryCommand::ReinjectTask {
+        self.run_command(py, move |reply| PrimaryCommand::ReinjectTask {
             hash: hash_str,
             reply,
         })
@@ -304,11 +321,12 @@ impl PyPrimaryHandle {
     /// unknown hash or channel failure.
     fn update_preferred_secondaries(
         &self,
+        py: Python<'_>,
         hash: &Bound<'_, PyBytes>,
         secondaries: Vec<String>,
     ) -> PyResult<()> {
         let hash_str = bytes_to_hash_string(hash)?;
-        self.run_command(move |reply| PrimaryCommand::UpdatePreferredSecondaries {
+        self.run_command(py, move |reply| PrimaryCommand::UpdatePreferredSecondaries {
             hash: hash_str,
             secondaries,
             reply,
@@ -322,8 +340,13 @@ impl PyPrimaryHandle {
     /// the primary at any time during the run (independent of the
     /// peer's join-time advertisement). Raises `PyRuntimeError` on
     /// channel failure.
-    fn set_can_be_primary(&self, peer_id: String, can_be_primary: bool) -> PyResult<()> {
-        self.run_command(move |reply| PrimaryCommand::SetCanBePrimary {
+    fn set_can_be_primary(
+        &self,
+        py: Python<'_>,
+        peer_id: String,
+        can_be_primary: bool,
+    ) -> PyResult<()> {
+        self.run_command(py, move |reply| PrimaryCommand::SetCanBePrimary {
             peer_id,
             can_be_primary,
             reply,
@@ -672,11 +695,14 @@ mod tests {
         // blocks forever inside `run_command`'s un-detached `block_on`.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<PyResult<()>>();
         let caller = std::thread::spawn(move || {
-            let outcome = Python::attach(|_py| {
+            let outcome = Python::attach(|py| {
                 // GIL is held for the whole closure body — including the
                 // blocking `run_command` wait inside `reinject_task`.
-                let hash = pyo3::types::PyBytes::new(_py, b"0000000000000000");
-                handle.reinject_task(&hash)
+                // After the fix, `run_command` releases the GIL across
+                // its `block_on`, so the attach-needing op-loop can make
+                // progress and reply.
+                let hash = pyo3::types::PyBytes::new(py, b"0000000000000000");
+                handle.reinject_task(py, &hash)
             });
             let _ = done_tx.send(outcome);
             // Keep `handle` alive until the reply is observed; dropping

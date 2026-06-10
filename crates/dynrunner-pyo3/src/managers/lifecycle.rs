@@ -59,6 +59,18 @@ pub(crate) fn make_on_phase_start(
     task_definition: Py<PyAny>,
 ) -> impl FnMut(&PhaseId) + Send + 'static {
     move |phase_id: &PhaseId| {
+        // DEADLOCK INVARIANT: this `Python::attach` runs from a runtime
+        // task on the relocated-primary operational loop (the phase
+        // cascade fires it). Any Python-facing blocking wait
+        // (`PrimaryHandle::*`, `block_on(reply.await)`) MUST release the
+        // GIL (`py.detach`) for the duration of its wait — otherwise a
+        // GIL-holding Python caller blocks this attach forever and the
+        // loop can never produce the reply that caller is parked on (the
+        // GIL-vs-attach interlock; see `primary_handle::run_command` and
+        // the `run_command_releases_gil_*` repro). This is a phase-edge
+        // hook (not the per-dispatch hot path), so its attach shape is
+        // left as-is; the invariant it relies on is enforced on the
+        // handle side.
         Python::attach(|py| {
             if let Err(e) = task_definition
                 .bind(py)
@@ -137,6 +149,18 @@ fn make_on_phase_end_core(
           completed: u32,
           failed: u32,
           phase_outputs: &std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>| {
+        // DEADLOCK INVARIANT: this `Python::attach` runs from a runtime
+        // task on the relocated-primary operational loop (the phase
+        // cascade fires it). Any Python-facing blocking wait
+        // (`PrimaryHandle::*`, `block_on(reply.await)`) MUST release the
+        // GIL (`py.detach`) for the duration of its wait — otherwise a
+        // GIL-holding Python caller blocks this attach forever and the
+        // loop can never produce the reply that caller is parked on (the
+        // GIL-vs-attach interlock; see `primary_handle::run_command` and
+        // the `run_command_releases_gil_*` repro). This is a phase-edge
+        // hook (not the per-dispatch hot path), so its attach shape is
+        // left as-is; the invariant it relies on is enforced on the
+        // handle side.
         Python::attach(|py| {
             let task = task_definition.bind(py);
             let positional = (phase_id.as_str(), completed, failed);
