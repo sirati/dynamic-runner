@@ -434,3 +434,218 @@ async fn recv_peer_drains_buffered_frames_accepted_before_first_poll() {
         })
         .await;
 }
+
+/// #370 transport substrate of the relocation-handoff heal, end-to-end
+/// over real WSS through a flappable TCP proxy (the `-R` tunnel stand-in):
+///
+/// 1. the secondary dials + folds the bootstrap wire and REGISTERS on the
+///    submitter via its first frame (the production SecondaryWelcome);
+/// 2. the "tunnel" FLAPS (both pipe ends cut) — the secondary's
+///    bootstrap-redial supervisor re-dials the SAME fixed address and the
+///    fresh wire re-folds, but the submitter's accept loop holds it
+///    UNIDENTIFIED: submitter broadcasts reach NOBODY (the production
+///    "observer ticks, secondaries receive nothing" wedge shape);
+/// 3. the secondary SPEAKS on the re-folded wire (the setup-phase
+///    anti-entropy digest is exactly this frame in production) — the
+///    accept loop registers `sec-0` off the frame's sender-id, and the
+///    submitter's next broadcast REACHES the secondary again.
+///
+/// This pins the contract the manager-level heal depends on: a re-dialed
+/// wire re-enters the submitter's writer table ONLY via a first inbound
+/// frame, and once it does, broadcast reach is fully restored.
+#[tokio::test(flavor = "current_thread")]
+async fn redialed_bootstrap_wire_reregisters_on_first_frame_and_receives_broadcasts() {
+    use dynrunner_protocol_primary_secondary::StateDigest as WireDigest;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // ── Submitter: unified transport + real accept loops. ──
+            let (mut transport, _outgoing, inbound, registration) =
+                TunneledPeerTransport::<TestId>::new("setup".into());
+            let server: NetworkServer = NetworkServer::bind::<TestId>(
+                "127.0.0.1:0".parse().unwrap(),
+                "setup",
+                inbound,
+                registration,
+            )
+            .await
+            .unwrap();
+            let server_addr: SocketAddr = format!("127.0.0.1:{}", server.port()).parse().unwrap();
+
+            // ── The "tunnel": a TCP proxy whose live pipes the test cuts. ──
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = proxy_listener.local_addr().unwrap();
+            let (pipe_tx, mut pipe_rx) =
+                tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
+            tokio::task::spawn_local(async move {
+                loop {
+                    let Ok((mut downstream, _)) = proxy_listener.accept().await else {
+                        break;
+                    };
+                    let pipe = tokio::task::spawn_local(async move {
+                        let Ok(mut upstream) = tokio::net::TcpStream::connect(server_addr).await
+                        else {
+                            return;
+                        };
+                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    });
+                    let _ = pipe_tx.send(pipe);
+                }
+            });
+
+            // ── Secondary: peer mesh + the bootstrap dial THROUGH the proxy. ──
+            let mut net: crate::PeerNetwork<TestId> =
+                crate::PeerNetwork::start("sec-0", None).await.unwrap();
+            let client = NetworkClient::<TestId>::connect_wss_only(proxy_addr)
+                .await
+                .expect("initial bootstrap dial through the proxy");
+            net.register_primary_link("setup".to_string(), proxy_addr, client);
+            let pipe1 = tokio::time::timeout(Duration::from_secs(5), pipe_rx.recv())
+                .await
+                .expect("the initial dial must traverse the proxy")
+                .expect("proxy alive");
+
+            let welcome: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
+                target: None,
+                sender_id: "sec-0".into(),
+                timestamp: 1.0,
+                secondary_id: "sec-0".into(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+                is_observer: false,
+                can_be_primary: true,
+            };
+            net.send_to_peer("setup", welcome)
+                .await
+                .expect("welcome over the folded wire");
+
+            // The first frame registers the secondary on the submitter.
+            let got = tokio::time::timeout(Duration::from_secs(5), transport.recv_peer())
+                .await
+                .expect("the welcome must reach the submitter")
+                .expect("transport open");
+            assert!(matches!(got, DistributedMessage::SecondaryWelcome { .. }));
+            assert!(
+                PeerTransport::<TestId>::has_peer(&transport, &dynrunner_protocol_primary_secondary::PeerId::from("sec-0")),
+                "the first frame registers the secondary's writer"
+            );
+
+            // Baseline: a submitter broadcast reaches the secondary.
+            let submitter_digest = |ts: f64| DistributedMessage::<TestId>::StateDigest {
+                target: None,
+                sender_id: "setup".into(),
+                timestamp: ts,
+                digest: WireDigest::default(),
+            };
+            transport.broadcast(submitter_digest(1.0)).await.unwrap();
+            let mut baseline = false;
+            for _ in 0..25 {
+                if let Ok(Some(DistributedMessage::StateDigest { sender_id, .. })) =
+                    tokio::time::timeout(Duration::from_millis(200), net.recv_peer()).await
+                    && sender_id == "setup"
+                {
+                    baseline = true;
+                    break;
+                }
+            }
+            assert!(baseline, "pre-flap broadcast must reach the secondary");
+
+            // ── FLAP: cut the live pipe. Both wire ends drop; the
+            // secondary's redial supervisor re-dials the fixed proxy addr. ──
+            pipe1.abort();
+            let _pipe2 = tokio::time::timeout(Duration::from_secs(10), pipe_rx.recv())
+                .await
+                .expect("the secondary must RE-DIAL through the (rebuilt) tunnel")
+                .expect("proxy alive");
+
+            // Post-flap, pre-identification: submitter broadcasts go NOWHERE.
+            // (The first broadcast may also prune the dead pre-flap writer —
+            // the production silent-shrink, now WARN-narrated.)
+            transport.broadcast(submitter_digest(2.0)).await.unwrap();
+            transport.broadcast(submitter_digest(3.0)).await.unwrap();
+            let mut leaked = false;
+            for _ in 0..5 {
+                if let Ok(Some(DistributedMessage::StateDigest { sender_id, .. })) =
+                    tokio::time::timeout(Duration::from_millis(100), net.recv_peer()).await
+                    && sender_id == "setup"
+                {
+                    leaked = true;
+                    break;
+                }
+            }
+            assert!(
+                !leaked,
+                "an unidentified re-dialed wire must not receive submitter \
+                 broadcasts (the accept loop has no writer registered for it)"
+            );
+
+            // ── The heal: the secondary SPEAKS on the re-folded wire (the
+            // setup-phase anti-entropy digest). Retry on a compressed
+            // cadence — the production cadence is the ~20s jittered tick;
+            // the re-fold lands asynchronously via the secondary's own
+            // recv_peer turns, exactly as in production. ──
+            let sec_digest: DistributedMessage<TestId> = DistributedMessage::StateDigest {
+                target: None,
+                sender_id: "sec-0".into(),
+                timestamp: 4.0,
+                digest: WireDigest::default(),
+            };
+            let mut reregistered = false;
+            'outer: for _ in 0..50 {
+                // Drive the secondary's network turn (re-fold arm included).
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(100), net.recv_peer()).await;
+                let _ = net.send_to_peer("setup", sec_digest.clone()).await;
+                // Did the digest land (⇒ the accept loop identified the
+                // wire and registered the fresh writer)?
+                while let Ok(Some(frame)) =
+                    tokio::time::timeout(Duration::from_millis(100), transport.recv_peer()).await
+                {
+                    if matches!(
+                        &frame,
+                        DistributedMessage::StateDigest { sender_id, .. } if sender_id == "sec-0"
+                    ) {
+                        reregistered = true;
+                        break 'outer;
+                    }
+                }
+            }
+            assert!(
+                reregistered,
+                "the secondary's first frame on the re-folded wire must reach \
+                 the submitter and re-register it"
+            );
+            assert!(
+                PeerTransport::<TestId>::has_peer(&transport, &dynrunner_protocol_primary_secondary::PeerId::from("sec-0")),
+                "re-registration restores the writer-table membership"
+            );
+
+            // Reach restored: the submitter's next broadcast arrives.
+            transport.broadcast(submitter_digest(5.0)).await.unwrap();
+            let mut healed = false;
+            for _ in 0..50 {
+                if let Ok(Some(DistributedMessage::StateDigest {
+                    sender_id,
+                    timestamp,
+                    ..
+                })) = tokio::time::timeout(Duration::from_millis(200), net.recv_peer()).await
+                    && sender_id == "setup"
+                    && timestamp == 5.0
+                {
+                    healed = true;
+                    break;
+                }
+            }
+            assert!(
+                healed,
+                "post-re-registration broadcasts must reach the secondary — \
+                 the digest heal's transport substrate is restored"
+            );
+        })
+        .await;
+}
