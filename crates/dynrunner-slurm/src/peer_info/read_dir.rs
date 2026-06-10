@@ -38,15 +38,21 @@ pub enum ReadDirError {
     /// The directory was readable but produced zero v2 records. Either
     /// the dir is empty, contains only non-`*.info` files, or every
     /// `*.info` file is v1 (legacy-URI-only) — none of which carry the
-    /// `(secondary_id, cert, ipv4/ipv6, quic_port)` quad a late-joiner
-    /// needs to dial back into the mesh.
+    /// `(secondary_id, ipv4/ipv6, quic_port)` triple a late-joiner
+    /// needs to dial back into the mesh. `cert_pem_b64` is OPTIONAL in
+    /// the v2 envelope: the production wrapper intentionally omits it
+    /// (`slurm-wrapper/wrapper/src/network.rs`), and a cert-less record
+    /// is still dialable over the WSS/TCP fallback — only the QUIC leg
+    /// of the dial needs the cert (the dialer pins it at handshake).
     #[error(
         "peer-info directory `{dir}` produced no v2 records — \
          either the dir is empty / has no `*.info` files, or every \
          file is legacy v1 (pre-Step-7 wrapper). Late-joiner bootstrap \
-         requires the v2 envelope (`secondary_id`, `cert_pem_b64`, \
-         `quic_port`); re-run the cluster with a Step-7-or-newer SLURM \
-         wrapper, or supply a directory containing v2 records."
+         requires the v2 envelope (`secondary_id`, `quic_port`, and at \
+         least one of `ipv4`/`ipv6`; `cert_pem_b64` is optional — \
+         without it the joiner dials over WSS, not QUIC); re-run the \
+         cluster with a Step-7-or-newer SLURM wrapper, or supply a \
+         directory containing v2 records."
     )]
     NoV2Records { dir: String },
 }
@@ -76,8 +82,8 @@ pub enum ReadDirError {
 ///   A parse failure on any single candidate surfaces a `Parse` error
 ///   — the operator's seed dir is malformed and silently dropping
 ///   would let a typo hide.
-/// - Records with `version == V1` are discarded (no cert / no quic_port,
-///   so the joiner cannot dial them at the QUIC layer). The set of
+/// - Records with `version == V1` are discarded (no quic_port, so the
+///   joiner has no mesh port to dial at all). The set of
 ///   surviving records is returned in directory-enumeration order
 ///   (whatever the OS reports). Ordering is irrelevant to the joiner
 ///   — `join_running_cluster` fans the request to all non-self seeds

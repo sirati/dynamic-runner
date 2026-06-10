@@ -38,6 +38,14 @@ pub(crate) struct PySecondaryCoordinator {
     pub(super) python_executable: PathBuf,
     pub(super) primary_url: String,
     pub(super) secondary_id: String,
+    /// Port this secondary's OWN peer-mesh listeners bind (QUIC UDP +
+    /// WSS TCP, same number). `None` = OS-picked ephemeral (the
+    /// historical behaviour, and the non-SLURM default). Sourced from
+    /// the `--secondary-quic-port` CLI flag: under the SLURM wrapper
+    /// the port was pre-allocated host-side and recorded in the
+    /// late-joiner's `connection_info/<id>.info` file, so the mesh MUST
+    /// bind it or the recorded port is dead for every dialing peer.
+    pub(super) quic_bind_port: Option<u16>,
     pub(super) num_workers: u32,
     pub(super) max_resources: ResourceMap,
     pub(super) source_dir: PathBuf,

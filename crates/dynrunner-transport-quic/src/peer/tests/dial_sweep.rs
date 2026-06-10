@@ -44,7 +44,7 @@ async fn highest_id_sweep_spawns_zero_dials_and_names_awaiting_inbound() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z", None).await.unwrap();
             let summary = net.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
             assert_eq!(
                 summary,
@@ -71,7 +71,7 @@ async fn lowest_id_sweep_spawns_a_dial_per_peer() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
             let summary = net.connect_to_peers_inner(&[pinfo("peer-b"), pinfo("peer-z")]);
             assert_eq!(summary.listed, 2);
             assert_eq!(summary.spawned, 2);
@@ -87,7 +87,7 @@ async fn sweep_skips_self_and_counts_already_connected() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             net.connections.insert("peer-b".to_string(), tx);
             let summary =
@@ -108,7 +108,7 @@ async fn sweep_names_peers_dropped_from_the_authoritative_list() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z", None).await.unwrap();
             net.connect_to_peers_inner(&[pinfo("peer-a"), pinfo("peer-b")]);
             let summary = net.connect_to_peers_inner(&[pinfo("peer-b")]);
             assert_eq!(summary.dropped_from_list, vec!["peer-a".to_string()]);
@@ -143,7 +143,7 @@ async fn higher_id_summary_names_awaiting_inbound_not_dialing() {
         .run_until(async {
             // Self sorts HIGHER than the tracked peer ⇒ this node never
             // dials it.
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("peer-z", None).await.unwrap();
             let info = pinfo("peer-a");
             net.peer_dial_info.insert(info.secondary_id.clone(), info);
 

@@ -60,9 +60,9 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
     local
         .run_until(async {
             // Establish a 3-peer mesh.
-            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
-            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b").await.unwrap();
-            let mut peer_c: PeerNetwork<TestId> = PeerNetwork::start("peer-c").await.unwrap();
+            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
+            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
+            let mut peer_c: PeerNetwork<TestId> = PeerNetwork::start("peer-c", None).await.unwrap();
 
             let peers = vec![
                 PeerConnectionInfo {

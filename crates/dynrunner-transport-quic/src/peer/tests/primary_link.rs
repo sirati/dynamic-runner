@@ -44,7 +44,7 @@ async fn send_to_primary_routes_over_registered_link() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0", None).await.unwrap();
             let (primary_tx, mut primary_rx) = mpsc::unbounded_channel();
             net.connections.insert("primary".to_string(), primary_tx);
 
@@ -77,7 +77,7 @@ async fn folded_primary_is_a_plain_mesh_peer() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0", None).await.unwrap();
 
             // A real peer (registered the ordinary way) AND the folded
             // primary link — both plain connections.

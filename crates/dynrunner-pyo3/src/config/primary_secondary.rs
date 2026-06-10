@@ -144,6 +144,17 @@ pub(crate) struct PySecondaryConfig {
     /// lives entirely in Rust; Python only flips this bool.
     #[pyo3(get, set)]
     pub(crate) memprofile_enabled: bool,
+    /// Port this secondary's OWN peer-mesh listeners bind (QUIC UDP +
+    /// WSS TCP, same number — the `PeerNetwork` convention). `None` =
+    /// OS-picked ephemeral, the historical behaviour and the default
+    /// outside the SLURM wrapper. The Python dispatcher sets it from
+    /// the `--secondary-quic-port` CLI flag (`0` collapses to `None`):
+    /// the SLURM wrapper pre-allocates this port host-side and records
+    /// it as `quic_port=` in the late-joiner's
+    /// `connection_info/<id>.info` file, so the in-container mesh must
+    /// bind exactly it for the recorded port to be dialable.
+    #[pyo3(get, set)]
+    pub(crate) quic_bind_port: Option<u16>,
 }
 
 #[pymethods]
@@ -199,6 +210,7 @@ impl PySecondaryConfig {
         distributed_config = None,
         mem_manager_reserved_bytes = None,
         memprofile_enabled = false,
+        quic_bind_port = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -214,6 +226,7 @@ impl PySecondaryConfig {
         distributed_config: Option<DistributedConfig>,
         mem_manager_reserved_bytes: Option<u64>,
         memprofile_enabled: bool,
+        quic_bind_port: Option<u16>,
     ) -> PyResult<Self> {
         let num_workers = num_workers.unwrap_or_else(detect_num_workers);
         let max_resources = max_resources
@@ -263,6 +276,7 @@ impl PySecondaryConfig {
             distributed_config: distributed_config.unwrap_or_default(),
             mem_manager_reserved_bytes,
             memprofile_enabled,
+            quic_bind_port,
         })
     }
 }

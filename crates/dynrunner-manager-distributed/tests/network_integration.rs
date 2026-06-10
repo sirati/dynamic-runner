@@ -315,7 +315,7 @@ async fn e2e_primary_secondary_over_wss() {
                 // connection (both directions), with no separate uplink
                 // leg. The secondary holds the `PeerNetwork` directly —
                 // exactly the production secondary path.
-                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
+                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id, None)
                     .await
                     .expect("peer network start");
                 peer_network.register_primary_link("setup".to_string(), server_addr, client);
@@ -440,7 +440,7 @@ async fn e2e_primary_secondary_over_quic() {
                 // connection (both directions), with no separate uplink
                 // leg. The secondary holds the `PeerNetwork` directly —
                 // exactly the production secondary path.
-                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id)
+                let mut peer_network = PeerNetwork::<TestId>::start(&config.secondary_id, None)
                     .await
                     .expect("peer network start");
                 peer_network.register_primary_link("setup".to_string(), server_addr, client);

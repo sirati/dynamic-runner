@@ -42,7 +42,7 @@ async fn recv_peer_tick_survives_outer_drop() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
 
             // Pre-arm a fake peer entry so `process_reconnect_tick`
             // has work to do. The fake peer id sorts higher than

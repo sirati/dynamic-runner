@@ -38,6 +38,9 @@ impl PySecondaryCoordinator {
     fn run(&mut self, py: Python<'_>) -> PyResult<()> {
         let primary_url = self.primary_url.clone();
         let secondary_id = self.secondary_id.clone();
+        // The wrapper-pre-allocated mesh bind port (None = ephemeral);
+        // see the field doc on `PySecondaryCoordinator::quic_bind_port`.
+        let quic_bind_port = self.quic_bind_port;
         let num_workers = self.num_workers;
         let max_resources = self.max_resources.clone();
         let estimator = self.estimator.clone();
@@ -367,6 +370,7 @@ impl PySecondaryCoordinator {
                         bootstrap_primary_id: dynrunner_core::SETUP_NODE_ID.to_string(),
                         ipv4_address: Some(advertised_ipv4),
                         ipv6_address: advertised_ipv6.map(|(addr, _)| addr),
+                        quic_bind_port,
                     },
                 )
                 .await
