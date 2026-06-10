@@ -41,6 +41,10 @@ impl QuicConnection {
 impl<I: Identifier> MessageSender<DistributedMessage<I>> for QuicConnection {
     async fn send(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         let frame = codec::serialize_message(&msg)?;
+        // Sender-side wire-limit gate (#366): coherent with the WSS leg
+        // — an oversize frame is rejected loudly here instead of being
+        // rejected (or worse, buffered unboundedly) by the receiver.
+        crate::framing::check_outbound_len(frame.len())?;
         self.send
             .write_all(&frame)
             .await
@@ -52,6 +56,19 @@ impl<I: Identifier> MessageSender<DistributedMessage<I>> for QuicConnection {
 impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for QuicConnection {
     async fn recv(&mut self) -> Option<DistributedMessage<I>> {
         loop {
+            // Receiver-side wire-limit guard (#366): quinn streams have
+            // no per-message cap of their own, so reject an over-limit
+            // announced frame BEFORE accumulating its payload.
+            if let Some(announced) = crate::framing::oversize_announced_len(&self.recv_buf) {
+                tracing::error!(
+                    announced_bytes = announced,
+                    limit_bytes = crate::framing::MAX_WIRE_FRAME_BYTES,
+                    "QUIC peer announced a frame over the wire limit \
+                     (oversize message or corrupt length prefix); \
+                     dropping the connection"
+                );
+                return None;
+            }
             match codec::decode_frame(&self.recv_buf) {
                 Ok(Some((msg, consumed))) => {
                     self.recv_buf.drain(..consumed);
@@ -67,7 +84,14 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for QuicConnection {
                         Err(_) => return None,
                     }
                 }
-                Err(_) => return None,
+                Err(error) => {
+                    tracing::error!(
+                        error,
+                        "QUIC frame failed to decode (corrupt frame); \
+                         dropping the connection"
+                    );
+                    return None;
+                }
             }
         }
     }
@@ -223,5 +247,48 @@ mod tests {
         }
 
         assert_eq!(server_msg.sender_id(), "test");
+    }
+
+    /// The QUIC-leg receiver guard (#366): a frame whose 4-byte length
+    /// prefix announces more than the wire limit must terminate `recv`
+    /// with `None` (loud reject + normal disconnect) BEFORE the
+    /// receiver accumulates the payload — quinn itself has no
+    /// per-message cap, so without the guard a corrupt/oversize prefix
+    /// would buffer without bound.
+    #[tokio::test]
+    async fn quic_oversize_announcement_rejected() {
+        let cert = CertPair::generate("localhost").unwrap();
+        let listener = QuicListener::bind(&cert).await.unwrap();
+        let port = listener.port();
+        let cert_der = cert.cert_der.clone();
+
+        let server_task = async {
+            let mut conn = listener.accept().await.expect("accept failed");
+            MessageReceiver::<DistributedMessage<TestId>>::recv(&mut conn).await
+        };
+
+        let client_task = async {
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let client = connect(addr, "localhost", &cert_der)
+                .await
+                .expect("connect failed");
+            // Bypass the egress gate: write a raw prefix announcing an
+            // over-limit frame (no payload needed — the guard must
+            // fire on the announcement alone).
+            let (mut send, _recv, _buf) = client.into_parts();
+            let announced = (crate::framing::MAX_WIRE_FRAME_BYTES as u32) + 1;
+            send.write_all(&announced.to_be_bytes())
+                .await
+                .expect("prefix write failed");
+            // Keep the stream open so the server's exit is the guard,
+            // not a stream end.
+            (send, _recv)
+        };
+
+        let (received, _client_streams) = tokio::join!(server_task, client_task);
+        assert!(
+            received.is_none(),
+            "an over-limit announced frame must terminate recv with None"
+        );
     }
 }
