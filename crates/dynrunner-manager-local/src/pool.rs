@@ -202,7 +202,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     ///     subgroup, leaving the secondary alive.
     ///
     /// On graceful-fallback conditions (not under cgroup-v2, missing
-    /// memory controller, leaf not writable) the function logs a
+    /// memory controller, leaf not writable, permission/delegation
+    /// refusal during the subgroup writes) the function logs a
     /// `tracing::warn!` line via the [`crate::cgroup`] orchestrator
     /// and proceeds with the flat layout (`workers_cgroup = None`).
     /// Genuine I/O errors propagate as `Err(...)`.
@@ -217,12 +218,14 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     ) -> Result<(), String> {
         // Set up the nested workers cgroup once per pool, BEFORE the
         // spawn loop. If the caller opted out (`None`) or the
-        // environment doesn't support nesting (graceful fallback),
-        // the per-spawn leaf-creation helper returns `None` and the
-        // factory leaves the child in the inherited cgroup (pre-
-        // nested layout, unchanged behaviour). Errors here are I/O-
-        // level (corrupted /proc or sysfs) and bubble up so the
-        // caller can abort the run with a clear cause.
+        // environment doesn't support nesting (graceful fallback,
+        // incl. permission/delegation refusals — classified inside
+        // the cgroup module), the per-spawn leaf-creation helper
+        // returns `None` and the factory leaves the child in the
+        // inherited cgroup (pre-nested layout, unchanged behaviour).
+        // Errors here are genuinely unexpected I/O (corrupted /proc
+        // or sysfs) and bubble up so the caller can abort the run
+        // with a clear cause.
         if let Some(reserved) = mem_manager_reserved_bytes {
             self.workers_cgroup = cgroup::setup_worker_cgroup_default(reserved)
                 .map_err(|e| format!("nested workers cgroup setup failed: {e}"))?;

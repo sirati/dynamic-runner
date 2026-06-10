@@ -16,18 +16,22 @@
 //!     does not error and ends with the same on-disk shape.
 //!
 //! `cgroup_v2_leaf` reads the REAL `/proc/self/cgroup` (we don't
-//! mock /proc), so the tests below DON'T exercise [`super::setup_worker_cgroup`]
+//! mock /proc), so most tests below DON'T exercise [`super::setup_worker_cgroup`]
 //! end-to-end. Instead they call the lower-level
 //! [`super::writer::write_workers_subgroup`] (re-exported into the
 //! test module via `use super::writer`) for the happy-path /
 //! idempotence assertions and exercise the graceful-fallback gates
 //! by directly invoking the predicates.
 //!
-//! Conscious-trade-off: dropping the `/proc/self/cgroup` mock means
-//! the warn-line plumbing in the orchestrator isn't exercised in
-//! unit tests. The orchestrator is six straightforward branches over
-//! the predicate helpers, each itself unit-tested below; the
-//! integration risk is bounded.
+//! Exception: the permission-classification tests
+//! (`setup_worker_cgroup_degrades_on_permission_denied`,
+//! `setup_worker_cgroup_genuine_error_stays_fatal`) DO drive the
+//! public orchestrator end-to-end. `cgroup_v2_leaf` joins the real
+//! `/proc/self/cgroup` relative path onto the injected root, so a
+//! fixture materialised at exactly `<tempdir>/<real-rel-path>` is
+//! what the orchestrator resolves — no /proc mock needed. They skip
+//! (eprintln + return) on hosts without a cgroup-v2 line or when
+//! running as a user that chmod cannot lock out (root).
 
 use super::*;
 use std::path::Path;
@@ -154,6 +158,125 @@ fn leaf_subtree_writable_false_when_missing() {
     std::fs::create_dir_all(&leaf).unwrap();
     // No subtree_control file → open fails → returns false.
     assert!(!super::leaf_subtree_writable(&leaf));
+}
+
+/// Materialise a fixture leaf at the path the REAL
+/// `/proc/self/cgroup` relative path resolves to under the injected
+/// `root`, so [`super::setup_worker_cgroup`] (whose first step is
+/// `cgroup_v2_leaf(root)`) finds it end-to-end. Returns `None` on
+/// hosts without a cgroup-v2 (`0::`) line, in which case the caller
+/// should skip.
+fn make_fake_leaf_at_real_rel_path(root: &Path) -> Option<std::path::PathBuf> {
+    let leaf = super::cgroup_v2_leaf(root)?;
+    std::fs::create_dir_all(&leaf).unwrap();
+    Some(leaf)
+}
+
+#[test]
+fn setup_worker_cgroup_degrades_on_permission_denied() {
+    // The #371 repro shape: every PROBE passes (memory controller
+    // listed, subtree_control file opens for write — file perms allow
+    // it even under a chmod-555 dir), but the WRITE phase hits a real
+    // kernel EACCES (here: `create_dir_all(<leaf>/workers)` against a
+    // read-only directory). The orchestrator must classify the
+    // permission failure and degrade to the flat layout (`Ok(None)`)
+    // exactly like the probe-stage conditions — NOT propagate the
+    // fatal `Err(Io)` the pre-fix code surfaced as "nested workers
+    // cgroup setup failed: cgroup I/O error: Permission denied".
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let Some(leaf) = make_fake_leaf_at_real_rel_path(root.path()) else {
+        eprintln!(
+            "skipping setup_worker_cgroup_degrades_on_permission_denied: \
+             no cgroup-v2 line in /proc/self/cgroup"
+        );
+        return;
+    };
+    write_fixture(&leaf.join("cgroup.controllers"), "cpu memory pids\n");
+    write_fixture(&leaf.join("cgroup.subtree_control"), "");
+    write_fixture(&leaf.join("memory.max"), "1073741824\n");
+
+    // Lock the leaf directory: r-x only, so mkdir inside it returns
+    // EACCES. (Probe files inside stay openable — directory +x allows
+    // traversal and the files' own modes allow the write-open.)
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Root (or CAP_DAC_OVERRIDE) bypasses directory modes; the EACCES
+    // this test depends on never fires there. Detect and skip.
+    if std::fs::create_dir(leaf.join(".dac-override-probe")).is_ok() {
+        std::fs::remove_dir(leaf.join(".dac-override-probe")).unwrap();
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!(
+            "skipping setup_worker_cgroup_degrades_on_permission_denied: \
+             chmod 555 does not lock this user out (root / CAP_DAC_OVERRIDE)"
+        );
+        return;
+    }
+
+    let outcome = super::setup_worker_cgroup(root.path(), 0);
+
+    // Restore perms BEFORE asserting so the tempdir cleans up even on
+    // assertion failure.
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let handle = outcome.expect("permission class must degrade, not propagate as Err");
+    assert!(
+        handle.is_none(),
+        "permission class must degrade to the flat layout (None handle)"
+    );
+    assert!(
+        !leaf.join("workers").exists(),
+        "no workers/ subgroup should have been materialised"
+    );
+}
+
+#[test]
+fn setup_worker_cgroup_genuine_error_stays_fatal() {
+    // A leaf that resolves but is structurally broken (no
+    // `cgroup.controllers` file → ENOENT on a pseudo-file every real
+    // cgroup-v2 dir has) is a genuine anomaly, NOT the
+    // permission/delegation class: it must stay `Err(_)` so the
+    // caller aborts loudly instead of silently running flat on a
+    // corrupted mount.
+    let root = tempfile::tempdir().unwrap();
+    let Some(_leaf) = make_fake_leaf_at_real_rel_path(root.path()) else {
+        eprintln!(
+            "skipping setup_worker_cgroup_genuine_error_stays_fatal: \
+             no cgroup-v2 line in /proc/self/cgroup"
+        );
+        return;
+    };
+    // No fixtures: the bare directory lacks cgroup.controllers.
+
+    let err = super::setup_worker_cgroup(root.path(), 0)
+        .expect_err("missing cgroup.controllers must stay fatal");
+    assert!(matches!(&err, CgroupSetupError::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+    assert!(!err.is_permission_class());
+}
+
+#[test]
+fn permission_class_predicate_classifies_kinds() {
+    use std::io::{Error, ErrorKind};
+
+    // The two kinds the degrade contract names: EACCES/EPERM (both
+    // decode to PermissionDenied) and EROFS.
+    assert!(CgroupSetupError::Io(Error::from(ErrorKind::PermissionDenied)).is_permission_class());
+    assert!(CgroupSetupError::Io(Error::from(ErrorKind::ReadOnlyFilesystem)).is_permission_class());
+    // The probe-stage spelling of the same condition.
+    assert!(CgroupSetupError::NotWritable {
+        leaf: "/x".into()
+    }
+    .is_permission_class());
+
+    // Genuine I/O anomalies and environment-shape variants stay
+    // outside the class (fatal / probe-handled respectively).
+    assert!(!CgroupSetupError::Io(Error::from(ErrorKind::NotFound)).is_permission_class());
+    assert!(!CgroupSetupError::Io(Error::from(ErrorKind::Other)).is_permission_class());
+    assert!(!CgroupSetupError::NotCgroupV2.is_permission_class());
+    assert!(!CgroupSetupError::NoMemoryController {
+        leaf: "/x".into()
+    }
+    .is_permission_class());
 }
 
 #[test]

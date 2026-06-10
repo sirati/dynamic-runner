@@ -63,3 +63,39 @@ pub enum CgroupSetupError {
     #[error("cgroup I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+impl CgroupSetupError {
+    /// Classify whether this failure is the PERMISSION/DELEGATION
+    /// class: the kernel (or VFS) refused a cgroup write because the
+    /// tree is not delegated to the runtime user. This is the
+    /// condition an operator hits on a plain desktop session without
+    /// `Delegate=yes` — the writability PROBE can pass (the leaf's
+    /// `subtree_control` file is user-owned under `user@.service`
+    /// delegation) while a later `mkdir` / `cgroup.procs` migration /
+    /// controller write is still refused with `EACCES`/`EPERM`, or
+    /// the whole mount is read-only (`EROFS`).
+    ///
+    /// SINGLE classification owner: [`super::setup_worker_cgroup`]
+    /// consults this predicate to map the class onto the same
+    /// graceful `Ok(None)` flat-cgroup degradation the probe-stage
+    /// conditions take. Callers never re-classify.
+    ///
+    /// `Io` kinds: `PermissionDenied` covers both `EACCES` and
+    /// `EPERM` (std maps both to that kind); `ReadOnlyFilesystem` is
+    /// `EROFS`. `NotWritable` is the probe-stage spelling of the same
+    /// condition, included for coherence should a caller construct it
+    /// directly. `NotCgroupV2` / `NoMemoryController` are environment
+    /// shape, not permission, and genuine I/O anomalies (corrupted
+    /// `/proc`, `ENOENT` on kernel pseudo-files) stay outside the
+    /// class so they remain fatal.
+    pub fn is_permission_class(&self) -> bool {
+        match self {
+            CgroupSetupError::Io(e) => matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            ),
+            CgroupSetupError::NotWritable { .. } => true,
+            CgroupSetupError::NotCgroupV2 | CgroupSetupError::NoMemoryController { .. } => false,
+        }
+    }
+}
