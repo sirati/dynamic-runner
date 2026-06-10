@@ -357,6 +357,125 @@ impl WorkerFactory<ChannelManagerEnd> for FlakyWorkerFactory {
     }
 }
 
+/// One scripted per-task behaviour for [`ScriptedWorkerFactory`], selected by
+/// substring match on the wire `relative_path` (same selection scheme as
+/// [`SlowFakeWorkerFactory`]'s markers).
+#[derive(Clone)]
+pub(super) enum WorkerScript {
+    /// Sleep `delay`, then respond `Response::Done` (a successful task).
+    Done { delay: std::time::Duration },
+    /// Sleep `delay`, then respond `Response::Error { error_type, message }`.
+    /// The worker protocol resolves an `Error` response to
+    /// `PollResult::Disconnected` (needs restart), so the pool surfaces it as
+    /// `WorkerEvent::Disconnected { result, binary: Some(..) }` — the
+    /// disconnect-with-error shape (the nix-build-failure / #341 class) —
+    /// and the secondary respawns the slot.
+    Error {
+        delay: std::time::Duration,
+        error_type: dynrunner_core::ErrorType,
+        message: String,
+    },
+}
+
+/// Worker factory driven by per-`relative_path` substring scripts, with a
+/// CROSS-THREAD run-count + spawn-count ledger.
+///
+/// Generalises the timing-only [`SlowFakeWorkerFactory`] and the
+/// Recoverable-only [`FlakyWorkerFactory`]: a scenario that needs latency AND
+/// worker-protocol errors AND per-task run accounting in ONE fleet-wide
+/// factory uses this. The ledgers are `Arc<Mutex<..>>` / `Arc<AtomicU32>`
+/// (not `Rc<RefCell<..>>`) deliberately: the producer-backstop failover
+/// scenario runs one node on a SEPARATE thread/runtime (the kill target), and
+/// its workers must record into the same ledger as the main-thread fleet's.
+///
+/// `Clone` shares the ledgers + scripts (construct once, clone per node), so
+/// `run_counts` is the fleet-wide "how many times did each task actually run
+/// on a worker" oracle — the redo/no-redo accounting a failover scenario
+/// asserts on — and `spawn_count` counts every `spawn_worker` call (initial
+/// pool spawns + first-bind/type-shift/disconnect respawns), the worker-churn
+/// observability.
+#[derive(Clone)]
+pub(super) struct ScriptedWorkerFactory {
+    scripts: Arc<Vec<(String, WorkerScript)>>,
+    /// Per-task run counter keyed by the wire `relative_path`, bumped on
+    /// every `ProcessTask` a worker receives (before the scripted response).
+    pub(super) run_counts: Arc<std::sync::Mutex<HashMap<String, u32>>>,
+    /// Total `spawn_worker` invocations across the fleet (initial spawns +
+    /// every respawn).
+    pub(super) spawn_count: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl ScriptedWorkerFactory {
+    pub(super) fn new(scripts: Vec<(String, WorkerScript)>) -> Self {
+        Self {
+            scripts: Arc::new(scripts),
+            run_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            spawn_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+}
+
+impl WorkerFactory<ChannelManagerEnd> for ScriptedWorkerFactory {
+    fn spawn_worker(
+        &mut self,
+        _worker_id: u32,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        self.spawn_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (manager_end, runner_end) = channel_pair();
+        let scripts = self.scripts.clone();
+        let run_counts = self.run_counts.clone();
+        tokio::task::spawn_local(async move {
+            let mut runner = runner_end;
+            let _ = runner.send(Response::Ready).await;
+            loop {
+                match MessageReceiver::<Command>::recv(&mut runner).await {
+                    Some(Command::Stop) => break,
+                    Some(Command::ProcessTask { relative_path, .. }) => {
+                        *run_counts
+                            .lock()
+                            .expect("run_counts mutex poisoned")
+                            .entry(relative_path.clone())
+                            .or_insert(0) += 1;
+                        let script = scripts
+                            .iter()
+                            .find(|(needle, _)| relative_path.contains(needle))
+                            .map(|(_, s)| s.clone())
+                            .unwrap_or(WorkerScript::Done {
+                                delay: std::time::Duration::ZERO,
+                            });
+                        let response = match script {
+                            WorkerScript::Done { delay } => {
+                                if !delay.is_zero() {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                Response::Done { result_data: None }
+                            }
+                            WorkerScript::Error {
+                                delay,
+                                error_type,
+                                message,
+                            } => {
+                                if !delay.is_zero() {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                Response::Error {
+                                    error_type,
+                                    message,
+                                }
+                            }
+                        };
+                        let _ = runner.send(response).await;
+                    }
+                    None => break,
+                }
+            }
+        });
+        Ok((manager_end, None))
+    }
+}
+
 /// Simulate a secondary that sends welcome + cert, then echoes
 /// assignments as completions. Convenience wrapper around
 /// [`fake_secondary_with_addrs`] using the historical
@@ -902,12 +1021,51 @@ pub(super) fn build_test_promote_recipe_with_config(
     FixedEstimator,
     TestId,
 > {
+    build_test_promote_recipe_with_config_and_hooks(
+        config,
+        setup_discovery,
+        Box::new(|_| (Box::new(|_| {}), Box::new(|_, _, _, _| {}))),
+    )
+}
+
+/// The phase-hooks factory a scenario hands to
+/// [`build_test_promote_recipe_with_config_and_hooks`]: invoked ONCE at the
+/// promotion build, AFTER the coordinator exists, with the promoted primary's
+/// live command sender — so the built hooks can drive
+/// `PrimaryCommand::SpawnTasks` (the consumer's phase-chaining
+/// `on_phase_end → primary_handle.spawn_tasks` pattern) against the primary
+/// they belong to. Mirrors how the production pyo3 recipe builds its
+/// Python-callback hooks around the coordinator it just constructed.
+pub(super) type PromoteHooksFactory = Box<
+    dyn FnOnce(
+        tokio_mpsc::Sender<crate::primary::command_channel::PrimaryCommand<TestId>>,
+    ) -> (crate::primary::OnPhaseStart, crate::primary::OnPhaseEnd),
+>;
+
+/// As [`build_test_promote_recipe_with_config`] but the caller supplies a
+/// [`PromoteHooksFactory`] for the promoted primary's `on_phase_start` /
+/// `on_phase_end` — the seam a phase-chaining e2e scenario needs on a
+/// PROMOTED primary (relocate target or failover winner), where the hooks
+/// must capture the freshly-built coordinator's command sender.
+pub(super) fn build_test_promote_recipe_with_config_and_hooks(
+    config: PrimaryConfig,
+    setup_discovery: Option<crate::discovery::SetupDiscovery<TestId>>,
+    hooks: PromoteHooksFactory,
+) -> crate::process::PromotedPrimaryBuilder<
+    dynrunner_scheduler::ResourceStealingScheduler,
+    FixedEstimator,
+    TestId,
+> {
     let mut setup_discovery = setup_discovery;
     // The recipe fires at most once (a node promotes once); take the
-    // single-use `PrimaryConfig` (not `Clone`) on that one invocation.
+    // single-use `PrimaryConfig` / hooks factory (not `Clone`) on that one
+    // invocation.
     let mut config = Some(config);
+    let mut hooks = Some(hooks);
     Box::new(move |client, inbox, demote_rx, snapshot| {
-        let config = config.take().expect("promote recipe invoked more than once");
+        let config = config
+            .take()
+            .expect("promote recipe invoked more than once");
         let mut primary = PrimaryCoordinator::new(
             config,
             client,
@@ -920,12 +1078,16 @@ pub(super) fn build_test_promote_recipe_with_config(
             primary.register_setup_discovery(sd);
         }
         primary.seed_from_promotion_snapshot(snapshot);
+        let (on_phase_start, on_phase_end) =
+            (hooks.take().expect("promote recipe invoked more than once"))(
+                primary.command_sender(),
+            );
         crate::process::PromotedPrimary {
             coordinator: primary,
             run_args: crate::process::PrimaryRunArgs {
                 seed: crate::process::SeedSource::PromotionSnapshot,
-                on_phase_start: Box::new(|_| {}),
-                on_phase_end: Box::new(|_, _, _, _| {}),
+                on_phase_start,
+                on_phase_end,
             },
         }
     })
