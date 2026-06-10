@@ -536,10 +536,13 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// failures; their ErrorType classification is the operator's
     /// post-mortem signal.
     pub(super) failed_tasks: HashMap<String, ErrorType>,
-    // Per-phase completed/failed EVENT tallies are now the replicated
-    // grow-only-MAX `ClusterState::phase_event_tallies` (F4) so a promoted
-    // primary reports the SAME event-shaped `on_phase_end` numbers; the
-    // per-(phase, bucket) retry-pass counter is the replicated
+    // Per-phase completed/failed EVENT tallies are the replicated
+    // grow-only-MAX `ClusterState::phase_event_tallies` (F4), bumped by the
+    // `merge_task_state` join on every winning `TaskCompleted`/`TaskFailed`
+    // apply (#358) — so EVERY mirror's tally advances with the
+    // per-completion broadcast in real time and a promoted primary reports
+    // the SAME event-shaped `on_phase_end` numbers (no anti-entropy lag).
+    // The per-(phase, bucket) retry-pass counter is the replicated
     // `ClusterState::retry_passes_used` (P3) so the retry budget survives
     // failover. Neither is node-local on the coordinator any more.
     /// Currently in-flight count per `TypeId`, against
@@ -4417,17 +4420,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         task_id: Option<&str>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
-        // Originate the per-phase Completed EVENT tally (F4): compute the
-        // new running count and max-bump the replicated grow-only-MAX field.
-        // EVENT-shaped — a fail → reinject → succeed task increments BOTH
-        // Failed and Completed — so this counts terminal OBSERVATIONS, not a
-        // terminal-state projection.
-        let key = (
-            phase_id.clone(),
-            crate::cluster_state::PhaseTally::Completed,
-        );
-        let new_count = self.cluster_state.phase_event_tally_for(&key) + 1;
-        self.cluster_state.record_phase_event_tally(key, new_count);
+        // The per-phase Completed EVENT tally (F4) is NOT bumped here: the
+        // single bump owner is the `merge_task_state` join (#358), which the
+        // caller's `ClusterMutation::TaskCompleted` apply already ran BEFORE
+        // this bookkeeping fires — so the cascade below reads a tally that
+        // includes the triggering task, and every MIRROR bumped identically
+        // on the same broadcast. A second bump here would double-count
+        // against the originator's own apply-locally pass.
         self.pool_mut().on_item_finished(phase_id, task_id);
         self.process_phase_lifecycle(command_rx).await;
     }
@@ -4449,14 +4448,10 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         _task_id: Option<&str>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
-        // Originate the per-phase Failed EVENT tally (F4): same shape as
-        // `note_item_completed` — compute the new running count and max-bump
-        // the replicated grow-only-MAX field. EVENT-shaped (counts terminal
-        // OBSERVATIONS), so a later retry-success still increments Completed
-        // and BOTH survive a promotion via max-merge.
-        let key = (phase_id.clone(), crate::cluster_state::PhaseTally::Failed);
-        let new_count = self.cluster_state.phase_event_tally_for(&key) + 1;
-        self.cluster_state.record_phase_event_tally(key, new_count);
+        // Same as `note_item_completed`: the per-phase Failed EVENT tally
+        // (F4) bump is owned by the `merge_task_state` join (#358) — the
+        // caller's `ClusterMutation::TaskFailed` apply bumped it before this
+        // bookkeeping runs, identically on every mirror.
         self.pool_mut().on_item_finished(phase_id, None);
         self.process_phase_lifecycle(command_rx).await;
     }

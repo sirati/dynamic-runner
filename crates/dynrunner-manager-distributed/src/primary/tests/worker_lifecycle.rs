@@ -58,6 +58,16 @@ fn primary_with_pool_and_idle_worker(
     let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
         .expect("work-phase pool");
     primary.pending = Some(pool);
+    // Seed the CRDT ledger alongside the pool (production-shaped: every
+    // pool task has a ledger entry — `handle_task_complete`'s TaskCompleted
+    // apply, which owns the F4 tally bump since #358, NoOps on a
+    // ledger-absent hash).
+    for t in &tasks {
+        primary.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: compute_task_hash(t),
+            task: t.clone(),
+        });
+    }
     primary.pool_mut().extend(tasks).expect("valid extend");
     primary.register_idle_worker_for_test(
         "sec-0".into(),
@@ -424,6 +434,14 @@ fn primary_two_secondaries_with_pool(
     let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new([phase.clone()], HashMap::new())
         .expect("work-phase pool");
     primary.pending = Some(pool);
+    // Seed the CRDT ledger alongside the pool (production-shaped; see
+    // `primary_with_pool_and_idle_worker`).
+    for t in &tasks {
+        primary.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: compute_task_hash(t),
+            task: t.clone(),
+        });
+    }
     primary.pool_mut().extend(tasks).expect("valid extend");
     let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
     primary.register_idle_worker_for_test("sec-0".into(), 0, budget.clone());

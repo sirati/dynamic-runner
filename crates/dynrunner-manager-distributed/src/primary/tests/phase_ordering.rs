@@ -22,13 +22,13 @@
 //!
 //! The cascade fires `on_phase_end` synchronously from
 //! `note_item_completed` AFTER the per-phase Completed EVENT tally is
-//! max-bumped for the just-completed task (see `coordinator.rs` —
-//! `note_item_completed` records the replicated `phase_event_tallies`
-//! count then calls `process_phase_lifecycle`). So when `on_phase_end`
-//! fires for a phase, the `completed` argument (read from the replicated
-//! tally) is the cumulative count INCLUDING the task whose
-//! `handle_task_complete` tick triggered the cascade. A premature firing
-//! surfaces as `completed < phase_total`.
+//! max-bumped for the just-completed task (the `merge_task_state` join
+//! bumps it when `handle_task_complete` applies the `TaskCompleted`
+//! mutation, BEFORE `note_item_completed` runs the cascade — #358). So
+//! when `on_phase_end` fires for a phase, the `completed` argument (read
+//! from the replicated tally) is the cumulative count INCLUDING the task
+//! whose `handle_task_complete` tick triggered the cascade. A premature
+//! firing surfaces as `completed < phase_total`.
 
 use super::*;
 

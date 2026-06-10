@@ -755,6 +755,15 @@ impl<I: Identifier> ClusterState<I> {
         // max regardless of (live-broadcast, snapshot) arrival order — the
         // exact property that makes the run-start `clear()` unnecessary AND
         // safe. The merge rule is spelled once in `grow_max::merge_grow_max`.
+        //
+        // ORDER IS LOAD-BEARING for F4 (#358): this field merge must run
+        // AFTER the per-task `merge_task_state` loop at the top of this fn.
+        // The join bumps the tally on each winning terminal transition; a
+        // snapshot's tally count covers exactly the events its own task
+        // states reflect, so merging states FIRST lets each in-snapshot
+        // transition bump once and the `max` here then aliases (never adds)
+        // those same events. Field-first would max-import the count and
+        // THEN bump again for the same snapshot's transitions = overshoot.
         merge_grow_max(&mut self.phase_event_tallies, phase_event_tallies);
         merge_grow_max(&mut self.retry_passes_used, retry_passes_used);
         merge_grow_max(
