@@ -35,8 +35,10 @@ pub(super) fn map_read_dir_error(e: PeerInfoReadDirError) -> PyErr {
                 "observer late-joiner: peer-info dir {dir} contains no v2 records — \
                  either the dir is empty, has no `*.info` files, or every file is \
                  legacy v1 (pre-Step-7 wrapper). The late-joiner snapshot RPC \
-                 requires the v2 envelope (cert_pem_b64 + quic_port + at least \
-                 one of ipv4/ipv6). Re-run the cluster with a Step-7-or-newer \
+                 requires the v2 envelope (secondary_id + quic_port + at least \
+                 one of ipv4/ipv6; cert_pem_b64 is optional — the production \
+                 wrapper omits it, and a cert-less record is dialed over WSS \
+                 rather than QUIC). Re-run the cluster with a Step-7-or-newer \
                  wrapper, or point this flag at a different directory."
             ))
         }
@@ -65,11 +67,16 @@ pub(super) fn records_to_seed(records: &[PeerInfoRecord]) -> Vec<PeerConnectionI
             let secondary_id = r.secondary_id.clone()?;
             let quic_port = r.quic_port?;
             // `cert` is `String` (not `Option<String>`) on the wire
-            // frame; v2 records that lack a cert_pem are pre-handshake
-            // partial-writes from the wrapper and won't QUIC-dial
-            // anyway. Empty string when absent matches the channel
-            // transport's test convention and surfaces a CN-mismatch
-            // (loud failure) on the dialer, not a silent drop.
+            // frame. A cert-less record is the NORMAL production shape:
+            // the SLURM wrapper intentionally omits `cert_pem_b64` from
+            // the on-disk record (`slurm-wrapper/wrapper/src/network.rs`
+            // — the peer's cert is minted in-container AFTER the record
+            // is written, so the wrapper cannot know it). The dialer
+            // (`peer/dial.rs::dial_peer`) skips the QUIC race when no
+            // valid cert parses and goes straight to WSS on the same
+            // port, which needs no pinned cert — so cert-less late-join
+            // works end-to-end over WSS. Only the QUIC leg of the dial
+            // requires a record that actually carries the cert.
             let cert = r.cert_pem.clone().unwrap_or_default();
             Some(PeerConnectionInfo {
                 secondary_id,
