@@ -17,7 +17,7 @@ use dynrunner_protocol_primary_secondary::{
     SendOutcome,
 };
 
-use super::PeerNetwork;
+use super::{PeerNetwork, RedialNudge};
 
 fn timestamp_secs() -> f64 {
     std::time::SystemTime::now()
@@ -33,6 +33,50 @@ fn now_clocks() -> Clocks {
     Clocks {
         now: Instant::now(),
         wire: timestamp_secs(),
+    }
+}
+
+impl<I: Identifier> PeerNetwork<I> {
+    /// Send one wire `RedialRequest` to a tracked-disconnected peer
+    /// that owns the dial side of the shared leg (this node never
+    /// dials it — the lower-id-dials rule). Relay-capable by
+    /// construction: the direct leg is down, so the frame rides
+    /// `send_to_peer`'s relay path through any live forwarder.
+    ///
+    /// Log cadence (the rate-limit contract): the FIRST nudge of an
+    /// outage is operator-visible at INFO; subsequent nudges are
+    /// DEBUG — the reconnect tracker's milestone WARNs own the
+    /// long-outage narration. A no-route failure (mesh fully down
+    /// toward that peer) is DEBUG too: the next tick retries.
+    async fn send_redial_request(&mut self, nudge: RedialNudge) {
+        let msg = DistributedMessage::RedialRequest {
+            target: None,
+            sender_id: self.peer_id.clone(),
+            timestamp: timestamp_secs(),
+            attempts: nudge.attempts,
+        };
+        if nudge.attempts <= 1 {
+            tracing::info!(
+                peer = %nudge.peer_id,
+                "{}",
+                super::MSG_REDIAL_REQUEST_SENT
+            );
+        } else {
+            tracing::debug!(
+                peer = %nudge.peer_id,
+                ticks_disconnected = nudge.attempts,
+                "{}",
+                super::MSG_REDIAL_REQUEST_SENT
+            );
+        }
+        if let Err(e) = self.send_to_peer(&nudge.peer_id, msg).await {
+            tracing::debug!(
+                peer = %nudge.peer_id,
+                error = %e,
+                "redial request had no route; retrying on the next \
+                 reconnect tick"
+            );
+        }
     }
 }
 
@@ -179,10 +223,25 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if let Some(id) = redial_target {
                                 self.spawn_redial(&id);
                             }
-                            // Unbox once at the router/role-layer boundary
-                            // so the by-value role-layer signature stays
-                            // unchanged.
-                            Some(*msg)
+                            // Transport-internal frame: a peer that cannot
+                            // dial this leg (lower-id-dials) asks US — the
+                            // dial owner — to force-prune + re-dial. Consumed
+                            // here; the application layer never observes it
+                            // (same contract as Relay/RelayBackoff, which the
+                            // Router consumes one layer down).
+                            if let DistributedMessage::RedialRequest {
+                                sender_id, attempts, ..
+                            } = &*msg
+                            {
+                                let (from, attempts) = (sender_id.clone(), *attempts);
+                                self.handle_redial_request(&from, attempts);
+                                None
+                            } else {
+                                // Unbox once at the router/role-layer boundary
+                                // so the by-value role-layer signature stays
+                                // unchanged.
+                                Some(*msg)
+                            }
                         }
                         InboundOutcome::Handled { redial_target } => {
                             if let Some(id) = redial_target {
@@ -207,6 +266,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             peer = %accepted.peer_id,
                             "incoming peer registered (during recv)"
                         );
+                        self.ever_connected.insert(accepted.peer_id.clone());
                         self.connections
                             .insert(accepted.peer_id, accepted.outgoing_tx);
                     }
@@ -242,7 +302,19 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             // picked up here. `spawn_redial` deduplicates
                             // against `connections` so duplicate dials on
                             // a freshly-restored peer are harmless.
-                            self.process_reconnect_tick();
+                            //
+                            // Legs this node structurally never dials (the
+                            // peer owns the dial side) come back as nudges:
+                            // ask each dial owner to re-dial over the
+                            // relay-capable send path. If the outer caller
+                            // drops this future mid-send the remaining
+                            // nudges are lost with the consumed tick — the
+                            // next 5s tick re-derives them from tracker
+                            // state, so nothing is permanently dropped.
+                            let nudges = self.process_reconnect_tick();
+                            for nudge in nudges {
+                                self.send_redial_request(nudge).await;
+                            }
                         }
                         None => {
                             // The 5 s tick task ended, closing the channel.
@@ -342,6 +414,20 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     if let Some(id) = redial_target {
                         self.spawn_redial(&id);
                     }
+                    // Transport-internal: consume RedialRequest on the sync
+                    // path too (handling is synchronous — prune + spawned
+                    // dial), so a consumer driving recv via try_recv only
+                    // still honors the dial-owner nudge.
+                    if let DistributedMessage::RedialRequest {
+                        sender_id,
+                        attempts,
+                        ..
+                    } = &*msg
+                    {
+                        let (from, attempts) = (sender_id.clone(), *attempts);
+                        self.handle_redial_request(&from, attempts);
+                        continue;
+                    }
                     return Some(*msg);
                 }
                 InboundOutcome::Handled { redial_target } => {
@@ -375,8 +461,36 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // side, which is the correct membership answer. Drained-but-not-
         // yet-registered accept-loop connections are not counted here —
         // the table is the single source of truth for "reachable right
-        // now".
+        // now". For "can a directed frame REACH it" (direct OR relay),
+        // see `has_route` — the deliverability companion.
         self.connections.contains_key(id.as_str())
+    }
+
+    fn has_route(&self, id: &PeerId) -> bool {
+        // Deliverability: delegate to the Router — the single owner of
+        // routing state (direct table + per-target forwarder blacklist)
+        // — so the answer can never drift from what `send_to_peer`
+        // would actually do (direct, relay, or NoRoute).
+        self.router
+            .has_route(id.as_str(), &self.connections, Instant::now())
+    }
+
+    fn relay_capable(&self) -> bool {
+        // Router-backed: directed sends relay through live forwarders,
+        // so `has_route` genuinely exceeds `has_peer`.
+        true
+    }
+
+    fn unroutable_ids(&self) -> Vec<PeerId> {
+        // The published projection of `has_route` for detached
+        // membership-view readers: only ids with active blacklist state
+        // can be DECIDED unroutable; everything else derives from the
+        // connected set (see the trait doc).
+        self.router
+            .unroutable_ids(&self.connections, Instant::now())
+            .into_iter()
+            .map(|s| PeerId::from(s.as_str()))
+            .collect()
     }
 
     fn connected_ids(&self) -> Vec<PeerId> {

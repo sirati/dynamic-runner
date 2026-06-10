@@ -28,6 +28,7 @@ use crate::relay::testing::{DispatchedRecord, RecordingChannel};
 mod inbound;
 mod inbound_sync;
 mod prune;
+mod routability;
 mod send;
 
 /// Trivial Identifier impl so we can build messages without

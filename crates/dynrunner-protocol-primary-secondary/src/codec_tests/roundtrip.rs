@@ -825,3 +825,62 @@ fn custom_message_decodes_literal_sender_bytes() {
         _ => panic!("expected CustomMessage"),
     }
 }
+
+/// The wire-only `RedialRequest` (member-leg redial handshake) survives
+/// the codec, INCLUDING its non-default `attempts` count — `attempts`
+/// carries `#[serde(default)]`, so a roundtrip with 0 would still pass
+/// if the field were dropped on the wire (a default masks a dropped
+/// layer perfectly); the non-zero value pins the field's presence. The
+/// mirror direction (a pre-`attempts` sender) is pinned by
+/// `legacy_redial_request_without_attempts_decodes_zero` below.
+#[test]
+fn roundtrip_redial_request() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::RedialRequest {
+        target: None,
+        sender_id: "sec-7".into(),
+        timestamp: 99.25,
+        attempts: 3,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::RedialRequest {
+            sender_id,
+            timestamp,
+            attempts,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-7");
+            assert_eq!(timestamp, 99.25);
+            assert_eq!(attempts, 3);
+        }
+        _ => panic!("expected RedialRequest"),
+    }
+}
+
+/// Mirror-the-other-side's-bytes: a `RedialRequest` emitted WITHOUT the
+/// `attempts` field (a sender predating it) decodes with `attempts == 0`
+/// — inside the dial owner's grace window, the conservative
+/// don't-prune-a-live-wire value.
+#[test]
+fn legacy_redial_request_without_attempts_decodes_zero() {
+    let wire = br#"{"msg_type":"redial_request","sender_id":"sec-9","timestamp":7.5}"#;
+    let decoded: DistributedMessage<TestId> = deserialize_message(wire).unwrap();
+    match decoded {
+        DistributedMessage::RedialRequest {
+            sender_id,
+            attempts,
+            ..
+        } => {
+            assert_eq!(sender_id, "sec-9");
+            assert_eq!(
+                attempts, 0,
+                "absent attempts must decode as 0 (grace window)"
+            );
+        }
+        _ => panic!("expected RedialRequest"),
+    }
+}

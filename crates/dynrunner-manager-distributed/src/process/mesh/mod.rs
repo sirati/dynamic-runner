@@ -84,6 +84,17 @@ pub struct Mesh<I: Identifier, Tr: PeerTransport<I>> {
 }
 
 impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
+    /// Test-only access to the owned transport, for fixtures that must
+    /// drive transport-internal routing state (e.g. seeding the
+    /// Router's post-bounce blacklist to represent a genuinely
+    /// unroutable node). Production code NEVER reaches through the
+    /// mesh to the transport — membership reads go through the
+    /// published view / the mesh's own delegating methods.
+    #[cfg(test)]
+    pub(crate) fn transport_mut(&mut self) -> &mut Tr {
+        &mut self.transport
+    }
+
     pub fn new(transport: Tr) -> Self {
         let (local_dispatch_tx, local_dispatch_rx) = mpsc::unbounded_channel();
         Self {

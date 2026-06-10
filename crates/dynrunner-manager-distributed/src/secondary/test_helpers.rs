@@ -111,7 +111,7 @@ impl<P: PeerTransport<TestId>> SecondaryHarness<P> {
     /// `MeshClient` enqueued, applying each against the mesh (and thus the
     /// transport). After this returns, a `RecordingPeer` log / channel
     /// receiver has observed all the sends. Also publishes the live
-    /// membership so the coordinator's `has_peer` egress gate reads the
+    /// membership so the coordinator's `has_route` egress gate reads the
     /// transport truth.
     ///
     /// `MeshClient::send` enqueues synchronously, so by the time a test
@@ -239,11 +239,21 @@ pub(super) fn channel_mesh_with_observed_peer(
 /// (`recv_peer` blocks forever, like the prior stubs).
 ///
 /// This is what the R1 failover-health-probe tests drive: paired with
-/// `set_bootstrap_primary_id("primary")`, `send_to_primary` resolves
-/// `Destination::Primary` to `"primary"`, finds no outbox for it, and
-/// surfaces the no-route `Err` that arms the count-axis — the real
-/// routing-aware no-route signal, replacing the identity-blind
-/// `FixedPeerCount` stub that could only no-op (Ok) on every send.
+/// `set_bootstrap_primary_id("setup")`, `send_to_primary` resolves
+/// `Destination::Primary` to `"setup"`, the egress deliverability gate
+/// (`has_route`) reads it unroutable, and the no-route `Err` arms the
+/// count-axis — the real routing-aware no-route signal, replacing the
+/// identity-blind `FixedPeerCount` stub that could only no-op (Ok) on
+/// every send.
+///
+/// UNROUTABLE means unroutable by ANY path: the channel transport is
+/// Router-backed (relay-capable), so a merely-absent direct outbox with
+/// live peers would read relay-routable and the gate would queue the
+/// frame instead of arming the probe. The fixture therefore pre-seeds
+/// the Router's per-target blacklist with every peer for `"primary"` —
+/// the honest post-bounce steady state of a genuinely dead primary
+/// ("relays already bounced off every forwarder"), which is exactly the
+/// state the R1 scenarios model.
 pub(super) fn channel_mesh_no_primary(
     secondary_id: &str,
     peer_count: usize,
@@ -262,7 +272,21 @@ pub(super) fn channel_mesh_no_primary(
         let (peer_tx, _peer_rx) = mpsc::unbounded_channel();
         outgoing.insert(format!("peer-{i}"), peer_tx);
     }
-    ChannelPeerTransport::from_raw_channels(secondary_id.into(), outgoing, never_rx)
+    let mut transport =
+        ChannelPeerTransport::from_raw_channels(secondary_id.into(), outgoing, never_rx);
+    // Post-bounce steady state (see the doc above): every peer is a
+    // bounced forwarder for the dead bootstrap primary (`"setup"` — the
+    // id `make_with_peers` pairs this stub with), so
+    // `has_route("setup")` is honestly false while the peer mesh stays
+    // healthy. A test that installs a DIFFERENT primary identity
+    // (`PrimaryChanged`) marks that id unroutable itself (see
+    // `r1_helpers::mark_unroutable`).
+    for i in 0..peer_count {
+        transport
+            .router
+            .blacklist_forwarder_for_test("setup", &format!("peer-{i}"));
+    }
+    transport
 }
 
 /// Minimal serializable identifier used by every secondary test.
@@ -332,7 +356,7 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
 /// removing / re-adding `"setup"` and re-publishing the view — the unified
 /// "records sends AND controllable membership" stub the buffered-terminal-
 /// replay test needs (record the re-delivery on the wire AND flip the
-/// no-route gate). The egress no-route gate (`send_to`'s `has_peer` on a
+/// no-route gate). The egress no-route gate (`send_to`'s `has_route` on a
 /// resolved `Peer(id)`) reads this through the published `MembershipView`,
 /// so a `Destination::Primary` send no-routes exactly when `"setup"` is
 /// absent from `connected` at the last `publish_membership`.
@@ -427,12 +451,32 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
 /// primary STARTS present and is removed mid-test.
 pub(super) struct MembershipControlPeer {
     pub(super) connected: Rc<RefCell<Vec<PeerId>>>,
+    /// Whether this stub models a Router-backed (relay-capable)
+    /// transport. `false` (the [`Self::new`] default) keeps the
+    /// historical direct-only semantics every membership-departure test
+    /// pins: `has_route == has_peer`. The relay-coherence tests build
+    /// the `true` variant to model the production direct-down-but-
+    /// relay-covered link (BUG 3.3).
+    relay_capable: bool,
+    /// Controllable analogue of the Router's blacklist projection: ids
+    /// the (relay-capable) stub declares unroutable by ANY path.
+    pub(super) unroutable: Rc<RefCell<Vec<PeerId>>>,
 }
 
 impl MembershipControlPeer {
     fn new(initial: Vec<PeerId>) -> Self {
         Self {
             connected: Rc::new(RefCell::new(initial)),
+            relay_capable: false,
+            unroutable: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// The relay-capable variant (see the `relay_capable` field doc).
+    fn new_relay_capable(initial: Vec<PeerId>) -> Self {
+        Self {
+            relay_capable: true,
+            ..Self::new(initial)
         }
     }
 
@@ -440,6 +484,11 @@ impl MembershipControlPeer {
     /// the stub is moved into the coordinator.
     fn handle(&self) -> Rc<RefCell<Vec<PeerId>>> {
         self.connected.clone()
+    }
+
+    /// Shared handle to the unroutable id-set (relay-capable variant).
+    fn unroutable_handle(&self) -> Rc<RefCell<Vec<PeerId>>> {
+        self.unroutable.clone()
     }
 }
 
@@ -468,6 +517,22 @@ impl<I: Identifier> PeerTransport<I> for MembershipControlPeer {
     }
     fn connected_ids(&self) -> Vec<PeerId> {
         self.connected.borrow().clone()
+    }
+    fn relay_capable(&self) -> bool {
+        self.relay_capable
+    }
+    fn has_route(&self, id: &PeerId) -> bool {
+        // Mirrors `MembershipView::has_route` / the Router predicate:
+        // direct, or (relay-capable AND some other connection AND not
+        // declared unroutable). The non-relay variant collapses to
+        // `has_peer` — the trait default.
+        <Self as PeerTransport<I>>::has_peer(self, id)
+            || (self.relay_capable
+                && self.connected.borrow().iter().any(|p| p != id)
+                && !self.unroutable.borrow().iter().any(|p| p == id))
+    }
+    fn unroutable_ids(&self) -> Vec<PeerId> {
+        self.unroutable.borrow().clone()
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
@@ -659,6 +724,38 @@ pub(super) fn make_secondary_membership(
         FixedEstimator(100),
     );
     (harness, handle)
+}
+
+/// Shared-cell handle to a membership/unroutable id-set a test mutates
+/// after the stub moved into the coordinator (pair mutations with
+/// `publish_membership()`).
+pub(super) type SharedIdSet = Rc<RefCell<Vec<PeerId>>>;
+
+/// The relay-capable sibling of [`make_secondary_membership`]: the stub
+/// declares `relay_capable`, so a peer absent from `connected` still
+/// reads `has_route == true` while any OTHER peer is connected and the
+/// id is not in the returned `unroutable` set — the production
+/// direct-down-but-relay-covered link shape (BUG 3.3). Returns the
+/// harness + the connected-set handle + the unroutable-set handle; pair
+/// every mutation with `publish_membership()`.
+pub(super) fn make_secondary_membership_relay(
+    config: SecondaryConfig,
+    initial: Vec<PeerId>,
+) -> (
+    SecondaryHarness<MembershipControlPeer>,
+    SharedIdSet,
+    SharedIdSet,
+) {
+    let peer = MembershipControlPeer::new_relay_capable(initial);
+    let connected = peer.handle();
+    let unroutable = peer.unroutable_handle();
+    let harness = build_harness(
+        config,
+        peer,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (harness, connected, unroutable)
 }
 
 /// Build a secondary over a `ChannelPeerTransport` mesh stub, returning the

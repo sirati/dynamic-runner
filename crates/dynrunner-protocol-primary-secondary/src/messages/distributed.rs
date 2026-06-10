@@ -889,6 +889,49 @@ pub enum DistributedMessage<I> {
         original_sender: String,
         relay_id: u64,
     },
+    /// Wire-only signal from the NON-dial-owning side of a
+    /// member↔member mesh leg to the leg's DIAL OWNER (the
+    /// lower-id-dials rule fixes ownership): "my end of our wire is
+    /// dead — prune your entry for me and re-dial." Sent on the
+    /// requester's reconnect-tick cadence while its leg to the
+    /// recipient is tracked-disconnected, and — because the direct leg
+    /// is down by definition — typically delivered via [`Self::Relay`].
+    ///
+    /// This closes the half-open hole the lower-id-dials rule leaves
+    /// open: when the dial owner's side of the wire still looks healthy
+    /// (its frames keep flowing one way) it never observes a disconnect
+    /// and never re-dials, while the non-owner side structurally never
+    /// dials. The request is authoritative evidence from the other end
+    /// that the wire is useless; the owner force-prunes its stale
+    /// connection entry (so the fresh dial's registration is not
+    /// dedup-dropped against it) and dials immediately.
+    ///
+    /// Application code never observes `RedialRequest` — the transport's
+    /// recv path consumes it. It restores the TRANSPORT PIPE only and
+    /// feeds no liveness/failover input; the requester keeps narrating
+    /// the outage through its reconnect tracker's milestone WARNs.
+    RedialRequest {
+        /// Mesh routing target (Phase-C C3) — same contract as on every
+        /// other variant. `#[serde(default, skip_serializing_if)]` keeps
+        /// the wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Consecutive reconnect ticks the requester has observed the
+        /// leg dead (its tracker's attempt count). The dial owner's
+        /// GRACE gate keys on this: a low count may be the
+        /// mesh-forming / first-frame-identification window, where the
+        /// owner's wire is healthy and its own next regular frame will
+        /// identify it at the requester's accept loop — force-pruning
+        /// there kills a good wire (and any frames queued on it). Only
+        /// a PERSISTING request (count past the grace threshold) proves
+        /// the wire dead from the requester's side despite the owner
+        /// having spoken on it. `#[serde(default)]` keeps pre-field
+        /// senders decodable (count 0 → inside the grace window).
+        #[serde(default)]
+        attempts: u32,
+    },
 }
 
 /// Which role's liveness a [`DistributedMessage::Keepalive`] asserts.

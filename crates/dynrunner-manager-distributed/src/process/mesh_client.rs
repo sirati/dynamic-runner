@@ -146,6 +146,14 @@ impl<I: Identifier> MeshClient<I> {
     pub fn has_peer(&self, id: &PeerId) -> bool {
         self.membership.has_peer(id)
     }
+
+    /// Whether the transport could DELIVER to `id` (direct OR relay) as
+    /// of the last pump publish. The deliverability companion to
+    /// [`Self::has_peer`] — see `MembershipView::has_route` for the
+    /// formula and the has_route-vs-has_peer consumer split.
+    pub fn has_route(&self, id: &PeerId) -> bool {
+        self.membership.has_route(id)
+    }
 }
 
 /// The receive end of a role's mesh inbound.

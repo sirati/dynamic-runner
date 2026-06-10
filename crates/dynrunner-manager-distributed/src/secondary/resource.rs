@@ -193,14 +193,16 @@ where
     /// frame is queued:
     ///   - `resolve_destination` returns `None` — no current primary AND no
     ///     bootstrap link, so nothing resolves at all.
-    ///   - it resolves to a concrete remote [`SendTarget::Peer`] that is NOT
-    ///     a connected mesh member (`!self.client.has_peer(id)`). This is the
-    ///     one-mesh analogue of the deleted transport-level
-    ///     `send_to_peer(id) -> NoRoute Err`: because
+    ///   - it resolves to a concrete remote [`SendTarget::Peer`] the
+    ///     transport cannot DELIVER to by any path
+    ///     (`!self.client.has_route(id)` — no direct connection AND no
+    ///     relay forwarder). This is the one-mesh analogue of the
+    ///     transport-level `send_to_peer(id) -> NoRoute`: because
     ///     [`crate::process::MeshClient::send`] is QUEUED (it returns `Ok`
     ///     the moment it enqueues, never observing the eventual wire result),
     ///     the no-route signal must be read from the pump-published
-    ///     membership view at egress, not awaited from the send. The view is
+    ///     membership/routability view at egress, not awaited from the
+    ///     send. The view is
     ///     ≤1-cycle stale + monotone-toward-truth, which is SAFE for the
     ///     probe: it never declares death (the probe only feeds a thresholded
     ///     health window that a successful keepalive resets), and a stale-high
@@ -248,16 +250,32 @@ where
              bootstrap primary link — no route to the primary"
                 .to_string()
         })?;
-        // A resolved remote host that is NOT a connected member is the
-        // queued-mesh analogue of the old transport-level NoRoute — surface
-        // it as the probe `Err`. `Loopback` (a promoted self) and `Broadcast`
-        // never no-route.
+        // A resolved remote host the transport cannot DELIVER to by any
+        // path is the queued-mesh analogue of the old transport-level
+        // NoRoute — surface it as the probe `Err`. `Loopback` (a promoted
+        // self) and `Broadcast` never no-route.
+        //
+        // DELIVERABILITY, not direct membership (BUG 3.3): the gate reads
+        // `has_route` — direct connection OR a live, non-blacklisted relay
+        // forwarder — NEVER `has_peer` (direct-only). Gating on `has_peer`
+        // dropped every primary-bound frame here the moment the direct
+        // wire died, even while the transport's relay path could (and on
+        // the inbound side DID) deliver: outbound resolution read dead
+        // while relayed primary messages kept arriving and resetting the
+        // health window — the production "death suspected → message
+        // resumed" flip-flop, plus starved TaskRequests/terminal reports
+        // that never reached a reachable primary. With `has_route` the
+        // frame is queued and relays; the probe arms only when NOTHING
+        // can deliver — exactly the state in which no inbound can arrive
+        // either, so the two liveness readers agree by construction (one
+        // state owner: the transport's Router).
         if let SendTarget::Peer(id) = &target
-            && !self.client.has_peer(id)
+            && !self.client.has_route(id)
         {
             return Err(format!(
-                "no route to {id}: resolved host is not a connected mesh member \
-                 (queued-mesh no-route — failover-health probe)"
+                "no route to {id}: not a connected mesh member and no relay \
+                 path through any connected peer (queued-mesh no-route — \
+                 failover-health probe)"
             ));
         }
         // The C3 stamp is ALWAYS the role-bearing intent `dst` — it is what
@@ -287,8 +305,10 @@ where
     ///
     /// # Failover-health probe (the fast path)
     ///
-    /// A clean `Err` from the send means "no route to the primary": the
-    /// role table has no current primary AND no bootstrap link resolves.
+    /// A clean `Err` from the send means "no route to the primary": no
+    /// primary resolves at all, OR the resolved host is unreachable by
+    /// ANY transport path — no direct connection and no relay forwarder
+    /// (the `has_route` deliverability gate in [`Self::send_to`]).
     /// That is the fast-failover signal — it arms the count-axis of
     /// `PrimaryLink` immediately, well before the keepalive time-axis
     /// would. The probe is transport-AGNOSTIC: the manager reacts only
@@ -679,7 +699,9 @@ where
             // crossing the threshold (and every further multiple)
             // escalates to ERROR naming the task and the likely causes.
             if entry.attempts >= REPORT_REPLAY_ESCALATION_ATTEMPTS
-                && entry.attempts.is_multiple_of(REPORT_REPLAY_ESCALATION_ATTEMPTS)
+                && entry
+                    .attempts
+                    .is_multiple_of(REPORT_REPLAY_ESCALATION_ATTEMPTS)
             {
                 tracing::error!(
                     task_hash = ?task_hash,
@@ -699,7 +721,10 @@ where
             // Re-send through the egress edge with the SAME stamped
             // frame (same seq — never re-stamp). `Destination::Primary`
             // re-resolves to the CURRENT holder.
-            entry.state = match self.send_to(Destination::Primary, entry.frame.clone()).await {
+            entry.state = match self
+                .send_to(Destination::Primary, entry.frame.clone())
+                .await
+            {
                 Ok(()) => RetainedSendState::AwaitingAck { sent_at: now },
                 Err(e) => {
                     // Still no route: feed the failover-health probe

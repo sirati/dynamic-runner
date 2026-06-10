@@ -23,8 +23,12 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// the connected id-set) — never a hand-maintained delta (the SETTLED
     /// no-shadow rule).
     pub fn publish_membership(&self) {
-        self.membership
-            .publish(self.transport.peer_count(), self.transport.connected_ids());
+        self.membership.publish(
+            self.transport.peer_count(),
+            self.transport.connected_ids(),
+            self.transport.unroutable_ids(),
+            self.transport.relay_capable(),
+        );
     }
 
     /// Live mesh cardinality — the transport's `connections.len()`. The
@@ -37,5 +41,12 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// table.
     pub fn has_peer(&self, id: &PeerId) -> bool {
         self.transport.has_peer(id)
+    }
+
+    /// Live per-id deliverability (direct OR relay) — delegates to the
+    /// transport's routing layer. See `PeerTransport::has_route` for
+    /// the has_route-vs-has_peer split.
+    pub fn has_route(&self, id: &PeerId) -> bool {
+        self.transport.has_route(id)
     }
 }

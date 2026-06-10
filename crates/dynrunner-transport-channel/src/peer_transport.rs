@@ -170,6 +170,31 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
             .collect()
     }
 
+    fn relay_capable(&self) -> bool {
+        // Router-backed (same dispatcher as the QUIC `PeerNetwork`):
+        // directed sends relay through live forwarders, so `has_route`
+        // genuinely exceeds `has_peer`.
+        true
+    }
+
+    fn has_route(&self, id: &PeerId) -> bool {
+        // Deliverability: delegate to the Router — the single owner of
+        // routing state — so the answer can never drift from what
+        // `send_to_peer` would actually do (direct, relay, or NoRoute).
+        self.router
+            .has_route(id.as_str(), &self.outgoing, std::time::Instant::now())
+    }
+
+    fn unroutable_ids(&self) -> Vec<PeerId> {
+        // The published projection of `has_route` for detached
+        // membership-view readers (see the trait doc).
+        self.router
+            .unroutable_ids(&self.outgoing, std::time::Instant::now())
+            .into_iter()
+            .map(|s| PeerId::from(s.as_str()))
+            .collect()
+    }
+
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {
         // No-op: peers are pre-wired via `peer_mesh` /
         // `peer_mesh_with_adjacency`. Test drivers simulate partition

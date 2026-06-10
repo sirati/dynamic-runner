@@ -68,6 +68,29 @@ mod r1_helpers {
         sec
     }
 
+    /// Mark `id` unroutable on the harness's channel transport: seed
+    /// the Router's per-target blacklist with every currently-connected
+    /// peer (the post-bounce steady state of a genuinely dead node) and
+    /// republish the membership view so the egress deliverability gate
+    /// (`has_route`) reads it. Used by tests that install a primary
+    /// identity other than the bootstrap `"setup"` (which
+    /// `channel_mesh_no_primary` pre-seeds).
+    pub(super) fn mark_unroutable(sec: &mut R1Secondary, id: &str) {
+        use dynrunner_protocol_primary_secondary::PeerTransport as _;
+        let peers: Vec<String> = (&*sec.test_mesh.transport_mut() as &ChannelPeerTransport<TestId>)
+            .connected_ids()
+            .into_iter()
+            .map(|p| p.as_str().to_owned())
+            .collect();
+        for peer in peers {
+            sec.test_mesh
+                .transport_mut()
+                .router
+                .blacklist_forwarder_for_test(id, &peer);
+        }
+        sec.publish_membership();
+    }
+
     /// A keepalive frame for driving `send_to_primary` in the probe
     /// tests.
     pub(super) fn probe_msg(
@@ -147,6 +170,11 @@ async fn r1_promotion_on_no_route_count_axis() {
         },
     );
     sec.record_primary_message();
+    // The new primary identity is genuinely dead: relays toward it have
+    // already bounced off every peer (post-bounce steady state), so the
+    // egress deliverability gate reads no-route — NOT merely
+    // direct-absent (which would read relay-routable and queue).
+    r1_helpers::mark_unroutable(&mut sec, "primary-orig");
 
     // Drive the count-axis via the SEND-SIDE probe: each
     // `send_to_primary` resolves `Destination::Primary` to the bootstrap

@@ -48,6 +48,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 dynrunner-transport-tunnel = { workspace = true }
+# Test-only Router backdoors (blacklist injection for the post-bounce
+# unroutable-primary fixtures; route-state inspection) — same feature
+# the transport-channel tests enable.
+dynrunner-protocol-primary-secondary = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
