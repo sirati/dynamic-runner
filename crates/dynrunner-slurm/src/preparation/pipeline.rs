@@ -18,9 +18,8 @@ use tokio::task::JoinSet;
 
 use super::establish::establish_one_tunnel_inner;
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
-use super::ssh::{
-    LingerRestoreMap, production_spawner, reconnect_spawner, restore_linger, terminate_child,
-};
+use super::ssh::{LingerRestoreMap, production_spawner, reconnect_spawner, restore_linger};
+use super::store::{PerSecondaryTunnelRegistry, SharedTunnelVec, TunnelStore};
 
 /// Lifecycle for the SLURM preparation phase. Owns spawned `ssh -N -R`
 /// subprocess handles and tears them down on cleanup().
@@ -34,7 +33,22 @@ pub struct SlurmPreparation {
     /// cleanup() drains them). Shared with watcher tasks so a watcher
     /// records its child here BEFORE it might be aborted, letting
     /// cleanup() reap any children that escaped the deadline.
+    ///
+    /// The cohort-setup + single-respawn paths commit here (append-only:
+    /// each secondary establishes once, no prior child to displace). The
+    /// observer-reconnect path uses [`Self::reconnect_tunnels`] instead.
     ssh_tunnels: Arc<Mutex<Vec<Child>>>,
+    /// Per-secondary tunnel registry for the OBSERVER-RECONNECT path:
+    /// one live `ssh -N -R` `Child` per secondary id, replaced (old
+    /// reaped) on each rebuild. Keyed by id so the reconnect cadence can
+    /// ask "is this secondary's tunnel still alive?" and NO-OP a re-fire
+    /// on a healthy forward — the fix for the rc=255 release+rebind loop
+    /// that blinded the observer. Distinct from `ssh_tunnels` because the
+    /// reconnect path needs per-id REPLACEMENT (the cohort Vec is
+    /// anonymous append-only and would accumulate dead lingerers). Both
+    /// are drained at [`Self::cleanup`]. See
+    /// [`PerSecondaryTunnelRegistry`].
+    reconnect_tunnels: Arc<Mutex<HashMap<String, Child>>>,
     /// secondary_id -> tunnel_port discovered from the info file.
     /// Populated as watchers complete; preserved across cleanup so
     /// the caller can still inspect the map after teardown. Wrapped
@@ -76,6 +90,7 @@ impl SlurmPreparation {
         Self {
             opts,
             ssh_tunnels: Arc::new(Mutex::new(Vec::new())),
+            reconnect_tunnels: Arc::new(Mutex::new(HashMap::new())),
             secondary_port_map: Arc::new(StdMutex::new(HashMap::new())),
             establish_pool,
             primary_quic_port: StdMutex::new(None),
@@ -85,6 +100,17 @@ impl SlurmPreparation {
 
     pub fn opts(&self) -> &PreparationOptions {
         &self.opts
+    }
+
+    /// Test backdoor: the observer-reconnect per-secondary tunnel
+    /// registry Arc. Lets the gate test pre-seed a live child so it can
+    /// assert `reestablish_one_tunnel` no-ops (returns Ok WITHOUT
+    /// touching ssh) when the prior child is alive — keyed on the SAME
+    /// Arc the method clones. `cfg(test)` so the production surface is
+    /// unchanged.
+    #[cfg(test)]
+    pub(super) fn reconnect_tunnels_for_test(&self) -> Arc<Mutex<HashMap<String, Child>>> {
+        Arc::clone(&self.reconnect_tunnels)
     }
 
     /// Snapshot of the `secondary_id -> tunnel_port` map. Cloned under
@@ -158,7 +184,7 @@ impl SlurmPreparation {
             );
             let opts = self.opts.clone();
             let reader_clone = reader.clone();
-            let tunnels = Arc::clone(&self.ssh_tunnels);
+            let store = SharedTunnelVec::new(Arc::clone(&self.ssh_tunnels));
             let establish_pool = Arc::clone(&self.establish_pool);
             // `Arc<StdMutex<...>>` field lets per-watcher tasks share
             // the persistent port map without borrowing `self` (they
@@ -179,7 +205,7 @@ impl SlurmPreparation {
                     primary_quic_port,
                     &opts,
                     reader_clone,
-                    &tunnels,
+                    &store,
                     &port_map,
                     &establish_pool,
                     spawner,
@@ -276,21 +302,25 @@ impl SlurmPreparation {
         );
 
         let opts = self.opts.clone();
-        let tunnels = Arc::clone(&self.ssh_tunnels);
+        let store = SharedTunnelVec::new(Arc::clone(&self.ssh_tunnels));
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
         let linger_restore = Arc::clone(&self.linger_restore);
         let id_owned = secondary_id.to_owned();
 
-        let spawner =
-            production_spawner(id_owned.clone(), opts.clone(), primary_quic_port, linger_restore);
+        let spawner = production_spawner(
+            id_owned.clone(),
+            opts.clone(),
+            primary_quic_port,
+            linger_restore,
+        );
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
             primary_quic_port,
             &opts,
             reader,
-            &tunnels,
+            &store,
             &port_map,
             &establish_pool,
             spawner,
@@ -303,23 +333,41 @@ impl SlurmPreparation {
     /// `-R` link the (passive, zero-authority) observer lost — the
     /// observer-reconnect path. Identical to [`Self::establish_one_tunnel`]
     /// (re-poll the info file, re-spawn `ssh -N -R`, verify, join the
-    /// shared cleanup set) EXCEPT the injected spawner first force-
-    /// releases the stale worker-side `-R <tunnel_port>` binding before
-    /// rebinding the SAME port.
+    /// cleanup set) EXCEPT (1) a LIVENESS GATE that NO-OPs the rebuild
+    /// when the secondary's prior tunnel child is still alive, and (2) the
+    /// injected spawner first force-releases the stale worker-side `-R
+    /// <tunnel_port>` binding before rebinding the SAME port.
+    ///
+    /// # The liveness gate (defect (a))
+    ///
+    /// The observer's lost-visibility cadence re-fires this rebuild every
+    /// ~60s while visibility stays lost. Blindly running release+rebind on
+    /// every tick — even when THIS secondary's `-R` forward is perfectly
+    /// healthy — is the bug: the release `fuser -k` either kills the live
+    /// forward or (psmisc absent) fails, and the same-port rebind collides
+    /// rc=255 against the observer's OWN healthy listener, looping forever
+    /// and accumulating dead ssh children. So we FIRST consult the
+    /// per-secondary registry: if the prior child for this id is still
+    /// running (`try_wait() == None`), the tunnel is fine and we return
+    /// `Ok(())` immediately — no release, no rebind, no churn. Only when
+    /// the prior child has EXITED (or there was none) do we proceed to the
+    /// release+rebind, whose fresh verified child then REPLACES the dead
+    /// registry entry (the displaced child reaped). The blindness that
+    /// keeps `lost_secs` growing is the SECONDARY's missing QUIC re-dial
+    /// (defect (b)), a separate concern in the transport — not this
+    /// tunnel's job.
     ///
     /// Why a distinct entry point rather than a flag on
     /// `establish_one_tunnel`: the two paths cross the SAME
     /// establishment seam ([`establish_one_tunnel_inner`]) and differ
-    /// in exactly ONE injected dependency — the spawner. The respawn
-    /// path establishes a tunnel for a node the primary just spawned
-    /// (no prior binding can exist on a fresh node), so it must NOT pay
-    /// the release round-trip; the observer-reconnect path rebuilds an
-    /// EXISTING node's dropped tunnel, where an ungraceful drop leaves
-    /// the worker's sshd holding the old listener and the same-port
-    /// rebind collides (rc=255) unless the stale binding is released
-    /// first. Same inner, different spawner — no duplicated control
-    /// flow, no `if reconnecting { … }` special-casing inside the
-    /// inner.
+    /// in the injected spawner (release-first vs not) AND the tunnel
+    /// STORE (per-id registry vs append-only Vec). The respawn path
+    /// establishes a tunnel for a node the primary just spawned (no prior
+    /// binding can exist on a fresh node), so it must NOT pay the release
+    /// round-trip and has no prior child to gate on; the observer-reconnect
+    /// path rebuilds an EXISTING node's dropped tunnel. Same inner,
+    /// different spawner + store — no duplicated control flow, no
+    /// `if reconnecting { … }` special-casing inside the inner.
     ///
     /// Precondition + caller cleanup: identical to
     /// [`Self::establish_one_tunnel`].
@@ -328,6 +376,21 @@ impl SlurmPreparation {
         secondary_id: &str,
         reader: R,
     ) -> Result<(), PrepError> {
+        let store = PerSecondaryTunnelRegistry::new(Arc::clone(&self.reconnect_tunnels));
+
+        // LIVENESS GATE: if this secondary's prior tunnel child is still
+        // running, the `-R` forward is healthy — the rebuild is a NO-OP.
+        // Returning Ok here is the success signal the cadence was blind to:
+        // it stops the release+rebind churn against the observer's own
+        // healthy listener. Only an EXITED/absent child warrants a rebuild.
+        if store.is_alive(secondary_id).await {
+            tracing::debug!(
+                secondary_id,
+                "observer-reconnect: tunnel child still alive — skipping rebuild (no-op)"
+            );
+            return Ok(());
+        }
+
         let primary_quic_port = self
             .primary_quic_port
             .lock()
@@ -346,21 +409,24 @@ impl SlurmPreparation {
         );
 
         let opts = self.opts.clone();
-        let tunnels = Arc::clone(&self.ssh_tunnels);
         let establish_pool = Arc::clone(&self.establish_pool);
         let port_map = Arc::clone(&self.secondary_port_map);
         let linger_restore = Arc::clone(&self.linger_restore);
         let id_owned = secondary_id.to_owned();
 
-        let spawner =
-            reconnect_spawner(id_owned.clone(), opts.clone(), primary_quic_port, linger_restore);
+        let spawner = reconnect_spawner(
+            id_owned.clone(),
+            opts.clone(),
+            primary_quic_port,
+            linger_restore,
+        );
         let _port = establish_one_tunnel_inner(
             &id_owned,
             &info_path,
             primary_quic_port,
             &opts,
             reader,
-            &tunnels,
+            &store,
             &port_map,
             &establish_pool,
             spawner,
@@ -372,11 +438,11 @@ impl SlurmPreparation {
     /// Terminate all tracked tunnel subprocesses. SIGTERM, 5s wait,
     /// then SIGKILL escalation — mirrors Python's
     /// `proc.terminate(); proc.wait(timeout=5); proc.kill()`.
-    /// Idempotent (drains `ssh_tunnels`).
+    /// Idempotent (drains BOTH the cohort/respawn `ssh_tunnels` Vec AND
+    /// the observer-reconnect `reconnect_tunnels` registry).
     ///
     /// `&self` mirrors [`Self::setup_ssh_tunnels`]: the only mutation
-    /// is draining the `Arc<Mutex<Vec<Child>>>`, which is already
-    /// interior-mutable.
+    /// is draining the interior-mutable child stores.
     ///
     /// Linger: after the tunnels are down, RESTORE each node's logind
     /// linger to off where the run enabled it (whole-run-scoped, race-free
@@ -385,12 +451,15 @@ impl SlurmPreparation {
     /// returns logind to exactly the pre-run state. Best-effort per node.
     pub async fn cleanup(&self) {
         tracing::info!("cleaning up SLURM preparation resources");
-        {
-            let mut tunnels = self.ssh_tunnels.lock().await;
-            for mut child in tunnels.drain(..) {
-                terminate_child(&mut child).await;
-            }
-        }
+        // Drain both tunnel stores through the same `TunnelStore` seam —
+        // the cohort/respawn append-only Vec and the reconnect per-id
+        // registry both reap their children identically.
+        SharedTunnelVec::new(Arc::clone(&self.ssh_tunnels))
+            .drain_and_terminate()
+            .await;
+        PerSecondaryTunnelRegistry::new(Arc::clone(&self.reconnect_tunnels))
+            .drain_and_terminate()
+            .await;
         restore_linger(&self.linger_restore, &self.opts).await;
         tracing::info!("SLURM preparation cleanup complete");
     }

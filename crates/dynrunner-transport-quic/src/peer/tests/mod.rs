@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TestId(pub(crate) String);
 
+mod bootstrap_redial;
 mod cert_parsing;
 mod dial_failure_summary;
 mod log_capture;

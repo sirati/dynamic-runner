@@ -745,32 +745,86 @@ pub(super) async fn verify_tunnel_alive(
     secondary_id: &str,
     child: &mut Child,
 ) -> Result<(), PrepError> {
+    use tokio::io::AsyncReadExt;
+
+    // Take both pipes BEFORE the wait so a CONCURRENT drain can run
+    // alongside `child.wait()`. ssh writes its decisive failure line
+    // ("Warning: remote port forwarding failed for listen port NNN")
+    // to stderr in the window between spawn and exit; reading stderr
+    // only AFTER the reap races that final flush — the OS pipe buffer
+    // may already be drained-and-closed by the time we look, dropping
+    // the one line the operator needs. Draining concurrently captures
+    // every pre-exit byte regardless of when the child flushes.
+    //
+    // stdout is piped at spawn time but otherwise unused on the `-N -R`
+    // tunnel; drain it too so a child that writes there cannot wedge on
+    // a full pipe (back-pressure) and never exit.
+    //
+    // On the ALIVE path the pipes are restored to the Child (below) so
+    // its long-lived stdout/stderr writes still have a live read end —
+    // the concurrent drain only OWNS the pipes for the 3s gate window.
+    let mut stderr_pipe = child.stderr.take();
+    let mut stdout_pipe = child.stdout.take();
+
     // exit_info encodes alive/dead-with-rc:
     //   Outer None => still alive past 3s (success).
-    //   Outer Some(rc_opt) => process exited; rc_opt may be None
-    //     (process killed by signal, no exit code).
-    let exit_info: Option<Option<i32>> =
-        match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
-            Err(_elapsed) => None,
-            Ok(Ok(status)) => Some(status.code()),
-            Ok(Err(e)) => return Err(PrepError::Io(e)),
+    //   Outer Some((rc_opt, stderr)) => process exited; rc_opt may be
+    //     None (killed by signal). stderr carries every pre-exit byte,
+    //     captured by the concurrent drain that ran against the wait.
+    let exit_info: Option<(Option<i32>, String)> = {
+        // The drain future: read both pipes to EOF concurrently (neither
+        // back-pressures the other into a stall). Both reads resolve to
+        // EOF only when the child closes its pipe ends — i.e. at/after
+        // exit — so while the child is alive this future stays pending,
+        // which is exactly what the 3s gate wants.
+        let drain_streams = async {
+            let mut err_buf = Vec::new();
+            let mut out_buf = Vec::new();
+            match (stderr_pipe.as_mut(), stdout_pipe.as_mut()) {
+                (Some(e), Some(o)) => {
+                    let _ = tokio::join!(e.read_to_end(&mut err_buf), o.read_to_end(&mut out_buf));
+                }
+                (Some(e), None) => {
+                    let _ = e.read_to_end(&mut err_buf).await;
+                }
+                (None, Some(o)) => {
+                    let _ = o.read_to_end(&mut out_buf).await;
+                }
+                (None, None) => {}
+            }
+            err_buf
         };
+
+        // Run the wait and the concurrent stderr/stdout drain together,
+        // bounded by the same 3s budget. `tokio::join!` keeps both
+        // polling: the drain completes as the child closes its pipes at
+        // exit, and the wait yields the status — so `stderr` holds the
+        // final flush rather than a post-reap re-read that could miss it.
+        let waited = tokio::time::timeout(Duration::from_secs(3), async {
+            let (status, err_buf) = tokio::join!(child.wait(), drain_streams);
+            status.map(|s| (s.code(), err_buf))
+        })
+        .await;
+        match waited {
+            Err(_elapsed) => None,
+            Ok(Ok((rc, err_buf))) => {
+                Some((rc, String::from_utf8_lossy(&err_buf).trim().to_string()))
+            }
+            Ok(Err(e)) => return Err(PrepError::Io(e)),
+        }
+    };
 
     match exit_info {
         None => {
+            // Alive past the gate: hand the pipes back to the Child so
+            // its later stdout/stderr writes keep a live read end (the
+            // drain only borrowed them for the gate window).
+            child.stderr = stderr_pipe;
+            child.stdout = stdout_pipe;
             tracing::info!(secondary_id, "SSH tunnel established");
             Ok(())
         }
-        Some(rc) => {
-            // Drain stderr from the dead child for the error message.
-            let stderr = {
-                let mut buf = Vec::new();
-                if let Some(mut e) = child.stderr.take() {
-                    use tokio::io::AsyncReadExt;
-                    let _ = e.read_to_end(&mut buf).await;
-                }
-                String::from_utf8_lossy(&buf).trim().to_string()
-            };
+        Some((rc, stderr)) => {
             tracing::error!(
                 secondary_id,
                 rc = ?rc,

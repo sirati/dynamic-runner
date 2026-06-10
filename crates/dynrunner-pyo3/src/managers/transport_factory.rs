@@ -238,7 +238,14 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // uniform mesh path, so the primary's frames arrive via `recv_peer`
     // like every other peer's — there is no separate `uplink` leg. "The
     // tunnel is just a way of joining the mesh."
-    transport.register_primary_link(bootstrap_primary_id, client);
+    //
+    // `addr` is retained (it is `Copy`) so the wire is RE-dialable: when
+    // the `-R` tunnel drops, the bootstrap-redial supervisor re-dials this
+    // same `localhost:<tunnel_port>` address indefinitely and re-folds the
+    // fresh client (defect (b)). It is the FIXED tunnel address — never a
+    // LAN addr — because the submitter is unroutable except through the
+    // tunnel.
+    transport.register_primary_link(bootstrap_primary_id, addr, client);
 
     let peer_cert_info = PeerCertInfo {
         public_cert_pem: cert_pem,

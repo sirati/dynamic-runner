@@ -15,6 +15,7 @@ mod gather;
 mod pipeline;
 mod respawn;
 mod ssh;
+mod store;
 mod uri_parsing;
 
 /// Construct a `PreparationOptions` with `setup_timeout` / `poll_interval`

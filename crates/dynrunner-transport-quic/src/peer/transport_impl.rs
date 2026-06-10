@@ -192,6 +192,26 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     self.process_reconnect_tick();
                     None
                 }
+                redialed = self.bootstrap_redial_rx.recv() => {
+                    // Defect (b): a dropped submitter-bootstrap wire was
+                    // re-dialed off-loop (the `-R` tunnel came back); re-
+                    // fold the fresh client into the mesh under `&mut self`
+                    // via the SAME `register_primary_link` install path —
+                    // fan-in `mesh_writer` + inbound forwarder. This re-
+                    // arms the redial for the NEXT drop, so the link stays
+                    // restorable for the life of the run. Restores ONLY the
+                    // transport pipe: no failover input is touched (the
+                    // secondary→primary app-layer liveness window is
+                    // unchanged; see `bootstrap_redial`).
+                    //
+                    // `recv()` never yields `None` while the network lives
+                    // (the held `bootstrap_redial_tx` clone keeps the
+                    // channel open), so this only fires on a real re-dial.
+                    if let Some(r) = redialed {
+                        self.fold_primary_link(r.target, r.client);
+                    }
+                    None
+                }
                 queued = self.proxy_rx.recv() => {
                     // Mesh-send proxy drain (see `mesh_send.rs` +
                     // `MeshSendHandle`). A promoted-host primary's

@@ -13,29 +13,36 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use tokio::process::Child;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 use crate::peer_info::parse as parse_peer_info;
 
 use super::options::{InfoFileReader, PrepError, PreparationOptions};
 use super::policy::EstablishmentPolicy;
 use super::ssh::verify_tunnel_alive;
+use super::store::TunnelStore;
 
 /// Per-tunnel work shared by `setup_ssh_tunnels` (run in parallel
 /// across N secondaries inside a JoinSet) and `establish_one_tunnel`
 /// (run once for a single respawn).
 ///
 /// Single concern: take one secondary from "info file may or may not
-/// be there yet" to "verified ssh -R subprocess in the shared cleanup
-/// set, with `(id, port)` recorded in the shared port map". Returns
-/// the discovered `tunnel_port` on success.
+/// be there yet" to "verified ssh -R subprocess committed to the
+/// caller-supplied [`TunnelStore`], with `(id, port)` recorded in the
+/// shared port map". Returns the discovered `tunnel_port` on success.
+///
+/// Store DI: the verified `Child` is handed to `store.commit(id, child)`
+/// — the engine never learns whether that store appends to the shared
+/// cohort Vec or replaces a per-secondary registry entry. Cohort + respawn
+/// pass a `SharedTunnelVec`; the observer-reconnect path passes a
+/// `PerSecondaryTunnelRegistry`. Same control flow, no `if reconnecting`.
 ///
 /// Spawner DI: the `spawner` closure is parameterised over
 /// `(host: String, tunnel_port: u16) -> Future<Result<Child, PrepError>>`.
 /// Production callers pass a closure that builds the `ssh -N -R` argv
 /// and runs `Command::spawn`; tests pass a closure that returns a
 /// `/bin/sh` child with a configurable outcome, exercising the
-/// push-to-Vec / port-map / rate-limiter control flow without ever
+/// store-commit / port-map / rate-limiter control flow without ever
 /// touching ssh. `String` (not `&str`) so the closure's returned
 /// future can own its inputs without borrow-lifetime contortions.
 ///
@@ -50,19 +57,20 @@ use super::ssh::verify_tunnel_alive;
 // state into a struct would just shift the verbosity to the
 // call-site without changing the parameter count.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn establish_one_tunnel_inner<R, F, Fut>(
+pub(super) async fn establish_one_tunnel_inner<R, S, F, Fut>(
     secondary_id: &str,
     info_path: &str,
     primary_quic_port: u16,
     opts: &PreparationOptions,
     reader: R,
-    tunnels: &Arc<Mutex<Vec<Child>>>,
+    store: &S,
     port_map: &Arc<StdMutex<HashMap<String, u16>>>,
     establish_pool: &Arc<Semaphore>,
     mut spawner: F,
 ) -> Result<u16, PrepError>
 where
     R: InfoFileReader,
+    S: TunnelStore,
     F: FnMut(String, u16) -> Fut,
     Fut: Future<Output = Result<Child, PrepError>>,
 {
@@ -116,19 +124,18 @@ where
     // Delegate spawn + verify + rate-limit + retry to a single
     // helper that owns the establishment concern (see
     // `EstablishmentPolicy` doc-comment). Returns the verified Child
-    // already past the 3s alive-gate; this function then moves it
-    // into the shared tunnels Vec for cleanup() to reap.
+    // already past the 3s alive-gate; this function then commits it
+    // to the caller's store for cleanup() to reap.
     let child = establish_tunnel(secondary_id, &opts.establishment, establish_pool, || {
         spawner(host.clone(), tunnel_port)
     })
     .await?;
 
-    // Commit to the shared tunnel set only after verification —
-    // cleanup() now only sees established tunnels.
-    {
-        let mut guard = tunnels.lock().await;
-        guard.push(child);
-    }
+    // Commit to the caller's tunnel store only after verification —
+    // cleanup() now only sees established tunnels. The store decides
+    // append-to-Vec (cohort/respawn) vs replace-by-id (reconnect); the
+    // engine is blind to which.
+    store.commit(secondary_id, child).await;
 
     // Record the discovered port in the persistent port map. Under
     // a synchronous `StdMutex` — not held across any await.

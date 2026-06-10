@@ -36,6 +36,9 @@
 //!   `setup_ssh_tunnels`, `establish_one_tunnel`, `cleanup`).
 //! - [`establish`] — the per-tunnel watcher / retry / backoff loop
 //!   shared by the cohort and respawn paths.
+//! - [`store`] — the `TunnelStore` commit/drain seam: the append-only
+//!   `SharedTunnelVec` (cohort + respawn) and the per-secondary
+//!   `PerSecondaryTunnelRegistry` (observer-reconnect liveness gate).
 //! - [`ssh`] — low-level argv construction, `Command::spawn`, liveness
 //!   verification, and SIGTERM/SIGKILL teardown.
 //! - [`io`] — `read_peer_info_file` (late-joiner bootstrap entry
@@ -56,6 +59,7 @@ mod options;
 mod pipeline;
 mod policy;
 mod ssh;
+mod store;
 #[cfg(test)]
 mod tests;
 
