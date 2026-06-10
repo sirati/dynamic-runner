@@ -228,21 +228,37 @@ impl PyPrimaryHandle {
     /// the reply, translate the inner `Result<(), String>` into PyO3
     /// shape. Centralised so the per-method handlers stay one-liners
     /// and the error-translation rules don't drift.
+    ///
+    /// The blocking `block_on(reply_rx.await)` wait RELEASES the GIL
+    /// (`py.detach`) for its whole duration. This is load-bearing for
+    /// correctness, not an optimisation: when this handle is the
+    /// relocated primary's, the reply is produced by the operational
+    /// loop running on its OWN runtime, and that loop re-enters Python
+    /// via synchronous `Python::attach` (the memory-estimator bridge on
+    /// every dispatch decision; the phase-edge bridges) to make
+    /// progress. A Python thread that called this method while HOLDING
+    /// the GIL would block the loop's `attach` forever — the loop can
+    /// never produce the reply this wait is parked on. Releasing the
+    /// GIL across the wait lets the loop attach, progress, and reply.
+    /// See the `run_command_releases_gil_*` repro test.
     fn run_command(
         &self,
+        py: Python<'_>,
         build: impl FnOnce(oneshot::Sender<Result<(), String>>) -> PrimaryCommand<RunnerIdentifier>,
     ) -> PyResult<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = build(reply_tx);
         let sender = self.sender.clone();
         let rt = self.rt.clone();
-        let outcome: Result<Result<(), String>, String> = rt.block_on(async move {
-            sender.send(cmd).await.map_err(|_| {
-                "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
-            })?;
-            reply_rx
-                .await
-                .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
+        let outcome: Result<Result<(), String>, String> = py.detach(|| {
+            rt.block_on(async move {
+                sender.send(cmd).await.map_err(|_| {
+                    "PrimaryHandle: command channel closed (coordinator dropped?)".to_string()
+                })?;
+                reply_rx
+                    .await
+                    .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
+            })
         });
         match outcome {
             Ok(Ok(())) => Ok(()),
@@ -265,6 +281,7 @@ impl PyPrimaryHandle {
     #[pyo3(signature = (hash, error_kind, reason = None))]
     fn fail_permanent(
         &self,
+        py: Python<'_>,
         hash: &Bound<'_, PyBytes>,
         error_kind: &str,
         reason: Option<String>,
@@ -278,7 +295,7 @@ impl PyPrimaryHandle {
             ))
         })?;
         let reason = reason.unwrap_or_else(|| "fail_permanent via PrimaryHandle".into());
-        self.run_command(move |reply| PrimaryCommand::FailPermanent {
+        self.run_command(py, move |reply| PrimaryCommand::FailPermanent {
             hash: hash_str,
             error,
             reason,
@@ -290,9 +307,9 @@ impl PyPrimaryHandle {
     /// failure class. Returns `Ok(None)` on accept; raises
     /// `PyRuntimeError` on budget exhaustion / wrong-state / unknown
     /// hash.
-    fn reinject_task(&self, hash: &Bound<'_, PyBytes>) -> PyResult<()> {
+    fn reinject_task(&self, py: Python<'_>, hash: &Bound<'_, PyBytes>) -> PyResult<()> {
         let hash_str = bytes_to_hash_string(hash)?;
-        self.run_command(move |reply| PrimaryCommand::ReinjectTask {
+        self.run_command(py, move |reply| PrimaryCommand::ReinjectTask {
             hash: hash_str,
             reply,
         })
@@ -304,11 +321,12 @@ impl PyPrimaryHandle {
     /// unknown hash or channel failure.
     fn update_preferred_secondaries(
         &self,
+        py: Python<'_>,
         hash: &Bound<'_, PyBytes>,
         secondaries: Vec<String>,
     ) -> PyResult<()> {
         let hash_str = bytes_to_hash_string(hash)?;
-        self.run_command(move |reply| PrimaryCommand::UpdatePreferredSecondaries {
+        self.run_command(py, move |reply| PrimaryCommand::UpdatePreferredSecondaries {
             hash: hash_str,
             secondaries,
             reply,
@@ -322,8 +340,13 @@ impl PyPrimaryHandle {
     /// the primary at any time during the run (independent of the
     /// peer's join-time advertisement). Raises `PyRuntimeError` on
     /// channel failure.
-    fn set_can_be_primary(&self, peer_id: String, can_be_primary: bool) -> PyResult<()> {
-        self.run_command(move |reply| PrimaryCommand::SetCanBePrimary {
+    fn set_can_be_primary(
+        &self,
+        py: Python<'_>,
+        peer_id: String,
+        can_be_primary: bool,
+    ) -> PyResult<()> {
+        self.run_command(py, move |reply| PrimaryCommand::SetCanBePrimary {
             peer_id,
             can_be_primary,
             reply,
@@ -593,6 +616,115 @@ mod tests {
         // closes the channel.
         drop(handle);
         stub_thread.join().expect("stub thread joined");
+    }
+
+    /// Build a `PyPrimaryHandle` paired with a stub receiver whose
+    /// command handler must `Python::attach` BEFORE it can produce the
+    /// reply. This is the faithful stand-in for the production
+    /// operational loop: the loop runs on its own (current-thread)
+    /// runtime and, to make progress on a command, re-enters Python
+    /// via a synchronous `Python::attach` (the memory-estimator bridge
+    /// on every dispatch decision, the phase-edge bridges, etc.). The
+    /// reply this handler sends models "the loop completed the command
+    /// and answered the handle".
+    ///
+    /// The receiver runs on a dedicated OS thread with its OWN runtime,
+    /// exactly like the production op-loop runs on its own runtime
+    /// distinct from the handle's `block_on` runtime — so the ONLY
+    /// thing that can wedge the reply is GIL contention, not a
+    /// single-runtime self-block.
+    fn handle_with_attach_needing_receiver() -> (PyPrimaryHandle, std::thread::JoinHandle<()>) {
+        let (tx, mut rx) =
+            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(COMMAND_CHANNEL_CAPACITY);
+        let cell = ReinjectCapCell::default();
+        let handle = PyPrimaryHandle::from_sender(tx, cell).expect("handle init");
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stub op-loop runtime");
+            rt.block_on(async {
+                while let Some(cmd) = rx.recv().await {
+                    if let PrimaryCommand::ReinjectTask { reply, .. } = cmd {
+                        // Faithful op-loop step: re-enter Python under
+                        // the GIL to make progress (the estimator-bridge
+                        // attach shape) BEFORE answering the handle.
+                        // Until this attach acquires the GIL, no reply is
+                        // produced.
+                        Python::attach(|_py| {});
+                        let _ = reply.send(Ok(()));
+                    }
+                }
+            });
+        });
+        (handle, thread)
+    }
+
+    /// REPRO (the relocated-primary GIL deadlock, pinned at the pyo3
+    /// seam). Fidelity: the FULL deadlock-primitive pairing —
+    ///   (a) a Python-facing `PrimaryHandle` method whose blocking wait
+    ///       (`run_command` → `rt.block_on(reply_rx.await)`) is invoked
+    ///       while the calling thread HOLDS the GIL, paired with
+    ///   (b) a runtime (the stub op-loop, on its own thread + runtime)
+    ///       that needs `Python::attach` to make the progress that
+    ///       produces the reply.
+    /// The estimator dispatch decision is collapsed to its essential
+    /// ingredient — a synchronous `Python::attach` on the op loop's
+    /// progress path — rather than wiring a whole `assign_normal`; the
+    /// deadlock is GIL-vs-attach, and this reproduces exactly that
+    /// interlock without the scheduler scaffolding.
+    ///
+    /// Shape: a worker thread acquires the GIL (`Python::attach`) and,
+    /// while holding it, calls `reinject_task` (the real
+    /// `run_command` path). With the GIL-holding `block_on` defect the
+    /// stub op-loop's `Python::attach` can never acquire the GIL, so it
+    /// never sends the reply, so `block_on` waits forever — DEADLOCK.
+    /// The watchdog channel times out → RED. After the fix
+    /// (`run_command` detaches the GIL across its `block_on`), the stub
+    /// op-loop acquires the GIL immediately, replies, and the call
+    /// returns well within the budget → GREEN.
+    ///
+    /// Revert-check: drop the `py.detach` from `run_command` and this
+    /// test times out (the deadlock re-forms).
+    #[test]
+    fn run_command_releases_gil_so_attach_needing_loop_can_progress() {
+        let (handle, op_loop_thread) = handle_with_attach_needing_receiver();
+
+        // Run the GIL-HOLDING handle call on its own thread so the test
+        // thread stays free to watchdog it. In RED state this thread
+        // blocks forever inside `run_command`'s un-detached `block_on`.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<PyResult<()>>();
+        let caller = std::thread::spawn(move || {
+            let outcome = Python::attach(|py| {
+                // GIL is held for the whole closure body — including the
+                // blocking `run_command` wait inside `reinject_task`.
+                // After the fix, `run_command` releases the GIL across
+                // its `block_on`, so the attach-needing op-loop can make
+                // progress and reply.
+                let hash = pyo3::types::PyBytes::new(py, b"0000000000000000");
+                handle.reinject_task(py, &hash)
+            });
+            let _ = done_tx.send(outcome);
+            // Keep `handle` alive until the reply is observed; dropping
+            // it here closes the channel so the op-loop thread exits.
+            drop(handle);
+        });
+
+        // Watchdog: the production wedge presents as "ingest freezes"
+        // (the loop never returns to its select). A generous budget
+        // distinguishes a true deadlock from CI scheduling jitter.
+        let outcome = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "DEADLOCK: reinject_task held the GIL across its block_on, so the \
+                 attach-needing op-loop could never acquire the GIL to produce the \
+                 reply. run_command must release the GIL (py.detach) across its \
+                 blocking wait.",
+            );
+        outcome.expect("reinject_task must succeed once the op-loop can progress");
+
+        caller.join().expect("caller thread joined");
+        op_loop_thread.join().expect("op-loop thread joined");
     }
 
     /// Regression: a `PyPrimaryHandle` (the LAST `Arc` to its in-handle

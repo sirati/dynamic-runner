@@ -76,6 +76,19 @@ impl LifecycleListener for PyPeerLifecycleListener {
         // is one attach + one method lookup + one call; the apply
         // path's emit is non-blocking so this latency is invisible to
         // the CRDT.
+        //
+        // DEADLOCK INVARIANT: this `Python::attach` runs from a runtime
+        // task on the relocated-primary operational loop. Any
+        // Python-facing blocking wait (`PrimaryHandle::*`,
+        // `block_on(reply.await)`) MUST release the GIL (`py.detach`)
+        // for the duration of its wait — otherwise a GIL-holding Python
+        // caller blocks this attach forever and the loop can never
+        // produce the reply that caller is parked on (the
+        // GIL-vs-attach interlock; see `primary_handle::run_command`
+        // and the `run_command_releases_gil_*` repro). This bridge is
+        // peer-lifecycle (event-driven, not the per-dispatch hot path),
+        // so its attach shape is left as-is; the invariant it relies on
+        // is enforced on the handle side.
         let outcome: PyResult<()> = Python::attach(|py| {
             let listener = self.listener.bind(py);
             match event {
