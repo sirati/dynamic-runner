@@ -55,6 +55,20 @@
   # mutableUsers must be true for runtime useradd to be respected.
   users.mutableUsers = true;
 
+  # Active polkit, matching production (LMU Krater) nodes. systemd-logind
+  # consults polkit for org.freedesktop.login1.set-self-linger, whose stock
+  # policy allows active/inactive sessions — so an unprivileged user's plain
+  # `loginctl enable-linger` (the framework's setup-side self-enable)
+  # succeeds, exactly as on Krater. logind fails closed when polkit is
+  # unreachable (every unprivileged set-linger request gets "Access
+  # denied"), and linger is what keeps user@.service — and with it every
+  # libpod-*.scope — alive past the last ssh logout. The stock policy
+  # suffices; no custom rules file. To exercise the polkit-ABSENT branch on
+  # a node at runtime, see "Environment parity" in the README (`systemctl
+  # mask` is refused on the read-only /etc unit symlink; the working
+  # kill-switch is a /run drop-in that fails ExecStart).
+  security.polkit.enable = true;
+
   # Subuid/subgid layout for nested rootless podman.
   #
   # The whole container only has 65536 uids in its user namespace (the

@@ -68,6 +68,36 @@ Restart one node in place by its cluster-internal hostname (what
 INSTANCE_ID=<tag> nix run .#reboot-node -- slurm-worker1
 ```
 
+## Environment parity (vs. LMU Krater)
+
+- **I9 — polkit**: LMU runs an active polkit whose stock
+  `org.freedesktop.login1.set-self-linger` policy lets an unprivileged
+  user run plain `loginctl enable-linger` for themselves; the node
+  image matches (polkit active, default policy, no custom rules). To
+  test the polkit-absent deny branch, take polkit down on one node at
+  runtime. `systemctl mask` does not work here (the unit file is a
+  read-only `/etc` symlink, which also shadows a `/run`-level mask), so
+  the kill-switch is a `/run` drop-in that replaces `ExecStart` with
+  `false` — named `zz-*` so it sorts after the image's nix-store
+  `overrides.conf` drop-in (drop-ins apply in filename order, last
+  writer wins):
+
+  ```sh
+  podman exec <container> /bin/sh -c '
+    export PATH=/run/current-system/sw/bin
+    mkdir -p /run/systemd/system/polkit.service.d
+    printf "[Service]\nExecStart=\nExecStart=/run/current-system/sw/bin/false\n" \
+      > /run/systemd/system/polkit.service.d/zz-deny.conf
+    systemctl daemon-reload && systemctl stop polkit'
+  # ... deny path: unprivileged `loginctl enable-linger` on that node
+  #     now fails with "Access denied" (logind fails closed) ...
+  podman exec <container> /bin/sh -c '
+    export PATH=/run/current-system/sw/bin
+    rm /run/systemd/system/polkit.service.d/zz-deny.conf
+    rmdir /run/systemd/system/polkit.service.d
+    systemctl daemon-reload && systemctl restart polkit'
+  ```
+
 ## Tear down
 
 ```sh
