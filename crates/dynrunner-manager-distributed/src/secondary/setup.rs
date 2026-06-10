@@ -11,6 +11,17 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::SecondaryCoordinator;
 use super::wire::{distributed_to_binary, timestamp_now};
 
+/// Setup-progress heartbeat cadence for [`wait_for_setup`]'s recv:
+/// when NO setup frame arrives for this long while the trio
+/// (PeerInfo / InitialAssignment / TransferComplete) is incomplete,
+/// one WARN names which frames are still missing and how long the
+/// wait has lasted. Narration only — the wait itself is unbounded
+/// (the unconfigured-deadline owns the give-up policy). Without this
+/// heartbeat a secondary wedged in setup (e.g. the primary's directed
+/// sends never reach it) is TOTALLY silent until that deadline — the
+/// #362 production shape: "received peer list" and then nothing, ever.
+const SETUP_STALL_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
     M: ManagerEndpoint + 'static,
@@ -391,7 +402,35 @@ where
             // setup frames onto this secondary's slot inbox as the primary
             // host dials/accepts; the manager addresses peers by id and
             // never sees a transport role split.
-            match self.recv_setup_frame().await {
+            //
+            // Stall heartbeat (#362): the recv is wrapped in a 60s
+            // timeout that logs WHICH trio frames are still missing and
+            // loops back to waiting — narration only, no behavior change
+            // (the unconfigured-deadline still owns the give-up policy).
+            // Cancel-safe: `recv_setup_frame` is a sync backlog pop +
+            // `RoleInbox::recv` (a plain mpsc `UnboundedReceiver::recv`),
+            // so the timeout dropping it mid-wait loses no frame — this
+            // is NOT the historical transport-recv cancellation hazard
+            // documented above (that recv could hold a partially decoded
+            // wire frame; the role inbox receives only whole frames).
+            let received = loop {
+                match tokio::time::timeout(SETUP_STALL_WARN_INTERVAL, self.recv_setup_frame()).await
+                {
+                    Ok(frame) => break frame,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            got_peer_info,
+                            got_assignment,
+                            got_transfer,
+                            "still waiting for the setup trio from the primary \
+                             (no setup frame for 60s); the missing directed \
+                             frames may indicate the primary has no route to \
+                             this node or proceeded without it"
+                        );
+                    }
+                }
+            };
+            match received {
                 Some(msg) => {
                     // Run-config PUSH is PRE-ANNOUNCE config delivery: it
                     // fires from the primary's welcome handler, BEFORE the
@@ -454,9 +493,23 @@ where
                                     .iter()
                                     .filter(|p| p.secondary_id != self.config.secondary_id)
                                     .count();
+                                // Truthful narration (#362): the
+                                // coordinator does NOT dial — the Node
+                                // mesh-pump dials off this same frame,
+                                // and its "peer-dial sweep" transport
+                                // line is the authoritative record of
+                                // how many dials were actually spawned
+                                // (possibly ZERO on the highest-id
+                                // node, whose legs all arrive inbound
+                                // under the lower-id-dials rule). The
+                                // old text "kicking off peer dials"
+                                // promised dials this node may never
+                                // make.
                                 tracing::info!(
                                     peers = peer_count,
-                                    "received peer list, kicking off peer dials"
+                                    "received peer list; the mesh-pump runs the \
+                                     peer-dial sweep (see 'peer-dial sweep' for \
+                                     what was actually dialed)"
                                 );
                                 // Observer-set replication no longer rides
                                 // PeerInfo: the primary originates one

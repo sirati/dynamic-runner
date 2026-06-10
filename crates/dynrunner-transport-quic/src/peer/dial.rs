@@ -37,6 +37,32 @@ use super::util::{PeerConnection, parse_cert_pem};
 /// eyeballs sequential dialer so the total per-peer budget is unchanged.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Narration context for one `dial_peer` call: WHICH dial this is, so
+/// every attempt/outcome line carries the attempt provenance the
+/// operator needs to distinguish "first sweep failed" from "the 5s
+/// reconnect ticker is on its Nth retry". Carried alongside the dial —
+/// it has no behavioral effect; the dial itself is identical for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DialAttempt {
+    /// First dial for this peer off a received `PeerInfo` sweep
+    /// (`connect_to_peers`).
+    Initial,
+    /// Reconnect-ticker / router-pulse redial; `attempt` is the
+    /// tracker's consecutive-failed-dial count at spawn time (0 when
+    /// the redial fired before any tick bumped the counter — e.g. the
+    /// immediate redial on first disconnect observation).
+    Redial { attempt: u32 },
+}
+
+impl std::fmt::Display for DialAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DialAttempt::Initial => write!(f, "initial"),
+            DialAttempt::Redial { attempt } => write!(f, "redial#{attempt}"),
+        }
+    }
+}
+
 /// Resolve a peer's `(ipv4, ipv6, port)` triple into a list of candidate
 /// `SocketAddr`s. Skips fields that don't parse as a literal IP — the
 /// addresses are produced upstream by `detect_ipv4` / equivalent and are
@@ -82,8 +108,12 @@ pub(super) fn format_dial_targets(addrs: &[SocketAddr]) -> String {
 
 /// Race a connection attempt across every `addr` in parallel using
 /// `attempt`. Returns the first successful connection along with the
-/// address it was made to; returns `None` if every attempt fails or the
-/// per-attempt timeout fires for all of them.
+/// address it was made to; returns `Err` with EVERY per-address failure
+/// reason (error string, or `"timed out after …"` when the per-attempt
+/// timeout fired) if no attempt succeeds — so the caller's outcome log
+/// can name WHY each candidate failed instead of just that the race
+/// lost (the dial-path silent-branch rule: a failure must carry its
+/// reasons to the operator, not just its fact).
 ///
 /// The `attempt` closure produces a future per address. On success,
 /// the runner-up futures are dropped (Tokio cancellation), which
@@ -92,7 +122,7 @@ async fn race_first_success<C, F, Fut>(
     addrs: &[SocketAddr],
     timeout: Duration,
     mut attempt: F,
-) -> Option<(SocketAddr, C)>
+) -> Result<(SocketAddr, C), Vec<(SocketAddr, String)>>
 where
     F: FnMut(SocketAddr) -> Fut,
     Fut: std::future::Future<Output = Result<C, String>>,
@@ -100,8 +130,9 @@ where
     use futures_util::FutureExt;
     use futures_util::stream::{FuturesUnordered, StreamExt};
 
+    let mut failures: Vec<(SocketAddr, String)> = Vec::new();
     if addrs.is_empty() {
-        return None;
+        return Err(failures);
     }
 
     let mut pending: FuturesUnordered<_> = addrs
@@ -115,16 +146,29 @@ where
 
     while let Some((addr, result)) = pending.next().await {
         match result {
-            Ok(Ok(conn)) => return Some((addr, conn)),
+            Ok(Ok(conn)) => return Ok((addr, conn)),
             Ok(Err(e)) => {
                 tracing::debug!(%addr, error = %e, "peer dial attempt failed");
+                failures.push((addr, e));
             }
             Err(_) => {
                 tracing::debug!(%addr, "peer dial attempt timed out");
+                failures.push((addr, format!("timed out after {timeout:?}")));
             }
         }
     }
-    None
+    Err(failures)
+}
+
+/// Render a failed race's per-address reasons into one compact operator
+/// string (`"10.0.0.1:7000: connection refused; [fe80::1]:7000: timed
+/// out after 10s"`). Pure formatting for the outcome WARN/ERROR lines.
+fn format_failures(failures: &[(SocketAddr, String)]) -> String {
+    failures
+        .iter()
+        .map(|(addr, reason)| format!("{addr}: {reason}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Dial a single peer, racing QUIC then WSS across every candidate
@@ -136,36 +180,74 @@ where
 /// no valid certificate can be parsed from `peer_info.cert`, the QUIC
 /// race is skipped and we go straight to WSS — same as the pre-happy-
 /// eyeballs dialer.
+///
+/// Narration contract (the silent-branch rule, #362): the dial START
+/// logs the peer + every candidate address + the attempt provenance
+/// (INFO for the initial sweep, DEBUG for the 5s-ticker redials — the
+/// throttled `peer unreachable` summary in `process_reconnect_tick`
+/// owns the redial path's operator-level visibility), and EVERY
+/// terminal outcome logs: success names the transport + address;
+/// failure names every candidate address WITH the reason its attempt
+/// ended. No exit from this function is silent.
 pub(super) async fn dial_peer(
     peer_id: &str,
     peer_info: &PeerConnectionInfo,
+    attempt: DialAttempt,
 ) -> Option<PeerConnection> {
     let addrs = candidate_addrs(peer_info);
+    let targets = format_dial_targets(&addrs);
     let peer_cert_der = parse_cert_pem(&peer_info.cert);
+    match attempt {
+        DialAttempt::Initial => tracing::info!(
+            peer = peer_id,
+            targets = %targets,
+            %attempt,
+            "dialing peer (QUIC, then WSS fallback)"
+        ),
+        DialAttempt::Redial { .. } => tracing::debug!(
+            peer = peer_id,
+            targets = %targets,
+            %attempt,
+            "dialing peer (QUIC, then WSS fallback)"
+        ),
+    }
 
     if let Some(cert_der) = peer_cert_der.as_ref() {
-        if let Some((addr, conn)) = race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await {
-            tracing::info!(peer = peer_id, %addr, "connected to peer via QUIC");
-            return Some(PeerConnection::Quic(conn));
+        match race_quic(&addrs, peer_id, cert_der, ATTEMPT_TIMEOUT).await {
+            Ok((addr, conn)) => {
+                tracing::info!(peer = peer_id, %addr, %attempt, "connected to peer via QUIC");
+                return Some(PeerConnection::Quic(conn));
+            }
+            Err(failures) => {
+                tracing::warn!(
+                    peer = peer_id,
+                    %attempt,
+                    reasons = %format_failures(&failures),
+                    "QUIC race to peer failed across all addresses, trying WSS"
+                );
+            }
         }
-        tracing::warn!(
-            peer = peer_id,
-            "QUIC race to peer failed across all addresses, trying WSS"
-        );
     } else {
-        tracing::warn!(peer = peer_id, "no valid cert for peer, trying WSS");
+        tracing::warn!(peer = peer_id, %attempt, "no valid cert for peer, trying WSS");
     }
 
-    if let Some((addr, conn)) = race_wss(&addrs, ATTEMPT_TIMEOUT).await {
-        tracing::info!(peer = peer_id, %addr, "connected to peer via WSS");
-        return Some(PeerConnection::Wss(Box::new(conn)));
+    match race_wss(&addrs, ATTEMPT_TIMEOUT).await {
+        Ok((addr, conn)) => {
+            tracing::info!(peer = peer_id, %addr, %attempt, "connected to peer via WSS");
+            Some(PeerConnection::Wss(Box::new(conn)))
+        }
+        Err(failures) => {
+            tracing::error!(
+                peer = peer_id,
+                %attempt,
+                reasons = %format_failures(&failures),
+                "WSS race to peer failed across all addresses; dial gave up \
+                 (the 5s reconnect ticker keeps retrying while the peer stays \
+                 in the authoritative dial list)"
+            );
+            None
+        }
     }
-
-    tracing::error!(
-        peer = peer_id,
-        "WSS race to peer failed across all addresses"
-    );
-    None
 }
 
 async fn race_quic(
@@ -173,7 +255,7 @@ async fn race_quic(
     server_name: &str,
     cert_der: &CertificateDer<'_>,
     timeout: Duration,
-) -> Option<(SocketAddr, crate::transport::QuicConnection)> {
+) -> Result<(SocketAddr, crate::transport::QuicConnection), Vec<(SocketAddr, String)>> {
     race_first_success(addrs, timeout, |addr| {
         crate::transport::connect(addr, server_name, cert_der)
     })
@@ -183,7 +265,7 @@ async fn race_quic(
 async fn race_wss(
     addrs: &[SocketAddr],
     timeout: Duration,
-) -> Option<(SocketAddr, crate::wss::WssConnection)> {
+) -> Result<(SocketAddr, crate::wss::WssConnection), Vec<(SocketAddr, String)>> {
     race_first_success(addrs, timeout, connect_wss).await
 }
 
@@ -254,7 +336,7 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             "127.0.0.1:2".parse().unwrap(),
         ];
-        let result: Option<(SocketAddr, &'static str)> =
+        let result: Result<(SocketAddr, &'static str), _> =
             race_first_success(&addrs, Duration::from_secs(1), |addr| async move {
                 if addr.port() == 1 {
                     Err::<&'static str, _>("nope".to_string())
@@ -270,17 +352,48 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn race_first_success_all_fail_returns_none() {
-        let addrs = vec![
+    async fn race_first_success_all_fail_returns_every_reason() {
+        // The failed race must hand back EVERY per-address reason so
+        // the outcome log can name why each candidate failed — the
+        // dial-path silent-branch contract (#362). A regression to a
+        // reasonless `None` would make the outcome ERROR vague again.
+        let addrs: Vec<SocketAddr> = vec![
             "127.0.0.1:1".parse().unwrap(),
             "127.0.0.1:2".parse().unwrap(),
         ];
-        let result: Option<(SocketAddr, ())> =
-            race_first_success(&addrs, Duration::from_secs(1), |_addr| async {
-                Err::<(), String>("fail".into())
+        let result: Result<(SocketAddr, ()), _> =
+            race_first_success(&addrs, Duration::from_secs(1), |addr| async move {
+                Err::<(), String>(format!("fail-{}", addr.port()))
             })
             .await;
-        assert!(result.is_none());
+        let failures = result.expect_err("expected Err with reasons");
+        assert_eq!(failures.len(), 2);
+        let mut reasons: Vec<String> = failures.iter().map(|(_, r)| r.clone()).collect();
+        reasons.sort();
+        assert_eq!(reasons, vec!["fail-1".to_string(), "fail-2".to_string()]);
+        // And the formatter renders addr+reason pairs for the log line.
+        let rendered = format_failures(&failures);
+        assert!(rendered.contains("fail-1") && rendered.contains("fail-2"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn race_first_success_timeout_reason_named() {
+        // A hung attempt's failure reason must say it TIMED OUT (with
+        // the window), not be dropped silently.
+        let addrs: Vec<SocketAddr> = vec!["127.0.0.1:1".parse().unwrap()];
+        let result: Result<(SocketAddr, ()), _> =
+            race_first_success(&addrs, Duration::from_millis(20), |_addr| async {
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+            .await;
+        let failures = result.expect_err("expected timeout Err");
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].1.contains("timed out"),
+            "timeout reason must be named, got: {}",
+            failures[0].1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -297,13 +410,13 @@ mod tests {
         ];
         let attempt_timeout = Duration::from_millis(50);
         let start = std::time::Instant::now();
-        let result: Option<(SocketAddr, ())> =
+        let result: Result<(SocketAddr, ()), _> =
             race_first_success(&addrs, attempt_timeout, |_addr| async {
                 std::future::pending::<()>().await;
                 Ok(())
             })
             .await;
-        assert!(result.is_none());
+        assert!(result.is_err());
         // Parallel race: all 3 attempts time out together at ~50ms,
         // not 150ms. Allow generous slack (5×) for scheduling so the
         // test isn't flaky on loaded CI but still catches a regression
@@ -316,12 +429,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn race_first_success_empty_returns_none() {
-        let result: Option<(SocketAddr, ())> =
+    async fn race_first_success_empty_returns_err() {
+        let result: Result<(SocketAddr, ()), _> =
             race_first_success(&[], Duration::from_secs(1), |_addr| async {
                 Err::<(), String>("unused".into())
             })
             .await;
-        assert!(result.is_none());
+        assert!(
+            result
+                .expect_err("empty candidate set is a failure")
+                .is_empty()
+        );
     }
 }
