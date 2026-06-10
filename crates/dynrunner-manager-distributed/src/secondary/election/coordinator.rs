@@ -145,28 +145,31 @@ where
         }
     }
 
-    /// Is `primary_id`'s transport-INDEPENDENT liveness beacon still fresh?
+    /// Is `node_id`'s transport-INDEPENDENT liveness beacon still fresh?
     ///
-    /// The UNION counterpart to the mesh-frame liveness legs. Reads this
+    /// The UNION counterpart to the mesh-frame liveness legs, keyed on ANY
+    /// node id (the current primary at the election-arming sites, the
+    /// queried node at the `TimeoutQuery` responder, the candidate at the
+    /// Voting re-evaluation). Reads this
     /// node's [`crate::liveness::BeaconLiveness`] POLL view (published by the
     /// `LivenessListener` per decoded beacon datagram) and judges its
     /// staleness on the SAME death deadline the mesh-frame quorum gates use
     /// (`keepalive_interval × keepalive_miss_threshold`), so the beacon and
     /// the frame are weighed on one yardstick. A never-seen beacon (`None`)
     /// is NOT fresh — it must never spuriously suppress a genuine election
-    /// (#317): before the primary has proven liveness on the beacon path the
+    /// (#317): before a node has proven liveness on the beacon path the
     /// union degrades to the mesh-frame view alone. The beacon fires on
     /// `keepalive_interval`, so `keepalive_miss_threshold` consecutive
-    /// missed beacons is the same "the primary went silent" bound as for
-    /// frames — a starved-but-alive primary keeps its dedicated-thread
+    /// missed beacons is the same "the node went silent" bound as for
+    /// frames — a starved-but-alive node keeps its dedicated-thread
     /// beacon flowing well inside it.
-    pub(in crate::secondary) fn primary_beacon_fresh(&self, primary_id: &str) -> bool {
+    pub(in crate::secondary) fn node_beacon_fresh(&self, node_id: &str) -> bool {
         let deadline = self
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
         self.beacon_liveness
-            .last_seen(primary_id)
+            .last_seen(node_id)
             .map(|t| Instant::now().duration_since(t) <= deadline)
             .unwrap_or(false)
     }
@@ -244,7 +247,7 @@ where
     /// deferrer would have lent during the blip is simply never sent once
     /// `has_peer` reads `true` again on the next call. The beacon union is
     /// deliberately NOT folded in here: each consumer applies its own
-    /// `primary_beacon_fresh` suppression at its decision site, exactly as
+    /// `node_beacon_fresh` suppression at its decision site, exactly as
     /// the arming side always has.
     pub(in crate::secondary) fn primary_departed_membership(&self) -> bool {
         let seen = self
@@ -289,6 +292,10 @@ where
     ///     alive primary whose QUIC connection idle-timed-out) is NOT
     ///     death-observed — its keepalive age is reported as before, so a
     ///     peer's spurious election cannot gather agreement through us.
+    ///
+    /// All three guards ARE the single-source seen-peer death-evidence rule
+    /// [`Self::peer_death_observed`]; this method only adds the age-report
+    /// shape on top of it.
     pub(in crate::secondary) fn queried_node_liveness_age(
         &self,
         query_node_id: &str,
@@ -297,11 +304,56 @@ where
             .op_ref()
             .and_then(|op| op.peer_keepalives.get(query_node_id))
             .map(|t| t.elapsed().as_secs_f64());
-        let death_observed = age.is_some()
-            && query_node_id != self.config.secondary_id
-            && !self.is_mesh_member(query_node_id)
-            && !self.primary_beacon_fresh(query_node_id);
-        if death_observed { None } else { age }
+        if self.peer_death_observed(query_node_id) {
+            None
+        } else {
+            age
+        }
+    }
+
+    /// SINGLE SOURCE for the seen-PEER death-evidence rule: has this node
+    /// independently OBSERVED peer `id`'s death at the transport level?
+    /// True iff ALL of:
+    ///   - SEEN-GATE: `id` has a `peer_keepalives` entry (this node saw it
+    ///     alive at least once) — a never-seen peer is never death-observed,
+    ///     so a not-yet-dialled bring-up window cannot false-fire;
+    ///   - SELF-EXCLUSION: `id` is not THIS node — a node is structurally
+    ///     absent from its own membership view (`connected_ids` enumerates
+    ///     REMOTE peers), so reading that absence as death would be wrong;
+    ///   - MEMBERSHIP DEPARTURE: `id` is gone from the live transport
+    ///     `MembershipView` ([`Self::is_mesh_member`] — the fast,
+    ///     idle-independent signal the mesh-pump republishes on QUIC
+    ///     teardown);
+    ///   - BEACON-SILENT: `id`'s transport-INDEPENDENT beacon is also not
+    ///     fresh ([`Self::node_beacon_fresh`]) — a CPU-starved-but-alive
+    ///     node whose QUIC connection idle-timed-out keeps beaconing and is
+    ///     NOT death-observed.
+    ///
+    /// LIVE READ, not a latch (the #331 no-churn shape): every call reads
+    /// the CURRENT membership view + beacon view, so a transient
+    /// departure+rejoin blip reads alive again at the next evaluation —
+    /// nothing is latched.
+    ///
+    /// Consumed by BOTH peer-keyed death observations so they cannot drift:
+    ///   - the `TimeoutQuery` responder ([`Self::queried_node_liveness_age`]),
+    ///     which reports `None` (no liveness evidence) for a death-observed
+    ///     queried node, and
+    ///   - the Voting-state candidate-liveness re-evaluation in
+    ///     [`Self::run_election_tick`] (#361), which releases a vote lent
+    ///     to a candidate this node has watched die.
+    ///
+    /// The PRIMARY-keyed twin is [`Self::primary_departed_membership`]
+    /// (seen-gate on `primary_last_seen`, beacon union applied per
+    /// consumer); this rule is keyed on an arbitrary PEER id with the
+    /// seen-gate on that peer's own `peer_keepalives` entry.
+    pub(in crate::secondary) fn peer_death_observed(&self, id: &str) -> bool {
+        let seen = self
+            .op_ref()
+            .map(|op| op.peer_keepalives.contains_key(id))
+            .unwrap_or(false);
+        seen && id != self.config.secondary_id
+            && !self.is_mesh_member(id)
+            && !self.node_beacon_fresh(id)
     }
 
     /// The live mesh peers for failover quorum/candidate reasoning: the
@@ -472,8 +524,23 @@ where
         // `false`, so the election still arms promptly (the #317 path).
         let primary_beacon_fresh = current_primary_id
             .as_deref()
-            .map(|id| self.primary_beacon_fresh(id))
+            .map(|id| self.node_beacon_fresh(id))
             .unwrap_or(false);
+        // (#361) Voting-state candidate-liveness re-evaluation, snapshotted
+        // as a `&self` read before the `&mut op` borrow below: is the
+        // CANDIDATE this node lent its vote to death-observed — departed
+        // the transport membership with its beacon also silent, via the
+        // SAME single-source seen-peer evidence rule the `TimeoutQuery`
+        // responder applies (`peer_death_observed`)? Pre-#361 the Voting
+        // state had NO tick arm at all: a voter whose candidate died
+        // mid-election waited indefinitely for an external event (another
+        // candidate's `PromotionVote`, or a primary frame), so on a small
+        // fleet where the dead candidate was the only one the election
+        // wedged forever. `false` whenever the election is not in Voting.
+        let voting_candidate_dead = match self.op_ref().map(|op| &op.election) {
+            Some(ElectionState::Voting { candidate, .. }) => self.peer_death_observed(candidate),
+            _ => false,
+        };
         let live_peers: Vec<String> = self.live_peer_ids().cloned().collect();
         let observers: std::collections::HashSet<String> = self
             .cluster_state
@@ -825,6 +892,54 @@ where
                     });
                 }
             }
+            // (#361) The CANDIDATE this node lent its vote to has died
+            // mid-election — death-observed via the snapshotted
+            // single-source `peer_death_observed` rule (membership
+            // departure ∩ beacon-silent ∩ seen-gate, self-excluded — the
+            // same evidence the `TimeoutQuery` responder reports on).
+            // Waiting any longer is a wedge: the dead candidate will never
+            // broadcast the winning `PrimaryChanged`, and on a small fleet
+            // there may be no OTHER candidate whose `PromotionVote` could
+            // re-pull this voter. RELEASE the vote — revert to Suspecting
+            // — and let the normal election machinery re-run: the re-poll
+            // gathers fresh peer agreement and the next tally's
+            // lowest-live-id selection no longer sees the departed
+            // candidate (`live_peer_ids` intersects the same membership
+            // view), so a SURVIVOR emerges as the new candidate — possibly
+            // this node, possibly alone via the single-survivor
+            // self-quorum.
+            //
+            // NO CHURN on a blip: the observation is a LIVE `has_peer` +
+            // beacon read at tick time (non-latching, the #331 shape), so
+            // a transient departure+rejoin, or a CPU-starved-but-alive
+            // candidate still beaconing, reads alive again and the guard
+            // never fires — a live candidate's election proceeds untouched
+            // through the `_` arm below.
+            //
+            // The `mesh_degraded` lone-secondary guard needs no mirror
+            // here: `degraded` latches only at FORMATION time (zero peers
+            // ever meshed — see `mesh_watchdog`), and a node in Voting
+            // necessarily meshed (the vote/quorum traffic arrived over the
+            // mesh), so the re-entered Suspecting machinery runs strictly
+            // downstream of that guard exactly as any armed election does.
+            ElectionState::Voting { round, candidate } if voting_candidate_dead => {
+                tracing::warn!(
+                    secondary = %secondary_id,
+                    candidate = %candidate,
+                    round,
+                    "candidate death observed mid-election (departed the mesh, \
+                     beacon silent); releasing vote and re-entering Suspecting"
+                );
+                op.election = ElectionState::Suspecting {
+                    since: Instant::now(),
+                    responses: HashMap::new(),
+                };
+                // Re-ask the fleet about the still-silent primary — the
+                // same entering-Suspecting emit the Normal arm fires,
+                // through the single query-builder so the sites cannot
+                // drift.
+                push_timeout_query(&mut actions.broadcast, &secondary_id, current_primary_id);
+            }
             _ => {}
         }
         actions
@@ -893,7 +1008,7 @@ where
         let current_primary = self.cluster_state.current_primary().map(str::to_owned);
         let beacon_fresh = current_primary
             .as_deref()
-            .map(|id| self.primary_beacon_fresh(id))
+            .map(|id| self.node_beacon_fresh(id))
             .unwrap_or(false);
         let primary_silent = (frame_silent || membership_departed) && !beacon_fresh;
         if !primary_silent {

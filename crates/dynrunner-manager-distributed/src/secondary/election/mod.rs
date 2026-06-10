@@ -10,6 +10,7 @@
 //!   Suspecting ──quorum agrees + a peer is lower──> Voting
 //!   Candidate  ──majority confirms──> Promoted
 //!   Voting     ──saw winner's first task list──> Normal (new primary tracked)
+//!   Voting     ──candidate death observed (#361)──> Suspecting (vote released)
 //!   any state  ──primary keepalive arrives──> Normal
 //! ```
 //!
