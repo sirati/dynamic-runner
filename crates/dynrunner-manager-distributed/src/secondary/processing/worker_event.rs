@@ -525,6 +525,43 @@ where
                         predecessor_outputs,
                     } = pending;
                     let log_task_hash = file_hash.clone();
+                    // #360 gate: this continuation is a DISPATCH-shaped
+                    // bind (it puts work on a worker without the
+                    // authority's per-tick gate seeing it again), so it
+                    // re-consults the member-side half of the pairwise
+                    // dispatch-readiness predicate before binding. The
+                    // production bypass: the stash was taken while this
+                    // member's mesh leg to the current primary was
+                    // unconfirmed (or the primary identity changed across
+                    // the respawn, re-arming the confirmation), the
+                    // primary's own gate was actively withholding work
+                    // ("member remains unassignable until its mesh leg
+                    // confirms") — and this arm assigned anyway ("pending
+                    // first-bind assigned post-Ready"), running a task
+                    // whose terminal then swallowed on the half-formed
+                    // egress leg. An unconfirmed leg at Ready-time routes
+                    // the deferred task through the SAME reinject contract
+                    // every other deferred-loss edge uses
+                    // (`report_deferred_task_lost`, backpressure-shaped):
+                    // the authority requeues it for a confirmed member.
+                    // The worker is healthy (it reached Ready) and stays
+                    // idle — the periodic idle-repoll pulls fresh work
+                    // once the leg settles, and a re-dispatch of the same
+                    // type binds via the same-type fast path.
+                    if !self.mesh_leg_confirmed_for_bind().await {
+                        tracing::warn!(
+                            worker_id,
+                            task_hash = %log_task_hash,
+                            "pending first-bind NOT assigned post-Ready: this \
+                             member's mesh leg to the current primary is \
+                             unconfirmed, so a bound task's terminal could \
+                             swallow on the half-formed egress leg; reinjecting \
+                             the deferred task to the authority instead"
+                        );
+                        self.report_deferred_task_lost(worker_id, &log_task_hash)
+                            .await?;
+                        return Ok(None);
+                    }
                     let task_id_log = binary.task_id.clone();
                     let phase_log = binary.phase_id.clone();
                     let type_log = binary.type_id.clone();

@@ -153,19 +153,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// pre-loop waits (`wait_for_connections` / `wait_for_mesh_ready`) and
     /// the operational-loop entry sweep:
     ///
-    ///   - PRE-LOOP SELF-RECOVERY. A late `SecondaryCapacity` applied
-    ///     DURING a wait emits `TasksAdded` (via `react_to_capacity_growth`)
-    ///     onto the bus, but the operational loop — the usual drain — has
-    ///     not started yet, so the dispatch would be deferred past the
-    ///     wait. `wait_for_mesh_ready` would then block its full timeout on
-    ///     that late secondary's `MeshReady`, which it can only emit AFTER
-    ///     receiving an assignment. Draining + reacting inline dispatches
-    ///     the ready work to the freshly-rostered idle worker NOW, so the
-    ///     secondary gets a `TaskAssignment` → goes operational → emits
-    ///     `MeshReady` → unblocks the wait. The circular deadlock
-    ///     (assigned=0 ⇒ no operational remotes ⇒ no `MeshReady` ⇒ wait
-    ///     blocks) self-recovers without reverting rc-C's decoupling or
-    ///     moving the wait before assignment.
+    ///   - PRE-LOOP IN-WAIT SERVICING. `TasksAdded` signals emitted
+    ///     DURING a wait — a late `SecondaryCapacity` growing the roster
+    ///     (`react_to_capacity_growth`) or a `MeshReady` confirming a
+    ///     member into the assignable set (`handle_mesh_ready`'s
+    ///     confirmation-edge wakeup) — land on the bus, but the
+    ///     operational loop (the usual drain) has not started yet, so the
+    ///     dispatch recheck would be deferred past the wait and ready
+    ///     work would pool while admitted members idle. Draining +
+    ///     reacting inline dispatches NOW, per confirmation edge. (The
+    ///     `MeshReady` that `wait_for_mesh_ready` blocks on is not
+    ///     dispatch-driven: secondaries reach their operational loop via
+    ///     the ungated setup-trio fan-out and report from there.)
     ///
     ///   - ENTRY SWEEP. Any `TasksAdded` emitted across the pre-loop chain
     ///     (initial empty-phase cascade, a late capacity, an `on_phase_end`

@@ -1358,6 +1358,9 @@ async fn pending_first_bind_reinjects_when_mesh_leg_unconfirmed_at_ready() {
                 "expected Ready for worker 0; got {ready:?}"
             );
             secondary.handle_worker_event(ready, &oom).await.unwrap();
+            // MeshClient sends are QUEUED; flush them into the recorder's
+            // log before reading it (the make_secondary_recording contract).
+            secondary.drain_egress().await;
 
             // THE #360 assertion: the continuation must NOT bind work onto
             // the unconfirmed member ("pending first-bind assigned

@@ -173,25 +173,24 @@ fn drain_assignments(
 
 /// THE round-2 production composition. Promoted-primary shape (empty
 /// mesh-confirmation set, roster rebuilt from replicated capacity), six
-/// live members × 3 workers. A prior small phase ran one task on one
-/// member (so that member is in `members_dispatched_to`, exactly like
-/// the production unify phase). Every member's RE-ANNOUNCED `MeshReady`
+/// live members × 3 workers. Every member's RE-ANNOUNCED `MeshReady`
 /// (the frame the secondary-side fix emits on observing
 /// `PrimaryChanged`) arrives through the real inbound path — one of
 /// them TWICE, pinning that `handle_mesh_ready` tolerates the
-/// duplicates an idempotent re-announce can produce. Then a 12-task
-/// batch — fewer tasks than free slots — is injected mid-run through
-/// the real `spawn_tasks → TasksAdded → recheck` path.
+/// duplicates an idempotent re-announce can produce. A prior small
+/// phase then runs one task on one member (the production unify phase),
+/// and a 12-task batch — fewer tasks than free slots — is injected
+/// mid-run through the real `spawn_tasks → TasksAdded → recheck` path.
 ///
 /// Contract (the #349 spread contract, now on the injected path with
 /// the gate active): the WHOLE batch dispatches in the recheck,
 /// interleaved across members — exactly 2 per secondary, nothing left
 /// in the pool. WITHOUT the re-announces this exact shape degrades to
-/// the production pack: the prior-phase member is gate-blocked
-/// outright, every other member gets exactly ONE task before
-/// `originate_task_assigned` flips it into the gated class mid-tick,
-/// and 7 of 12 tasks strand in the pool with 13 workers idle (the
-/// withholding half is pinned by
+/// the production pack: every member is gate-blocked outright (the
+/// promoted primary's confirmation set is empty and, post-#360, there
+/// is no first-dispatch exemption to leak through) and the whole batch
+/// strands in the pool with all 18 workers idle (the withholding half
+/// is pinned by
 /// `injected_batch_withholds_from_member_whose_reannounce_never_arrived`).
 #[tokio::test(flavor = "current_thread")]
 async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
@@ -216,6 +215,30 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
                 .install_worker_mgmt_sender(wm_tx);
 
             seed_promoted_roster(&mut primary, &ids, 3);
+
+            // ── The fleet's re-announced MeshReady frames land (the
+            // secondary-side fix: every member that observed
+            // PrimaryChanged re-sends). One member's frame arrives TWICE
+            // — a duplicate the unconditional `handle_mesh_ready` insert
+            // must tolerate. Post-#360 these confirmations are what make
+            // the fleet assignable at all: the promoted primary's
+            // confirmation set starts EMPTY and there is no
+            // first-dispatch exemption, so nothing dispatches before
+            // this stage. ──
+            for id in &ids {
+                primary
+                    .dispatch_message(mesh_ready_from(id), &mut None)
+                    .await
+                    .expect("MeshReady dispatch");
+            }
+            primary
+                .dispatch_message(mesh_ready_from(&ids[0]), &mut None)
+                .await
+                .expect("duplicate MeshReady dispatch");
+            // Discard the confirmation-edge TasksAdded wakeups (nothing
+            // is in the pool yet) — each stage below must stand on its
+            // own signal.
+            while wm_rx.try_recv().is_ok() {}
 
             // ── Prior phase: one task, dispatched + completed on ONE member ──
             inject_and_recheck(&mut primary, &mut wm_rx, vec![ptask("u0")]).await;
@@ -250,22 +273,6 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
                 )
                 .await
                 .expect("TaskComplete dispatch");
-
-            // ── The fleet's re-announced MeshReady frames land (the
-            // secondary-side fix: every member that observed
-            // PrimaryChanged re-sends). The prior-phase member's frame
-            // arrives TWICE — a duplicate the unconditional
-            // `handle_mesh_ready` insert must tolerate. ──
-            for id in &ids {
-                primary
-                    .dispatch_message(mesh_ready_from(id), &mut None)
-                    .await
-                    .expect("MeshReady dispatch");
-            }
-            primary
-                .dispatch_message(mesh_ready_from(&unify_id), &mut None)
-                .await
-                .expect("duplicate MeshReady dispatch");
             // Discard any bus signals the pre-injection stages emitted —
             // the injection below must stand on its own TasksAdded.
             while wm_rx.try_recv().is_ok() {}
@@ -437,9 +444,16 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                 let loop_fut = primary.operational_loop();
                 tokio::pin!(loop_fut);
                 let driver = async {
-                    // The loop's entry sweep dispatches u0 (first-dispatch
-                    // exemption: no MeshReady needed for a never-
-                    // dispatched member). Find who got it.
+                    // Gate FULL first: every member's MeshReady arrives
+                    // through the real inbound. Post-#360 there is no
+                    // first-dispatch exemption — u0 dispatches only once
+                    // a member is confirmed, woken by the confirmation-
+                    // edge TasksAdded.
+                    for id in &ids {
+                        incoming.send(mesh_ready_from(id)).expect("inbound open");
+                    }
+
+                    // Find who got u0.
                     let mut u_member: Option<(usize, u32)> = None;
                     for _ in 0..500 {
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -454,13 +468,8 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                             break;
                         }
                     }
-                    let (u_idx, u_worker) = u_member.expect("entry sweep must dispatch u0");
-
-                    // Gate FULL: every member's MeshReady arrives through
-                    // the real inbound (the production +15s state).
-                    for id in &ids {
-                        incoming.send(mesh_ready_from(id)).expect("inbound open");
-                    }
+                    let (u_idx, u_worker) =
+                        u_member.expect("confirmation edge must dispatch u0");
 
                     // u0's terminal through the real inbound → the cascade
                     // fires on_phase_end("u") → the hook injects → the
@@ -563,13 +572,12 @@ async fn injected_batch_withholds_from_member_whose_reannounce_never_arrived() {
                 2,
             );
 
-            // BOTH members already got work (no first-dispatch exemption
-            // left). Only `confirmed`'s re-announced MeshReady arrives;
+            // Only `confirmed`'s re-announced MeshReady arrives;
             // `unconfirmed` KEEPALIVES (it is alive!) but its
             // confirmation never lands — its mesh leg is dead, the exact
-            // member the gate exists to withhold from.
-            primary.mark_member_dispatched_for_test(&confirmed_id);
-            primary.mark_member_dispatched_for_test(&unconfirmed_id);
+            // member the gate exists to withhold from. Post-#360 the
+            // gate keys on confirmation alone (no dispatched-to
+            // precondition).
             primary
                 .dispatch_message(mesh_ready_from(&confirmed_id), &mut None)
                 .await

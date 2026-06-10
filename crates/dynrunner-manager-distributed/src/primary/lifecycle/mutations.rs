@@ -155,16 +155,6 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         secondary: String,
         worker: u32,
     ) {
-        // Record that this member has now received at least one dispatch —
-        // the SINGLE writer of `members_dispatched_to`, shared by every
-        // origination site (initial-assignment + both operational dispatch
-        // paths). The dispatch-readiness gate
-        // (`should_skip_worker_for_dispatch` → `member_mesh_confirmed`)
-        // reads it to distinguish a member's first/bootstrap dispatch
-        // (always allowed) from a half-joined member that already got work
-        // and never confirmed its mesh leg (withheld). See the field doc on
-        // `members_dispatched_to`.
-        self.members_dispatched_to.insert(secondary.clone());
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskAssigned {
             hash: task_hash,
             secondary,

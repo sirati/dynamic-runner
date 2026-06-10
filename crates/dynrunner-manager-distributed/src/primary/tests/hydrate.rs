@@ -581,6 +581,12 @@ async fn dead_secondary_requeue_then_hydrate_dispatches_exactly_once() {
                 promoted.alive_worker_count_for_test() > 0,
                 "the surviving secondary's worker slot is reconstructed"
             );
+            // The surviving member's re-announced MeshReady has landed
+            // (the e3178916 secondary-side re-announce on PrimaryChanged)
+            // — the dispatch-readiness gate keys on confirmation alone,
+            // and this test's concern is the hydrate/requeue crossing,
+            // not the gate (pinned in mesh_readiness_gate.rs).
+            promoted.confirm_member_mesh_for_test("sec-0");
 
             // A single dispatch tick assigns the requeued task EXACTLY
             // ONCE to sec-live's free worker.
