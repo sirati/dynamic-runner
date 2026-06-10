@@ -25,6 +25,7 @@ mod dispatch_decoupling;
 mod e2e;
 mod hydrate;
 mod initial_assignment;
+mod mesh_readiness_gate;
 mod node_gates;
 mod oom_bucket;
 mod oploop_arm_hunt;

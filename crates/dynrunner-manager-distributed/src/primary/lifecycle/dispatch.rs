@@ -47,7 +47,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // `dispatch_order`) so a backpressure window or
             // single-worker-mode flip mid-tick takes effect
             // immediately.
-            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure) {
+            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure, false) {
                 continue;
             }
             // Dispatch-shape view pipeline: pool view → soft

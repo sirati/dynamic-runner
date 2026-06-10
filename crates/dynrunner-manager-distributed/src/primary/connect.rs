@@ -237,6 +237,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// cleared is
     /// idempotent — the set just stays full and the message is a
     /// no-op.
+    /// # Sole writer of the mesh-confirmation set
+    ///
+    /// `mesh_ready_secondaries` is the single source of truth for "has
+    /// this member confirmed its peer-mesh leg formed". This is its ONLY
+    /// insertion site, and it is UNCONDITIONAL — a `MeshReady` that lands
+    /// AFTER `wait_for_mesh_ready` already proceeded on the timeout (a
+    /// straggler that finished its dials late) STILL flips the member
+    /// confirmed here, so the dispatch gate keyed on
+    /// [`Self::member_mesh_confirmed`] recovers it into the assignable
+    /// set. Late join must recover — there is no one-shot guard.
     pub(super) fn handle_mesh_ready(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::MeshReady {
             target: None,
@@ -250,8 +260,72 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 peer_count,
                 "secondary reports mesh ready"
             );
-            self.mesh_ready_secondaries.insert(secondary_id);
+            let newly_confirmed = self.mesh_ready_secondaries.insert(secondary_id.clone());
+            if newly_confirmed {
+                // Name the CONSEQUENCE the silent-branch rule asks for: the
+                // dispatch gate that withheld work from this member
+                // (`member_mesh_confirmed` returned false for it) now lets
+                // it through — a late MeshReady recovers a member that the
+                // mesh-ready timeout left unassignable.
+                tracing::info!(
+                    secondary = %secondary_id,
+                    "member mesh leg confirmed; it is now assignable to proactive dispatch"
+                );
+            }
         }
+    }
+
+    /// THE single dispatch-readiness predicate every assignment path
+    /// consults: may proactive dispatch assign MORE work to
+    /// `secondary_id`, or is it a half-joined member whose mesh leg never
+    /// confirmed?
+    ///
+    /// Returns `true` (assignable) unless the member is BOTH:
+    ///   1. already dispatched-to ([`Self::members_dispatched_to`] — it
+    ///      got at least one task, so its first/bootstrap dispatch already
+    ///      happened), AND
+    ///   2. has NOT confirmed its peer-mesh leg formed
+    ///      (`mesh_ready_secondaries` — no `MeshReady` received).
+    ///
+    /// # Single owner of the dispatch readiness gate
+    ///
+    /// A member that got work but never confirmed its mesh leg is
+    /// half-joined: its terminals ride a half-formed mesh egress leg that
+    /// silently swallows them (route present at the transport `has_peer`
+    /// view, send returns `Ok`, but the frame never reaches the authority
+    /// — the run_20260610_105906 strand). Piling MORE work on it strands
+    /// each task and wedges the phase barrier. So it is withheld from
+    /// EVERY operational path until a `MeshReady` lands.
+    ///
+    /// The first/bootstrap dispatch is NEVER gated (condition 1): the
+    /// bring-up recovery during `wait_for_mesh_ready`
+    /// (`drain_and_react_to_pending_worker_signals`) dispatches to a member
+    /// that joined after the initial-assignment snapshot, and that dispatch
+    /// is precisely what drives it operational so it CAN emit the
+    /// `MeshReady` the wait blocks on — gating it would re-create the
+    /// assigned=0 deadlock. The terminal of that first dispatch, if the leg
+    /// IS half-formed, is caught by the secondary-side
+    /// buffered-terminal-replay (the Half-B honesty fix), so the
+    /// first-dispatch exemption never loses a terminal.
+    ///
+    /// The SOLE writer of `mesh_ready_secondaries` is
+    /// [`Self::handle_mesh_ready`] (unconditional, so a late `MeshReady`
+    /// recovers the member into the assignable set). The SOLE writer of
+    /// `members_dispatched_to` is `originate_task_assigned`.
+    ///
+    /// Read by [`Self::should_skip_worker_for_dispatch`] — the single
+    /// owner of the per-worker dispatch-skip decision — so BOTH
+    /// operational dispatch paths (`dispatch_to_idle_workers` and
+    /// `handle_task_request`) gate on this ONE predicate without either
+    /// site knowing the mesh-readiness rule.
+    pub(super) fn member_mesh_confirmed(&self, secondary_id: &str) -> bool {
+        // Not-yet-dispatched member: its first (bootstrap) dispatch is
+        // always allowed.
+        if !self.members_dispatched_to.contains(secondary_id) {
+            return true;
+        }
+        // Already got work: must have confirmed its mesh leg to get more.
+        self.mesh_ready_secondaries.contains(secondary_id)
     }
 
     pub(super) async fn handle_welcome(&mut self, msg: DistributedMessage<I>) {

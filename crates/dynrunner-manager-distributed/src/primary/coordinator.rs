@@ -627,8 +627,30 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// newly-named primary becomes authoritative against a still-
     /// forming peer mesh and every pre-mesh-formation message goes
     /// nowhere. Recorded by `handle_mesh_ready`; consumed by
-    /// `wait_for_mesh_ready`.
+    /// `wait_for_mesh_ready` AND the dispatch-readiness predicate
+    /// [`Self::member_mesh_confirmed`].
     pub(super) mesh_ready_secondaries: HashSet<String>,
+
+    /// Set of secondary ids that have ALREADY received at least one task
+    /// dispatch (initial-assignment OR an operational dispatch). Recorded
+    /// by the single origination point `originate_task_assigned`.
+    ///
+    /// # Why this gates the strand without deadlocking bootstrap
+    ///
+    /// A member's FIRST dispatch must be allowed unconditionally: the
+    /// bring-up recovery (`drain_and_react_to_pending_worker_signals`
+    /// during `wait_for_mesh_ready`) dispatches to a member that joined
+    /// after the initial-assignment snapshot — that very dispatch is what
+    /// drives it operational so it CAN emit the `MeshReady` the wait
+    /// blocks on. Gating the first dispatch on `MeshReady` would deadlock
+    /// that recovery (the assigned=0 hang). So the readiness gate
+    /// (`member_mesh_confirmed`) is consulted only for a member ALREADY in
+    /// this set: it got work, had its chance to confirm its leg, and still
+    /// hasn't — the half-joined strand member (sec-2 in
+    /// run_20260610_105906) whose terminals swallow on a half-formed mesh
+    /// egress leg. Its FURTHER dispatch is withheld until `MeshReady`
+    /// lands.
+    pub(super) members_dispatched_to: HashSet<String>,
 
     // primary promotion
     pub(super) primary_id: Option<String>,
@@ -1161,6 +1183,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
+            members_dispatched_to: HashSet::new(),
             primary_id: None,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
@@ -1827,9 +1850,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// True iff the worker at `worker_idx` must be skipped this
-    /// dispatch tick. Composes the two reasons-to-skip the dispatch
+    /// dispatch tick. Composes the reasons-to-skip the dispatch
     /// pipeline knows about today:
     ///
+    ///   * The worker's secondary is a half-joined member: it already got
+    ///     work but never confirmed its peer-mesh leg
+    ///     ([`Self::member_mesh_confirmed`]). PROACTIVE dispatch only — a
+    ///     member whose mesh leg is unformed silently swallows its
+    ///     terminals on the half-formed egress leg, so PUSHING more work to
+    ///     it strands the task and wedges the phase barrier (the
+    ///     run_20260610_105906 strand).
     ///   * The worker's secondary is in backpressure backoff
     ///     ([`Self::is_backpressured`]).
     ///   * OOM-bucket single-worker mode is active and this is not
@@ -1852,12 +1882,45 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// The per-`TaskRequest` path and the periodic/non-signal kickstart
     /// pass `false` so a secondary that just said "no idle worker"
     /// isn't immediately re-hammered by its own request retry.
+    ///
+    /// `request_driven` lifts the mesh-confirmation gate: a
+    /// `TaskRequest` that ARRIVED is itself direct proof the member's
+    /// uplink to the primary delivers (the half-joined strand member
+    /// could NOT send requests — they swallowed on the same wedged leg —
+    /// so it never reaches this path). Honouring a request that
+    /// demonstrably reached us can never strand on an unreachable
+    /// member, so the reactive caller (`handle_task_request`) passes
+    /// `true`. The PROACTIVE caller (`dispatch_to_idle_workers`, which
+    /// PUSHES work to an idle worker that did NOT ask) passes `false`:
+    /// that is the bypass the production strand rode, and the gate
+    /// withholds work from a half-joined member there.
     pub(super) fn should_skip_worker_for_dispatch(
         &self,
         worker_idx: usize,
         bypass_backpressure: bool,
+        request_driven: bool,
     ) -> bool {
         let sec_id = self.workers[worker_idx].secondary_id.as_str();
+        // Mesh-confirmation gate — PROACTIVE push only (a request that
+        // arrived is its own proof of a working leg, so `request_driven`
+        // lifts it). An unconfirmed member that already got work is
+        // unassignable to a proactive push until a `MeshReady` lands
+        // (`member_mesh_confirmed` flips true) and recovers it. WARN names
+        // the member + the consequence per the silent-branch rule; it fires
+        // only for a genuinely half-joined member (the rare fault path), so
+        // a tail-of-phase recheck against it is the exact signal an operator
+        // wants to see.
+        if !request_driven && !self.member_mesh_confirmed(sec_id) {
+            tracing::warn!(
+                secondary = %sec_id,
+                worker_id = self.workers[worker_idx].worker_id,
+                "member remains unassignable until its mesh leg confirms \
+                 (got work but no MeshReady received); skipping proactive \
+                 dispatch to avoid stranding the task on its half-formed \
+                 egress leg"
+            );
+            return true;
+        }
         if !bypass_backpressure && self.is_backpressured(sec_id) {
             return true;
         }
@@ -2644,6 +2707,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// handshaked pre-promotion); the dispatch hazard test seeds a
     /// worker directly so it can drive `dispatch_to_idle_workers` and
     /// assert the resulting `TaskAssignment` routes over the loopback.
+    ///
+    /// A worker registered here models a FULLY-OPERATIONAL member, so it
+    /// is also marked mesh-confirmed (the `MeshReady` the welcome handshake
+    /// would have delivered) — otherwise the dispatch-readiness gate in
+    /// `should_skip_worker_for_dispatch` would correctly withhold work from
+    /// it. A test that wants to exercise the half-joined (unconfirmed)
+    /// member uses [`Self::mark_member_mesh_unconfirmed_for_test`] to undo
+    /// this.
     #[cfg(test)]
     pub fn register_idle_worker_for_test(
         &mut self,
@@ -2651,12 +2722,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         worker_id: u32,
         resource_budgets: ResourceMap,
     ) {
+        self.mesh_ready_secondaries.insert(secondary_id.clone());
         self.workers.push(RemoteWorkerState {
             worker_id,
             secondary_id,
             resource_budgets,
             state: SlotState::Idle,
         });
+    }
+
+    /// Test-only seam: model a HALF-JOINED member by dropping `secondary_id`
+    /// from the mesh-confirmation set, so `should_skip_worker_for_dispatch`
+    /// withholds work from its workers (the unformed-mesh-leg dispatch gate).
+    /// Pairs with [`Self::register_idle_worker_for_test`] (which marks every
+    /// registered member confirmed) to drive the strand-prevention test.
+    #[cfg(test)]
+    pub fn mark_member_mesh_unconfirmed_for_test(&mut self, secondary_id: &str) {
+        self.mesh_ready_secondaries.remove(secondary_id);
+    }
+
+    /// Test-only seam: deliver a member's `MeshReady` confirmation (the
+    /// late-join recovery edge) so a previously-unconfirmed member becomes
+    /// assignable. Mirrors what `handle_mesh_ready` does on the wire.
+    #[cfg(test)]
+    pub fn confirm_member_mesh_for_test(&mut self, secondary_id: &str) {
+        self.mesh_ready_secondaries.insert(secondary_id.to_string());
+    }
+
+    /// Test-only seam: mark a member as already-dispatched-to (mirrors what
+    /// `originate_task_assigned` records on a real dispatch) so the
+    /// first-dispatch exemption in `member_mesh_confirmed` no longer applies
+    /// — the half-joined member shape (got work + unconfirmed). Pairs with
+    /// [`Self::mark_member_mesh_unconfirmed_for_test`].
+    #[cfg(test)]
+    pub fn mark_member_dispatched_for_test(&mut self, secondary_id: &str) {
+        self.members_dispatched_to.insert(secondary_id.to_string());
     }
 
     /// Test-only inspector for whether the peer-lifecycle dispatcher
