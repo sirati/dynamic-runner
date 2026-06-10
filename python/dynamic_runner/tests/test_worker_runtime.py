@@ -35,6 +35,7 @@ from dynamic_runner.comm import (
     WorkerExceptionResponse,
 )
 from dynamic_runner.worker import (
+    PUBLISH_STRING_MAX_BYTES,
     NonRecoverableError,
     RecoverableError,
     Task,
@@ -676,6 +677,105 @@ class KeyedOutputsEndToEndTests(unittest.TestCase):
 
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0].predecessor_outputs, {})
+
+
+class PublishStringSizeLimitTests(unittest.TestCase):
+    """#364: the API-level size limit on ``Task.publish_string``.
+
+    A worker that published a ~55MB inline string wedged forever: the
+    oversize ``done:`` frame died downstream with no reply, leaving the
+    worker blocked and the task stranded. The fix contract pinned here:
+    the publish call RETURNS with a Python-visible error at the call
+    site (it never silently accepts a value that cannot survive the
+    wire), the error names the actual size and the limit and recommends
+    the file-publish path, and under-limit large values still flow
+    end-to-end.
+    """
+
+    def test_limit_constant_is_16_mib(self):
+        # The documented default. Rust owns the number
+        # (dynrunner_core::INLINE_VALUE_HARD_CAP_BYTES); Python only
+        # re-exports it. A change on either side must be deliberate.
+        self.assertEqual(PUBLISH_STRING_MAX_BYTES, 16 * 1024 * 1024)
+
+    def test_oversize_publish_string_raises_naming_size_and_limit(self):
+        # The merge gate: publish_string with an over-limit value must
+        # RETURN (raise) immediately — a Python-visible error — rather
+        # than accepting a value that strands the task downstream.
+        big = "x" * (PUBLISH_STRING_MAX_BYTES + 1)
+        t = Task(relative_path="/x")
+        with self.assertRaises(NonRecoverableError) as ctx:
+            t.publish_string("blob", big)
+        msg = str(ctx.exception)
+        # Names the actual size...
+        self.assertIn(str(PUBLISH_STRING_MAX_BYTES + 1), msg)
+        # ...and the limit...
+        self.assertIn(str(PUBLISH_STRING_MAX_BYTES), msg)
+        # ...and recommends the file-publish path for bulk artifacts.
+        self.assertIn("publish(", msg)
+        # The rejected value must NOT have entered the accumulator —
+        # otherwise the done-frame flush would still ship it.
+        self.assertEqual(t._outputs_accumulator, {})
+
+    def test_publish_string_at_exact_limit_is_accepted(self):
+        # Boundary: exactly PUBLISH_STRING_MAX_BYTES is allowed; the
+        # reject is strictly-greater-than.
+        val = "x" * PUBLISH_STRING_MAX_BYTES
+        t = Task(relative_path="/x")
+        t.publish_string("blob", val)
+        self.assertEqual(
+            t._outputs_accumulator["blob"]["value"], val
+        )
+
+    def test_limit_counts_utf8_bytes_not_codepoints(self):
+        # A multi-byte value whose CHARACTER count is under the limit
+        # but whose UTF-8 BYTE count is over must be rejected — the
+        # wire frame is bytes.
+        # '€' encodes to 3 bytes.
+        n_chars = (PUBLISH_STRING_MAX_BYTES // 3) + 1
+        val = "€" * n_chars
+        assert len(val) < PUBLISH_STRING_MAX_BYTES  # chars under
+        assert len(val.encode("utf-8")) > PUBLISH_STRING_MAX_BYTES
+        t = Task(relative_path="/x")
+        with self.assertRaises(NonRecoverableError):
+            t.publish_string("blob", val)
+
+    def test_oversize_mid_task_fails_task_loudly_and_loop_survives(self):
+        # Through the real runtime loop: a handler that lets the
+        # oversize reject propagate produces a loud NON_RECOVERABLE
+        # ErrorResponse on the wire (the task fails — not a silent
+        # strand), and the loop keeps serving subsequent commands.
+        def handle(task: Task):
+            task.publish_string("blob", "x" * (PUBLISH_STRING_MAX_BYTES + 1))
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        errors = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(errors[0].error_type, ErrorType.NON_RECOVERABLE)
+        self.assertIn(str(PUBLISH_STRING_MAX_BYTES), errors[0].error_message)
+        # No DoneResponse for the failed task.
+        self.assertEqual(
+            [r for r in comm.outbox if isinstance(r, DoneResponse)], []
+        )
+
+    def test_under_limit_8mb_value_flows_end_to_end(self):
+        # Don't break legitimate large outputs: an 8 MiB value (half
+        # the limit) must ride the accumulator → done-frame flush
+        # intact through the real loop.
+        val = "y" * (8 * 1024 * 1024)
+
+        def handle(task: Task):
+            task.publish_string("blob", val)
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+        decoded = json.loads(done[0].result_data.decode("utf-8"))
+        self.assertEqual(decoded["outputs"]["blob"]["value"], val)
 
 
 class RunStartSweepTests(unittest.TestCase):
