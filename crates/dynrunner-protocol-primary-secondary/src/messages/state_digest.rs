@@ -142,6 +142,19 @@ pub struct StateDigest {
     /// (P3): a divergent used-count at an equal hash is detected.
     #[serde(default)]
     pub unfulfillable_reinject_used_hash: u64,
+    /// Number of phases whose `on_phase_end` edge completed (#343
+    /// grow-only SET of `PhaseId`s, replicated via
+    /// `ClusterMutation::PhaseEnded`).
+    #[serde(default)]
+    pub phases_ended_count: u64,
+    /// XOR-fold over the ended-phase ids (#343): key-only, like
+    /// `secondary_capacities_hash` — the set carries no values, so the
+    /// key-set identity detects a missing entry. A peer that recorded an
+    /// end edge this replica lacks makes the replica behind; the snapshot
+    /// pull's union-merge heals it (and the promoted-primary no-redo
+    /// decision converges cluster-wide).
+    #[serde(default)]
+    pub phases_ended_hash: u64,
     /// Number of respawn-ledger entries (F7 grow-only SET).
     #[serde(default)]
     pub respawn_events_count: u64,
@@ -283,6 +296,15 @@ impl StateDigest {
                 self.unfulfillable_reinject_used_hash,
                 other.unfulfillable_reinject_used_count,
                 other.unfulfillable_reinject_used_hash,
+            )
+            // #343 grow-only SET of ended phases: count-OR-hash compare. A
+            // peer that recorded an end edge this replica lacks makes the
+            // replica behind; the snapshot pull's union-merge heals it.
+            || field_behind(
+                self.phases_ended_count,
+                self.phases_ended_hash,
+                other.phases_ended_count,
+                other.phases_ended_hash,
             )
             // F7 grow-only SET: count-OR-hash compare, same shape as the
             // other count-bearing fields. A peer that recorded a respawn

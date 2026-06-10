@@ -157,11 +157,13 @@ impl fmt::Display for RunError {
             Self::ClusterCollapsed { stranded, outcome } => write!(
                 f,
                 "{stranded} tasks left unassigned because cluster routing collapsed \
-                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} stranded={stranded})",
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
+                 skipped={sk} stranded={stranded})",
                 s = outcome.succeeded,
                 r = outcome.fail_retry,
                 o = outcome.fail_oom,
                 fi = outcome.fail_final,
+                sk = outcome.skipped,
             ),
             Self::PanikShutdown {
                 matched_path,

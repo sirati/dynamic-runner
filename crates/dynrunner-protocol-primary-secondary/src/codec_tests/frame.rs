@@ -172,6 +172,8 @@ fn roundtrip_all_message_types() {
                 unfulfillable_reinject_used_hash: 0xAA,
                 respawn_events_count: 4,
                 respawn_events_hash: 0xBB,
+                phases_ended_count: 1,
+                phases_ended_hash: 0xCC,
             },
         },
         DistributedMessage::TaskComplete {

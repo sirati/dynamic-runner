@@ -365,7 +365,15 @@ fn skipped_already_done_is_weakest_terminal_and_silent() {
     assert_eq!(c.failed, 0);
     let o = s.outcome_counts();
     assert_eq!(o.succeeded, 0, "a skip is NOT a success");
-    assert_eq!(o.total_terminal(), 0, "a skip is in neither outcome bucket");
+    assert_eq!(o.skipped, 1, "a skip is tallied in its OWN outcome bucket");
+    assert_eq!(
+        o.total_terminal(),
+        1,
+        "a skip IS a terminal, fully-accounted outcome — total_terminal must \
+         count it, or the finalize accounting (stranded = total - \
+         total_terminal) mis-classifies every skip as STRANDED and \
+         false-aborts a clean skip-bearing run as ClusterCollapsed"
+    );
 
     // iter_terminal surfaces it (dependents resolve against it).
     let terminal_ids: std::collections::HashSet<&str> =

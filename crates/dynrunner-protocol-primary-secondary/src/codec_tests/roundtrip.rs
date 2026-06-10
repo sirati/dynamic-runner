@@ -89,6 +89,8 @@ fn roundtrip_state_digest_payload() {
         unfulfillable_reinject_used_hash: 0xABCD_1234,
         respawn_events_count: 8,
         respawn_events_hash: 0xDEAD_C0DE,
+        phases_ended_count: 2,
+        phases_ended_hash: 0xFEED_FACE,
     };
     let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
         target: None,

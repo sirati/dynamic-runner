@@ -600,16 +600,26 @@ pub struct OutcomeSummary {
     pub fail_retry: usize,
     pub fail_oom: usize,
     pub fail_final: usize,
+    /// Discovery-time `SkippedAlreadyDone` terminals — a SUCCESS-LIKE
+    /// terminal kept in its OWN bucket: NOT folded into `succeeded` (the
+    /// run-complete summary / narrator success count must report only
+    /// work this run actually performed) and NOT any failure class. It IS
+    /// a terminal, fully-accounted outcome, so [`Self::total_terminal`]
+    /// includes it — without that, every skip would be mis-classified as
+    /// STRANDED by the finalize accounting (`stranded = total -
+    /// total_terminal()`) and a clean skip-bearing run would false-abort
+    /// as `ClusterCollapsed`.
+    pub skipped: usize,
 }
 
 impl OutcomeSummary {
     /// Sum across all buckets — the total tasks that reached a
-    /// terminal state (success or any failure). Distinct from
-    /// `total_tasks` on the coordinator, which counts the input
-    /// batch; `total_terminal()` reaches `total_tasks` exactly when
-    /// the run is fully accounted for.
+    /// terminal state (success, any failure, or a discovery-time
+    /// skip). Distinct from `total_tasks` on the coordinator, which
+    /// counts the input batch; `total_terminal()` reaches
+    /// `total_tasks` exactly when the run is fully accounted for.
     pub fn total_terminal(&self) -> usize {
-        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
+        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final + self.skipped
     }
 }
 

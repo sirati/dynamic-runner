@@ -496,6 +496,20 @@ impl<I: Identifier> ClusterState<I> {
                     }
                 }
             }
+            ClusterMutation::PhaseEnded { phase } => {
+                // Grow-only per-phase "end edge completed" fact (#343):
+                // set-insert, join = OR. `Applied` iff the phase was not
+                // yet recorded; a re-applied / redelivered `PhaseEnded` is
+                // a NoOp (idempotent under at-least-once delivery), and no
+                // transition ever removes a phase (sticky — the no-redo
+                // decision must never regress to re-firing a hook that
+                // already fired, #326).
+                if self.phases_ended.insert(phase) {
+                    ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
+                }
+            }
             ClusterMutation::TaskSkippedAlreadyDone { hash } => {
                 // Discovery-time skip: materialize the ledger entry DIRECTLY
                 // terminal. Authoritative spawn-time transition (like the

@@ -325,6 +325,22 @@ pub struct ClusterState<I> {
     /// Replicated via snapshot + AE digest, NOT a new `ClusterMutation`
     /// variant.
     pub(super) respawn_events: HashMap<String, super::types::RespawnEventRecord>,
+    /// Replicated "phase ended" facts (#343) — grow-only SET of the phases
+    /// whose `on_phase_end` edge COMPLETED on the authoritative primary
+    /// (hook fired + hook-queued commands drained + `mark_phase_done`
+    /// issued). Maintained by the `ClusterMutation::PhaseEnded` apply rule
+    /// (set-insert; join = OR/union). Read by the promoted-primary no-redo
+    /// decision (`hydrate_from_cluster_state`'s `seed_completed_phases`
+    /// filter): a terminal-only phase is seeded straight to `Done` —
+    /// suppressing a re-fire (#326) — ONLY when this set says the hook
+    /// already fired; otherwise the phase flows through the live cascade
+    /// and fires its FIRST `on_phase_end` (the freshly-discovered
+    /// all-`SkippedAlreadyDone` phase, whose terminal-only shape exists
+    /// from the moment it is seeded).
+    ///
+    /// Merge: grow-only SET union (never removes a phase). Replicated via
+    /// the live `PhaseEnded` broadcast + snapshot + AE digest.
+    pub(super) phases_ended: HashSet<PhaseId>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -371,6 +387,7 @@ where
             unfulfillable_reinject_used,
             respawn_events,
             phase_may_be_empty,
+            phases_ended,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -416,6 +433,8 @@ where
             unfulfillable_reinject_used: unfulfillable_reinject_used.clone(),
             // Replicated grow-only SET (F7) — clone preserves it.
             respawn_events: respawn_events.clone(),
+            // Replicated grow-only SET (#343) — clone preserves it.
+            phases_ended: phases_ended.clone(),
         }
     }
 }
@@ -455,6 +474,7 @@ where
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            phases_ended,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -484,6 +504,7 @@ where
                 &unfulfillable_reinject_used.len(),
             )
             .field("respawn_events", &respawn_events.len())
+            .field("phases_ended", phases_ended)
             .finish()
     }
 }
@@ -516,6 +537,7 @@ impl<I> Default for ClusterState<I> {
             retry_passes_used: HashMap::new(),
             unfulfillable_reinject_used: HashMap::new(),
             respawn_events: HashMap::new(),
+            phases_ended: HashSet::new(),
         }
     }
 }

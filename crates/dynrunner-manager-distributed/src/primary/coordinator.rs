@@ -3837,14 +3837,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 fail_retry = outcome.fail_retry,
                 fail_oom = outcome.fail_oom,
                 fail_final = outcome.fail_final,
+                skipped = outcome.skipped,
                 stranded,
                 total,
                 "{stranded} tasks left unassigned because cluster routing collapsed \
-                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} stranded={stranded})",
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
+                 skipped={sk} stranded={stranded})",
                 s = outcome.succeeded,
                 r = outcome.fail_retry,
                 o = outcome.fail_oom,
                 fi = outcome.fail_final,
+                sk = outcome.skipped,
             );
             return Err(RunError::ClusterCollapsed { stranded, outcome });
         }
@@ -4322,6 +4325,28 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // shutdown directly (decoupling law). See
                 // `phase_can_proceed` for the exact policy.
                 if self.phase_can_proceed(p) {
+                    // Originate the replicated "phase ended" fact (#343) at
+                    // the SAME decision point as `mark_phase_done` — the
+                    // fact is that call's replicated counterpart ("the end
+                    // edge COMPLETED: hook fired, hook-queued commands
+                    // drained, phase advancing"). A promoted primary's
+                    // hydrate consumes it to seed this phase straight to
+                    // `Done` WITHOUT re-firing `on_phase_end` (#326), while
+                    // its absence makes a never-ended terminal-only phase
+                    // (the fresh all-skipped shape) flow through the live
+                    // cascade and fire for the first time. Originated AFTER
+                    // `drain_callback_queued_commands` (above) so the
+                    // hook's injection mutations precede the fact on the
+                    // wire: a death in between re-fires the hook on the
+                    // next primary and the deterministic re-spawn is
+                    // absorbed by the idempotent failover-replay dedup —
+                    // the fail-SAFE side. NOT originated on the raise /
+                    // fail-loud branches: an end edge that did not complete
+                    // must REPLAY on the next primary, not be suppressed.
+                    self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PhaseEnded {
+                        phase: p.clone(),
+                    }])
+                    .await;
                     self.pool_mut().mark_phase_done(p);
                 } else {
                     self.cluster_state
