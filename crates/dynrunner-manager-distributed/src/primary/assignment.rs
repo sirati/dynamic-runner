@@ -67,11 +67,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // pre-sorted by `run()` (size DESC) and bucketed by
         // `(phase, type, affinity)`; per-worker visibility is the
         // `view_for_worker` slice the scheduler chooses from.
+        //
+        // Worker visit order is `dispatch_order` — the ONE owner of the
+        // dispatch-target ordering policy, shared with the operational
+        // recheck (`dispatch_to_idle_workers`) — so the initial batch
+        // interleaves grants across secondaries (least-projected-load
+        // round-robin) instead of relying on the roster Vec's layout
+        // for spread. On the cold all-idle roster the order coincides
+        // with the round-robin construction order; on a roster carrying
+        // inherited occupancy (promotion/resume) it correctly
+        // deprioritizes already-loaded secondaries, where the raw
+        // `0..len` scan it replaces ignored load entirely.
         let mut assignments_per_secondary: HashMap<String, Vec<(u32, TaskInfo<I>, ResourceMap)>> =
             HashMap::new();
         let mut total_assigned_resources = ResourceMap::new();
 
-        for worker_idx in 0..self.workers.len() {
+        for worker_idx in super::lifecycle::dispatch_order(&self.workers) {
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             let global_wid = self.workers[worker_idx].worker_id;
