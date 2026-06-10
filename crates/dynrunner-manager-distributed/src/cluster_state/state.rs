@@ -76,6 +76,21 @@ pub struct ClusterState<I> {
     /// on it too (failover has nothing left to guard once the run is
     /// aborting). Carries the abort reason for the PyO3-boundary log.
     pub(super) run_aborted: Option<String>,
+    /// Set by `ClusterMutation::GracefulAbortRequested`. The dispatch
+    /// FREEZE latch — sticky monotonic, like `run_complete`: once true,
+    /// no new work may leave the ready pool toward a worker anywhere in
+    /// the cluster; in-flight tasks run to completion, each secondary
+    /// tears down as its own work drains, and the run terminates with
+    /// the graceful-abort verdict (`run_complete ∧ graceful_abort` —
+    /// the verdict is the COMPOSITION of the two sticky facts).
+    /// Originated only by the authoritative primary on an observer's
+    /// `GracefulAbortRequest`; replicated (live broadcast + snapshot +
+    /// AE digest) so a failover-promoted primary INHERITS the freeze
+    /// and also refuses to schedule (the no-redo law). Consumed by
+    /// PRIMARY decisions (the dispatch-view gate, the respawn-admission
+    /// gate, the drain/relocate/terminal decisions) — the observer only
+    /// derives its reported verdict from the same fact.
+    pub(super) graceful_abort_requested: bool,
     /// Replicated "this run still owes discovery" fact (V6). Declared by
     /// the mode-2 seed BEFORE relocation; settled exactly once by the
     /// compute-peer primary's discover-on-promotion driver after it has
@@ -390,6 +405,7 @@ where
             phase_deps,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             role_table,
             // Deliberately not cloned — see field doc.
@@ -432,6 +448,8 @@ where
             phase_may_be_empty: phase_may_be_empty.clone(),
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Replicated sticky latch — clone preserves it (like `run_complete`).
+            graceful_abort_requested: *graceful_abort_requested,
             // Replicated CRDT data — clone preserves it (like `run_complete`).
             discovery_debt: *discovery_debt,
             role_table: role_table.clone(),
@@ -492,6 +510,7 @@ where
             phase_may_be_empty,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             role_table,
             role_change_hooks,
@@ -521,6 +540,7 @@ where
             .field("phase_may_be_empty", phase_may_be_empty)
             .field("run_complete", run_complete)
             .field("run_aborted", run_aborted)
+            .field("graceful_abort_requested", graceful_abort_requested)
             .field("discovery_debt", discovery_debt)
             .field("role_table", role_table)
             .field("role_change_hooks", &role_change_hooks.len())
@@ -559,6 +579,7 @@ impl<I> Default for ClusterState<I> {
             phase_may_be_empty: std::collections::HashSet::new(),
             run_complete: false,
             run_aborted: None,
+            graceful_abort_requested: false,
             discovery_debt: DiscoveryDebt::default(),
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),

@@ -80,6 +80,7 @@ fn roundtrip_state_digest_payload() {
         primary_epoch: 42,
         run_complete: true,
         run_aborted: true,
+        graceful_abort: true,
         discovery_debt: crate::DiscoveryDebt::Owed,
         phase_event_tallies_count: 9,
         phase_event_tallies_hash: 0x1357_2468,
@@ -437,6 +438,56 @@ fn roundtrip_request_run_config() {
             assert_eq!(sender_id, "sec-late");
         }
         _ => panic!("expected RequestRunConfig"),
+    }
+}
+
+/// `GracefulAbortRequest` (the observer's ONE management command) carries
+/// no payload beyond the routing/common fields; the round-trip pins the
+/// length-prefixed frame codec preserving the variant + `sender_id`.
+#[test]
+fn roundtrip_graceful_abort_request() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::GracefulAbortRequest {
+        target: None,
+        sender_id: "obs-1".into(),
+        timestamp: 42.0,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::GracefulAbortRequest { sender_id, .. } => {
+            assert_eq!(sender_id, "obs-1");
+        }
+        _ => panic!("expected GracefulAbortRequest"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes an observer emits — the internally-tagged
+/// `{"msg_type":"graceful_abort_request",...}` envelope with the
+/// `target: None` routing header elided via `skip_serializing_if` —
+/// rather than re-encoding our own value, so a tag/field divergence that
+/// still round-trips against itself is caught against the sender's
+/// actual bytes.
+#[test]
+fn graceful_abort_request_decodes_literal_sender_bytes() {
+    let literal =
+        r#"{"msg_type":"graceful_abort_request","sender_id":"obs-relocated","timestamp":3.5}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(literal).unwrap();
+
+    match decoded {
+        DistributedMessage::GracefulAbortRequest {
+            target,
+            sender_id,
+            timestamp,
+        } => {
+            assert!(target.is_none(), "elided target must decode as None");
+            assert_eq!(sender_id, "obs-relocated");
+            assert_eq!(timestamp, 3.5);
+        }
+        _ => panic!("expected GracefulAbortRequest"),
     }
 }
 
