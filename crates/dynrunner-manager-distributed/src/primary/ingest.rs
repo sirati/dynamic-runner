@@ -435,19 +435,16 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         let Some(reason) = self.pending_run_abort.take() else {
             return Ok(());
         };
-        // Same broadcast/apply/settle path as `RunComplete`, so the
-        // abort inherits the identical delivery semantics — the CRDT
-        // `run_aborted` flag lands on every connected secondary and its
-        // `process_tasks` loop returns `RunOutcome::Terminal` (projecting
-        // to `SecondaryTerminal::Aborted`).
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunAborted {
+        // The single terminal-verdict mechanism (#313) — same broadcast/
+        // apply/settle path as `RunComplete`, so the abort inherits the
+        // identical delivery semantics: the CRDT `run_aborted` flag lands
+        // on every connected secondary and its `process_tasks` loop
+        // returns `RunOutcome::Terminal` (projecting to
+        // `SecondaryTerminal::Aborted`).
+        self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
             reason: reason.clone(),
-        }])
+        })
         .await;
-        // Brief settle window so the broadcast lands before the
-        // dispatcher tears down its transport — the same
-        // `PRIMARY_BROADCAST_SETTLE` window the `RunComplete` path uses.
-        tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
         Err(RunError::DuplicateTaskIdPrePhase { reason })
     }
 

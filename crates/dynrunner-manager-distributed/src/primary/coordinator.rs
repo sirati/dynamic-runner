@@ -3330,6 +3330,18 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // backend (in-process mpsc AND SLURM QUIC) — no longer
                 // "unreachable" for any topology.
                 let Some(chosen) = self.select_relocation_target() else {
+                    // #313 — terminal RUN VERDICT before exiting. The fleet
+                    // `wait_for_connections` registered is CONNECTED but NO
+                    // peer advertised `can_be_primary`, so an election can
+                    // NEVER produce a primary — failover cannot salvage this
+                    // run. Without the verdict the connected non-promotable
+                    // secondaries / observers idle into their own timeouts
+                    // holding SLURM slots. Same reason string as the local
+                    // error so both sides of the wire agree.
+                    self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
+                        reason: RunError::NoRelocationTarget.to_string(),
+                    })
+                    .await;
                     return Err(RunError::NoRelocationTarget);
                 };
                 self.relocate_primary_to(chosen).await;
@@ -3593,7 +3605,9 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// operational loop,
     /// the structured-abort checks (panik / worker-mgmt-fail /
     /// setup-deadline), the retry passes, final accounting, and the
-    /// `RunComplete` broadcast + settle window.
+    /// terminal RUN VERDICT broadcast + settle window (`RunComplete` /
+    /// `RunAborted` — see `broadcast_terminal_verdict` for the #313
+    /// verdict-vs-failover exit-path classification).
     ///
     /// The task count is read LIVE from `self.total_tasks` (refreshed by
     /// `hydrate_from_cluster_state` on every seed, including discovery's
@@ -3640,6 +3654,22 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 error = %outcome,
                 "primary run aborted by worker-management run-should-fail signal"
             );
+            // #313 — the terminal RUN VERDICT. This latch is a DELIBERATE
+            // fail-loud terminal (a `RunShouldFail` / `PolicyFatalExit`
+            // policy decision over replicated facts — a promoted successor
+            // would inherit the same facts and re-decide it), so broadcast
+            // the failure twin of `RunComplete` before exiting. Without it
+            // the primary just vanished: the secondaries idled into their
+            // own timeouts and the observer reported nothing (the "fatal
+            // error lost" class). Best-effort by design — see
+            // `broadcast_terminal_verdict` for the full exit-path
+            // classification (panik and generic `Other` bootstrap/transport
+            // failures deliberately do NOT broadcast: those are failover's
+            // jurisdiction).
+            self.broadcast_terminal_verdict(ClusterMutation::RunAborted {
+                reason: outcome.to_string(),
+            })
+            .await;
             return Err(outcome);
         }
 
@@ -3683,33 +3713,13 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // through to the spawn-rejection backstop + clean-finish tail below.
         self.finalize_terminal_accounting().await?;
 
-        // Loud-fail backstop for the silent zero-dispatch path. A runtime
-        // `spawn_tasks` batch (typically `on_phase_end` spawning the next
-        // phase) whose EVERY task the validator rejected nets that phase
-        // ZERO dispatch — `apply_spawn_tasks` never refreshed `total_tasks`,
-        // so `run_complete_check`'s counter exit tripped against the
-        // pre-spawn total and the run reached this clean tail with that
-        // planned work silently dropped (the asm-dataset-nix c39034f2
-        // producer-path silent total=0). Surfacing it as a structured
-        // `RunError::SpawnRejected` makes the submitter's PyO3 boundary
-        // RAISE instead of returning rc=0 — a non-empty spawn plan that
-        // dispatched nothing must never present as a clean run.
-        //
-        // Sequenced AFTER the strand check (a routing collapse is the
-        // stronger terminal and already raises). The per-index `SpawnError`
-        // the consumer received from `spawn_tasks` is unchanged; this is
-        // the run-level net the consumer's per-task WARN-and-continue
-        // otherwise slips through.
-        if !self.spawn_rejected_task_ids.is_empty() {
-            let rejected_task_ids = std::mem::take(&mut self.spawn_rejected_task_ids);
-            tracing::error!(
-                rejected = rejected_task_ids.len(),
-                "runtime spawn_tasks rejected every task in a batch — the \
-                 phase dispatched ZERO tasks and the run would otherwise have \
-                 exited rc=0 with that planned work silently dropped"
-            );
-            return Err(RunError::SpawnRejected { rejected_task_ids });
-        }
+        // The wholesale spawn-rejection backstop lives INSIDE
+        // `finalize_terminal_accounting` (it is final ledger state, and the
+        // terminal-verdict broadcast must match the local return — #313):
+        // a non-empty `spawn_rejected_task_ids` made the call above
+        // broadcast `RunAborted` and return `Err(RunError::SpawnRejected)`,
+        // which the `?` propagated. Reaching here means a genuinely clean
+        // finish.
 
         let outcome = self.outcome_summary();
         tracing::info!(
@@ -3819,41 +3829,43 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // signal).
         //
         // The variant is gated on the terminal fact: a routing collapse
-        // (`stranded > 0`) broadcasts `RunAborted { reason }`, a clean run
-        // broadcasts `RunComplete`. Both settle identically — same
-        // `apply_and_broadcast_cluster_mutations` pipeline + the
-        // `PRIMARY_BROADCAST_SETTLE` window below — and both are terminal
-        // for a straggler secondary (`RunAborted` → `SecondaryTerminal::
-        // Aborted`, `RunComplete` → done), so either way every peer still
-        // on the mesh releases its SLURM slot. The honest variant is what
-        // makes the strand reach the observer's important channel: the
-        // narrator projects `RunAborted` to "run aborted — …" on
-        // `IMPORTANT_TARGET` (a `RunComplete` would have narrated a false
-        // success over a collapsed cluster). The local `run()` return is
-        // unchanged — only the peer-facing broadcast becomes honest.
+        // (`stranded > 0`) broadcasts `RunAborted { reason }`, a wholesale
+        // runtime spawn rejection broadcasts `RunAborted` (#313 — pre-fix
+        // it broadcast a FALSE `RunComplete`, so the fleet/observer
+        // narrated a clean success while the primary exited non-zero), and
+        // a clean run broadcasts `RunComplete`. All settle identically —
+        // `broadcast_terminal_verdict` is the single mechanism (see its
+        // doc for the full verdict-vs-failover exit-path classification) —
+        // and each is terminal for a straggler secondary (`RunAborted` →
+        // `SecondaryTerminal::Aborted`, `RunComplete` → done), so either
+        // way every peer still on the mesh releases its SLURM slot. The
+        // honest variant is what makes the failure reach the observer's
+        // important channel: the narrator projects `RunAborted` to "run
+        // aborted — …" on `IMPORTANT_TARGET` (a `RunComplete` would have
+        // narrated a false success). The local `run()` return is unchanged
+        // — only the peer-facing broadcast becomes honest.
         //
-        // `reason` reuses the `RunError::ClusterCollapsed` Display render
-        // (the per-class succeeded/fail_retry/fail_oom/fail_final/stranded
-        // breakdown); `outcome` is `Copy`, so the later `ClusterCollapsed`
-        // return is unaffected.
+        // Priority: the strand is the stronger terminal (a collapse may
+        // ALSO leave spawn-rejection residue; the collapse names the root
+        // cause). `reason` reuses the corresponding `RunError` Display
+        // render (the per-class breakdown / the rejected-id list), so the
+        // primary-side exception and the peer-side report agree; `outcome`
+        // is `Copy`, so the later `ClusterCollapsed` return is unaffected.
         let terminal_mutation = if stranded > 0 {
             ClusterMutation::RunAborted {
                 reason: RunError::ClusterCollapsed { stranded, outcome }.to_string(),
             }
+        } else if !self.spawn_rejected_task_ids.is_empty() {
+            ClusterMutation::RunAborted {
+                reason: RunError::SpawnRejected {
+                    rejected_task_ids: self.spawn_rejected_task_ids.clone(),
+                }
+                .to_string(),
+            }
         } else {
             ClusterMutation::RunComplete
         };
-        self.apply_and_broadcast_cluster_mutations(vec![terminal_mutation])
-            .await;
-
-        // Brief settle window so the broadcast lands on every
-        // secondary before the dispatcher tears down its transport.
-        // Without this, fast dispatcher exits race the broadcast and
-        // some peers miss the signal — the symptom is leftover SLURM
-        // jobs in CG state for the wrappers whose secondaries didn't
-        // see RunComplete. See `PRIMARY_BROADCAST_SETTLE` for the
-        // rationale (shared with the `RunAborted` path).
-        tokio::time::sleep(super::PRIMARY_BROADCAST_SETTLE).await;
+        self.broadcast_terminal_verdict(terminal_mutation).await;
 
         if stranded > 0 {
             tracing::error!(
@@ -3874,6 +3886,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 sk = outcome.skipped,
             );
             return Err(RunError::ClusterCollapsed { stranded, outcome });
+        }
+
+        // Loud-fail backstop for the silent zero-dispatch path. A runtime
+        // `spawn_tasks` batch (typically `on_phase_end` spawning the next
+        // phase) whose EVERY task the validator rejected nets that phase
+        // ZERO dispatch — `apply_spawn_tasks` never refreshed `total_tasks`,
+        // so `run_complete_check`'s counter exit tripped against the
+        // pre-spawn total and the run reached this tail with that planned
+        // work silently dropped (the asm-dataset-nix c39034f2 producer-path
+        // silent total=0). Surfacing it as a structured
+        // `RunError::SpawnRejected` makes the submitter's PyO3 boundary
+        // RAISE instead of returning rc=0 — a non-empty spawn plan that
+        // dispatched nothing must never present as a clean run. Sequenced
+        // AFTER the strand check (the stronger terminal); the matching
+        // `RunAborted` verdict was chosen by the SAME ladder above (#313),
+        // so the wire fact and the local return cannot diverge. The
+        // per-index `SpawnError` the consumer received from `spawn_tasks`
+        // is unchanged; this is the run-level net the consumer's per-task
+        // WARN-and-continue otherwise slips through.
+        if !self.spawn_rejected_task_ids.is_empty() {
+            let rejected_task_ids = std::mem::take(&mut self.spawn_rejected_task_ids);
+            tracing::error!(
+                rejected = rejected_task_ids.len(),
+                "runtime spawn_tasks rejected every task in a batch — the \
+                 phase dispatched ZERO tasks and the run would otherwise have \
+                 exited rc=0 with that planned work silently dropped"
+            );
+            return Err(RunError::SpawnRejected { rejected_task_ids });
         }
 
         Ok(())
