@@ -1025,14 +1025,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // without the per-worker cgroup they have nothing to read.
         //
         // When the cgroup setup itself fails (no cgroup-v2, missing
-        // memory controller, non-delegated subtree, read-only sysfs)
-        // the run aborts loudly: the operator explicitly opted into
-        // `--memprofile`, and silently degrading to "no profile
-        // files" would be a confusing failure mode. The graceful-
-        // fallback paths inside `cgroup::setup_worker_cgroup` already
-        // cover the three "expected" missing-env conditions (returning
-        // `Ok(None)` + warn); anything past those is a genuine
-        // environment problem the operator should fix.
+        // memory controller, non-delegated subtree, any errno from
+        // the subgroup writes) the run proceeds on the flat layout:
+        // `cgroup::setup_worker_cgroup` degrades EVERY failure to
+        // `None` + one warn line naming the refused operation. The
+        // memprofile sampler then has no per-worker leaves to read —
+        // the warn line is the operator's signal to fix the
+        // environment if profile files matter to them.
         let mem_manager_reserved_bytes = if self.config.output_dir.is_some() {
             Some(0)
         } else {
