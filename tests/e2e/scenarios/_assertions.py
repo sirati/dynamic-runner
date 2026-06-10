@@ -48,6 +48,21 @@ def expected_canonical_outputs(num_tasks: int) -> list[str]:
     return out
 
 
+def expected_framework_outputs(num_tasks: int) -> list[str]:
+    """Filenames the produce worker delivers under its framework
+    ``--output`` directory (the explicit-dst publish exercise).
+
+    Mirrors the ``produce-{idx}.framework-out`` literal in
+    :func:`tests.e2e.test_consumer.worker._produce`. Scenarios assert
+    these against the OPERATOR's ``--output`` path: on same-host
+    dispatch modes the framework-derived per-secondary
+    ``output_dir`` must BE that directory (the SLURM-production
+    semantic, where every secondary's publish target is the one
+    user-visible bind-mounted dir).
+    """
+    return [f"produce-{i}.framework-out" for i in range(num_tasks)]
+
+
 def assert_no_partial_files(
     publish_dst: Path,
     *,
