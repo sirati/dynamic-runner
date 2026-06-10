@@ -203,21 +203,22 @@ where
                 sender_id,
                 ..
             } => {
-                // Respond with how STALE our last keepalive of the queried
-                // node is — a monotonic AGE in seconds, NOT an absolute
-                // wall-clock timestamp. We hold the receipt-time `Instant`
-                // locally (process-private; cannot cross the wire), so we
-                // convert it to a relative age here. The querier compares that
-                // age against its death deadline without any cross-node
-                // wall-clock subtraction, so a coordinated suspend/resume can't
-                // make a fresh peer look stale (or vice-versa). `None` =
-                // "never seen", same "agrees the node is silent" meaning as
-                // before. See `TimeoutResponse::last_keepalive` doc.
-                let last_keepalive = self
-                    .op_mut()
-                    .peer_keepalives
-                    .get(&query_node_id)
-                    .map(|t| t.elapsed().as_secs_f64());
+                // Respond with this node's liveness EVIDENCE about the
+                // queried node. `Some(age)`: how STALE our last keepalive
+                // of a still-mesh-member node is — a monotonic AGE in
+                // seconds, NOT an absolute wall-clock timestamp (we hold
+                // the receipt-time `Instant` locally; the querier compares
+                // the relative age against its death deadline without any
+                // cross-node wall-clock subtraction, so a coordinated
+                // suspend/resume can't make a fresh peer look stale or
+                // vice-versa). `None` = NO liveness evidence — never seen,
+                // OR (#331) seen and then watched DEPART the transport
+                // membership with its beacon also silent — either way the
+                // "agrees the node is silent" meaning the tally consumes.
+                // The evidence rule is the election's own single source
+                // (`queried_node_liveness_age`); this arm only carries it
+                // onto the wire. See `TimeoutResponse::last_keepalive` doc.
+                let last_keepalive = self.queried_node_liveness_age(&query_node_id);
                 let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
                     target: None,
                     sender_id: self.config.secondary_id.clone(),

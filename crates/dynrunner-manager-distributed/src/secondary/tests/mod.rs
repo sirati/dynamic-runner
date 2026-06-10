@@ -54,6 +54,13 @@
 //!   failover's dead lowest-id primary on the SECOND failover; it self-leads
 //!   and promotes (vs. wedging the full reaper window). A still-MEMBER lowest-id
 //!   peer is correctly still deferred to (no over-exclude).
+//! - [`deferrer_membership_death`] — #331 deferrer-side death-observation
+//!   on membership-departure: a peer asked to lend its failover agreement
+//!   (`TimeoutResponse` / `PromotionConfirm`) treats the current primary's
+//!   transport membership-departure as its own death observation — the
+//!   deferrer-side twin of arming leg (C) — so failover converges without
+//!   each survivor waiting out its frame-silence death deadline. A
+//!   non-primary departure and a departure+rejoin blip change nothing.
 //! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
 //!   current-primary keepalive refreshes `primary_last_seen`; any other
 //!   peer's keepalive feeds `peer_keepalives`.
@@ -77,6 +84,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod deferrer_membership_death;
 mod failover_beacon_union;
 mod failover_lone_survivor;
 mod failover_membership;
