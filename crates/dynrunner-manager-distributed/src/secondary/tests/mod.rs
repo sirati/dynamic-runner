@@ -77,6 +77,7 @@ mod failover_lone_survivor;
 mod failover_membership;
 mod failover_multi_survivor;
 mod failover_second_round;
+mod firstbind_orphan;
 mod generation_gate;
 mod honest_liveness;
 mod keepalive_emission;

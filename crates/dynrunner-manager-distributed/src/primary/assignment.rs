@@ -249,6 +249,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 .map(|(worker_id, binary, _)| (compute_task_hash(binary), *worker_id))
                 .collect();
             for (task_hash, worker_id) in assigned_inflight {
+                // Operator-facing per-task INFO, same shape/fields as the
+                // two live dispatch sites (`lifecycle/dispatch.rs`,
+                // `task/request.rs`): one line per task naming which
+                // secondary/worker took it. The aggregate "initial
+                // assignment complete" emit below carries only the TOTAL,
+                // so without this the initial batch records no per-task
+                // "assigned" line — breaking the assigned-vs-terminal set
+                // forensics (obs-3) that diffs each "task assigned" hash
+                // against its terminal report.
+                tracing::info!(
+                    secondary = %secondary_id,
+                    worker_id,
+                    task_hash = %task_hash,
+                    "task assigned"
+                );
                 self.originate_task_assigned(task_hash, secondary_id.clone(), worker_id)
                     .await;
             }
