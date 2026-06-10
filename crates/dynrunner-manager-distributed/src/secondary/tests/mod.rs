@@ -109,6 +109,7 @@ mod panik_integration;
 mod peer_mesh_watchdog;
 mod processing;
 mod r1;
+mod relocation_handoff_race;
 mod run_config_responder;
 mod terminal_ack;
 mod voting_candidate_death;
