@@ -578,19 +578,25 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// unboundedly on a hook-less consumer). Installed pre-run via
     /// [`Self::set_custom_message_handler`].
     pub(super) on_custom_message: Option<OnCustomMessage>,
-    /// Node-local per-message handler-raise bookkeeping (F5 poison
-    /// policy): consecutive raise count + the backoff deadline for the
-    /// next retry, keyed by the `(origin, seq)` inbox key. NOT
-    /// replicated by design (fork F5-c): a failover resets strikes,
-    /// which is fail-safe — the new primary's handler may well succeed.
-    /// Entries are dropped on a clean handler return and at the poison
-    /// cap.
-    pub(super) custom_handler_strikes:
-        HashMap<(String, u64), crate::primary::custom_message::CustomHandlerBackoff>,
-    /// Backoff base for handler-raise retries (F5): retry `n` waits
-    /// `base × 2^(n-1)`. A field (not a const) so tests drive
-    /// sub-second schedules; production keeps the default.
-    pub(super) custom_handler_backoff_base: std::time::Duration,
+    /// Mutation-capture sink (F5 atomicity): `Some` only inside the
+    /// atomic effect+terminal window opened by
+    /// [`Self::begin_mutation_capture`] — while armed, every
+    /// `apply_and_broadcast_cluster_mutations` call applies locally as
+    /// usual but appends its NoOp-filtered batch here instead of
+    /// broadcasting, and [`Self::take_mutation_capture`] hands the
+    /// accumulated batch to the one-frame flush
+    /// ([`Self::broadcast_applied_mutations`]). `None` on every other
+    /// path — the steady-state broadcast behaviour is unchanged.
+    pub(super) mutation_capture: Option<Vec<ClusterMutation<I>>>,
+    /// Node-local custom-message backlog monitor (F5 keep-up WARN):
+    /// first-observed instants per `Unhandled` inbox key + the
+    /// rate-limit state behind the "handler is not keeping up"
+    /// diagnostic. Observed on the heartbeat tick
+    /// ([`Self::observe_custom_backlog`]). NOT replicated by design —
+    /// posted-at wall-clock age is a node-local observation; a promoted
+    /// primary restarts the ages from first sight, which only DELAYS a
+    /// WARN, never fabricates one.
+    pub(super) custom_backlog_monitor: crate::primary::custom_message::CustomBacklogMonitor,
     /// The consumer's discovery policy for a relocated (mode-2) primary or
     /// an in-process `--source-already-staged` local primary, plus the
     /// phase graph it seeds alongside the discovered tasks. `None` on every
@@ -1219,9 +1225,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // real latch via `set_phase_hook_raise_latch`.
             phase_hook_raise_latch: PhaseHookRaiseLatch::detached(),
             on_custom_message: None,
-            custom_handler_strikes: HashMap::new(),
-            custom_handler_backoff_base:
-                crate::primary::custom_message::CUSTOM_HANDLER_BACKOFF_BASE,
+            mutation_capture: None,
+            custom_backlog_monitor: Default::default(),
             setup_discovery: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
@@ -4264,6 +4269,73 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 processed_since_yield = 0;
             }
         }
+    }
+
+    /// CAPTURING drain variant (F5 atomicity): drain + dispatch exactly
+    /// like [`Self::drain_callback_queued_commands`] — same chokepoint,
+    /// same FIFO, same yield budget, ZERO duplicated handler logic —
+    /// but with the coordinator's mutation-capture sink armed, then
+    /// apply `terminal` under the SAME capture before disarming.
+    ///
+    /// Every cluster mutation the drained commands originate
+    /// (transitively — including any cascade-fired `PhaseEnded` etc.)
+    /// is applied LOCALLY exactly as on the plain drain, but diverted
+    /// off the wire into the returned batch; `terminal` (the message's
+    /// `CustomMessageHandled` fact) is then routed through the same
+    /// `apply_and_broadcast_cluster_mutations` chokepoint, so it lands
+    /// LAST in the batch by construction — the effect mutations always
+    /// precede the terminal fact in the one flushed frame
+    /// (hook-mutations-before-the-fact, the `PhaseEnded` ordering
+    /// rule). The caller flushes the returned batch as ONE wire frame
+    /// via `broadcast_applied_mutations` — every replica applies the
+    /// handler's effect and the terminal together or not at all.
+    ///
+    /// Non-mutation side effects of the drained commands (pool
+    /// re-injection, the buffered `TasksAdded` worker-mgmt emits) still
+    /// happen during the drain, but their CONSUMERS (the operational
+    /// loop's worker-mgmt arm) only run after control returns to the
+    /// `select!` loop — i.e. after the caller's flush — so they fire
+    /// AFTER the batch lands, never before.
+    pub(super) async fn drain_callback_queued_commands_capturing(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        terminal: ClusterMutation<I>,
+    ) -> Vec<ClusterMutation<I>> {
+        self.begin_mutation_capture();
+        self.drain_callback_queued_commands(command_rx).await;
+        self.apply_and_broadcast_cluster_mutations(vec![terminal])
+            .await;
+        self.take_mutation_capture()
+    }
+
+    /// DISCARD drain variant (F5 all-or-nothing): drop every queued
+    /// command UNEXECUTED, rejecting each through
+    /// [`PrimaryCommand::reject`] so a caller blocked on its reply
+    /// learns the discard. Used when a `custom_message_handler` RAISED:
+    /// the handler's queued commands are its partial effect, and a
+    /// raising handler's effect must never land — not in the local
+    /// pool, not in the local CRDT, not on the wire (discarding
+    /// EXECUTED effects would be unsound: local applies leak through
+    /// snapshot anti-entropy). Returns the discard count for the
+    /// caller's structured ERROR.
+    ///
+    /// Scope note: the channel cannot distinguish provenance, so a
+    /// command a concurrent OS thread races onto it DURING the
+    /// (synchronous, GIL-holding) handler invocation would be discarded
+    /// with the handler's own — the dispatch decision pre-drains
+    /// bystanders before invoking precisely to keep that window at the
+    /// theoretical minimum.
+    pub(super) fn discard_callback_queued_commands(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        reason: &str,
+    ) -> usize {
+        let mut discarded = 0;
+        while let Some(cmd) = command_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            cmd.reject(reason);
+            discarded += 1;
+        }
+        discarded
     }
 
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`

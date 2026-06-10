@@ -345,28 +345,31 @@ pub struct ClusterState<I> {
     /// secondary→primary consumer messages, keyed by the per-origin
     /// `(origin, seq)` idempotency pair, each `Unhandled { topic, data }`
     /// (awaiting a `custom_message_handler` invocation on the primary)
-    /// or a `Handled` tombstone (payload dropped). Maintained by the
-    /// `CustomMessagePosted` / `CustomMessageHandled` apply rules (see
-    /// `apply_custom.rs` — vacant-insert / sticky-latch lattice).
+    /// or a terminal tombstone (`Handled` / `Failed`, payload dropped).
+    /// Maintained by the `CustomMessagePosted` / `CustomMessageHandled`
+    /// / `CustomMessageFailed` apply rules (see `apply_custom.rs` —
+    /// vacant-insert / sticky-latch lattice, Handled-wins join).
     /// Consumed by a PRIMARY decision: the handler-dispatch decision
     /// ("which messages do I still owe a handler invocation?") on both
     /// the live and the promoted primary (the promotion-replay
-    /// failover-safety the feature exists for). Replicated via the live
-    /// mutation broadcasts + snapshot + AE digest. NOT grow-only: the
-    /// per-origin watermark compaction physically prunes handled
-    /// tombstones (see `custom_handled_watermarks`).
+    /// failover-safety the feature exists for; `Failed` entries are
+    /// never replayed). Replicated via the live mutation broadcasts +
+    /// snapshot + AE digest. NOT grow-only: the per-origin watermark
+    /// compaction physically prunes terminal tombstones (see
+    /// `custom_terminal_watermarks`).
     pub(super) custom_messages: HashMap<(String, u64), super::types::CustomMsgState>,
-    /// Per-origin contiguous-prefix HANDLED watermark (F5 compaction):
+    /// Per-origin contiguous-prefix TERMINAL watermark (F5 compaction):
     /// `origin → w` asserts every seq in `1..=w` for that origin is
-    /// `Handled` AND physically pruned from `custom_messages`. A
-    /// grow-max register per origin (the house `grow_max` shape): the
-    /// apply-side compaction advances it over contiguous handled
-    /// tombstones; `Posted`/`Handled` re-applications at `seq <= w` are
+    /// terminal (`Handled` or `Failed` — the label is erased) AND
+    /// physically pruned from `custom_messages`. A grow-max register
+    /// per origin (the house `grow_max` shape): the apply-side
+    /// compaction advances it over contiguous terminal tombstones;
+    /// `Posted`/`Handled`/`Failed` re-applications at `seq <= w` are
     /// NoOps by watermark check; the restore merge takes the per-origin
     /// MAX and prunes the newly-subsumed local entries. Replicated via
     /// snapshot + AE digest (no mutation of its own — it is derived
-    /// from the `Handled` stream).
-    pub(super) custom_handled_watermarks: HashMap<String, u64>,
+    /// from the terminal stream).
+    pub(super) custom_terminal_watermarks: HashMap<String, u64>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -415,7 +418,7 @@ where
             phase_may_be_empty,
             phases_ended,
             custom_messages,
-            custom_handled_watermarks,
+            custom_terminal_watermarks,
         } = self;
         Self {
             tasks: tasks.clone(),
@@ -466,7 +469,7 @@ where
             // Replicated custom-message inbox + watermarks (F5) — clone
             // preserves them (replicated CRDT data, like `tasks`).
             custom_messages: custom_messages.clone(),
-            custom_handled_watermarks: custom_handled_watermarks.clone(),
+            custom_terminal_watermarks: custom_terminal_watermarks.clone(),
         }
     }
 }
@@ -508,7 +511,7 @@ where
             respawn_events,
             phases_ended,
             custom_messages,
-            custom_handled_watermarks,
+            custom_terminal_watermarks,
         } = self;
         f.debug_struct("ClusterState")
             .field("tasks", tasks)
@@ -540,7 +543,7 @@ where
             .field("respawn_events", &respawn_events.len())
             .field("phases_ended", phases_ended)
             .field("custom_messages", &custom_messages.len())
-            .field("custom_handled_watermarks", &custom_handled_watermarks.len())
+            .field("custom_terminal_watermarks", &custom_terminal_watermarks.len())
             .finish()
     }
 }
@@ -575,7 +578,7 @@ impl<I> Default for ClusterState<I> {
             respawn_events: HashMap::new(),
             phases_ended: HashSet::new(),
             custom_messages: HashMap::new(),
-            custom_handled_watermarks: HashMap::new(),
+            custom_terminal_watermarks: HashMap::new(),
         }
     }
 }

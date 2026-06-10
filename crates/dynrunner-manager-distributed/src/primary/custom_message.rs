@@ -2,34 +2,77 @@
 //! arm and the handler-DISPATCH decision over the replicated inbox.
 //!
 //! Single concern: WHO invokes the consumer's `custom_message_handler`,
-//! in WHAT order, and with WHAT poison policy. The replicated facts it
-//! reads/originates (`custom_messages` + the `CustomMessagePosted` /
-//! `CustomMessageHandled` mutations) are owned by
-//! `cluster_state/apply_custom.rs`; the at-least-once transport leg is
-//! owned by the secondary's retention chokepoint; the ack echo is the
-//! generic `ack_delivery_report` in `connect.rs`. This module never
+//! in WHAT order, and HOW each invocation's outcome lands in the
+//! replicated inbox. The replicated facts it reads/originates
+//! (`custom_messages` + the `CustomMessagePosted` /
+//! `CustomMessageHandled` / `CustomMessageFailed` mutations) are owned
+//! by `cluster_state/apply_custom.rs`; the at-least-once transport leg
+//! is owned by the secondary's retention chokepoint; the ack echo is
+//! the generic `ack_delivery_report` in `connect.rs`. This module never
 //! touches any of those internals — it composes their APIs.
 //!
 //! # The dispatch decision (per the F5 design)
 //!
 //! * DROPPABLE (`important = false`): dispatch the handler directly on
-//!   ingest, at-most-once — a raise is WARNed and the message is gone
-//!   (lost on failover by design; never CRDT-resident).
+//!   ingest, at-most-once — a raise is WARNed, the message is gone
+//!   (lost on failover by design; never CRDT-resident), and the
+//!   handler's queued commands are discarded (the same all-or-nothing
+//!   handler contract as the important class).
 //! * IMPORTANT: the ingest originates `CustomMessagePosted` (idempotent
-//!   under transport replays — the `(origin, seq)` vacant-insert NoOps a
-//!   duplicate), then runs the decision over EVERY `Unhandled` entry in
-//!   `(origin, seq)` order: a clean handler return originates
-//!   `CustomMessageHandled`; a raise leaves the entry `Unhandled`, WARNs,
-//!   and retries on a later dispatch trigger with exponential backoff —
-//!   after [`CUSTOM_HANDLER_POISON_CAP`] consecutive raises the message
-//!   is latched `Handled` anyway with a structured ERROR (an
-//!   always-raising handler must not wedge the inbox; fork F5-c). Strike
-//!   counts are node-local — a failover resets them, fail-safe (the new
-//!   primary's handler may well succeed).
-//! * PER-ORIGIN ORDER: within one origin, a not-yet-handleable entry
-//!   (backoff pending, or a fresh raise) BLOCKS its successors — seq
-//!   `n+1` is never handled before seq `n` resolves (handled or
-//!   poison-capped). Origins are independent.
+//!   under transport replays — the `(origin, seq)` vacant-insert NoOps
+//!   a duplicate), then runs the decision over EVERY `Unhandled` entry
+//!   in `(origin, seq)` order. Each entry resolves TERMINALLY in the
+//!   same pass:
+//!     - clean handler return → the ATOMIC effect+terminal batch (see
+//!       below): the handler's queued `PrimaryHandle` commands drain
+//!       through the capturing variant of the one
+//!       `drain_callback_queued_commands` chokepoint and their cluster
+//!       mutations ride ONE wire frame together with
+//!       `CustomMessageHandled` (effects first, terminal last);
+//!     - raise → a USER ERROR, terminal `Failed`: the queued commands
+//!       are discarded UNEXECUTED (all-or-nothing — no partial effect
+//!       can ever land anywhere), `CustomMessageFailed` is originated
+//!       ALONE, and a structured ERROR carries origin/seq/topic + the
+//!       exception. No retry, no backoff, no poison cap — ever.
+//! * PER-ORIGIN ORDER: the sorted `(origin, seq)` walk + the
+//!   synchronous terminal resolution of every entry preserve the
+//!   consumer's per-origin send order by construction (nothing is ever
+//!   deferred, so nothing can be overtaken).
+//! * NO BOUND: the unhandled set is never capped. The keep-up monitor
+//!   ([`CustomBacklogMonitor`]) WARNs — rate-limited — when the backlog
+//!   grows across consecutive heartbeat ticks or its oldest entry ages
+//!   past [`CUSTOM_BACKLOG_OLDEST_WARN`].
+//!
+//! # Atomicity (both causality directions)
+//!
+//! It is impossible for a message's EFFECT to be in the CRDT without
+//! its terminal state, or the terminal state without the effect:
+//!
+//! * One wire frame: the capturing drain diverts every mutation the
+//!   handler's commands originate into one batch, the terminal fact is
+//!   appended through the same chokepoint, and the batch flushes via
+//!   `broadcast_applied_mutations` as ONE
+//!   `DistributedMessage::ClusterMutation` frame. The replica-side
+//!   batch apply (`secondary::dispatch::helpers::apply_cluster_mutations`
+//!   and the primary-receive twin) is a synchronous, await-free loop
+//!   over the frame's mutations — both-or-neither on every replica.
+//!   (Frame size is a non-issue: even a 200-descriptor spawn batch +
+//!   terminal is well under the 96 MiB wire limit, #366.)
+//! * A primary that dies BEFORE the frame lands leaves `Unhandled` +
+//!   no effect in every replica; the promoted primary's replay
+//!   re-handles and the re-produced effect+terminal batch is absorbed
+//!   by the idempotent spawn dedup (fail-SAFE).
+//! * A raising handler's effect is discarded UNEXECUTED — never in the
+//!   local pool, the local CRDT, or any snapshot — so `Failed` is
+//!   always terminal-without-effect BY CONSTRUCTION, and the discarded
+//!   commands' repliers receive an explicit rejection.
+//!
+//! The local primary's OWN apply of the captured batch happens
+//! per-command during the drain (identical local semantics to the
+//! plain drain — the capture only diverts the WIRE leg); the transient
+//! local effect+`Unhandled` window this opens is the same benign
+//! pre-terminal state a snapshot may legitimately carry (a death there
+//! replays, and the dedup absorbs).
 //!
 //! # Dispatch triggers
 //!
@@ -38,20 +81,18 @@
 //!    [`PrimaryCoordinator::dispatch_unhandled_custom_messages`] after
 //!    hydrate, so a primary that died between landing and handling has
 //!    its `Unhandled` residue re-dispatched on the promoted primary.
-//! 3. The heartbeat tick — the persistent-interval retry driver for
-//!    backoff-deferred entries (a per-iteration sleep arm would be
-//!    reset by load; the interval fires under load by construction).
+//!    The replay walks ONLY `Unhandled` entries — `Failed` (like
+//!    `Handled`) is terminal and never re-dispatched.
+//! 3. The heartbeat tick — the periodic backstop dispatch (idempotent,
+//!    cheap when the inbox holds no `Unhandled` entry) and the keep-up
+//!    monitor's observation point ([`PrimaryCoordinator::observe_custom_backlog`]).
 //!
 //! Every trigger passes the live `command_rx` so the handler's
 //! in-runtime `PrimaryHandle` commands (the streamed-spawn site's
 //! `spawn_tasks`) drain inline through the SAME
-//! `drain_callback_queued_commands` chokepoint `on_phase_end` uses —
-//! the spawn lands BEFORE `CustomMessageHandled` is originated (the
-//! hook-mutations-before-the-fact ordering rule), so a death in between
-//! re-handles on the next primary and the spawn dedup absorbs the
-//! replay (fail-SAFE).
+//! `drain_callback_queued_commands` chokepoint `on_phase_end` uses.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::Identifier;
@@ -62,24 +103,83 @@ use tokio::sync::mpsc as tokio_mpsc;
 use super::PrimaryCoordinator;
 use super::command_channel::PrimaryCommand;
 
-/// Consecutive handler raises after which an important message is
-/// latched `Handled` anyway, with a structured ERROR (fork F5-c: an
-/// always-raising handler must not wedge the per-origin inbox forever).
-pub(crate) const CUSTOM_HANDLER_POISON_CAP: u32 = 5;
+/// Oldest-entry age past which the keep-up monitor WARNs even without
+/// tick-over-tick growth: an `Unhandled` entry a minute old means the
+/// dispatch decision has not resolved it across many heartbeat ticks.
+pub(crate) const CUSTOM_BACKLOG_OLDEST_WARN: Duration = Duration::from_secs(60);
 
-/// Default backoff base for handler-raise retries: retry `n` (1-based)
-/// becomes due `base × 2^(n-1)` after the raise. With the 5-strike cap
-/// the full poison schedule spans ~15s of deferral.
-pub(crate) const CUSTOM_HANDLER_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Minimum spacing between two keep-up WARNs (the rate limit): the
+/// diagnostic is a trend signal, not a per-tick alarm.
+pub(crate) const CUSTOM_BACKLOG_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Node-local per-message raise bookkeeping (see the module doc and the
-/// `custom_handler_strikes` field on the coordinator).
-#[derive(Debug)]
-pub(crate) struct CustomHandlerBackoff {
-    /// Consecutive raises observed for this `(origin, seq)`.
-    pub(super) strikes: u32,
-    /// The earliest instant the next retry may run.
-    pub(super) next_due: Instant,
+/// Node-local keep-up monitor for the replicated custom-message inbox
+/// (F5): tracks when each `Unhandled` key was FIRST OBSERVED on this
+/// node (posted-at instants are node-local by design — wall-clock age
+/// does not replicate) and decides — purely, testably — when the
+/// "handler is not keeping up" WARN fires.
+///
+/// WARN policy: fire when the backlog GREW across consecutive
+/// observations (this tick's count > last tick's) or the oldest live
+/// entry is older than [`CUSTOM_BACKLOG_OLDEST_WARN`]; rate-limited to
+/// one WARN per [`CUSTOM_BACKLOG_WARN_INTERVAL`]. There is NO bound on
+/// the backlog itself — observability only, never backpressure.
+#[derive(Debug, Default)]
+pub(crate) struct CustomBacklogMonitor {
+    /// First-observation instant per live `Unhandled` key. Entries are
+    /// forgotten the observation after their key leaves the backlog.
+    first_seen: HashMap<(String, u64), Instant>,
+    /// The previous observation's backlog count (the growth detector).
+    prev_count: usize,
+    /// When the last WARN fired (the rate limit).
+    last_warn: Option<Instant>,
+}
+
+/// One fired keep-up observation — the WARN's payload.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CustomBacklogReport {
+    /// Live `Unhandled` entries at observation time.
+    pub(crate) count: usize,
+    /// Age of the oldest live entry (since first observed HERE).
+    pub(crate) oldest_age: Duration,
+}
+
+impl CustomBacklogMonitor {
+    /// Feed one observation (the current `Unhandled` key set at `now`);
+    /// returns `Some(report)` exactly when the WARN should fire.
+    pub(crate) fn observe(
+        &mut self,
+        live: &[(String, u64)],
+        now: Instant,
+    ) -> Option<CustomBacklogReport> {
+        let live_set: std::collections::HashSet<&(String, u64)> = live.iter().collect();
+        self.first_seen.retain(|k, _| live_set.contains(k));
+        for k in live {
+            self.first_seen.entry(k.clone()).or_insert(now);
+        }
+        let count = live.len();
+        let grew = count > self.prev_count;
+        self.prev_count = count;
+        if count == 0 {
+            return None;
+        }
+        let oldest_age = self
+            .first_seen
+            .values()
+            .map(|t| now.duration_since(*t))
+            .max()
+            .unwrap_or_default();
+        if !(grew || oldest_age > CUSTOM_BACKLOG_OLDEST_WARN) {
+            return None;
+        }
+        if self
+            .last_warn
+            .is_some_and(|t| now.duration_since(t) < CUSTOM_BACKLOG_WARN_INTERVAL)
+        {
+            return None;
+        }
+        self.last_warn = Some(now);
+        Some(CustomBacklogReport { count, oldest_age })
+    }
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -110,14 +210,34 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             return;
         };
         if !important {
-            // DROPPABLE: at-most-once direct dispatch. A raise loses the
-            // message by contract (WARNed inside the invoke); no CRDT, no
-            // retention, no retry.
-            let _ = self.invoke_custom_handler(&origin_secondary_id, &topic, &data, false);
-            // The handler may have queued in-runtime PrimaryHandle
-            // commands (spawn_tasks et al.) — drain them inline exactly
-            // like the phase cascade does after `on_phase_end`.
-            self.drain_callback_queued_commands(command_rx).await;
+            // DROPPABLE: at-most-once direct dispatch, no CRDT, no
+            // retention, no retry. Same all-or-nothing handler
+            // contract as the important class: a clean return drains
+            // the handler's queued commands (plain per-command
+            // broadcast — there is no terminal fact to be atomic
+            // with); a raise loses the message by contract AND
+            // discards the queued commands unexecuted.
+            match self.invoke_custom_handler(&origin_secondary_id, &topic, &data, false) {
+                Ok(()) => {
+                    self.drain_callback_queued_commands(command_rx).await;
+                }
+                Err(reason) => {
+                    let discarded = self.discard_callback_queued_commands(
+                        command_rx,
+                        "custom_message_handler raised; its queued commands are \
+                         discarded (all-or-nothing handler semantics)",
+                    );
+                    tracing::warn!(
+                        origin = %origin_secondary_id,
+                        topic = %topic,
+                        discarded_commands = discarded,
+                        error = %reason,
+                        "custom_message_handler raised for a droppable custom \
+                         message; the message is lost (at-most-once contract) \
+                         and its partial effect was discarded"
+                    );
+                }
+            }
             return;
         }
         tracing::debug!(
@@ -143,15 +263,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     }
 
     /// THE handler-dispatch decision (F5): walk every `Unhandled` inbox
-    /// entry in `(origin, seq)` order and resolve each — clean handler
-    /// return → originate `CustomMessageHandled`; raise → strike +
-    /// backoff, poison-cap after [`CUSTOM_HANDLER_POISON_CAP`]; within
-    /// one origin an unresolved entry blocks its successors (per-origin
-    /// send order is the consumer contract). Idempotent + cheap when the
-    /// inbox has no `Unhandled` entries (the steady-state hot path).
+    /// entry in `(origin, seq)` order and resolve each TERMINALLY —
+    /// clean handler return → the atomic effect+`CustomMessageHandled`
+    /// one-frame batch; raise → discard the partial effect unexecuted,
+    /// originate `CustomMessageFailed` alone, structured ERROR (a raise
+    /// is a USER ERROR: terminal, never retried). Within one origin the
+    /// sorted walk + synchronous resolution preserve the consumer's
+    /// per-origin send order. Idempotent + cheap when the inbox has no
+    /// `Unhandled` entries (the steady-state hot path).
     ///
     /// Called from all three dispatch triggers (ingest, promotion
-    /// replay, heartbeat retry tick) — see the module doc.
+    /// replay, heartbeat backstop) — see the module doc.
     pub(crate) async fn dispatch_unhandled_custom_messages(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -160,102 +282,87 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         if unhandled.is_empty() {
             return;
         }
-        let now = Instant::now();
-        // Origins whose in-order head could not be resolved this pass:
-        // their later seqs are skipped to preserve per-origin order.
-        let mut blocked_origins: HashSet<String> = HashSet::new();
+        // BYSTANDER pre-drain: dispatch (with normal per-command
+        // broadcast semantics) anything already queued on the channel
+        // BEFORE the first handler runs, so the capture/discard windows
+        // below hold exactly the handler's own commands — a discard
+        // must never eat a command some other site queued earlier.
+        self.drain_callback_queued_commands(command_rx).await;
         for (origin, seq, topic, data) in unhandled {
-            if blocked_origins.contains(&origin) {
-                continue;
-            }
-            let key = (origin.clone(), seq);
-            if let Some(backoff) = self.custom_handler_strikes.get(&key)
-                && backoff.next_due > now
-            {
-                // Raised before and the backoff window is still open:
-                // not due yet — and nothing AFTER it in this origin may
-                // overtake it.
-                blocked_origins.insert(origin);
-                continue;
-            }
             match self.invoke_custom_handler(&origin, &topic, &data, true) {
                 Ok(()) => {
-                    self.custom_handler_strikes.remove(&key);
-                    // Drain the handler's in-runtime commands BEFORE
-                    // originating the Handled latch: the hook's
-                    // injection mutations must precede the fact on the
-                    // wire (the `PhaseEnded` ordering rule) so a death
-                    // in between re-handles on the next primary and the
-                    // deterministic re-spawn is absorbed by the spawn
-                    // dedup — the fail-SAFE side.
-                    self.drain_callback_queued_commands(command_rx).await;
+                    // ATOMIC effect+terminal batch: drain the handler's
+                    // queued commands CAPTURING their cluster mutations,
+                    // append `CustomMessageHandled` through the same
+                    // chokepoint (terminal LAST by construction), and
+                    // flush everything as ONE wire frame — every
+                    // replica applies the effect and the terminal
+                    // together or not at all.
+                    let batch = self
+                        .drain_callback_queued_commands_capturing(
+                            command_rx,
+                            ClusterMutation::CustomMessageHandled {
+                                origin: origin.clone(),
+                                seq,
+                            },
+                        )
+                        .await;
+                    self.broadcast_applied_mutations(batch).await;
+                }
+                Err(reason) => {
+                    // RAISE → terminal `Failed` (a USER ERROR — no
+                    // retry, ever). All-or-nothing: the handler's
+                    // queued commands are its partial effect and are
+                    // discarded UNEXECUTED (nothing lands in the pool,
+                    // the local CRDT, or any snapshot; blocked
+                    // repliers get an explicit rejection).
+                    let discarded = self.discard_callback_queued_commands(
+                        command_rx,
+                        "custom_message_handler raised; its queued commands are \
+                         discarded (all-or-nothing handler semantics)",
+                    );
+                    tracing::error!(
+                        origin = %origin,
+                        msg_seq = seq,
+                        topic = %topic,
+                        discarded_commands = discarded,
+                        error = %reason,
+                        "custom_message_handler raised; the message is \
+                         terminally Failed (payload dropped, partial effect \
+                         discarded, never retried — a handler raise is a \
+                         user error)"
+                    );
+                    // `CustomMessageFailed` is originated ALONE — the
+                    // terminal-without-effect direction of the
+                    // atomicity contract is satisfied by construction
+                    // (there IS no effect).
                     self.apply_and_broadcast_cluster_mutations(vec![
-                        ClusterMutation::CustomMessageHandled {
+                        ClusterMutation::CustomMessageFailed {
                             origin: origin.clone(),
                             seq,
                         },
                     ])
                     .await;
                 }
-                Err(reason) => {
-                    // The handler may have queued commands before
-                    // raising — never strand them.
-                    self.drain_callback_queued_commands(command_rx).await;
-                    let entry = self
-                        .custom_handler_strikes
-                        .entry(key.clone())
-                        .or_insert(CustomHandlerBackoff {
-                            strikes: 0,
-                            next_due: now,
-                        });
-                    entry.strikes += 1;
-                    let strikes = entry.strikes;
-                    if strikes >= CUSTOM_HANDLER_POISON_CAP {
-                        // POISON CAP (F5-c): latch it Handled anyway —
-                        // an always-raising handler must not wedge the
-                        // origin's inbox — and surface the loss as a
-                        // structured ERROR the operator can act on.
-                        self.custom_handler_strikes.remove(&key);
-                        tracing::error!(
-                            origin = %origin,
-                            msg_seq = seq,
-                            topic = %topic,
-                            strikes,
-                            error = %reason,
-                            "custom_message_handler raised {strikes} consecutive \
-                             times for this message; poison cap reached — marking \
-                             it Handled UNCONSUMED (the payload is dropped)"
-                        );
-                        self.apply_and_broadcast_cluster_mutations(vec![
-                            ClusterMutation::CustomMessageHandled {
-                                origin: origin.clone(),
-                                seq,
-                            },
-                        ])
-                        .await;
-                        // The poison latch resolves this seq, so the
-                        // origin's successors may proceed this pass.
-                    } else {
-                        // Exponential backoff: retry n becomes due
-                        // base × 2^(n-1) after this raise.
-                        let delay = self
-                            .custom_handler_backoff_base
-                            .saturating_mul(1u32 << (strikes - 1).min(16));
-                        entry.next_due = now + delay;
-                        tracing::warn!(
-                            origin = %origin,
-                            msg_seq = seq,
-                            topic = %topic,
-                            strikes,
-                            retry_in_secs = delay.as_secs_f64(),
-                            error = %reason,
-                            "custom_message_handler raised; message stays \
-                             Unhandled and will be retried with backoff"
-                        );
-                        blocked_origins.insert(origin);
-                    }
-                }
             }
+        }
+    }
+
+    /// Heartbeat-tick observation point for the keep-up monitor: feed
+    /// the current `Unhandled` key set to [`CustomBacklogMonitor`] and
+    /// emit the rate-limited WARN when it trips. Pure observability —
+    /// the backlog is never bounded or shed.
+    pub(crate) fn observe_custom_backlog(&mut self) {
+        let keys = self.cluster_state.unhandled_custom_message_keys();
+        if let Some(report) = self.custom_backlog_monitor.observe(&keys, Instant::now()) {
+            tracing::warn!(
+                unhandled = report.count,
+                oldest_secs = report.oldest_age.as_secs_f64(),
+                "primary custom-message handler is not keeping up: {} \
+                 unhandled (oldest {}s)",
+                report.count,
+                report.oldest_age.as_secs(),
+            );
         }
     }
 

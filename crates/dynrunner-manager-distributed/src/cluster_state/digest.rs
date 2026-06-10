@@ -113,7 +113,7 @@ impl<I: Identifier> ClusterState<I> {
             // count, so both folds must see the value — the grow-max /
             // grow-set shape).
             custom_messages,
-            custom_handled_watermarks,
+            custom_terminal_watermarks,
             // Replicated static phase-graph metadata, but EXCLUDED from the
             // digest: `phase_may_be_empty` is originated in the SAME seed
             // batch as `phase_deps` (both set-once at run start, paired in
@@ -233,8 +233,8 @@ impl<I: Identifier> ClusterState<I> {
         // fold; the snapshot pull's sticky-latch merge heals the lagging
         // side). Watermarks: the grow-max KEY+VALUE fold.
         let custom_messages_hash = super::grow_max::fold_grow_set(custom_messages);
-        let custom_handled_watermarks_hash =
-            super::grow_max::fold_grow_max(custom_handled_watermarks);
+        let custom_terminal_watermarks_hash =
+            super::grow_max::fold_grow_max(custom_terminal_watermarks);
 
         StateDigest {
             tasks_count: tasks.len() as u64,
@@ -280,8 +280,8 @@ impl<I: Identifier> ClusterState<I> {
             phases_ended_hash,
             custom_messages_count: custom_messages.len() as u64,
             custom_messages_hash,
-            custom_handled_watermarks_count: custom_handled_watermarks.len() as u64,
-            custom_handled_watermarks_hash,
+            custom_terminal_watermarks_count: custom_terminal_watermarks.len() as u64,
+            custom_terminal_watermarks_hash,
         }
     }
 }

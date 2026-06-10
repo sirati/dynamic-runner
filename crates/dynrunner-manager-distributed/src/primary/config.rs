@@ -40,11 +40,12 @@ pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32, &BTreeMap<String, TaskOu
 ///
 /// The `Result` return is the dispatch decision's input: `Ok(())` =
 /// the consumer consumed the message (an IMPORTANT message is then
-/// latched `Handled` in the replicated inbox); `Err(reason)` = the
-/// consumer hook RAISED — an important message stays `Unhandled` and is
-/// retried with backoff up to the poison cap (see
-/// `primary/custom_message.rs`); a droppable one is lost (at-most-once
-/// by contract).
+/// latched `Handled` in the replicated inbox, atomically with the
+/// handler's effect mutations); `Err(reason)` = the consumer hook
+/// RAISED — a USER ERROR: an important message transitions terminally
+/// to `Failed` (never retried, the handler's partial effect discarded
+/// unexecuted — see `primary/custom_message.rs`); a droppable one is
+/// lost (at-most-once by contract).
 pub type OnCustomMessage = Box<dyn FnMut(&str, &str, &[u8], bool) -> Result<(), String> + Send>;
 
 /// A shared side-channel by which an [`OnPhaseEnd`] closure records that

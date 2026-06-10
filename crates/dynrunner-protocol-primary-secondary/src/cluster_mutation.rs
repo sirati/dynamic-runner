@@ -712,7 +712,7 @@ pub enum ClusterMutation<I> {
     /// Apply rule: vacant-insert as `Unhandled { topic, data }`; NoOp if
     /// the key is present in ANY state (idempotent under at-least-once
     /// delivery — a replayed landing re-posts the same key) or already
-    /// subsumed by the per-origin `custom_handled_watermarks` compaction
+    /// subsumed by the per-origin `custom_terminal_watermarks` compaction
     /// (a `Posted { seq <= watermark }` re-application is a NoOp by
     /// watermark check). Droppable (`important = false`) customs never
     /// reach the CRDT — they are dispatched directly and lost on
@@ -727,24 +727,51 @@ pub enum ClusterMutation<I> {
     /// custom message (F5): `Unhandled → Handled`, DROPPING the payload
     /// (the tombstone is a few bytes; the ≤100 KB bodies never
     /// accumulate). The primary originates it after a clean
-    /// `custom_message_handler` return (or at the poison cap — see the
-    /// dispatch decision), ALWAYS after any mutations the handler itself
-    /// originated (the hook-mutations-before-the-fact ordering rule, the
-    /// `PhaseEnded` precedent) so a death in between re-handles on the
+    /// `custom_message_handler` return, ALWAYS in the SAME broadcast
+    /// frame as — and after — any mutations the handler itself
+    /// originated (the atomic effect+terminal batch: every replica
+    /// applies the handler's effect and this terminal together or not
+    /// at all), so a death before the frame lands re-handles on the
     /// next primary and the deterministic re-spawn is absorbed by the
     /// idempotent spawn dedup — the fail-SAFE side.
     ///
-    /// Apply rule: handled-state is a sticky LATCH that must win
+    /// Apply rule: terminal state is a sticky LATCH that must win
     /// regardless of arrival order (the `DiscoveryDebt` lattice
-    /// precedent, `Unposted ⊑ Unhandled ⊑ Handled`, join = max):
+    /// precedent, `Unposted ⊑ Unhandled ⊑ {Handled, Failed}`):
     /// `Unhandled → Handled` (Applied, payload dropped); NoOp if already
     /// `Handled` or watermark-subsumed; if the key is ABSENT, insert
     /// `Handled` directly — a `Handled` that outruns its `Posted` on a
     /// different gossip path latches first and the late `Posted` NoOps.
-    /// Each Applied advances the per-origin contiguous-prefix watermark
-    /// (`custom_handled_watermarks`) and physically drops the subsumed
-    /// tombstones (the GC story).
+    /// The theoretical `Handled` vs `Failed` conflict joins
+    /// Handled-wins (`Failed → Handled` is Applied) — deterministic,
+    /// though never exercised: the primary originates exactly ONE
+    /// terminal per message. Each Applied advances the per-origin
+    /// contiguous-prefix watermark (`custom_terminal_watermarks`) and
+    /// physically drops the subsumed tombstones (the GC story).
     CustomMessageHandled {
+        origin: String,
+        seq: u64,
+    },
+    /// The primary's consumer handler RAISED for the `(origin, seq)`
+    /// custom message (F5): `Unhandled → Failed`, DROPPING the payload.
+    /// A handler raise is a USER ERROR — terminal, never retried; the
+    /// handler's captured partial effect was DISCARDED (all-or-nothing
+    /// handler semantics: no effect mutation of a raising handler ever
+    /// lands in any replica), so this mutation is always originated
+    /// ALONE, never batched with effect mutations. A promoted primary
+    /// replays ONLY `Unhandled` entries — a `Failed` tombstone is never
+    /// re-dispatched.
+    ///
+    /// Apply rule: the `Failed` twin of [`Self::CustomMessageHandled`]'s
+    /// sticky terminal latch (`Unhandled ⊑ {Handled, Failed}`):
+    /// `Unhandled → Failed` (Applied, payload dropped); NoOp if already
+    /// terminal or watermark-subsumed (Handled-wins join: `Failed` never
+    /// overwrites `Handled`); if the key is ABSENT, insert `Failed`
+    /// directly — a `Failed` that outruns its `Posted` latches first and
+    /// the late `Posted` NoOps. Each Applied advances the per-origin
+    /// terminal watermark exactly as `Handled` does (both terminals are
+    /// payload-dropping tombstones the GC compacts).
+    CustomMessageFailed {
         origin: String,
         seq: u64,
     },

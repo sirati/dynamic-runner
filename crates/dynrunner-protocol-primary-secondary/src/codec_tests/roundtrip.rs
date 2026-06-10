@@ -93,8 +93,8 @@ fn roundtrip_state_digest_payload() {
         phases_ended_hash: 0xFEED_FACE,
         custom_messages_count: 3,
         custom_messages_hash: 0xC0FF_EE00,
-        custom_handled_watermarks_count: 1,
-        custom_handled_watermarks_hash: 0xBEEF_0001,
+        custom_terminal_watermarks_count: 1,
+        custom_terminal_watermarks_hash: 0xBEEF_0001,
     };
     let msg: DistributedMessage<TestId> = DistributedMessage::StateDigest {
         target: None,

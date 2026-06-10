@@ -176,13 +176,13 @@ pub struct StateDigest {
     pub custom_messages_hash: u64,
     /// Number of per-origin handled watermarks (F5 compaction).
     #[serde(default)]
-    pub custom_handled_watermarks_count: u64,
+    pub custom_terminal_watermarks_count: u64,
     /// XOR-fold over the per-origin `(origin, watermark)` pairs (F5): a
     /// peer whose watermark advanced past this replica's makes the
     /// replica behind; the snapshot pull's grow-max merge heals it and
     /// prunes the subsumed local tombstones.
     #[serde(default)]
-    pub custom_handled_watermarks_hash: u64,
+    pub custom_terminal_watermarks_hash: u64,
 }
 
 impl StateDigest {
@@ -353,10 +353,10 @@ impl StateDigest {
             // F5 per-origin handled watermarks: grow-max map —
             // count-OR-hash compare like the other grow-max fields.
             || field_behind(
-                self.custom_handled_watermarks_count,
-                self.custom_handled_watermarks_hash,
-                other.custom_handled_watermarks_count,
-                other.custom_handled_watermarks_hash,
+                self.custom_terminal_watermarks_count,
+                self.custom_terminal_watermarks_hash,
+                other.custom_terminal_watermarks_count,
+                other.custom_terminal_watermarks_hash,
             )
     }
 }

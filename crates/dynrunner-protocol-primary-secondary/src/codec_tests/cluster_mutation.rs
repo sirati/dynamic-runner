@@ -783,7 +783,26 @@ fn roundtrip_custom_message_handled() {
     }
 }
 
-/// Literal-bytes pins for both F5 mutations (the externally-tagged
+/// F5 `CustomMessageFailed` round-trips with its `(origin, seq)` key
+/// (the terminal twin of `CustomMessageHandled` — a handler raise).
+#[test]
+fn roundtrip_custom_message_failed() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::CustomMessageFailed {
+        origin: "sec-1".into(),
+        seq: 11,
+    };
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageFailed { origin, seq } => {
+            assert_eq!(origin, "sec-1");
+            assert_eq!(seq, 11);
+        }
+        _ => panic!("expected CustomMessageFailed"),
+    }
+}
+
+/// Literal-bytes pins for the F5 mutations (the externally-tagged
 /// `ClusterMutation` shape every current originator emits). Pinning the
 /// sender bytes catches a tag / field-name divergence a symmetric
 /// round-trip cannot see.
@@ -810,5 +829,13 @@ fn custom_message_mutations_decode_literal_sender_bytes() {
             assert_eq!((origin.as_str(), seq), ("sec-1", 3));
         }
         _ => panic!("expected CustomMessageHandled"),
+    }
+    let failed = r#"{"CustomMessageFailed":{"origin":"sec-1","seq":3}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(failed).unwrap();
+    match decoded {
+        ClusterMutation::CustomMessageFailed { origin, seq } => {
+            assert_eq!((origin.as_str(), seq), ("sec-1", 3));
+        }
+        _ => panic!("expected CustomMessageFailed"),
     }
 }

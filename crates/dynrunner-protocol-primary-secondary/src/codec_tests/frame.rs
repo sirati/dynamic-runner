@@ -176,8 +176,8 @@ fn roundtrip_all_message_types() {
                 phases_ended_hash: 0xCC,
                 custom_messages_count: 2,
                 custom_messages_hash: 0xDD,
-                custom_handled_watermarks_count: 1,
-                custom_handled_watermarks_hash: 0xEE,
+                custom_terminal_watermarks_count: 1,
+                custom_terminal_watermarks_hash: 0xEE,
             },
         },
         DistributedMessage::TaskComplete {

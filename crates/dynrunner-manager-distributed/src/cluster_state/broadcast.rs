@@ -175,11 +175,12 @@ fn stamp_versions<I: Identifier>(
             // The F5 custom-message inbox mutations are version-LESS:
             // the `(origin, seq)` key is the originating secondary's
             // per-origin monotone (the idempotency arbiter), and the
-            // `Unhandled ⊑ Handled` sticky lattice needs no version —
-            // there is exactly one originator (the primary) and the
-            // latch join is order-free.
+            // `Unhandled ⊑ {Handled, Failed}` sticky lattice needs no
+            // version — there is exactly one originator (the primary)
+            // and the latch join is order-free.
             | ClusterMutation::CustomMessagePosted { .. }
-            | ClusterMutation::CustomMessageHandled { .. } => {}
+            | ClusterMutation::CustomMessageHandled { .. }
+            | ClusterMutation::CustomMessageFailed { .. } => {}
         }
     }
 }

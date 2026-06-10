@@ -355,7 +355,7 @@ pub struct ClusterStateSnapshot<I> {
     /// higher watermark PROVES those seqs were handled cluster-wide).
     /// `#[serde(default)]` keeps wire compat with a pre-field sender.
     #[serde(default)]
-    pub custom_handled_watermarks: HashMap<String, u64>,
+    pub custom_terminal_watermarks: HashMap<String, u64>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -412,7 +412,7 @@ impl<I: Identifier> ClusterState<I> {
             phases_ended,
             // Replicated custom-message inbox + watermarks (F5).
             custom_messages,
-            custom_handled_watermarks,
+            custom_terminal_watermarks,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -494,7 +494,7 @@ impl<I: Identifier> ClusterState<I> {
             // so a promoted primary inherits every `Unhandled` entry for
             // the hydrate replay, and the compaction state converges.
             custom_messages: custom_messages.clone(),
-            custom_handled_watermarks: custom_handled_watermarks.clone(),
+            custom_terminal_watermarks: custom_terminal_watermarks.clone(),
         }
     }
 
@@ -583,7 +583,7 @@ impl<I: Identifier> ClusterState<I> {
             respawn_events,
             phases_ended,
             custom_messages,
-            custom_handled_watermarks,
+            custom_terminal_watermarks,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -828,10 +828,10 @@ impl<I: Identifier> ClusterState<I> {
         // compaction re-runs per touched origin so a restore that
         // completes a handled prefix compacts exactly like the live
         // apply path would (apply == restore by construction).
-        let watermark_origins: Vec<String> = custom_handled_watermarks.keys().cloned().collect();
+        let watermark_origins: Vec<String> = custom_terminal_watermarks.keys().cloned().collect();
         merge_grow_max(
-            &mut self.custom_handled_watermarks,
-            custom_handled_watermarks,
+            &mut self.custom_terminal_watermarks,
+            custom_terminal_watermarks,
         );
         for origin in &watermark_origins {
             self.prune_below_custom_watermark(origin);
@@ -839,7 +839,7 @@ impl<I: Identifier> ClusterState<I> {
         let mut touched_origins: HashSet<String> = HashSet::new();
         for ((origin, seq), incoming) in custom_messages {
             if self
-                .custom_handled_watermarks
+                .custom_terminal_watermarks
                 .get(&origin)
                 .is_some_and(|w| seq <= *w)
             {
