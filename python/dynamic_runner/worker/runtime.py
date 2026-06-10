@@ -71,9 +71,12 @@ from typing import Any, Callable, Optional
 # the `--log-file` argument.
 _LOG = logging.getLogger(__name__)
 
+from .._native import CUSTOM_MESSAGE_MAX_BYTES as _CUSTOM_MESSAGE_MAX_BYTES
 from .._native import PUBLISH_STRING_MAX_BYTES as _PUBLISH_STRING_MAX_BYTES
 from ..comm import (
     CommunicationInterface,
+    CustomMessageCommand,
+    CustomMessageResponse,
     DoneResponse,
     ErrorResponse,
     ErrorType,
@@ -86,6 +89,12 @@ from ..comm import (
     UnixSocketInterface,
     WorkerExceptionResponse,
 )
+
+#: Per-message hard cap on ``Task.send_message`` /
+#: ``SecondaryHandle.send_to_worker`` payloads (100 KiB). Rust owns
+#: the number (``dynrunner_protocol_manager_worker::CUSTOM_MESSAGE_MAX_BYTES``);
+#: Python only reads it — the ``PUBLISH_STRING_MAX_BYTES`` precedent.
+CUSTOM_MESSAGE_MAX_BYTES = _CUSTOM_MESSAGE_MAX_BYTES
 
 
 class RecoverableError(Exception):
@@ -176,6 +185,14 @@ class Task:
         default_factory=dict
     )
     _emit: Optional[Callable[[Any], None]] = field(default=None, repr=False)
+    # Loop-wired drain hook for the secondary→worker custom-message
+    # direction: returns the next buffered ``(topic, data)`` pair or
+    # ``None`` (non-blocking). ``None`` hook (direct construction in
+    # unit tests) makes ``poll_messages()`` return ``[]`` — the same
+    # no-op-safety contract as ``_emit``.
+    _poll_custom: Optional[Callable[[], Optional[tuple]]] = field(
+        default=None, repr=False
+    )
     # {output_key -> {"kind": "inline"|"file", "value": str}}. Built up
     # by publish_string and publish(key=...); flushed into
     # DoneResponse.result_data on task return. Lives on the Task so
@@ -197,6 +214,67 @@ class Task:
     def keepalive(self) -> None:
         if self._emit is not None:
             self._emit(KeepaliveResponse())
+
+    def send_message(self, topic: str, data: bytes) -> None:
+        """Send a consumer custom message to this node's secondary.
+
+        ``topic`` is a routing key the framework never interprets —
+        the secondary's ``worker_message_listener`` hook receives it
+        verbatim alongside ``data``. Legal mid-task (the message is a
+        NON-TERMINAL wire frame, streamed immediately; it cannot
+        perturb the eventual done/error attribution) — this is the
+        streamed-spawn hot path: emit descriptor batches / progress
+        pings while the task keeps running.
+
+        Size limit: ``data`` must be at most
+        ``CUSTOM_MESSAGE_MAX_BYTES`` (100 KiB, exported from
+        ``dynamic_runner._native``). Custom messages ride the worker's
+        signal channel; the framework rejects bulk data here, at the
+        call site, with a :class:`ValueError` naming the actual size
+        and the limit — split bulk streams into multiple messages
+        (the consumer owns batch sizing).
+
+        No-op-safe like :meth:`keepalive`: a ``Task`` constructed
+        outside the runtime loop (unit-test handlers) validates the
+        size but emits nothing.
+        """
+        size = len(data)
+        if size > CUSTOM_MESSAGE_MAX_BYTES:
+            raise ValueError(
+                f"send_message data for topic {topic!r} is {size} bytes, "
+                f"exceeding the CUSTOM_MESSAGE_MAX_BYTES limit of "
+                f"{CUSTOM_MESSAGE_MAX_BYTES} bytes (100 KiB). Custom messages "
+                f"are for signal-sized payloads; split bulk streams into "
+                f"multiple messages."
+            )
+        if self._emit is not None:
+            self._emit(CustomMessageResponse(topic, bytes(data)))
+
+    def poll_messages(self) -> list[tuple[str, bytes]]:
+        """Drain buffered secondary→worker custom messages, non-blocking.
+
+        Returns every ``(topic, data)`` queued by the secondary's
+        ``SecondaryHandle.send_to_worker`` since the last drain, in
+        wire order; ``[]`` when none are buffered. The worker runtime
+        is a synchronous read/run/respond loop, so delivery is
+        explicit-poll — call this from long-running handlers at
+        convenient points (the bytes buffer in the socket meanwhile).
+
+        Between tasks, queued customs are instead routed to the
+        optional module-level :func:`message_handler` before the next
+        task is processed.
+
+        No-op-safe: a ``Task`` constructed outside the runtime loop
+        returns ``[]``.
+        """
+        drained: list[tuple[str, bytes]] = []
+        if self._poll_custom is None:
+            return drained
+        while True:
+            item = self._poll_custom()
+            if item is None:
+                return drained
+            drained.append(item)
 
     def set_phase(self, phase_name: str) -> None:
         if self._emit is not None:
@@ -321,16 +399,27 @@ def _encode_done_payload(
 _HandlerFn = Callable[[Task], Optional[WorkerOutput]]
 
 
+#: Optional module-level custom-message handler:
+#: ``handler(topic: str, data: bytes) -> None``.
+_MessageHandlerFn = Callable[[str, bytes], None]
+
+
 @dataclass
 class _Registry:
     """Module-level registry holding the most recently
     @task_function-decorated handler. Lookup is by ``__default__``
     only — multiple decorators in one process overwrite each other,
     matching the "one handler per worker module" convention.
+
+    ``message_handler`` is the @task_function twin for the
+    secondary→worker custom-message direction: the loop routes
+    customs that arrive BETWEEN tasks to it (mid-task customs are
+    drained by ``Task.poll_messages``). Same overwrite semantics.
     """
 
     default: Optional[_HandlerFn] = None
     overwritten: bool = False
+    message_handler: Optional[_MessageHandlerFn] = None
 
 
 _REGISTRY = _Registry()
@@ -354,6 +443,28 @@ def task_function(fn: _HandlerFn) -> _HandlerFn:
     if _REGISTRY.default is not None and _REGISTRY.default is not fn:
         _REGISTRY.overwritten = True
     _REGISTRY.default = fn
+    return fn
+
+
+def message_handler(fn: _MessageHandlerFn) -> _MessageHandlerFn:
+    """Mark a callable as the worker's between-tasks custom-message
+    handler — the ``@task_function`` twin for the secondary→worker
+    direction.
+
+    ``fn(topic: str, data: bytes)`` is invoked once per queued
+    ``Command::Custom`` that arrives while NO task is in flight
+    (mid-task customs are drained explicitly via
+    ``Task.poll_messages()``), before the next task is processed.
+    Exceptions raised by the handler are logged and swallowed — a
+    buggy handler never kills the worker loop (the listener-isolation
+    idiom). Optional: with no handler registered, between-task customs
+    are dropped with a debug log.
+
+    The decorator returns the function unchanged — no wrapping.
+    """
+    if not callable(fn):
+        raise TypeError(f"@message_handler expects a callable, got {fn!r}")
+    _REGISTRY.message_handler = fn
     return fn
 
 
@@ -396,6 +507,20 @@ def _open_comm(args: argparse.Namespace) -> CommunicationInterface:
     fd = args.dynamic_queue
     sock = _socket.socket(fileno=fd)
     return UnixSocketInterface(sock)
+
+
+def _derive_fault_dump_path(log_file: str) -> str:
+    """Per-worker faulthandler dump target derived from the worker's
+    ``--log-file``: a sibling with ``-faulthandler.log`` interposed —
+    ``<log_dir>/worker_3.log`` → ``<log_dir>/worker_3-faulthandler.log``.
+    Separate from the worker's busy log so a frame dump is never
+    interleaved with (and lost in) the ordinary log stream — the same
+    rationale as the manager-side ``faulthandler.log``.
+    """
+    from pathlib import Path
+
+    p = Path(log_file)
+    return str(p.with_name(f"{p.stem}-faulthandler.log"))
 
 
 def _parse_payload(payload_str: Optional[str]) -> Any:
@@ -532,6 +657,13 @@ class _RunCtx:
     exit_after_response: bool = False
     last_send_failed: bool = False
     fatal_send_errors: list[str] = field(default_factory=list)
+    # Commands a mid-task `Task.poll_messages` drain pulled off the
+    # comm channel that are NOT custom messages (defensive: the
+    # framework never dispatches a task or a stop mid-task, but a
+    # buffered frame must not be LOST by the drain). The main loop
+    # consumes this queue before its next blocking receive, so frame
+    # order is preserved end-to-end.
+    pending_commands: list[Any] = field(default_factory=list)
     # Whether at least one NonRecoverableError was raised by the
     # task handler during this run. Set when `_classify_exception`
     # produces an ErrorType.NON_RECOVERABLE response; consumed at
@@ -563,6 +695,58 @@ def _try_send(ctx: _RunCtx, response: Any) -> None:
             ctx.fatal_send_errors.append(err)
 
 
+def _dispatch_custom_between_tasks(command: Any) -> None:
+    """Route one between-tasks ``CustomMessageCommand`` to the
+    optional module-level ``@message_handler``.
+
+    Handler isolation (the listener idiom): an ``Exception`` raised by
+    consumer handler code is logged with its traceback and swallowed —
+    the worker loop survives. ``KeyboardInterrupt`` / ``SystemExit``
+    propagate so signal-driven shutdown keeps its normal path. With no
+    handler registered the message is dropped with a debug log (the
+    handler is optional by contract).
+    """
+    handler = _REGISTRY.message_handler
+    if handler is None:
+        _LOG.debug(
+            "worker.runtime: dropping between-tasks custom message "
+            "topic=%r (%d bytes): no @message_handler registered",
+            command.topic,
+            len(command.data),
+        )
+        return
+    try:
+        handler(command.topic, command.data)
+    except Exception:  # noqa: BLE001 — handler isolation by contract
+        _LOG.exception(
+            "worker.runtime: @message_handler raised on topic=%r; "
+            "swallowed to keep the worker loop alive",
+            command.topic,
+        )
+
+
+def _make_poll_custom(ctx: _RunCtx) -> Callable[[], Optional[tuple]]:
+    """Build the ``Task._poll_custom`` drain hook for one task.
+
+    Returns a non-blocking callable yielding the next buffered
+    ``(topic, data)`` pair or ``None``. Non-custom frames encountered
+    mid-drain are STASHED on ``ctx.pending_commands`` (never lost,
+    never reordered relative to each other) for the main loop to
+    process after the task returns.
+    """
+
+    def poll() -> Optional[tuple]:
+        while True:
+            cmd = ctx.comm.receive_command(blocking=False)
+            if cmd is None:
+                return None
+            if isinstance(cmd, CustomMessageCommand):
+                return (cmd.topic, cmd.data)
+            ctx.pending_commands.append(cmd)
+
+    return poll
+
+
 def _process_one(ctx: _RunCtx, command: Any) -> bool:
     """Handle a single inbound command. Returns ``True`` to keep the
     loop running, ``False`` to break out (clean shutdown OR fatal
@@ -570,6 +754,14 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
     """
     if isinstance(command, StopCommand):
         return False
+
+    if isinstance(command, CustomMessageCommand):
+        # A custom message arriving BETWEEN tasks (no task in flight
+        # at this read point) routes to the optional module-level
+        # @message_handler; mid-task customs are drained by
+        # Task.poll_messages instead.
+        _dispatch_custom_between_tasks(command)
+        return not ctx.last_send_failed
 
     if not isinstance(command, ProcessBinaryCommand):
         _try_send(
@@ -593,6 +785,7 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         # contract docstring at `commands.rs`.
         predecessor_outputs=json.loads(command.predecessor_outputs_json),
         _emit=lambda response, _ctx=ctx: _try_send(_ctx, response),
+        _poll_custom=_make_poll_custom(ctx),
     )
 
     ctx.task_in_flight = True
@@ -719,6 +912,21 @@ def run(
         from .logging_setup import setup_worker_logging
 
         setup_worker_logging(getattr(args, "log_file", None))
+        # Per-worker crash/frame-dump diagnostics (#365): register
+        # `faulthandler` (fatal signals + on-demand SIGUSR1 all-thread
+        # dump, no exit) in the WORKER subprocess, writing to a
+        # per-worker sibling of the `--log-file`
+        # (`worker_<id>-faulthandler.log`). An operator
+        # `kill -USR1 <worker pid>` (or the runtime watchdog, were it
+        # ever pointed at a worker) names a wedged handler's Python
+        # stack with no ptrace. Best-effort by `enable_fault_dumps`
+        # contract; skipped when no `--log-file` was passed (no
+        # durable per-worker target to write to).
+        log_file = getattr(args, "log_file", None)
+        if log_file:
+            from .._fault_dumps import enable_fault_dumps
+
+            enable_fault_dumps(dump_path=_derive_fault_dump_path(log_file))
         comm = _open_comm(args)
 
     prev_handlers = _install_exit_signal_handlers()
@@ -729,14 +937,20 @@ def run(
         if ctx.last_send_failed:
             return
         while True:
-            try:
-                command = comm.receive_command(blocking=True)
-            except (KeyboardInterrupt, SystemExit):
-                # No task in flight at this point — clean shutdown,
-                # no error response needed (the framework's
-                # disconnect path treats this as a normal worker
-                # exit).
-                break
+            if ctx.pending_commands:
+                # A mid-task poll_messages drain pulled a non-custom
+                # frame off the channel; consume it before reading the
+                # socket again so frame order is preserved.
+                command = ctx.pending_commands.pop(0)
+            else:
+                try:
+                    command = comm.receive_command(blocking=True)
+                except (KeyboardInterrupt, SystemExit):
+                    # No task in flight at this point — clean shutdown,
+                    # no error response needed (the framework's
+                    # disconnect path treats this as a normal worker
+                    # exit).
+                    break
             if command is None:
                 break
             if not _process_one(ctx, command):
@@ -784,10 +998,12 @@ def run(
 
 
 __all__ = [
+    "CUSTOM_MESSAGE_MAX_BYTES",
     "RecoverableError",
     "NonRecoverableError",
     "Task",
     "WorkerOutput",
+    "message_handler",
     "task_function",
     "run",
 ]

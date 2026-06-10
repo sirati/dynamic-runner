@@ -30,6 +30,8 @@ from dynamic_runner._native import protocol_manager_worker as _native_pmw
 
 # noqa: F401 — re-export
 Command = _native_pmw.Command
+CustomMessageCommand = _native_pmw.CustomMessageCommand
+CustomMessageResponse = _native_pmw.CustomMessageResponse
 DoneResponse = _native_pmw.DoneResponse
 ErrorResponse = _native_pmw.ErrorResponse
 KeepaliveResponse = _native_pmw.KeepaliveResponse

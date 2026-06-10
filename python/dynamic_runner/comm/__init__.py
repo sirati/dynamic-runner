@@ -1,6 +1,8 @@
 from .interface import CommunicationInterface, NamedSocketInterface, NoopInterface, UnixSocketInterface
 from .proto import (
     Command,
+    CustomMessageCommand,
+    CustomMessageResponse,
     DoneResponse,
     ErrorResponse,
     ErrorType,
@@ -22,6 +24,8 @@ __all__ = [
     "NoopInterface",
     "UnixSocketInterface",
     "Command",
+    "CustomMessageCommand",
+    "CustomMessageResponse",
     "StopCommand",
     "ProcessBinaryCommand",
     "Response",

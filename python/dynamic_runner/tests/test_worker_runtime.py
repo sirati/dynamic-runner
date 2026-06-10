@@ -23,6 +23,8 @@ from unittest.mock import patch
 from dynamic_runner.comm import (
     Command,
     CommunicationInterface,
+    CustomMessageCommand,
+    CustomMessageResponse,
     DoneResponse,
     ErrorResponse,
     ErrorType,
@@ -32,14 +34,18 @@ from dynamic_runner.comm import (
     ReadyResponse,
     Response,
     StopCommand,
+    UnixSocketInterface,
     WorkerExceptionResponse,
+    parse_response,
 )
 from dynamic_runner.worker import (
+    CUSTOM_MESSAGE_MAX_BYTES,
     PUBLISH_STRING_MAX_BYTES,
     NonRecoverableError,
     RecoverableError,
     Task,
     WorkerOutput,
+    message_handler,
     run,
     task_function,
 )
@@ -93,6 +99,7 @@ def _drive(handler, commands):
     # previous @task_function decoration doesn't leak in.
     _REGISTRY.default = None
     _REGISTRY.overwritten = False
+    _REGISTRY.message_handler = None
     comm = ScriptedComm(inbox=list(commands))
     comm.exit_code = 0
     try:
@@ -860,6 +867,272 @@ class ExitSignalHandlerTests(unittest.TestCase):
         finally:
             for signum, p in prev.items():
                 signal.signal(signum, p)
+
+
+@dataclass
+class DuplexScriptedComm(ScriptedComm):
+    """ScriptedComm extended with a SEPARATE mid-task inbox consumed by
+    non-blocking reads (the ``Task.poll_messages`` drain). The plain
+    ScriptedComm pops its one inbox regardless of the blocking flag,
+    which would let a mid-task poll EAT the next scripted command.
+    """
+
+    mid_task_inbox: list = field(default_factory=list)
+
+    def receive_command(self, blocking=True):
+        if not blocking:
+            if self.mid_task_inbox:
+                return self.mid_task_inbox.pop(0)
+            return None
+        return super().receive_command(blocking)
+
+
+def _drive_comm(handler, comm):
+    """`_drive` against a caller-built comm stub."""
+    _REGISTRY.default = None
+    _REGISTRY.overwritten = False
+    _REGISTRY.message_handler = None
+    comm.exit_code = 0
+    try:
+        run(handler, comm=comm)
+    except SystemExit as exc:
+        comm.exit_code = exc.code if isinstance(exc.code, int) else 1
+    return comm
+
+
+class CustomMessageWorkerTests(unittest.TestCase):
+    """Worker side of the custom-message channel (feature 2): the
+    frozen `Task.send_message` / `Task.poll_messages` /
+    `@message_handler` surfaces.
+    """
+
+    def test_limit_constant_is_100_kib(self):
+        self.assertEqual(CUSTOM_MESSAGE_MAX_BYTES, 100 * 1024)
+
+    def test_send_message_emits_custom_response_mid_task(self):
+        def handle(task: Task):
+            task.send_message("phase4-batch", b"descriptor-bytes")
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+        customs = [r for r in comm.outbox if isinstance(r, CustomMessageResponse)]
+        self.assertEqual(len(customs), 1)
+        self.assertEqual(customs[0].topic, "phase4-batch")
+        self.assertEqual(customs[0].data, b"descriptor-bytes")
+        # The custom is NON-TERMINAL: the done still lands after it.
+        self.assertLess(
+            comm.outbox.index(customs[0]),
+            comm.outbox.index(
+                next(r for r in comm.outbox if isinstance(r, DoneResponse))
+            ),
+        )
+
+    def test_send_message_oversize_raises_naming_size_and_limit(self):
+        task = Task(relative_path="x")
+        oversize = b"x" * (CUSTOM_MESSAGE_MAX_BYTES + 1)
+        with self.assertRaises(ValueError) as ctx:
+            task.send_message("big", oversize)
+        msg = str(ctx.exception)
+        self.assertIn(str(CUSTOM_MESSAGE_MAX_BYTES + 1), msg)
+        self.assertIn(str(CUSTOM_MESSAGE_MAX_BYTES), msg)
+
+    def test_send_message_at_exact_limit_is_accepted(self):
+        task = Task(relative_path="x")
+        task.send_message("max", b"x" * CUSTOM_MESSAGE_MAX_BYTES)
+
+    def test_send_message_noop_safe_without_emit_hook(self):
+        # Unit-harness contract (the keepalive() twin): no _emit wired,
+        # no side effects, no crash — but the size contract still holds.
+        task = Task(relative_path="x")
+        task.send_message("t", b"d")
+
+    def test_poll_messages_returns_empty_without_hook(self):
+        self.assertEqual(Task(relative_path="x").poll_messages(), [])
+
+    def test_poll_messages_drains_in_order_then_empty(self):
+        polls = []
+
+        def handle(task: Task):
+            polls.append(task.poll_messages())
+            polls.append(task.poll_messages())
+            return None
+
+        comm = DuplexScriptedComm(
+            inbox=[_process(), StopCommand()],
+            mid_task_inbox=[
+                CustomMessageCommand("reply-a", b"one"),
+                CustomMessageCommand("reply-b", b"two"),
+            ],
+        )
+        _drive_comm(handle, comm)
+        self.assertEqual(polls[0], [("reply-a", b"one"), ("reply-b", b"two")])
+        self.assertEqual(polls[1], [])
+
+    def test_poll_messages_stashes_non_custom_commands(self):
+        # A non-custom frame encountered mid-drain (here: a buffered
+        # Stop) is NEVER lost: it is stashed and processed by the main
+        # loop after the task returns — the loop exits before the
+        # second scripted ProcessTask runs.
+        ran = []
+
+        def handle(task: Task):
+            ran.append(task.relative_path)
+            self.assertEqual(task.poll_messages(), [("mid", b"m")])
+            return None
+
+        comm = DuplexScriptedComm(
+            inbox=[_process("first"), _process("second-never-runs")],
+            mid_task_inbox=[
+                CustomMessageCommand("mid", b"m"),
+                StopCommand(),
+            ],
+        )
+        _drive_comm(handle, comm)
+        self.assertEqual(ran, ["first"])
+        dones = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(dones), 1)
+
+    def _drive_with_message_handler(self, handler_fn, commands):
+        """Drive a loop with a registered @message_handler. `_drive` /
+        `_drive_comm` reset the registry BEFORE running (inter-test
+        hygiene), so this variant registers the handler after the
+        reset and clears it afterwards.
+        """
+
+        def handle(task: Task):
+            return None
+
+        _REGISTRY.default = None
+        _REGISTRY.overwritten = False
+        _REGISTRY.message_handler = message_handler(handler_fn)
+        comm = ScriptedComm(inbox=list(commands))
+        comm.exit_code = 0
+        try:
+            run(handle, comm=comm)
+        except SystemExit as exc:
+            comm.exit_code = exc.code if isinstance(exc.code, int) else 1
+        finally:
+            _REGISTRY.message_handler = None
+        return comm
+
+    def test_between_tasks_custom_routes_to_message_handler(self):
+        seen = []
+
+        def on_message(topic: str, data: bytes) -> None:
+            seen.append((topic, data))
+
+        self._drive_with_message_handler(
+            on_message,
+            [
+                CustomMessageCommand("config-push", b"payload"),
+                _process(),
+                StopCommand(),
+            ],
+        )
+        self.assertEqual(seen, [("config-push", b"payload")])
+
+    def test_message_handler_exception_is_swallowed(self):
+        def on_message(topic: str, data: bytes) -> None:
+            raise RuntimeError("handler bug")
+
+        comm = self._drive_with_message_handler(
+            on_message,
+            [CustomMessageCommand("boom", b""), _process(), StopCommand()],
+        )
+        # The loop survived the raising handler: the task still ran.
+        self.assertTrue(any(isinstance(r, DoneResponse) for r in comm.outbox))
+        self.assertEqual(comm.exit_code, 0)
+
+    def test_no_message_handler_drops_between_tasks_custom(self):
+        def handle(task: Task):
+            return None
+
+        comm = _drive(
+            handle,
+            [CustomMessageCommand("ignored", b"x"), _process(), StopCommand()],
+        )
+        # Dropped silently; the task after it still ran.
+        self.assertTrue(any(isinstance(r, DoneResponse) for r in comm.outbox))
+        self.assertEqual(comm.exit_code, 0)
+
+    def test_message_handler_decorator_rejects_non_callable(self):
+        with self.assertRaises(TypeError):
+            message_handler("not-callable")
+
+
+
+class CustomMessageSocketE2ETests(unittest.TestCase):
+    """E2E smoke over a REAL socketpair: the worker loop runs against a
+    genuine ``UnixSocketInterface`` while this test plays the manager
+    side with raw codec bytes — so the buffered line reader's
+    blocking/non-blocking interleaving (the seam unit stubs cannot
+    see) is exercised: the worker's blocking command read, a mid-task
+    ``send_message`` stream, and a mid-task ``poll_messages`` drain of
+    the manager's reply all share one socket.
+    """
+
+    def test_worker_streams_and_reply_reaches_poll_messages(self):
+        import socket as socket_mod
+        import threading
+        import time
+
+        sock_mgr, sock_wrk = socket_mod.socketpair()
+        replies = []
+
+        def handle(task: Task):
+            # Stream N=3 customs mid-task...
+            for i in range(3):
+                task.send_message(f"batch-{i}", bytes([i]) * 4)
+            # ...then wait for the manager's reply via poll_messages.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                msgs = task.poll_messages()
+                if msgs:
+                    replies.extend(msgs)
+                    return None
+                time.sleep(0.005)
+            raise RuntimeError("manager reply never reached poll_messages")
+
+        def worker_main():
+            _REGISTRY.default = None
+            _REGISTRY.overwritten = False
+            _REGISTRY.message_handler = None
+            comm = UnixSocketInterface(sock_wrk)
+            try:
+                run(handle, comm=comm)
+            except SystemExit:
+                pass
+
+        worker = threading.Thread(target=worker_main, daemon=True)
+        worker.start()
+
+        mgr = sock_mgr.makefile("rb")
+        try:
+            # Worker announces readiness.
+            self.assertEqual(mgr.readline(), b"ready\n")
+            # Dispatch one task.
+            sock_mgr.sendall(ProcessBinaryCommand("item-1").serialize())
+            # The worker streams its three customs, in order.
+            for i in range(3):
+                line = mgr.readline().decode()
+                resp = parse_response(line)
+                self.assertIsInstance(resp, CustomMessageResponse)
+                self.assertEqual(resp.topic, f"batch-{i}")
+                self.assertEqual(resp.data, bytes([i]) * 4)
+            # Reply MID-TASK; the worker's poll_messages must see it.
+            sock_mgr.sendall(CustomMessageCommand("pong", b"xyz").serialize())
+            # The task completes normally (customs perturbed nothing).
+            done = parse_response(mgr.readline().decode())
+            self.assertIsInstance(done, DoneResponse)
+            # Clean shutdown.
+            sock_mgr.sendall(StopCommand().serialize())
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive(), "worker loop must exit on Stop")
+            self.assertEqual(replies, [("pong", b"xyz")])
+        finally:
+            mgr.close()
+            sock_mgr.close()
+
 
 
 if __name__ == "__main__":
