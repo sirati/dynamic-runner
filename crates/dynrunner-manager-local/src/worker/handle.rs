@@ -720,8 +720,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
-    /// Abort the background poll task (if any) so it cannot emit
-    /// further [`WorkerEvent`]s on the pool's shared event channel.
+    /// Abort the background poll task (if any) so it stops emitting
+    /// [`WorkerEvent`]s on the pool's shared event channel.
     ///
     /// # Single concern
     ///
@@ -731,18 +731,20 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// might still emit (a buffered `Response::Completed` read from
     /// the closing pipe, a `Disconnected` synthesised from pipe-EOF
     /// after `kill_subprocess`) would land on the pool's `event_tx`
-    /// with the original `worker_id` and be processed by the
-    /// secondary's `handle_worker_event` AS IF it came from the
-    /// fresh subprocess — but the secondary has already removed the
-    /// killed task from `active_tasks`, so the lookup misses and
-    /// the event surfaces as `task done task_hash=None` (the
-    /// observed wedge symptom).
+    /// with the original `worker_id`.
     ///
-    /// `JoinHandle::abort` cancels the spawned task at its next
-    /// await point; the protocol state it was driving is forfeited
-    /// (the slot is being replaced anyway, so the prior protocol
-    /// state is no longer needed). The `tx` clone the task held
-    /// drops with the task, so no further events can be sent. The
+    /// `JoinHandle::abort` is BEST-EFFORT: it cancels the spawned
+    /// task at its NEXT await point — it CANNOT retract a terminal
+    /// the resolved `poll_status` already `tx.send`'d (the send is
+    /// synchronous, with no await between resolve and send). Such a
+    /// buffered stale terminal survives the abort and carries the OLD
+    /// generation; it is neutralized at the CONSUMER by the generation
+    /// gate (`WorkerPool::is_stale_event` — every event is stamped
+    /// with the emitting subprocess's [`Self::generation`], and the
+    /// replacement edge bumps the slot's generation, so the gate drops
+    /// the stale event instead of processing it against the fresh
+    /// slot's bindings). The protocol state the task was driving is
+    /// forfeited (the slot is being replaced anyway). The
     /// `WorkerHandle` itself is unchanged from the caller's
     /// perspective; the pool's replacement code follows with the
     /// usual `kill_subprocess` + new-handle assignment.

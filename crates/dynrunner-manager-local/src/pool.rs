@@ -121,6 +121,44 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         }
     }
 
+    /// The GENERATION GATE — the single owner of the stale-event check.
+    ///
+    /// Returns `true` (and emits the WARN) when `event` was stamped by a
+    /// DEAD/REPLACED subprocess: its generation differs from the slot's
+    /// CURRENT (live handle's) generation, or its `worker_id` has no slot
+    /// at all (no live subprocess could have produced it). The pool owns
+    /// worker identity — including the per-slot [`WorkerHandle::generation`]
+    /// that every replacement edge bumps — so the comparison lives here;
+    /// both event-consumer loops (the LocalManager's `handle_event` and the
+    /// distributed secondary's `handle_worker_event`) are thin call sites.
+    ///
+    /// Why the gate exists: a replacement edge's `abort_poll_task` cancels
+    /// the orphan poll task at its NEXT await point — it cannot retract a
+    /// terminal the resolved `poll_status` already `tx.send`'d with no
+    /// await in between. That buffered stale terminal carries the OLD
+    /// generation; processing it against the fresh slot mis-attributes /
+    /// consumes whatever task the fresh subprocess was since bound to.
+    pub fn is_stale_event(&self, event: &WorkerEvent<I>) -> bool {
+        let event_generation = event.generation();
+        let worker_id = event.worker_id();
+        let current_generation = self
+            .workers
+            .get(worker_id as usize)
+            .map(|w| w.generation);
+        let stale = current_generation != Some(event_generation);
+        if stale {
+            tracing::warn!(
+                worker_id,
+                event_generation,
+                current_generation = ?current_generation,
+                event = ?std::mem::discriminant(event),
+                "dropping stale-generation worker event (slot was respawned; \
+                 the event is from a dead subprocess)"
+            );
+        }
+        stale
+    }
+
     /// Accessor for the materialised workers/ cgroup handle, if any.
     /// Exposed for tests + diagnostic logging; production callers do
     /// not need this — the pool's per-spawn sites materialise a
@@ -368,11 +406,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // task detached on handle drop, which can later emit a
         // buffered `Response::Completed` (or pipe-EOF `Disconnected`)
         // on the pool's shared event channel for this worker_id. The
-        // secondary's `handle_worker_event` has already cleaned
-        // `active_tasks` for the killed task, so the stale event
-        // surfaces as `task done task_hash=None` and the dispatcher's
-        // accounting silently stalls. See `WorkerHandle::abort_poll_task`
-        // for the full rationale.
+        // abort is BEST-EFFORT — it cannot retract a terminal the poll
+        // loop already sent — so the real protection is the generation
+        // gate (`is_stale_event`: the replacement below constructs the
+        // successor handle with a BUMPED generation, and consumers drop
+        // any event stamped with the old one). See
+        // `WorkerHandle::abort_poll_task` for the full rationale.
         old.abort_poll_task();
 
         let preserved_type = self.workers[worker_id as usize].loaded_type_id.clone();

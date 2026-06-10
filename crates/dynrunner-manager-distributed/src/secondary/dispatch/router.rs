@@ -261,6 +261,14 @@ where
                             // gate: the gate stops a stale terminal from
                             // mis-attributing; this stops a replacement from
                             // abandoning a still-bound task.
+                            //
+                            // ORDERING: the sweep runs after the generation
+                            // bump, in the SAME select-arm body — the event
+                            // channel cannot drain between bump and sweep
+                            // within one loop iteration. Keep them adjacent;
+                            // even if a future refactor yielded to the event
+                            // arm in between, the bumped generation makes the
+                            // gate drop a draining stale terminal first.
                             self.sweep_replaced_worker_task(target_wid).await?;
                             self.op_mut().pending_first_bind.insert(
                                 target_wid,

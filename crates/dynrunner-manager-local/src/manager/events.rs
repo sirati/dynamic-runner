@@ -39,33 +39,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         factory: &mut impl WorkerFactory<M>,
         oom_watcher: &OomWatcher,
     ) {
-        // Generation gate: drop any event from a dead subprocess.
-        //
-        // A worker-replacement edge (`restart_worker`,
-        // `ensure_worker_for_type`) bumps the slot's generation and
-        // installs a fresh subprocess. The prior poll task can leave a
-        // buffered TERMINAL on the channel that `abort_poll_task` could
-        // not retract — it carries the OLD generation. Acting on it here
-        // would `clear_task` / reclaim against the FRESH slot, wiping the
-        // newly-assigned task's metadata. Comparing the event's
-        // generation to the slot's CURRENT (live handle's) generation and
-        // dropping the mismatch closes that race. An out-of-range
-        // `worker_id` has no slot and is dropped for the same reason.
-        let event_generation = event.generation();
-        let event_worker_id = event.worker_id();
-        let current_generation = self
-            .pool
-            .workers
-            .get(event_worker_id as usize)
-            .map(|w| w.generation);
-        if current_generation != Some(event_generation) {
-            tracing::warn!(
-                worker_id = event_worker_id,
-                event_generation,
-                current_generation = ?current_generation,
-                event = ?std::mem::discriminant(&event),
-                "dropping stale-generation worker event (slot was respawned)"
-            );
+        // Generation gate: drop any event from a dead subprocess. A
+        // replacement edge bumps the slot's generation; a buffered stale
+        // terminal `abort_poll_task` could not retract would otherwise
+        // `clear_task` / reclaim against the FRESH slot, wiping the
+        // newly-assigned task's metadata. The check (and its WARN) is
+        // owned by the pool — see [`WorkerPool::is_stale_event`].
+        if self.pool.is_stale_event(&event) {
             return;
         }
 

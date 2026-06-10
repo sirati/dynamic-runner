@@ -64,28 +64,10 @@ where
         // since bound to, leaving the real in-flight task orphaned
         // (assigned-never-terminal) and wedging the phase barrier.
         //
-        // The slot's CURRENT generation is the live handle's
-        // `generation`. Any event whose generation differs is from a
-        // dead subprocess: drop it. An out-of-range `worker_id` (degenerate
-        // 0-worker node) has no slot to compare against and is dropped
-        // for the same reason — no live subprocess could have produced it.
-        let event_generation = event.generation();
-        let worker_id = event.worker_id();
-        let current_generation = self
-            .op_mut()
-            .pool
-            .workers
-            .get(worker_id as usize)
-            .map(|w| w.generation);
-        if current_generation != Some(event_generation) {
-            tracing::warn!(
-                worker_id,
-                event_generation,
-                current_generation = ?current_generation,
-                event = ?std::mem::discriminant(&event),
-                "dropping stale-generation worker event (slot was respawned; \
-                 this event is from a dead subprocess)"
-            );
+        // The check (and its WARN) is owned by the pool, which owns
+        // worker identity + the per-slot generation — see
+        // [`dynrunner_manager_local::WorkerPool::is_stale_event`].
+        if self.op_mut().pool.is_stale_event(&event) {
             return Ok(None);
         }
 
