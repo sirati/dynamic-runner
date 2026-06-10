@@ -171,6 +171,139 @@ where
             .unwrap_or(false)
     }
 
+    /// Is `id` currently a connected member of the transport mesh
+    /// (`MeshClient::has_peer` over the published `MembershipView`)?
+    ///
+    /// SINGLE SOURCE for the transport-membership read every
+    /// death/liveness seam takes (the `live_peer_ids` quorum
+    /// intersection, the leg-(C) arming observation in
+    /// [`Self::primary_departed_membership`], the deferrer-side
+    /// death-evidence sites): the mesh-pump republishes the view on every
+    /// peer connect/disconnect (`handle_peer_disconnect` → live
+    /// `transport.connected_ids()` re-read), so this flips `false` within
+    /// one pump cycle of a peer's QUIC teardown — the fast,
+    /// idle-independent, role-independent transport signal (mesh ⊥ role).
+    pub(in crate::secondary) fn is_mesh_member(&self, id: &str) -> bool {
+        self.client
+            .has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(id))
+    }
+
+    /// Leg (C) of the primary-death evidence: has the CURRENT PRIMARY
+    /// departed the transport mesh membership? The idle-independent
+    /// primary-death observation, SINGLE-SOURCED here for BOTH sides of
+    /// the failover protocol:
+    ///   - the ARMING side: `run_election_tick`'s `need_election`
+    ///     disjunction (the "election arms on current_primary leaving
+    ///     membership" leg), and
+    ///   - the DEFERRER side (#331): `record_promotion_vote`'s
+    ///     independent-death-observation gate, so a peer asked to confirm
+    ///     a candidate stops deferring the moment it has watched the
+    ///     primary's QUIC connection tear down, instead of withholding its
+    ///     confirm until its own frame-silence clock crosses the ~15s
+    ///     death deadline — the deferrer-side twin that lets failover
+    ///     converge sub-deadline. (The `TimeoutQuery` responder's
+    ///     equivalent observation is [`Self::queried_node_liveness_age`],
+    ///     keyed on the QUERIED id rather than the primary role.)
+    ///
+    /// Reads the transport `MembershipView` (NOT the CRDT `is_peer_alive`
+    /// ledger): a dead primary cannot originate its own `PeerRemoved`, and
+    /// no surviving secondary originates one for it — the CRDT membership
+    /// stays stale on primary death, while the transport view is the
+    /// direct, role-independent death observation (mesh ⊥ role). The
+    /// mesh-pump republishes the view on the primary's QUIC teardown
+    /// (`handle_peer_disconnect`), so `has_peer` flips `false` within one
+    /// pump cycle — regardless of whether THIS node ever issued a
+    /// primary-bound send.
+    ///
+    /// SELF-EXCLUSION: a `current_primary` naming THIS node (a same-peer /
+    /// self-promoted primary co-located with the secondary role) is NEVER
+    /// a membership-departure signal — a node is structurally absent from
+    /// its OWN transport `connected_ids` (the view enumerates REMOTE
+    /// peers), so `has_peer(self)` is always `false` while the local
+    /// primary is perfectly alive. Reading that as "primary left" would
+    /// make a promoted/co-located node spuriously act against itself, so
+    /// the observation is keyed only on a REMOTE primary identity —
+    /// exactly the single-source self-skip `live_peer_ids` /
+    /// `check_peer_timeouts` apply for the quorum side.
+    ///
+    /// SEEN-GATE (`primary_last_seen.is_some()`): fires only for a primary
+    /// this node has actually SEEN (received ≥1 message from) and that is
+    /// now absent from membership — a genuine death of a previously-live
+    /// primary. The gate suppresses the relocation bring-up window, where
+    /// a freshly-named compute primary is in `current_primary()` but this
+    /// survivor's transport has not yet dialled it (so `has_peer` is
+    /// transiently `false`): there `primary_last_seen` is still `None` (no
+    /// primary message yet, and neither backdate site has run — both
+    /// require a prior no-route), so the observation correctly stays
+    /// silent until the primary has proven liveness once.
+    ///
+    /// DEBOUNCE: a transient single-cycle membership flicker on a
+    /// still-live primary is self-cancelling, on both consuming sides —
+    /// the next primary keepalive routes through `record_primary_message`,
+    /// which reverts an armed Suspecting back to Normal; and a confirm the
+    /// deferrer would have lent during the blip is simply never sent once
+    /// `has_peer` reads `true` again on the next call. The beacon union is
+    /// deliberately NOT folded in here: each consumer applies its own
+    /// `primary_beacon_fresh` suppression at its decision site, exactly as
+    /// the arming side always has.
+    pub(in crate::secondary) fn primary_departed_membership(&self) -> bool {
+        let seen = self
+            .op_ref()
+            .map(|op| op.primary_last_seen.is_some())
+            .unwrap_or(false);
+        seen && self
+            .cluster_state
+            .current_primary()
+            .filter(|id| *id != self.config.secondary_id.as_str())
+            .map(|id| !self.is_mesh_member(id))
+            .unwrap_or(false)
+    }
+
+    /// The liveness EVIDENCE this node reports about `query_node_id` in a
+    /// `TimeoutResponse`: `Some(age)` — seconds since its last `Secondary`
+    /// keepalive, on THIS node's monotonic clock — while the queried node
+    /// is a live mesh member; `None` when this node has NO liveness
+    /// evidence for it: never saw a keepalive (the pre-existing meaning),
+    /// OR — the responder-side membership observation (#331) — saw it and
+    /// then watched it DEPART the transport membership with its beacon
+    /// also silent. The querier's Suspecting tally counts a `None` as
+    /// agreement that the queried node is silent, so a responder that
+    /// observed the death at the transport level lends its agreement
+    /// IMMEDIATELY instead of deferring until its keepalive age crosses
+    /// the ~15s death deadline. This is the same
+    /// keepalive ∩ membership rule `live_peer_ids` applies to the quorum
+    /// denominator: a departed peer's lingering `peer_keepalives` entry is
+    /// a corpse entry (the 300s reaper just hasn't fired), not liveness —
+    /// reporting its raw age as if it were liveness evidence is what made
+    /// every survivor's agreement wait out the silence window.
+    ///
+    /// Guards, mirroring [`Self::primary_departed_membership`]'s shape:
+    ///   - SELF-EXCLUSION: this node is structurally absent from its own
+    ///     membership view, so a query about THIS node's id never reads as
+    ///     departed.
+    ///   - SEEN-GATE: the departed branch requires a `peer_keepalives`
+    ///     entry (seen-then-departed); a never-seen node reports `None`
+    ///     exactly as before, with no membership read.
+    ///   - BEACON UNION: a membership-departed node whose
+    ///     transport-INDEPENDENT beacon is still fresh (a CPU-starved but
+    ///     alive primary whose QUIC connection idle-timed-out) is NOT
+    ///     death-observed — its keepalive age is reported as before, so a
+    ///     peer's spurious election cannot gather agreement through us.
+    pub(in crate::secondary) fn queried_node_liveness_age(
+        &self,
+        query_node_id: &str,
+    ) -> Option<f64> {
+        let age = self
+            .op_ref()
+            .and_then(|op| op.peer_keepalives.get(query_node_id))
+            .map(|t| t.elapsed().as_secs_f64());
+        let death_observed = age.is_some()
+            && query_node_id != self.config.secondary_id
+            && !self.is_mesh_member(query_node_id)
+            && !self.primary_beacon_fresh(query_node_id);
+        if death_observed { None } else { age }
+    }
+
     /// The live mesh peers for failover quorum/candidate reasoning: the
     /// keys of `peer_keepalives`, MINUS the current primary's host id, AND
     /// INTERSECTED with the live transport `MembershipView` — a peer counts
@@ -213,26 +346,21 @@ where
     /// because the 300s reaper has not fired) is correctly excluded NOW.
     pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
         let current_primary = self.cluster_state.current_primary();
-        // The live transport membership view is read off the same
-        // `MeshClient` leg (C) uses for the primary. A disjoint `&self`
-        // field from `cluster_state` / the operational state, so all three
-        // shared borrows coexist.
-        let client = &self.client;
         // `peer_keepalives` now lives in `OperationalState`; outside
         // `Operational` there are no peer keepalives to enumerate (the
         // election that calls this only runs `Operational`), so an empty
-        // iterator is the faithful pre-`Operational` answer. Both
-        // borrows (`cluster_state` + the operational state) are shared
-        // `&self` reads of disjoint fields, so they coexist.
+        // iterator is the faithful pre-`Operational` answer. All the
+        // reads here (`cluster_state`, the operational state, the
+        // membership view behind `is_mesh_member`) are shared `&self`
+        // borrows, so they coexist.
         self.op_ref()
             .into_iter()
             .flat_map(|op| op.peer_keepalives.keys())
             .filter(move |id| Some(id.as_str()) != current_primary)
-            .filter(move |id| {
-                client.has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(
-                    id.as_str(),
-                ))
-            })
+            // The live transport membership view, read through the same
+            // single-source seam (`is_mesh_member`) leg (C) and the
+            // deferrer-side death-evidence sites use.
+            .filter(move |id| self.is_mesh_member(id))
     }
 
     /// The role-aware "alive secondaries" set — the single coordinator
@@ -317,49 +445,24 @@ where
         // primary's diagnostic identity + the `TimeoutQuery` target.
         let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
         // (C) primary DEPARTED the transport mesh — the idle-independent
-        // primary-death signal. The mesh-pump republishes the
-        // `MembershipView` on every peer connect/disconnect
-        // (`handle_peer_disconnect` → live `transport.connected_ids()`
-        // re-read), so `MeshClient::has_peer` flips to `false` the pump
-        // cycle a primary's QUIC connection tears down — regardless of
-        // whether THIS node ever issued a primary-bound send. That is the
-        // gap legs (A)/(B) cannot cover for an IDLE survivor: (A) opens its
-        // health window only on a `send_to_primary` no-route (an idle node
-        // issues none), and (B) is the patient ~120s backstop; a node with
-        // no pending send to the dead primary would otherwise loop the
-        // transport's reconnect-ticker silently and never elect. Reading the
-        // transport `MembershipView` (NOT the CRDT `is_peer_alive` ledger)
-        // is correct because a dead primary cannot originate its own
-        // `PeerRemoved`, and no surviving secondary originates one for it —
-        // the CRDT membership stays stale on primary death, while the
-        // transport view is the direct, role-independent death observation
-        // (mesh ⊥ role; built on the same pump/`MembershipView` layer rc-C
-        // landed). Snapshotted here as a `&self` read alongside
+        // primary-death signal. That is the gap legs (A)/(B) cannot cover
+        // for an IDLE survivor: (A) opens its health window only on a
+        // `send_to_primary` no-route (an idle node issues none), and (B)
+        // is the patient ~120s backstop; a node with no pending send to
+        // the dead primary would otherwise loop the transport's
+        // reconnect-ticker silently and never elect. The observation
+        // itself — the `MembershipView` read, the self-exclusion, the
+        // `primary_last_seen` seen-gate — is the single-source
+        // [`Self::primary_departed_membership`], SHARED with the
+        // deferrer-side consumer (`record_promotion_vote`) so the arming
+        // and deferring sides cannot drift on what "the primary left the
+        // mesh" means. Snapshotted here as a `&self` read alongside
         // `current_primary_id`, before the `&mut op` borrow below.
-        //
-        // SELF-EXCLUSION: a `current_primary` naming THIS node (a same-peer /
-        // self-promoted primary co-located with the secondary role) is NEVER
-        // a membership-departure signal — a node is structurally absent from
-        // its OWN transport `connected_ids` (the view enumerates REMOTE
-        // peers), so `has_peer(self)` is always `false` while the local
-        // primary is perfectly alive. Reading that as "primary left" would
-        // make a promoted/co-located node spuriously elect against itself, so
-        // leg (C) is keyed only on a REMOTE primary identity — exactly the
-        // single-source self-skip `live_peer_ids` / `check_peer_timeouts`
-        // apply for the quorum side.
-        let primary_left_membership = current_primary_id
-            .as_deref()
-            .filter(|id| *id != self.config.secondary_id.as_str())
-            .map(|id| {
-                !self
-                    .client
-                    .has_peer(&dynrunner_protocol_primary_secondary::address::PeerId::from(id))
-            })
-            .unwrap_or(false);
+        let primary_left_membership_after_seen = self.primary_departed_membership();
         // UNION counterpart of the mesh-frame death legs: is the current
         // primary's transport-INDEPENDENT beacon still flowing? Snapshotted
         // here as a `&self` read of `beacon_liveness` (alongside
-        // `current_primary_id` / `primary_left_membership`), before the
+        // `current_primary_id` / `primary_left_membership_after_seen`), before the
         // `&mut op` borrow below. A CPU-starved-but-alive primary (its
         // single-threaded runtime pegged by a co-located build) freezes its
         // OUTBOUND mesh keepalive AND lets its QUIC connection idle-timeout —
@@ -467,24 +570,10 @@ where
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > backstop)
             .unwrap_or(false);
-        // (C) primary departed the transport mesh — the idle-independent
-        // death signal (snapshotted above off `MeshClient::has_peer`).
-        // GATED on `primary_last_seen.is_some()`: leg (C) fires only for a
-        // primary this node has actually SEEN (received ≥1 message from) and
-        // that is now absent from membership — a genuine death of a
-        // previously-live primary. The gate suppresses the relocation
-        // bring-up window, where a freshly-named compute primary is in
-        // `current_primary()` but this survivor's transport has not yet
-        // dialled it (so `has_peer` is transiently `false`): there
-        // `primary_last_seen` is still `None` (no primary message yet, and
-        // neither backdate site has run — both require a prior no-route), so
-        // (C) correctly stays silent until the primary has proven liveness
-        // once. A transient single-cycle membership flicker on a still-live
-        // primary is self-cancelling: the next primary keepalive routes
-        // through `record_primary_message`, which reverts an
-        // (A)/(B)/(C)-triggered Suspecting back to Normal.
-        let primary_left_membership_after_seen =
-            primary_left_membership && op.primary_last_seen.is_some();
+        // (C) primary departed the transport mesh — snapshotted above via
+        // the single-source `primary_departed_membership()` (which carries
+        // the `primary_last_seen.is_some()` seen-gate, the self-exclusion,
+        // and the blip self-cancellation rationale).
 
         // The UNION death-clock (mirroring the primary-side reaper, where a
         // secondary is reaped iff BOTH its beacon and its frames are silent):
@@ -760,8 +849,10 @@ where
     }
 
     /// Handle an incoming `PromotionVote` from a peer. We confirm only if
-    /// the candidate is the lowest-live-id we know about and we also see
-    /// the primary as silent. Returns the message to send back, if any.
+    /// the candidate is the lowest-live-id we know about and we have
+    /// independently observed the primary as dead — silent frames OR a
+    /// transport membership departure (#331). Returns the message to send
+    /// back, if any.
     pub(in crate::secondary) fn record_promotion_vote(
         &mut self,
         candidate: String,
@@ -776,6 +867,22 @@ where
             .and_then(|op| op.primary_last_seen)
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(true);
+        // Deferrer-side leg (C) (#331): the current primary DEPARTING the
+        // transport membership is this node's own, independent death
+        // observation — the same single-source
+        // [`Self::primary_departed_membership`] the arming side reads.
+        // Pre-fix the deferrer's only mesh-frame evidence was
+        // `frame_silent` (its own receive-staleness crossing the ~15s
+        // death deadline), so even though every survivor WATCHED the
+        // primary's QUIC teardown within one pump cycle, each still
+        // WITHHELD its confirm until its own silence clock ran out —
+        // bounding failover convergence below by the deadline. With the
+        // membership observation the deferrer lends its confirm the
+        // moment it has independently seen the death; a transient blip
+        // self-debounces exactly as on the arming side (seen-gate,
+        // `has_peer` reading `true` again by the next vote, and the
+        // unchanged beacon union below).
+        let membership_departed = self.primary_departed_membership();
         // UNION with the beacon (mirror the arm-side `need_election`): a peer
         // that armed an election against a CPU-starved-but-alive primary
         // would otherwise pull our confirm on the frame-silence alone. The
@@ -788,7 +895,7 @@ where
             .as_deref()
             .map(|id| self.primary_beacon_fresh(id))
             .unwrap_or(false);
-        let primary_silent = frame_silent && !beacon_fresh;
+        let primary_silent = (frame_silent || membership_departed) && !beacon_fresh;
         if !primary_silent {
             return None;
         }
