@@ -115,6 +115,9 @@ class WriteCrashTracebackTests(unittest.TestCase):
     def _crash_file(self, log_dir: str) -> pathlib.Path:
         return pathlib.Path(log_dir) / fault_dumps._CRASH_BASENAME
 
+    def _exit_file(self, log_dir: str) -> pathlib.Path:
+        return pathlib.Path(log_dir) / fault_dumps._EXIT_BASENAME
+
     def test_writes_traceback_of_inflight_exception(self) -> None:
         import tempfile
 
@@ -160,16 +163,51 @@ class WriteCrashTracebackTests(unittest.TestCase):
                 except SystemExit:
                     fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
             self.assertFalse(self._crash_file(tmp).exists())
+            # A clean exit is not even trace-worthy: no exit log either.
+            self.assertFalse(self._exit_file(tmp).exists())
 
-    def test_nonzero_systemexit_is_recorded(self) -> None:
+    def test_systemexit_any_code_is_never_crash_dumped(self) -> None:
+        # `SystemExit` is by definition a deliberate interpreter exit
+        # (raise-by-design) — regardless of code, it must NEVER land in
+        # bootstrap-crash.log. The asm-dataset 2212c136 fire-drill: a
+        # secondary's deliberate `sys.exit(1)` after the primary's
+        # RunAborted was filed as a "bootstrap crash", sending the
+        # operator hunting a phantom.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for code in (1, 2, "secondary exiting: run aborted by primary"):
+                try:
+                    raise SystemExit(code)
+                except SystemExit:
+                    fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            self.assertFalse(self._crash_file(tmp).exists())
+
+    def test_keyboardinterrupt_is_never_crash_dumped(self) -> None:
+        # Operator-initiated interrupt: deliberate, not a crash.
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                raise SystemExit(2)
+                raise KeyboardInterrupt()
+            except KeyboardInterrupt:
+                fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
+            self.assertFalse(self._crash_file(tmp).exists())
+
+    def test_nonzero_systemexit_leaves_one_line_exit_trace(self) -> None:
+        # A deliberate NON-ZERO exit still leaves a durable one-line trace
+        # (in `bootstrap-exit.log`, never the crash log) so the operator can
+        # correlate the container's exit code without a phantom crash hunt.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                raise SystemExit(1)
             except SystemExit:
                 fault_dumps.write_crash_traceback(["--full-log-dir", tmp])
-            self.assertIn("SystemExit: 2", self._crash_file(tmp).read_text())
+            body = self._exit_file(tmp).read_text()
+            self.assertIn("bootstrap exited deliberately rc=1", body)
+            self.assertNotIn("Traceback", body)
 
     def test_never_raises_without_log_dir_or_with_bad_dir(self) -> None:
         # No `--full-log-dir` → silent no-op; an uncreatable dir → swallowed.
