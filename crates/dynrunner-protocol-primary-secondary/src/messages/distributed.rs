@@ -553,6 +553,60 @@ pub enum DistributedMessage<I> {
         /// The confirmed report's `delivery_seq`, echoed verbatim.
         seq: u64,
     },
+    /// Primary -> holder secondary: per-task reconciliation probe
+    /// (#308). Asks "do you still hold `task_hash` in any live
+    /// bookkeeping?" — emitted by the primary's per-task deadline
+    /// tracker once the task has been in flight too long with no
+    /// terminal. The holder answers with a
+    /// [`DistributedMessage::TaskHoldResponse`].
+    ///
+    /// Accounting reconciliation ONLY — never a liveness signal: a
+    /// missing response is left to the existing silent-secondary
+    /// machinery (the probe re-arms and takes no action).
+    TaskHoldQuery {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The in-flight ledger key being reconciled (the same hash the
+        /// `TaskAssignment` carried as `file_hash` and a terminal
+        /// carries as `task_hash`).
+        task_hash: String,
+    },
+    /// Holder secondary -> primary: the answer to a
+    /// [`DistributedMessage::TaskHoldQuery`]. `held = true` means the
+    /// task is genuinely in some live bookkeeping on the responder
+    /// (the generation-aware `active_tasks` map or the deferred
+    /// `pending_first_bind` set) — the primary re-arms its deadline (a
+    /// long task survives unlimited probe rounds). `held = false` is
+    /// the responder's positive denial: it will never produce a
+    /// terminal for this task, so the primary fails + requeues it
+    /// through the backpressure-shaped path.
+    TaskHoldResponse {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// Echoes the query's `task_hash` so the primary matches the
+        /// answer to its outstanding probe.
+        task_hash: String,
+        /// Whether the responder holds the task in any live bookkeeping.
+        held: bool,
+    },
     Keepalive {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
         /// [`Destination`] the egress stamps so the receiving mesh-pump
