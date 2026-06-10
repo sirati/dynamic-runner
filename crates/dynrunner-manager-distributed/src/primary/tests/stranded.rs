@@ -999,6 +999,7 @@ async fn drain_pending_messages_updates_completed_set() {
                         worker_id: 0,
                         task_hash: hash.into(),
                         result_data: None,
+                        delivery_seq: None,
                     })
                     .unwrap();
             }

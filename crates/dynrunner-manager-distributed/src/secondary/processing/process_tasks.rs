@@ -554,14 +554,18 @@ where
                     .await;
             }
 
-            // Re-deliver any terminal-bearing report whose send was absorbed
-            // on a transient no-route (the buffered-terminal-replay edge).
-            // Every tick re-attempts the buffer FIFO, retrying forever until
-            // delivered; a still-no-route re-absorb re-buffers it. No-op when
-            // the buffer is empty (the steady-state hot path). This is the
-            // PERIODIC re-delivery trigger; the `record_primary_message`
-            // primary-link-recovery edge is the fast complement (drains the
-            // instant a primary message resumes, ahead of the next tick).
+            // Re-deliver any terminal-bearing report not yet CONFIRMED at
+            // the authority (the buffered-terminal-replay edge): a no-route
+            // absorb re-sends every tick, and a sent-but-unacked report
+            // replays once its `terminal_ack_timeout` elapses (#352 — the
+            // blackholed-but-live-leg detection); only the primary's
+            // `TerminalAck` drops an entry. FIFO, retrying forever; a
+            // still-no-route re-absorb re-buffers. No-op when the buffer is
+            // empty and silent while entries merely await a fresh ack (the
+            // steady-state hot paths). This is the PERIODIC re-delivery
+            // trigger; the `record_primary_message` primary-link-recovery
+            // edge is the fast complement (drains the instant a primary
+            // message resumes, ahead of the next tick).
             self.drain_terminal_replays().await;
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh

@@ -303,6 +303,8 @@ where
                             error_message: format!(
                                 "No idle worker available (respawn failed): {e}"
                             ),
+                            // Stamped at the send_to_primary chokepoint (#352).
+                            delivery_seq: None,
                         };
                         // Report to the primary role only; the authority
                         // owns mesh propagation (it originates the CRDT
@@ -383,6 +385,8 @@ where
                                 task_hash: file_hash,
                                 error_type: ErrorType::Recoverable,
                                 error_message: "worker pipe broken; respawning".into(),
+                                // Stamped at the send_to_primary chokepoint (#352).
+                                delivery_seq: None,
                             };
                             self.send_to_primary(msg).await?;
                         }
@@ -404,6 +408,8 @@ where
                         task_hash: file_hash,
                         error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
+                        // Stamped at the send_to_primary chokepoint (#352).
+                        delivery_seq: None,
                     };
                     // Report to the primary only — the authority owns
                     // mesh propagation. Routing across a primary

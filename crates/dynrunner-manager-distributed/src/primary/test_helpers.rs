@@ -620,6 +620,7 @@ pub(super) async fn fake_secondary_with_addrs(
                                         worker_id: 0,
                                         task_hash,
                                         result_data: None,
+                                        delivery_seq: None,
                                     })
                                     .unwrap();
                             }
@@ -654,6 +655,7 @@ pub(super) async fn fake_secondary_with_addrs(
                             worker_id,
                             task_hash: entry.hash.clone(),
                             result_data: None,
+                            delivery_seq: None,
                         })
                         .unwrap();
 
@@ -684,6 +686,7 @@ pub(super) async fn fake_secondary_with_addrs(
                         worker_id: 0,
                         task_hash: file_hash,
                         result_data: None,
+                        delivery_seq: None,
                     })
                     .unwrap();
 
@@ -797,6 +800,7 @@ pub(super) async fn fake_secondary_transport_only_no_meshready(
                                     worker_id: 0,
                                     task_hash,
                                     result_data: None,
+                                    delivery_seq: None,
                                 })
                                 .unwrap();
                         }

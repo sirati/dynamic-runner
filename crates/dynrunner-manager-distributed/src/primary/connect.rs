@@ -187,6 +187,14 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // are sparser than task traffic.
         self.record_keepalive(msg.sender_id());
 
+        // App-level delivery confirmation (#352): echo a `TerminalAck`
+        // for EVERY `delivery_seq`-stamped terminal-bearing landing,
+        // BEFORE the handlers run — including landings their dedup gates
+        // will drop (a duplicate means the original ack was lost or the
+        // replay raced it; not re-acking would replay forever). A no-op
+        // for every other frame, so the handlers stay seq-oblivious.
+        self.ack_terminal_report(&msg).await;
+
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
@@ -228,6 +236,60 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             }
         }
         Ok(())
+    }
+
+    /// Echo the app-level delivery confirmation (#352) for one
+    /// terminal-bearing report landing: a `TerminalAck { seq }` unicast
+    /// back to the report's ORIGINATING secondary.
+    ///
+    /// Gated on the frame carrying BOTH a `delivery_seq` (a pre-field /
+    /// unstamped sender gets no ack and keeps the pre-#352 no-route-only
+    /// replay behaviour) and a `terminal_reporter` (non-terminal frames
+    /// have neither) — i.e. a no-op for everything but a stamped
+    /// `TaskComplete` / `TaskFailed`.
+    ///
+    /// Addressed to the frame's `secondary_id` (the originator holding
+    /// the retention buffer), NOT the wire `sender_id`: a relayed or
+    /// peer-forwarded landing must still clear the originator's buffer.
+    /// The ack is acked-per-LANDING and exact-seq (no ack-up-to
+    /// coalescing — replays re-send the same seq, possibly across a
+    /// failover, so cumulative semantics could falsely confirm a seq
+    /// that travelled a different, still-blackholed leg). Dedup of the
+    /// duplicate landings themselves stays with the proven hash-keyed
+    /// terminal idempotence in the handlers — no per-secondary seq state
+    /// is kept here, so a freshly-promoted primary acks replays
+    /// correctly with zero handoff.
+    ///
+    /// A send failure is best-effort (DEBUG): the reporter's ack-timeout
+    /// replay re-lands the report and this site re-acks it.
+    pub(super) async fn ack_terminal_report(&mut self, msg: &DistributedMessage<I>) {
+        let (Some(seq), Some(reporter)) = (msg.delivery_seq(), msg.terminal_reporter()) else {
+            return;
+        };
+        let reporter = reporter.to_string();
+        let ack = DistributedMessage::TerminalAck {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: super::wire::timestamp_now(),
+            seq,
+        };
+        if let Err(e) = self
+            .send_to(
+                dynrunner_protocol_primary_secondary::Destination::Secondary(
+                    dynrunner_protocol_primary_secondary::PeerId::from(reporter.as_str()),
+                ),
+                ack,
+            )
+            .await
+        {
+            tracing::debug!(
+                secondary = %reporter,
+                seq,
+                error = %e,
+                "TerminalAck send failed (best-effort; the reporter's \
+                 ack-timeout replay re-lands the report and gets re-acked)"
+            );
+        }
     }
 
     /// Record a secondary's `MeshReady` report. The

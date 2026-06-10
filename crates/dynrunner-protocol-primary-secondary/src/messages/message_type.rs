@@ -43,6 +43,12 @@ pub enum MessageType {
     // Secondary <-> Secondary (peer-to-peer)
     TaskComplete,
     TaskFailed,
+    /// Primary -> reporting secondary: app-level delivery confirmation
+    /// for one terminal-bearing report landing (#352). Carries the
+    /// confirmed report's `delivery_seq` verbatim; the receiving
+    /// secondary drops the matching retention-buffer entry. Delivery
+    /// bookkeeping only — never a liveness signal.
+    TerminalAck,
     Keepalive,
     TimeoutDetected,
     TimeoutQuery,

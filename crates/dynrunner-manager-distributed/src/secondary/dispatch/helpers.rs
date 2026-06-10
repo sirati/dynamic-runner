@@ -438,6 +438,8 @@ where
                     "file_hash {file_hash} not pre-staged at {local_path}; \
                      expected StageFile notification first"
                 ),
+                // Stamped at the send_to_primary chokepoint (#352).
+                delivery_seq: None,
             };
             self.send_to_primary(msg).await?;
             return Ok(true);

@@ -184,6 +184,7 @@ fn roundtrip_all_message_types() {
             worker_id: 0,
             task_hash: "h".into(),
             result_data: None,
+            delivery_seq: None,
         },
         DistributedMessage::TaskFailed {
             target: None,
@@ -194,6 +195,13 @@ fn roundtrip_all_message_types() {
             task_hash: "h".into(),
             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
             error_message: "m".into(),
+            delivery_seq: None,
+        },
+        DistributedMessage::TerminalAck {
+            target: None,
+            sender_id: "p".into(),
+            timestamp: 0.0,
+            seq: 7,
         },
         DistributedMessage::Keepalive {
             target: None,

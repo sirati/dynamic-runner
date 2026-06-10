@@ -57,6 +57,7 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 worker_id: 0,
                 task_hash: hash.clone(),
                 result_data: Some(payload.clone()),
+                delivery_seq: None,
             };
             primary.handle_task_complete(msg, &mut None).await;
             // Let the pump drain the queued ClusterMutation broadcast onto the

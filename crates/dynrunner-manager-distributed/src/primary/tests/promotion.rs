@@ -534,6 +534,7 @@ fn handle_inbound_for_gated_secondary(
                     worker_id,
                     task_hash: entry.hash.clone(),
                     result_data: None,
+                    delivery_seq: None,
                 });
                 let _ = outgoing.send(DistributedMessage::TaskRequest {
                     target: None,
@@ -558,6 +559,7 @@ fn handle_inbound_for_gated_secondary(
                 worker_id: 0,
                 task_hash: file_hash,
                 result_data: None,
+                delivery_seq: None,
             });
             let _ = outgoing.send(DistributedMessage::TaskRequest {
                 target: None,
@@ -923,6 +925,7 @@ async fn promoted_inflight_reserves_per_type_slot_for_symmetric_release() {
                 worker_id: 0,
                 task_hash: "inflight-cap".into(),
                 result_data: None,
+                delivery_seq: None,
             };
             promoted.handle_task_complete(msg, &mut None).await;
 

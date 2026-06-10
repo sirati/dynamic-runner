@@ -17,6 +17,7 @@ use tracing::Instrument;
 
 use super::lifecycle::{OperationalLatches, SecondaryLifecycle};
 use super::primary_link::PrimaryLink;
+use super::resource;
 use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
 use crate::process::{MeshClient, PromotionSignal, RoleInbox};
@@ -141,10 +142,15 @@ where
             forwarded_argv,
             staging_dispatch_context,
             // The reporting concern's buffered-terminal-replay queue starts
-            // empty; it only fills when a terminal-bearing report's send is
-            // absorbed on a transient no-route (see the field doc on
+            // empty; it fills when a terminal-bearing report's send is
+            // absorbed on a transient no-route OR sent and awaiting its
+            // app-level TerminalAck (#352 — see the field doc on
             // `SecondaryCoordinator`).
             pending_terminal_replays: Vec::new(),
+            // Per-secondary monotonic delivery-confirmation counter; 1 so
+            // a zero seq never appears on the wire.
+            next_terminal_seq: 1,
+            terminal_ack_timeout: resource::DEFAULT_TERMINAL_ACK_TIMEOUT,
             op_loop_arm_stats: None,
             op_loop_arm_stats_cell: None,
         };
@@ -881,7 +887,6 @@ where
     pub fn local_tasks_run_for_test(&self) -> usize {
         self.local_tasks_run
     }
-
 
     /// Test accessor: snapshot of `self.sampler.is_some()`. Mirrors
     /// `LocalManager::sampler_is_some` — used by the secondary's

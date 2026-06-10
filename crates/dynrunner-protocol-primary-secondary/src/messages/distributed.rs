@@ -474,6 +474,18 @@ pub enum DistributedMessage<I> {
         task_hash: String,
         #[serde(default)]
         result_data: Option<Vec<u8>>,
+        /// App-level delivery-confirmation sequence id (#352). Stamped by
+        /// the reporting secondary's `send_to_primary` chokepoint
+        /// (per-secondary monotonic) on every terminal-bearing
+        /// primary-bound send; the primary's ingest answers each landing
+        /// with a [`DistributedMessage::TerminalAck`] carrying it back.
+        /// A replay re-sends the SAME seq, so the ack matches whichever
+        /// landing got through. `None` for a pre-field sender (no ack is
+        /// emitted, restoring the pre-#352 no-route-only replay
+        /// behaviour). `#[serde(default, skip_serializing_if)]` keeps
+        /// the wire bytes byte-identical while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_seq: Option<u64>,
     },
     TaskFailed {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing
@@ -492,6 +504,54 @@ pub enum DistributedMessage<I> {
         task_hash: String,
         error_type: ErrorType,
         error_message: String,
+        /// App-level delivery-confirmation sequence id (#352) — see
+        /// [`DistributedMessage::TaskComplete`]'s twin field for the
+        /// full contract. Stamped at the secondary's `send_to_primary`
+        /// chokepoint; acked per landing by the primary's ingest;
+        /// replays carry the SAME seq. `None` for pre-field senders;
+        /// the wire bytes stay byte-identical while `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_seq: Option<u64>,
+    },
+    /// Primary -> reporting secondary: app-level delivery confirmation
+    /// for ONE terminal-bearing report landing (#352).
+    ///
+    /// A registered-but-blackholed QUIC leg buffers `send.write_all`
+    /// locally and returns `Ok` without delivering, and is not pruned
+    /// until the 60s idle timeout — so a transport-level "send
+    /// succeeded" cannot prove a terminal reached the authority. This
+    /// frame is the application-level proof: the primary's ingest emits
+    /// exactly one `TerminalAck { seq }` back to the report's
+    /// ORIGINATING secondary (the frame's `secondary_id`, NOT the wire
+    /// `sender_id` — a relayed/forwarded landing must still clear the
+    /// originator's retention buffer) for EVERY terminal landing that
+    /// carries a `delivery_seq`, INCLUDING dedup-dropped duplicates
+    /// (the duplicate means the original ack was lost or raced; not
+    /// re-acking would replay forever). The seq is acked EXACTLY (no
+    /// ack-up-to coalescing): replays re-send the same seq across
+    /// failover to a new primary, so cumulative semantics could
+    /// falsely confirm an earlier seq that travelled a different,
+    /// still-blackholed leg; per-landing exact acks are unconditionally
+    /// sound and terminals are low-rate, so there is nothing to batch.
+    ///
+    /// Delivery bookkeeping ONLY — never a liveness signal: the
+    /// receiving secondary drops the matching retention-buffer entry
+    /// and nothing else (no `primary_link` input is touched on either
+    /// presence or absence of an ack).
+    TerminalAck {
+        /// Mesh routing target (Phase-C C3): the resolved role-bearing
+        /// [`Destination`] the egress stamps so the receiving mesh-pump
+        /// demuxes the frame to the right local role-slot WITHOUT a
+        /// content classifier. `None` on a freshly-constructed frame; the
+        /// egress stamps `Some(resolved)` once the coordinators are
+        /// rewired. `#[serde(default, skip_serializing_if)]` keeps the
+        /// wire bytes unchanged while the field is `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<Destination>,
+        sender_id: String,
+        timestamp: f64,
+        /// The confirmed report's `delivery_seq`, echoed verbatim.
+        seq: u64,
     },
     Keepalive {
         /// Mesh routing target (Phase-C C3): the resolved role-bearing

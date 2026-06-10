@@ -26,7 +26,9 @@ use super::processing::make_binary;
 use dynrunner_core::{ErrorType, TaskResult};
 use dynrunner_manager_local::WorkerEvent;
 use dynrunner_manager_local::oom::{OomWatcher, OomWatcherConfig};
-use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedBinaryInfo, DistributedMessage, PeerTransport,
+};
 use std::time::Duration;
 
 /// Disabled OOM watcher (flat layout, no workers cgroup) — the repro
@@ -751,12 +753,14 @@ async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
             let terminals_after_sweep = log
                 .borrow()
                 .iter()
-                .filter(|m| matches!(
-                    m,
-                    DistributedMessage::TaskFailed { task_hash, .. }
-                        | DistributedMessage::TaskComplete { task_hash, .. }
-                    if *task_hash == file_hash
-                ))
+                .filter(|m| {
+                    matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                            | DistributedMessage::TaskComplete { task_hash, .. }
+                        if *task_hash == file_hash
+                    )
+                })
                 .count();
             assert_eq!(
                 terminals_after_sweep, 1,
@@ -785,12 +789,14 @@ async fn post_ready_assigned_swept_then_stale_terminal_is_dropped() {
             let terminals_after_stale = log
                 .borrow()
                 .iter()
-                .filter(|m| matches!(
-                    m,
-                    DistributedMessage::TaskFailed { task_hash, .. }
-                        | DistributedMessage::TaskComplete { task_hash, .. }
-                    if *task_hash == file_hash
-                ))
+                .filter(|m| {
+                    matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                            | DistributedMessage::TaskComplete { task_hash, .. }
+                        if *task_hash == file_hash
+                    )
+                })
                 .count();
             assert_eq!(
                 terminals_after_stale, 1,
@@ -887,35 +893,70 @@ async fn swept_terminal_is_retained_and_redelivered_when_route_recovers() {
 
             // Bring the ROUTE BACK UP and drain: the retained terminal is
             // re-delivered through the recovered route.
-            membership.borrow_mut().push(
-                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
-            );
+            membership
+                .borrow_mut()
+                .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
             secondary.drain_terminal_replays().await;
             secondary.drain_egress().await;
 
-            // RE-DELIVERED EXACTLY ONCE: the buffer is empty and the wire
-            // log carries exactly one TaskFailed for the hash.
+            // RE-DELIVERED EXACTLY ONCE: the wire log carries exactly one
+            // TaskFailed for the hash. Post-#352 the re-delivered frame
+            // STAYS retained awaiting the primary's app-level TerminalAck
+            // (transport `Ok` proves nothing on a blackholed leg); the ack
+            // below is what empties the buffer.
             assert_eq!(
                 secondary.pending_terminal_replays.len(),
-                0,
-                "the replay buffer must be drained after the route recovers"
+                1,
+                "the re-delivered terminal must stay retained AWAITING ACK"
+            );
+            assert!(
+                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                "the retention reason must flip NoRoute → AwaitingAck on the \
+                 successful re-send"
             );
             let terminals_for_hash = log
                 .borrow()
                 .iter()
-                .filter(|m| matches!(
-                    m,
-                    DistributedMessage::TaskFailed { task_hash, .. }
-                        | DistributedMessage::TaskComplete { task_hash, .. }
-                    if *task_hash == file_hash
-                ))
+                .filter(|m| {
+                    matches!(
+                        m,
+                        DistributedMessage::TaskFailed { task_hash, .. }
+                            | DistributedMessage::TaskComplete { task_hash, .. }
+                        if *task_hash == file_hash
+                    )
+                })
                 .count();
             assert_eq!(
-                terminals_for_hash, 1,
+                terminals_for_hash,
+                1,
                 "the retained terminal must be re-delivered EXACTLY ONCE on \
                  route recovery (not lost, not duplicated); got {:?}",
                 log.borrow()
+            );
+
+            // The primary's TerminalAck (matching the stamped seq) is the
+            // ONLY drop site: deliver it through the real inbound arm and
+            // the buffer empties.
+            let seq = secondary.pending_terminal_replays[0]
+                .frame
+                .delivery_seq()
+                .expect("a sent terminal must carry its delivery_seq stamp");
+            secondary
+                .handle_inbound(
+                    DistributedMessage::TerminalAck {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        seq,
+                    },
+                    &mut factory,
+                )
+                .await;
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                0,
+                "the TerminalAck must release the sent-but-unacked retention"
             );
         })
         .await;
@@ -978,16 +1019,26 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
             );
 
             // Route UP; drain delivers BOTH in arrival order (first then second).
-            membership.borrow_mut().push(
-                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
-            );
+            membership
+                .borrow_mut()
+                .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
             secondary.drain_terminal_replays().await;
             secondary.drain_egress().await;
+            // Post-#352 both delivered frames stay retained AWAITING ACK
+            // (in order); the wire log is the delivery evidence.
             assert_eq!(
                 secondary.pending_terminal_replays.len(),
-                0,
-                "the buffer must be drained on recovery"
+                2,
+                "both re-delivered terminals must stay retained awaiting ack"
+            );
+            assert!(
+                secondary
+                    .pending_terminal_replays
+                    .iter()
+                    .all(|e| e.state.is_awaiting_ack()),
+                "both retention reasons must flip NoRoute → AwaitingAck on \
+                 the successful re-sends"
             );
             let delivered_hashes: Vec<String> = log
                 .borrow()
@@ -1002,6 +1053,31 @@ async fn replay_buffer_is_fifo_and_requeues_on_reabsorb() {
                 vec!["hash-first".to_string(), "hash-second".to_string()],
                 "the two retained terminals must be re-delivered FIFO (arrival \
                  order preserved across the re-absorb flap); got {delivered_hashes:?}"
+            );
+
+            // Exact-seq acks release each retention independently, in any
+            // order — ack the SECOND first to pin the by-seq (not by-head)
+            // match, then the first.
+            let seqs: Vec<u64> = secondary
+                .pending_terminal_replays
+                .iter()
+                .map(|e| e.frame.delivery_seq().expect("stamped"))
+                .collect();
+            secondary.ack_terminal(seqs[1]);
+            assert_eq!(
+                secondary.pending_terminal_replays.len(),
+                1,
+                "acking the second seq drops exactly that entry"
+            );
+            assert_eq!(
+                secondary.pending_terminal_replays[0].frame.delivery_seq(),
+                Some(seqs[0]),
+                "the unacked first entry stays"
+            );
+            secondary.ack_terminal(seqs[0]);
+            assert!(
+                secondary.pending_terminal_replays.is_empty(),
+                "both acks together empty the buffer"
             );
         })
         .await;
@@ -1088,23 +1164,30 @@ async fn replay_survives_primary_change_redelivers_to_new_primary() {
             // names the new holder; the egress then resolves
             // Destination::Primary → "peer-0". ("peer-0" was seeded in
             // membership by the RecordingPeer's peer_count=1.)
-            secondary
-                .cluster_state
-                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+            secondary.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
                     new: "peer-0".into(),
                     epoch: 1,
                     reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-                });
+                },
+            );
             secondary.publish_membership();
 
             // Drain: the retained terminal re-resolves to the NEW primary and
-            // is delivered.
+            // is delivered (then stays retained awaiting the new primary's
+            // TerminalAck — post-#352 only the ack drops it).
             secondary.drain_terminal_replays().await;
             secondary.drain_egress().await;
             assert_eq!(
                 secondary.pending_terminal_replays.len(),
-                0,
-                "the retained terminal must drain to the new primary"
+                1,
+                "the re-delivered terminal stays retained awaiting the NEW \
+                 primary's ack"
+            );
+            assert!(
+                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                "retention reason flips to AwaitingAck on the successful \
+                 re-send to the new primary"
             );
             assert_eq!(
                 log.borrow()
@@ -1155,13 +1238,13 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
             // Drive the election into Suspecting so the recovery edge has
             // something to revert; "setup" is the current primary so a
             // primary message from it recognises + reverts.
-            secondary
-                .cluster_state
-                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+            secondary.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
                     new: "setup".into(),
                     epoch: 1,
                     reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason::Election,
-                });
+                },
+            );
             secondary.op_mut().election = super::super::election::ElectionState::Suspecting {
                 since: std::time::Instant::now(),
                 responses: std::collections::HashMap::new(),
@@ -1170,9 +1253,9 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
             // Route BACK UP, then the primary-link-recovery edge fires: a
             // primary message from "setup" reverts Suspecting → Normal and
             // drains the replay buffer immediately.
-            membership.borrow_mut().push(
-                dynrunner_protocol_primary_secondary::PeerId::from("setup"),
-            );
+            membership
+                .borrow_mut()
+                .push(dynrunner_protocol_primary_secondary::PeerId::from("setup"));
             secondary.publish_membership();
             secondary
                 .record_primary_message_if_from_primary("setup")
@@ -1181,8 +1264,14 @@ async fn primary_link_recovery_edge_drains_replay_buffer() {
 
             assert_eq!(
                 secondary.pending_terminal_replays.len(),
-                0,
-                "the primary-link-recovery edge must drain the replay buffer"
+                1,
+                "the primary-link-recovery edge must re-send the retained \
+                 terminal (which then stays retained awaiting ack, #352)"
+            );
+            assert!(
+                secondary.pending_terminal_replays[0].state.is_awaiting_ack(),
+                "the recovery-edge re-send flips the retention reason \
+                 NoRoute → AwaitingAck"
             );
             assert_eq!(
                 log.borrow()

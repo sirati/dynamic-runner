@@ -41,6 +41,7 @@ mod result_data_plumbing;
 mod retry;
 mod setup_promote;
 mod stranded;
+mod terminal_ack;
 mod wire;
 mod worker_lifecycle;
 
