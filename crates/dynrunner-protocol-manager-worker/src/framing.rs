@@ -171,18 +171,48 @@ fn oversize_response(len: usize) -> Response {
 /// guard. Drop-in body for every manager-end transport's
 /// `MessageReceiver<Response>::recv`:
 ///
-/// * `None` — connection closed / transport error (unchanged).
+/// * `None` — connection closed / transport error / unparseable frame
+///   (unchanged classification; the NON-EOF causes are now logged, see
+///   below).
 /// * `Some(parsed)` — frame under the cap (unchanged).
 /// * `Some(Error(NonRecoverable, …))` — frame over the cap; the stream
 ///   is drained past the offending line and left recoverable.
+///
+/// The silent-branch rule (#366 adjacent-hazard): every `None` used to
+/// look like a clean EOF to the caller, so a PARSE failure (garbage on
+/// the response stream) masqueraded as "worker disconnected" with zero
+/// trace of the real cause. The collapse to `None` stays — the
+/// protocol state machine's disconnect handling is the right recovery
+/// either way — but the parse-failure and I/O-error paths now WARN
+/// with the evidence (frame length + truncated prefix / the error)
+/// before classifying, so a phantom-disconnect diagnosis takes one log
+/// line instead of a packet capture. A clean EOF stays silent.
 pub async fn recv_response_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Option<Response> {
     match read_line_bounded(reader, MAX_RESPONSE_FRAME_BYTES).await {
         Ok(BoundedLine::Eof) => None,
-        Ok(BoundedLine::Line(line)) => codec::parse_response(&line),
+        Ok(BoundedLine::Line(line)) => {
+            let parsed = codec::parse_response(&line);
+            if parsed.is_none() {
+                tracing::warn!(
+                    frame_bytes = line.len(),
+                    frame_prefix = %line.chars().take(128).collect::<String>(),
+                    "worker response frame is unparseable (NOT a clean \
+                     disconnect); treating the connection as broken"
+                );
+            }
+            parsed
+        }
         Ok(BoundedLine::Oversize { len }) => Some(oversize_response(len)),
-        Err(_) => None,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "I/O error reading worker response frame (NOT a clean \
+                 disconnect); treating the connection as broken"
+            );
+            None
+        }
     }
 }
 
