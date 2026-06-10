@@ -258,7 +258,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
         // Worker-management signal receiver. Same shape + lifetime as
         // `matcher_trigger_rx`: taken out for the loop's duration so the
-        // `drain_worker_signal_batch` await can borrow it without
+        // `recv_worker_signal_batch` await can borrow it without
         // conflicting with the per-arm `&mut self` borrows, then put
         // back at loop exit so retry-pass re-entries keep draining the
         // same channel. `None` when a previous run already consumed it
@@ -558,11 +558,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 wm_batch = async {
                     match worker_mgmt_rx.as_mut() {
+                        // CANCEL-SAFE by contract: `recv_worker_signal_batch`
+                        // consumes signals only on the poll that COMPLETES
+                        // it (one cancel-safe recv + a synchronous sweep,
+                        // no await while holding consumed signals), so a
+                        // sibling arm winning this iteration cannot destroy
+                        // a `TasksAdded`. Its idle-window predecessor was
+                        // NOT cancel-safe and silently lost injected-batch
+                        // signals on every busy-mesh phase boundary (the
+                        // run_20260610_145529 starve→pack).
                         Some(rx) => {
-                            crate::worker_signal::drain_worker_signal_batch(
-                                rx,
-                                crate::worker_signal::WORKER_SIGNAL_BATCH_IDLE_WINDOW,
-                            ).await
+                            crate::worker_signal::recv_worker_signal_batch(rx).await
                         }
                         // No receiver attached — park forever so the
                         // arm never fires. Mirrors the matcher arm's

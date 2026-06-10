@@ -10,9 +10,11 @@
 //!   may need to react to (`TasksAdded`, `PhaseStartedNeedsWorkers`,
 //!   `RunShouldFail`, `PolicyFatalExit`).
 //! - [`pipeline`] is the batched drain helper worker management's
-//!   operational `select!` awaits. It coalesces a burst of signals with
-//!   a 50ms idle window and yields one [`WorkerSignalBatch`] carrying
-//!   every signal in arrival order.
+//!   operational `select!` awaits. It awaits the first signal
+//!   cancel-safely, sweeps everything queued behind it synchronously,
+//!   and yields one [`WorkerSignalBatch`] carrying every signal in
+//!   arrival order (see the pipeline doc's load-bearing
+//!   cancellation-safety contract).
 //!
 //! The module boundary mirrors `fulfillability_matcher`: the emit side
 //! NEVER invokes worker management directly — it only `tx.send()`s a
@@ -25,8 +27,5 @@
 pub mod pipeline;
 pub mod signal;
 
-pub use pipeline::{
-    WORKER_SIGNAL_BATCH_IDLE_WINDOW, WorkerSignalBatch, drain_worker_signal_batch,
-    try_collect_worker_signal_batch,
-};
+pub use pipeline::{WorkerSignalBatch, recv_worker_signal_batch, try_collect_worker_signal_batch};
 pub use signal::WorkerMgmtSignal;

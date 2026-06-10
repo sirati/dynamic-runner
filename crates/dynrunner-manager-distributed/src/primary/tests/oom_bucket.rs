@@ -278,14 +278,10 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
             // `TasksAdded` rather than dispatching inline. Drain the
             // coalesced batch and run the worker-management reaction
             // synchronously — this is exactly what the operational
-            // loop's worker-management `select!` arm does, minus the
-            // 50ms idle window (driven here directly for determinism).
-            let batch = crate::worker_signal::drain_worker_signal_batch(
-                &mut wm_rx,
-                std::time::Duration::from_millis(50),
-            )
-            .await
-            .expect("OOM-bucket reinject must emit a TasksAdded batch");
+            // loop's worker-management `select!` arm does.
+            let batch = crate::worker_signal::recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("OOM-bucket reinject must emit a TasksAdded batch");
             assert!(
                 batch.signals.contains(&WorkerMgmtSignal::TasksAdded),
                 "the bucket's emit must carry a TasksAdded; got {:?}",

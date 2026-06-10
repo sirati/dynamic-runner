@@ -175,7 +175,7 @@ pub struct ClusterState<I> {
     /// via [`Self::install_worker_mgmt_sender`] when worker management
     /// wires its operational loop; `None` while nothing has attached.
     /// Receiver is consumed by
-    /// [`crate::worker_signal::drain_worker_signal_batch`] from inside
+    /// [`crate::worker_signal::recv_worker_signal_batch`] from inside
     /// worker management's operational `select!` loop. Skipped from
     /// Clone / snapshot / restore for the same reason as `lifecycle_tx`.
     pub(super) worker_mgmt_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkerMgmtSignal>>,

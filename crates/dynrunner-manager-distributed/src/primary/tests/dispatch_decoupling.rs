@@ -4,7 +4,7 @@
 //!
 //! All deterministic — no operational loop raced against a wall-clock
 //! `timeout`. The signal bus is driven synchronously: emit a signal,
-//! drain the coalesced batch via `drain_worker_signal_batch`, and run
+//! drain the coalesced batch via `recv_worker_signal_batch`, and run
 //! `react_to_worker_signal_batch` directly (exactly what the operational
 //! loop's worker-management `select!` arm does, minus the 50ms idle
 //! window). Failure modes are reached by constructing the exact message
@@ -31,7 +31,7 @@ use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, ResourceMap, TaskDep
 
 use crate::primary::lifecycle::dispatch_order;
 use crate::primary::wire::compute_task_hash;
-use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch, drain_worker_signal_batch};
+use crate::worker_signal::{WorkerMgmtSignal, WorkerSignalBatch, recv_worker_signal_batch};
 
 type TestPrimary = PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>;
 
@@ -212,7 +212,7 @@ async fn tasks_added_recheck_dispatches_dependent_phase_after_predecessor_comple
 
             // Drive the parked recheck exactly as the operational loop
             // would: drain the coalesced batch, run the reaction.
-            let batch = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("completion must emit a TasksAdded batch");
             assert!(
@@ -387,7 +387,7 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
             primary
                 .cluster_state_mut_for_test()
                 .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
-            let batch = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("emit must produce a batch");
             primary.react_to_worker_signal_batch(batch).await;
@@ -404,11 +404,11 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
         .await;
 }
 
-/// (4) COALESCE. Several `TasksAdded` arriving inside one idle window
-/// collapse into ONE batch carrying every signal — the reaction runs the
-/// dispatch recheck exactly once per batch (the recheck is idempotent
-/// over the pool/worker view). Pins the burst-coalescing contract at the
-/// worker-management reaction boundary.
+/// (4) COALESCE. Several `TasksAdded` queued on the bus by the time the
+/// arm is polled collapse into ONE batch carrying every signal — the
+/// reaction runs the dispatch recheck exactly once per batch (the
+/// recheck is idempotent over the pool/worker view). Pins the
+/// burst-coalescing contract at the worker-management reaction boundary.
 #[tokio::test(flavor = "current_thread")]
 async fn coalesce_multiple_tasks_added_into_one_recheck() {
     let local = tokio::task::LocalSet::new();
@@ -429,8 +429,8 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
                 .cluster_state_mut_for_test()
                 .install_worker_mgmt_sender(wm_tx);
 
-            // Complete A AND fire two extra explicit TasksAdded in the
-            // same window: a burst the idle window must coalesce.
+            // Complete A AND fire two extra explicit TasksAdded
+            // back-to-back: a queued burst the drain must coalesce.
             primary
                 .handle_task_complete(task_complete("sec-0", 0, &hash_a), &mut None)
                 .await;
@@ -448,10 +448,9 @@ async fn coalesce_multiple_tasks_added_into_one_recheck() {
             // TasksAdded burst — all of it coalesces into this single
             // batch (the coalescing proof: the three TasksAdded did NOT
             // each produce their own batch).
-            let batch: WorkerSignalBatch =
-                drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
-                    .await
-                    .expect("burst must produce one batch");
+            let batch: WorkerSignalBatch = recv_worker_signal_batch(&mut wm_rx)
+                .await
+                .expect("burst must produce one batch");
             let tasks_added = batch
                 .signals
                 .iter()

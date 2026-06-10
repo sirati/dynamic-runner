@@ -32,7 +32,7 @@ use super::*;
 use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, TypeId};
 
 use crate::primary::wire::compute_task_hash;
-use crate::worker_signal::{WorkerMgmtSignal, drain_worker_signal_batch};
+use crate::worker_signal::{WorkerMgmtSignal, recv_worker_signal_batch};
 
 type TestPrimary = PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>;
 
@@ -182,7 +182,7 @@ async fn late_capacity_over_wire_grows_roster_and_dispatches_ready_task() {
             );
 
             // (2) A `TasksAdded` was emitted onto the bus — the recheck cue.
-            let batch = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("a roster-growing SecondaryCapacity must emit a batch");
             assert!(
@@ -221,7 +221,7 @@ async fn redundant_capacity_reemit_is_a_noop() {
                 .handle_cluster_mutation(capacity_batch("sec-0", 1))
                 .await;
             assert_eq!(primary.alive_worker_count_for_test(), 1);
-            let first = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            let first = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("first apply emits a batch");
             assert!(first.signals.contains(&WorkerMgmtSignal::TasksAdded));
@@ -279,7 +279,7 @@ async fn locally_originated_capacity_growth_grows_roster_and_dispatches() {
                 1,
                 "local origination of a new capacity must rebuild the roster"
             );
-            let batch = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+            let batch = recv_worker_signal_batch(&mut wm_rx)
                 .await
                 .expect("local capacity growth must emit a batch");
             assert!(

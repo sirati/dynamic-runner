@@ -24,7 +24,7 @@ use super::*;
 use dynrunner_core::{PhaseId, ResourceAmount, ResourceKind, ResourceMap, TypeId};
 
 use crate::primary::wire::compute_task_hash;
-use crate::worker_signal::{WorkerMgmtSignal, drain_worker_signal_batch};
+use crate::worker_signal::{WorkerMgmtSignal, recv_worker_signal_batch};
 
 type TestPrimary = PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>;
 
@@ -73,7 +73,7 @@ async fn run_dispatch_recheck(primary: &mut TestPrimary) {
     primary
         .cluster_state_mut_for_test()
         .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
-    let batch = drain_worker_signal_batch(&mut wm_rx, Duration::from_millis(50))
+    let batch = recv_worker_signal_batch(&mut wm_rx)
         .await
         .expect("emit must produce a batch");
     primary.react_to_worker_signal_batch(batch).await;

@@ -978,7 +978,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// Worker-management signal receiver, paired with the
     /// `worker_mgmt_tx` installed on `cluster_state` at construction.
     /// Taken out at the operational loop's start so its `select!` arm
-    /// can `drain_worker_signal_batch` against it; put back at loop
+    /// can `recv_worker_signal_batch` against it; put back at loop
     /// exit so retry-pass re-entries keep draining the same channel.
     /// Same `take()`/restore lifecycle as `matcher_trigger_rx`. `None`
     /// once a previous loop entry already consumed it AND the local was
@@ -1134,7 +1134,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // edge → `TasksAdded`) need a sender ready from the very first
         // mutation. The receiver waits on `self` until the operational
         // loop takes it and drains coalesced batches via
-        // `crate::worker_signal::drain_worker_signal_batch`. No longer
+        // `crate::worker_signal::recv_worker_signal_batch`. No longer
         // test-only: this is the PRODUCTION sender wire-up.
         let (worker_mgmt_tx, worker_mgmt_rx) = tokio::sync::mpsc::unbounded_channel();
         // Task-completion dispatcher channel. Same construction-time
