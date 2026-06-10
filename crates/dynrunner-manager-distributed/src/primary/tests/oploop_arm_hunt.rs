@@ -606,3 +606,319 @@ async fn drain_remote_handles(handles: Vec<tokio::task::JoinHandle<usize>>) {
     // caller is the decisive burst-was-real proof).
     let _ = total_remote_own;
 }
+
+// ─── ROUND 6 — the INBOX-ARM hot-spin (run_20260610_121427), captured by the
+// round-5 arm instrumentation and replayed here ───
+//
+// Production signature on the wedged relocated primary: the INBOX arm wins
+// essentially EVERY iteration (~600K/s, `since_inbox=0`, `last_arm=inbox`)
+// while NO completions ingest (succeeded frozen) and the timer arms tick
+// normally. Mechanism: `handle_task_request`'s "demoted-primary relay" —
+// every TaskRequest the primary cannot assign was re-sent to
+// `Destination::Primary`, which on the current primary is a mesh LOOPBACK
+// into its OWN inbox (`Mesh::dispatch`'s `Primary` arm is loopback-only and
+// a directed delivery never excludes the origin). `RoleSlot::deliver` clears
+// the routing stamp, so the relayed frame re-matches `target: None` and is
+// relayed again: a self-sustaining memory-speed cycle, one inbox win per
+// re-relay. With ≥2 frames circulating, the mesh-pump's `biased` select
+// (egress before ingress) never finds the egress queue empty, so WIRE
+// ingress — the remote completions — starves: ingest freezes exactly as
+// captured. The onset trigger is any unassignable TaskRequest (an unknown/
+// not-yet-rostered worker, an idle worker with an empty dispatch view, a
+// declined scheduler decision); the burst of freed-worker re-polls after a
+// 14-task completion burst supplied several at once.
+
+/// Ghost-frame factory: a `TaskRequest` from a secondary the primary has
+/// never welcomed (no roster entry, no capacity record), stamped the way the
+/// wire ingress demux expects. `worker_idx_for` returns `None` for it, so the
+/// primary can never assign against it — the relay arm (pre-fix) re-relayed
+/// it forever.
+fn ghost_task_request(worker_id: u32) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskRequest {
+        target: Some(dynrunner_protocol_primary_secondary::Destination::Primary),
+        sender_id: "ghost-sec".into(),
+        timestamp: 1.0,
+        secondary_id: "ghost-sec".into(),
+        worker_id,
+        available_resources: vec![],
+    }
+}
+
+/// The round-6 channel-mesh fixture: ONE real channel secondary (so the
+/// pre-loop connect/mesh chain is satisfied, as in the e2e tests) plus a RAW
+/// injection handle into the primary transport's inbound — the test's stand-in
+/// for "a frame arrives off the wire" (the pump's ingress demux routes it to
+/// the primary slot by its stamped target).
+struct GhostFixture {
+    primary: PrimaryCoordinator<ResourceStealingScheduler, FixedEstimator, TestId>,
+    mesh_keepalive: PrimaryMeshKeepalive,
+    /// Raw wire-inbound injection handle (frames enter the pump's ingress).
+    wire_tx: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    _sec_handle: tokio::task::JoinHandle<usize>,
+}
+
+/// Build the fixture: a primary over `from_raw_channels` wired to one real
+/// secondary (`sec-0`, 2 workers), with the production pump (via
+/// [`build_test_primary`]). The ledger is seeded with `binaries`; when
+/// `ghost_in_flight` is `Some(task)`, that task is additionally marked
+/// `InFlight` on the never-connected `ghost-sec` — an inherited assignment
+/// whose terminal never arrives, so the operational loop provably stays alive
+/// for the test's whole observation window (`run_complete_check` cannot trip).
+fn ghost_fixture(binaries: Vec<TaskInfo<TestId>>, ghost_in_flight: Option<TaskInfo<TestId>>) -> GhostFixture {
+    let max_res = dynrunner_core::ResourceMap::from([(
+        dynrunner_core::ResourceKind::memory(),
+        1024 * 1024 * 1024u64,
+    )]);
+    let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+        spawn_real_secondary("sec-0".to_string(), 2, max_res);
+
+    let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+    let mut outgoing = HashMap::new();
+    outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+    // Forward secondary→primary frames into the same wire inbound the test
+    // injects into (one inbound, exactly like the e2e harness).
+    {
+        let tx = incoming_tx.clone();
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let transport =
+        ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+    let config = PrimaryConfig {
+        connect_timeout: Duration::from_secs(10),
+        peer_timeout: Duration::from_secs(10),
+        ..test_primary_config()
+    };
+    let (mut primary, mesh_keepalive) = build_test_primary(
+        config,
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    seed_operational_ledger(&mut primary, binaries, HashMap::new());
+    if let Some(ghost) = ghost_in_flight {
+        let hash = crate::primary::wire::compute_task_hash(&ghost);
+        primary
+            .cluster_state_mut_for_test()
+            .apply(ClusterMutation::TaskAssigned {
+                hash,
+                secondary: "ghost-sec".into(),
+                worker: 0,
+                version: Default::default(),
+                attempt: 0,
+            });
+    }
+
+    GhostFixture {
+        primary,
+        mesh_keepalive,
+        wire_tx: incoming_tx,
+        _sec_handle: sec_handle,
+    }
+}
+
+/// ── ROUND 6 repro #1 (the capture's spin, deterministic) ──
+///
+/// One TaskRequest from a never-welcomed secondary lands on the live
+/// operational loop while one inherited in-flight task keeps the run open.
+/// The request can never assign (`worker_idx_for` → `None`).
+///
+/// RED (pre-fix): the relay arm re-sends it to `Destination::Primary` →
+/// loopback into the loop's own inbox → re-relay, forever. The inbox arm
+/// wins millions of iterations in the observation window — the EXACT
+/// arm-stats signature of run_20260610_121427 (`inbox≈iter`,
+/// `since_inbox=0`, `last_arm=inbox`).
+///
+/// GREEN (post-fix): the unassignable request is dropped (R1: a TaskRequest
+/// is a pure capacity hint; the requester re-polls on its own backoff), so
+/// the inbox arm wins only for genuine traffic — orders of magnitude below
+/// the bound.
+#[tokio::test(flavor = "current_thread")]
+async fn ghost_task_request_must_not_self_relay_spin() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let real = make_binary("bin_real", 50);
+            let ghost = make_binary("bin_ghost", 60);
+            let fixture = ghost_fixture(vec![real, ghost.clone()], Some(ghost));
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // Inject the unassignable request once the run has settled into
+            // the operational loop (connect + initial assignment done well
+            // inside 1.5s on the channel mesh).
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(StdDuration::from_millis(1500)).await;
+                let _ = wire_tx.send(ghost_task_request(0));
+            });
+
+            {
+                let (_deps, ops, ope) = noop_phase_args();
+                let run = primary.run(SeedSource::PromotionSnapshot, ops, ope);
+                tokio::pin!(run);
+                // The ghost in-flight task never completes, so the run cannot
+                // resolve: the timeout is the observation window, after which
+                // the live arm stats are read off the retained coordinator.
+                let _ = tokio::time::timeout(StdDuration::from_secs(5), &mut run).await;
+            }
+
+            let snap = primary
+                .op_loop_arm_stats
+                .as_ref()
+                .map(|s| s.snapshot())
+                .expect(
+                    "the operational loop must still be live (the inherited \
+                     in-flight task keeps the run open)",
+                );
+            let inbox_wins = snap
+                .counts
+                .iter()
+                .find(|(name, _)| *name == "inbox")
+                .map(|(_, n)| *n)
+                .expect("inbox arm is instrumented");
+            assert!(
+                inbox_wins < 10_000,
+                "INBOX-ARM HOT-SPIN: one unassignable TaskRequest drove {inbox_wins} \
+                 inbox-arm wins in a ~3.5s window — the self-relay cycle \
+                 (handle_task_request re-sending to Destination::Primary, which \
+                 loopbacks into the primary's own inbox). Arm snapshot: [{snap}]",
+            );
+        })
+        .await;
+}
+
+/// ── ROUND 6 repro #2 (the capture's ingest freeze, end-to-end) ──
+///
+/// The production sequence replayed: unassignable TaskRequests are ALREADY
+/// queued on the primary's wire inbound when the run starts (the freed-worker
+/// re-poll burst), and the real secondary's welcome/completions must flow
+/// through the SAME pump behind them.
+///
+/// RED (pre-fix): the two ghost requests start a 2-frame self-relay cycle, so
+/// the pump's `biased` select (egress before ingress) never finds the egress
+/// queue empty and wire ingress starves — the secondary's frames never ingest
+/// and the run cannot finish (the capture's "succeeded frozen; everything
+/// after the onset vanished").
+///
+/// GREEN (post-fix): the ghosts are dropped on arrival; all tasks dispatch,
+/// complete, and the run resolves.
+#[tokio::test(flavor = "current_thread")]
+async fn completion_burst_survives_unassignable_request_storm() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let tasks = 4usize;
+            let binaries: Vec<TaskInfo<TestId>> = (0..tasks)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + (i as u64) * 10))
+                .collect();
+            let fixture = ghost_fixture(binaries, None);
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive: _mesh,
+                wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // The unassignable burst is queued BEFORE the run starts — the
+            // pump routes it into the primary slot ahead of the run's first
+            // recv, exactly the "requests with nothing dispatchable" shape
+            // the production onset had.
+            let _ = wire_tx.send(ghost_task_request(0));
+            let _ = wire_tx.send(ghost_task_request(1));
+
+            let (_deps, ops, ope) = noop_phase_args();
+            let result = tokio::time::timeout(
+                StdDuration::from_secs(20),
+                primary.run(SeedSource::PromotionSnapshot, ops, ope),
+            )
+            .await;
+
+            let completed = primary.completed_count();
+            match result {
+                Err(_) => panic!(
+                    "INGEST FREEZE: the run did not resolve within the window \
+                     (completed {completed}/{tasks}) — unassignable TaskRequests \
+                     wedged the loop/pump (the production run_20260610_121427 \
+                     signature)",
+                ),
+                Ok(run_result) => {
+                    assert!(
+                        run_result.is_ok(),
+                        "run must resolve cleanly despite the unassignable \
+                         request burst; got {run_result:?}"
+                    );
+                    assert_eq!(
+                        completed, tasks,
+                        "every real completion must ingest despite the \
+                         unassignable request burst"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// ── ROUND 6 pin #3 (requirement 1: a dead inbox is loud + terminal) ──
+///
+/// Drop the mesh-pump (which owns the primary slot's `Arc`) mid-run: every
+/// sender of the operational inbox is gone, `inbox.recv()` yields `None`.
+/// The loop must take the transport-closed terminal path — gate the arm,
+/// break, run final accounting — and the run future must RESOLVE. A spin
+/// (the closed-mpsc hazard) or a silently-disabled arm that zombies the run
+/// would both fail this as a timeout.
+#[tokio::test(flavor = "current_thread")]
+async fn inbox_closed_mid_run_breaks_loop_no_zombie_no_spin() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let real = make_binary("bin_real", 50);
+            let ghost = make_binary("bin_ghost", 60);
+            // The ghost in-flight keeps the loop from completing on its own,
+            // so the ONLY way the run resolves inside the window is the
+            // inbox-closed terminal path.
+            let fixture = ghost_fixture(vec![real, ghost.clone()], Some(ghost));
+            let GhostFixture {
+                mut primary,
+                mesh_keepalive,
+                wire_tx: _wire_tx,
+                _sec_handle,
+            } = fixture;
+
+            // Kill the mesh mid-run: aborting the pump drops the primary
+            // slot `Arc` it owns → the inbox's only sender drops → recv None.
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(StdDuration::from_secs(2)).await;
+                drop(mesh_keepalive);
+            });
+
+            let (_deps, ops, ope) = noop_phase_args();
+            let result = tokio::time::timeout(
+                StdDuration::from_secs(10),
+                primary.run(SeedSource::PromotionSnapshot, ops, ope),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "a closed operational inbox must BREAK the loop into final \
+                 accounting (loud terminal), never zombie the run: the run \
+                 future did not resolve within the window"
+            );
+        })
+        .await;
+}
