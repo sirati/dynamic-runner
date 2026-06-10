@@ -1017,7 +1017,7 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// candidates left OR budget exhausted).
     ///
     /// Read by dispatch-shape sites (`dispatch_to_idle_workers`,
-    /// `handle_task_request`, the operational-loop 5-min timeout arm)
+    /// `handle_task_request`)
     /// through the accessor [`Self::single_worker_mode`] / the
     /// composed predicate [`Self::should_skip_worker_for_dispatch`].
     /// Call sites never branch on this directly — the masking + the
@@ -1838,9 +1838,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// True while the per-phase OOM retry bucket is actively
     /// reinjecting + draining. Sole writer: `try_run_phase_retry_bucket`
     /// (set true on `BucketKind::Oom` entry, reset on its `Ok(false)`
-    /// returns). Read by the dispatch-shape pipeline and the
-    /// operational-loop 5-min timeout arm. See the field doc on
-    /// `single_worker_mode` for the user-spec rationale.
+    /// returns). Read by the dispatch-shape pipeline. See the field
+    /// doc on `single_worker_mode` for the user-spec rationale.
     pub(super) fn single_worker_mode(&self) -> bool {
         self.single_worker_mode
     }

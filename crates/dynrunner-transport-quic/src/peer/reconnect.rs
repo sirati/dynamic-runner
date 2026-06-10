@@ -76,6 +76,12 @@ pub(super) struct PeerReconnectState {
     /// [`MILESTONE_RECURRENCE`] schedule (idx ==
     /// `MILESTONES.len() + N` ⇒ N+1 recurrences emitted).
     pub(super) next_milestone_idx: usize,
+    /// Once-per-outage latch for the broadcast-miss WARN (#363).
+    /// `false` until the first [`ReconnectTracker::first_broadcast_miss`]
+    /// call of this outage flips it; cleared implicitly when
+    /// [`ReconnectTracker::observe_reconnect`] removes the whole entry,
+    /// so a FRESH outage re-arms the warn.
+    pub(super) broadcast_miss_warned: bool,
 }
 
 impl PeerReconnectState {
@@ -158,6 +164,7 @@ impl ReconnectTracker {
                 disconnect_at: Instant::now(),
                 attempts: 0,
                 next_milestone_idx: 0,
+                broadcast_miss_warned: false,
             },
         );
         tracing::warn!(
@@ -270,6 +277,31 @@ impl ReconnectTracker {
     /// number — the tracker stays the single owner of the count.
     pub fn attempts_for(&self, peer_id: &str) -> Option<u32> {
         self.state.get(peer_id).map(|s| s.attempts)
+    }
+
+    /// Once-per-outage gate for the broadcast-miss WARN (#363): returns
+    /// `true` exactly once per tracked outage — the first call for a
+    /// peer whose disconnect is currently tracked flips the per-outage
+    /// latch; every later call returns `false` until
+    /// [`Self::observe_reconnect`] clears the entry (a fresh outage
+    /// re-arms the gate). The tracker owns this latch because it owns
+    /// the outage LIFECYCLE — the latch's reset point (the heal) is the
+    /// entry's removal, so the two can never drift.
+    ///
+    /// An UNTRACKED peer returns `false`: a known-but-not-yet-tracked
+    /// peer is in the mesh-forming dial window (≤ one [`RECONNECT_TICK`]
+    /// until the tick reconciliation tracks it), and staying silent
+    /// there mirrors the milestone schedule's "no WARN on a fast heal"
+    /// intent — only a peer the tracker already considers disconnected
+    /// earns the broadcast-miss line.
+    pub fn first_broadcast_miss(&mut self, peer_id: &str) -> bool {
+        match self.state.get_mut(peer_id) {
+            Some(state) if !state.broadcast_miss_warned => {
+                state.broadcast_miss_warned = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Tracker size. Used in tests + the existing `peer_count`
@@ -421,6 +453,43 @@ mod tests {
     }
 
     #[test]
+    fn first_broadcast_miss_false_for_untracked_peer() {
+        // A peer the tracker does not consider disconnected (connected,
+        // or in the mesh-forming window before the first reconciling
+        // tick) must NOT earn a broadcast-miss warn.
+        let mut t = ReconnectTracker::new();
+        assert!(!t.first_broadcast_miss("peer-1"));
+    }
+
+    #[test]
+    fn first_broadcast_miss_fires_once_per_outage() {
+        // The gate is once-per-outage: true on the first call of a
+        // tracked outage, false on every subsequent call — a
+        // persistently-down peer must not warn on every broadcast.
+        let mut t = ReconnectTracker::new();
+        t.observe_disconnect("peer-1");
+        assert!(t.first_broadcast_miss("peer-1"));
+        assert!(!t.first_broadcast_miss("peer-1"));
+        assert!(!t.first_broadcast_miss("peer-1"));
+    }
+
+    #[test]
+    fn first_broadcast_miss_rearms_on_fresh_outage() {
+        // The heal removes the entry (and with it the latch), so a NEW
+        // outage earns a new warn.
+        let mut t = ReconnectTracker::new();
+        t.observe_disconnect("peer-1");
+        assert!(t.first_broadcast_miss("peer-1"));
+        t.observe_reconnect("peer-1");
+        assert!(!t.first_broadcast_miss("peer-1"), "healed peer is silent");
+        t.observe_disconnect("peer-1");
+        assert!(
+            t.first_broadcast_miss("peer-1"),
+            "a fresh outage re-arms the once-per-outage gate"
+        );
+    }
+
+    #[test]
     fn milestone_indices_advance_past_thresholds() {
         // Manually construct a state with a disconnect_at far in
         // the past so all milestones trip in one tick. Verifies
@@ -435,6 +504,7 @@ mod tests {
                 disconnect_at: one_hour_ago,
                 attempts: 0,
                 next_milestone_idx: 0,
+                broadcast_miss_warned: false,
             },
         );
         t.tick();
