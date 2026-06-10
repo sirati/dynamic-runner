@@ -637,6 +637,205 @@ async fn mode2_zero_to_run_phase1_with_lazy_spawn_phase2_does_not_prematurely_co
         .await;
 }
 
+/// #343 reproducer — MODE-2 end-to-end, the FRESH-SKIP twin of the
+/// zero-to-run test above. Discovery resolves the phase-1 `probe` corpus to
+/// items that are ALL marked `skipped_already_done` (the `--skip-existing`
+/// "everything already on disk" shape a consumer hits on a re-run), and the
+/// dependent phase-2 `build` work is injected only via
+/// `on_phase_end("probe")` — the same lazy-spawn consumer pattern.
+///
+/// A freshly-discovered all-skipped phase has NEVER fired `on_phase_end`
+/// anywhere (discover_on_promotion just seeded it terminal), so the phase
+/// MUST flow through the live cascade exactly like the zero-to-run shape:
+/// `on_phase_start("probe")` → `on_phase_end("probe", 0, 0)` (skips are
+/// terminal LEDGER states, not completion EVENTS, so the event tallies are
+/// zero) → the consumer hook injects `build` → the injected work runs.
+///
+/// PRE-FIX (the bug): `hydrate_from_cluster_state` saw `probe` as
+/// "all-terminal with no live work" and seeded it `PhaseState::Done`
+/// WITHOUT firing — the failover-INHERITED treatment (where the hook
+/// already fired on the original primary, #326) misapplied to a phase
+/// whose hook never ran. The injection was silently dropped, the empty
+/// dependent `build` phase false-fired `on_phase_end("build", 0, 0)`, and
+/// the run tripped the empty-drain fail-loud — event log
+/// `[Start("build"), End("build", 0, 0)]` with NO probe events.
+#[tokio::test(flavor = "current_thread")]
+async fn mode2_all_skipped_phase1_fires_on_phase_end_once_and_lazy_spawn_lands() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Phase graph: `build` depends on `probe`. `probe`'s items are
+            // ALL already done at discovery time; `build`'s real work is
+            // injected via on_phase_end("probe").
+            let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+            phase_deps.insert(PhaseId::from("build"), vec![PhaseId::from("probe")]);
+
+            // Discovery resolves phase-1 to TWO items, BOTH marked
+            // `skipped_already_done` — the fresh all-skipped phase.
+            let probe_items: Vec<(TaskInfo<TestId>, bool)> = vec![
+                (phased_binary("probe_a", "probe", 50), true),
+                (phased_binary("probe_b", "probe", 50), true),
+            ];
+            let build_items: Vec<TaskInfo<TestId>> = vec![
+                phased_binary("build_x", "build", 50),
+                phased_binary("build_y", "build", 50),
+                phased_binary("build_z", "build", 50),
+            ];
+            let build_count = build_items.len();
+
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            let mut sec_handles = Vec::new();
+            for i in 0..2u32 {
+                let sec_id = format!("sec-{i}");
+                let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+                    spawn_real_secondary(sec_id.clone(), 1, max_res.clone());
+                outgoing.insert(sec_id, pri_to_sec_tx);
+                sec_handles.push(handle);
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = sec_to_pri_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(incoming_tx);
+
+            let transport =
+                ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, incoming_rx);
+            let config = PrimaryConfig {
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                ..test_primary_config()
+            };
+            let (mut primary, _mesh) = build_test_primary(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // MODE-2 seed: declare discovery debt + the phase graph, NO tasks.
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: phase_deps.clone(),
+                });
+                cs.apply(ClusterMutation::DiscoveryDebtDeclared);
+            }
+            let fires = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            primary.register_setup_discovery(fixed_discovery_marked(
+                probe_items,
+                phase_deps,
+                fires.clone(),
+            ));
+
+            // Event log + the consumer's lazy-spawn on_phase_end.
+            let command_sender = primary.command_sender();
+            let events: Arc<Mutex<Vec<PhaseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let starts_cb = events.clone();
+            let on_start: OnPhaseStart = Box::new(move |p: &PhaseId| {
+                starts_cb
+                    .lock()
+                    .unwrap()
+                    .push(PhaseEvent::Start(p.to_string()));
+            });
+            let ends_cb = events.clone();
+            let mut already_spawned = false;
+            let on_end: OnPhaseEnd = Box::new(move |p: &PhaseId, c: u32, f: u32, _outputs| {
+                ends_cb.lock().unwrap().push(PhaseEvent::End {
+                    phase: p.to_string(),
+                    completed: c,
+                    failed: f,
+                });
+                if p.as_str() == "probe" && !already_spawned {
+                    already_spawned = true;
+                    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                    let _ = command_sender.try_send(PrimaryCommand::SpawnTasks {
+                        tasks: build_items.clone(),
+                        reply: reply_tx,
+                    });
+                }
+            });
+
+            let exit = tokio::time::timeout(
+                Duration::from_secs(15),
+                primary.run(SeedSource::PromotionSnapshot, on_start, on_end),
+            )
+            .await
+            .expect("the all-skipped mode-2 run must complete promptly, not hang");
+            exit.expect(
+                "the all-skipped mode-2 run must exit Ok — an Err here is the \
+                 #343 shape: on_phase_end(\"probe\") never fired, the injection \
+                 was dropped, and the empty dependent phase tripped the \
+                 empty-drain fail-loud",
+            );
+
+            assert_eq!(fires.get(), 1, "discovery runs exactly once");
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+            let log = events.lock().unwrap().clone();
+            drop(primary);
+            for h in sec_handles {
+                let _ = h.await;
+            }
+
+            // The injected phase-2 work all completed (skips are accounted in
+            // their own outcome class, not `succeeded`).
+            assert_eq!(
+                completed, build_count,
+                "every injected `build` task must complete; event log: {log:?}"
+            );
+            assert_eq!(failed, 0, "no failures expected; event log: {log:?}");
+            // The hook fired EXACTLY ONCE for the fresh all-skipped phase —
+            // never (the #343 drop) and twice (a #326-shaped re-fire) are both
+            // failures.
+            let probe_ends = log
+                .iter()
+                .filter(|e| matches!(e, PhaseEvent::End { phase, .. } if phase == "probe"))
+                .count();
+            assert_eq!(
+                probe_ends, 1,
+                "on_phase_end(\"probe\") must fire exactly once for a freshly \
+                 discovered all-skipped phase; event log: {log:?}"
+            );
+            // The consumer lifecycle contract holds: the phase STARTED before
+            // it ended (a fresh skip phase never fired either hook anywhere,
+            // so both edges belong to this primary's cascade).
+            let probe_start = log
+                .iter()
+                .position(|e| matches!(e, PhaseEvent::Start(p) if p == "probe"));
+            let probe_end = log
+                .iter()
+                .position(|e| matches!(e, PhaseEvent::End { phase, .. } if phase == "probe"));
+            assert!(
+                probe_start.is_some() && probe_start < probe_end,
+                "on_phase_start(\"probe\") must precede on_phase_end(\"probe\"); \
+                 event log: {log:?}"
+            );
+            // The injection landed through the cascade.
+            let build_start = log
+                .iter()
+                .position(|e| matches!(e, PhaseEvent::Start(p) if p == "build"));
+            assert!(
+                build_start.is_some() && probe_end < build_start,
+                "on_phase_start(\"build\") must follow on_phase_end(\"probe\") — \
+                 the injected work activates only after the dependency phase \
+                 ends; event log: {log:?}"
+            );
+        })
+        .await;
+}
+
 /// Shared scenario driver. Builds the secondary cluster + primary,
 /// runs the workload to completion, and asserts every
 /// `on_phase_end(phase_id)` firing for a multi-item phase reports a
