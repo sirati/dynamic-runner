@@ -50,6 +50,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// A provider the checker thread calls when it declares the runtime starved,
+/// to render an extra diagnostic line ALONGSIDE the SIGUSR1 frame dump.
+///
+/// In the supported topology this returns the operational loop's live
+/// arm-stats snapshot (see [`crate::oploop_instrumentation`]) so the same dump
+/// that captures the wedged Python stack ALSO names which `select!` arm the
+/// loop was hot-spinning on — the ingest-wedge signature. `None` means "no
+/// snapshot available" (the loop is not running, or no provider was wired);
+/// the checker then dumps frames only, unchanged. Boxed + `Send + Sync`
+/// because the checker reads it from its own OS thread.
+pub type WedgeSnapshotProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// Cadence at which the runtime-side heartbeat task refreshes the shared
 /// timestamp. Short relative to [`STARVATION_THRESHOLD`] so a healthy runtime
 /// keeps the cell well within the threshold under normal scheduling jitter.
@@ -141,7 +153,15 @@ impl RuntimeWatchdog {
     /// the process — acceptable, because by then the runtime is already wedged
     /// and the operator wanted it surfaced; in the supported topology the
     /// handler IS installed (`dynamic_runner._secondary_bootstrap`).
-    pub fn spawn() -> (Self, impl std::future::Future<Output = ()>) {
+    ///
+    /// `wedge_snapshot` is an optional [`WedgeSnapshotProvider`]: when the
+    /// checker fires it calls this and, on `Some(line)`, logs the line at ERROR
+    /// alongside the frame dump so the dump NAMES the wedged loop's hot
+    /// `select!` arm. `None` (or a provider returning `None`) leaves the dump
+    /// behaviour exactly as before.
+    pub fn spawn(
+        wedge_snapshot: Option<WedgeSnapshotProvider>,
+    ) -> (Self, impl std::future::Future<Output = ()>) {
         let heartbeat = Arc::new(AtomicU64::new(now_millis()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -150,7 +170,7 @@ impl RuntimeWatchdog {
         let join = std::thread::Builder::new()
             .name("runtime-watchdog".to_string())
             .spawn(move || {
-                run_checker(checker_heartbeat, checker_shutdown);
+                run_checker(checker_heartbeat, checker_shutdown, wedge_snapshot);
             })
             .ok();
 
@@ -196,7 +216,11 @@ async fn heartbeat_loop(heartbeat: Arc<AtomicU64>) {
 /// The off-runtime checker body. Wakes every [`CHECK_INTERVAL`], reads the
 /// heartbeat, and acts on [`starvation_action`]. Lives on its own OS thread so
 /// it keeps running while the watched runtime is frozen.
-fn run_checker(heartbeat: Arc<AtomicU64>, shutdown: Arc<AtomicBool>) {
+fn run_checker(
+    heartbeat: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+    wedge_snapshot: Option<WedgeSnapshotProvider>,
+) {
     let mut last_dump: Option<Instant> = None;
     while !shutdown.load(Ordering::Relaxed) {
         std::thread::sleep(CHECK_INTERVAL);
@@ -216,6 +240,19 @@ fn run_checker(heartbeat: Arc<AtomicU64>, shutdown: Arc<AtomicBool>) {
                      wedged/spinning; dumping Python frames (SIGUSR1 → faulthandler)",
                     heartbeat_age.as_secs(),
                 );
+                // Name the wedged loop's hot arm alongside the frame dump. The
+                // arm-stats snapshot is read off the SAME relaxed atomics the
+                // loop writes; reading it from this off-runtime thread is sound
+                // even while the watched runtime is frozen (the atomics keep
+                // their last-written values). `None` leaves the behaviour
+                // unchanged. See `crate::oploop_instrumentation`.
+                if let Some(line) = wedge_snapshot.as_ref().and_then(|f| f()) {
+                    tracing::error!(
+                        oploop = %line,
+                        "wedged operational-loop arm snapshot (which arm the \
+                         starved runtime was hot-looping on)"
+                    );
+                }
                 // Self-directed SIGUSR1: the Python faulthandler registered at
                 // secondary bootstrap dumps every thread's stack to its target
                 // file. `raise` needs no ptrace and no extra privilege.

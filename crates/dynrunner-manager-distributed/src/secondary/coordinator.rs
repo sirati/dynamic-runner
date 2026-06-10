@@ -145,6 +145,8 @@ where
             // absorbed on a transient no-route (see the field doc on
             // `SecondaryCoordinator`).
             pending_terminal_replays: Vec::new(),
+            op_loop_arm_stats: None,
+            op_loop_arm_stats_cell: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -209,6 +211,19 @@ where
     /// bootstrap wire reaches.
     pub fn set_bootstrap_primary_id(&mut self, primary_id: String) {
         self.bootstrap_primary_id = Some(primary_id);
+    }
+
+    /// Wire the shared arm-stats bridge to the off-runtime
+    /// [`crate::runtime_watchdog`] (called at node bootstrap, before `run`).
+    /// The `process_tasks` loop then publishes its live arm stats into the
+    /// cell on entry and clears them on exit, so a freeze dump names this
+    /// secondary loop's hot arm. Observation-only. See
+    /// [`crate::oploop_instrumentation::OpLoopArmStatsCell`].
+    pub fn set_op_loop_arm_stats_cell(
+        &mut self,
+        cell: crate::oploop_instrumentation::OpLoopArmStatsCell,
+    ) {
+        self.op_loop_arm_stats_cell = Some(cell);
     }
 
     /// `&mut` access to the operational state. The operational handlers

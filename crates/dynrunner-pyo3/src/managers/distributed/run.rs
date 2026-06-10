@@ -705,6 +705,17 @@ impl PyDistributedManager {
                             // No node beacon on the in-process path (same
                             // follow-up): `None` = no primary→secondaries beacon.
                             peer_liveness_addrs: None,
+                            // No runtime-watchdog is spawned on the in-process
+                            // `--multi-computer local` path (same follow-up as
+                            // the beacon infra above), so there is no reader for
+                            // the arm-stats bridge here. Hand the recipe a fresh
+                            // standalone cell: the promoted primary's loop still
+                            // publishes its arms into it (a cheap, harmless
+                            // unread write) and the loop-local
+                            // `op_loop_arm_stats` field remains directly
+                            // inspectable. Observation-only.
+                            op_loop_arm_stats_cell:
+                                dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
                         });
 
                         let node = node.with_secondary(secondary, sec_slot);
