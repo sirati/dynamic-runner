@@ -257,6 +257,45 @@ impl PyKeepaliveResponse {
     }
 }
 
+/// Worker→secondary consumer custom message (`Response::Custom`).
+/// `topic` is the consumer routing key; `data` the opaque payload
+/// bytes (≤ `CUSTOM_MESSAGE_MAX_BYTES`, enforced at
+/// `Task.send_message` — this bridge class is shape-only, no policy).
+#[pyclass(name = "CustomMessageResponse", extends = PyResponse)]
+pub(crate) struct PyCustomMessageResponse {
+    #[pyo3(get, set)]
+    pub(super) topic: String,
+    pub(super) data: Vec<u8>,
+}
+
+#[pymethods]
+impl PyCustomMessageResponse {
+    #[new]
+    fn new(topic: String, data: Vec<u8>) -> (Self, PyResponse) {
+        (Self { topic, data }, PyResponse)
+    }
+
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    #[setter]
+    fn set_data(&mut self, value: Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes: &Bound<'_, PyBytes> = value.cast()?;
+        self.data = bytes.as_bytes().to_vec();
+        Ok(())
+    }
+
+    fn serialize<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        let resp = RustResponse::Custom {
+            topic: self.topic.clone(),
+            data: self.data.clone(),
+        };
+        rust_bytes_to_py(py, codec_serialize_response(&resp))
+    }
+}
+
 #[pyclass(name = "ReadyResponse", extends = PyResponse)]
 pub(crate) struct PyReadyResponse;
 

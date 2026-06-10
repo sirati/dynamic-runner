@@ -204,6 +204,25 @@ where
             return false;
         }
 
+        self.on_primary_identity_advanced(&new, epoch, reason);
+        true
+    }
+
+    /// The post-advance tail of a GENUINE primary-identity change — the
+    /// single seam every advance path runs, however the fact arrived:
+    /// the live `PrimaryChanged` apply ([`Self::apply_primary_changed`])
+    /// AND the anti-entropy snapshot heal
+    /// ([`Self::restore_cluster_snapshot_frame`]). Keying the seam on the
+    /// identity advance (not on the wire variant) is what makes the
+    /// relocation announcement RECOVERABLE: a secondary that missed the
+    /// one-shot broadcast still promotes / follows when the fact reaches
+    /// it through a snapshot pull.
+    fn on_primary_identity_advanced(
+        &mut self,
+        new: &str,
+        epoch: u64,
+        reason: dynrunner_protocol_primary_secondary::PrimaryChangeReason,
+    ) {
         if new == self.config.secondary_id {
             // (3) This node is the new primary.
             //
@@ -272,7 +291,119 @@ where
         // each tick, so this is the single place a failover redirects it —
         // with zero beacon-side election knowledge.
         self.republish_beacon_target();
-        true
+    }
+
+    /// Restore an inbound `ClusterSnapshot` frame into the local mirror AND
+    /// run the primary-identity seam if the heal advanced the primary fact.
+    ///
+    /// Shared between the operational dispatch router's `ClusterSnapshot`
+    /// arm and `wait_for_setup`'s receive loop (the same single-writer
+    /// discipline as [`Self::apply_cluster_mutations`]): both sites must
+    /// restore with identical semantics, and BOTH must observe a healed
+    /// primary-identity advance — pre-fix the restore was a silent lattice
+    /// merge, so a snapshot that newly named THIS node primary (the missed
+    /// relocation announcement healing through anti-entropy) never fired
+    /// the `PromotionSignal` and a peer-named heal never reset the
+    /// election. The decode failure stays WARN-and-keep (the steady-state
+    /// discriminator: the next digest round re-pulls).
+    ///
+    /// The healed `reason` is [`PrimaryChangeReason::default`]: a snapshot
+    /// carries no origination reason (the CRDT is reason-blind), and the
+    /// `Node`'s promotion build threads only the snapshot — the reason is
+    /// advisory routing metadata.
+    ///
+    /// Returns `true` iff the restore genuinely advanced the primary
+    /// identity (`(current_primary, primary_epoch)` moved); operational
+    /// callers react with [`Self::react_to_primary_identity_change`]
+    /// (async, pool-touching — the caller's concern, exactly as for
+    /// [`Self::apply_cluster_mutations`]).
+    pub(in crate::secondary) fn restore_cluster_snapshot_frame(
+        &mut self,
+        snapshot_json: &str,
+    ) -> bool {
+        let snap = match serde_json::from_str::<crate::cluster_state::ClusterStateSnapshot<I>>(
+            snapshot_json,
+        ) {
+            Ok(snap) => snap,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "ClusterSnapshot decode failed in the steady-state \
+                     anti-entropy sink; dropped a malformed snapshot (the \
+                     next peer StateDigest broadcast will re-trigger \
+                     reconciliation via the reactive digest arm)"
+                );
+                return false;
+            }
+        };
+        let before = (
+            self.cluster_state.current_primary().map(str::to_owned),
+            self.cluster_state.primary_epoch(),
+        );
+        self.cluster_state.restore(snap);
+        let after_primary = self.cluster_state.current_primary().map(str::to_owned);
+        let after = (after_primary.clone(), self.cluster_state.primary_epoch());
+        if after != before
+            && let Some(new) = after_primary
+        {
+            let epoch = self.cluster_state.primary_epoch();
+            self.on_primary_identity_advanced(
+                &new,
+                epoch,
+                dynrunner_protocol_primary_secondary::PrimaryChangeReason::default(),
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Anti-entropy receive side: compare `digest` (a peer's broadcast)
+    /// against the local replica and pull a snapshot from the proven-ahead
+    /// SENDER iff this replica is behind. The decision (compare + target
+    /// selection + request construction) lives in `crate::anti_entropy` so
+    /// primary / secondary / observer share ONE policy; this helper owns
+    /// only the `send_to` edge. Shared between the operational dispatch
+    /// router's `StateDigest` arm and `wait_for_setup`'s receive loop —
+    /// pre-`Operational` participation is what lets a setup-wedged
+    /// secondary recover a missed relocation announcement (the pull's
+    /// reply heals via [`Self::restore_cluster_snapshot_frame`]).
+    pub(in crate::secondary) async fn reconcile_state_digest(
+        &mut self,
+        sender_id: &str,
+        digest: &dynrunner_protocol_primary_secondary::StateDigest,
+    ) {
+        let local = self.cluster_state.digest();
+        let requester = crate::anti_entropy::RequesterIdentity {
+            node_id: &self.config.secondary_id,
+            // Wire role advertisement: a compute SecondaryCoordinator
+            // is never an observer (the observer role IS the
+            // standalone ObserverCoordinator), so the anti-entropy
+            // requester always declares `false`.
+            is_observer: false,
+            can_be_primary: self.config.can_be_primary,
+        };
+        if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
+            &local,
+            digest,
+            sender_id,
+            &requester,
+            timestamp_now(),
+        ) {
+            if let Err(e) = self.send_to(destination, request).await {
+                tracing::debug!(
+                    error = %e,
+                    peer = %sender_id,
+                    "anti-entropy: snapshot pull request send failed; \
+                     a later digest round retries"
+                );
+            } else {
+                tracing::debug!(
+                    peer = %sender_id,
+                    "anti-entropy: local replica behind peer digest; \
+                     requested snapshot pull"
+                );
+            }
+        }
     }
 
     /// Publish the CURRENT primary's liveness `SocketAddr` into the

@@ -122,7 +122,15 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
     /// — the originator is a remote peer, not a local role.
     ///
     /// - directed `Some(Primary|Secondary|Observer)` → [`Self::deliver_local`]
-    ///   to that one role's slot.
+    ///   to that one role's slot. When that role has NO live local slot the
+    ///   frame is NOT dropped: it already crossed the wire to the correct
+    ///   HOST, and the role tag is only the SENDER's (possibly stale) belief
+    ///   of which role lives here — e.g. a behind secondary addressing the
+    ///   relocated submitter as `Secondary(setup)` while the submitter
+    ///   swapped its primary into a standalone OBSERVER. Fall back to the
+    ///   documented safe default (fan to every live local slot, WARN) so the
+    ///   receiving role's own handler decides relevance instead of the mesh
+    ///   silently eating the frame.
     /// - `Some(All)` → local fan to every live slot.
     /// - `None` (transitional: a frame stamped before the egress rewire
     ///   lands) → a LOUD `debug_assert!` + `warn`, then the documented safe
@@ -138,7 +146,30 @@ impl<I: Identifier, Tr: PeerTransport<I>> Mesh<I, Tr> {
                 // variants; the `All` arm is handled above.
                 let role = LocalRole::from_destination(dst)
                     .expect("non-All directed Destination always carries a role");
-                self.deliver_local(role, frame);
+                // Role-miss no-drop fallback: a directed frame for a role
+                // with no LIVE local slot reflects the sender's stale role
+                // knowledge of this host (the host-level addressing is
+                // already satisfied — the frame arrived here). Fan it to
+                // the live slots instead of dropping. The presence check is
+                // upfront so the hot path (slot present) pays no clone; the
+                // transient "slot present but its inbox just closed" prune
+                // inside `deliver_local` keeps its existing semantics.
+                let role_has_live_slot = self
+                    .slot_for(role)
+                    .map(|weak| weak.upgrade().is_some())
+                    .unwrap_or(false);
+                if role_has_live_slot {
+                    self.deliver_local(role, frame);
+                } else {
+                    tracing::warn!(
+                        kind = ?frame.msg_type(),
+                        target = ?dst,
+                        "mesh ingress: directed frame names a role with no live \
+                         local slot (stale sender-side role knowledge); fanning \
+                         to every live local slot rather than dropping it"
+                    );
+                    self.fan_local(None, frame);
+                }
             }
             None => {
                 // A frame arriving unstamped is either a real production

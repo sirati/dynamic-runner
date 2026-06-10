@@ -1704,3 +1704,93 @@ async fn lost_visibility_drives_tunnel_reconnect_with_roster() {
     .await
     .expect("the reconnecting observer must terminate, not hang");
 }
+
+/// The relocated submitter-observer is the ONLY replica holding the
+/// relocation `PrimaryChanged` fact when the live broadcast is lost
+/// mid-setup (the run_20260610_185621 leaderless wedge). Its anti-entropy
+/// digest makes a behind secondary pull a snapshot FROM IT — so the
+/// observer MUST answer `RequestClusterSnapshot` (serve-only: the reply is
+/// a read of its converged mirror, never a mutation origination — the
+/// zero-authority contract is preserved; unlike the secondary's responder
+/// it originates NO `PeerJoined`).
+///
+/// REVERT-CHECK: pre-fix the request lands in `on_inbound`'s ignore-arm
+/// and the pull goes unanswered forever — the wedged fleet can never heal
+/// off the only ahead replica.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_answers_snapshot_pull_from_behind_secondary() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The requesting (behind, still-in-setup) secondary's outbox.
+                let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                let (sec1_tx, mut sec1_rx) = mpsc::unbounded_channel();
+                let mut outgoing = HashMap::new();
+                outgoing.insert("sec-1".to_string(), sec1_tx);
+                let transport =
+                    ChannelPeerTransport::from_raw_channels("setup".into(), outgoing, inbound_rx);
+
+                // The relocated submitter's converged mirror: it applied the
+                // relocation locally before the broadcast was lost.
+                let mut cs = ClusterState::<TestId>::new();
+                cs.apply(ClusterMutation::PrimaryChanged {
+                    new: "sec-0".into(),
+                    epoch: 1,
+                    reason: PrimaryChangeReason::Transferred,
+                });
+
+                let mut config = observer_config("setup");
+                config.fleet_dead_timeout = Duration::from_secs(60);
+
+                let (client, inbox, pump) = observer_mesh(transport, "setup");
+                tokio::task::spawn_local(pump);
+                let mut observer = ObserverCoordinator::new(client, inbox, cs, config);
+                let run_task = tokio::task::spawn_local(async move {
+                    let _ = observer.run().await;
+                });
+
+                // The behind secondary's anti-entropy pull (its reactive
+                // digest arm targets the proven-ahead SENDER — this observer).
+                inbound_tx
+                    .send(DistributedMessage::RequestClusterSnapshot {
+                        target: None,
+                        sender_id: "sec-1".into(),
+                        timestamp: 0.0,
+                        is_observer: false,
+                        can_be_primary: true,
+                    })
+                    .expect("inbound open");
+
+                // The observer MUST answer with its snapshot, carrying the
+                // relocation fact the requester is missing.
+                let reply = loop {
+                    let frame = sec1_rx
+                        .recv()
+                        .await
+                        .expect("observer transport stays open");
+                    if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = frame {
+                        break snapshot_json;
+                    }
+                };
+                let snap: crate::cluster_state::ClusterStateSnapshot<TestId> =
+                    serde_json::from_str(&reply).expect("served snapshot decodes");
+                let mut healed = ClusterState::<TestId>::new();
+                healed.restore(snap);
+                assert_eq!(
+                    healed.current_primary(),
+                    Some("sec-0"),
+                    "the served snapshot carries the relocation fact"
+                );
+                assert_eq!(healed.primary_epoch(), 1);
+
+                run_task.abort();
+            })
+            .await;
+    })
+    .await
+    .expect(
+        "REVERT-CHECK: the observer never answered the snapshot pull — the only \
+         ahead replica is mute and the wedged fleet cannot heal",
+    );
+}

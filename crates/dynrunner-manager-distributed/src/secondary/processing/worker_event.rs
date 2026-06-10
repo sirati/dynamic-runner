@@ -457,6 +457,48 @@ where
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
                 Ok(None)
             }
+            WorkerEvent::CustomMessage {
+                worker_id,
+                topic,
+                data,
+                ..
+            } => {
+                // Consumer custom message from this node's own worker
+                // (NON-TERMINAL — task attribution untouched). The
+                // stale-generation gate above already dropped frames
+                // from replaced subprocesses. Resolve the sending
+                // task's `type_id` (the consumer's routing context),
+                // then ENQUEUE for the worker-message dispatcher —
+                // the consumer's `worker_message_listener` is Python
+                // and must never run on this operational loop (the
+                // CCD-9-shaped boundary; see
+                // `crate::worker_messages`). Worker↔secondary customs
+                // are deliberately node-local: no CRDT mutation, no
+                // primary report — the consumer relays to the primary
+                // explicitly via `SecondaryHandle.send_to_primary`
+                // (feature 5) when it wants replication.
+                let type_id = self.op_mut().pool.workers[worker_id as usize]
+                    .current_binary
+                    .as_ref()
+                    .map(|b| b.type_id.to_string())
+                    .unwrap_or_default();
+                tracing::debug!(
+                    worker_id,
+                    topic = %topic,
+                    bytes = data.len(),
+                    task_type = %type_id,
+                    "worker custom message received; dispatching to listeners"
+                );
+                let _ = self
+                    .worker_message_tx
+                    .send(crate::worker_messages::WorkerCustomMessage {
+                        worker_id,
+                        type_id,
+                        topic,
+                        data,
+                    });
+                Ok(None)
+            }
             WorkerEvent::Keepalive { worker_id, .. } => {
                 tracing::trace!(worker_id, "worker keepalive");
                 Ok(None)

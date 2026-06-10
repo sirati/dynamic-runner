@@ -2,6 +2,7 @@ import socket
 
 from ..proto import Command, Response, parse_command, parse_response
 from .base_interface import CommunicationInterface
+from .line_reader import SocketLineReader
 
 
 class UnixSocketInterface(CommunicationInterface):
@@ -9,7 +10,11 @@ class UnixSocketInterface(CommunicationInterface):
 
     def __init__(self, sock: socket.socket):
         self.socket = sock
-        self.socket_file = None
+        # ONE buffered line reader for both blocking and non-blocking
+        # command reads — see `line_reader.SocketLineReader` for why
+        # the two paths must share a buffer (poll_messages interleaves
+        # with the runtime's blocking command loop).
+        self._line_reader = SocketLineReader(sock)
 
     def send_command(self, command: Command) -> tuple[bool, str | None]:
         """Send a command through the socket."""
@@ -28,35 +33,20 @@ class UnixSocketInterface(CommunicationInterface):
             return (False, str(e))
 
     def receive_command(self, blocking: bool = True) -> Command | None:
-        """Receive a command from the socket."""
-        try:
-            if blocking:
-                # Use buffered file object for blocking reads (worker side)
-                if self.socket_file is None:
-                    self.socket_file = self.socket.makefile("r")
+        """Receive ONE command from the socket.
 
-                line = self.socket_file.readline()
-                if not line:
-                    return None
-                return parse_command(line)
-            else:
-                # Non-blocking for manager side
-                self.socket.setblocking(False)
-                data = self.socket.recv(1024)
-                if not data:
-                    return None
-                line = data.decode("utf-8").strip()
-                return parse_command(line)
-        except BlockingIOError:
+        ``blocking=True`` waits for the next complete line (the
+        runtime loop's resting read); ``blocking=False`` returns the
+        next ALREADY-BUFFERED complete line or ``None`` without
+        waiting (the ``Task.poll_messages()`` drain — callers loop
+        until ``None``). Both modes share the one line buffer, so a
+        frame spanning recv chunks or two frames sharing a chunk are
+        framed correctly either way.
+        """
+        line = self._line_reader.read_line(blocking=blocking)
+        if not line:
             return None
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            return None
-        finally:
-            if not blocking:
-                try:
-                    self.socket.setblocking(True)
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
+        return parse_command(line)
 
     def receive_responses(self) -> list[Response]:
         """Receive and parse all available responses from the socket."""
@@ -90,8 +80,6 @@ class UnixSocketInterface(CommunicationInterface):
     def close(self) -> None:
         """Close the socket."""
         try:
-            if self.socket_file:
-                self.socket_file.close()
             self.socket.close()
         except Exception:
             pass

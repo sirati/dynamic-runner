@@ -449,6 +449,41 @@ where
                         }
                         continue;
                     }
+                    // Anti-entropy frames are replicated-STATE traffic, not a
+                    // primary announce: handled BEFORE the `enter_configuring`
+                    // trigger (like the RunConfig push above) so a digest from
+                    // a non-primary peer (e.g. the relocated submitter's
+                    // observer) never spawns the worker pool. Participating
+                    // here — instead of dropping these frames in the
+                    // `other =>` arm — is what makes a LOST relocation
+                    // `PrimaryChanged` broadcast recoverable while the fleet
+                    // is still mid-setup (the run_20260610_185621 leaderless
+                    // wedge): the observer's ~20s digest cadence proves this
+                    // replica behind, the pull's snapshot restores the
+                    // primary fact, and the restore helper's identity seam
+                    // fires the `PromotionSignal` on a self-named heal (or
+                    // re-points `current_primary` on a peer-named one). Both
+                    // helpers are the SAME single writers the operational
+                    // router uses.
+                    if let MessageType::StateDigest = msg.msg_type() {
+                        if let DistributedMessage::StateDigest {
+                            digest, sender_id, ..
+                        } = msg
+                        {
+                            self.reconcile_state_digest(&sender_id, &digest).await;
+                        }
+                        continue;
+                    }
+                    if let MessageType::ClusterSnapshot = msg.msg_type() {
+                        if let DistributedMessage::ClusterSnapshot { snapshot_json, .. } = msg {
+                            self.restore_cluster_snapshot_frame(&snapshot_json);
+                        }
+                        // The restored snapshot may carry a terminal latch
+                        // (RunComplete / RunAborted) — re-loop to the single
+                        // terminal-exit check at the loop head, exactly as
+                        // the ClusterMutation arm below does.
+                        continue;
+                    }
                     // FIRST primary-originated frame = the announce. This
                     // is the `AwaitingPrimary → Configuring` boundary: the
                     // primary has made contact, so spawn the worker pool

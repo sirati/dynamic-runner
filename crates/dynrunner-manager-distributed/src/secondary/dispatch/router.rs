@@ -24,7 +24,6 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::wire::{distributed_to_binary, timestamp_now};
-use crate::cluster_state::ClusterStateSnapshot;
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
@@ -551,12 +550,14 @@ where
                 Ok(())
             }
             DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {
-                // Lattice-merge into the local mirror via
-                // `ClusterState::restore`. Idempotent on duplicates
-                // and safe under concurrent live broadcasts (joiner
-                // may have already applied mutations the snapshot also
-                // contains; the merge keeps the strictly stronger of
-                // each).
+                // Lattice-merge into the local mirror via the shared
+                // single-writer restore helper (`ClusterState::restore` +
+                // the primary-identity seam — see
+                // `restore_cluster_snapshot_frame`; `wait_for_setup`'s
+                // receive loop shares it). Idempotent on duplicates and
+                // safe under concurrent live broadcasts (joiner may have
+                // already applied mutations the snapshot also contains;
+                // the merge keeps the strictly stronger of each).
                 //
                 // Per-frame fatality discriminator (D-C / D3): this arm is
                 // the STEADY-STATE anti-entropy / late-heal pull sink — it
@@ -575,19 +576,16 @@ where
                 // hard-fail there. The discriminator is WHICH FUNCTION the
                 // decode lives in (steady-state loop arm = WARN, bootstrap
                 // constructor = fatal); there is no latch.
-                match serde_json::from_str::<ClusterStateSnapshot<I>>(&snapshot_json) {
-                    Ok(snap) => {
-                        self.cluster_state.restore(snap);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "ClusterSnapshot decode failed in the steady-state \
-                             anti-entropy sink; dropped a malformed snapshot (the \
-                             next peer StateDigest broadcast will re-trigger \
-                             reconciliation via the reactive digest arm)"
-                        );
-                    }
+                //
+                // A heal that genuinely advanced the primary identity gets
+                // the SAME per-primary state refresh the live
+                // `ClusterMutation::PrimaryChanged` apply gets (the
+                // `react_to_primary_identity_change` single owner) — a
+                // snapshot-healed primary flip must re-announce MeshReady /
+                // reset backoff / repoll exactly like a broadcast-delivered
+                // one.
+                if self.restore_cluster_snapshot_frame(&snapshot_json) {
+                    self.react_to_primary_identity_change().await;
                 }
                 Ok(())
             }
@@ -595,45 +593,13 @@ where
                 digest, sender_id, ..
             } => {
                 // Anti-entropy receive: compare the peer's digest against
-                // ours and pull a snapshot iff we are behind. The decision
-                // (compare + target selection + request construction) lives
-                // in `crate::anti_entropy` so primary / secondary / observer
-                // share ONE policy; this arm only owns the `send_to` edge.
-                // The pull's reply heals via the existing `ClusterSnapshot`
-                // recv arm above (idempotent `restore`), so a converged
-                // second round matches and pulls nothing (self-quiescing).
-                let local = self.cluster_state.digest();
-                let requester = crate::anti_entropy::RequesterIdentity {
-                    node_id: &self.config.secondary_id,
-                    // Wire role advertisement: a compute SecondaryCoordinator
-                    // is never an observer (the observer role IS the
-                    // standalone ObserverCoordinator), so the anti-entropy
-                    // requester always declares `false`.
-                    is_observer: false,
-                    can_be_primary: self.config.can_be_primary,
-                };
-                if let Some((destination, request)) = crate::anti_entropy::reconcile_against_peer(
-                    &local,
-                    &digest,
-                    &sender_id,
-                    &requester,
-                    timestamp_now(),
-                ) {
-                    if let Err(e) = self.send_to(destination, request).await {
-                        tracing::debug!(
-                            error = %e,
-                            peer = %sender_id,
-                            "anti-entropy: snapshot pull request send failed; \
-                             a later digest round retries"
-                        );
-                    } else {
-                        tracing::debug!(
-                            peer = %sender_id,
-                            "anti-entropy: local replica behind peer digest; \
-                             requested snapshot pull"
-                        );
-                    }
-                }
+                // ours and pull a snapshot iff we are behind, via the
+                // shared single-writer helper (`reconcile_state_digest`;
+                // `wait_for_setup`'s receive loop shares it). The pull's
+                // reply heals via the `ClusterSnapshot` recv arm above
+                // (idempotent restore), so a converged second round matches
+                // and pulls nothing (self-quiescing).
+                self.reconcile_state_digest(&sender_id, &digest).await;
                 Ok(())
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {

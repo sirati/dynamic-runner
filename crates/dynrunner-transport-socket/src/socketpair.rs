@@ -38,6 +38,7 @@ pub fn create_socketpair() -> std::io::Result<(SocketpairManagerEnd, RawFd)> {
         SocketpairManagerEnd {
             reader,
             writer: write_half,
+            frame_state: dynrunner_protocol_manager_worker::FrameReadState::default(),
         },
         child_raw,
     ))
@@ -47,6 +48,12 @@ pub fn create_socketpair() -> std::io::Result<(SocketpairManagerEnd, RawFd)> {
 pub struct SocketpairManagerEnd {
     reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
     writer: tokio::io::WriteHalf<UnixStream>,
+    /// Partial-frame state held OUTSIDE the recv future so `recv` is
+    /// cancellation-safe (the `MessageReceiver` contract): a recv
+    /// future dropped by a losing `select!` arm resumes the same
+    /// in-flight frame on the next call. See
+    /// `dynrunner_protocol_manager_worker::framing::FrameReadState`.
+    frame_state: dynrunner_protocol_manager_worker::FrameReadState,
 }
 
 impl MessageSender<Command> for SocketpairManagerEnd {
@@ -64,9 +71,15 @@ impl MessageReceiver<Response> for SocketpairManagerEnd {
     async fn recv(&mut self) -> Option<Response> {
         // Bounded framing (#364): an over-limit frame is drained and
         // surfaced as the protocol's loud NonRecoverable error instead
-        // of being consumed replylessly. See
-        // `dynrunner_protocol_manager_worker::framing`.
-        dynrunner_protocol_manager_worker::recv_response_bounded(&mut self.reader).await
+        // of being consumed replylessly. Cancel-safe: the partial-
+        // frame state persists on `self` across a dropped recv future
+        // (the custom-outbox select in the per-task poll relies on
+        // this). See `dynrunner_protocol_manager_worker::framing`.
+        dynrunner_protocol_manager_worker::ResponseFrameReader {
+            state: &mut self.frame_state,
+        }
+        .recv(&mut self.reader)
+        .await
     }
 }
 

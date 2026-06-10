@@ -93,6 +93,24 @@ def _full_log_dir_from_argv(argv: list[str]) -> str | None:
     return None
 
 
+def _open_dump_file(file_path: Path) -> IO[str] | None:
+    """Open (append, line-buffered) one durable dump file, retaining the
+    handle process-globally so the registered ``faulthandler`` fd stays
+    alive. ``None`` on any filesystem trouble (mount not ready, perms) —
+    callers fall back to ``sys.stderr`` rather than break cold start.
+    Line-buffered append so concurrent dumps don't truncate prior ones
+    and each dump is flushed promptly.
+    """
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = file_path.open("a", buffering=1)
+        global _DUMP_FILE
+        _DUMP_FILE = handle
+        return handle
+    except OSError:
+        return None
+
+
 def _resolve_dump_target(argv: list[str]) -> IO[str]:
     """Pick the durable frame-dump file object.
 
@@ -102,23 +120,17 @@ def _resolve_dump_target(argv: list[str]) -> IO[str]:
     """
     full_log_dir = _full_log_dir_from_argv(argv)
     if full_log_dir:
-        try:
-            dir_path = Path(full_log_dir)
-            dir_path.mkdir(parents=True, exist_ok=True)
-            # Line-buffered append so concurrent dumps don't truncate prior
-            # ones and each dump is flushed promptly.
-            handle = (dir_path / _DUMP_BASENAME).open("a", buffering=1)
-            global _DUMP_FILE
-            _DUMP_FILE = handle
+        handle = _open_dump_file(Path(full_log_dir) / _DUMP_BASENAME)
+        if handle is not None:
             return handle
-        except OSError:
-            # Any filesystem trouble (mount not ready, perms): fall back to
-            # stderr rather than break cold start.
-            pass
     return sys.stderr
 
 
-def enable_fault_dumps(argv: list[str] | None = None) -> None:
+def enable_fault_dumps(
+    argv: list[str] | None = None,
+    *,
+    dump_path: str | Path | None = None,
+) -> None:
     """Install ``faulthandler`` for this process. Call once, at bootstrap.
 
     Registers:
@@ -133,14 +145,22 @@ def enable_fault_dumps(argv: list[str] | None = None) -> None:
         process — ``chain=False`` returns control to the interrupted code after
         writing the traceback, leaving the process running.
 
-    ``argv`` defaults to ``sys.argv[1:]`` (the live command line). Best-effort:
-    if ``faulthandler`` cannot be wired (e.g. a redirected ``sys.stderr`` with
-    no real fd, or the platform lacks ``SIGUSR1``), the exception is swallowed
-    so cold start is never blocked.
+    ``argv`` defaults to ``sys.argv[1:]`` (the live command line) and is used
+    only to resolve the ``--full-log-dir`` dump target. ``dump_path``
+    (keyword-only) overrides that resolution with an EXPLICIT dump-file path
+    — the worker-subprocess entry (``worker.runtime.run``) uses it to write
+    a per-worker ``worker_<id>-faulthandler.log`` sibling of its
+    ``--log-file``, since workers carry no ``--full-log-dir``. Best-effort:
+    if ``faulthandler`` cannot be wired (e.g. a redirected ``sys.stderr``
+    with no real fd, or the platform lacks ``SIGUSR1``), the exception is
+    swallowed so cold start is never blocked.
     """
     raw = list(sys.argv[1:] if argv is None else argv)
     try:
-        target = _resolve_dump_target(raw)
+        if dump_path is not None:
+            target = _open_dump_file(Path(dump_path)) or sys.stderr
+        else:
+            target = _resolve_dump_target(raw)
         # Fatal-signal dumps to the durable target.
         faulthandler.enable(file=target, all_threads=True)
         # On-demand all-thread dump. ``SIGUSR1`` is not used by CPython

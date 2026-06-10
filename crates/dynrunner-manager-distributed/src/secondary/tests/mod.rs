@@ -88,6 +88,7 @@
 #![cfg(test)]
 
 mod anti_entropy_heal;
+mod custom_messages;
 mod deferrer_membership_death;
 mod failover_beacon_union;
 mod failover_lone_survivor;
@@ -109,6 +110,7 @@ mod panik_integration;
 mod peer_mesh_watchdog;
 mod processing;
 mod r1;
+mod relocation_handoff_race;
 mod run_config_responder;
 mod terminal_ack;
 mod voting_candidate_death;

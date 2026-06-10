@@ -225,6 +225,23 @@ impl PySecondaryCoordinator {
             .take()
             .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
+        // Duck-typed consumer hook (the `task_completed_listener`
+        // idiom): an optional `worker_message_listener` attribute on
+        // the consumer's TaskDefinition. Captured on the GIL thread
+        // as an unbound callable; the bridge + the minted
+        // `SecondaryHandle` are built inside the runtime once the
+        // inner coordinator (and therefore its control-plane sender)
+        // exists. Fired with worker custom messages
+        // (`Task.send_message` frames) off the operational loop, with
+        // PyErr/panic isolation.
+        let worker_message_listener_py: Option<Py<PyAny>> = {
+            let td = self.task_definition_py.bind(py);
+            match td.getattr("worker_message_listener") {
+                Ok(attr) if attr.is_callable() => Some(attr.unbind()),
+                _ => None,
+            }
+        };
+
         // Phase-lifecycle callbacks the PROMOTED primary fires. Built here
         // under the GIL (the `make_on_phase_*` constructors capture a
         // `Py<PyAny>` clone of `task_definition_py` that the closure body
@@ -494,6 +511,38 @@ impl PySecondaryCoordinator {
                 // into the spawned dispatcher on first entry.
                 if let Some(listener) = peer_lifecycle_listener {
                     secondary.register_lifecycle_listener(listener);
+                }
+
+                // Register the consumer's `worker_message_listener`
+                // (if the TaskDefinition exposes one) BEFORE `run` —
+                // same pre-run contract as the lifecycle listener
+                // (the listener vector is `mem::take`-d into the
+                // worker-message dispatcher on first entry). The one
+                // `SecondaryHandle` minted here is reused on every
+                // fire; its `send_to_worker` queues on THIS
+                // coordinator's control channel (drained by the
+                // operational loop, which owns the pool).
+                if let Some(listener) = worker_message_listener_py {
+                    let control_tx = secondary.secondary_control_sender();
+                    let handle = Python::attach(|py| {
+                        Py::new(
+                            py,
+                            crate::managers::secondary_handle::PySecondaryHandle::new(control_tx),
+                        )
+                    })
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to mint SecondaryHandle for worker_message_listener: {e}"
+                        ))
+                    })?;
+                    secondary.register_worker_message_listener(
+                        crate::worker_message_bridge::PyWorkerMessageListener::new(
+                            listener, handle,
+                        ),
+                    );
+                    tracing::info!(
+                        "worker_message_listener registered (consumer TaskDefinition hook)"
+                    );
                 }
 
                 // Set peer cert info so the CertExchange message includes
