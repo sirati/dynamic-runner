@@ -135,7 +135,8 @@ pub(crate) struct SecondaryDialParams<'a> {
     pub addr: std::net::SocketAddr,
     /// Overall dial budget; the retry loop gives up past this.
     pub connect_timeout: std::time::Duration,
-    /// Delay between dial attempts.
+    /// Initial delay between dial attempts; doubled per refused attempt,
+    /// capped at [`MAX_DIAL_RETRY_DELAY`].
     pub retry_delay: std::time::Duration,
     /// This secondary's logical id (the peer-mesh cert CN).
     pub secondary_id: &'a str,
@@ -146,6 +147,158 @@ pub(crate) struct SecondaryDialParams<'a> {
     pub ipv4_address: Option<String>,
     /// Detected IPv6 address advertised in the `PeerCertInfo`.
     pub ipv6_address: Option<String>,
+}
+
+/// Cap on the bring-up dial's backoff delay. The delay starts at the
+/// configured `retry_delay` (default 1s) and doubles per transient
+/// failure up to this cap, so a slow tunnel keeps a visible WARN
+/// cadence without hammering the port.
+const MAX_DIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Classify a failed bring-up dial attempt: `true` iff the error is
+/// connection-refused/reset-class — the canonical "the submitter's `-R`
+/// reverse tunnel is still establishing (or dropped mid-handshake)"
+/// race, which is worth retrying until the deadline. Auth/protocol/
+/// handshake errors return `false` and fail fast: retrying cannot fix
+/// them and would bury the real cause for the whole dial budget.
+///
+/// Matches BOTH the kernel error text and the raw errno because the
+/// backend stringifies `tungstenite` errors (production shape:
+/// `"IO error: Connection refused (os error 111)"`) and the text half
+/// is locale/wording-sensitive across std versions.
+fn is_transient_dial_error(error: &str) -> bool {
+    const TRANSIENT_NEEDLES: [&str; 6] = [
+        "Connection refused",
+        "os error 111", // ECONNREFUSED
+        "Connection reset",
+        "os error 104", // ECONNRESET
+        "Connection aborted",
+        "os error 103", // ECONNABORTED
+    ];
+    TRANSIENT_NEEDLES.iter().any(|n| error.contains(n))
+}
+
+/// Drive one bring-up dial to success or a hard verdict: retry
+/// transient (refused/reset-class) failures with capped exponential
+/// backoff until `deadline`, fail fast on anything else, and — on
+/// deadline exhaustion — fail with the full attempt history plus the
+/// last underlying error (so a never-listening tunnel is
+/// distinguishable from a first-attempt death; the production
+/// fire-drill of run_20260610_130030 was misdiagnosed exactly because
+/// the old exhaustion message carried neither).
+///
+/// Every attempt is additionally hard-bounded by the time remaining to
+/// the deadline (`connect_wss` itself has no handshake timeout, so a
+/// stalled accept could otherwise outlive the budget).
+///
+/// Generic over the dial future so the retry policy is unit-testable
+/// without a live backend; [`dial_secondary_mesh`] passes the real
+/// `NetworkClient::connect_wss_only`.
+async fn dial_until_deadline<T, F, Fut>(
+    addr: std::net::SocketAddr,
+    deadline: std::time::Duration,
+    initial_delay: std::time::Duration,
+    mut dial: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let start = std::time::Instant::now();
+    // An operator-raised fixed `retry_delay` above the cap is honoured
+    // (the cap only bounds the doubling, never lowers the configured
+    // floor).
+    let max_delay = MAX_DIAL_RETRY_DELAY.max(initial_delay);
+    let mut delay = initial_delay;
+    let mut attempts = 0u32;
+    // The most recent transient failure, kept so deadline exhaustion
+    // reports the real underlying error (e.g. the refused dial), not a
+    // synthetic timeout shell.
+    let mut last_error: Option<String> = None;
+    loop {
+        let budget = deadline.saturating_sub(start.elapsed());
+        // (A zero/expired budget BEFORE any attempt — `last_error` still
+        // `None` — falls through and gives the dial exactly one
+        // zero-budget chance, so a degenerate deadline still reports a
+        // real outcome.)
+        if budget.is_zero()
+            && let Some(error) = last_error
+        {
+            tracing::error!(
+                addr = %addr,
+                attempts,
+                elapsed_s = start.elapsed().as_secs_f64(),
+                last_error = %error,
+                "failed to connect to primary: retried every refused dial until the \
+                 deadline; the primary tunnel never started listening"
+            );
+            return Err(format!(
+                "failed to connect to primary at {addr} after {:.0}s ({attempts} attempts; \
+                 every connection-refused/reset failure was retried until the deadline — \
+                 the primary's reverse tunnel never started listening): last error: {error}",
+                start.elapsed().as_secs_f64()
+            ));
+        }
+        attempts += 1;
+        let error = match tokio::time::timeout(budget, dial()).await {
+            Ok(Ok(connected)) => {
+                tracing::info!(
+                    addr = %addr,
+                    elapsed_s = start.elapsed().as_secs_f64(),
+                    attempts,
+                    "connected to primary"
+                );
+                return Ok(connected);
+            }
+            Ok(Err(e)) => e,
+            // The attempt itself consumed the rest of the budget (a
+            // stalled TCP connect / WS handshake): deadline exhaustion,
+            // verbatim — never routed through the transient classifier.
+            Err(_) => {
+                let history = match &last_error {
+                    Some(e) => format!("; last completed attempt's error: {e}"),
+                    None => String::new(),
+                };
+                tracing::error!(
+                    addr = %addr,
+                    attempts,
+                    elapsed_s = start.elapsed().as_secs_f64(),
+                    "failed to connect to primary: final dial attempt still pending at the deadline"
+                );
+                return Err(format!(
+                    "failed to connect to primary at {addr} after {:.0}s ({attempts} attempts; \
+                     the final dial attempt was still pending when the deadline expired{history})",
+                    start.elapsed().as_secs_f64()
+                ));
+            }
+        };
+        if !is_transient_dial_error(&error) {
+            tracing::error!(
+                addr = %addr,
+                attempts,
+                error = %error,
+                "failed to connect to primary (non-transient error; not retrying)"
+            );
+            return Err(format!(
+                "failed to connect to primary at {addr}: {error} \
+                 (non-transient error on attempt {attempts}; not retrying)"
+            ));
+        }
+        let remaining = deadline.saturating_sub(start.elapsed());
+        let pause = delay.min(remaining);
+        tracing::warn!(
+            addr = %addr,
+            attempt = attempts,
+            error = %error,
+            retry_in_s = pause.as_secs_f64(),
+            deadline_remaining_s = remaining.as_secs_f64(),
+            "primary tunnel not listening yet — the submitter's reverse tunnel may still \
+             be establishing; retrying until the deadline"
+        );
+        last_error = Some(error);
+        tokio::time::sleep(pause).await;
+        delay = (delay * 2).min(max_delay);
+    }
 }
 
 /// Dial the bootstrap primary and build the secondary's mesh transport.
@@ -169,51 +322,14 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         ipv4_address,
         ipv6_address,
     } = params;
-    // Connect to primary via WSS, retrying until the configured timeout.
-    let start = std::time::Instant::now();
-    let mut attempt = 0u32;
-    let client = loop {
-        attempt += 1;
-        let elapsed = start.elapsed();
-        if elapsed > connect_timeout {
-            tracing::error!(
-                addr = %addr,
-                attempts = attempt,
-                "failed to connect to primary after {:.0}s",
-                connect_timeout.as_secs_f64()
-            );
-            return Err(format!(
-                "failed to connect to primary at {addr} after {:.0}s ({attempt} attempts)",
-                connect_timeout.as_secs_f64()
-            ));
-        }
-        match NetworkClient::connect_wss_only(addr).await {
-            Ok(c) => {
-                tracing::info!(
-                    addr = %addr,
-                    elapsed_s = elapsed.as_secs_f64(),
-                    attempts = attempt,
-                    "connected to primary"
-                );
-                break c;
-            }
-            Err(e) => {
-                let remaining = connect_timeout.saturating_sub(elapsed);
-                if remaining > retry_delay {
-                    tracing::info!(
-                        attempt,
-                        error = %e,
-                        "connection failed, retrying in {:.0}s...",
-                        retry_delay.as_secs_f64()
-                    );
-                    tokio::time::sleep(retry_delay).await;
-                } else {
-                    tracing::error!(addr = %addr, error = %e, "failed to connect to primary");
-                    return Err(format!("failed to connect to primary at {addr}: {e}"));
-                }
-            }
-        }
-    };
+    // Connect to primary via WSS, retrying transient failures until the
+    // configured deadline (`connect_timeout`, default 600s — the same
+    // window as the submitter's secondary-welcome wait, so both sides
+    // give up together).
+    let client = dial_until_deadline(addr, connect_timeout, retry_delay, || {
+        NetworkClient::connect_wss_only(addr)
+    })
+    .await?;
 
     // Start the secondary's peer mesh. The identity passed to
     // `PeerNetwork::start` is BOTH the CN baked into this secondary's
@@ -289,3 +405,195 @@ pub(crate) async fn observer_mesh<I: Identifier>(
 // secondary `from_raw_channels` legs folded only the primary in) are gone:
 // under mesh-always the setup peer relocates onto a secondary, so every node
 // needs all-to-all reach, which the STAR could not provide.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identifier::RunnerIdentifier;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    /// The EXACT error shape production emitted in run_20260610_130030
+    /// (tungstenite `Error::Io` Display through `connect_wss`'s
+    /// `e.to_string()`); the retry tests drive the policy with it so the
+    /// classifier is exercised on the real wire shape, not a synthetic one.
+    const PRODUCTION_REFUSED: &str = "IO error: Connection refused (os error 111)";
+
+    fn test_addr() -> std::net::SocketAddr {
+        "127.0.0.1:1".parse().unwrap()
+    }
+
+    /// Refused/reset-class strings (text AND errno halves) are transient;
+    /// auth/protocol/handshake strings are not.
+    #[test]
+    fn classifier_separates_refused_class_from_protocol_class() {
+        assert!(is_transient_dial_error(PRODUCTION_REFUSED));
+        assert!(is_transient_dial_error(
+            "IO error: Connection reset by peer (os error 104)"
+        ));
+        assert!(is_transient_dial_error(
+            "IO error: Connection aborted (os error 103)"
+        ));
+        assert!(!is_transient_dial_error(
+            "WebSocket protocol error: Handshake not finished"
+        ));
+        assert!(!is_transient_dial_error("HTTP error: 401 Unauthorized"));
+        assert!(!is_transient_dial_error("IO error: unexpected end of file"));
+    }
+
+    /// A dial refused N times then accepted (the tunnel finishing its
+    /// concurrent establishment) connects instead of dying — the core
+    /// retry-works guarantee.
+    #[tokio::test(start_paused = true)]
+    async fn retries_refused_until_listener_appears() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = calls.clone();
+        let result: Result<u32, String> = dial_until_deadline(
+            test_addr(),
+            Duration::from_secs(600),
+            Duration::from_secs(1),
+            move || {
+                let counter = counter.clone();
+                async move {
+                    let n = counter.get() + 1;
+                    counter.set(n);
+                    if n <= 3 {
+                        Err(PRODUCTION_REFUSED.to_string())
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, Ok(7));
+        assert_eq!(calls.get(), 4, "three refused attempts then success");
+    }
+
+    /// Deadline exhaustion fails with the attempt history AND the last
+    /// underlying error — the production fire-drill was misdiagnosed as a
+    /// first-dial death precisely because the old message carried neither.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_exhaustion_reports_attempt_history() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = calls.clone();
+        let result: Result<u32, String> = dial_until_deadline(
+            test_addr(),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+            move || {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Err(PRODUCTION_REFUSED.to_string())
+                }
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            calls.get() > 1,
+            "must have retried before the deadline (attempts: {})",
+            calls.get()
+        );
+        assert!(
+            err.contains(&format!("({} attempts", calls.get())),
+            "error must carry the attempt count: {err}"
+        );
+        assert!(
+            err.contains("last error: IO error: Connection refused (os error 111)"),
+            "error must carry the last underlying error: {err}"
+        );
+        assert!(
+            err.contains("127.0.0.1:1") && err.contains("after 10s"),
+            "error must carry the target and the elapsed budget: {err}"
+        );
+    }
+
+    /// A non-refused-class error (auth/protocol) fails fast with the
+    /// original error — retrying cannot fix it and would bury the cause
+    /// for the whole dial budget.
+    #[tokio::test]
+    async fn non_transient_error_fails_fast() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = calls.clone();
+        let result: Result<u32, String> = dial_until_deadline(
+            test_addr(),
+            Duration::from_secs(600),
+            Duration::from_secs(1),
+            move || {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Err("WebSocket protocol error: Handshake not finished".to_string())
+                }
+            },
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(calls.get(), 1, "must not retry a non-transient error");
+        assert!(
+            err.contains("WebSocket protocol error: Handshake not finished")
+                && err.contains("not retrying"),
+            "fail-fast error must carry the original error verbatim: {err}"
+        );
+    }
+
+    /// Wire-shape mirror: a REAL refused dial through the REAL backend
+    /// (`connect_wss_only` against a port nothing listens on) produces an
+    /// error the classifier recognises as transient. Pins the cross-crate
+    /// Display shape the string classifier depends on.
+    #[tokio::test]
+    async fn real_refused_dial_error_is_classified_transient() {
+        // Reserve a port, then free it so nothing listens there.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+        let err = NetworkClient::<RunnerIdentifier>::connect_wss_only(addr)
+            .await
+            .err()
+            .expect("dialing a port with no listener must fail");
+        assert!(
+            is_transient_dial_error(&err),
+            "real refused error not classified transient: {err}"
+        );
+    }
+
+    /// End-to-end through the real backend: a dial racing a listener that
+    /// only appears after several refused attempts connects before the
+    /// deadline (the production tunnel race, replayed).
+    #[tokio::test]
+    async fn connects_when_listener_appears_within_deadline() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = probe.local_addr().unwrap();
+                drop(probe);
+                // The "submitter": brings the listener up only after the
+                // secondary has already started dialing.
+                let server = tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let listener = dynrunner_transport_quic::WssListener::bind(addr)
+                        .await
+                        .expect("test listener bind");
+                    let _conn = listener.accept().await.expect("test accept");
+                });
+                let client = dial_until_deadline(
+                    addr,
+                    Duration::from_secs(30),
+                    Duration::from_millis(50),
+                    || NetworkClient::<RunnerIdentifier>::connect_wss_only(addr),
+                )
+                .await;
+                assert!(
+                    client.is_ok(),
+                    "dial must succeed once the listener appears: {:?}",
+                    client.err()
+                );
+                server.await.expect("server task");
+            })
+            .await;
+    }
+}
