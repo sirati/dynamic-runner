@@ -43,27 +43,65 @@ pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resour
 pub(in crate::secondary) const DEFAULT_DELIVERY_ACK_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(15);
 
-/// How many timed-out-and-replayed sends of ONE confirmable report
-/// before the drain escalates the per-attempt WARN to a
-/// PERMANENT-failure ERROR (#366) — and re-escalates on every further
-/// multiple.
+/// How many replays of ONE confirmable report before the drain
+/// escalates the per-attempt WARN to a PERMANENT-failure ERROR (#366) —
+/// and re-escalates on every further multiple.
 ///
-/// 8 attempts × the 15s default ack timeout ≈ 2 minutes of continuous
-/// non-delivery: far past any transient blip the replay loop exists to
-/// ride out (one mesh redial cycle, an election round), yet quick
-/// enough that an operator watching a wedging phase barrier gets the
-/// "this report is never going to make it" line while the run is still
-/// inspectable. The canonical permanent cause is a frame over the mesh
-/// wire limit — dropped LOUDLY at the transport egress gate
+/// 8 replay attempts on the capped exponential schedule
+/// ([`replay_backoff_delay`]: 15s → 30s → 60s-capped) ≈ 5–6 minutes of
+/// continuous non-delivery: far past any transient blip the replay
+/// loop exists to ride out (one mesh redial cycle, an election round),
+/// yet quick enough that an operator watching a wedging phase barrier
+/// gets the "this report is never going to make it" line while the run
+/// is still inspectable. The canonical permanent cause is a frame over
+/// the mesh wire limit — dropped LOUDLY at the transport egress gate
 /// (`dynrunner-transport-quic::framing`) but undeliverable forever, so
 /// without this tally its replay churn would look like an ordinary
-/// outage WARN every 15s.
+/// outage WARN every backoff slot.
 pub(in crate::secondary) const REPORT_REPLAY_ESCALATION_ATTEMPTS: u32 = 8;
+
+/// Ceiling on the per-report exponential replay backoff
+/// ([`replay_backoff_delay`]). An unACKed report keeps retrying forever
+/// (delivery is an obligation), but never more often than once per cap
+/// once the schedule has grown past it — frequent enough that a
+/// restored-but-unnoticed route re-delivers within a minute, sparse
+/// enough that a permanently-dead route costs one frame (and at most a
+/// couple of log lines) per minute instead of one per loop tick (the
+/// ~61/s production replay flood this cap exists to prevent).
+pub(in crate::secondary) const REPORT_REPLAY_BACKOFF_CAP: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Aggregation window for the drain's "re-sent" INFO line: re-send
+/// activity is tallied and emitted at most once per window (with the
+/// suppressed count and the oldest entry's unACKed age), never one line
+/// per drain pass — the production flood logged that line 19,437 times
+/// in ~5 minutes (~97% of the secondary's log) while a leg was
+/// blackholed.
+pub(in crate::secondary) const REPORT_REPLAY_LOG_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+/// The per-report replay schedule: how long after its `attempts`-th
+/// replay a still-unACKed report waits for the next one. Doubles from
+/// `ack_timeout` (`ack_timeout` → 2× → 4× …) and saturates at
+/// [`REPORT_REPLAY_BACKOFF_CAP`]; overflow-safe for unbounded attempt
+/// counts (the loop retries forever by design).
+pub(in crate::secondary) fn replay_backoff_delay(
+    ack_timeout: std::time::Duration,
+    attempts: u32,
+) -> std::time::Duration {
+    let factor = 1u32
+        .checked_shl(attempts.saturating_sub(1))
+        .unwrap_or(u32::MAX);
+    ack_timeout
+        .saturating_mul(factor)
+        .min(REPORT_REPLAY_BACKOFF_CAP)
+}
 
 /// One retained CONFIRMABLE report — a terminal-bearing report, or an
 /// IMPORTANT custom message (F5) — in the buffered-report-replay queue,
-/// tagged with WHY it is retained (the retention reason decides when
-/// the next drain re-sends it).
+/// tagged with WHY it is retained plus its OWN replay schedule (the
+/// entry is the single owner of when it may next be re-sent — the
+/// drain merely executes whatever is due).
 #[derive(Debug)]
 pub(in crate::secondary) struct RetainedReport<I> {
     /// The retained frame, `delivery_seq`-stamped at first send. Every
@@ -72,37 +110,57 @@ pub(in crate::secondary) struct RetainedReport<I> {
     /// terminal idempotence makes any duplicate landing a no-op).
     pub(in crate::secondary) frame: DistributedMessage<I>,
     pub(in crate::secondary) state: RetainedSendState,
+    /// How many times the drain has REPLAYED this entry (the first send
+    /// at the chokepoint is not a replay). Drives the exponential
+    /// backoff ([`replay_backoff_delay`]) and the permanent-failure
+    /// escalation ([`REPORT_REPLAY_ESCALATION_ATTEMPTS`], #366). Lives
+    /// here — not in a side table — because the entry is updated in
+    /// place across replays, so the entry itself is the sticky
+    /// identity.
+    pub(in crate::secondary) attempts: u32,
+    /// The earliest instant the next drain may re-send this entry — the
+    /// per-report backoff schedule state. A fresh no-route retention is
+    /// due immediately (`now`); a sent-awaiting-ack retention is due
+    /// one `delivery_ack_timeout` after the send; each replay pushes it
+    /// out by [`replay_backoff_delay`]. The operational loop's replay
+    /// wake arm parks on the buffer-wide minimum of this field
+    /// ([`SecondaryCoordinator::next_report_replay_due`]) — a
+    /// PERSISTENT deadline (stored here, never derived from "now +
+    /// interval" at the arm), so sibling select arms firing cannot
+    /// push it back.
+    pub(in crate::secondary) next_due: std::time::Instant,
+    /// When this report was FIRST retained — the entry's unACKed age
+    /// anchor for the aggregated drain log ("oldest unACKed Xs").
+    /// Never touched by replays.
+    pub(in crate::secondary) first_retained_at: std::time::Instant,
 }
 
-/// Why a confirmable report is retained in the replay buffer.
+/// Why a confirmable report is retained in the replay buffer. WHEN it
+/// is re-sent is the entry's own schedule
+/// ([`RetainedReport::next_due`]); the reason only classifies the
+/// retention for logging (the AwaitingAck → past-deadline WARN is the
+/// blackholed-leg honesty signal #352 exists for).
 #[derive(Debug)]
 pub(in crate::secondary) enum RetainedSendState {
     /// The send was ABSORBED on a no-route (the pre-#352 retention
-    /// reason): nothing was queued toward the primary, so the frame is
-    /// due for re-send on EVERY drain trigger.
+    /// reason): nothing was queued toward the primary. Retained with a
+    /// due-NOW schedule slot (the next drain retries immediately, then
+    /// backs off).
     NoRoute,
     /// The send returned `Ok` — queued toward a route the membership
     /// view calls live — but the primary's app-level `TerminalAck` has
     /// not yet landed (#352). `Ok` proves nothing about DELIVERY on a
     /// blackholed-but-live QUIC leg, so the frame stays retained; an
-    /// ack drops it, and `sent_at` aging past the ack timeout makes it
-    /// no-route-equivalent (due for replay).
+    /// ack drops it, and the schedule slot (`next_due`, one ack window
+    /// after `sent_at`) makes the drain treat it as no-route-equivalent
+    /// (replay, same seq).
     AwaitingAck { sent_at: std::time::Instant },
 }
 
 impl RetainedSendState {
-    /// Is this retained frame due for a re-send at this drain?
-    /// `NoRoute` is always due; `AwaitingAck` becomes due once the ack
-    /// deadline has elapsed (the blackholed-leg detection edge).
-    fn due_for_resend(&self, ack_timeout: std::time::Duration) -> bool {
-        match self {
-            Self::NoRoute => true,
-            Self::AwaitingAck { sent_at } => sent_at.elapsed() >= ack_timeout,
-        }
-    }
-
-    /// Test-visible state predicate (the production drain reads
-    /// `due_for_resend`; tests assert on the retention reason itself).
+    /// Test-visible state predicate (the production drain keys due-ness
+    /// on the entry's `next_due`; tests assert on the retention reason
+    /// itself).
     #[cfg(test)]
     pub(in crate::secondary) fn is_awaiting_ack(&self) -> bool {
         matches!(self, Self::AwaitingAck { .. })
@@ -290,33 +348,9 @@ where
         };
         let result = self.send_to(Destination::Primary, msg).await;
         if let Err(ref e) = result {
-            // No route to the primary — feed the failover-health
-            // probe. `record_recv_failure` anchors the failure window
-            // on the first breach and returns true once the count- or
-            // time-axis threshold is crossed.
-            let armed = self.op_mut().primary_link.record_recv_failure();
-            if armed {
-                tracing::warn!(
-                    error = %e,
-                    "no route to primary (resolved primary peer unreachable / no primary \
-                     resolvable); failover-health threshold breached — arming election"
-                );
-                let backdate = self
-                    .config
-                    .keepalive_interval
-                    .saturating_mul(self.config.keepalive_miss_threshold + 1);
-                self.op_mut().primary_last_seen = Some(
-                    std::time::Instant::now()
-                        .checked_sub(backdate)
-                        .unwrap_or_else(std::time::Instant::now),
-                );
-            } else {
-                tracing::debug!(
-                    error = %e,
-                    "no route to primary; recording failover-health probe \
-                     (threshold not yet breached)"
-                );
-            }
+            // No route to the primary — feed the failover-health probe
+            // (shared with the replay drain's re-send edge).
+            self.note_primary_no_route(e);
             // FAILOVER-B: a no-route is NOT a run-fatal error — it is a
             // failover SIGNAL, fully recorded above into the primary-link
             // health window. Returning the no-route `Err` here would
@@ -340,10 +374,12 @@ where
             // must-not-lose payload, contractually delivered
             // at-least-once. So when the absorbed send was confirmable we
             // RETAIN the frame in the reporting concern's replay buffer
-            // instead of dropping it; the next drain (loop tick /
-            // primary-link recovery edge) re-sends it FIFO, retrying
-            // forever until delivered — including to a NEW primary after
-            // failover, since `send_to_primary` re-resolves
+            // instead of dropping it; the next drain (the loop's replay
+            // wake arm — due immediately for a fresh no-route retention,
+            // then per-entry backoff — or the primary-link recovery
+            // edge) re-sends it FIFO, retrying forever until delivered
+            // — including to a NEW primary after failover, since the
+            // drain's egress re-resolves
             // `Destination::Primary` to the current holder at the egress
             // edge. The authority is idempotent on a duplicate landing
             // (hash-keyed `completed_tasks`/`failed_tasks` dedup;
@@ -372,11 +408,17 @@ where
             // primary-bound send class, should one ever exist.
             if let Some(retained) = replay_copy {
                 // RETAIN the confirmable report FIFO (push at the back
-                // so the buffer stays in arrival order; a re-absorbed drain
-                // re-appends at the back, never reorders).
+                // so the buffer stays in arrival order; the drain
+                // updates entries in place, never reorders). Due NOW:
+                // nothing was queued, so the next drain trigger retries
+                // immediately (then the per-entry backoff takes over).
+                let now = std::time::Instant::now();
                 self.pending_report_replays.push(RetainedReport {
                     frame: retained,
                     state: RetainedSendState::NoRoute,
+                    attempts: 0,
+                    next_due: now,
+                    first_retained_at: now,
                 });
                 let buffered = self.pending_report_replays.len();
                 tracing::warn!(
@@ -412,11 +454,16 @@ where
         // same seq). NO failover-health input is touched on this path —
         // the ack is delivery bookkeeping, not liveness.
         if let Some(retained) = replay_copy {
+            let now = std::time::Instant::now();
             self.pending_report_replays.push(RetainedReport {
                 frame: retained,
-                state: RetainedSendState::AwaitingAck {
-                    sent_at: std::time::Instant::now(),
-                },
+                state: RetainedSendState::AwaitingAck { sent_at: now },
+                attempts: 0,
+                // Due one ack window from the send: an ack landing
+                // inside it drops the entry; aging past it makes the
+                // drain treat the send as no-route-equivalent (#352).
+                next_due: now + self.delivery_ack_timeout,
+                first_retained_at: now,
             });
             tracing::debug!(
                 msg_kind = ?msg_kind,
@@ -428,6 +475,39 @@ where
             );
         }
         result
+    }
+
+    /// Feed one no-route-to-primary observation into the
+    /// failover-health probe — the single owner of the
+    /// `record_recv_failure` + backdate reaction, shared by the
+    /// first-send chokepoint ([`Self::send_to_primary`]) and the replay
+    /// drain's re-send edge. `record_recv_failure` anchors the failure
+    /// window on the first breach and returns true once the count- or
+    /// time-axis threshold is crossed.
+    fn note_primary_no_route(&mut self, e: &str) {
+        let armed = self.op_mut().primary_link.record_recv_failure();
+        if armed {
+            tracing::warn!(
+                error = %e,
+                "no route to primary (resolved primary peer unreachable / no primary \
+                 resolvable); failover-health threshold breached — arming election"
+            );
+            let backdate = self
+                .config
+                .keepalive_interval
+                .saturating_mul(self.config.keepalive_miss_threshold + 1);
+            self.op_mut().primary_last_seen = Some(
+                std::time::Instant::now()
+                    .checked_sub(backdate)
+                    .unwrap_or_else(std::time::Instant::now),
+            );
+        } else {
+            tracing::debug!(
+                error = %e,
+                "no route to primary; recording failover-health probe \
+                 (threshold not yet breached)"
+            );
+        }
     }
 
     /// Drop the retained confirmable report whose `delivery_seq` the
@@ -445,11 +525,11 @@ where
     /// written here.
     pub(in crate::secondary) fn ack_delivery(&mut self, seq: u64) {
         let before = self.pending_report_replays.len();
+        // Dropping the entry also drops its replay-attempt tally and
+        // its backoff schedule — both live ON the entry, so a confirmed
+        // delivery leaves no side state behind.
         self.pending_report_replays
             .retain(|entry| entry.frame.delivery_seq() != Some(seq));
-        // Delivery confirmed: clear the permanent-failure tally (#366)
-        // so the map only ever holds still-undelivered seqs.
-        self.report_replay_attempts.remove(&seq);
         if self.pending_report_replays.len() < before {
             tracing::debug!(
                 seq,
@@ -470,111 +550,211 @@ where
     /// retained confirmable report FIFO, retrying forever until the
     /// primary's app-level [`DistributedMessage::TerminalAck`] confirms
     /// delivery ([`Self::ack_delivery`] is the only drop site).
+    /// Returns the number of reports re-sent (the test observable for
+    /// the replay-flood bound).
     ///
     /// The reporting concern's RE-DELIVERY edge. Due-ness is the
-    /// retention reason's call ([`RetainedSendState::due_for_resend`]):
-    ///   - `NoRoute` (absorbed, nothing ever queued): due on EVERY drain
-    ///     trigger — the pre-#352 behaviour.
-    ///   - `AwaitingAck` (sent, unconfirmed): due once `sent_at` ages
-    ///     past the ack timeout — the blackholed-but-live-leg detection
-    ///     (#352): the transport said `Ok` but the authority never
-    ///     answered, so the send is treated as no-route-equivalent and
-    ///     replayed. A not-yet-due entry is kept untouched (the common
-    ///     just-sent case — the ack is still in flight).
+    /// entry's OWN schedule ([`RetainedReport::next_due`]): a fresh
+    /// no-route retention is due immediately, a sent-awaiting-ack
+    /// retention one ack window after its send (the
+    /// blackholed-but-live-leg detection, #352), and every replay
+    /// pushes the entry's next slot out on the capped exponential
+    /// backoff ([`replay_backoff_delay`]: `ack_timeout` → 2× → 4× …
+    /// capped). The schedule is what bounds the replay rate when the
+    /// ack can never come — pre-backoff a `NoRoute` entry was due on
+    /// EVERY drain trigger and a blackholed secondary re-sent the same
+    /// seq at operational-loop speed (~61/s, the production replay
+    /// flood).
     ///
-    /// A due frame is re-sent through the SAME `send_to_primary`
-    /// chokepoint, so it re-resolves `Destination::Primary` to whoever
-    /// holds the role NOW (a NEW primary after failover routes
-    /// automatically) and carries the SAME `delivery_seq` (the stamp is
-    /// sticky); the chokepoint re-retains it with its fresh post-send
-    /// state (`AwaitingAck` with a reset `sent_at` on Ok, `NoRoute` on a
-    /// re-absorb). Never dropped here, never reordered: the WHOLE buffer
-    /// is taken (`std::mem::take`) and every entry — kept or re-sent —
-    /// re-appends to the now-empty live buffer in iteration order.
-    /// Duplicate landings at the authority are safe (hash-keyed terminal
-    /// idempotence; the primary re-acks every landing).
+    /// A due frame is re-sent through [`Self::send_to`] directly (NOT
+    /// `send_to_primary` — the chokepoint would retain a SECOND entry;
+    /// this drain owns the one existing entry and updates it in place),
+    /// still re-resolving `Destination::Primary` to whoever holds the
+    /// role NOW (a NEW primary after failover routes automatically) and
+    /// carrying the SAME `delivery_seq` (the stamp is sticky — the
+    /// idempotency-key contract). A failed re-send feeds the
+    /// failover-health probe exactly as a first send does
+    /// ([`Self::note_primary_no_route`]). One seq is re-sent at most
+    /// ONCE per pass (coalescing — a defensive duplicate entry waits
+    /// for the next pass). Never dropped here, never reordered: the
+    /// WHOLE buffer is taken (`std::mem::take`) and every entry — kept
+    /// or re-sent — re-appends to the now-empty live buffer in
+    /// iteration order. Duplicate landings at the authority are safe
+    /// (hash-keyed terminal idempotence; the primary re-acks every
+    /// landing).
     ///
-    /// Called from the two re-delivery triggers (the operational loop
-    /// tick and the `record_primary_message` primary-link-recovery
-    /// edge). A no-op when the buffer is empty (the steady-state hot
-    /// path), and silent when nothing is due (entries merely awaiting a
-    /// fresh ack).
-    pub(in crate::secondary) async fn drain_report_replays(&mut self) {
+    /// Called from the two re-delivery triggers: the operational loop's
+    /// replay wake arm (parked on [`Self::next_report_replay_due`] —
+    /// fires only when an entry is due, never per tick) and the
+    /// `record_primary_message` primary-link-recovery edge (via
+    /// [`Self::drain_report_replays_now`], which overrides the schedule
+    /// for a prompt route-restored retry). A no-op when the buffer is
+    /// empty (the steady-state hot path), and silent when nothing is
+    /// due.
+    pub(in crate::secondary) async fn drain_report_replays(&mut self) -> usize {
+        self.drain_report_replays_inner(false).await
+    }
+
+    /// Schedule-overriding drain for the ROUTE-RESTORED edge: re-send
+    /// every retained report NOW instead of waiting out its backoff
+    /// slot. Called from the `record_primary_message` primary-link-
+    /// recovery edge — the route to the primary just provably came
+    /// back, so a retained report sitting deep inside a (possibly
+    /// 60s-capped) slot must not wait it out. Each re-send still
+    /// advances the entry's schedule, so a recovery edge that lied
+    /// (route immediately gone again) degrades back to the backoff
+    /// cadence, not a flood.
+    pub(in crate::secondary) async fn drain_report_replays_now(&mut self) -> usize {
+        self.drain_report_replays_inner(true).await
+    }
+
+    /// The operational loop's replay wake deadline: the EARLIEST
+    /// `next_due` across the retained entries, `None` when the buffer
+    /// is empty (the wake arm parks). The deadline is PERSISTENT state
+    /// (stored on the entries), so the arm re-creating its
+    /// `sleep_until` future every loop iteration always re-targets the
+    /// same instant — sibling arms firing cannot push it back
+    /// (watchdog-fires-under-load law).
+    pub(in crate::secondary) fn next_report_replay_due(&self) -> Option<std::time::Instant> {
+        self.pending_report_replays
+            .iter()
+            .map(|entry| entry.next_due)
+            .min()
+    }
+
+    async fn drain_report_replays_inner(&mut self, force_due: bool) -> usize {
         if self.pending_report_replays.is_empty() {
-            return;
+            return 0;
         }
         // Take the whole buffer; every entry re-appends to the now-empty
-        // live buffer in iteration order (kept directly, or via the
-        // re-send's retain), preserving FIFO order across drains.
+        // live buffer in iteration order (kept or re-sent), preserving
+        // FIFO order across drains.
         let pending = std::mem::take(&mut self.pending_report_replays);
         let ack_timeout = self.delivery_ack_timeout;
+        let now = std::time::Instant::now();
         let mut resent = 0usize;
-        for entry in pending {
-            if !entry.state.due_for_resend(ack_timeout) {
-                // Sent and still inside the ack window: keep waiting.
+        // Coalescing: one in-flight replay per seq per pass. After a
+        // long outage many entries become due at once — each distinct
+        // seq goes out once; a duplicate of an already-sent seq keeps
+        // its (overdue) slot and rides the next pass.
+        let mut sent_seqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for mut entry in pending {
+            let seq = entry.frame.delivery_seq();
+            let due = force_due || now >= entry.next_due;
+            let coalesced = seq.is_some_and(|s| sent_seqs.contains(&s));
+            if !due || coalesced {
+                // Inside its backoff slot (the common just-sent case —
+                // the ack may still be in flight), or its seq already
+                // went out this pass: keep waiting.
                 self.pending_report_replays.push(entry);
                 continue;
             }
-            resent += 1;
             let task_hash = entry.frame.task_hash().map(str::to_owned);
-            let seq = entry.frame.delivery_seq();
-            if matches!(entry.state, RetainedSendState::AwaitingAck { .. }) {
+            if let RetainedSendState::AwaitingAck { sent_at } = entry.state
+                && now.duration_since(sent_at) >= ack_timeout
+            {
                 // The blackhole detection edge firing: the transport
                 // accepted the send but no ack came back within the
                 // window — surface it, this is the honesty signal #352
-                // exists for.
+                // exists for. Bounded per entry by the backoff
+                // schedule, never per drain pass.
                 tracing::warn!(
                     task_hash = ?task_hash,
                     delivery_seq = ?seq,
+                    attempts = entry.attempts,
+                    unacked_for_secs = now.duration_since(sent_at).as_secs_f64(),
                     ack_timeout_secs = ack_timeout.as_secs_f64(),
                     "confirmable report sent but UNACKED past the ack timeout \
                      (possible blackholed-but-live leg); treating as \
                      no-route-equivalent and replaying with the same seq"
                 );
-                // Permanent-failure escalation (#366): tally the
-                // timed-out replays per seq (the entry itself is
-                // recreated by the re-send's re-retention, so the seq
-                // is the sticky identity) and escalate to ERROR at the
-                // threshold + every further multiple. The NoRoute
-                // retention reason is deliberately NOT tallied: it
-                // re-sends on EVERY drain trigger (loop-tick cadence)
-                // and its absorb site already WARNs per occurrence.
-                if let Some(seq) = seq {
-                    let attempts = self.report_replay_attempts.entry(seq).or_insert(0);
-                    *attempts += 1;
-                    if *attempts >= REPORT_REPLAY_ESCALATION_ATTEMPTS
-                        && attempts.is_multiple_of(REPORT_REPLAY_ESCALATION_ATTEMPTS)
-                    {
-                        tracing::error!(
-                            task_hash = ?task_hash,
-                            delivery_seq = seq,
-                            attempts = *attempts,
-                            "confirmable report has been replayed {attempts} times \
-                             without an ack — PERMANENT delivery failure \
-                             suspected. Likely causes: the frame exceeds the \
-                             mesh wire limit (look for 'dropping outbound mesh \
-                             frame' ERRORs from the transport egress gate) or \
-                             the primary link is persistently blackholed. The \
-                             task stays unresolved at the authority until this \
-                             report lands"
-                        );
-                    }
-                }
             }
-            // `send_to_primary` absorbs a no-route into `Ok(())` and
-            // re-retains the frame either way (`NoRoute` on re-absorb —
-            // already WARNed at the absorb site — or a fresh
-            // `AwaitingAck` on a successful re-send), so this never
-            // errors and never loses the frame.
-            let _ = self.send_to_primary(entry.frame).await;
+            // Advance the entry's schedule BEFORE the send: the replay
+            // is attempt N regardless of its outcome, and a failed send
+            // must consume the slot too (a permanently-dead route backs
+            // off instead of flooding).
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.next_due = now + replay_backoff_delay(ack_timeout, entry.attempts);
+            // Permanent-failure escalation (#366): the per-entry tally
+            // crossing the threshold (and every further multiple)
+            // escalates to ERROR naming the task and the likely causes.
+            if entry.attempts >= REPORT_REPLAY_ESCALATION_ATTEMPTS
+                && entry.attempts.is_multiple_of(REPORT_REPLAY_ESCALATION_ATTEMPTS)
+            {
+                tracing::error!(
+                    task_hash = ?task_hash,
+                    delivery_seq = ?seq,
+                    attempts = entry.attempts,
+                    "confirmable report has been replayed {} times \
+                     without an ack — PERMANENT delivery failure \
+                     suspected. Likely causes: the frame exceeds the \
+                     mesh wire limit (look for 'dropping outbound mesh \
+                     frame' ERRORs from the transport egress gate) or \
+                     the primary link is persistently blackholed. The \
+                     task stays unresolved at the authority until this \
+                     report lands",
+                    entry.attempts
+                );
+            }
+            // Re-send through the egress edge with the SAME stamped
+            // frame (same seq — never re-stamp). `Destination::Primary`
+            // re-resolves to the CURRENT holder.
+            entry.state = match self.send_to(Destination::Primary, entry.frame.clone()).await {
+                Ok(()) => RetainedSendState::AwaitingAck { sent_at: now },
+                Err(e) => {
+                    // Still no route: feed the failover-health probe
+                    // (same as a first send) and keep the NoRoute
+                    // classification; the advanced schedule above is
+                    // what keeps this from flooding.
+                    self.note_primary_no_route(&e);
+                    RetainedSendState::NoRoute
+                }
+            };
+            if let Some(s) = seq {
+                sent_seqs.insert(s);
+            }
+            resent += 1;
+            self.pending_report_replays.push(entry);
         }
         if resent > 0 {
-            tracing::info!(
-                resent,
-                buffered = self.pending_report_replays.len(),
-                "buffered-report-replay drain re-sent due confirmable reports"
-            );
+            self.note_replays_for_log(resent, now);
         }
+        resent
+    }
+
+    /// Aggregated, rate-limited drain log: tally re-sends and emit at
+    /// most one INFO per [`REPORT_REPLAY_LOG_WINDOW`] carrying the
+    /// suppressed total and the oldest entry's unACKed age — never one
+    /// line per drain pass (the production flood logged 19,437 of the
+    /// per-pass line in ~5 minutes). A tally accumulated inside a
+    /// closed window rides along until the next re-send after the
+    /// window opens (replays only stop on ack/route-recovery, at which
+    /// point there is nothing left worth logging).
+    fn note_replays_for_log(&mut self, resent: usize, now: std::time::Instant) {
+        self.replay_log_suppressed += resent;
+        let window_open = self
+            .replay_log_last_emit
+            .is_none_or(|last| now.duration_since(last) >= REPORT_REPLAY_LOG_WINDOW);
+        if !window_open {
+            return;
+        }
+        let oldest_unacked_secs = self
+            .pending_report_replays
+            .iter()
+            .map(|entry| now.duration_since(entry.first_retained_at))
+            .max()
+            .unwrap_or_default()
+            .as_secs_f64();
+        tracing::info!(
+            resent = self.replay_log_suppressed,
+            buffered = self.pending_report_replays.len(),
+            oldest_unacked_secs,
+            window_secs = REPORT_REPLAY_LOG_WINDOW.as_secs(),
+            "buffered-report-replay drain re-sent confirmable reports \
+             (aggregated over the rate-limit window)"
+        );
+        self.replay_log_last_emit = Some(now);
+        self.replay_log_suppressed = 0;
     }
 
     /// Report a respawn-HOLD-deferred task whose worker died before it
