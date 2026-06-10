@@ -70,7 +70,7 @@ async fn dial_failure_summary_fires_at_threshold_with_addr() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
             // Register the unreachable peer's dial info, but never
             // connect it — so every reconnect tick observes it as
             // disconnected and re-dials (which fails silently against
@@ -142,7 +142,7 @@ async fn dial_failure_summary_not_emitted_when_peer_connects() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
             let info = unreachable_peer_info();
             let peer_id = info.secondary_id.clone();
             peer_a.peer_dial_info.insert(peer_id.clone(), info);

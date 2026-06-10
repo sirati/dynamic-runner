@@ -18,8 +18,8 @@ async fn two_peers_exchange_messages() {
     local
         .run_until(async {
             // Start two peer networks
-            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
-            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b").await.unwrap();
+            let mut peer_a: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
+            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
 
             let port_a = peer_a.port();
             let port_b = peer_b.port();
@@ -101,8 +101,8 @@ async fn higher_id_does_not_dial_lower_id() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer_low: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
-            let mut peer_high: PeerNetwork<TestId> = PeerNetwork::start("peer-b").await.unwrap();
+            let mut peer_low: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
+            let mut peer_high: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
             let port_low = peer_low.port();
             let port_high = peer_high.port();
             let cert_low = peer_low.cert_pem().to_string();

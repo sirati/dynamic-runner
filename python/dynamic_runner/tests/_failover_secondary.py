@@ -54,6 +54,9 @@ def main() -> None:
         secondary_id=args.secondary_id,
         num_workers=2,
         max_resources=_rs.ResourceMap({"memory": 1 * 1024 * 1024 * 1024}),
+        # Mirrors `run._dispatch_secondary`: 0 (the local-spawn value)
+        # collapses to None = OS-picked ephemeral mesh bind.
+        quic_bind_port=(args.secondary_quic_port or None),
     )
 
     from . import _failover_stub_worker

@@ -143,7 +143,7 @@ async fn dropped_bootstrap_wire_is_redialed_and_refolded() {
                 .expect("bind test WSS listener");
             let addr: SocketAddr = listener.local_addr();
 
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("sec-0", None).await.unwrap();
 
             // ---- Initial fold ----
             // Dial and accept CONCURRENTLY: the WSS handshake the client

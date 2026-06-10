@@ -88,6 +88,12 @@ pub(crate) fn run_secondary<'py>(
     // SecondaryCoordinator resolves the actual output directory at
     // run start (via the `/app/out-network` bind-mount probe).
     kwargs.set_item("memprofile_enabled", config.memprofile_enabled)?;
+    // The wrapper-pre-allocated mesh bind port (QUIC UDP + WSS TCP).
+    // None means "OS-picked ephemeral" — omit the kwarg and let the
+    // constructor default apply, mirroring the other optional opt-ins.
+    if let Some(port) = config.quic_bind_port {
+        kwargs.set_item("quic_bind_port", port)?;
+    }
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }

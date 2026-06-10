@@ -505,7 +505,7 @@ async fn stand_up_burst_fleet(
     }
     let mut networks: Vec<(String, PeerNetwork<TestId>)> = Vec::new();
     for id in &ids {
-        let net = PeerNetwork::<TestId>::start(id)
+        let net = PeerNetwork::<TestId>::start(id, None)
             .await
             .expect("peer network start");
         networks.push((id.clone(), net));

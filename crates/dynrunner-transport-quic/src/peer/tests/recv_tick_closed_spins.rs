@@ -76,7 +76,7 @@ const ITEMS: usize = 50_000;
 /// moved-in tick-task sender leaves behind when that task ends, so
 /// `reconnect_tick_rx.recv()` resolves `None` immediately and forever.
 async fn items_drained_under_recv_peer(close_tick: bool) -> usize {
-    let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+    let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
 
     if close_tick {
         let (tick_tx, tick_rx) = mpsc::unbounded_channel::<()>();
@@ -162,7 +162,7 @@ async fn drained_and_warns_with_closed_tick() -> (usize, usize) {
     // function exit.
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a").await.unwrap();
+    let mut peer: PeerNetwork<TestId> = PeerNetwork::start("peer-a", None).await.unwrap();
 
     // Close the tick channel: replace the receiver with one whose sole sender
     // is dropped — the exact state the moved-in tick-task sender leaves when

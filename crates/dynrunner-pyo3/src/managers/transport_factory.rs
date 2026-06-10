@@ -152,6 +152,15 @@ pub(crate) struct SecondaryDialParams<'a> {
     pub ipv4_address: Option<String>,
     /// Detected IPv6 address advertised in the `PeerCertInfo`.
     pub ipv6_address: Option<String>,
+    /// Port this secondary's OWN mesh listeners bind (QUIC UDP + WSS
+    /// TCP, same number — the `PeerNetwork::start` convention). `None`
+    /// keeps the historical OS-picked ephemeral bind. The SLURM wrapper
+    /// pre-allocates this port host-side, records it as `quic_port=` in
+    /// the late-joiner's `connection_info/<id>.info` file, and delivers
+    /// it in-container via `--secondary-quic-port` — so the bind here is
+    /// what makes the recorded port actually dialable (a late-joining
+    /// observer dials exactly this `ip:port`).
+    pub quic_bind_port: Option<u16>,
 }
 
 /// Cap on the bring-up dial's backoff delay. The delay starts at the
@@ -396,6 +405,7 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
         bootstrap_primary_id,
         ipv4_address,
         ipv6_address,
+        quic_bind_port,
     } = params;
     // Per-attempt candidate order: v4 first, loopback family-completed
     // (the dial-side half of the partial-`-R`-bind defense — see
@@ -430,11 +440,15 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
     // QUIC certificate AND the `peer_id` other secondaries pass to
     // quinn's `connect(addr, server_name)` to validate that cert — the
     // primary distributes peer info keyed by `secondary_id` (the logical
-    // id), so the cert CN must match the logical id.
-    let mut transport = PeerNetwork::<I>::start(secondary_id).await.map_err(|e| {
-        tracing::error!(error = %e, "failed to start peer network");
-        format!("peer network start failed: {e}")
-    })?;
+    // id), so the cert CN must match the logical id. `quic_bind_port`
+    // (when the operator/wrapper pre-allocated one) pins BOTH mesh
+    // listeners to the advertised port; `None` keeps the OS-picked bind.
+    let mut transport = PeerNetwork::<I>::start(secondary_id, quic_bind_port)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to start peer network");
+            format!("peer network start failed: {e}")
+        })?;
     let cert_pem = transport.cert_pem().to_string();
     let port = transport.port();
 
@@ -490,7 +504,10 @@ pub(crate) async fn dial_secondary_mesh<I: Identifier>(
 pub(crate) async fn observer_mesh<I: Identifier>(
     observer_id: &str,
 ) -> Result<PeerNetwork<I>, String> {
-    PeerNetwork::<I>::start(observer_id)
+    // Ephemeral bind (`None`): the late-joiner DIALS the recorded
+    // ports of existing peers; nobody dials the late-joiner from a
+    // pre-advertised record, so it has no fixed port to honour.
+    PeerNetwork::<I>::start(observer_id, None)
         .await
         .map_err(|e| format!("failed to start peer network: {e}"))
 }
@@ -897,5 +914,81 @@ mod tests {
             err.contains("127.0.0.1:42655") && err.contains("[::1]:42655"),
             "exhaustion carries the per-candidate failures: {err}"
         );
+    }
+
+    /// Allocate a port free on BOTH protocols (TCP and UDP) — the same
+    /// shape the SLURM wrapper's host-side pre-allocation produces for
+    /// `--secondary-quic-port`. Mirrors the helper in
+    /// `dynrunner-transport-quic`'s `peer/tests/bind_port.rs` (test-only;
+    /// the crates share no test-support crate to host it).
+    fn alloc_dual_free_port() -> u16 {
+        for _ in 0..16 {
+            let tcp = std::net::TcpListener::bind("0.0.0.0:0").expect("probe tcp bind");
+            let port = tcp.local_addr().expect("probe tcp addr").port();
+            if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+                return port;
+            }
+        }
+        panic!("could not find a port free on both TCP and UDP in 16 attempts");
+    }
+
+    /// #355 end-to-end through the factory: `SecondaryDialParams::
+    /// quic_bind_port` threads into `PeerNetwork::start`, so the
+    /// advertised `PeerCertInfo.quic_port` — the SAME number the SLURM
+    /// wrapper recorded as `quic_port=` in the late-joiner's
+    /// connection-info file — is a port the mesh actually LISTENS on: a
+    /// cert-less WSS dial to it connects, which is exactly the
+    /// late-joiner's fallback dial leg. Pre-fix the mesh bound an
+    /// ephemeral port and the recorded one was dead
+    /// (`JoinError::NoReachablePeer`).
+    #[tokio::test]
+    async fn dial_secondary_mesh_binds_the_preallocated_port() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // The "submitter" bootstrap listener the secondary dials.
+                let bootstrap = dynrunner_transport_quic::WssListener::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                )
+                .await
+                .expect("bootstrap bind");
+                let bootstrap_addr = bootstrap.local_addr();
+                tokio::task::spawn_local(async move {
+                    let _conn = bootstrap.accept().await.expect("bootstrap accept");
+                    // Hold the folded wire open for the test's lifetime.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+
+                // Wrapper-style host-side pre-allocation.
+                let mesh_port = alloc_dual_free_port();
+
+                let bundle = dial_secondary_mesh::<RunnerIdentifier>(SecondaryDialParams {
+                    addrs: vec![bootstrap_addr],
+                    connect_timeout: Duration::from_secs(30),
+                    retry_delay: Duration::from_millis(50),
+                    secondary_id: "sec-0",
+                    bootstrap_primary_id: "primary".to_string(),
+                    ipv4_address: Some("127.0.0.1".to_string()),
+                    ipv6_address: None,
+                    quic_bind_port: Some(mesh_port),
+                })
+                .await
+                .expect("dial_secondary_mesh");
+
+                assert_eq!(
+                    bundle.peer_cert_info.quic_port, mesh_port,
+                    "the advertised quic_port must be the pre-allocated one, \
+                     not an ephemeral pick"
+                );
+                // The recorded port is DIALABLE — the late-joiner's
+                // cert-less WSS leg, against the live mesh.
+                let mesh_addr: std::net::SocketAddr =
+                    format!("127.0.0.1:{mesh_port}").parse().unwrap();
+                NetworkClient::<RunnerIdentifier>::connect_wss_only(mesh_addr)
+                    .await
+                    .expect("a WSS dial to the pre-allocated port must connect");
+                drop(bundle);
+            })
+            .await;
     }
 }

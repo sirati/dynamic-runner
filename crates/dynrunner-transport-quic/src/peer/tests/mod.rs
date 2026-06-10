@@ -1,6 +1,9 @@
 //! Tests for the QUIC peer overlay.
 //!
 //! Layout:
+//! - [`bind_port`]: `PeerNetwork::start` bind-port contract (#355) —
+//!   an explicit port pins both listeners (QUIC/UDP + WSS/TCP);
+//!   `None` keeps the OS-picked ephemeral behaviour.
 //! - [`cert_parsing`]: pure PEM→DER bridge tests.
 //! - [`two_peers`]: basic peer exchange + dial tie-break
 //!   (`higher_id_does_not_dial_lower_id`).
@@ -34,6 +37,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct TestId(pub(crate) String);
 
+mod bind_port;
 mod bootstrap_redial;
 mod cert_parsing;
 mod dial_failure_summary;

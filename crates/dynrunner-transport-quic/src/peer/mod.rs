@@ -251,11 +251,26 @@ pub struct PeerNetwork<I: Identifier> {
 
 impl<I: Identifier> PeerNetwork<I> {
     /// Create a new peer network: generate a certificate and start listening.
-    pub async fn start(peer_id: &str) -> Result<Self, String> {
+    ///
+    /// `bind_port` is the numeric port BOTH listeners bind (QUIC on UDP,
+    /// WSS on TCP — the same-numeric-port convention below). `None` (and
+    /// `Some(0)`) keeps the historical behaviour: the OS picks an
+    /// ephemeral port for the QUIC bind and WSS follows it. A concrete
+    /// port exists for deployments where the port was advertised BEFORE
+    /// this network started — e.g. the SLURM wrapper pre-allocates a free
+    /// port host-side, records it in the late-joiner's
+    /// `connection_info/<id>.info` file, and hands it to the in-container
+    /// secondary via `--secondary-quic-port`; binding anything else makes
+    /// the recorded port a dead address for every peer that dials it.
+    pub async fn start(peer_id: &str, bind_port: Option<u16>) -> Result<Self, String> {
         let cert = CertPair::generate(peer_id)?;
 
-        // Bind QUIC (UDP)
-        let quic_listener = QuicListener::bind(&cert).await?;
+        // Bind QUIC (UDP). `bind_port` None → port 0 → the OS picks, which
+        // is exactly what `QuicListener::bind` (the no-port convenience)
+        // does — the None path is unchanged from the historical behaviour.
+        let quic_bind: SocketAddr =
+            (std::net::Ipv4Addr::UNSPECIFIED, bind_port.unwrap_or(0)).into();
+        let quic_listener = QuicListener::bind_addr(&cert, quic_bind).await?;
         let port = quic_listener.port();
 
         // Bind WSS (TCP) on the same port

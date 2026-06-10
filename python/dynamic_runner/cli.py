@@ -368,7 +368,13 @@ def add_framework_arguments(
         "--secondary-quic-port",
         type=non_negative_int,
         default=0,
-        help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
+        help=(
+            "Port this secondary's peer mesh binds (QUIC/UDP and WSS/TCP "
+            "share the number; 0 = let the OS pick, default: 0). The SLURM "
+            "wrapper pre-allocates this port and records it in the "
+            "late-joiner connection-info file, so the mesh must bind "
+            "exactly it for late-joining observers to dial in."
+        ),
     )
     parser.add_argument(
         "--secondary-primary-pubkey-pem",

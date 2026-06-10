@@ -748,6 +748,18 @@ def _dispatch_secondary(task, args, logger) -> None:
         src_tmp=args.src_tmp,
         distributed_config=distributed_config,
         mem_manager_reserved_bytes=mem_manager_reserved_bytes,
+        # `--secondary-quic-port`: the port this secondary's peer mesh
+        # binds (QUIC UDP + WSS TCP, same number). The SLURM wrapper
+        # pre-allocates it host-side, records it as `quic_port=` in the
+        # late-joiner's `connection_info/<id>.info` file, and passes it
+        # in-container via this flag — binding it is what makes the
+        # recorded port dialable. The CLI default `0` ("let the OS
+        # pick") collapses to None = ephemeral, so non-SLURM paths
+        # (e.g. `--multi-computer local`, which always passes 0) keep
+        # the historical behaviour. `getattr` mirrors the other
+        # optional opt-ins for out-of-tree callers driving
+        # `_dispatch_secondary` with a bare Namespace.
+        quic_bind_port=(getattr(args, "secondary_quic_port", 0) or None),
         # `--memprofile` opt-in. The Rust-side
         # `PySecondaryCoordinator::run` resolves the actual output
         # path against the SLURM wrapper's `/app/out-network`

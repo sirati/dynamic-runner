@@ -36,7 +36,7 @@ async fn reader_exit_prunes_connection() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b").await.unwrap();
+            let mut peer_b: PeerNetwork<TestId> = PeerNetwork::start("peer-b", None).await.unwrap();
             let port_b = peer_b.port();
             let cert_b = peer_b.cert_der().clone();
 
@@ -107,7 +107,7 @@ async fn stale_disconnect_does_not_prune_reconnected_entry() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let mut net: PeerNetwork<TestId> = PeerNetwork::start("self").await.unwrap();
+            let mut net: PeerNetwork<TestId> = PeerNetwork::start("self", None).await.unwrap();
 
             // The "old" (dead) connection's writer channel.
             let (old_tx, _old_rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
