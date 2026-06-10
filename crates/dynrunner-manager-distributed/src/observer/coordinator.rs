@@ -67,8 +67,8 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{BoundedString, IMPORTANT_TARGET, Identifier};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, RemovalCause, SendTarget,
-    StateDigest, resolve_destination,
+    ClusterMutation, Destination, DistributedMessage, KeepaliveRole, PeerId, RemovalCause,
+    SendTarget, StateDigest, resolve_destination,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -1035,6 +1035,13 @@ where
             } => {
                 self.on_state_digest(&sender_id, &digest).await;
             }
+            DistributedMessage::RequestClusterSnapshot {
+                sender_id,
+                is_observer,
+                ..
+            } => {
+                self.answer_snapshot_request(&sender_id, is_observer).await;
+            }
             // Every other frame is irrelevant to a zero-authority
             // observer (it owns no dispatch / setup / election concern).
             // Silently ignored — the observer only consumes the
@@ -1149,6 +1156,57 @@ where
                 error = %e,
                 "observer anti-entropy snapshot pull failed; will retry on the next \
                  digest divergence"
+            );
+        }
+    }
+
+    /// Serve a peer's anti-entropy snapshot pull from this observer's
+    /// converged mirror.
+    ///
+    /// READ-ONLY gossip, in-contract for a zero-authority observer: the
+    /// reply is a serialization of the mirror it already holds — no
+    /// mutation is originated (unlike the secondary's responder, NO
+    /// `PeerJoined` is emitted; membership recording stays a compute-role
+    /// concern) and nothing is re-broadcast. Serving is LOAD-BEARING for
+    /// the relocation handoff: after the submitter relocates, this
+    /// observer can be the ONLY replica holding the `PrimaryChanged` fact
+    /// (the live broadcast is one-shot), and its own digest broadcasts
+    /// (`on_anti_entropy_tick`) are what prove behind peers divergent — a
+    /// mute responder would advertise data nobody can pull (the
+    /// run_20260610_185621 leaderless wedge).
+    ///
+    /// The reply destination is typed off the requester's self-declared
+    /// role (the same `is_observer` field the snapshot responders record):
+    /// `Observer(id)` for an observer requester, `Secondary(id)` otherwise.
+    async fn answer_snapshot_request(&mut self, requester: &str, requester_is_observer: bool) {
+        let snapshot = self.cluster_state.snapshot();
+        let snapshot_json = match serde_json::to_string(&snapshot) {
+            Ok(json) => json,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "observer: snapshot serialization failed; cannot answer the pull"
+                );
+                return;
+            }
+        };
+        let reply = DistributedMessage::ClusterSnapshot {
+            target: None,
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            snapshot_json,
+        };
+        let dst = if requester_is_observer {
+            Destination::Observer(PeerId::from(requester.to_string()))
+        } else {
+            Destination::Secondary(PeerId::from(requester.to_string()))
+        };
+        if let Err(e) = self.send_to(dst, reply).await {
+            tracing::warn!(
+                requester = %requester,
+                error = %e,
+                "observer: failed to deliver ClusterSnapshot answer; the \
+                 requester's next digest round retries"
             );
         }
     }

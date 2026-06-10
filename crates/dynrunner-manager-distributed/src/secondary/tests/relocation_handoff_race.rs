@@ -17,13 +17,13 @@
 //! These tests replay that exact sequence over the channel mesh + the
 //! production pump:
 //!
-//! - [`lost_relocation_announcement_heals_via_setup_anti_entropy`]: the
+//! - `lost_relocation_announcement_heals_via_setup_anti_entropy`: the
 //!   CHOSEN secondary (the relocation target) misses the announcement,
 //!   then receives the observer's digest. It must pull the snapshot,
 //!   restore the primary fact naming ITSELF, and fire the
 //!   `PromotionSignal` — from `Configuring`, without ever completing the
 //!   setup trio (the setup peer never sends one).
-//! - [`lost_relocation_announcement_non_chosen_follows_new_primary`]: a
+//! - `lost_relocation_announcement_non_chosen_follows_new_primary`: a
 //!   NON-chosen secondary heals the same way and converges its mirror on
 //!   the new primary (the `bootstrap_redial` re-fold check: the
 //!   placeholder must not stay the resolved primary), WITHOUT firing any
@@ -313,6 +313,55 @@ async fn lost_relocation_announcement_non_chosen_follows_new_primary() {
             );
 
             observer_handle.abort();
+        })
+        .await;
+}
+
+/// The seam itself, pinned at the unit level: a snapshot heal that newly
+/// names THIS node primary fires the SAME `PromotionSignal` the live
+/// `PrimaryChanged` apply fires (`on_primary_identity_advanced` is one
+/// writer for both paths), and a repeated identical restore is a NoOp
+/// (no duplicate signal). A peer-named heal advances the mirror without
+/// any promotion.
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_restore_runs_the_primary_identity_seam() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            use super::super::test_helpers::{election_config, make_secondary_recording};
+
+            // Self-named heal → promotion fires once, idempotent on re-restore.
+            let (mut sec, _log) = make_secondary_recording(election_config("worker-a"), 1);
+            let donor = donor_with_primary("worker-a");
+            let json = serde_json::to_string(&donor.snapshot()).unwrap();
+            assert!(
+                sec.restore_cluster_snapshot_frame(&json),
+                "the heal advances the primary identity"
+            );
+            let sig = sec
+                .promotion_rx
+                .try_recv()
+                .expect("self-named snapshot heal fires the PromotionSignal");
+            assert_eq!(sig.epoch, 1);
+            assert!(
+                !sec.restore_cluster_snapshot_frame(&json),
+                "an identical re-restore is a NoOp"
+            );
+            assert!(
+                sec.promotion_rx.try_recv().is_err(),
+                "no duplicate promotion on the NoOp re-restore"
+            );
+
+            // Peer-named heal → mirror follows, no promotion.
+            let (mut sec_b, _log_b) = make_secondary_recording(election_config("worker-b"), 1);
+            let donor_b = donor_with_primary("worker-a");
+            let json_b = serde_json::to_string(&donor_b.snapshot()).unwrap();
+            assert!(sec_b.restore_cluster_snapshot_frame(&json_b));
+            assert_eq!(sec_b.cluster_state().current_primary(), Some("worker-a"));
+            assert!(
+                sec_b.promotion_rx.try_recv().is_err(),
+                "a peer-named heal must not fire a promotion"
+            );
         })
         .await;
 }
