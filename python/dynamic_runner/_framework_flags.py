@@ -73,10 +73,16 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
 )
 
 
-# Value-less `store_true` framework flags that are SUBMITTER-LOCAL: they
-# steer the submitter process only and must never propagate to a secondary.
-# `--important-stdio-only` arms LLM-wake stdio mode on the submitter; the
-# secondary still gets `--full-log-dir` for its per-role file logs.
+# Value-less `store_true` framework flags that are OPERATOR-STDIO-scoped:
+# they steer the operator-facing stdio and must not ride the GENERIC forward
+# set. `--important-stdio-only` arms LLM-wake stdio mode; whether it reaches
+# a secondary follows the file descriptors, not this set: a SLURM
+# secondary's stdio is a per-node sbatch capture (full logs, no gate), while
+# the `--multi-computer local` spawn path re-emits the flag explicitly
+# (`logging_setup.stdio_mode_argv` via `spawn_secondary`) because its
+# subprocess secondaries INHERIT the operator's stdio. Either way the
+# secondary still gets `--full-log-dir` (SLURM) / the full-log default for
+# its durable record.
 SUBMITTER_LOCAL_FLAGS: frozenset[str] = frozenset(
     {
         IMPORTANT_STDIO_ONLY_FLAG,

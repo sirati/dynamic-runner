@@ -24,11 +24,16 @@ feature are "configure logging for importance mode", so they live together:
     In importance mode the Python console handler is additionally dropped so
     stdio carries only the Rust-emitted important events.
 
-``--important-stdio-only`` is SUBMITTER-LOCAL: it steers the submitter's own
-stdout/log split and is deliberately NOT forwarded to secondaries (see
-:mod:`dynamic_runner._framework_flags`) — secondaries keep their full logs
-for debugging, and post-relocation the operator's narrative comes from the
-observer reading the CRDT.
+``--important-stdio-only`` gates the OPERATOR's stdio, a classification
+that follows the file descriptors, not the role. It is stripped from the
+generic forward set (see :mod:`dynamic_runner._framework_flags`) because a
+SLURM secondary's stdio is a per-node sbatch capture, not the operator's
+terminal — there the secondary keeps its full logs for debugging, and
+post-relocation the operator's narrative comes from the observer reading
+the CRDT. A ``--multi-computer local`` secondary, however, spawns with
+INHERITED stdio: its stdout IS the operator's terminal, so the local spawn
+path re-emits the flag explicitly via :func:`stdio_mode_argv` and the
+secondary installs the same gate through its own :func:`setup_logging`.
 """
 
 from __future__ import annotations
@@ -130,6 +135,34 @@ def resolve_full_log_file(
     if full_log_dir and full_log_dir.strip():
         return None
     return DEFAULT_FULL_LOG_FILE
+
+
+def stdio_mode_argv(args: argparse.Namespace) -> list[str]:
+    """Argv tokens that reproduce THIS process's operator-stdio mode in a
+    child that INHERITS its stdio.
+
+    Single concern: own the answer to "which flags must a stdio-inheriting
+    child re-receive so the operator-facing stdio contract holds across the
+    process boundary?". ``--important-stdio-only`` gates what reaches the
+    OPERATOR's stdio — a property of the file descriptors, not of the role.
+    A SLURM secondary's stdio is a per-node sbatch capture, so the flag must
+    NOT reach it (it keeps its full log); a ``--multi-computer local``
+    secondary spawns with inherited stdio — its stdout IS the operator's
+    terminal — so the gate must ride its argv or the secondary's full INFO
+    stream floods the importance-gated view (the consumer-reported local-mode
+    firehose, 2026-06-10). The child then installs the gate through the SAME
+    :func:`setup_logging`/``init_logging`` seam every mode uses; nothing
+    mode-specific is copied.
+
+    Callers (the local-subprocess argv assembler,
+    :mod:`dynamic_runner.spawn_secondary`) append the returned tokens
+    verbatim and know nothing about flag names or modes. Spawn paths whose
+    children do NOT inherit the operator's stdio (the SLURM wrapper) never
+    call this.
+    """
+    if getattr(args, "important_stdio_only", False):
+        return [IMPORTANT_STDIO_ONLY_FLAG]
+    return []
 
 
 @contextlib.contextmanager

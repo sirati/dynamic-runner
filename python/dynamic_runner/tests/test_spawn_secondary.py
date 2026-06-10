@@ -109,6 +109,52 @@ def _captured_argv(args: argparse.Namespace) -> list[str]:
     return list(spec.argv)
 
 
+class TestSpawnSecondaryStdioModeThreadThrough(unittest.TestCase):
+    """Pins the local-mode importance-gate plumbing (2026-06-10): a
+    `--multi-computer local` secondary is spawned with INHERITED stdio —
+    its stdout IS the operator's terminal — so the operator's
+    `--important-stdio-only` must ride its argv. It is stripped from the
+    generic `forwarded_argv` (correct for SLURM, where secondary stdio is
+    a per-node sbatch capture), so the local spawn path must re-emit it
+    explicitly via `logging_setup.stdio_mode_argv`. Pre-fix the secondary
+    subprocess installed an UNGATED subscriber and flooded the operator's
+    importance-only stdout with its full INFO firehose."""
+
+    def test_important_stdio_only_threaded_when_set(self) -> None:
+        argv = _captured_argv(_make_args(important_stdio_only=True))
+        self.assertIn(
+            "--important-stdio-only",
+            argv,
+            f"stdio-inheriting secondary lost the operator's stdio gate: {argv}",
+        )
+
+    def test_important_stdio_only_absent_when_off(self) -> None:
+        argv = _captured_argv(_make_args(important_stdio_only=False))
+        self.assertNotIn("--important-stdio-only", argv)
+
+    def test_important_stdio_only_absent_when_attr_missing(self) -> None:
+        # Programmatic callers may pass a namespace without the attr; never
+        # synthesize the flag from nothing.
+        argv = _captured_argv(_make_args())
+        self.assertNotIn("--important-stdio-only", argv)
+
+    def test_secondary_boot_parse_arms_importance_from_spawn_argv(self) -> None:
+        """Wire-shape mirror: the SECONDARY-side framework parser, fed the
+        verbatim argv this spawn path produced, must come out with
+        `important_stdio_only=True` — the same parsed knob its
+        `setup_logging` hands to the shared `init_logging` seam. This is
+        the cross-process chain the per-layer tests can't see."""
+        cli = _load_module_direct("cli", "cli.py")
+        argv = _captured_argv(_make_args(important_stdio_only=True))
+        # Drop the `python -m <module>` launcher prefix; argparse sees the rest.
+        flags = argv[3:]
+        boot_args = cli.build_arg_parser("test").parse_args(flags)
+        self.assertTrue(
+            boot_args.important_stdio_only,
+            f"secondary boot parse did not arm importance mode from {flags}",
+        )
+
+
 class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):
     def test_cores_threaded_when_set(self) -> None:
         """argv MUST include `--cores <spec>` when the primary args

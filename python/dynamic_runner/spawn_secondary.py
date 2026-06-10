@@ -45,6 +45,7 @@ import sys
 from collections.abc import Callable
 
 from .deployment_spec import TaskDeploymentSpec
+from .logging_setup import stdio_mode_argv
 from .subprocess_spec import SubprocessSpec
 
 
@@ -99,12 +100,21 @@ def build_subprocess_spawn(
     framework-regenerated flags (``--secondary``, ``--secondary-id``,
     ``--secondary-quic-port``, ``--src-network``, ``--cores``,
     ``--max-memory``, ``--log-dir``) are stripped there so they don't
-    duplicate the explicit emissions above, and submitter-local flags
-    (``--important-stdio-only``) are stripped so the secondary keeps its
-    FULL logs rather than the operator's importance-only stdio. Boolean
-    store_true flags that ARE manually re-emitted (``--raw-logs``,
-    ``--log-oom-watcher``) may appear twice if the operator passed them;
-    argparse's store_true tolerates that.
+    duplicate the explicit emissions above, and operator-stdio flags
+    (``--important-stdio-only``) are stripped from the GENERIC forward
+    set (on SLURM a secondary's stdio is a per-node sbatch capture, so
+    it keeps its FULL logs). Boolean store_true flags that ARE manually
+    re-emitted (``--raw-logs``, ``--log-oom-watcher``) may appear twice
+    if the operator passed them; argparse's store_true tolerates that.
+
+    **Operator-stdio mode** is re-emitted here regardless: a local
+    subprocess secondary INHERITS the primary's stdio (Rust spawns it
+    with ``Command::spawn`` defaults), so its stdout IS the operator's
+    terminal and the operator's stdio gate must hold across the process
+    boundary. :func:`dynamic_runner.logging_setup.stdio_mode_argv` owns
+    which tokens that takes; this builder appends them verbatim. The
+    spawned secondary then installs the gate through the same
+    ``setup_logging``/``init_logging`` seam every mode uses.
     """
 
     def spawn_secondary(
@@ -133,6 +143,10 @@ def build_subprocess_spawn(
             cmd.append("--raw-logs")
         if getattr(args, "log_oom_watcher", False):
             cmd.append("--log-oom-watcher")
+        # The subprocess inherits this process's stdio, so the operator's
+        # stdio-mode flags must ride along (owned by logging_setup; see
+        # the docstring above).
+        cmd += stdio_mode_argv(args)
         # Task-specific + memprofile + any other operator flags the
         # consumer's argparse declared. Pre-filtered by
         # ``filter_framework_argv`` so the framework-regenerated flags
