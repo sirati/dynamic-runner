@@ -753,6 +753,33 @@ where
                 break;
             }
 
+            // Graceful-abort drain exit: the replicated dispatch freeze is
+            // latched and THIS secondary's last running task has completed,
+            // so it tears down NOW — mid-run, before the primary's terminal
+            // `RunComplete` — announcing a DELIBERATE self-departure first
+            // (the existing graceful-leave path; see
+            // `announce_graceful_drain_departure` for why this never trips
+            // the failover/respawn machinery). EXCLUDED while this host is
+            // the recognized PRIMARY's node: the co-resident secondary and
+            // the primary share the node id, so a self-`PeerRemoved` here
+            // would bury the live primary's membership entry. That node
+            // parks instead until the primary either relocates away (the
+            // `current_primary` re-point releases this gate) or finalizes
+            // the drained run (`RunComplete` → the break above) — exactly
+            // the graceful protocol's last-holder shape.
+            if self.cluster_state.graceful_abort_requested()
+                && no_active_tasks
+                && self.cluster_state.current_primary() != Some(self.config.secondary_id.as_str())
+            {
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "graceful abort: local work drained; announcing deliberate \
+                     departure and exiting cleanly"
+                );
+                self.announce_graceful_drain_departure().await;
+                break;
+            }
+
             // Restart workers that disconnected (via the
             // pool-event channel — typical when a poll_loop
             // observed pipe-EOF mid-task) OR workers that the

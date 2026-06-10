@@ -1064,6 +1064,13 @@ impl PyDistributedManager {
                 // (uniform with `PyPrimaryCoordinator::run`).
                 match outcome.terminal {
                     RunTerminal::Done => {}
+                    RunTerminal::GracefulAbort { reason } => {
+                        // Operator-requested graceful abort ran its drain
+                        // protocol to the end. A DELIBERATE clean wind-down:
+                        // reported loudly (distinct from a silent success),
+                        // exits 0 (distinct from the hard-abort raise).
+                        tracing::warn!(verdict = %reason, "run gracefully aborted");
+                    }
                     RunTerminal::Aborted { reason } => {
                         // A cluster-wide `RunAborted` observed by the setup
                         // node. Carry the broadcast reason VERBATIM — the
@@ -1100,6 +1107,13 @@ impl PyDistributedManager {
                                 // compute secondary surfaces this. RAISE rather
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
+                            }
+                            RunError::GracefulAbort { .. } => {
+                                // Unreachable in practice: `Node::run` maps a
+                                // primary's GracefulAbort onto its OWN
+                                // `RunTerminal::GracefulAbort` (handled above),
+                                // never `Failed`. Defensive: treat as the
+                                // graceful verdict, never a raise.
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow

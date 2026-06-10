@@ -163,6 +163,7 @@ fn roundtrip_all_message_types() {
                 primary_epoch: 3,
                 run_complete: true,
                 run_aborted: false,
+                graceful_abort: true,
                 discovery_debt: crate::DiscoveryDebt::Owed,
                 phase_event_tallies_count: 6,
                 phase_event_tallies_hash: 0x88,

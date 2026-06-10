@@ -24,6 +24,7 @@ mod crdt_convergence;
 mod custom_messages;
 mod dispatch_decoupling;
 mod e2e;
+mod graceful_abort;
 mod hydrate;
 mod initial_assignment;
 mod injected_spread;

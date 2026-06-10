@@ -20,6 +20,11 @@
 //! - [`promotion`] — `wait_for_mesh_ready` + `activate_local_primary`
 //!   (the mesh-settle gate + the single mechanism that activates THIS
 //!   node as the primary authority — see `activate_local_primary`).
+//! - [`graceful_abort`] — the primary side of the observer-requested
+//!   graceful abort: the request→latch origination, the per-iteration
+//!   drain/relocate/terminal decision, and the respawn-admission gate
+//!   predicate. The dispatch FREEZE itself lives at the one dispatch-view
+//!   seam (`PrimaryCoordinator::dispatch_view_for_worker`).
 //!
 //! `dispatch_order` (free fn) lives here because every sub-module
 //! consumes it; it has no `&self` so it can't sit on the inherent
@@ -32,10 +37,13 @@ use dynrunner_core::Identifier;
 use crate::primary::RemoteWorkerState;
 
 mod dispatch;
+mod graceful_abort;
 mod mutations;
 mod operational_loop;
 mod promotion;
 mod worker_mgmt;
+
+pub(crate) use promotion::RelocationPolicy;
 
 #[cfg(test)]
 mod tests;

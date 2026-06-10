@@ -511,6 +511,35 @@ impl<I: Identifier> ClusterState<I> {
         self.run_aborted.as_deref()
     }
 
+    /// Whether a GRACEFUL abort has been requested
+    /// (`ClusterMutation::GracefulAbortRequested`) — the replicated
+    /// dispatch-freeze latch. Sticky monotonic, like
+    /// [`Self::run_complete`]: once set, never clears. Consumed by the
+    /// primary's dispatch-view gate (no new work leaves the ready pool),
+    /// the respawn-admission gate, and the drain/relocate/terminal
+    /// decisions; by each secondary's drain-exit decision; and by the
+    /// observer's verdict derivation (`run_complete ∧ graceful_abort` =
+    /// the graceful-abort verdict).
+    pub fn graceful_abort_requested(&self) -> bool {
+        self.graceful_abort_requested
+    }
+
+    /// Count of `InFlight` ledger entries currently assigned to
+    /// `secondary` — the CRDT-derived "active workers" occupancy of one
+    /// secondary. Pure projection of the replicated `tasks` ledger, so
+    /// every replica (live primary, promoted primary, observer) reads
+    /// the same answer. Consumed by the graceful-abort relocation
+    /// policy (`RelocationPolicy::MostActiveWorkers`) and its drain
+    /// decisions.
+    pub fn inflight_count_for_secondary(&self, secondary: &str) -> usize {
+        self.tasks
+            .values()
+            .filter(|state| {
+                matches!(state, TaskState::InFlight { secondary: s, .. } if s == secondary)
+            })
+            .count()
+    }
+
     /// The replicated per-run discovery-debt latch (V6). `Undeclared` (the
     /// default/bottom) means no discovery is owed — the run was cold-seeded
     /// (mode-1 / legacy) or never declared debt; `Owed` means a relocated
