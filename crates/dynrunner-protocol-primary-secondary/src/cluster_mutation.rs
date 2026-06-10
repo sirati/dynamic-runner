@@ -423,6 +423,37 @@ pub enum ClusterMutation<I> {
         hash: String,
         on: String,
     },
+    /// "Phase `phase`'s end edge COMPLETED on the authoritative primary":
+    /// the lifecycle cascade fired the consumer's `on_phase_end` hook,
+    /// drained every command the hook queued (the lazy-spawn injection),
+    /// and marked the phase done. Replicated so the no-redo decision on a
+    /// promoted primary (`hydrate_from_cluster_state`'s
+    /// `seed_completed_phases` filter) is keyed on THIS fact instead of
+    /// inferring "ended" from "all tasks terminal" — an inference the
+    /// `TaskSkippedAlreadyDone` spawn-time terminal broke: a freshly
+    /// discovered all-skipped phase is all-terminal the moment it is
+    /// seeded, BEFORE its hook ever ran anywhere, so the terminal-only
+    /// inference silently dropped the hook (and the consumer's
+    /// `on_phase_end`-keyed next-phase injection with it).
+    ///
+    /// Grow-only per-phase fact; join = OR (set union). The apply rule is
+    /// a set-insert: `Applied` iff the phase was not yet in the local set,
+    /// NoOp on re-application — idempotent under at-least-once delivery
+    /// and reorder (there is no transition that ever removes a phase).
+    ///
+    /// Originated by the cascade's proceed branch (the SAME decision point
+    /// that calls `mark_phase_done` — the fact is that call's replicated
+    /// counterpart). NOT originated on the raise / fail-loud branches: an
+    /// end edge that did not complete must REPLAY on the next primary
+    /// (re-fire → re-raise / re-evaluate), not be suppressed. The residual
+    /// die-between-hook-and-broadcast window fails SAFE: the next primary
+    /// re-fires the hook and the deterministic re-spawn is absorbed by the
+    /// documented idempotent failover-replay dedup (`DuplicateTaskHash` is
+    /// dropped, never escalated) — whereas suppressing a never-fired hook
+    /// loses the injection unrecoverably.
+    PhaseEnded {
+        phase: PhaseId,
+    },
     /// Discovery-time skip: the originator determined the item's outputs
     /// already exist on the shared filesystem, so the ledger entry is
     /// materialized DIRECTLY terminal (`TaskState::SkippedAlreadyDone`) and

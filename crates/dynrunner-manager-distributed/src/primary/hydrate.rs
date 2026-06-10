@@ -102,9 +102,12 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // old split: `originate_cold_seed`'s `.clear()` + the promote-only
         // `seed_from_promotion_snapshot` `has_any` projection). A phase is
         // "started" iff it holds ≥1 task that has PROGRESSED past
-        // `Pending`/`Blocked` — i.e. ≥1 `InFlight` or terminal
-        // (`Completed`/`Failed`/`Unfulfillable`/`InvalidTask`) entry. This is
-        // exactly `has_any && (in_flight || terminal-present)`:
+        // `Pending`/`Blocked` — i.e. ≥1 `InFlight` or DISPATCH-OBSERVED
+        // terminal (`Completed`/`Failed`/`Unfulfillable`/`InvalidTask`)
+        // entry. `SkippedAlreadyDone` deliberately does NOT count (#343):
+        // a skip is a SPAWN-TIME terminal that proves seeding, not
+        // activation — see its match arm below. This is
+        // `has_any && (in_flight || dispatch-observed-terminal-present)`:
         //   * COLD: a freshly-seeded CRDT is all-`Pending` ⇒ the set is EMPTY
         //     (the equivalent of the old `.clear()`), so the subsequent
         //     `fire_initial_phase_starts` legitimately fires each phase's
@@ -189,20 +192,41 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     completed_task_ids.insert(task.task_id.clone());
                     failed_tasks.insert(hash.clone(), kind.clone());
                 }
-                // `SkippedAlreadyDone` is a terminal that was NEVER
-                // dispatched, so it is seeded EXACTLY like the other
-                // success-/terminal-ish states (its task_id resolves its
-                // dependents' `task_depends_on` in `extend()`, and the phase
-                // is marked started + carrying a terminal) but is CRITICALLY
-                // NOT pushed into `items`: re-dispatching an already-done
-                // item on failover would re-run work whose outputs already
-                // exist (the NO-REDO failover-routing decision). The CRDT
-                // entry itself stays `SkippedAlreadyDone`.
                 TaskState::Completed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::InvalidTask { task, .. }
-                | TaskState::SkippedAlreadyDone { task, .. } => {
+                | TaskState::InvalidTask { task, .. } => {
                     started_phases.insert(task.phase_id.clone());
+                    phases_with_terminal.insert(task.phase_id.clone());
+                    primary_completed.insert(hash.clone());
+                    completed_task_ids.insert(task.task_id.clone());
+                }
+                // `SkippedAlreadyDone` is a terminal that was NEVER
+                // dispatched, so it is seeded like the other terminal-ish
+                // states (its task_id resolves its dependents'
+                // `task_depends_on` in `extend()`, the phase carries a
+                // terminal, and the hash enters `completed_tasks`) but is
+                // CRITICALLY NOT pushed into `items`: re-dispatching an
+                // already-done item on failover would re-run work whose
+                // outputs already exist (the NO-REDO failover-routing
+                // decision). The CRDT entry itself stays
+                // `SkippedAlreadyDone`.
+                //
+                // It does NOT mark the phase STARTED (#343): a skip is a
+                // SPAWN-TIME terminal — it proves the phase was seeded, not
+                // that it ever activated and fired `on_phase_start`. A
+                // freshly-discovered all-skipped phase has fired NOTHING
+                // anywhere, and must flow through the live cascade
+                // (`on_phase_start` → drain → `on_phase_end`) like any
+                // other never-started phase. An INHERITED all-skipped phase
+                // whose edges DID fire on the original primary carries the
+                // replicated `PhaseEnded` fact and is seeded straight to
+                // `Done` below — a `Done` phase is never `Active`, so
+                // `fire_initial_phase_starts` (which iterates active phases
+                // only) never consults the started set for it and neither
+                // hook re-fires. A mixed phase (skips + dispatched work) is
+                // marked started by its non-skip entries, exactly as the
+                // original primary observed it.
+                TaskState::SkippedAlreadyDone { task, .. } => {
                     phases_with_terminal.insert(task.phase_id.clone());
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
@@ -345,28 +369,48 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     self.pending = None;
                     return;
                 }
-                // Seed already-completed-and-ended phases straight to `Done`
-                // (failover-promotion resume). A phase that holds ≥1 terminal
-                // task and NO live (`Pending`/`Blocked`/`InFlight`) work was
-                // already drained AND had its `on_phase_end` fired (plus any
-                // children that hook spawned — present in this same CRDT) on
-                // the run's original primary. Without this seed the freshly
-                // built pool starts it `Active`/`Blocked` and the post-hydrate
-                // lifecycle cascade re-`(0,0,0)`-drains it → re-fires
-                // `on_phase_end` → the consumer hook re-spawns its children
-                // with identical deterministic identities → run-wide
-                // invalidation. Marking it `Done` here removes it from the
-                // cascade's `poll_drain_transitions` entirely. Runs AFTER
-                // `extend` (a failure leaves `pending = None` and any seeded
-                // phase state would be stranded) and the activation
-                // convergence inside `seed_completed_phases` flips a live
-                // dependent phase `Blocked → Active` if all its deps are now
-                // `Done`. EMPTY on the cold path (no terminal tasks), so the
-                // cold-start `fire_initial_phase_starts` + empty-phase cascade
-                // are untouched.
+                // Seed already-completed-AND-ENDED phases straight to `Done`
+                // (failover-promotion resume). The decision is keyed on the
+                // REPLICATED `PhaseEnded` fact (#343), not inferred from the
+                // task lattice alone: a phase is seeded `Done` iff it holds
+                // ≥1 terminal task, NO live (`Pending`/`Blocked`/`InFlight`)
+                // work, AND the CRDT says its `on_phase_end` edge already
+                // COMPLETED on some primary (the cascade originates the fact
+                // at the same edge it calls `mark_phase_done`, so any
+                // children the hook spawned are present in this same CRDT).
+                // Without the seed the freshly built pool would start such a
+                // phase `Active`/`Blocked` and the post-hydrate cascade
+                // would re-`(0,0,0)`-drain it → re-fire `on_phase_end` → the
+                // consumer hook re-spawns its identical-identity children →
+                // run-wide invalidation (#326). Marking it `Done` removes it
+                // from `poll_drain_transitions` entirely.
+                //
+                // The fact gate is what distinguishes that INHERITED shape
+                // from a freshly-discovered all-`SkippedAlreadyDone` phase
+                // (#343): the skip seed makes a phase terminal-only the
+                // moment it lands, BEFORE its hook ever ran ANYWHERE — the
+                // task lattice alone cannot tell the two apart. No fact ⇒
+                // the phase flows through the live cascade, fires its FIRST
+                // `on_phase_end`, and the consumer's lazy-spawn injection
+                // lands. (The residual die-between-hook-and-fact-broadcast
+                // window re-fires the hook on the next primary; the
+                // deterministic re-spawn is absorbed by the idempotent
+                // failover-replay dedup in `apply_spawn_tasks` — fail-safe,
+                // unlike suppressing a never-fired hook, which loses the
+                // injection unrecoverably.)
+                //
+                // Runs AFTER `extend` (a failure leaves `pending = None` and
+                // any seeded phase state would be stranded) and the
+                // activation convergence inside `seed_completed_phases`
+                // flips a live dependent phase `Blocked → Active` if all its
+                // deps are now `Done`. EMPTY on the cold path (no
+                // `PhaseEnded` fact exists before the first end edge), so
+                // the cold-start `fire_initial_phase_starts` + empty-phase
+                // cascade are untouched.
                 let completed_phases: Vec<PhaseId> = phases_with_terminal
                     .iter()
                     .filter(|ph| !phases_with_live_work.contains(*ph))
+                    .filter(|ph| self.cluster_state.phase_ended(ph))
                     .cloned()
                     .collect();
                 if !completed_phases.is_empty() {

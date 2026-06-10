@@ -160,6 +160,10 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::PhaseMayBeEmptySet { .. }
+            // `PhaseEnded` is version-LESS: a grow-only set-insert fact
+            // (join = OR) needs no arbitration — there is no competing
+            // writer and no transition out of the set.
+            | ClusterMutation::PhaseEnded { .. }
             | ClusterMutation::RunComplete
             | ClusterMutation::RunAborted { .. }
             | ClusterMutation::DiscoveryDebtDeclared

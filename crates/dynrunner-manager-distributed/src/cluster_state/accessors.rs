@@ -225,6 +225,19 @@ impl<I: Identifier> ClusterState<I> {
         self.phase_may_be_empty.contains(phase)
     }
 
+    /// True iff `phase`'s `on_phase_end` edge COMPLETED on some
+    /// authoritative primary (hook fired + hook-queued commands drained +
+    /// `mark_phase_done` issued), replicated via
+    /// `ClusterMutation::PhaseEnded` (#343). Read by the hydration-time
+    /// no-redo decision: a terminal-only phase is seeded straight to
+    /// `Done` — suppressing an `on_phase_end` re-fire (#326) — ONLY when
+    /// this fact is present; without it the phase flows through the live
+    /// cascade and fires its FIRST `on_phase_end` (the freshly-discovered
+    /// all-`SkippedAlreadyDone` phase).
+    pub fn phase_ended(&self, phase: &PhaseId) -> bool {
+        self.phases_ended.contains(phase)
+    }
+
     /// Per-phase derived view recomputed from the CRDT: for every phase
     /// that owns at least one task, the [`PhaseRollup`] of `has_any`,
     /// `has_live`, and `dispatchable`.

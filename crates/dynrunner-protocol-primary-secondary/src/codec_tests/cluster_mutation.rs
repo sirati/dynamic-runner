@@ -95,6 +95,46 @@ fn task_skipped_already_done_decodes_literal_sender_bytes() {
     }
 }
 
+/// `PhaseEnded` round-trips through serde with its `phase` preserved
+/// (the replicated "on_phase_end edge completed" fact carries only the
+/// phase id — grow-only set semantics live in the apply rule, not on the
+/// wire).
+#[test]
+fn roundtrip_phase_ended() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::PhaseEnded {
+        phase: dynrunner_core::PhaseId::from("build"),
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::PhaseEnded { phase } => {
+            assert_eq!(phase.as_str(), "build");
+        }
+        _ => panic!("expected PhaseEnded"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes a sender emits — `{"PhaseEnded":{"phase":"..."}}` (`PhaseId`
+/// is `#[serde(transparent)]`, a plain string on the wire) — rather than
+/// re-encoding our own value, so a field reorder/rename that still
+/// round-trips against itself is caught against the other side's actual
+/// bytes.
+#[test]
+fn phase_ended_decodes_literal_sender_bytes() {
+    let bytes = r#"{"PhaseEnded":{"phase":"unify_vocab"}}"#;
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(bytes).unwrap();
+
+    match decoded {
+        ClusterMutation::PhaseEnded { phase } => {
+            assert_eq!(phase.as_str(), "unify_vocab");
+        }
+        _ => panic!("expected PhaseEnded"),
+    }
+}
+
 /// `SecondaryCapacity` round-trips through serde with its
 /// `worker_count` + advertised `resources` preserved verbatim.
 #[test]

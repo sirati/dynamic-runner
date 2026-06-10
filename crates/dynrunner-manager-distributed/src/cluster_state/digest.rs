@@ -101,6 +101,11 @@ impl<I: Identifier> ClusterState<I> {
             // XOR-fold (a missing event key is caught by the count; the
             // VALUE is folded too, mirroring the grow-only-MAX shape).
             respawn_events,
+            // Replicated grow-only SET of ended phases (#343) — summarised:
+            // count + KEY-only XOR-fold (the set carries no values; the
+            // key-set identity detects a missing entry, same shape as
+            // `secondary_capacities_hash`).
+            phases_ended,
             // Replicated static phase-graph metadata, but EXCLUDED from the
             // digest: `phase_may_be_empty` is originated in the SAME seed
             // batch as `phase_deps` (both set-once at run start, paired in
@@ -207,6 +212,14 @@ impl<I: Identifier> ClusterState<I> {
         // fold). The fold rule is spelled once in `grow_max::fold_grow_set`.
         let respawn_events_hash = super::grow_max::fold_grow_set(respawn_events);
 
+        // Grow-only SET of ended phases (#343): count + order-independent
+        // XOR-fold over the phase ids (key-only — the set carries no
+        // values, like `secondary_capacities_hash`).
+        let mut phases_ended_hash = 0u64;
+        for phase in phases_ended {
+            phases_ended_hash ^= hash_one(phase);
+        }
+
         StateDigest {
             tasks_count: tasks.len() as u64,
             tasks_hash,
@@ -247,6 +260,8 @@ impl<I: Identifier> ClusterState<I> {
             unfulfillable_reinject_used_hash,
             respawn_events_count: respawn_events.len() as u64,
             respawn_events_hash,
+            phases_ended_count: phases_ended.len() as u64,
+            phases_ended_hash,
         }
     }
 }

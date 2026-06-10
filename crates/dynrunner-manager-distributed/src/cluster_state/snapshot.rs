@@ -276,6 +276,18 @@ pub struct ClusterStateSnapshot<I> {
     /// with a pre-field sender (missing field decodes as an empty map).
     #[serde(default)]
     pub respawn_events: HashMap<String, RespawnEventRecord>,
+    /// Replicated "phase ended" facts (#343) — grow-only SET of the phases
+    /// whose `on_phase_end` edge completed. Carried so a promoted primary
+    /// inherits exactly which phases already fired their hook: present →
+    /// seeded `Done` without re-firing (#326); absent → the phase flows
+    /// through the live cascade and fires for the first time (the
+    /// freshly-discovered all-skipped phase). Merge rule on `restore`:
+    /// set UNION (grow-only; a stale peer's snapshot can never un-end a
+    /// phase). `#[serde(default)]` keeps wire compat with a pre-field
+    /// sender (missing field decodes as the empty set — "no hook is known
+    /// to have fired", the conservative replay-the-edge shape).
+    #[serde(default)]
+    pub phases_ended: HashSet<PhaseId>,
 }
 
 /// Migration shim (snapshot-ONLY): fill the enclosing task's phase into
@@ -328,6 +340,8 @@ impl<I: Identifier> ClusterState<I> {
             unfulfillable_reinject_used,
             // Replicated grow-only SET (F7).
             respawn_events,
+            // Replicated grow-only SET (#343).
+            phases_ended,
             // ── node-local: not replicated ──
             // Atomic mirror is derived from `primary_epoch`; restore
             // re-stores it from the merged epoch (see `restore`).
@@ -401,6 +415,10 @@ impl<I: Identifier> ClusterState<I> {
             // inherits the respawn ledger via union-merge on restore (the
             // admission budget + cooldown survive failover).
             respawn_events: respawn_events.clone(),
+            // Replicated grow-only SET (#343) — carried so a promoted
+            // primary inherits which phases already fired `on_phase_end`
+            // (the no-redo decision input) via union-merge on restore.
+            phases_ended: phases_ended.clone(),
         }
     }
 
@@ -487,6 +505,7 @@ impl<I: Identifier> ClusterState<I> {
             retry_passes_used,
             unfulfillable_reinject_used,
             respawn_events,
+            phases_ended,
         } = snap;
         // Per-task restore now routes through the SHARED `merge_task_state`
         // join — the SAME order apply uses, so apply == restore by
@@ -708,5 +727,10 @@ impl<I: Identifier> ClusterState<I> {
         // correct + idempotent. The merge rule is spelled once in
         // `grow_max::merge_grow_set`.
         merge_grow_set(&mut self.respawn_events, respawn_events);
+        // Grow-only SET (#343): plain set UNION so a promoted primary
+        // inherits which phases already fired `on_phase_end` and a stale
+        // peer's snapshot can never un-end a phase. Idempotent +
+        // order-insensitive (set insert), the OR-join the fact declares.
+        self.phases_ended.extend(phases_ended);
     }
 }

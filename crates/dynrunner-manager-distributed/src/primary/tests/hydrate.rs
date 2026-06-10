@@ -982,14 +982,16 @@ async fn reconstruct_workers_double_invoke_is_sum_capacity_not_double() {
         .await;
 }
 
-/// (a) HEADLINE: a promoted primary hydrated from a CRDT where phases X,Y,Z
-/// are ALL-terminal (completed) and a downstream phase W still has live work
-/// must seed X,Y,Z as `PhaseState::Done` — NOT re-run them. Without this the
-/// freshly built pool starts them `Active`/`Blocked` and the post-hydrate
-/// lifecycle cascade re-`(0,0,0)`-drains them → re-fires `on_phase_end` →
-/// (the real-world failure) a consumer hook re-spawns 2041 children with
-/// identical identities → run-wide invalidation. W (live, depends on Z) is
-/// `Active` (its dep Z is Done) and its work enters the pool.
+/// (a) HEADLINE (#326 guard): a promoted primary hydrated from a CRDT where
+/// phases X,Y,Z are ALL-terminal (completed) AND carry the replicated
+/// `PhaseEnded` fact (the original primary's cascade originated it at its
+/// `mark_phase_done` edge) must seed X,Y,Z as `PhaseState::Done` — NOT
+/// re-run them. Without this the freshly built pool starts them
+/// `Active`/`Blocked` and the post-hydrate lifecycle cascade
+/// re-`(0,0,0)`-drains them → re-fires `on_phase_end` → (the real-world
+/// failure) a consumer hook re-spawns 2041 children with identical
+/// identities → run-wide invalidation. W (live, depends on Z) is `Active`
+/// (its dep Z is Done) and its work enters the pool.
 ///
 /// Revert-check: drop the `seed_completed_phases` call in
 /// `hydrate_from_cluster_state` and X,Y,Z come back `Active` (a zero-dep
@@ -1041,6 +1043,17 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
                 result_data: None,
             });
         }
+        // The original primary's cascade fired `on_phase_end` for X,Y,Z and
+        // originated the replicated `PhaseEnded` fact at its
+        // `mark_phase_done` edge — the no-redo decision input (#343). The
+        // inherited CRDT carries it; a terminal-only phase WITHOUT the fact
+        // is a never-ended phase and flows through the live cascade instead
+        // (see `hydrate_does_not_seed_done_without_phase_ended_fact`).
+        for ph in ["X", "Y", "Z"] {
+            cs.apply(ClusterMutation::PhaseEnded {
+                phase: PhaseId::from(ph),
+            });
+        }
         cs.apply(ClusterMutation::TaskAdded {
             hash: "w-task".into(),
             task: w.clone(),
@@ -1071,6 +1084,183 @@ fn hydrate_seeds_completed_phases_as_done_not_rerun() {
         pool.iter().any(|t| t.task_id == "w-task"),
         "W's live task must be in the pool to dispatch"
     );
+}
+
+/// #343 discriminator, fact-ABSENT side: a terminal-only phase WITHOUT the
+/// replicated `PhaseEnded` fact is a phase whose `on_phase_end` edge never
+/// completed ANYWHERE — the freshly-discovered all-`SkippedAlreadyDone`
+/// shape (the skip seed makes a phase all-terminal the moment it lands,
+/// before any hook ran). Hydrate must NOT seed it `Done`: it stays
+/// `Active` so the live cascade fires its FIRST `on_phase_start` /
+/// `on_phase_end` and a chaining consumer's injection lands. The dependent
+/// phase stays `Blocked` (its dep has not ended). Also pins the
+/// started-derivation half: a skip is a spawn-time terminal, NOT
+/// activation evidence, so `phase_started_emitted` must NOT contain the
+/// phase (otherwise `on_phase_start` is suppressed and the consumer sees
+/// an End without a Start).
+#[test]
+fn hydrate_does_not_seed_done_without_phase_ended_fact() {
+    use dynrunner_scheduler_api::PhaseState;
+
+    let (transport, _ends) = setup_test(1);
+    let (mut primary, _mesh) = build_test_primary(
+        PrimaryConfig::default(),
+        transport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // `build` (all skipped at discovery) → `ship` (live work, depends on
+    // build). NO `PhaseEnded` fact for `build` — its hook never ran.
+    let a = dep_binary("a-task", "build", &[]);
+    let b = dep_binary("b-task", "build", &[]);
+    let s = dep_binary("s-task", "ship", &[]);
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(PhaseId::from("ship"), vec![PhaseId::from("build")])]),
+        });
+        for (hash, task) in [("a-task", &a), ("b-task", &b)] {
+            cs.apply(ClusterMutation::TaskAdded {
+                hash: hash.into(),
+                task: task.clone(),
+            });
+            cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: hash.into() });
+        }
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "s-task".into(),
+            task: s.clone(),
+        });
+    }
+
+    primary.hydrate_from_cluster_state();
+
+    let pool = primary.pool();
+    assert_eq!(
+        pool.phase_state(&PhaseId::from("build")),
+        Some(PhaseState::Active),
+        "a terminal-only phase WITHOUT the PhaseEnded fact must NOT be \
+         seeded Done — its on_phase_end never fired anywhere and must fire \
+         through the live cascade (pre-fix: seeded Done, hook silently \
+         dropped, the chaining consumer's injection lost)"
+    );
+    assert_eq!(
+        pool.phase_state(&PhaseId::from("ship")),
+        Some(PhaseState::Blocked),
+        "the dependent stays Blocked until its dep phase actually ends \
+         through the cascade"
+    );
+    assert!(
+        !primary.phase_started_emitted.contains(&PhaseId::from("build")),
+        "a skip is a spawn-time terminal, not activation evidence — the \
+         started set must not contain the fresh all-skipped phase, so its \
+         first on_phase_start fires before its first on_phase_end"
+    );
+}
+
+/// #326 preservation at the CASCADE level: an inherited all-terminal phase
+/// WITH the `PhaseEnded` fact is seeded `Done` and the post-hydrate
+/// lifecycle cascade (`fire_initial_phase_starts` +
+/// `drain_empty_active_phases` + `process_phase_lifecycle`) fires ZERO
+/// duplicate `on_phase_end` (and zero duplicate `on_phase_start`) for it —
+/// the exact promotion seam, hook-counted, not just the pool-state
+/// assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn inherited_ended_phase_with_fact_does_not_refire_on_phase_end() {
+    use dynrunner_scheduler_api::PhaseState;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let (mut primary, _mesh) = build_test_primary(
+                PrimaryConfig::default(),
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Inherited CRDT: `build` is all-skipped AND ended on the
+            // original primary (fact present); `ship` depends on it and has
+            // live work (the resume target).
+            let a = dep_binary("a-task", "build", &[]);
+            let b = dep_binary("b-task", "build", &[]);
+            let s = dep_binary("s-task", "ship", &[]);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(PhaseId::from("ship"), vec![PhaseId::from("build")])]),
+                });
+                for (hash, task) in [("a-task", &a), ("b-task", &b)] {
+                    cs.apply(ClusterMutation::TaskAdded {
+                        hash: hash.into(),
+                        task: task.clone(),
+                    });
+                    cs.apply(ClusterMutation::TaskSkippedAlreadyDone { hash: hash.into() });
+                }
+                cs.apply(ClusterMutation::PhaseEnded {
+                    phase: PhaseId::from("build"),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "s-task".into(),
+                    task: s.clone(),
+                });
+            }
+
+            // Counting hooks installed on the coordinator (what `run()`
+            // would wire from the consumer callbacks). `Arc<Mutex<..>>`
+            // because the hook types are `+ Send`.
+            let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let ends = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let starts_cb = starts.clone();
+            primary.on_phase_start = Some(Box::new(move |p: &PhaseId| {
+                starts_cb.lock().unwrap().push(p.to_string());
+            }));
+            let ends_cb = ends.clone();
+            primary.on_phase_end = Some(Box::new(move |p: &PhaseId, _c, _f, _outputs| {
+                ends_cb.lock().unwrap().push(p.to_string());
+            }));
+
+            primary.hydrate_from_cluster_state();
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("build")),
+                Some(PhaseState::Done),
+                "all-terminal + PhaseEnded fact ⇒ seeded Done on resume"
+            );
+            assert_eq!(
+                primary.pool().phase_state(&PhaseId::from("ship")),
+                Some(PhaseState::Active),
+                "the live dependent activates (its dep is Done) and resumes"
+            );
+
+            // The promotion seam's pre-loop cascade: zero duplicate firings
+            // for the already-ended phase.
+            primary.fire_initial_phase_starts();
+            primary.pool_mut().drain_empty_active_phases();
+            primary.process_phase_lifecycle(&mut None).await;
+
+            let fired_ends = ends.lock().unwrap().clone();
+            let fired_starts = starts.lock().unwrap().clone();
+            assert!(
+                !fired_ends.iter().any(|p| p == "build"),
+                "an inherited ENDED phase (fact in the snapshot) must NOT \
+                 re-fire on_phase_end on promotion (#326); fired: {fired_ends:?}"
+            );
+            assert!(
+                !fired_starts.iter().any(|p| p == "build"),
+                "an inherited ENDED phase must not re-fire on_phase_start \
+                 either; fired: {fired_starts:?}"
+            );
+            // The live dependent's own first start DID fire (the resume is
+            // not suppressed wholesale).
+            assert_eq!(
+                fired_starts.iter().filter(|p| *p == "ship").count(),
+                1,
+                "the live dependent fires its own first on_phase_start; \
+                 fired: {fired_starts:?}"
+            );
+        })
+        .await;
 }
 
 /// (a) cold-path NOT regressed at hydrate: a fresh all-`Pending` cold seed
