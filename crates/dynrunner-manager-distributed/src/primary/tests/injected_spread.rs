@@ -474,6 +474,7 @@ async fn injection_during_cascade_dispatches_despite_busy_inbox() {
                             worker_id: u_worker,
                             task_hash: compute_task_hash(&utask),
                             result_data: None,
+                            delivery_seq: None,
                         })
                         .expect("inbound open");
 
