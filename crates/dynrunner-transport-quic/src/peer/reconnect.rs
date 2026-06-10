@@ -263,6 +263,15 @@ impl ReconnectTracker {
         }
     }
 
+    /// Consecutive redial attempts issued for `peer_id` since its
+    /// disconnect was first observed; `None` when the peer is not
+    /// tracked (connected, or never disconnected). Read by the dial
+    /// path so each spawned redial's narration carries its attempt
+    /// number — the tracker stays the single owner of the count.
+    pub fn attempts_for(&self, peer_id: &str) -> Option<u32> {
+        self.state.get(peer_id).map(|s| s.attempts)
+    }
+
     /// Tracker size. Used in tests + the existing `peer_count`
     /// neighbourhood for diagnostics — not part of any operator
     /// log contract.

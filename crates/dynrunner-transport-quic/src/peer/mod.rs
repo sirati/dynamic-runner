@@ -33,6 +33,73 @@ pub use mesh_send::MeshSendHandle;
 
 use mesh_send::MeshSend;
 
+/// What one `connect_to_peers` sweep decided, per disposition — the
+/// single source for the sweep-summary log line and the unit tests
+/// that pin the dispositions. A sweep that spawns ZERO dials is a
+/// legitimate, structural outcome (every listed peer has a lower id,
+/// so this node awaits their inbound dials), and before this summary
+/// existed it was INVISIBLE at operator level: the coordinator logged
+/// "kicking off peer dials peers=N" and then nothing, ever — the #362
+/// production shape.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct DialSweepSummary {
+    /// Peers in the list excluding self.
+    pub(super) listed: usize,
+    /// Dial tasks actually spawned this sweep.
+    pub(super) spawned: usize,
+    /// Skipped: already in `connections` (accept loop or earlier dial).
+    pub(super) already_connected: usize,
+    /// Skipped by the lower-id-dials rule: these peers' ids sort LOWER
+    /// than ours, so THEY dial US — this node never dials them and its
+    /// mesh leg to each depends entirely on their inbound succeeding.
+    pub(super) awaiting_inbound: Vec<String>,
+    /// Peers that were in the previous authoritative dial list but are
+    /// absent from this one: their cached dial info AND any redial
+    /// tracking stop now (membership-replacement semantics).
+    pub(super) dropped_from_list: Vec<String>,
+}
+
+/// RAII abort-detector for a spawned dial task (#362). Armed at task
+/// entry, defused once `dial_peer` returned (every return path of
+/// which logs its outcome). If the task is dropped mid-dial (LocalSet
+/// teardown cancels detached tasks) or unwinds on a panic, `Drop` runs
+/// with the guard still armed and emits the WARN — so a dial that was
+/// SPAWNED can never conclude tracelessly: it logs an outcome, or it
+/// logs that it was aborted before reaching one.
+struct DialTaskGuard {
+    peer_id: String,
+    attempt: dial::DialAttempt,
+    armed: bool,
+}
+
+impl DialTaskGuard {
+    fn new(peer_id: String, attempt: dial::DialAttempt) -> Self {
+        Self {
+            peer_id,
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DialTaskGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::warn!(
+                peer = %self.peer_id,
+                attempt = %self.attempt,
+                "peer dial task aborted before reaching an outcome \
+                 (task cancelled mid-dial or panicked) — the dial \
+                 produced neither a success nor a failure"
+            );
+        }
+    }
+}
+
 /// A peer connection accepted by this node's server.
 pub(super) struct AcceptedPeer<I: Identifier> {
     pub(super) peer_id: String,
@@ -465,13 +532,58 @@ impl<I: Identifier> PeerNetwork<I> {
     /// budget is ≤ 20s, same as the pre-happy-eyeballs sequential
     /// QUIC-then-WSS shape.
     pub fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
+        let summary = self.connect_to_peers_inner(peers);
+        // Sweep-summary narration (#362): ONE operator line per sweep
+        // naming every disposition, so a sweep that spawned zero dials
+        // names WHY (e.g. "awaiting_inbound=[a, b]" — the lower-id-dials
+        // rule made the dials structurally someone else's) instead of
+        // going silent after the coordinator's "received peer list".
+        tracing::info!(
+            listed = summary.listed,
+            spawned = summary.spawned,
+            already_connected = summary.already_connected,
+            awaiting_inbound = ?summary.awaiting_inbound,
+            "peer-dial sweep: spawned dial tasks for the listed peers \
+             (awaiting_inbound peers have LOWER ids and dial us — this \
+             node never dials them)"
+        );
+        if !summary.dropped_from_list.is_empty() {
+            // Membership shrink is operator-significant: every dropped
+            // peer's redial tracking stops NOW, silently, forever — if
+            // the new list is wrong (e.g. a freshly promoted primary
+            // broadcast a partial roster), this is the only trace.
+            tracing::warn!(
+                dropped = ?summary.dropped_from_list,
+                "authoritative peer list no longer contains previously \
+                 tracked peers; their cached dial info and redial \
+                 tracking stop here"
+            );
+        }
+    }
+
+    /// The sweep itself, returning the per-disposition summary the
+    /// public wrapper logs (and the unit tests pin). Kept separate so
+    /// the narration has exactly one emission point.
+    fn connect_to_peers_inner(&mut self, peers: &[PeerConnectionInfo]) -> DialSweepSummary {
         // Cache dial info wholesale: peers dropped from this
         // authoritative list have their cached entry removed so
         // subsequent redial signals against retired peers find no
-        // dial info and silently no-op. The primary's `PeerInfo`
-        // broadcast is the source of truth — chunked / additive
-        // callers would observe peers leaking after a membership
-        // change, so we replace rather than extend.
+        // dial info and no-op (loudly, per `spawn_redial`'s skip
+        // narration). The primary's `PeerInfo` broadcast is the
+        // source of truth — chunked / additive callers would observe
+        // peers leaking after a membership change, so we replace
+        // rather than extend. Dropped peers are surfaced on the
+        // summary so the replacement is never a silent shrink.
+        let mut summary = DialSweepSummary {
+            dropped_from_list: self
+                .peer_dial_info
+                .keys()
+                .filter(|known| !peers.iter().any(|p| p.secondary_id == known.as_str()))
+                .cloned()
+                .collect(),
+            ..Default::default()
+        };
+        summary.dropped_from_list.sort();
         self.peer_dial_info.clear();
         self.peer_dial_info.extend(
             peers
@@ -484,8 +596,10 @@ impl<I: Identifier> PeerNetwork<I> {
             if peer_info.secondary_id == self.peer_id {
                 continue; // Skip self
             }
+            summary.listed += 1;
 
             if self.connections.contains_key(&peer_info.secondary_id) {
+                summary.already_connected += 1;
                 continue; // Already connected (from accept loop)
             }
 
@@ -519,17 +633,35 @@ impl<I: Identifier> PeerNetwork<I> {
             // eliminates the duplicate scenario: there is at most
             // one WSS pipe per pair. The accept loop on the
             // higher-id side handles the inbound dial as before.
-            if self.peer_id.as_str() > peer_info.secondary_id.as_str() {
+            if !self.dials_outbound_to(&peer_info.secondary_id) {
                 tracing::debug!(
                     self_id = %self.peer_id,
                     peer = %peer_info.secondary_id,
                     "skipping dial: peer has lower id, expecting them to initiate"
                 );
+                summary
+                    .awaiting_inbound
+                    .push(peer_info.secondary_id.clone());
                 continue;
             }
 
-            self.spawn_dial_task(peer_info.clone());
+            summary.spawned += 1;
+            self.spawn_dial_task(peer_info.clone(), dial::DialAttempt::Initial);
         }
+        summary.awaiting_inbound.sort();
+        summary
+    }
+
+    /// THE lower-id-dials predicate — the single owner of the dial-side
+    /// ownership rule: this node dials `peer_id` iff our id sorts
+    /// lexicographically LOWER than the peer's. The higher-id side
+    /// NEVER dials; its mesh leg to the peer exists only if the peer's
+    /// inbound dial lands on our accept loop. Consulted by the initial
+    /// sweep (`connect_to_peers`), the redial path (`spawn_redial`),
+    /// and the reconnect-summary narration (`process_reconnect_tick`),
+    /// so all three agree by construction.
+    fn dials_outbound_to(&self, peer_id: &str) -> bool {
+        self.peer_id.as_str() < peer_id
     }
 
     /// Drain any newly accepted incoming connections and register them.
@@ -596,12 +728,30 @@ impl<I: Identifier> PeerNetwork<I> {
                 // (membership churn) and not worth suppressing the WARN
                 // over — the count alone is still operator-useful.
                 .unwrap_or_else(|| "<unknown>".to_string());
-            tracing::warn!(
-                peer = %summary.peer_id,
-                addr = %dialed,
-                consecutive_failed_dials = summary.attempts,
-                "peer unreachable; dialing address — verify it is peer-routable"
-            );
+            // Dial-side truthfulness (#362): on the higher-id side this
+            // node NEVER dials (lower-id-dials rule), so "dialing
+            // address" would be a lie that sends the operator chasing
+            // local dial failures that do not exist. Name the real
+            // dependency instead: the missing leg can only come from
+            // the PEER's inbound dial — its logs hold the failure.
+            if self.dials_outbound_to(&summary.peer_id) {
+                tracing::warn!(
+                    peer = %summary.peer_id,
+                    addr = %dialed,
+                    consecutive_failed_dials = summary.attempts,
+                    "peer unreachable; dialing address — verify it is peer-routable"
+                );
+            } else {
+                tracing::warn!(
+                    peer = %summary.peer_id,
+                    peer_advertised_addr = %dialed,
+                    ticks_disconnected = summary.attempts,
+                    "peer leg missing; this node NEVER dials it (lower-id-dials \
+                     rule — the peer's id sorts lower, so IT dials US): check \
+                     THAT peer's logs for dial failures toward this node and \
+                     verify this node's advertised address is peer-routable"
+                );
+            }
         }
 
         for peer_id in outcome.to_dial {
@@ -613,25 +763,47 @@ impl<I: Identifier> PeerNetwork<I> {
     /// info AND we own the dial-side of the lower-id-dials rule.
     /// Called whenever the [`Router`] emits a redial signal — i.e. on
     /// the first observation of an active relay relationship with
-    /// `peer_id` (or first re-observation past `REDIAL_COOLDOWN`).
-    /// Silent on attempt and silent on failure: the only operator-
-    /// visible signal that the peer is reachable again is the
-    /// Router's `Relay → Direct` info log on the next send through
-    /// the restored peer.
+    /// `peer_id` (or first re-observation past `REDIAL_COOLDOWN`) —
+    /// and on every reconnect tick for a tracked-disconnected peer.
+    ///
+    /// Attempt narration rides the spawned dial itself (`dial_peer`
+    /// logs start + outcome with the redial's attempt count); the
+    /// skip branches log at DEBUG (they fire every 5s tick for a
+    /// tracked peer, so operator-level visibility for the skip facts
+    /// belongs to the throttled summary in `process_reconnect_tick`).
+    /// A heal is still narrated where it always was: the tracker's
+    /// `peer reconnected` INFO + the registration INFO.
     fn spawn_redial(&self, peer_id: &str) {
         if self.connections.contains_key(peer_id) {
-            return; // already directly connected (mid-heal: prior dial
-            // landed but the cooldown timestamp is still hot).
-            // Skipping avoids a duplicate WSS pipe whose sender
-            // would later be discarded by drain_new_connections.
+            // already directly connected (mid-heal: prior dial landed
+            // but the cooldown timestamp is still hot). Skipping avoids
+            // a duplicate WSS pipe whose sender would later be
+            // discarded by drain_new_connections.
+            tracing::debug!(peer = %peer_id, "redial skipped: already connected");
+            return;
         }
         let Some(peer_info) = self.peer_dial_info.get(peer_id).cloned() else {
-            return; // peer no longer in the authoritative cluster list
+            // peer no longer in the authoritative cluster list
+            tracing::debug!(
+                peer = %peer_id,
+                "redial skipped: peer not in the authoritative dial list"
+            );
+            return;
         };
-        if self.peer_id.as_str() > peer_id {
-            return; // higher-id side: lower-id-dials rule, accept loop handles inbound
+        if !self.dials_outbound_to(peer_id) {
+            // higher-id side: lower-id-dials rule, accept loop handles
+            // inbound. The throttled `peer leg missing` summary names
+            // this structural fact at WARN level.
+            tracing::debug!(
+                peer = %peer_id,
+                "redial skipped: lower-id-dials rule (the peer dials us)"
+            );
+            return;
         }
-        self.spawn_dial_task(peer_info);
+        let attempt = dial::DialAttempt::Redial {
+            attempt: self.reconnect_tracker.attempts_for(peer_id).unwrap_or(0),
+        };
+        self.spawn_dial_task(peer_info, attempt);
     }
 
     /// Spawn a per-peer outgoing dial task: race QUIC/WSS via
@@ -639,14 +811,32 @@ impl<I: Identifier> PeerNetwork<I> {
     /// `new_conn_tx` so the caller's next `drain_new_connections`
     /// picks it up. Single dispatch shape used by both the initial-
     /// dial path (`connect_to_peers`) and the redial path
-    /// (`spawn_redial`); failed dials exit silently in both cases.
-    fn spawn_dial_task(&self, peer_info: PeerConnectionInfo) {
+    /// (`spawn_redial`).
+    ///
+    /// No-silent-vanish contract (#362): the spawned task's
+    /// `JoinHandle` is detached, so a panicked or cancelled dial task
+    /// would otherwise produce NO outcome line at all — neither
+    /// success nor failure — and the dial would just vanish (the
+    /// "spawned but never concluded" shape). The [`DialTaskGuard`]
+    /// makes that impossible-or-loud: it is defused only after
+    /// `dial_peer` returned (which itself logs every outcome), so a
+    /// task dropped mid-dial (LocalSet teardown) or unwound by a
+    /// panic emits the guard's WARN from its `Drop`. A success whose
+    /// registration channel is already closed is likewise named, not
+    /// swallowed.
+    fn spawn_dial_task(&self, peer_info: PeerConnectionInfo, attempt: dial::DialAttempt) {
         let incoming_tx = self.incoming_tx.clone();
         let new_conn_tx = self.new_conn_tx.clone();
         let disconnect_tx = self.disconnect_tx.clone();
         tokio::task::spawn_local(async move {
             let peer_id = peer_info.secondary_id.clone();
-            let Some(connection) = dial::dial_peer(&peer_id, &peer_info).await else {
+            let mut guard = DialTaskGuard::new(peer_id.clone(), attempt);
+            let outcome = dial::dial_peer(&peer_id, &peer_info, attempt).await;
+            // `dial_peer` has logged the outcome (success or failure with
+            // reasons) — the dial CONCLUDED, so the abort guard stands
+            // down regardless of which it was.
+            guard.defuse();
+            let Some(connection) = outcome else {
                 return;
             };
             let outgoing_tx = handler::spawn_outgoing_handler(
@@ -655,10 +845,23 @@ impl<I: Identifier> PeerNetwork<I> {
                 incoming_tx,
                 disconnect_tx,
             );
-            let _ = new_conn_tx.send(AcceptedPeer {
-                peer_id,
-                outgoing_tx,
-            });
+            if new_conn_tx
+                .send(AcceptedPeer {
+                    peer_id: peer_id.clone(),
+                    outgoing_tx,
+                })
+                .is_err()
+            {
+                // Registration sink closed (network tearing down): the
+                // freshly dialed connection is dropped on the floor.
+                // Name it — a silently discarded SUCCESS is the most
+                // confusing flavor of silent branch.
+                tracing::warn!(
+                    peer = %peer_id,
+                    "dialed peer connection established but the registration \
+                     channel is closed (network tearing down); dropping it"
+                );
+            }
         });
     }
 

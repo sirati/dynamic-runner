@@ -14,6 +14,10 @@
 //!   dial-failure summary emitted from `process_reconnect_tick` —
 //!   carries the dialed address + consecutive-failure count, throttled
 //!   to the summary threshold/recurrence boundaries.
+//! - [`dial_sweep`]: the `connect_to_peers` sweep-summary dispositions
+//!   (#362) — spawned / already-connected / awaiting-inbound (lower-id
+//!   rule) / dropped-from-list — plus the higher-id side's truthful
+//!   "peer leg missing, this node never dials it" summary WARN.
 //! - [`log_capture`]: shared tracing capture layer + `pump_b_until`
 //!   used by the silent-reconnect + dial-failure-summary scenarios;
 //!   kept here because they observe the framework log trace.
@@ -33,6 +37,7 @@ pub(crate) struct TestId(pub(crate) String);
 mod bootstrap_redial;
 mod cert_parsing;
 mod dial_failure_summary;
+mod dial_sweep;
 mod log_capture;
 mod primary_link;
 mod reader_exit_disconnect;
