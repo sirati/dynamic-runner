@@ -36,7 +36,7 @@ use std::time::Duration;
 /// A disabled OOM watcher: the gate/sweep tests never exercise the
 /// kernel-OOM reclassifier, so a flat-layout watcher (no workers cgroup
 /// path) is sufficient — `kernel_oom_recent` always reads false.
-fn test_oom_watcher() -> OomWatcher {
+pub(super) fn test_oom_watcher() -> OomWatcher {
     OomWatcher::new_with_workers_cgroup(
         OomWatcherConfig {
             sample_interval: Duration::from_millis(50),
@@ -51,7 +51,7 @@ fn test_oom_watcher() -> OomWatcher {
 /// Build a `SecondaryConfig` for a single-worker pool. The defaults are
 /// the production-shaped values from `r1`'s dispatch test; only
 /// `num_workers = 1` and the id matter for these direct-call tests.
-fn one_worker_config(secondary_id: &str) -> SecondaryConfig {
+pub(super) fn one_worker_config(secondary_id: &str) -> SecondaryConfig {
     SecondaryConfig {
         secondary_id: secondary_id.into(),
         num_workers: 1,

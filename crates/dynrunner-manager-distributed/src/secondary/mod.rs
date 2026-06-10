@@ -36,6 +36,7 @@ use crate::zip_extract::ExtractionCache;
 
 use self::lifecycle::{MeshFormation, SecondaryLifecycle};
 
+pub mod control;
 mod coordinator;
 mod dispatch;
 mod election;
@@ -61,6 +62,7 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
+pub use control::SecondaryControlCommand;
 pub use primary_link::DEFAULT_PRIMARY_SILENCE_BACKSTOP;
 pub use types::{
     FinalizeRunConfigFn, PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryTerminal,
@@ -353,6 +355,49 @@ where
     /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
     /// rationale.
     pub(super) task_completed_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Worker custom-message dispatcher channel SENDER, paired with
+    /// `worker_message_rx`. The worker-event bridge
+    /// (`processing/worker_event.rs`, the `WorkerEvent::CustomMessage`
+    /// arm) enqueues one [`crate::worker_messages::WorkerCustomMessage`]
+    /// per inbound worker custom frame; the dispatcher task drains and
+    /// fans out to the registered listeners OFF the operational loop
+    /// (the consumer's `worker_message_listener` runs Python).
+    pub(super) worker_message_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::worker_messages::WorkerCustomMessage>,
+
+    /// Worker custom-message dispatcher channel receiver. Same
+    /// single-shot / `mem::take`-at-first-entry semantics as
+    /// `lifecycle_rx` / `task_completed_rx`.
+    pub(super) worker_message_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::worker_messages::WorkerCustomMessage>,
+    >,
+
+    /// Consumers of worker custom-message events; same single-shot
+    /// `mem::take`-at-run semantics as `task_completed_listeners`.
+    pub(super) worker_message_listeners:
+        Vec<Box<dyn crate::worker_messages::WorkerMessageListener>>,
+
+    /// Handle to the worker-message dispatcher task. Mirrors
+    /// `task_completed_dispatcher_handle` — same Drop-vs-explicit
+    /// cleanup rationale.
+    pub(super) worker_message_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Secondary control-plane ingress SENDER (cloned to external
+    /// surfaces via [`Self::secondary_control_sender`] — today the
+    /// PyO3 `SecondaryHandle.send_to_worker`). Commands land on
+    /// `secondary_control_rx` and are drained by a dedicated
+    /// `process_tasks` select arm, so external callers act on this
+    /// node's workers WITHOUT touching the pool from a foreign task
+    /// (the dispatch-decoupling law).
+    pub(super) secondary_control_tx:
+        tokio::sync::mpsc::UnboundedSender<control::SecondaryControlCommand>,
+
+    /// Secondary control-plane ingress receiver. Taken into a
+    /// loop-local at `process_tasks` entry (the same take-once
+    /// discipline as `fatal_exit_signal_rx`).
+    pub(super) secondary_control_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<control::SecondaryControlCommand>>,
 
     /// Announcer-outbox sender. Cloned out via
     /// [`Self::attach_observer_announcer`] into the

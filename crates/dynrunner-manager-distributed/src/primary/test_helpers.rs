@@ -206,6 +206,8 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { .. }) => {
                         let _ = runner.send(Response::Done { result_data: None }).await;
                     }
@@ -258,6 +260,8 @@ impl WorkerFactory<ChannelManagerEnd> for SlowFakeWorkerFactory {
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { relative_path, .. }) => {
                         let delay = markers
                             .iter()
@@ -325,6 +329,8 @@ impl WorkerFactory<ChannelManagerEnd> for FlakyWorkerFactory {
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { relative_path, .. }) => {
                         // Per-task attempt counter, shared across
                         // workers via Rc<RefCell>. Increment first
@@ -432,6 +438,8 @@ impl WorkerFactory<ChannelManagerEnd> for ScriptedWorkerFactory {
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
+                    // Test fixtures ignore consumer custom messages.
+                    Some(Command::Custom { .. }) => {}
                     Some(Command::ProcessTask { relative_path, .. }) => {
                         *run_counts
                             .lock()
