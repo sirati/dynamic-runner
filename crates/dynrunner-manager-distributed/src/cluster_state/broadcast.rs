@@ -166,6 +166,9 @@ fn stamp_versions<I: Identifier>(
             | ClusterMutation::PhaseEnded { .. }
             | ClusterMutation::RunComplete
             | ClusterMutation::RunAborted { .. }
+            // `GracefulAbortRequested` is version-LESS: a payload-free
+            // sticky false→true latch (join = OR), like `RunComplete`.
+            | ClusterMutation::GracefulAbortRequested
             | ClusterMutation::DiscoveryDebtDeclared
             | ClusterMutation::DiscoverySettled
             | ClusterMutation::PeerRemoved { .. }

@@ -214,6 +214,51 @@ async fn respawn_dispatcher_fires_spawner_on_peer_removed() {
         .await;
 }
 
+/// Under the replicated graceful-abort freeze a departing secondary must
+/// NOT be replaced: the fleet is draining DOWN by design, so
+/// `dispatch_respawn_request` suppresses the request BEFORE the budget —
+/// no spawner call, no respawn task, no ledger entry (a drain departure
+/// never consumes budget either).
+#[tokio::test(flavor = "current_thread")]
+async fn respawn_suppressed_under_graceful_abort() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _mesh) = make_coordinator();
+            let spawner = Arc::new(MockSpawner::new());
+            let calls = Arc::clone(&spawner.calls);
+            coordinator.enable_respawn(
+                spawner.clone(),
+                permissive_budget(),
+                "tcp://127.0.0.1:5555".into(),
+                "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+            );
+            // Latch the replicated dispatch freeze (the fact a drained
+            // secondary departs under).
+            coordinator
+                .cluster_state
+                .apply(dynrunner_protocol_primary_secondary::ClusterMutation::GracefulAbortRequested);
+
+            coordinator.dispatch_respawn_request(RespawnRequest {
+                original_id: "secondary-0".into(),
+                cause: RemovalCause::SelfDeparture(dynrunner_core::BoundedString::from(
+                    "graceful abort: local work drained".to_string(),
+                )),
+            });
+
+            assert!(
+                coordinator.respawn_tasks.is_empty(),
+                "no respawn future may be spawned under the graceful-abort freeze"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "spawner never invoked");
+            assert!(
+                coordinator.cluster_state.respawn_events().is_empty(),
+                "a suppressed request must not consume replicated respawn budget"
+            );
+        })
+        .await;
+}
+
 /// Policy-disabled coordinators must never register the
 /// dispatcher listener and never invoke a spawner — even when a
 /// `Removed` event is delivered directly via the lifecycle

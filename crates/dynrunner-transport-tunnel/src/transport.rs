@@ -331,6 +331,19 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
             }
         }
         if !dead.is_empty() {
+            // Registry shrink is operator-significant: this transport has NO
+            // dial path, so a pruned peer comes back ONLY when it re-dials
+            // AND speaks (the accept loop registers a connection on its
+            // first inbound frame). Silent pruning is exactly how the
+            // demoted-submitter's writer table emptied invisibly while its
+            // anti-entropy broadcasts kept "succeeding" over nobody.
+            tracing::warn!(
+                pruned = ?dead,
+                remaining = self.outgoing.borrow().len().saturating_sub(dead.len()),
+                "broadcast found dead peer writers; pruning them from the mesh \
+                 registry (no dial path here — each peer rejoins only by \
+                 re-dialing and sending a frame)"
+            );
             let mut outgoing = self.outgoing.borrow_mut();
             for peer_id in &dead {
                 outgoing.remove(peer_id);

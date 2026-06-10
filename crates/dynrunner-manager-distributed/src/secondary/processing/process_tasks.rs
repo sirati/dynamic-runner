@@ -41,6 +41,7 @@ const ARM_PANIK: usize = 6;
 const ARM_FATAL_EXIT: usize = 7;
 const ARM_ANTI_ENTROPY: usize = 8;
 const ARM_SECONDARY_CONTROL: usize = 9;
+const ARM_REPORT_REPLAY: usize = 10;
 
 /// Arm names, index-aligned with the `ARM_*` ids above (render order of the
 /// compact stats line).
@@ -55,6 +56,7 @@ const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
     "fatal_exit",
     "anti_entropy",
     "secondary_control",
+    "report_replay",
 ];
 
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
@@ -252,6 +254,18 @@ where
         loop {
             // Workers that need restart after disconnect
             let mut workers_to_restart: Vec<WorkerId> = Vec::new();
+
+            // Replay wake deadline: the EARLIEST `next_due` across the
+            // retained confirmable reports (None parks the arm —
+            // nothing pending). Recomputed each iteration from the
+            // PERSISTENT per-entry schedule state, so the arm's
+            // re-created `sleep_until` always targets the same stored
+            // instant — sibling arms firing cannot push the deadline
+            // back (the watchdog-fires-under-load law). Buffer changes
+            // (a new retention from any arm's send, an inbound
+            // TerminalAck dropping an entry) are picked up here on the
+            // next iteration.
+            let next_replay_due = self.next_report_replay_due();
 
             // Cancellation safety note: every awaiting arm here must be
             // cancel-safe because the periodic ticks (keepalive, oom)
@@ -618,6 +632,33 @@ where
                     );
                     let _ = self.send_to(Destination::All, frame).await;
                 }
+                // Buffered-report-replay WAKE arm: re-deliver a retained
+                // confirmable report (terminal / IMPORTANT custom) when
+                // its per-entry backoff slot comes due — `sleep_until`
+                // the buffer-wide minimum deadline computed above, parked
+                // on `pending()` while nothing is retained. This replaces
+                // the pre-backoff per-iteration drain call (which re-sent
+                // a never-ackable report at loop speed — the ~61/s
+                // production replay flood): the drain now runs only when
+                // something is DUE, plus the `record_primary_message`
+                // route-restored edge (`drain_report_replays_now`).
+                //
+                // Cancel-safety: `sleep_until` consumes nothing, and the
+                // deadline is PERSISTENT per-entry state (`next_due`), so
+                // a sibling arm winning the race merely re-creates the
+                // future against the SAME instant next iteration — the
+                // arm cannot be starved into never firing by a busy loop.
+                _ = async {
+                    match next_replay_due {
+                        Some(due) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    arm_stats.record(ARM_REPORT_REPLAY);
+                    self.drain_report_replays().await;
+                }
             }
 
             // Flush any deferred peer messages — each names a concrete
@@ -633,19 +674,13 @@ where
                     .await;
             }
 
-            // Re-deliver any terminal-bearing report not yet CONFIRMED at
-            // the authority (the buffered-terminal-replay edge): a no-route
-            // absorb re-sends every tick, and a sent-but-unacked report
-            // replays once its `delivery_ack_timeout` elapses (#352 — the
-            // blackholed-but-live-leg detection); only the primary's
-            // `TerminalAck` drops an entry. FIFO, retrying forever; a
-            // still-no-route re-absorb re-buffers. No-op when the buffer is
-            // empty and silent while entries merely await a fresh ack (the
-            // steady-state hot paths). This is the PERIODIC re-delivery
-            // trigger; the `record_primary_message` primary-link-recovery
-            // edge is the fast complement (drains the instant a primary
-            // message resumes, ahead of the next tick).
-            self.drain_report_replays().await;
+            // NOTE: buffered-report-replay re-delivery is NOT a
+            // per-iteration call here any more — it is the dedicated
+            // wake arm in the `select!` above (parked on the per-entry
+            // backoff deadlines via `next_report_replay_due`), plus the
+            // `record_primary_message` route-restored edge. The old
+            // per-iteration drain re-sent a never-ackable report at
+            // loop speed (the production replay flood).
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh
             // watchdog) detected an unrecoverable fault, queued the
@@ -715,6 +750,33 @@ where
                 .unwrap_or(true);
             if run_complete && no_active_tasks {
                 tracing::info!("RunComplete signal received from primary; exiting");
+                break;
+            }
+
+            // Graceful-abort drain exit: the replicated dispatch freeze is
+            // latched and THIS secondary's last running task has completed,
+            // so it tears down NOW — mid-run, before the primary's terminal
+            // `RunComplete` — announcing a DELIBERATE self-departure first
+            // (the existing graceful-leave path; see
+            // `announce_graceful_drain_departure` for why this never trips
+            // the failover/respawn machinery). EXCLUDED while this host is
+            // the recognized PRIMARY's node: the co-resident secondary and
+            // the primary share the node id, so a self-`PeerRemoved` here
+            // would bury the live primary's membership entry. That node
+            // parks instead until the primary either relocates away (the
+            // `current_primary` re-point releases this gate) or finalizes
+            // the drained run (`RunComplete` → the break above) — exactly
+            // the graceful protocol's last-holder shape.
+            if self.cluster_state.graceful_abort_requested()
+                && no_active_tasks
+                && self.cluster_state.current_primary() != Some(self.config.secondary_id.as_str())
+            {
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "graceful abort: local work drained; announcing deliberate \
+                     departure and exiting cleanly"
+                );
+                self.announce_graceful_drain_departure().await;
                 break;
             }
 

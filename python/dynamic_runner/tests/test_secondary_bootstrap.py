@@ -295,6 +295,18 @@ class CrashLogEndToEndTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"stderr:\n{proc.stderr}")
         self.assertFalse(crash_log.exists(), "clean exit must not be recorded")
 
+    def test_deliberate_nonzero_exit_writes_no_crash_log(self) -> None:
+        # The asm-dataset 2212c136 shape: a secondary deliberately
+        # `sys.exit(1)`s after the primary broadcast RunAborted. SystemExit
+        # (any code) is raise-by-design — the exit code must survive
+        # unchanged, but it is NOT a crash and must never be crash-dumped.
+        proc, crash_log = self._run_child("import sys\nsys.exit(1)\n")
+        self.assertEqual(proc.returncode, 1, f"stderr:\n{proc.stderr}")
+        self.assertFalse(
+            crash_log.exists(),
+            "deliberate SystemExit(1) must not be filed as a bootstrap crash",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

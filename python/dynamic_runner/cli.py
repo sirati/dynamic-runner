@@ -356,7 +356,14 @@ def add_framework_arguments(
             "(`peer_transport.join_running_cluster`). On success the "
             "observer restores the snapshot, joins steady-state broadcasts, "
             "and exits when the cluster broadcasts RunComplete. Mutually "
-            "exclusive with --secondary (a secondary is not a late-joiner)."
+            "exclusive with --secondary (a secondary is not a late-joiner). "
+            "GRACEFUL ABORT: sending SIGUSR2 to an observer process (this "
+            "late-joiner, or the relocated submitter) asks the primary to "
+            "stop scheduling new tasks; running tasks finish, each "
+            "secondary tears down as it drains, and the run ends with the "
+            "graceful-abort verdict (distinct from success and from a hard "
+            "abort). Re-send the signal to retry if the primary was "
+            "mid-failover."
         ),
     )
     parser.add_argument(
@@ -426,6 +433,19 @@ def add_framework_arguments(
         help="Per-secondary scratch directory where staged files land. "
         "Defaults to /app/src-tmp in container deployments or a system tempdir "
         "otherwise.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Per-secondary output directory — the publish target every "
+        "worker receives as its --output. Spawn paths regenerate it "
+        "per-secondary: the --multi-computer local dispatcher passes its "
+        "resolved --output so all same-host secondaries publish straight "
+        "into the operator's output directory (mirroring the SLURM "
+        "wrapper's user-visible /app/out-network bind-mount). Defaults to "
+        "/app/out-network in container deployments or a per-secondary "
+        "tempdir otherwise.",
     )
     parser.add_argument(
         "--gateway",

@@ -255,6 +255,30 @@ pub enum ClusterMutation<I> {
     RunAborted {
         reason: String,
     },
+    /// "STOP scheduling new work — let the running work finish and let
+    /// the fleet drain." The graceful sibling of [`Self::RunAborted`]:
+    /// a hard abort tears the run down NOW; a graceful abort freezes
+    /// dispatch (no new assignments leave the ready pool) while every
+    /// in-flight task runs to completion, each secondary tears down as
+    /// its own work drains, and the run finally terminates with the
+    /// graceful-abort verdict (`RunComplete` broadcast WITH this latch
+    /// set — the verdict is the COMPOSITION of the two sticky facts;
+    /// there is deliberately NO third terminal mutation).
+    ///
+    /// Originated ONLY by the authoritative primary, on receipt of an
+    /// observer's `DistributedMessage::GracefulAbortRequest` (the ONE
+    /// management command a zero-authority observer may send). Broadcast
+    /// over the canonical `apply_and_broadcast_cluster_mutations` path so
+    /// every replica's mirror latches it; replicated (snapshot + AE
+    /// digest) so a failover-promoted primary INHERITS the freeze and
+    /// also refuses to schedule (the no-redo law).
+    ///
+    /// Payload-free latch-SET, NOT a `Set(bool)` toggle — the
+    /// monotonicity lives in the apply rule (sticky `false → true`,
+    /// NoOp on re-application), exactly the [`Self::RunComplete`]
+    /// shape. There is no un-abort: once requested, the freeze holds
+    /// for the rest of the run.
+    GracefulAbortRequested,
     /// "This run still OWES discovery." Sets the replicated
     /// `discovery_debt` lattice to `Owed`.
     ///

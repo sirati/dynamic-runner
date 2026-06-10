@@ -115,11 +115,13 @@ pub(super) fn push_timeout_query<I: Identifier>(
 }
 
 /// The failover quorum size for a live mesh of `live_peer_count` peers
-/// (the count of [`SecondaryCoordinator::live_peer_ids`], which is
-/// `peer_keepalives` MINUS the current primary — so it is the set of peers
-/// that could vote/become-candidate, NOT counting the node being
-/// failed-over-FROM). The voter itself is NOT in `live_peer_count`; the
-/// caller adds itself (`+1`) when tallying agreement/confirms against this.
+/// (the count of [`SecondaryCoordinator::failover_quorum_peer_count`]: the
+/// candidate/voter-eligible [`SecondaryCoordinator::live_peer_ids`] PLUS
+/// the current primary while the mesh membership still lists it — a
+/// member-listed primary is role-excluded from candidacy but NOT gone, so
+/// it must not shrink the denominator). The voter itself is NOT in
+/// `live_peer_count`; the caller adds itself (`+1`) when tallying
+/// agreement/confirms against this.
 ///
 /// SINGLE SOURCE for the rule (CLAUDE.md: no duplicated logic). It is
 /// consulted at BOTH the Suspecting-tally site and the

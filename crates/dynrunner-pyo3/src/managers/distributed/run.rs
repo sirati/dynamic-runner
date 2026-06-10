@@ -20,6 +20,7 @@ use crate::config::connection::ConnectionMode;
 use crate::identifier::RunnerIdentifier;
 use crate::managers::secondary::run::{
     PromotedPrimaryRecipeInputs, build_promoted_primary_recipe, build_setup_discovery_fn,
+    promoted_command_channel_cell,
 };
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
@@ -288,8 +289,20 @@ impl PyDistributedManager {
         // `handle()` calls. Mirrors `PyPrimaryCoordinator::run`.
         let wiring = self.control_plane.take_for_run()?;
         let unfulfillable_reinject_max_per_task = wiring.cap_snapshot;
-        let command_tx = wiring.command_tx;
-        let command_rx = wiring.command_rx;
+        // The ONE Python `PrimaryHandle` command channel, wrapped in the
+        // shared take-once cell every promotable secondary's recipe clones.
+        // Under mesh-always the setup peer ALWAYS relocates the primary onto
+        // an in-process secondary, so the channel must follow the AUTHORITY:
+        // the relocate winner claims the pair at promotion
+        // (`replace_command_channel`) and services the consumer's
+        // `on_phase_end → primary_handle.spawn_tasks` lazy-injection. The
+        // setup peer keeps the internal channel `PrimaryCoordinator::new`
+        // mints (its pre-relocate window only ever drains its own
+        // custom-message-handler commands); handle commands issued before the
+        // promotion buffer in the channel and are drained by the promoted
+        // primary's loop.
+        let python_command_channel =
+            promoted_command_channel_cell(wiring.command_tx, wiring.command_rx);
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -311,6 +324,15 @@ impl PyDistributedManager {
         // raises a `PyRuntimeError` so the wrapper does not return
         // exit 0.
         let mut duplicate_task_id_pre_phase: Option<RunError> = None;
+        // Cluster-wide `RunAborted` OBSERVED by the setup node after it
+        // relocated (the promoted authority broadcast the verdict). Carries
+        // the broadcast reason VERBATIM — `RunAborted` is the general abort
+        // verdict (a #3a duplicate, a consumer-hook fatal-exit, an
+        // empty-drain honesty abort, ...), so it must NOT be re-typed as
+        // `DuplicateTaskIdPrePhase` (which appends a fix-your-duplicate-ids
+        // lecture that misdirects the operator for every non-duplicate
+        // abort). Mirrors `PyPrimaryCoordinator::run`'s `relocated_aborted`.
+        let mut relocated_aborted: Option<String> = None;
         // Policy-abort terminal — `Some(RunError::FatalPolicyExit)` iff the
         // node's terminal was a deliberate policy abort (a panicked role task,
         // or an invalid-task fatal-exit). RAISES at the GIL-side tail (never
@@ -414,6 +436,11 @@ impl PyDistributedManager {
                     // primary on relocation) needs its own.
                     let promote_scheduler_config = scheduler_config.clone();
                     let promote_estimator = estimator.clone();
+                    // Every promotable secondary's recipe clones the SAME
+                    // take-once cell holding the ONE Python `PrimaryHandle`
+                    // command channel; the relocate winner claims the pair so
+                    // the handle reaches the live authority.
+                    let promote_command_channel = python_command_channel.clone();
                     // The run's phase graph for this secondary's discovery
                     // policy (pre-staged path) — the relocate target pairs it
                     // with the discovered corpus in `discover_on_promotion`.
@@ -694,11 +721,13 @@ impl PyDistributedManager {
                         // per-secondary `on_phase_*`) and, on the pre-staged
                         // path, runs `discover_on_promotion` with the
                         // per-secondary discovery policy on the shared host fs.
-                        // `command_channel: None` — the ONE Python `PrimaryHandle`
-                        // is held by the setup peer; the promoted primary keeps
-                        // the internal command channel `new` mints (the run loop
-                        // is fully driven; only runtime `spawn_tasks` via that
-                        // handle does not re-route to the relocated primary).
+                        // `command_channel` — the shared take-once cell holding
+                        // the ONE Python `PrimaryHandle` command channel. The
+                        // relocate winner claims the pair at promotion so the
+                        // consumer's `on_phase_end → spawn_tasks` lazy-injection
+                        // reaches the live authority (pre-cell, the channel died
+                        // with the demoted setup peer and every composite-run
+                        // spawn raised "command channel closed").
                         let promote = build_promoted_primary_recipe(PromotedPrimaryRecipeInputs {
                             secondary_id: sec_id_for_slot.clone(),
                             custom_message_handler_def: sec_custom_message_handler_def,
@@ -709,7 +738,7 @@ impl PyDistributedManager {
                             oom_retry_max_passes: dist_oom_retry_max_passes,
                             scheduler_config: promote_scheduler_config,
                             estimator: promote_estimator,
-                            command_channel: None,
+                            command_channel: promote_command_channel,
                             on_phase_start: sec_on_phase_start,
                             on_phase_end: sec_on_phase_end,
                             phase_hook_raise_latch: sec_phase_hook_raise_latch,
@@ -862,11 +891,16 @@ impl PyDistributedManager {
                     estimator,
                 );
 
-                // Swap in the Python-facing command channel so the
-                // `PrimaryHandle` Python is holding talks to the same
-                // receiver the operational loop reads from. Same
-                // pre-`run()` contract as `PyPrimaryCoordinator`.
-                primary.replace_command_channel(command_tx, command_rx);
+                // The setup peer deliberately does NOT take the Python-facing
+                // command channel: under mesh-always it relocates the primary
+                // role before any phase runs, and a channel consumed here would
+                // die with the demoted-to-observer coordinator (the
+                // composite-run "command channel closed" regression). The pair
+                // lives in `python_command_channel` (the shared take-once cell
+                // every promotable secondary's recipe holds) and is claimed by
+                // the relocate winner; the setup peer keeps the internal
+                // channel `PrimaryCoordinator::new` minted for its own
+                // pre-relocate window.
 
                 // Wire the on_phase_end raise-latch (built above, captured
                 // by the in-process primary's closure) onto the
@@ -877,8 +911,9 @@ impl PyDistributedManager {
                 // Install the consumer custom-message hook (F5) on the
                 // setup peer too — a custom message can land during the
                 // pre-relocate bootstrap window. Built from THIS
-                // coordinator's command sender (post-`replace_command_channel`,
-                // so the handler's spawn_tasks reaches its loop).
+                // coordinator's command sender (its INTERNAL channel — the
+                // Python channel belongs to the eventual promoted primary),
+                // which the setup peer drains during its bootstrap waits.
                 if let Some(def) = setup_custom_message_handler_def {
                     match crate::custom_message_bridge::make_custom_message_handler(
                         def,
@@ -1029,13 +1064,21 @@ impl PyDistributedManager {
                 // (uniform with `PyPrimaryCoordinator::run`).
                 match outcome.terminal {
                     RunTerminal::Done => {}
+                    RunTerminal::GracefulAbort { reason } => {
+                        // Operator-requested graceful abort ran its drain
+                        // protocol to the end. A DELIBERATE clean wind-down:
+                        // reported loudly (distinct from a silent success),
+                        // exits 0 (distinct from the hard-abort raise).
+                        tracing::warn!(verdict = %reason, "run gracefully aborted");
+                    }
                     RunTerminal::Aborted { reason } => {
-                        // A cluster-wide `RunAborted` surfaced as the terminal
-                        // (the in-process primary broadcasts it on #3a). Carry
-                        // the reason as a structured duplicate marker so the
-                        // GIL-side tail raises.
-                        duplicate_task_id_pre_phase =
-                            Some(RunError::DuplicateTaskIdPrePhase { reason });
+                        // A cluster-wide `RunAborted` observed by the setup
+                        // node. Carry the broadcast reason VERBATIM — the
+                        // verdict already names its own cause (#3a duplicate,
+                        // consumer-hook fatal-exit, empty-drain abort, ...);
+                        // re-typing it as `DuplicateTaskIdPrePhase` fabricated
+                        // a duplicate-task-id diagnosis for every abort.
+                        relocated_aborted = Some(reason);
                     }
                     RunTerminal::Panik { matched_path } => {
                         panik_shutdown_path = Some(matched_path);
@@ -1064,6 +1107,23 @@ impl PyDistributedManager {
                                 // compute secondary surfaces this. RAISE rather
                                 // than silently swallow.
                                 no_relocation_target = Some(e);
+                            }
+                            e @ (RunError::AbortedByClusterVerdict { .. }
+                            | RunError::Deposed { .. }) => {
+                                // Run-authority terminals (zombie split-brain
+                                // fix): an adopted cluster RunAborted verdict,
+                                // or a deposed primary that authored no
+                                // verdict. RAISE — never the `Other` swallow's
+                                // false rc=0 (uniform with
+                                // `PyPrimaryCoordinator::run`).
+                                fatal_policy_exit = Some(e);
+                            }
+                            RunError::GracefulAbort { .. } => {
+                                // Unreachable in practice: `Node::run` maps a
+                                // primary's GracefulAbort onto its OWN
+                                // `RunTerminal::GracefulAbort` (handled above),
+                                // never `Failed`. Defensive: treat as the
+                                // graceful verdict, never a raise.
                             }
                             RunError::Other(_) => {
                                 // The PRESERVED stay-local-primary swallow
@@ -1111,6 +1171,16 @@ impl PyDistributedManager {
             // primary already broadcast `RunAborted`; raise here so the
             // Python wrapper sees a non-zero exit instead of exit 0.
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
+
+        if let Some(reason) = relocated_aborted {
+            // The setup node observed a cluster-wide `RunAborted`. Raise the
+            // broadcast reason verbatim (the in-process manager is a library
+            // call, so a PyErr — not the network-submitter's exit(1)); the
+            // reason already names the actual cause.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "run aborted cluster-wide: {reason}"
+            )));
         }
 
         if let Some(err) = fatal_policy_exit {

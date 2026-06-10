@@ -317,6 +317,243 @@ async fn lost_relocation_announcement_non_chosen_follows_new_primary() {
         .await;
 }
 
+/// The EMIT half of the heal (production replay 2212c136, part 1): a
+/// trio-waiting secondary must BROADCAST its own anti-entropy
+/// `StateDigest` on the jittered cadence — from `Configuring`, with the
+/// setup trio incomplete. This is what makes the heal REACHABLE in the
+/// demoted-submitter topology: the submitter's accept loop registers a
+/// (re-dialed) connection only on its FIRST inbound frame, and the
+/// transport-level bootstrap-redial re-fold sends nothing — so a MUTE
+/// trio-wait leaves the wire permanently unregistered and the observer's
+/// digest broadcasts fan over an empty writer table forever (the 4/4
+/// leaderless wedge: observer ticking, secondaries receiving nothing).
+///
+/// REVERT-CHECK: pre-fix this times out — the trio-wait never sends a
+/// single frame after its welcome/cert handshake.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn setup_wait_emits_anti_entropy_digest_on_cadence() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = race_config("sec-0");
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut harness = make_secondary_channel(config, unified);
+            harness.set_bootstrap_primary_id("setup".to_string());
+            let (mut secondary, _guard) = start_secondary_pump(harness);
+
+            // The submitter side, inline: complete the welcome/cert
+            // handshake, send the announce (PeerInfo → `Configuring`), then
+            // WAIT for the secondary's own digest broadcast.
+            let driver = async {
+                let (mut got_welcome, mut got_cert) = (false, false);
+                while !got_welcome || !got_cert {
+                    match sec_to_pri_rx.recv().await.expect("wire open") {
+                        m if matches!(m.msg_type(), MessageType::SecondaryWelcome) => {
+                            got_welcome = true;
+                        }
+                        m if matches!(m.msg_type(), MessageType::CertExchange) => got_cert = true,
+                        _ => {}
+                    }
+                }
+                pri_to_sec_tx
+                    .send(DistributedMessage::PeerInfo {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        peers: Vec::new(),
+                    })
+                    .unwrap();
+                // The pivot: a digest from the trio-waiting secondary within
+                // a couple of anti-entropy periods (the per-node jittered
+                // period is ≤ 25s; paused time auto-advances).
+                loop {
+                    let frame = tokio::select! {
+                        f = sec_to_pri_rx.recv() => f.expect("wire open"),
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => panic!(
+                            "MUTE TRIO-WAIT (the production shape): the secondary \
+                             never broadcast its anti-entropy StateDigest from \
+                             Configuring — a re-dialed bootstrap wire could never \
+                             re-register and the relocation heal stays unreachable"
+                        ),
+                    };
+                    if let DistributedMessage::StateDigest { sender_id, .. } = frame {
+                        assert_eq!(sender_id, "sec-0");
+                        break;
+                    }
+                }
+            };
+
+            let mut factory = FakeWorkerFactory;
+            tokio::select! {
+                res = secondary.run_until_setup_or_done(&mut factory) => {
+                    panic!("setup wait must keep waiting for the trio, got {res:?}");
+                }
+                () = driver => { /* digest observed on the wire */ }
+            }
+        })
+        .await;
+}
+
+/// The relocated-submitter observer behind the production REGISTRATION
+/// GATE (production replay 2212c136, part 2): the secondary's bootstrap
+/// wire flapped at the relocate instant, the `PrimaryChanged { Transferred }`
+/// broadcast is LOST, and the re-dialed wire is UNREGISTERED on the
+/// submitter's accept loop — a connection registers only on its FIRST
+/// inbound frame (`network/accept.rs`), and the bootstrap-redial re-fold
+/// sends nothing. So NOTHING this observer broadcasts reaches the
+/// secondary until the secondary itself speaks on the fresh wire; from
+/// then on the wire is registered and the digest rounds flow.
+async fn registration_gated_observer(
+    digest_rounds: Vec<ClusterState<TestId>>,
+    mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    // Pre-flap handshake — identical to `fake_relocated_observer`.
+    let (mut got_welcome, mut got_cert) = (false, false);
+    while !got_welcome || !got_cert {
+        match from_secondary.recv().await {
+            Some(msg) => match msg.msg_type() {
+                MessageType::SecondaryWelcome => got_welcome = true,
+                MessageType::CertExchange => got_cert = true,
+                _ => {}
+            },
+            None => return,
+        }
+    }
+    to_secondary
+        .send(DistributedMessage::PeerInfo {
+            target: None,
+            sender_id: "setup".into(),
+            timestamp: 0.0,
+            peers: Vec::new(),
+        })
+        .unwrap();
+
+    // ── FLAP: the wire drops at the relocate instant; the relocation
+    // `PrimaryChanged` broadcast is LOST. The secondary re-dials, but the
+    // fresh wire is UNREGISTERED: every digest this observer broadcasts
+    // fans over a writer table that has no entry for the secondary. The
+    // gate models the accept-loop contract — deliver NOTHING until the
+    // secondary's first post-flap frame arrives. ──
+    if from_secondary.recv().await.is_none() {
+        return;
+    }
+
+    // Registered. The observer's digest cadence now reaches the secondary;
+    // same scripted rounds as `fake_relocated_observer`.
+    for donor in digest_rounds {
+        to_secondary
+            .send(DistributedMessage::StateDigest {
+                target: None,
+                sender_id: "setup".into(),
+                timestamp: 0.0,
+                digest: donor.digest(),
+            })
+            .unwrap();
+        loop {
+            match from_secondary.recv().await {
+                Some(msg) => {
+                    if let MessageType::RequestClusterSnapshot = msg.msg_type() {
+                        let snapshot_json = serde_json::to_string(&donor.snapshot())
+                            .expect("donor snapshot serializes");
+                        to_secondary
+                            .send(DistributedMessage::ClusterSnapshot {
+                                target: None,
+                                sender_id: "setup".into(),
+                                timestamp: 0.0,
+                                snapshot_json,
+                            })
+                            .unwrap();
+                        break;
+                    }
+                }
+                None => return,
+            }
+        }
+    }
+    while from_secondary.recv().await.is_some() {}
+}
+
+/// THE full production wedge (2212c136, deterministic 4/4), replayed:
+/// lost relocation announcement + flapped bootstrap wire + the
+/// first-frame registration gate. The heal can only engage end-to-end if
+/// the trio-waiting secondary SPEAKS (its setup-phase anti-entropy digest
+/// is the registering first frame); the observer's digest round then
+/// proves it behind, the snapshot pull restores the primary fact naming
+/// ITSELF, and the `PromotionSignal` fires.
+///
+/// REVERT-CHECK: pre-fix the secondary stays mute, the gate never opens,
+/// no digest is ever delivered, no promotion fires — the leaderless wedge,
+/// surfaced here as the bounded-select panic.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn relocation_heal_engages_through_first_frame_registration_gate() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let config = race_config("sec-0");
+            let observer_handle = tokio::task::spawn_local(registration_gated_observer(
+                vec![donor_with_primary("sec-0")],
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let unified =
+                channel_mesh_to_primary(&config.secondary_id, sec_to_pri_tx, pri_to_sec_rx);
+            let mut harness = make_secondary_channel(config, unified);
+            harness.set_bootstrap_primary_id("setup".to_string());
+            let (_dummy_tx, dummy_rx) = tokio_mpsc::unbounded_channel();
+            let mut promotion_rx = std::mem::replace(&mut harness.promotion_rx, dummy_rx);
+            let (mut secondary, _guard) = start_secondary_pump(harness);
+
+            let mut factory = FakeWorkerFactory;
+            tokio::select! {
+                res = secondary.run_until_setup_or_done(&mut factory) => {
+                    panic!(
+                        "setup wait must keep waiting for the promoted primary's trio, \
+                         got {res:?}"
+                    );
+                }
+                sig = promotion_rx.recv() => {
+                    let sig = sig.expect("promotion channel open");
+                    assert_eq!(
+                        sig.epoch, 1,
+                        "promotion fires at the relocation epoch the snapshot healed"
+                    );
+                }
+                // Generous bound: the secondary's first digest lands within
+                // one jittered period (≤25s) and the heal round-trip is
+                // immediate; 300s of paused time stays below the 600s
+                // unconfigured deadline.
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                    panic!(
+                        "LEADERLESS WEDGE (the production shape): the secondary \
+                         never spoke on the re-dialed wire, the registration gate \
+                         never opened, and the observer's digest heal never fired \
+                         the PromotionSignal"
+                    );
+                }
+            }
+
+            assert_eq!(
+                secondary.cluster_state().current_primary(),
+                Some("sec-0"),
+                "the healed mirror names this secondary the primary"
+            );
+
+            observer_handle.abort();
+        })
+        .await;
+}
+
 /// The seam itself, pinned at the unit level: a snapshot heal that newly
 /// names THIS node primary fires the SAME `PromotionSignal` the live
 /// `PrimaryChanged` apply fires (`on_primary_identity_advanced` is one

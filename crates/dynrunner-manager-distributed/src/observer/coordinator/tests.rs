@@ -223,6 +223,110 @@ async fn observer_returns_on_run_complete() {
         .await;
 }
 
+/// The composed graceful-abort verdict: `run_complete ∧
+/// graceful_abort_requested` already applied ⇒ the observer returns the
+/// DISTINCT `GracefulAbort` terminal (never plain `Done` — the verdict
+/// must not narrate as a clean success).
+#[tokio::test(flavor = "current_thread")]
+async fn observer_reports_graceful_abort_verdict() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, _peers) = transport_with_peers("obs", 1);
+            let mut cs = ClusterState::<TestId>::new();
+            cs.apply(ClusterMutation::GracefulAbortRequested);
+            cs.apply(ClusterMutation::RunComplete);
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+            let terminal = observer.run().await.expect("Ok on graceful verdict");
+            assert!(
+                matches!(terminal, ObserverTerminal::GracefulAbort),
+                "run_complete + graceful latch must report the DISTINCT \
+                 GracefulAbort terminal, got {terminal:?}"
+            );
+        })
+        .await;
+}
+
+/// The graceful latch ALONE (no run terminal) is NOT an exit: the
+/// observer keeps observing the drain and terminates only on the
+/// primary's eventual `RunComplete` — then with the graceful verdict.
+#[tokio::test(flavor = "current_thread")]
+async fn observer_keeps_observing_until_drain_terminal() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, inbound, _peers) = transport_with_peers("obs", 1);
+            let mut cs = ClusterState::<TestId>::new();
+            cs.apply(ClusterMutation::GracefulAbortRequested);
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+            // Deliver the drain terminal over the wire a beat later; the
+            // observer must still be running to consume it.
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = inbound.send(DistributedMessage::ClusterMutation {
+                    target: None,
+                    sender_id: "primary".into(),
+                    timestamp: 0.0,
+                    mutations: vec![ClusterMutation::RunComplete],
+                });
+            });
+            let terminal = observer.run().await.expect("Ok on the drain terminal");
+            assert!(
+                matches!(terminal, ObserverTerminal::GracefulAbort),
+                "got {terminal:?}"
+            );
+        })
+        .await;
+}
+
+/// `request_graceful_abort` (the operator-trigger seam — the SIGUSR2 arm
+/// calls this) sends ONE typed `GracefulAbortRequest` frame routed to the
+/// recognized primary, stamped `Destination::Primary`.
+#[tokio::test(flavor = "current_thread")]
+async fn request_graceful_abort_sends_typed_frame_to_primary() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, mut peers) = transport_with_peers("obs", 1);
+            let mut cs = ClusterState::<TestId>::new();
+            // The recognized primary is the wired peer.
+            cs.apply(ClusterMutation::PrimaryChanged {
+                new: "peer-0".into(),
+                epoch: 1,
+                reason: PrimaryChangeReason::Election,
+            });
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+            observer.request_graceful_abort().await;
+            // Let the pump drain the queued egress onto the wire.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let frame = peers[0].try_recv().expect("the request reaches the primary peer");
+            match frame {
+                DistributedMessage::GracefulAbortRequest {
+                    target, sender_id, ..
+                } => {
+                    assert_eq!(sender_id, "obs");
+                    assert!(
+                        matches!(
+                            target,
+                            Some(dynrunner_protocol_primary_secondary::Destination::Primary)
+                        ),
+                        "the frame must be stamped Destination::Primary, got {target:?}"
+                    );
+                }
+                other => panic!("expected GracefulAbortRequest, got {other:?}"),
+            }
+        })
+        .await;
+}
+
 /// BUG-B: zero peers + no RunComplete (the observer lost ALL visibility —
 /// its `-R` setup tunnel dropped) must NOT collapse the run. The observer
 /// carries zero authority: it reports lost + keeps observing, and
@@ -1794,4 +1898,60 @@ async fn observer_answers_snapshot_pull_from_behind_secondary() {
         "REVERT-CHECK: the observer never answered the snapshot pull — the only \
          ahead replica is mute and the wedged fleet cannot heal",
     );
+}
+
+/// #370 fires-under-real-topology: the PRODUCTION observer EMITS its
+/// anti-entropy digest on the wire — through the real `run()` loop, the
+/// real `Mesh`, and a real transport with a registered peer — and KEEPS
+/// emitting (the cadence recurs) while the loop's other periodic arms
+/// (the 50ms visibility-recheck tick, the recovery tick) stay busy.
+///
+/// The prior relocation-heal fix tested only the APPLY/PULL sides with a
+/// synthetic observer pushing digest frames by hand; nobody pinned that
+/// the production observer's `ae_tick` actually puts `StateDigest`
+/// frames onto the wire (the generalized watchdog-needs-a-fires-test
+/// law). The jittered period is 15–25s, so this runs under paused time.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn observer_digest_cadence_emits_on_the_wire() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _inbound, mut peers) = transport_with_peers("obs", 1);
+            let mut peer_rx = peers.pop().expect("one registered peer");
+            // No terminal in the ledger — the observer keeps observing for
+            // the whole assertion window.
+            let cs = ClusterState::<TestId>::new();
+            let (client, inbox, pump) = observer_mesh(transport, "obs");
+            tokio::task::spawn_local(pump);
+            let mut observer = ObserverCoordinator::new(client, inbox, cs, observer_config("obs"));
+
+            // TWO digests prove the cadence RECURS (a single emit could be a
+            // one-shot); both must reach the registered peer's wire end.
+            let assertion = async {
+                let mut digests_seen = 0u32;
+                while digests_seen < 2 {
+                    let frame = peer_rx.recv().await.expect("peer wire open");
+                    if matches!(frame, DistributedMessage::StateDigest { ref sender_id, .. } if sender_id == "obs")
+                    {
+                        digests_seen += 1;
+                    }
+                }
+            };
+
+            tokio::select! {
+                run = observer.run() => {
+                    panic!("the observer must keep observing, got {run:?}");
+                }
+                () = assertion => { /* two digest broadcasts reached the wire */ }
+                _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    panic!(
+                        "SILENT CADENCE: the production observer's anti-entropy \
+                         tick never put a StateDigest on the wire within 120s \
+                         (≥4 jittered periods) — the relocation-handoff heal \
+                         has no emitter"
+                    );
+                }
+            }
+        })
+        .await;
 }

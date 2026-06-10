@@ -194,12 +194,15 @@ async fn rebroadcast_full_roster_heals_partial_promoted_mirror() {
             // the heal. The idempotent lattice absorbs sec-0's own
             // already-present records (NoOp) and adds sec-1's.
             promoted
-                .handle_cluster_mutation(DistributedMessage::ClusterMutation {
-                    target: None,
-                    sender_id: "setup".into(),
-                    timestamp: 0.0,
-                    mutations: batch,
-                })
+                .handle_cluster_mutation(
+                    DistributedMessage::ClusterMutation {
+                        target: None,
+                        sender_id: "setup".into(),
+                        timestamp: 0.0,
+                        mutations: batch,
+                    },
+                    &mut None,
+                )
                 .await;
 
             // Post-heal: a fresh promotion reconstructs the FULL roster

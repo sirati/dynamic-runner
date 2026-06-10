@@ -91,9 +91,16 @@ pub struct RunNarrator {
     /// converged CRDT.
     retry_passes_emitted: HashSet<(PhaseId, BucketKind)>,
     /// Whether the one-shot run-complete / run-aborted summary has fired.
-    /// The two are mutually exclusive and share this single latch so at
-    /// most one terminal line is ever emitted.
+    /// The terminal outcomes are mutually exclusive and share this single
+    /// latch so at most one terminal line is ever emitted.
     completion_emitted: bool,
+    /// Whether the one-shot mid-run "graceful abort requested" line has
+    /// fired — the operator-wake announcement of the replicated
+    /// `graceful_abort_requested` dispatch-freeze latch (the terminal
+    /// graceful summary below shares `completion_emitted` instead; this
+    /// latch covers the REQUEST edge, which lands long before the drain
+    /// terminal).
+    graceful_abort_announced: bool,
     /// Whether the first [`Self::observe`] has run and SEEDED the
     /// membership / primary baseline. The cold fleet forming — and, on a
     /// relocation, the already-converged roster the observer inherits — is
@@ -149,6 +156,7 @@ impl RunNarrator {
             done_phases: HashSet::new(),
             retry_passes_emitted: HashSet::new(),
             completion_emitted: false,
+            graceful_abort_announced: false,
             failover_seeded: false,
             live_remote_secondaries: HashSet::new(),
             last_primary: None,
@@ -302,6 +310,25 @@ impl RunNarrator {
         // the summary is the run's end.
         self.narrate_failover(state);
 
+        // One-shot graceful-abort REQUEST announcement (mid-run edge): the
+        // replicated dispatch-freeze latch landed in the mirror. Narrated
+        // here — in the observer's process — so the operator's
+        // `--important-stdio` stdout sees the wind-down begin regardless of
+        // which node hosts the primary. The drain TERMINAL is the summary
+        // below; this is the request edge.
+        if !self.graceful_abort_announced && state.graceful_abort_requested() {
+            self.graceful_abort_announced = true;
+            let c = state.counts();
+            tracing::warn!(
+                target: IMPORTANT_TARGET,
+                in_flight = c.in_flight,
+                pending = c.pending,
+                blocked = c.blocked,
+                "graceful abort requested — dispatch frozen; running tasks \
+                 will complete and the fleet will drain"
+            );
+        }
+
         // One-shot run summary, gated on the sticky run-complete /
         // run-aborted latches AND the local `completion_emitted` bool so
         // it fires exactly once across the entire observer tail. The two
@@ -323,6 +350,32 @@ impl RunNarrator {
                     blocked = c.blocked,
                     reason = %reason,
                     "run aborted — shutting down",
+                );
+            } else if state.run_complete() && state.graceful_abort_requested() {
+                // The composed graceful-abort verdict (run_complete ∧
+                // graceful latch): distinct from the clean success below —
+                // `unscheduled` names the deliberately-unrun residue — and
+                // from the hard abort above (nothing failed; the wind-down
+                // was requested). Checked BEFORE the plain-complete branch
+                // so a graceful run never narrates as a clean success.
+                self.completion_emitted = true;
+                let o = state.outcome_counts();
+                let c = state.counts();
+                let unscheduled = c.pending + c.blocked;
+                tracing::warn!(
+                    target: IMPORTANT_TARGET,
+                    succeeded = o.succeeded,
+                    fail_retry = o.fail_retry,
+                    fail_oom = o.fail_oom,
+                    fail_final = o.fail_final,
+                    in_flight = c.in_flight,
+                    unscheduled,
+                    "run gracefully aborted: {} succeeded / {} failed-final / {} oom / {} retried / {} deliberately unscheduled — shutting down",
+                    o.succeeded,
+                    o.fail_final,
+                    o.fail_oom,
+                    o.fail_retry,
+                    unscheduled,
                 );
             } else if state.run_complete() {
                 self.completion_emitted = true;
@@ -733,6 +786,67 @@ mod tests {
         assert_eq!(
             done[0].fields.get("phase").map(String::as_str),
             Some("compile")
+        );
+    }
+
+    /// The graceful-abort narration: the REQUEST edge fires exactly one
+    /// "graceful abort requested" line the moment the latch lands, and
+    /// the terminal summary is the DISTINCT "run gracefully aborted" line
+    /// (never the clean "run complete" wording) carrying the
+    /// deliberately-unscheduled residue. Both are once-only.
+    #[test]
+    fn graceful_abort_request_and_verdict_narrate_distinctly_once() {
+        let events = capture(|| {
+            let mut state = ClusterState::<RunnerIdentifier>::new();
+            // 1 completed + 1 deliberately-unscheduled pending.
+            add(&mut state, &task("p", "done-task", &[]));
+            add(&mut state, &task("p", "frozen-task", &[]));
+            complete(&mut state, "done-task");
+
+            let mut narrator = RunNarrator::new();
+            // The latch lands mid-run: the request edge narrates once.
+            state.apply(ClusterMutation::GracefulAbortRequested);
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent
+
+            // The drain terminal: the composed verdict narrates once,
+            // DISTINCT from the clean-success summary.
+            state.apply(ClusterMutation::RunComplete);
+            narrator.observe(&state);
+            narrator.observe(&state); // idempotent
+        });
+
+        let requested: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("graceful abort requested"))
+            .collect();
+        assert_eq!(
+            requested.len(),
+            1,
+            "exactly one request-edge line: {events:?}"
+        );
+
+        let verdict: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("run gracefully aborted"))
+            .collect();
+        assert_eq!(
+            verdict.len(),
+            1,
+            "exactly one graceful terminal summary: {events:?}"
+        );
+        assert_eq!(
+            verdict[0].fields.get("succeeded").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            verdict[0].fields.get("unscheduled").map(String::as_str),
+            Some("1"),
+            "the deliberately-unscheduled residue is carried on the verdict"
+        );
+        assert!(
+            !events.iter().any(|e| e.message.contains("run complete:")),
+            "a graceful run must NEVER narrate the clean-success summary: {events:?}"
         );
     }
 

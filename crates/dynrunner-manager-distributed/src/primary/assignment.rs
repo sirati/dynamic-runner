@@ -85,23 +85,21 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         for worker_idx in super::lifecycle::dispatch_order(&self.workers) {
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
-            let global_wid = self.workers[worker_idx].worker_id;
-            // Soft preference tie-break: tasks whose
-            // `preferred_secondaries` lists this worker's secondary
-            // sort first within their priority class. The predicate
-            // is applied AFTER `cap_filter_view` — caps are hard,
-            // preferences are advisory. See
-            // `primary::preferred_secondaries` for the helper's
-            // contract.
-            let secondary_id = self.workers[worker_idx].secondary_id.clone();
-            let preference_predicate =
-                super::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
-                    &secondary_id,
-                );
-            let view = self.cap_filter_view(
-                self.pool()
-                    .view_for_worker(global_wid, Some(&preference_predicate)),
-            );
+            // The ONE dispatch-shape view pipeline (soft preferred-
+            // secondaries tie-break → strict gate → per-type cap filter →
+            // the graceful-abort freeze), shared with the two operational
+            // dispatch sites. This call previously re-spelled the
+            // soft-predicate + cap-filter steps inline (duplicated logic);
+            // routing through the single owner is behaviour-identical here
+            // — the strict preferred-secondaries gate is active only in
+            // OOM-bucket `single_worker_mode`, which
+            // `hydrate_from_cluster_state` resets to `false` before this
+            // pre-loop site can run — and it puts the initial assignment
+            // behind the SAME graceful-abort scheduling gate as every
+            // other dispatch path (load-bearing on the promoted-primary
+            // path: a freeze inherited via the promotion snapshot must
+            // also stop the post-promotion initial assignment).
+            let view = self.dispatch_view_for_worker(worker_idx);
             if view.is_empty() {
                 continue;
             }

@@ -718,7 +718,7 @@ async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
             // TaskRequest lands for (sec-0, worker 0). This reconciles the
             // stale slot AND dispatches in the same call.
             primary
-                .handle_task_request(task_request_for("sec-0", 0))
+                .handle_task_request(task_request_for("sec-0", 0), &mut None)
                 .await
                 .expect("task request handling must succeed");
             settle_pump().await;
@@ -751,7 +751,7 @@ async fn promoted_primary_reconciles_stale_inherited_slot_on_idle_request() {
             // and a second idle request drains the other task too — the run
             // makes progress, never wedged at assigned=0.
             primary
-                .handle_task_request(task_request_for("sec-0", 0))
+                .handle_task_request(task_request_for("sec-0", 0), &mut None)
                 .await
                 .expect("second request ok");
             settle_pump().await;
@@ -828,7 +828,7 @@ async fn dispatched_slot_request_is_noop_no_double_dispatch_rc_g2() {
             // Assigned, the task stays InFlight, and NO TaskAssignment goes
             // out — never a double-dispatch.
             primary
-                .handle_task_request(task_request_for("sec-0", 0))
+                .handle_task_request(task_request_for("sec-0", 0), &mut None)
                 .await
                 .expect("request ok");
             settle_pump().await;
@@ -910,7 +910,11 @@ async fn reconcile_inherited_slot_gates_on_provenance() {
             assert!(
                 matches!(
                     requeue,
-                    Some(ClusterMutation::TaskRequeued { ref hash, .. }) if *hash == inh_hash
+                    crate::primary::coordinator::InheritedSlotReconcile::Requeued(ref m)
+                        if matches!(
+                            **m,
+                            ClusterMutation::TaskRequeued { ref hash, .. } if *hash == inh_hash
+                        )
                 ),
                 "an inherited slot reconciles → TaskRequeued for its held hash"
             );
@@ -927,7 +931,10 @@ async fn reconcile_inherited_slot_gates_on_provenance() {
             // A second reconcile of the now-idle slot is a no-op (nothing to
             // reconcile).
             assert!(
-                primary.reconcile_inherited_slot(idx).is_none(),
+                matches!(
+                    primary.reconcile_inherited_slot(idx),
+                    crate::primary::coordinator::InheritedSlotReconcile::NotInherited
+                ),
                 "an Idle slot has nothing to reconcile"
             );
         })

@@ -286,6 +286,15 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-field shape).
     #[serde(default)]
     pub run_aborted: Option<String>,
+    /// Sticky-monotonic graceful-abort latch (the replicated
+    /// `GracefulAbortRequested` dispatch freeze). Merge rule on `restore`:
+    /// ratchets `false → true` only, never regresses — mirroring the
+    /// `GracefulAbortRequested` apply arm — so a failover-promoted primary
+    /// restoring a frozen snapshot INHERITS the freeze (the no-redo law).
+    /// `#[serde(default)]` keeps wire compat with pre-field senders
+    /// (missing field decodes as `false`, the pre-field shape).
+    #[serde(default)]
+    pub graceful_abort_requested: bool,
     /// Sticky-monotonic discovery-debt latch (the replicated discovery
     /// lattice). Merge rule on `restore`: join = `max` over
     /// `Undeclared ⊑ Owed ⊑ Settled` (a replica only moves UP; a `Settled`
@@ -410,6 +419,7 @@ impl<I: Identifier> ClusterState<I> {
             phase_may_be_empty,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             role_table: _role_table,
             peer_state,
@@ -496,6 +506,9 @@ impl<I: Identifier> ClusterState<I> {
             // from a snapshot learns the run is already over / aborted.
             run_complete: *run_complete,
             run_aborted: run_aborted.clone(),
+            // Sticky-monotonic graceful-abort latch — carried so a
+            // failover-promoted primary inherits the dispatch freeze.
+            graceful_abort_requested: *graceful_abort_requested,
             // Sticky-monotonic discovery-debt latch — carried so a promoted
             // primary inherits "discovery already settled" and does NOT
             // re-run discovery on failover.
@@ -601,6 +614,7 @@ impl<I: Identifier> ClusterState<I> {
             member_generations,
             run_complete,
             run_aborted,
+            graceful_abort_requested,
             discovery_debt,
             phase_event_tallies,
             retry_passes_used,
@@ -818,6 +832,10 @@ impl<I: Identifier> ClusterState<I> {
         {
             self.run_aborted = Some(reason);
         }
+        // Graceful-abort latch: the same false→true ratchet as
+        // `run_complete` — a promoted primary restoring a frozen snapshot
+        // inherits the dispatch freeze and refuses to schedule (no-redo).
+        self.graceful_abort_requested |= graceful_abort_requested;
         // Discovery-debt latch: sticky-monotonic join = `max` over the
         // total order `Undeclared ⊑ Owed ⊑ Settled` (the derived `Ord`).
         // A replica only moves UP: an incoming `Settled` ratchets a local

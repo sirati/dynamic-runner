@@ -172,6 +172,20 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 return;
             }
 
+            // Requeue-raced fallback (run_20260610_221140, the failure
+            // twin of `handle_task_complete`'s): a hash absent from the
+            // in-flight ledger may instead sit QUEUED in the pool — an
+            // earlier failover-recovery requeue returned it to `Pending`
+            // before this lost terminal's late delivery. Reclaim the
+            // queued copy (with the `mark_in_flight` compensation) so the
+            // terminal-failure cascade below accounts it and the failed
+            // attempt is never silently re-dispatched alongside its retry
+            // bookkeeping. AFTER the backpressure arm: a backpressure
+            // bounce means the task never ran — a queued copy there is
+            // exactly where it belongs.
+            let recovered_binary =
+                recovered_binary.or_else(|| self.reclaim_requeued_on_terminal(&task_hash));
+
             // Failure budget: one per task per pass. Recoverable
             // and NonRecoverable both terminate the dispatch slot
             // and add to `failed_tasks`. The `run()` pipeline calls

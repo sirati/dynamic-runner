@@ -171,7 +171,7 @@ async fn peer_joined_revalidates_preferred_secondaries() {
                     },
                 ],
             };
-            primary.handle_cluster_mutation(join).await;
+            primary.handle_cluster_mutation(join, &mut None).await;
 
             // Re-validation pathway: forget(id) + validate. The id was
             // previously warned but is now in `self.secondaries`, so the

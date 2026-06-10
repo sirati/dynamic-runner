@@ -120,7 +120,13 @@ pub(crate) struct PySecondaryConfig {
     /// populated after `__new__` (auto-resolves to
     /// `/app/out-network` inside the wrapper container — durable
     /// bind to gateway's `<slurm_root>/out` — or a unique
-    /// `<TMPDIR>/secondary-<id>-<pid>-out` outside it).
+    /// `<TMPDIR>/secondary-<id>-<pid>-out` outside it). The
+    /// `--multi-computer local` dispatcher does NOT rely on the
+    /// tempdir fallback: its spawner threads `--output-dir` (the
+    /// operator's resolved `--output`) so all same-host secondaries
+    /// publish into the one user-visible directory, mirroring the
+    /// SLURM bind-mount semantic. The tempdir remains the backstop
+    /// for out-of-tree callers that supply no output dir.
     #[pyo3(get, set)]
     pub(crate) output_dir: PathBuf,
     #[pyo3(get, set)]

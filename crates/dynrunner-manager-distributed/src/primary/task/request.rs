@@ -1,15 +1,24 @@
 use dynrunner_core::{Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{Destination, DistributedMessage, PeerId};
 use dynrunner_scheduler_api::{AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
+use crate::primary::coordinator::InheritedSlotReconcile;
 use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the terminal-veto settle cascade (its
+    /// `note_item_*` → `process_phase_lifecycle` may run consumer
+    /// `on_phase_end` callbacks that queue `spawn_tasks`). Pre-loop /
+    /// post-loop callers pass `&mut None`, same as the terminal handlers.
     pub(crate) async fn handle_task_request(
         &mut self,
         msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
             target: None,
@@ -47,17 +56,46 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // in_flight IS correct are untouched. Without this the 6
             // survivor slots stay phantom-busy forever and dispatch never
             // fires (the LMU-gating deadlock).
-            if let Some(idx) = target_idx
-                && let Some(requeue) = self.reconcile_inherited_slot(idx)
-            {
-                // Broadcast the `InFlight → Pending` transition in lockstep
-                // with the local pool requeue just done inside the
-                // reconcile, so a stale replicated `InFlight` cannot survive
-                // and re-strand the task on a later failover. The slot is
-                // now `Idle`, so the assignment block below dispatches the
-                // requeued (and any other ready) work to it.
-                self.apply_and_broadcast_cluster_mutations(vec![requeue])
-                    .await;
+            if let Some(idx) = target_idx {
+                match self.reconcile_inherited_slot(idx) {
+                    InheritedSlotReconcile::Requeued(requeue) => {
+                        // Broadcast the `InFlight → Pending` transition in
+                        // lockstep with the local pool requeue just done
+                        // inside the reconcile, so a stale replicated
+                        // `InFlight` cannot survive and re-strand the task
+                        // on a later failover. The slot is now `Idle`, so
+                        // the assignment block below dispatches the
+                        // requeued (and any other ready) work to it.
+                        self.apply_and_broadcast_cluster_mutations(vec![*requeue])
+                            .await;
+                    }
+                    InheritedSlotReconcile::VetoedByTerminal { task_hash } => {
+                        // The replicated ledger already records a terminal
+                        // for the held hash (the requeue-vs-complete race,
+                        // run_20260610_221140): settle the slot / ledger /
+                        // pool residue through the ONE CRDT-terminal settle
+                        // path instead of re-queueing completed work. The
+                        // slot comes back `Idle`, so the assignment block
+                        // below can hand this worker FRESH work.
+                        if !self
+                            .settle_local_state_on_crdt_terminal(&task_hash, command_rx)
+                            .await
+                        {
+                            // Inherited slot ⟺ inherited ledger entry is a
+                            // seed-time invariant (`seed_inflight` +
+                            // `reconstruct_workers_from_cluster_state` are
+                            // 1:1); a veto that found nothing to settle
+                            // would leave the slot phantom-busy.
+                            tracing::warn!(
+                                task_hash = %task_hash,
+                                "terminal-vetoed inherited slot had no \
+                                 settleable residue (ledger entry / queued \
+                                 copy missing) — slot left untouched"
+                            );
+                        }
+                    }
+                    InheritedSlotReconcile::NotInherited => {}
+                }
             }
 
             // R1: `TaskRequest` is a pure capacity hint that NEVER
