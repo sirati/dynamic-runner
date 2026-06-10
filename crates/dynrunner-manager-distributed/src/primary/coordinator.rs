@@ -1043,6 +1043,27 @@ pub struct PrimaryCoordinator<S: Scheduler<I>, E: ResourceEstimator<I>, I: Ident
     /// post-connection broadcast a natural no-op there — the `SeedSource` arm
     /// is the discriminator, never a runtime `if seeded`.
     pub(super) pending_cold_seed_broadcast: Vec<ClusterMutation<I>>,
+
+    /// Per-iteration `select!`-arm accounting for the operational loop,
+    /// published by [`Self::operational_loop`] at loop entry so the
+    /// off-runtime [`crate::runtime_watchdog`] checker thread can dump
+    /// WHICH arm a wedged loop is hot-spinning on (the ingest-wedge
+    /// signature: the inbound arm never wins again). `None` until the
+    /// operational loop is entered; observation-only — never read by any
+    /// control-flow decision. See [`crate::oploop_instrumentation`].
+    pub(super) op_loop_arm_stats:
+        Option<std::sync::Arc<crate::oploop_instrumentation::OpLoopArmStats>>,
+
+    /// Optional shared bridge to the off-runtime [`crate::runtime_watchdog`]:
+    /// when set (via [`Self::set_op_loop_arm_stats_cell`] at node bootstrap),
+    /// [`Self::operational_loop`] publishes its live arm stats into this cell
+    /// on entry and clears them on exit, so the single long-lived watchdog can
+    /// dump WHICHEVER loop (secondary or this promoted primary) is running at
+    /// the freeze. `None` in unit/integration fixtures that read
+    /// `op_loop_arm_stats` directly instead. See
+    /// [`crate::oploop_instrumentation::OpLoopArmStatsCell`].
+    pub(super) op_loop_arm_stats_cell:
+        Option<crate::oploop_instrumentation::OpLoopArmStatsCell>,
 }
 
 impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<S, E, I> {
@@ -1178,6 +1199,8 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             single_worker_mode: false,
             forwarded_argv,
             pending_cold_seed_broadcast: Vec::new(),
+            op_loop_arm_stats: None,
+            op_loop_arm_stats_cell: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -1692,6 +1715,19 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
     /// policy entirely.
     pub fn register_setup_discovery(&mut self, discovery: crate::discovery::SetupDiscovery<I>) {
         self.setup_discovery = Some(discovery);
+    }
+
+    /// Wire the shared arm-stats bridge to the off-runtime
+    /// [`crate::runtime_watchdog`] (called at node bootstrap, before `run`).
+    /// The operational loop then publishes its live arm stats into the cell on
+    /// entry and clears them on exit, so a freeze dump names THIS loop's hot
+    /// arm. Observation-only; no behaviour change. See
+    /// [`crate::oploop_instrumentation::OpLoopArmStatsCell`].
+    pub fn set_op_loop_arm_stats_cell(
+        &mut self,
+        cell: crate::oploop_instrumentation::OpLoopArmStatsCell,
+    ) {
+        self.op_loop_arm_stats_cell = Some(cell);
     }
 
     /// Register the set of phases the consumer declared `may_be_empty`

@@ -25,6 +25,36 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::{RunOutcome, SecondaryCoordinator};
 
+// ── Secondary `process_tasks` `select!` arm ids (oploop instrumentation) ──
+//
+// One id per arm of the `select!` below, in source order. `ARM_INBOX` is the
+// INBOUND (mesh ingress) arm. Index == id with [`PROCESS_TASKS_ARM_NAMES`];
+// each arm body records its id as its first statement. Observation-only — see
+// [`crate::oploop_instrumentation`].
+const ARM_POOL_EVENT: usize = 0;
+const ARM_INBOX: usize = 1;
+const ARM_ANNOUNCER_OUTBOX: usize = 2;
+const ARM_KEEPALIVE: usize = 3;
+const ARM_OOM_SAMPLE: usize = 4;
+const ARM_OOM_DECISION: usize = 5;
+const ARM_PANIK: usize = 6;
+const ARM_FATAL_EXIT: usize = 7;
+const ARM_ANTI_ENTROPY: usize = 8;
+
+/// Arm names, index-aligned with the `ARM_*` ids above (render order of the
+/// compact stats line).
+const PROCESS_TASKS_ARM_NAMES: &[&str] = &[
+    "pool_event",
+    "inbox",
+    "announcer_outbox",
+    "keepalive",
+    "oom_sample",
+    "oom_decision",
+    "panik",
+    "fatal_exit",
+    "anti_entropy",
+];
+
 impl<M, S, E, I> SecondaryCoordinator<M, S, E, I>
 where
     M: ManagerEndpoint + 'static,
@@ -189,6 +219,28 @@ where
         // the composed-primary runtime hands the receiver to the
         // primary's command loop. This secondary loop never drains it.
 
+        // Per-iteration arm accounting (observation only — see
+        // `crate::oploop_instrumentation`). The secondary twin of the
+        // primary's `op_loop_arm_stats`: the co-located topology runs both
+        // loops on one runtime, so the watchdog must be able to name a wedged
+        // arm on either. Each arm body records its id as its first statement;
+        // published on `self.op_loop_arm_stats` for the runtime-watchdog dump
+        // path.
+        let arm_stats = crate::oploop_instrumentation::OpLoopArmStats::new(
+            PROCESS_TASKS_ARM_NAMES,
+            ARM_INBOX,
+        );
+        self.op_loop_arm_stats = Some(std::sync::Arc::clone(&arm_stats));
+        // Publish into the watchdog bridge cell (labelled "secondary") if
+        // wired; the returned guard clears the "secondary" entry on EVERY exit
+        // of this function — the clean `break` tail AND the panik / fatal /
+        // run-aborted early returns — without a per-exit `clear` call. The
+        // co-located primary's "primary" entry is untouched (role-keyed cell).
+        let _arm_stats_guard = self
+            .op_loop_arm_stats_cell
+            .as_ref()
+            .map(|cell| cell.publish_scoped("secondary", std::sync::Arc::clone(&arm_stats)));
+
         loop {
             // Workers that need restart after disconnect
             let mut workers_to_restart: Vec<WorkerId> = Vec::new();
@@ -220,6 +272,7 @@ where
                     .pool
                     .recv_event() =>
                 {
+                    arm_stats.record(ARM_POOL_EVENT);
                     if let Some(event) = event {
                         let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
@@ -237,6 +290,7 @@ where
                 // so exit cleanly — the historical "inbound closed = end of
                 // run" contract.
                 msg = self.inbox.recv() => {
+                    arm_stats.record(ARM_INBOX);
                     match msg {
                         Some(m) => {
                             self.handle_inbound(m, factory).await;
@@ -288,6 +342,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_ANNOUNCER_OUTBOX);
                     if let Some(item) = outbox_item {
                         // Observer holdings update → the primary. Route
                         // through the `Destination::Primary` egress edge
@@ -317,6 +372,7 @@ where
                     // `process_tasks`. Drop the value (no-op).
                 }
                 _ = keepalive_interval.tick() => {
+                    arm_stats.record(ARM_KEEPALIVE);
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;
@@ -371,12 +427,14 @@ where
                     }
                 }
                 _ = oom_sample_interval.tick() => {
+                    arm_stats.record(ARM_OOM_SAMPLE);
                     // Fast sample tick: refresh per-worker RSS, read
                     // host + cgroup state, evaluate structured-log
                     // triggers. No scheduler call.
                     oom_watcher.on_sample(&mut self.op_mut().pool);
                 }
                 _ = oom_decision_interval.tick() => {
+                    arm_stats.record(ARM_OOM_DECISION);
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
                 }
                 // Panik (operator-initiated emergency stop) arm. The
@@ -403,6 +461,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_PANIK);
                     // Drop the rx slot so a subsequent loop iteration
                     // (if any — the panik handler returns immediately
                     // below) finds it None and re-parks on
@@ -446,6 +505,7 @@ where
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_FATAL_EXIT);
                     match signal {
                         Some(reason) => {
                             // First (and only consumed) signal: latch it.
@@ -470,6 +530,7 @@ where
                 // the receive-side compare+pull lives in the `StateDigest`
                 // router arm. `interval.tick` is cancel-safe (tokio docs).
                 _ = anti_entropy_interval.tick() => {
+                    arm_stats.record(ARM_ANTI_ENTROPY);
                     let digest = self.cluster_state.digest();
                     let frame = crate::anti_entropy::digest_broadcast(
                         &self.config.secondary_id,

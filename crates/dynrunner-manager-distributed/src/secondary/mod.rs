@@ -620,4 +620,23 @@ where
     /// no lifecycle gating.
     pub(in crate::secondary) pending_terminal_replays:
         Vec<DistributedMessage<I>>,
+
+    /// Per-iteration `select!`-arm accounting for the secondary's
+    /// `process_tasks` operational loop. The co-located topology runs the
+    /// promoted primary AND this secondary on ONE runtime, so the production
+    /// ingest wedge could in principle present on either loop's arms; this is
+    /// the secondary's twin of the primary's `op_loop_arm_stats`. Published at
+    /// `process_tasks` entry, observation-only (never read by control flow),
+    /// `None` until the loop runs. See [`crate::oploop_instrumentation`].
+    pub(in crate::secondary) op_loop_arm_stats:
+        Option<std::sync::Arc<crate::oploop_instrumentation::OpLoopArmStats>>,
+
+    /// Optional shared bridge to the off-runtime [`crate::runtime_watchdog`]
+    /// (set at node bootstrap via [`Self::set_op_loop_arm_stats_cell`]). The
+    /// `process_tasks` loop publishes its live arm stats into this cell on
+    /// entry and clears them on exit, so the single watchdog can dump this
+    /// loop's hot arm at a freeze — the co-located twin of the primary's cell.
+    /// See [`crate::oploop_instrumentation::OpLoopArmStatsCell`].
+    pub(in crate::secondary) op_loop_arm_stats_cell:
+        Option<crate::oploop_instrumentation::OpLoopArmStatsCell>,
 }

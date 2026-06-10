@@ -8,6 +8,42 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::compute_task_hash;
 
+// ── Operational-loop `select!` arm ids (oploop instrumentation) ──
+//
+// One id per arm of the big `select!` below, in source order. Passed to
+// [`crate::oploop_instrumentation::OpLoopArmStats`] so a future production
+// wedge names its hot arm in one log line. `ARM_INBOX` is the INBOUND (ingest)
+// arm whose starvation IS the wedge signature. Kept adjacent to
+// [`OP_LOOP_ARM_NAMES`] (index == id) so the two never drift; each arm body
+// records its own id as its first statement.
+const ARM_COMMAND: usize = 0;
+const ARM_MATCHER: usize = 1;
+const ARM_WORKER_MGMT: usize = 2;
+const ARM_INBOX: usize = 3;
+const ARM_HEARTBEAT: usize = 4;
+const ARM_ANTI_ENTROPY: usize = 5;
+const ARM_RESPAWN_REQUEST: usize = 6;
+const ARM_LIVENESS_PING: usize = 7;
+const ARM_RESPAWN_JOIN: usize = 8;
+const ARM_PANIK: usize = 9;
+const ARM_STUCK_WATCHDOG: usize = 10;
+
+/// Arm names, index-aligned with the `ARM_*` ids above. The render order of
+/// the compact stats line.
+const OP_LOOP_ARM_NAMES: &[&str] = &[
+    "command",
+    "matcher",
+    "worker_mgmt",
+    "inbox",
+    "heartbeat",
+    "anti_entropy",
+    "respawn_request",
+    "liveness_ping",
+    "respawn_join",
+    "panik",
+    "stuck_watchdog",
+];
+
 /// Render a drain-by-`MessageType` tally as a single diagnostic string:
 /// `[TaskRequest=N, Keepalive=M, ...]`, only non-zero types, sorted by
 /// count descending (ties broken by the type's `Debug` name for a
@@ -135,6 +171,29 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
 
     pub(crate) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
+
+        // Per-iteration arm accounting (observation only — see
+        // `crate::oploop_instrumentation`). One [`OpLoopArmStats`] per loop
+        // entry, naming each `select!` arm in id order and which one is the
+        // INBOUND (ingest) arm whose starvation is the production wedge
+        // signature. Published on `self.op_loop_arm_stats` so the off-runtime
+        // runtime-watchdog can dump the live arm breakdown when it fires; each
+        // arm body calls `arm_stats.record(ARM_*)` as its first statement. The
+        // hot-path cost is a handful of relaxed atomic stores per iteration.
+        let arm_stats =
+            crate::oploop_instrumentation::OpLoopArmStats::new(OP_LOOP_ARM_NAMES, ARM_INBOX);
+        self.op_loop_arm_stats = Some(std::sync::Arc::clone(&arm_stats));
+        // If a watchdog bridge cell is wired, publish the SAME Arc into it
+        // (labelled "primary") so the off-runtime checker dumps this loop's
+        // arms on a freeze. One Arc, two observers (the local field for
+        // in-process fixtures, the cell for the production watchdog) — no
+        // duplicated recording. The returned guard clears the "primary" entry
+        // on EVERY exit of this function (break/return/unwind), so the entry's
+        // lifetime tracks the loop exactly with no per-exit bookkeeping.
+        let _arm_stats_guard = self
+            .op_loop_arm_stats_cell
+            .as_ref()
+            .map(|cell| cell.publish_scoped("primary", std::sync::Arc::clone(&arm_stats)));
 
         let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
         // Skip (not Burst) missed ticks: a host suspend/resume would otherwise
@@ -426,6 +485,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_COMMAND);
                     match cmd {
                         Some(command) => {
                             // Delegate to the per-variant handler.
@@ -471,6 +531,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 }, if !matcher_arm_closed => {
+                    arm_stats.record(ARM_MATCHER);
                     match batch {
                         Some(batch) => {
                             // Single-line delegation: the walk +
@@ -510,6 +571,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 }, if !worker_mgmt_arm_closed => {
+                    arm_stats.record(ARM_WORKER_MGMT);
                     match wm_batch {
                         Some(batch) => {
                             // Worker management's PARKED RECHECK: a batch
@@ -538,6 +600,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     }
                 }
                 msg = self.inbox.recv(), if !transport_closed => {
+                    arm_stats.record(ARM_INBOX);
                     match msg {
                         Some(m) => {
                             // THE single inbound arm. Every wire shape —
@@ -576,6 +639,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                     }
                 }
                 _ = heartbeat_tick.tick() => {
+                    arm_stats.record(ARM_HEARTBEAT);
                     self.broadcast_primary_keepalive().await;
                     // Refresh the PRIMARY→secondaries liveness-beacon target
                     // set on the SAME cadence as the mesh keepalive — the
@@ -599,6 +663,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // the primary `dispatch_message` `StateDigest` arm.
                 // `interval.tick` is cancel-safe (tokio docs).
                 _ = anti_entropy_tick.tick() => {
+                    arm_stats.record(ARM_ANTI_ENTROPY);
                     let digest = self.cluster_state.digest();
                     let frame = crate::anti_entropy::digest_broadcast(
                         &self.config.node_id,
@@ -623,6 +688,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_RESPAWN_REQUEST);
                     match req {
                         Some(request) => {
                             // Single-line delegation: the dispatch
@@ -667,6 +733,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_LIVENESS_PING);
                     match ping {
                         Some(node_id) => {
                             // `record_keepalive` is a no-op for an
@@ -701,6 +768,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         self.respawn_tasks.join_next().await
                     }
                 } => {
+                    arm_stats.record(ARM_RESPAWN_JOIN);
                     self.handle_respawn_join(outcome);
                 }
                 // Panik (operator-initiated emergency stop) arm. The
@@ -729,6 +797,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                         None => std::future::pending().await,
                     }
                 } => {
+                    arm_stats.record(ARM_PANIK);
                     panik_signal_rx = None;
                     if let Ok(signal) = panik {
                         let outcome = self
@@ -747,6 +816,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)),
                     if !self.single_worker_mode() => {
+                    arm_stats.record(ARM_STUCK_WATCHDOG);
                     // 5-min stuck-worker watchdog. Disabled while
                     // the OOM retry bucket is active: a single-
                     // worker-per-secondary pass on a memory-pressed
@@ -856,6 +926,15 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         // an entry into `run_retry_passes` checks BEFORE re-entering
         // the loop so the retry pass is bypassed on panik.
         self.panik_signal_rx = panik_signal_rx;
+
+        // Unpublish the local arm-stats handle now the loop has exited: a
+        // stale snapshot read after the loop is gone would be misleading (the
+        // loop is no longer the thing to diagnose). A retry-pass re-entry
+        // rebuilds a fresh block. The watchdog-cell entry is cleared
+        // automatically by `_arm_stats_guard`'s drop at function exit (it
+        // covers the early-return paths too). Observation-only — no
+        // control-flow depends on this.
+        self.op_loop_arm_stats = None;
 
         // Drain any in-flight respawn tasks so the operational loop
         // never exits with a tokio task quietly outliving the

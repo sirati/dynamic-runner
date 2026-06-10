@@ -622,9 +622,26 @@ impl PySecondaryCoordinator {
                 // returned heartbeat future is the "I'm alive" pulse and runs
                 // ON this runtime via `spawn_local`, so it stops advancing
                 // exactly when the runtime freezes.
+                // Shared arm-stats bridge: each operational loop on this node
+                // (this secondary's `process_tasks`, and — on promotion — the
+                // co-located primary's `operational_loop`) publishes its live
+                // `select!`-arm accounting here on entry and clears it on exit.
+                // The watchdog's snapshot provider reads it so a freeze dump
+                // names WHICH arm the wedged loop was hot-looping on (the
+                // ingest-wedge signature). Role-keyed, so the two co-located
+                // loops never collide. Observation-only.
+                let arm_stats_cell =
+                    dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new();
+                let watchdog_arm_stats_cell = arm_stats_cell.clone();
                 let (_runtime_watchdog, watchdog_heartbeat) =
-                    dynrunner_manager_distributed::runtime_watchdog::RuntimeWatchdog::spawn();
+                    dynrunner_manager_distributed::runtime_watchdog::RuntimeWatchdog::spawn(Some(
+                        std::sync::Arc::new(move || watchdog_arm_stats_cell.snapshot_line()),
+                    ));
                 tokio::task::spawn_local(watchdog_heartbeat);
+                // Wire the cell into this secondary BEFORE the run so its
+                // `process_tasks` loop publishes its arms; the promote recipe
+                // (built below) carries a clone into the co-located primary.
+                secondary.set_op_loop_arm_stats_cell(arm_stats_cell.clone());
 
                 // Spawn the panik watcher and register its signal
                 // receiver on the coordinator BEFORE entering the
@@ -804,6 +821,12 @@ impl PySecondaryCoordinator {
                     // the promoted primary's own beacon resolves its
                     // secondaries' addresses from it (primary→secondaries).
                     peer_liveness_addrs: promote_peer_liveness_addrs,
+                    // The shared arm-stats bridge: the promoted primary's
+                    // operational loop publishes its arms here (labelled
+                    // "primary") so the same watchdog that watches the
+                    // co-located secondary names the primary's hot arm at a
+                    // freeze. Observation-only.
+                    op_loop_arm_stats_cell: arm_stats_cell.clone(),
                 });
 
                 let node = node.with_secondary(secondary, sec_slot);
@@ -1070,6 +1093,14 @@ pub(crate) struct PromotedPrimaryRecipeInputs {
     /// `None` for callers without a listener (no beacon emitted).
     pub peer_liveness_addrs:
         Option<dynrunner_manager_distributed::liveness::PeerLivenessAddrs>,
+    /// The shared arm-stats bridge to the off-runtime runtime-watchdog. The
+    /// promoted primary's operational loop publishes its `select!`-arm
+    /// accounting here (labelled `"primary"`) so a freeze dump names its hot
+    /// arm. Shared (a cheap `Arc`-backed clone), wired via
+    /// `set_op_loop_arm_stats_cell` on the recipe fire. Observation-only — see
+    /// [`dynrunner_manager_distributed::oploop_instrumentation`].
+    pub op_loop_arm_stats_cell:
+        dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell,
 }
 
 /// Read the run's two staging-dispatch flags from this node's OWN LOCAL
@@ -1155,6 +1186,7 @@ pub(crate) fn build_promoted_primary_recipe(
         setup_discovery,
         liveness_ping_rx,
         peer_liveness_addrs,
+        op_loop_arm_stats_cell,
     } = inputs;
     // Single-use: an `mpsc::UnboundedReceiver` is one-owner, so capture it
     // in an `Option` and `take` on the recipe's single fire (a node
@@ -1313,6 +1345,13 @@ pub(crate) fn build_promoted_primary_recipe(
         if let Some(sd) = setup_discovery.take() {
             primary.register_setup_discovery(sd);
         }
+        // Wire the shared arm-stats bridge so the promoted primary's
+        // operational loop publishes its `select!`-arm accounting (labelled
+        // "primary") into the same cell the off-runtime watchdog reads — a
+        // freeze then names the primary's hot arm alongside the co-located
+        // secondary's. The cell is a cheap `Arc`-backed clone (the recipe fires
+        // once, but `clone()` keeps the `FnMut` move-free). Observation-only.
+        primary.set_op_loop_arm_stats_cell(op_loop_arm_stats_cell.clone());
         // Seed from the promoting host's converged snapshot (NORMAL pre-`run`
         // construction input — not a `run_activated` resume, which is gone):
         // restore the ledger + rebuild the derived pool/roster caches, then
@@ -2331,6 +2370,8 @@ task = Task()
                 setup_discovery: None,
                 liveness_ping_rx: None,
                 peer_liveness_addrs: None,
+                op_loop_arm_stats_cell:
+                    dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
             });
 
             let mut built = recipe(client, inbox, demote_rx, snapshot);
@@ -2429,6 +2470,8 @@ task = Task()
                 setup_discovery: None,
                 liveness_ping_rx: None,
                 peer_liveness_addrs: None,
+                op_loop_arm_stats_cell:
+                    dynrunner_manager_distributed::oploop_instrumentation::OpLoopArmStatsCell::new(),
             });
 
             let built = recipe(client, inbox, demote_rx, snapshot);
