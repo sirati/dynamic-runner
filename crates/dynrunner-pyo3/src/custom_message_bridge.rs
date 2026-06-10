@@ -25,10 +25,12 @@
 //! uses, after every handler invocation.
 //!
 //! Error policy: a handler raise is REPORTED to the dispatch decision
-//! (the closure returns `Err(reason)`), which leaves an important
-//! message `Unhandled` for a backoff retry (poison-capped) and loses a
-//! droppable one — the F5 contract. The raise is logged here (the only
-//! place the `PyErr` exists); the decision owns the retry policy.
+//! (the closure returns `Err(reason)`) — a USER ERROR the decision
+//! resolves TERMINALLY: an important message transitions to `Failed`
+//! in the replicated inbox (never retried, partial effect discarded
+//! unexecuted), a droppable one is lost — the F5 contract. The raise
+//! is logged here (the only place the `PyErr` exists); the decision
+//! owns the terminal policy.
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -102,8 +104,8 @@ pub(crate) fn make_custom_message_handler(
                     Ok(_) => Ok(()),
                     Err(e) => {
                         // Log here (the only place the PyErr exists);
-                        // the dispatch decision owns the retry/poison
-                        // policy off the returned reason.
+                        // the dispatch decision owns the terminal
+                        // Failed policy off the returned reason.
                         tracing::warn!(
                             error = %e,
                             origin,
@@ -194,7 +196,7 @@ class Task:
     }
 
     /// A handler raise maps to `Err(reason)` — the dispatch decision's
-    /// retry/poison input.
+    /// terminal-`Failed` input.
     #[test]
     fn handler_raise_maps_to_err_with_reason() {
         Python::attach(|py| {

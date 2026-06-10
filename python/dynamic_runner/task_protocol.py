@@ -181,13 +181,22 @@ TaskCompletedListener = Callable[
 #   - ``primary_handle``: the live in-flight ``PrimaryHandle`` of THE
 #     primary the handler runs on -- the streamed-spawn site
 #     (``primary_handle.spawn_tasks(batch)``).
-# Error contract: a raise leaves an important message unhandled; the
-# framework retries it with exponential backoff and, after 5 consecutive
-# raises, consumes it UNHANDLED with a structured ERROR (a poison
-# message must not wedge the per-origin queue). Per-origin send order is
-# preserved: message N+1 from one origin is never handled before
-# message N resolves (handled or poison-capped). Absent or ``None``
-# opts out (important messages are then consumed unhandled with a WARN).
+# Error contract: a raise is a USER ERROR and is TERMINAL -- the
+# message transitions to ``Failed`` in the replicated ledger (payload
+# dropped), is NEVER retried (not on this primary, not on a promoted
+# one), and the framework logs a structured ERROR carrying
+# origin/seq/topic and the exception. The handler is all-or-nothing:
+# every ``primary_handle`` command it issued before raising (e.g. a
+# ``spawn_tasks`` batch) is DISCARDED unexecuted -- a raising handler
+# produces NO effect anywhere in the cluster. A clean return is atomic
+# the other way: the handler's effects and the handled-fact replicate
+# in one batch, so no replica can ever observe one without the other.
+# Per-origin send order is preserved: message N+1 from one origin is
+# never handled before message N resolves (handled or failed). The
+# unhandled backlog is never capped; if the handler cannot keep up the
+# primary logs a rate-limited WARN naming the backlog size and the
+# oldest entry's age. Absent or ``None`` opts out (important messages
+# are then consumed unhandled with a WARN).
 #
 # Spawn-anytime note (F4) for handlers that spawn: spawning into a phase
 # that already ENDED re-opens it and re-fires its ``on_phase_end`` at
