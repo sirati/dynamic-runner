@@ -91,7 +91,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 // backoff exists precisely to stop a secondary that
                 // just said "no idle worker" from re-hammering us on
                 // its request-retry tick.
-                if self.should_skip_worker_for_dispatch(idx, false) {
+                if self.should_skip_worker_for_dispatch(idx, false, true) {
                     return Ok(());
                 }
                 if !available_res.is_empty() {
