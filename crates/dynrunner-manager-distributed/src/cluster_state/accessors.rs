@@ -116,12 +116,15 @@ impl<I: Identifier> ClusterState<I> {
                 // mapping keeps the operator-readable partition stable.
                 TaskState::InvalidTask { .. } => o.fail_final += 1,
                 // Discovery-time skip: a SUCCESS-LIKE terminal kept in its
-                // OWN accounting category (`counts().skipped_already_done`),
-                // NOT a success and NOT any failure bucket. Folding it into
-                // `succeeded` would mis-report it on the run-complete summary
-                // / the narrator's success count, so `outcome_counts` ignores
-                // it here.
-                TaskState::SkippedAlreadyDone { .. } => {}
+                // OWN accounting bucket (`skipped`), NOT folded into
+                // `succeeded` (the run-complete summary / narrator success
+                // count must report only work this run performed) and NOT
+                // any failure bucket. It IS a terminal, fully-accounted
+                // outcome, so `total_terminal()` counts it — otherwise the
+                // finalize accounting (`stranded = total - total_terminal()`)
+                // would mis-classify every skip as STRANDED and false-abort
+                // a clean skip-bearing run as `ClusterCollapsed`.
+                TaskState::SkippedAlreadyDone { .. } => o.skipped += 1,
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to

@@ -3737,14 +3737,17 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
                 fail_retry = outcome.fail_retry,
                 fail_oom = outcome.fail_oom,
                 fail_final = outcome.fail_final,
+                skipped = outcome.skipped,
                 stranded,
                 total,
                 "{stranded} tasks left unassigned because cluster routing collapsed \
-                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} stranded={stranded})",
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} \
+                 skipped={sk} stranded={stranded})",
                 s = outcome.succeeded,
                 r = outcome.fail_retry,
                 o = outcome.fail_oom,
                 fi = outcome.fail_final,
+                sk = outcome.skipped,
             );
             return Err(RunError::ClusterCollapsed { stranded, outcome });
         }
