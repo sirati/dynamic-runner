@@ -86,6 +86,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         source=None,
         cores=None,
         raw_logs=False,
+        resolved_output_root=None,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -207,6 +208,30 @@ class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):
         self.assertIn("--cores", argv)
         self.assertEqual(argv[argv.index("--cores") + 1], "4")
         self.assertIn("--raw-logs", argv)
+
+    def test_output_dir_threaded_from_resolved_output_root(self) -> None:
+        """argv MUST include `--output-dir <resolved --output>` so the
+        spawned secondary's `SecondaryConfig.output_dir` — the publish
+        target every worker receives as its own `--output` — IS the
+        operator's output directory. Pre-fix this failed: the argv
+        builder emitted no output flag, the secondary fell back to the
+        `<TMPDIR>/secondary-<id>-<pid>-out` auto-resolution, and every
+        artifact of a `--multi-computer local` run died with the
+        per-secondary temp dir (consumer-validated at 2212c136). On
+        SLURM the wrapper bind-mounts the user-visible dir at
+        /app/out-network; local mode mirrors that semantic by
+        threading the same-host path directly."""
+        argv = _captured_argv(_make_args(resolved_output_root="/runs/out"))
+        self.assertIn("--output-dir", argv, f"--output-dir missing from argv: {argv}")
+        self.assertEqual(argv[argv.index("--output-dir") + 1], "/runs/out")
+
+    def test_output_dir_omitted_when_unresolved(self) -> None:
+        """Programmatic callers that never ran the selection-args
+        resolution carry no `resolved_output_root`; don't synthesize
+        an empty `--output-dir ""` — let the secondary's
+        auto-resolution apply."""
+        argv = _captured_argv(_make_args(resolved_output_root=None))
+        self.assertNotIn("--output-dir", argv, f"--output-dir should be absent: {argv}")
 
     def test_secondary_connection_args_always_present(self) -> None:
         """Sanity: the three secondary-connection flags are still

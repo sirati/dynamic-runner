@@ -139,6 +139,20 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
         "produce-%d: wrote %d bytes to %s, publishing", idx, out_path.stat().st_size, out_path
     )
     _publish(out_path)
+    # Framework-output exercise: ALSO deliver one artifact under the
+    # worker's framework-threaded `--output` directory (the explicit-dst
+    # publish form real consumers use). This is a DIFFERENT delivery
+    # surface from the env-redirected publish above: `--output` carries
+    # `SecondaryConfig.output_dir` end-to-end (dispatcher → secondary →
+    # subprocess_factory worker argv), so a scenario asserting on these
+    # files pins the whole output_dir derivation chain per dispatch
+    # mode — e.g. that `--multi-computer local` secondaries publish
+    # into the operator's `--output` rather than a per-secondary
+    # tempdir.
+    framework_output_dir = _output_dir()
+    fw_staged = staging / f"produce-{idx}.framework-out"
+    fw_staged.write_bytes(b"framework-out:" + content)
+    _publish(fw_staged, dst=framework_output_dir / fw_staged.name)
     # Keyed-outputs exercise: emit a deterministic inline nonce so the
     # downstream consume task can assert the value-and-kind through the
     # framework's predecessor_outputs plumbing. Gated on the payload
@@ -257,10 +271,29 @@ def handle(task: Task) -> WorkerOutput:
     raise NonRecoverableError(f"unknown task kind: {kind!r}")
 
 
-# Module-level handle to the configured ``--source`` directory. The
-# framework-injected worker CLI carries it; we pull it out in
-# :func:`_on_args` so :func:`handle` can use it without re-parsing.
+# Module-level handles to the configured ``--source`` / ``--output``
+# directories. The framework-injected worker CLI carries both; we pull
+# them out in :func:`_on_args` so :func:`handle` can use them without
+# re-parsing.
 _SOURCE_DIR: Path | None = None
+_OUTPUT_DIR: Path | None = None
+
+
+def _output_dir() -> Path:
+    """The framework-threaded ``--output`` directory.
+
+    This is ``SecondaryConfig.output_dir`` as seen by the worker —
+    the per-mode publish target the framework derived (operator's
+    ``--output`` on same-host modes, the ``/app/out-network`` bind
+    in SLURM containers). Fails loud if the framework forgot to
+    inject it, mirroring the ``--source`` guard in :func:`handle`.
+    """
+    if _OUTPUT_DIR is None:
+        raise NonRecoverableError(
+            "worker output_dir not configured — did the framework "
+            "forget to pass --output?"
+        )
+    return _OUTPUT_DIR
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -291,8 +324,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _on_args(args: argparse.Namespace) -> None:
-    global _SOURCE_DIR
+    global _SOURCE_DIR, _OUTPUT_DIR
     _SOURCE_DIR = Path(args.source)
+    _OUTPUT_DIR = Path(args.output)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [worker] %(levelname)s %(name)s: %(message)s",

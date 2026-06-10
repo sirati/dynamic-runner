@@ -1976,9 +1976,10 @@ fn discover_items_under_gil(
 ///      every dispatch path that owns an `output_dir`:
 ///      single-process via [`PyDistributedManager`],
 ///      multi-computer-local via the subprocess secondary
-///      ([`PySecondaryCoordinator::output_dir`] auto-resolves to
-///      the per-secondary tempdir), SLURM secondary via the
-///      wrapper-auto-resolved `/app/out-network`.
+///      ([`PySecondaryCoordinator::output_dir`] carries the
+///      spawner-threaded `--output-dir` — the operator's resolved
+///      `--output`), SLURM secondary via the wrapper-auto-resolved
+///      `/app/out-network`.
 ///   3. The SLURM wrapper bind-mount exists at
 ///      [`dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR`]
 ///      → use it. Backstop for callers that intentionally pass no

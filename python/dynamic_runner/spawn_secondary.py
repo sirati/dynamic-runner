@@ -74,6 +74,18 @@ def build_subprocess_spawn(
     and secondary share the local filesystem, so the primary's
     ``source_dir`` IS the secondary's ``src_network``.
 
+    ``--output-dir`` is auto-threaded from the dispatcher's resolved
+    ``--output`` (``args.resolved_output_root``) so every spawned
+    secondary's ``SecondaryConfig.output_dir`` — the publish target its
+    workers receive as ``--output`` — IS the operator's output
+    directory. This mirrors the SLURM-production semantic, where every
+    secondary publishes into the one user-visible directory via the
+    wrapper's ``/app/out-network`` bind-mount; on the shared local
+    filesystem the same-host path needs no mount, just this
+    thread-through. Without it the secondary auto-resolves to a
+    ``<TMPDIR>/secondary-<id>-<pid>-out`` tempdir and every artifact
+    dies with it (consumer-validated at 2212c136).
+
     ``--cores`` is forwarded as the verbatim spec string (e.g.
     ``"2"``, ``"-2"``, ``"-0"``) so each secondary resolves it
     against its own host via :func:`parse_cores`. This preserves the
@@ -136,6 +148,9 @@ def build_subprocess_spawn(
         source = getattr(args, "source", None)
         if source:
             cmd += ["--src-network", str(source)]
+        output_root = getattr(args, "resolved_output_root", None)
+        if output_root:
+            cmd += ["--output-dir", str(output_root)]
         cores = getattr(args, "cores", None)
         if cores is not None:
             cmd += ["--cores", str(cores)]
