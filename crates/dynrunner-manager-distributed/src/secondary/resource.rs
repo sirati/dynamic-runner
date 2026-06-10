@@ -19,6 +19,77 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 /// primary's `is_backpressure` predicate in the same commit.
 pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str = "worker no-fault preempt; resource stealing";
 
+/// How long a SENT terminal-bearing report waits for the primary's
+/// app-level [`DistributedMessage::TerminalAck`] before the reporting
+/// concern treats the send as no-route-equivalent and replays it (#352).
+///
+/// Why 15s:
+///   * It must be MEANINGFULLY shorter than the QUIC `max_idle_timeout`
+///     (60s) — the blackholed-but-live leg this exists for buffers
+///     `send.write_all` locally and returns `Ok` without delivering, and
+///     is not pruned from `has_peer` until that idle timeout. At 15s the
+///     replay engages within the task window and gets ≥3 attempts before
+///     the transport would even notice the dead leg.
+///   * It must be FAR above any genuine delivery+ack latency. A healthy
+///     ack is one mesh round-trip (sub-second); 15s = 3 production
+///     keepalive intervals (5s), so a loaded-but-live primary never
+///     produces spurious replays in practice — and a spurious replay is
+///     harmless anyway (the authority's hash-keyed terminal idempotence
+///     dedupes, and the primary re-acks every landing).
+///   * It sits below the primary-link failure window (30s) without
+///     feeding it: an ack timeout records NO `record_recv_failure` —
+///     delivery bookkeeping, never liveness.
+pub(in crate::secondary) const DEFAULT_TERMINAL_ACK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+
+/// One retained terminal-bearing report in the buffered-terminal-replay
+/// queue, tagged with WHY it is retained (the retention reason decides
+/// when the next drain re-sends it).
+#[derive(Debug)]
+pub(in crate::secondary) struct PendingTerminal<I> {
+    /// The retained frame, `delivery_seq`-stamped at first send. Every
+    /// re-send carries the SAME seq, so whichever landing reaches the
+    /// authority matches the ack (and the authority's hash-keyed
+    /// terminal idempotence makes any duplicate landing a no-op).
+    pub(in crate::secondary) frame: DistributedMessage<I>,
+    pub(in crate::secondary) state: TerminalSendState,
+}
+
+/// Why a terminal-bearing report is retained in the replay buffer.
+#[derive(Debug)]
+pub(in crate::secondary) enum TerminalSendState {
+    /// The send was ABSORBED on a no-route (the pre-#352 retention
+    /// reason): nothing was queued toward the primary, so the frame is
+    /// due for re-send on EVERY drain trigger.
+    NoRoute,
+    /// The send returned `Ok` — queued toward a route the membership
+    /// view calls live — but the primary's app-level `TerminalAck` has
+    /// not yet landed (#352). `Ok` proves nothing about DELIVERY on a
+    /// blackholed-but-live QUIC leg, so the frame stays retained; an
+    /// ack drops it, and `sent_at` aging past the ack timeout makes it
+    /// no-route-equivalent (due for replay).
+    AwaitingAck { sent_at: std::time::Instant },
+}
+
+impl TerminalSendState {
+    /// Is this retained frame due for a re-send at this drain?
+    /// `NoRoute` is always due; `AwaitingAck` becomes due once the ack
+    /// deadline has elapsed (the blackholed-leg detection edge).
+    fn due_for_resend(&self, ack_timeout: std::time::Duration) -> bool {
+        match self {
+            Self::NoRoute => true,
+            Self::AwaitingAck { sent_at } => sent_at.elapsed() >= ack_timeout,
+        }
+    }
+
+    /// Test-visible state predicate (the production drain reads
+    /// `due_for_resend`; tests assert on the retention reason itself).
+    #[cfg(test)]
+    pub(in crate::secondary) fn is_awaiting_ack(&self) -> bool {
+        matches!(self, Self::AwaitingAck { .. })
+    }
+}
+
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
 
@@ -163,7 +234,7 @@ where
     /// election's patient leg (B).
     pub(in crate::secondary) async fn send_to_primary(
         &mut self,
-        msg: DistributedMessage<I>,
+        mut msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         // The frame is consumed by `send_to`; classify it FIRST so a
         // no-route absorb can decide whether to retain it for replay
@@ -172,7 +243,22 @@ where
         // (`is_terminal_bearing`), so this site owns NO message-shape
         // knowledge beyond "is this a task-resolving report?".
         let is_terminal = msg.is_terminal_bearing();
+        // App-level delivery-confirmation stamp (#352): THIS chokepoint
+        // is the single owner of `delivery_seq` assignment — every
+        // terminal-bearing primary-bound report gets the next value of
+        // the per-secondary monotonic counter on its FIRST pass through
+        // here. A replayed frame already carries its seq (the stamp is
+        // sticky on the retained copy), so a re-send goes out with the
+        // SAME seq and the primary's ack matches whichever landing got
+        // through. Non-terminal sends are never stamped (the accessor is
+        // a no-op for them anyway).
+        if is_terminal && msg.delivery_seq().is_none() {
+            let seq = self.next_terminal_seq;
+            self.next_terminal_seq += 1;
+            msg.set_delivery_seq(seq);
+        }
         let terminal_hash = msg.task_hash().map(str::to_owned);
+        let terminal_seq = msg.delivery_seq();
         let msg_kind = msg.msg_type();
         // Clone ONLY when the frame is terminal-bearing and might need
         // retaining; the common (droppable) path never clones.
@@ -258,12 +344,16 @@ where
                 // RETAIN the terminal-bearing report FIFO (push at the back
                 // so the buffer stays in arrival order; a re-absorbed drain
                 // re-appends at the back, never reorders).
-                self.pending_terminal_replays.push(retained);
+                self.pending_terminal_replays.push(PendingTerminal {
+                    frame: retained,
+                    state: TerminalSendState::NoRoute,
+                });
                 let buffered = self.pending_terminal_replays.len();
                 tracing::warn!(
                     error = %e,
                     msg_kind = ?msg_kind,
                     task_hash = ?terminal_hash,
+                    delivery_seq = ?terminal_seq,
                     buffered,
                     "primary-bound TERMINAL report absorbed on no-route; \
                      retained for replay ({buffered} buffered)"
@@ -278,71 +368,150 @@ where
             }
             return Ok(());
         }
+        // SENT-BUT-UNACKED retention (#352, the Half-B honesty fix): an
+        // `Ok` here only proves the frame was queued toward a route the
+        // membership view calls live — on a blackholed-but-not-timed-out
+        // QUIC leg `send.write_all` buffers locally and returns Ok while
+        // the bytes never arrive, and `has_peer` stays true until the
+        // 60s idle timeout (well past the task window). So a
+        // terminal-bearing report is RETAINED on success too, in the
+        // SAME replay buffer with the `AwaitingAck` retention reason:
+        // the primary's app-level `TerminalAck { seq }` is the ONLY
+        // event that drops it, and `sent_at` aging past the ack timeout
+        // makes the next drain treat it as no-route-equivalent (replay,
+        // same seq). NO failover-health input is touched on this path —
+        // the ack is delivery bookkeeping, not liveness.
+        if let Some(retained) = replay_copy {
+            self.pending_terminal_replays.push(PendingTerminal {
+                frame: retained,
+                state: TerminalSendState::AwaitingAck {
+                    sent_at: std::time::Instant::now(),
+                },
+            });
+            tracing::debug!(
+                msg_kind = ?msg_kind,
+                task_hash = ?terminal_hash,
+                delivery_seq = ?terminal_seq,
+                buffered = self.pending_terminal_replays.len(),
+                "primary-bound TERMINAL report sent; retained awaiting the \
+                 app-level TerminalAck"
+            );
+        }
         result
     }
 
-    /// Drain the buffered-terminal-replay queue: re-send every retained
-    /// terminal-bearing report FIFO, retrying forever until delivered.
+    /// Drop the retained terminal whose `delivery_seq` the primary just
+    /// confirmed (#352) — the app-level delivery proof that releases the
+    /// sent-but-unacked retention.
     ///
-    /// The reporting concern's RE-DELIVERY edge. A frame retained by
-    /// [`Self::send_to_primary`]'s no-route absorb is re-sent here through
-    /// the SAME `send_to_primary` chokepoint, so it re-resolves
-    /// `Destination::Primary` to whoever holds the role NOW (a NEW primary
-    /// after failover routes automatically). Each attempt is one of:
-    ///   - DELIVERED (`send_to` returned `Ok` — the route resolved): the
-    ///     frame is dropped from the buffer; an INFO records the
-    ///     re-delivery.
-    ///   - RE-ABSORBED (still no route): `send_to_primary` pushes the
-    ///     frame back onto `pending_terminal_replays`, so it stays queued
-    ///     for the next drain. Never dropped, never reordered.
+    /// Exact-seq match (no ack-up-to coalescing): replays re-send the
+    /// same seq, possibly to a NEW primary after failover, so cumulative
+    /// semantics could falsely confirm an earlier seq that travelled a
+    /// different, still-blackholed leg. An ack for an unknown seq is a
+    /// benign duplicate (the entry was already acked, or the landing was
+    /// a replay whose first ack got through) and is logged at DEBUG.
     ///
-    /// FIFO + no-reorder is enforced by draining the WHOLE buffer into an
-    /// owned `Vec` first (`std::mem::take`), then re-sending each in order:
-    /// a re-absorb appends to the now-EMPTY live buffer, so the surviving
-    /// frames keep their relative order and a delivered frame simply never
-    /// re-appears. Re-borrowing the buffer per-send (rather than holding it)
-    /// is required anyway — `send_to_primary` takes `&mut self`.
+    /// Delivery bookkeeping ONLY: no `primary_link` input is read or
+    /// written here.
+    pub(in crate::secondary) fn ack_terminal(&mut self, seq: u64) {
+        let before = self.pending_terminal_replays.len();
+        self.pending_terminal_replays
+            .retain(|entry| entry.frame.delivery_seq() != Some(seq));
+        if self.pending_terminal_replays.len() < before {
+            tracing::debug!(
+                seq,
+                buffered = self.pending_terminal_replays.len(),
+                "terminal delivery confirmed by primary ack; dropped from \
+                 the replay buffer"
+            );
+        } else {
+            tracing::debug!(
+                seq,
+                "TerminalAck for an unknown delivery_seq (already acked / \
+                 duplicate landing); no-op"
+            );
+        }
+    }
+
+    /// Drain the buffered-terminal-replay queue: re-send every DUE
+    /// retained terminal-bearing report FIFO, retrying forever until the
+    /// primary's app-level [`DistributedMessage::TerminalAck`] confirms
+    /// delivery ([`Self::ack_terminal`] is the only drop site).
     ///
-    /// Called from the two re-delivery triggers (the operational loop tick
-    /// and the `record_primary_message` primary-link-recovery edge). A
-    /// no-op when the buffer is empty (the steady-state hot path).
+    /// The reporting concern's RE-DELIVERY edge. Due-ness is the
+    /// retention reason's call ([`TerminalSendState::due_for_resend`]):
+    ///   - `NoRoute` (absorbed, nothing ever queued): due on EVERY drain
+    ///     trigger — the pre-#352 behaviour.
+    ///   - `AwaitingAck` (sent, unconfirmed): due once `sent_at` ages
+    ///     past the ack timeout — the blackholed-but-live-leg detection
+    ///     (#352): the transport said `Ok` but the authority never
+    ///     answered, so the send is treated as no-route-equivalent and
+    ///     replayed. A not-yet-due entry is kept untouched (the common
+    ///     just-sent case — the ack is still in flight).
+    ///
+    /// A due frame is re-sent through the SAME `send_to_primary`
+    /// chokepoint, so it re-resolves `Destination::Primary` to whoever
+    /// holds the role NOW (a NEW primary after failover routes
+    /// automatically) and carries the SAME `delivery_seq` (the stamp is
+    /// sticky); the chokepoint re-retains it with its fresh post-send
+    /// state (`AwaitingAck` with a reset `sent_at` on Ok, `NoRoute` on a
+    /// re-absorb). Never dropped here, never reordered: the WHOLE buffer
+    /// is taken (`std::mem::take`) and every entry — kept or re-sent —
+    /// re-appends to the now-empty live buffer in iteration order.
+    /// Duplicate landings at the authority are safe (hash-keyed terminal
+    /// idempotence; the primary re-acks every landing).
+    ///
+    /// Called from the two re-delivery triggers (the operational loop
+    /// tick and the `record_primary_message` primary-link-recovery
+    /// edge). A no-op when the buffer is empty (the steady-state hot
+    /// path), and silent when nothing is due (entries merely awaiting a
+    /// fresh ack).
     pub(in crate::secondary) async fn drain_terminal_replays(&mut self) {
         if self.pending_terminal_replays.is_empty() {
             return;
         }
-        // Take the whole buffer; a re-absorb during the loop re-appends to
-        // the now-empty live buffer, preserving FIFO order across drains.
+        // Take the whole buffer; every entry re-appends to the now-empty
+        // live buffer in iteration order (kept directly, or via the
+        // re-send's retain), preserving FIFO order across drains.
         let pending = std::mem::take(&mut self.pending_terminal_replays);
-        let attempted = pending.len();
-        tracing::info!(
-            attempted,
-            "draining buffered-terminal-replay queue (re-delivering absorbed terminals)"
-        );
-        for frame in pending {
-            let task_hash = frame.task_hash().map(str::to_owned);
-            // Snapshot the buffer length BEFORE the re-send so we can tell a
-            // delivery (buffer unchanged) from a re-absorb (buffer grew by
-            // one — the frame went back via `send_to_primary`'s retain).
-            let buffered_before = self.pending_terminal_replays.len();
-            // `send_to_primary` absorbs a re-absorb into `Ok(())` and
-            // re-buffers the frame, so this never errors here; the delivery
-            // outcome is read from whether the buffer grew.
-            let _ = self.send_to_primary(frame).await;
-            let re_absorbed = self.pending_terminal_replays.len() > buffered_before;
-            if re_absorbed {
-                // Still no route — the frame is back on the buffer for the
-                // next drain. The absorb site already WARNed; stay quiet here
-                // to avoid double-logging the same no-route.
-                tracing::debug!(
+        let ack_timeout = self.terminal_ack_timeout;
+        let mut resent = 0usize;
+        for entry in pending {
+            if !entry.state.due_for_resend(ack_timeout) {
+                // Sent and still inside the ack window: keep waiting.
+                self.pending_terminal_replays.push(entry);
+                continue;
+            }
+            resent += 1;
+            let task_hash = entry.frame.task_hash().map(str::to_owned);
+            let seq = entry.frame.delivery_seq();
+            if matches!(entry.state, TerminalSendState::AwaitingAck { .. }) {
+                // The blackhole detection edge firing: the transport
+                // accepted the send but no ack came back within the
+                // window — surface it, this is the honesty signal #352
+                // exists for.
+                tracing::warn!(
                     task_hash = ?task_hash,
-                    "buffered terminal re-absorbed (still no route); kept for next drain"
-                );
-            } else {
-                tracing::info!(
-                    task_hash = ?task_hash,
-                    "re-delivered absorbed terminal to the primary"
+                    delivery_seq = ?seq,
+                    ack_timeout_secs = ack_timeout.as_secs_f64(),
+                    "terminal report sent but UNACKED past the ack timeout \
+                     (possible blackholed-but-live leg); treating as \
+                     no-route-equivalent and replaying with the same seq"
                 );
             }
+            // `send_to_primary` absorbs a no-route into `Ok(())` and
+            // re-retains the frame either way (`NoRoute` on re-absorb —
+            // already WARNed at the absorb site — or a fresh
+            // `AwaitingAck` on a successful re-send), so this never
+            // errors and never loses the frame.
+            let _ = self.send_to_primary(entry.frame).await;
+        }
+        if resent > 0 {
+            tracing::info!(
+                resent,
+                buffered = self.pending_terminal_replays.len(),
+                "buffered-terminal-replay drain re-sent due terminal reports"
+            );
         }
     }
 
@@ -373,6 +542,8 @@ where
             task_hash: file_hash.to_string(),
             error_type: ErrorType::Recoverable,
             error_message: "worker pipe broken; respawning".into(),
+            // Stamped at the send_to_primary chokepoint (#352).
+            delivery_seq: None,
         };
         self.send_to_primary(msg).await
     }
@@ -571,6 +742,8 @@ where
                         task_hash: hash,
                         error_type,
                         error_message,
+                        // Stamped at the send_to_primary chokepoint (#352).
+                        delivery_seq: None,
                     };
                     // Report to the primary role only. The AUTHORITY
                     // originates the terminal CRDT mutation and

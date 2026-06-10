@@ -241,6 +241,7 @@ async fn injected_batch_on_promoted_primary_spreads_across_live_fleet() {
                         worker_id: unify_worker,
                         task_hash: compute_task_hash(&ptask("u0")),
                         result_data: None,
+                        delivery_seq: None,
                     },
                     &mut None,
                 )

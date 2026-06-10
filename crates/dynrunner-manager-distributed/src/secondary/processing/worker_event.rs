@@ -162,6 +162,8 @@ where
                             worker_id,
                             task_hash: hash.clone(),
                             result_data,
+                            // Stamped at the send_to_primary chokepoint (#352).
+                            delivery_seq: None,
                         };
                         // Report to the primary role only. The AUTHORITY
                         // originates the terminal CRDT mutation
@@ -206,6 +208,8 @@ where
                             error_message: result
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),
+                            // Stamped at the send_to_primary chokepoint (#352).
+                            delivery_seq: None,
                         };
                         // Report to the primary role only; the authority
                         // originates + broadcasts the terminal CRDT
@@ -392,6 +396,8 @@ where
                         task_hash: hash,
                         error_type: wire_error_type,
                         error_message: wire_error_message,
+                        // Stamped at the send_to_primary chokepoint (#352).
+                        delivery_seq: None,
                     };
                     // Report to the primary role only; the authority
                     // originates + broadcasts the terminal CRDT mutation.

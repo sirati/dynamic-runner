@@ -184,6 +184,20 @@ where
                     "observed peer TaskFailed"
                 );
             }
+            DistributedMessage::TerminalAck { seq, .. } => {
+                // App-level delivery confirmation (#352): the primary's
+                // ingest acked one terminal-bearing report landing; drop
+                // the matching sent-but-unacked entry from the
+                // buffered-terminal-replay retention. Delivery
+                // bookkeeping ONLY — deliberately NOT a primary-liveness
+                // signal (no `record_primary_message` here, mirroring
+                // the sibling TaskComplete/TaskFailed observation arms):
+                // the ack confirms one delivery, and liveness keeps
+                // flowing through the keepalive / dispatch preambles
+                // unchanged, so the failover-arming inputs are untouched
+                // by this feature.
+                self.ack_terminal(seq);
+            }
             DistributedMessage::TimeoutDetected {
                 sender_id,
                 timed_out_secondary_id,

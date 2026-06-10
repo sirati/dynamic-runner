@@ -35,6 +35,7 @@ impl<I> DistributedMessage<I> {
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
+            | Self::TerminalAck { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -73,6 +74,7 @@ impl<I> DistributedMessage<I> {
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
+            | Self::TerminalAck { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -125,6 +127,7 @@ impl<I> DistributedMessage<I> {
             | Self::MeshReady { target, .. }
             | Self::TaskComplete { target, .. }
             | Self::TaskFailed { target, .. }
+            | Self::TerminalAck { target, .. }
             | Self::Keepalive { target, .. }
             | Self::TimeoutDetected { target, .. }
             | Self::TimeoutQuery { target, .. }
@@ -158,6 +161,7 @@ impl<I> DistributedMessage<I> {
             | Self::MeshReady { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
+            | Self::TerminalAck { sender_id, .. }
             | Self::Keepalive { sender_id, .. }
             | Self::TimeoutDetected { sender_id, .. }
             | Self::TimeoutQuery { sender_id, .. }
@@ -190,6 +194,7 @@ impl<I> DistributedMessage<I> {
             | Self::MeshReady { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
+            | Self::TerminalAck { timestamp, .. }
             | Self::Keepalive { timestamp, .. }
             | Self::TimeoutDetected { timestamp, .. }
             | Self::TimeoutQuery { timestamp, .. }
@@ -221,7 +226,10 @@ impl<I> DistributedMessage<I> {
     /// Everything else through the primary-bound send chokepoint
     /// (`TaskRequest` capacity hints, `Keepalive`, `MeshReady`) is
     /// legitimately DROPPABLE — a missed one is re-emitted on the next
-    /// tick — so it is NOT terminal-bearing.
+    /// tick — so it is NOT terminal-bearing. Nor is
+    /// [`DistributedMessage::TerminalAck`]: it CONFIRMS a terminal
+    /// landing, it does not carry one (and it never flows through the
+    /// primary-bound chokepoint anyway — it is primary→secondary).
     pub fn is_terminal_bearing(&self) -> bool {
         matches!(self, Self::TaskComplete { .. } | Self::TaskFailed { .. })
     }
@@ -239,6 +247,55 @@ impl<I> DistributedMessage<I> {
         match self {
             Self::TaskComplete { task_hash, .. } | Self::TaskFailed { task_hash, .. } => {
                 Some(task_hash)
+            }
+            _ => None,
+        }
+    }
+
+    /// The app-level delivery-confirmation sequence id (#352) stamped on
+    /// a terminal-bearing report, if any. `None` for every non-terminal
+    /// variant AND for a terminal frame that was never routed through the
+    /// stamping chokepoint (a pre-field wire sender, or a frame the
+    /// secondary has constructed but not yet sent).
+    ///
+    /// Pairs with [`Self::is_terminal_bearing`]: the secondary's
+    /// reporting concern stamps it once per report
+    /// ([`Self::set_delivery_seq`]) and matches inbound
+    /// [`DistributedMessage::TerminalAck`]s against it; the primary's
+    /// ingest reads it to echo the ack.
+    pub fn delivery_seq(&self) -> Option<u64> {
+        match self {
+            Self::TaskComplete { delivery_seq, .. } | Self::TaskFailed { delivery_seq, .. } => {
+                *delivery_seq
+            }
+            _ => None,
+        }
+    }
+
+    /// Stamp the app-level delivery-confirmation `seq` (#352) on a
+    /// terminal-bearing frame IN PLACE. A no-op on every other variant —
+    /// the stamping chokepoint gates on [`Self::is_terminal_bearing`]
+    /// first, so a non-terminal frame never reaches this.
+    pub fn set_delivery_seq(&mut self, seq: u64) {
+        if let Self::TaskComplete { delivery_seq, .. } | Self::TaskFailed { delivery_seq, .. } =
+            self
+        {
+            *delivery_seq = Some(seq);
+        }
+    }
+
+    /// The ORIGINATING reporter of a terminal-bearing frame (its
+    /// `secondary_id` field); `None` for every other variant.
+    ///
+    /// This — NOT the wire `sender_id` — is where a
+    /// [`DistributedMessage::TerminalAck`] must be addressed: the
+    /// retention buffer awaiting the ack lives on the originator, and a
+    /// landing that travelled a relay / peer-forwarded path carries a
+    /// forwarder's `sender_id` while the originator still waits.
+    pub fn terminal_reporter(&self) -> Option<&str> {
+        match self {
+            Self::TaskComplete { secondary_id, .. } | Self::TaskFailed { secondary_id, .. } => {
+                Some(secondary_id)
             }
             _ => None,
         }
@@ -263,6 +320,7 @@ impl<I> DistributedMessage<I> {
             Self::MeshReady { .. } => MessageType::MeshReady,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,
+            Self::TerminalAck { .. } => MessageType::TerminalAck,
             Self::Keepalive { .. } => MessageType::Keepalive,
             Self::TimeoutDetected { .. } => MessageType::TimeoutDetected,
             Self::TimeoutQuery { .. } => MessageType::TimeoutQuery,

@@ -214,6 +214,7 @@ fn roundtrip_task_failed() {
         task_hash: "hash123".into(),
         error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
         error_message: "out of memory".into(),
+        delivery_seq: None,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -491,4 +492,127 @@ fn legacy_run_config_without_forwarded_argv_decodes_empty() {
         }
         _ => panic!("expected RunConfig"),
     }
+}
+
+/// `TerminalAck` (#352) round-trips through the length-prefixed codec
+/// with its `seq` preserved verbatim — the app-level delivery
+/// confirmation the primary's ingest echoes back for every
+/// `delivery_seq`-stamped terminal landing.
+#[test]
+fn roundtrip_terminal_ack() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::TerminalAck {
+        target: None,
+        sender_id: "primary".into(),
+        timestamp: 42.0,
+        seq: 9001,
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, consumed) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(consumed, bytes.len());
+
+    match decoded {
+        DistributedMessage::TerminalAck { sender_id, seq, .. } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(seq, 9001);
+        }
+        _ => panic!("expected TerminalAck"),
+    }
+}
+
+/// Wire-shape mirror (NOT symmetric-on-the-wrong-shape): decode the EXACT
+/// JSON bytes a primary emits for a `TerminalAck` —
+/// `{"msg_type":"terminal_ack",...,"seq":N}` (internally tagged,
+/// snake_case) — rather than re-encoding our own value, so a tag/field
+/// rename that still round-trips against itself is caught against the
+/// other side's actual bytes.
+#[test]
+fn terminal_ack_decodes_literal_sender_bytes() {
+    let bytes = r#"{"msg_type":"terminal_ack","sender_id":"primary","timestamp":7.5,"seq":42}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match decoded {
+        DistributedMessage::TerminalAck { sender_id, seq, .. } => {
+            assert_eq!(sender_id, "primary");
+            assert_eq!(seq, 42);
+        }
+        _ => panic!("expected TerminalAck"),
+    }
+}
+
+/// A `delivery_seq`-stamped terminal report round-trips with the seq
+/// preserved — what lets a replay re-send the SAME seq and the primary
+/// echo the matching ack.
+#[test]
+fn roundtrip_task_complete_with_delivery_seq() {
+    let mut msg: DistributedMessage<TestId> = DistributedMessage::TaskComplete {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 5.0,
+        secondary_id: "sec-1".into(),
+        worker_id: 3,
+        task_hash: "h-seq".into(),
+        result_data: None,
+        delivery_seq: None,
+    };
+    assert_eq!(msg.delivery_seq(), None);
+    msg.set_delivery_seq(11);
+    assert_eq!(msg.delivery_seq(), Some(11));
+    assert_eq!(msg.terminal_reporter(), Some("sec-1"));
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    assert_eq!(decoded.delivery_seq(), Some(11));
+    assert_eq!(decoded.task_hash(), Some("h-seq"));
+}
+
+/// Wire-shape mirror for the seq-stamped terminal: decode the EXACT JSON
+/// bytes a stamping secondary emits (`"delivery_seq":N` riding the
+/// internally-tagged `task_failed` frame) against the other side's
+/// actual bytes.
+#[test]
+fn task_failed_with_delivery_seq_decodes_literal_sender_bytes() {
+    let bytes = r#"{"msg_type":"task_failed","sender_id":"sec-2","timestamp":1.0,"secondary_id":"sec-2","worker_id":0,"task_hash":"h-lit","error_type":"Recoverable","error_message":"worker pipe broken; respawning","delivery_seq":3}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(bytes).unwrap();
+    match &decoded {
+        DistributedMessage::TaskFailed {
+            task_hash,
+            error_message,
+            delivery_seq,
+            ..
+        } => {
+            assert_eq!(task_hash, "h-lit");
+            assert_eq!(error_message, "worker pipe broken; respawning");
+            assert_eq!(*delivery_seq, Some(3));
+        }
+        _ => panic!("expected TaskFailed"),
+    }
+    assert_eq!(decoded.terminal_reporter(), Some("sec-2"));
+}
+
+/// Backcompat both ways for the additive `delivery_seq` field:
+///   * a pre-field sender's bytes (field absent) decode as `None`, and
+///   * a `None` frame serializes WITHOUT the field — byte-identical to
+///     the pre-#352 wire (`skip_serializing_if`), so a rolling upgrade
+///     never trips an old decoder on an unknown field.
+#[test]
+fn delivery_seq_is_wire_additive() {
+    let legacy = r#"{"msg_type":"task_complete","sender_id":"sec-1","timestamp":0.0,"secondary_id":"sec-1","worker_id":0,"task_hash":"h-old"}"#;
+    let decoded: DistributedMessage<TestId> = serde_json::from_str(legacy).unwrap();
+    assert_eq!(decoded.delivery_seq(), None);
+
+    let unstamped: DistributedMessage<TestId> = DistributedMessage::TaskComplete {
+        target: None,
+        sender_id: "sec-1".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-1".into(),
+        worker_id: 0,
+        task_hash: "h-old".into(),
+        result_data: None,
+        delivery_seq: None,
+    };
+    let json = serde_json::to_string(&unstamped).unwrap();
+    assert!(
+        !json.contains("delivery_seq"),
+        "a None delivery_seq must be elided from the wire bytes; got {json}"
+    );
 }

@@ -73,6 +73,10 @@
 //!   wiring contract (the separate resource-provider capability).
 //! - [`panik_integration`] — panik self-departure + worker teardown.
 //! - [`memprofile_hook`] — sampler lifecycle hooks.
+//! - [`terminal_ack`] — #352 app-level delivery confirmation: the
+//!   blackholed-but-live-leg repro (transport-Ok send retained awaiting
+//!   `TerminalAck`; ack-timeout replays with the same seq; the ack is the
+//!   only drop site; failover-arming inputs untouched).
 
 #![cfg(test)]
 
@@ -97,3 +101,4 @@ mod peer_mesh_watchdog;
 mod processing;
 mod r1;
 mod run_config_responder;
+mod terminal_ack;

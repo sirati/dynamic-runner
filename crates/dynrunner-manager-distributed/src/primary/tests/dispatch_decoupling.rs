@@ -79,6 +79,7 @@ fn task_complete(secondary_id: &str, worker_id: u32, hash: &str) -> DistributedM
         worker_id,
         task_hash: hash.into(),
         result_data: None,
+        delivery_seq: None,
     }
 }
 

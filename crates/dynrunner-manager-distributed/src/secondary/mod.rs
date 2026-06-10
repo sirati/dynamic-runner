@@ -575,8 +575,17 @@ where
         std::sync::Arc<std::sync::Mutex<types::StagingDispatchContext>>,
 
     /// Buffered-terminal-replay queue — the reporting concern's retain
-    /// buffer for a terminal-bearing primary-bound report whose send was
-    /// ABSORBED on a transient no-route.
+    /// buffer for a terminal-bearing primary-bound report that has not
+    /// yet been CONFIRMED delivered at the authority, for either of two
+    /// retention reasons ([`resource::TerminalSendState`]):
+    ///   * `NoRoute` — the send was ABSORBED on a transient no-route
+    ///     (nothing was ever queued);
+    ///   * `AwaitingAck` — the send returned `Ok` but the primary's
+    ///     app-level `TerminalAck { delivery_seq }` has not landed
+    ///     (#352): on a blackholed-but-live QUIC leg `write_all` buffers
+    ///     locally and returns `Ok` without delivering, and the route is
+    ///     not pruned until the 60s idle timeout — so transport success
+    ///     proves nothing; only the ack does.
     ///
     /// `send_to_primary` absorbs a no-route `Err` into `Ok(())` so a
     /// primary-loss never fatals / false-failovers a voter (the absorb is
@@ -585,41 +594,64 @@ where
     /// here LOCALLY (e.g. the replacement sweep clears `active_tasks`
     /// before reporting) but never reached the authority, so the
     /// primary's in-flight entry strands forever (phantom-busy; the phase
-    /// barrier wedges). This buffer is that fix: when a TERMINAL-bearing
-    /// (`DistributedMessage::is_terminal_bearing`) report is absorbed on
-    /// no-route, the frame is RETAINED here instead of dropped.
+    /// barrier wedges). This buffer is that fix: every TERMINAL-bearing
+    /// (`DistributedMessage::is_terminal_bearing`) report is RETAINED
+    /// here from the send until its ack.
     ///
     /// Scope: ONLY terminal-bearing reports are buffered — keepalives /
     /// stats / capacity `TaskRequest`s are legitimately droppable (a
     /// missed one is re-emitted next tick) and never land here. The gate
-    /// is at the absorb site in `send_to_primary` (see
+    /// is at the send chokepoint in `send_to_primary` (see
     /// `resource.rs::send_to_primary`); every other primary-bound send
     /// kind flows through unchanged.
     ///
-    /// Drained FIFO, retrying FOREVER until delivered, on TWO triggers:
-    /// the top of the operational loop tick (`process_tasks`, beside the
+    /// Drained FIFO, retrying FOREVER until acked, on TWO triggers: the
+    /// top of the operational loop tick (`process_tasks`, beside the
     /// deferred-peer-message flush) AND the primary-link-recovery edge
     /// (`record_primary_message`, where Suspecting/Voting/Candidate →
-    /// Normal).
+    /// Normal). A drain re-sends the DUE entries only (`NoRoute` always;
+    /// `AwaitingAck` once `sent_at` ages past `terminal_ack_timeout` —
+    /// the no-route-equivalent edge); the ONLY drop site is
+    /// `ack_terminal` (an inbound `TerminalAck` matching the entry's
+    /// `delivery_seq` exactly).
     ///
-    /// Each drain attempt re-sends FIFO; a re-absorb re-buffers the frame
-    /// at the back (never drop, never reorder within a single drain). A
+    /// Each re-send carries the SAME `delivery_seq` and re-retains at
+    /// the back (never drop, never reorder within a single drain). A
     /// re-delivery to a NEW primary after failover works automatically —
     /// `send_to_primary` routes `Destination::Primary` to
     /// `current_primary()` at the egress edge, so the retained frame
     /// follows the role. The authority dedupes a duplicate landing
     /// (hash-keyed `completed_tasks` / `failed_tasks`; idempotent
     /// backpressure requeue gated on `free_slot_on_terminal`'s held-hash
-    /// match), so an at-most-once-effective re-delivery is safe even if
-    /// the original send had in fact reached an old primary.
+    /// match) and ACKS every landing including dedup-dropped duplicates,
+    /// so an at-most-once-effective re-delivery is safe even if the
+    /// original send had in fact reached an old primary.
     ///
     /// Lives on the coordinator (NOT `OperationalState`) because the
     /// reporting concern that owns `send_to_primary` lives here, and the
     /// buffer is its private mechanism — a drain is a no-op outside an
     /// operational run (no terminal can be produced there), so it needs
     /// no lifecycle gating.
-    pub(in crate::secondary) pending_terminal_replays:
-        Vec<DistributedMessage<I>>,
+    pub(in crate::secondary) pending_terminal_replays: Vec<resource::PendingTerminal<I>>,
+
+    /// Per-secondary monotonic `delivery_seq` counter (#352), owned by
+    /// the `send_to_primary` stamping chokepoint: every terminal-bearing
+    /// primary-bound report is stamped with the next value on its first
+    /// send (replays keep their original stamp). Matched by the
+    /// primary's echoed `TerminalAck { seq }` to drop the corresponding
+    /// `pending_terminal_replays` entry. Starts at 1 so a `0` never
+    /// appears on the wire (`Some(0)` would be valid but a non-zero
+    /// floor makes a default-initialised stamp visibly distinct in
+    /// logs).
+    pub(in crate::secondary) next_terminal_seq: u64,
+
+    /// How long a sent terminal waits for its `TerminalAck` before the
+    /// drain treats it as no-route-equivalent and replays it. Seeded
+    /// from [`resource::DEFAULT_TERMINAL_ACK_TIMEOUT`] (see its doc for
+    /// the 15s justification against the 60s QUIC idle timeout); tests
+    /// drive it sub-second directly. Delivery bookkeeping only — never
+    /// an input to the failover-health probe.
+    pub(in crate::secondary) terminal_ack_timeout: std::time::Duration,
 
     /// Per-iteration `select!`-arm accounting for the secondary's
     /// `process_tasks` operational loop. The co-located topology runs the

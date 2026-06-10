@@ -331,6 +331,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                             task_hash: h,
                             error_type: dynrunner_core::ErrorType::Recoverable,
                             error_message: "always fails".into(),
+                            delivery_seq: None,
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
@@ -450,6 +451,7 @@ async fn retry_max_passes_zero_disables_retry() {
                             task_hash: h,
                             error_type: dynrunner_core::ErrorType::Recoverable,
                             error_message: "always fails".into(),
+                            delivery_seq: None,
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
@@ -580,6 +582,7 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
                                 dynrunner_core::ResourceKind::memory(),
                             ),
                             error_message: "over budget".into(),
+                            delivery_seq: None,
                         })
                         .unwrap();
                         tx.send(DistributedMessage::TaskRequest {
@@ -856,6 +859,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                                     dynrunner_core::ResourceKind::memory(),
                                 ),
                                 error_message: "over budget".into(),
+                                delivery_seq: None,
                             })
                             .unwrap();
                         } else {
@@ -867,6 +871,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                                 worker_id: 0,
                                 task_hash: h,
                                 result_data: None,
+                                delivery_seq: None,
                             })
                             .unwrap();
                         }

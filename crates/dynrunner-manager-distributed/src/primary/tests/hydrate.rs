@@ -345,6 +345,7 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
                 worker_id: 0,
                 task_hash: "inflight-1".into(),
                 result_data: None,
+                delivery_seq: None,
             };
             primary.handle_task_complete(msg, &mut None).await;
 
@@ -456,6 +457,7 @@ async fn hydrate_reconstructs_worker_roster_from_capacity_and_inflight() {
                         worker_id: 1,
                         task_hash: hash.clone(),
                         result_data: None,
+                        delivery_seq: None,
                     },
                     &mut None,
                 )
