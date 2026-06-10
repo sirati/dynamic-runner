@@ -39,6 +39,7 @@ mod producer_backstop;
 mod promotion;
 mod reconciliation_probe;
 mod relocate_staging;
+mod requeue_terminal_race;
 mod result_data_plumbing;
 mod retry;
 mod setup_promote;

@@ -199,7 +199,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
-            MessageType::TaskRequest => self.handle_task_request(msg).await?,
+            MessageType::TaskRequest => self.handle_task_request(msg, command_rx).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
             MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
             // Consumer custom message (F5): droppable → direct handler
@@ -225,7 +225,7 @@ impl<S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator
             // case after promotion); see `handle_cluster_mutation`
             // for the full rationale and the asm-dataset-nix R2 / T3
             // hang it pins.
-            MessageType::ClusterMutation => self.handle_cluster_mutation(msg).await,
+            MessageType::ClusterMutation => self.handle_cluster_mutation(msg, command_rx).await,
             // Snapshot-RPC responder. A late-joiner / re-bootstrapping
             // peer (or a recovering observer) unicasts
             // `RequestClusterSnapshot` to `Destination::Primary`; the

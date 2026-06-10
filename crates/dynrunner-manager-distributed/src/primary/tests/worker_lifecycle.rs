@@ -136,7 +136,7 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
 
             // Initial request assigns X to (sec-0, w0).
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(
@@ -156,7 +156,7 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
             // ahead of the completion). It MUST be a no-op on the slot
             // — never freeing X, never assigning Y on top of it.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(
@@ -250,7 +250,7 @@ async fn dispatch_originates_inflight_and_completion_clears_it() {
             // Dispatch via the real request path → originates TaskAssigned
             // after the successful send → CRDT transitions to InFlight.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(
@@ -326,7 +326,7 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             // insertion order → X first); pin the assertion to whichever
             // landed so the reassignment logic below is what's tested.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             // Re-derive which task the slot took, so the "complete the
@@ -476,11 +476,11 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
             // picks the highest-priority eligible item per request;
             // the two-task pool drains one per request.
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             primary
-                .handle_task_request(task_request("sec-1", 0))
+                .handle_task_request(task_request("sec-1", 0), &mut None)
                 .await
                 .unwrap();
 
@@ -624,7 +624,7 @@ async fn complete_for_untracked_hash_is_noop() {
             let (mut primary, _ends, _mesh) = primary_with_pool_and_idle_worker(vec![y]);
 
             primary
-                .handle_task_request(task_request("sec-0", 0))
+                .handle_task_request(task_request("sec-0", 0), &mut None)
                 .await
                 .unwrap();
             assert!(primary.slot_holds_hash_for_test("sec-0", 0, &hash_y));
