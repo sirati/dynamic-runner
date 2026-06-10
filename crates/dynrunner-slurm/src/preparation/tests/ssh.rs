@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use crate::preparation::options::{PrepError, PreparationOptions};
 use crate::preparation::ssh::{
     LingerVerb, build_linger_argv, build_release_argv, build_ssh_argv, linger_fail_reason,
-    linger_succeeded, parse_was_linger, verify_tunnel_alive,
+    linger_succeeded, parse_was_linger, verify_tunnel_alive, was_linger_from_probe,
 };
 
 /// Ssh spawn argv shape (no auth-options): -J jump_target form,
@@ -212,7 +212,18 @@ fn linger_enable_argv_forces_pty_jumps_and_self_targets() {
         remote_cmd.contains("WAS_LINGER="),
         "must probe the prior state: {remote_cmd:?}"
     );
-    assert!(remote_cmd.contains("show-user --value -p Linger"));
+    // The probe is BUS-FREE: a file test on the persistent linger marker,
+    // NOT `loginctl show-user` (which needs logind/a session and once
+    // misread an operator pre-set linger as off — the restore then wiped it
+    // mid-run, fan-killing the cluster).
+    assert!(
+        remote_cmd.contains("/var/lib/systemd/linger/"),
+        "probe must stat the persistent marker: {remote_cmd:?}"
+    );
+    assert!(
+        !remote_cmd.contains("show-user"),
+        "probe must not depend on logind: {remote_cmd:?}"
+    );
     // No collateral: no extra-forward / QUIC ports in the linger command.
     assert!(!remote_cmd.contains("9090"));
     assert!(!remote_cmd.contains("2222"));
@@ -282,6 +293,25 @@ fn parse_was_linger_reads_marker_crlf_tolerant() {
     assert_eq!(parse_was_linger("WAS_LINGER=\r\nENABLE=fail\r\n").as_deref(), Some(""));
     // Absent marker (e.g. ssh failed before the printf ran).
     assert_eq!(parse_was_linger("Permission denied\r\n"), None);
+}
+
+/// THE restore-decision regression guard: ONLY an explicit `WAS_LINGER=no`
+/// permits the run-end restore-disable. The EMPTY-value case is the
+/// krater 2026-06-10 post-mortem: a failed bus-dependent probe yielded
+/// `WAS_LINGER=` (empty), the old `== "yes"` mapping read it as "was off",
+/// and the restore DISABLED an operator pre-set linger while the cluster
+/// still ran — re-arming the fan-kill. Empty/absent/garbage must all read
+/// as "already on" (restore skipped).
+#[test]
+fn only_explicit_no_permits_restore() {
+    assert!(!was_linger_from_probe("WAS_LINGER=no\r\nENABLE=ok\r\n"), "explicit no → restore");
+    assert!(was_linger_from_probe("WAS_LINGER=yes\r\nENABLE=ok\r\n"), "yes → skip restore");
+    // THE regression: empty value must NOT be read as "was off".
+    assert!(was_linger_from_probe("WAS_LINGER=\r\nENABLE=ok\r\n"), "empty → skip restore");
+    // Absent marker (ssh died before the printf) → skip restore.
+    assert!(was_linger_from_probe("Permission denied\r\n"), "absent → skip restore");
+    // Garbage value → skip restore.
+    assert!(was_linger_from_probe("WAS_LINGER=maybe\r\n"), "garbage → skip restore");
 }
 
 /// `linger_succeeded` keys off the per-verb `=ok` marker, CR-tolerant, and

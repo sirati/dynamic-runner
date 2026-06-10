@@ -299,11 +299,21 @@ impl LingerVerb {
 }
 
 /// The remote shell command that (for `Enable`) FIRST reports the user's
-/// current linger state on a `WAS_LINGER=<value>` line, THEN runs the
+/// current linger state on a `WAS_LINGER=yes|no` line, THEN runs the
 /// requested `loginctl` mutation and reports its outcome on an
 /// `ENABLE=ok|fail` / `DISABLE=ok|fail` line. Both markers go to stdout so
 /// the setup can parse them out of a single round-trip even under a forced
 /// PTY (`-tt`), which merges stderr onto the same stream.
+///
+/// The probe is BUS-FREE: a `test -e` on `/var/lib/systemd/linger/<user>` —
+/// the persistent marker `enable-linger` writes and systemd itself reads —
+/// NOT `loginctl show-user`, which needs logind/a session and proved
+/// fragile: on a node where it failed, the probe yielded an EMPTY
+/// `WAS_LINGER=` that was misread as "was off", and the run-end restore
+/// then DISABLED an operator PRE-SET linger while the cluster still ran —
+/// re-arming the fan-kill the linger was protecting against (krater
+/// post-mortem 2026-06-10). The file test answers identically in any
+/// context and can only say `yes` or `no`.
 ///
 /// The `WAS_LINGER` probe runs for BOTH verbs but is only consumed on
 /// `Enable` (the setup captures it so the matching `Disable` restore knows
@@ -321,7 +331,8 @@ fn build_linger_remote_cmd(verb: LingerVerb) -> String {
         LingerVerb::Disable => "DISABLE",
     };
     format!(
-        "W=$(loginctl show-user --value -p Linger 2>/dev/null); \
+        "U=$(id -un); \
+         if test -e \"/var/lib/systemd/linger/$U\"; then W=yes; else W=no; fi; \
          printf 'WAS_LINGER=%s\\n' \"$W\"; \
          if E=$(loginctl {sub} 2>&1); then printf '{marker}=ok\\n'; \
          else printf '{marker}=fail %s\\n' \"$E\"; fi",
@@ -382,6 +393,19 @@ pub(super) fn parse_was_linger(stdout: &str) -> Option<String> {
         .filter_map(|line| line.trim_end_matches('\r').strip_prefix("WAS_LINGER="))
         .next_back()
         .map(|v| v.trim().to_string())
+}
+
+/// PURE: the restore decision from the probe output. ONLY an explicit
+/// `WAS_LINGER=no` permits the run-end restore-disable; an absent marker,
+/// an EMPTY value, or anything unparsable defaults to `true` ("assume
+/// already on" → restore skipped). The empty case is load-bearing: a failed
+/// bus-dependent probe once yielded `WAS_LINGER=` (empty), which a naive
+/// `== "yes"` mapping read as "was off" — and the restore then disabled an
+/// operator PRE-SET linger mid-run, fan-killing the still-running cluster
+/// (krater post-mortem 2026-06-10). Never disable a state the run cannot
+/// PROVE it set.
+pub(super) fn was_linger_from_probe(stdout: &str) -> bool {
+    !matches!(parse_was_linger(stdout).as_deref(), Some("no"))
 }
 
 /// PURE: did the requested mutation report success? Scans for the
@@ -451,11 +475,11 @@ async fn enable_linger_for_node(
     match cmd.output().await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // Default to "already on" (skip restore) when the probe could
-            // not be parsed — never disable a state we cannot prove we set.
-            let was_linger = parse_was_linger(&stdout)
-                .map(|v| v == "yes")
-                .unwrap_or(true);
+            // ONLY an explicit `no` permits the run-end restore — absent,
+            // empty, or unparsable probes all read as "already on" (see
+            // was_linger_from_probe; never disable a state the run cannot
+            // prove it set).
+            let was_linger = was_linger_from_probe(&stdout);
             if linger_succeeded(&stdout, LingerVerb::Enable) {
                 tracing::info!(
                     secondary_id,
